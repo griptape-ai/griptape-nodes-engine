@@ -17,7 +17,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 @dataclass
@@ -61,7 +61,7 @@ def _load(lm: LibraryManager, library: Library, library_info: LibraryManager.Lib
 
 
 class TestPostDispatchHookRegistration:
-    def test_hooks_registered_via_event_manager(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_hooks_registered_via_event_manager(self, engine: Engine) -> None:
         """get_post_dispatch_hooks() pairs should be registered with EventManager."""
 
         class MyLib(AdvancedNodeLibrary):
@@ -71,14 +71,14 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=MyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         event_manager.add_post_dispatch_hook.assert_called_once_with(_TestRequest, _hook)
 
-    def test_hook_pairs_recorded_on_library(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_hook_pairs_recorded_on_library(self, engine: Engine) -> None:
         """The request type is tracked alongside the callback, because removal needs both."""
 
         class MyLib(AdvancedNodeLibrary):
@@ -88,14 +88,14 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=MyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         assert library.get_registered_post_dispatch_hooks() == [(_TestRequest, _hook)]
 
-    def test_exception_in_get_post_dispatch_hooks_appends_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_exception_in_get_post_dispatch_hooks_appends_problem(self, engine: Engine) -> None:
         """An exception from get_post_dispatch_hooks() should append PostDispatchHookRegistrationProblem."""
 
         class BoomLib(AdvancedNodeLibrary):
@@ -106,15 +106,15 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=BoomLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]
         assert PostDispatchHookRegistrationProblem in problem_types
 
-    def test_non_callable_hook_appends_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_non_callable_hook_appends_problem(self, engine: Engine) -> None:
         """Library code is untyped at this boundary, so a bad pair must fail loudly here."""
 
         class BadLib(AdvancedNodeLibrary):
@@ -124,9 +124,9 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=BadLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]
@@ -134,9 +134,7 @@ class TestPostDispatchHookRegistration:
         event_manager.add_post_dispatch_hook.assert_not_called()
         assert library.get_registered_post_dispatch_hooks() == []
 
-    def test_a_bad_pair_stops_registration_but_leaves_earlier_pairs_tracked(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    def test_a_bad_pair_stops_registration_but_leaves_earlier_pairs_tracked(self, engine: Engine) -> None:
         """A bad pair abandons the rest of the list, so what did register must still be tracked.
 
         Registration aborts on the first bad entry, matching the request-handler block
@@ -159,9 +157,9 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=PartlyBadLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]
@@ -171,7 +169,7 @@ class TestPostDispatchHookRegistration:
         assert registered == [first_hook]
         assert library.get_registered_post_dispatch_hooks() == [(_TestRequest, first_hook)]
 
-    def test_non_type_request_key_appends_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_non_type_request_key_appends_problem(self, engine: Engine) -> None:
         """A key that is not a class would register and then never fire, silently.
 
         `_fire_post_dispatch_hooks` looks the callbacks up by `type(request)`, so a key
@@ -186,9 +184,9 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=BadKeyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]
@@ -196,19 +194,19 @@ class TestPostDispatchHookRegistration:
         event_manager.add_post_dispatch_hook.assert_not_called()
         assert library.get_registered_post_dispatch_hooks() == []
 
-    def test_no_advanced_library_does_nothing(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_no_advanced_library_does_nothing(self, engine: Engine) -> None:
         """A library with no advanced library should not touch EventManager at all."""
         library = _make_library(advanced_library=None)
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         event_manager.add_post_dispatch_hook.assert_not_called()
 
-    def test_empty_get_post_dispatch_hooks_does_nothing(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_empty_get_post_dispatch_hooks_does_nothing(self, engine: Engine) -> None:
         """A library returning [] should not register any hooks."""
 
         class EmptyLib(AdvancedNodeLibrary):
@@ -217,14 +215,14 @@ class TestPostDispatchHookRegistration:
         library = _make_library(advanced_library=EmptyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         event_manager.add_post_dispatch_hook.assert_not_called()
 
-    def test_worker_mode_library_with_hooks_appends_incompatible_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_worker_mode_library_with_hooks_appends_incompatible_problem(self, engine: Engine) -> None:
         """Hooks registered in a worker process never see requests the orchestrator handles."""
 
         class WorkerLib(AdvancedNodeLibrary):
@@ -235,15 +233,15 @@ class TestPostDispatchHookRegistration:
         library_info = _make_library_info()
         library_info.requires_worker = True
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]
         assert PostDispatchHooksWorkerIncompatibleProblem in problem_types
 
-    def test_non_worker_library_with_hooks_no_incompatible_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_non_worker_library_with_hooks_no_incompatible_problem(self, engine: Engine) -> None:
         """A non-worker library with hooks is the supported case and must load clean."""
 
         class OrchestratorLib(AdvancedNodeLibrary):
@@ -254,9 +252,9 @@ class TestPostDispatchHookRegistration:
         library_info = _make_library_info()
         library_info.requires_worker = False
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             _load(lm, library, library_info)
 
         problem_types = [type(p) for p in library_info.problems]

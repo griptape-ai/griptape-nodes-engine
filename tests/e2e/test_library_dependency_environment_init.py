@@ -39,12 +39,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
-from griptape_nodes.retained_mode.engine import reset_root_engine
+from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -115,13 +114,15 @@ def _materialize_dep_library(target_dir: Path, *, wheel_dir: Path, name: str, wo
 
 
 def _register(library_json: Path) -> RegisterLibraryFromFileResultSuccess:
-    result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    # Re-resolved on each call, rather than threaded from a fixture: the cold-boot test below
+    # calls `reset_root_engine()` mid-test, and a fixture-captured Engine would go stale then.
+    result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), getattr(result, "result_details", result)
     return result
 
 
 def _library_info(library_json: Path) -> LibraryManager.LibraryInfo:
-    return GriptapeNodes.LibraryManager()._library_file_path_to_info[str(library_json)]
+    return current_engine().library_manager._library_file_path_to_info[str(library_json)]
 
 
 def _hooks_seen(library_name: str) -> list[str]:
@@ -167,7 +168,7 @@ class TestWorkerEnvironmentInitialization:
         library_json = _materialize_dep_library(
             library_dir, wheel_dir=wheel_dir, name="Worker Dep Library Worker", worker_mode=True
         )
-        GriptapeNodes.LibraryManager()._is_worker = True
+        current_engine().library_manager._is_worker = True
 
         _register(library_json)
 
@@ -189,7 +190,7 @@ class TestWorkerEnvironmentInitialization:
         library_json = _materialize_dep_library(
             library_dir, wheel_dir=wheel_dir, name="Worker Dep Library Reboot", worker_mode=True
         )
-        GriptapeNodes.LibraryManager()._is_worker = True
+        current_engine().library_manager._is_worker = True
         _register(library_json)
         advanced = LibraryRegistry.get_library("Worker Dep Library Reboot").get_advanced_library()
         assert advanced is not None
@@ -200,7 +201,7 @@ class TestWorkerEnvironmentInitialization:
         LibraryRegistry._clear()
         sys.modules.pop(DEP_NAME, None)
         sys.modules.pop(advanced_module_name, None)
-        GriptapeNodes.LibraryManager()._is_worker = True
+        current_engine().library_manager._is_worker = True
 
         _register(library_json)
 

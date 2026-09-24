@@ -49,8 +49,9 @@ def strip_sequence_token(stem: str) -> str:
         stem: Filename stem (no extension) to inspect.
 
     Returns:
-        stem unchanged if it has no sequence token; otherwise the token-free
-        basename fileseq parsed out of it.
+        stem unchanged if it has no sequence token; otherwise the basename fileseq
+        parsed out of it, minus the separator that sat before the token, since the
+        situation macro supplies its own (``"render_####"`` becomes ``"render"``).
 
     Raises:
         FileSequenceError: If stem contains more than one sequence token.
@@ -64,7 +65,7 @@ def strip_sequence_token(stem: str) -> str:
             f"Failed because it contains {token_count} sequence tokens; only one is supported."
         )
         raise FileSequenceError(msg)
-    return fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename()
+    return fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename().rstrip("._-")
 
 
 def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:
@@ -388,3 +389,11 @@ def build_versioned_sequence_destination(
         existing_file_policy=existing_file_policy,
         create_parents=create_parents,
     )
+
+
+@typing.runtime_checkable
+class FileSequenceDestinationProvider(typing.Protocol):
+    """Protocol for nodes that provide a FileSequenceDestination without serializing it over the wire."""
+
+    @property
+    def file_sequence_destination(self) -> FileSequenceDestination | None: ...

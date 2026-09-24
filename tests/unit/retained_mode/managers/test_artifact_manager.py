@@ -4,7 +4,7 @@ import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import anyio
 import pytest
@@ -17,6 +17,7 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    GeneratePreviewFromDefaultsRequest,
     GeneratePreviewRequest,
     GeneratePreviewResultFailure,
     GeneratePreviewResultSuccess,
@@ -36,7 +37,6 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager, PreviewMetadata
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
@@ -554,6 +554,77 @@ class TestPermissionDispatch:
         assert manager.check_read_permission("/some/file_without_ext") is None
 
 
+class TestExtractArtifactMetadata:
+    """extract_artifact_metadata resolves the provider by extension and returns its metadata as a dict."""
+
+    _PROBE_FORMAT = "probe"
+
+    def _make_probe_provider_class(self, metadata=None):  # noqa: ANN001, ANN202
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        probe_format = self._PROBE_FORMAT
+
+        class _ProbeProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Probe"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {probe_format}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return metadata
+
+        return _ProbeProvider
+
+    def _register(self, manager: ArtifactManager, provider_class: type) -> None:
+        result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=provider_class)
+        )
+        assert isinstance(result, RegisterArtifactProviderResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_returns_provider_metadata_as_dict(self) -> None:
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+        )
+
+        class _ProbeMetadata(BaseArtifactMetadata):
+            codec: str = "prores"
+            width: int = 1920
+
+        probe_cls = self._make_probe_provider_class(metadata=_ProbeMetadata())
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        result = await manager.extract_artifact_metadata(f"/some/clip.{self._PROBE_FORMAT}")
+
+        assert result == {"codec": "prores", "width": 1920}
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_returns_none(self) -> None:
+        manager = ArtifactManager()
+        assert await manager.extract_artifact_metadata("/some/clip.unregistered") is None
+
+    @pytest.mark.asyncio
+    async def test_no_extension_returns_none(self) -> None:
+        manager = ArtifactManager()
+        assert await manager.extract_artifact_metadata("/some/file_without_ext") is None
+
+    @pytest.mark.asyncio
+    async def test_provider_returning_none_metadata_returns_none(self) -> None:
+        probe_cls = self._make_probe_provider_class(metadata=None)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        assert await manager.extract_artifact_metadata(f"/some/clip.{self._PROBE_FORMAT}") is None
+
+
 class TestCheckArtifactReadPermissionHandler:
     """The request-based read-permission check.
 
@@ -648,14 +719,14 @@ class TestGeneratePreview:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         # Parse macros for the template
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
@@ -699,14 +770,14 @@ class TestGeneratePreview:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.mark.asyncio
@@ -946,6 +1017,186 @@ class TestGeneratePreview:
         assert metadata.preview_generator_name == "Standard Thumbnail Generation"
         assert isinstance(metadata.preview_generator_parameters, dict)
 
+    @pytest.mark.asyncio
+    async def test_generator_exception_returns_failure(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath
+    ) -> None:
+        """A generator that raises produces a failure result, not an unhandled error."""
+        from unittest.mock import AsyncMock
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(
+            ImageArtifactProvider,
+            "attempt_generate_preview",
+            new=AsyncMock(side_effect=RuntimeError("codec exploded")),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultFailure)
+        assert "codec exploded" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_source_vanishing_mid_generation_keeps_preview(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A source deleted while its preview renders keeps the generated preview.
+
+        The post-generation verification stat can't run against a vanished file;
+        the loop keeps what it produced rather than failing a completed generation.
+        """
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_delete_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            await anyio.Path(test_image_path).unlink()
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_delete_source):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_source_changed_mid_generation_retries_once(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A source edited while its preview renders triggers exactly one retry.
+
+        The first attempt's preview depicts old content; the retry re-stats and
+        regenerates, so the recorded metadata matches the file actually on disk.
+        """
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_mutate_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                with test_image_path.open("ab") as f:
+                    f.write(b"changed while the preview was rendering")
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_mutate_source):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+        metadata_path = test_image_path.parent / ".griptape-nodes-previews" / f"{test_image_path.name}.json"
+        metadata = json.loads(await anyio.Path(metadata_path).read_text())
+        # The retry's pre-generation stat matches the final on-disk file: fresh.
+        source_stat = await anyio.Path(test_image_path).stat()
+        assert metadata["source_file_size"] == source_stat.st_size
+
+    @pytest.mark.asyncio
+    async def test_same_size_rewrite_mid_generation_retries(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A same-size in-place rewrite during generation still triggers the retry.
+
+        The verify compares mtime exactly: a tolerant compare would make this
+        rewrite invisible (size unchanged, mtime within the drift window), and the
+        staleness check is blind to it for the same reason — this loop is the only
+        place it can be caught.
+        """
+        import os
+
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_rewrite_same_size(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                # Rewrite in place: same byte count, mtime nudged by less than the
+                # staleness tolerance window — the shape of a re-rendered frame.
+                source_stat = await anyio.Path(test_image_path).stat()
+                content = await anyio.Path(test_image_path).read_bytes()
+                await anyio.Path(test_image_path).write_bytes(content)
+                os.utime(test_image_path, (source_stat.st_atime, source_stat.st_mtime + 0.5))
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_rewrite_same_size):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+
+    @pytest.mark.asyncio
+    async def test_source_still_changing_stops_after_two_attempts(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A source that keeps changing (e.g. a render mid-write) does not spin us.
+
+        Exactly two attempts run; the recorded stat mismatches the on-disk file,
+        which is what makes the next request judge the preview stale and heal.
+        """
+        import logging
+
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_always_mutating_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            with test_image_path.open("ab") as f:
+                f.write(b"still changing")
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with (
+            patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_always_mutating_source),
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+        assert any("still changing" in record.message for record in caplog.records)
+        metadata_path = test_image_path.parent / ".griptape-nodes-previews" / f"{test_image_path.name}.json"
+        metadata = json.loads(await anyio.Path(metadata_path).read_text())
+        # Deliberately stale: the next preview request will regenerate.
+        source_stat = await anyio.Path(test_image_path).stat()
+        assert metadata["source_file_size"] != source_stat.st_size
+
 
 class TestPreviewMetadataDoesNotCreateSidecar:
     """Tests that preview metadata JSON files do not trigger sidecar creation.
@@ -964,13 +1215,13 @@ class TestPreviewMetadataDoesNotCreateSidecar:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
         situation_schemas = project_manager._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
@@ -1004,12 +1255,12 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.mark.asyncio
@@ -1086,14 +1337,14 @@ class TestGetPreviewForArtifact:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         # Parse macros for the template
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
@@ -1133,14 +1384,14 @@ class TestGetPreviewForArtifact:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.fixture
@@ -1428,6 +1679,116 @@ class TestGetPreviewForArtifact:
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
         assert result.paths_to_preview is not None
 
+    def test_stale_check_size_mismatch_is_stale(self, artifact_manager: ArtifactManager) -> None:
+        """Any size difference marks the preview stale, regardless of mtime."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=101, source_mtime=1000.0)
+
+    def test_stale_check_tolerates_mtime_drift(self, artifact_manager: ArtifactManager) -> None:
+        """Sub-tolerance mtime drift (sync tools, FAT granularity, float noise) is not stale."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1000.0)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1000.0000001)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1001.9)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=998.1)
+
+    def test_stale_check_rejects_real_mtime_change(self, artifact_manager: ArtifactManager) -> None:
+        """An mtime moved beyond the tolerance window, in either direction, is stale."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1002.1)
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=997.9)
+
+    @pytest.mark.usefixtures("generated_preview_with_metadata")
+    def test_get_preview_mtime_drift_within_tolerance_is_not_stale(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        """A synced/copied source whose mtime drifted slightly still serves its preview.
+
+        Exact float equality would brand this permanently stale — a
+        DO_NOT_GENERATE failure with a valid preview sitting on disk.
+        """
+        import asyncio
+        import os
+
+        stat_result = test_image_path.stat()
+        os.utime(test_image_path, (stat_result.st_atime, stat_result.st_mtime + 1.0))
+
+        request = GetPreviewForArtifactRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
+        )
+
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+
+        assert isinstance(result, GetPreviewForArtifactResultSuccess)
+
+    @pytest.mark.usefixtures("generated_preview_with_metadata")
+    def test_concurrent_stale_requests_regenerate_once(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        """Concurrent requests for one stale source produce exactly one regeneration.
+
+        The editor renders the same artifact in several components and each fires its
+        own preview request; without the per-source lock they all regenerate the same
+        file simultaneously, tearing the copy a browser is fetching.
+        """
+        import asyncio
+
+        # Make the source genuinely stale (size change)
+        with test_image_path.open("ab") as f:
+            f.write(b"extra data to change size")
+
+        generation_count = 0
+        original_generate = artifact_manager.on_handle_generate_preview_from_defaults_request
+
+        async def counting_generate(request: GeneratePreviewFromDefaultsRequest) -> object:
+            nonlocal generation_count
+            generation_count += 1
+            return await original_generate(request)
+
+        artifact_manager.on_handle_generate_preview_from_defaults_request = counting_generate  # type: ignore[method-assign]
+
+        async def fire_concurrent_requests() -> list[object]:
+            requests = [
+                GetPreviewForArtifactRequest(
+                    macro_path=test_macro_path,
+                    artifact_provider_name="Image",
+                    preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+                )
+                for _ in range(5)
+            ]
+            return await asyncio.gather(
+                *(artifact_manager.on_handle_get_preview_for_artifact_request(r) for r in requests)
+            )
+
+        results = asyncio.run(fire_concurrent_requests())
+
+        assert all(isinstance(r, GetPreviewForArtifactResultSuccess) for r in results)
+        assert generation_count == 1
+
+
+def _make_preview_metadata(*, source_file_size: int, source_file_modified_time: float) -> PreviewMetadata:
+    """Build a PreviewMetadata with the fields the staleness check reads."""
+    return PreviewMetadata(
+        version=PreviewMetadata.LATEST_SCHEMA_VERSION,
+        source_macro_path="{inputs}/test.jpg",
+        source_file_size=source_file_size,
+        source_file_modified_time=source_file_modified_time,
+        preview_file_names="test.jpg.webp",
+        preview_generator_name="Standard Thumbnail Generation",
+        preview_generator_parameters={},
+    )
+
 
 class TestGeneratorValidation:
     """Test generator parameter validation logic."""
@@ -1629,7 +1990,7 @@ class TestProviderRegistrationConfigLogLevels:
     are expected and should not produce ERROR-level logs that alarm users.
     """
 
-    def test_read_generator_config_uses_debug_failure_log_level(self) -> None:
+    def test_read_generator_config_uses_debug_failure_log_level(self, engine: Engine) -> None:
         """Test that _read_generator_config uses failure_log_level=DEBUG in GetConfigCategoryRequest."""
         import logging
 
@@ -1645,7 +2006,7 @@ class TestProviderRegistrationConfigLogLevels:
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return GriptapeNodes.handle_request(request)
+            return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
         manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
@@ -1654,7 +2015,7 @@ class TestProviderRegistrationConfigLogLevels:
         assert len(category_requests) == 1
         assert category_requests[0].failure_log_level == logging.DEBUG
 
-    def test_validate_and_write_provider_settings_uses_debug_failure_log_level(self) -> None:
+    def test_validate_and_write_provider_settings_uses_debug_failure_log_level(self, engine: Engine) -> None:
         """Test that _validate_and_write_provider_settings uses failure_log_level=DEBUG."""
         import logging
 
@@ -1667,7 +2028,7 @@ class TestProviderRegistrationConfigLogLevels:
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return GriptapeNodes.handle_request(request)
+            return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
         manager._validate_and_write_provider_settings(ImageArtifactProvider)

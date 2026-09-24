@@ -15,6 +15,8 @@ from cattrs.strategies import include_subclasses, use_class_methods
 from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
+from griptape_nodes.common.macro_parser.core import ParsedMacro
+
 logger = logging.getLogger(__name__)
 
 converter = make_converter()
@@ -75,8 +77,16 @@ converter.register_unstructure_hook_func(
 # Bare `type` references (e.g. provider_class: type)
 converter.register_unstructure_hook(type, lambda t: f"{t.__module__}.{t.__qualname__}")
 
+# ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
+# never set by a caller, so the template is the entire value: sending the segments would send a
+# derived copy that the receiving side has to rebuild anyway. Without this, cattrs has no hook for
+# the dataclass and passes it through untouched, so the failure lands in json.dumps instead.
+converter.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
+
 
 # --- Structure hooks (deserialization) ---
+
+converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
 
 # The JSON preset strict mode rejects ints for float fields, but JSON has
 # no distinction between int and float, so coerce int -> float on input.

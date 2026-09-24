@@ -135,10 +135,13 @@ class TestStripSequenceToken:
         assert file_sequence.strip_sequence_token("render") == "render"
 
     def test_hash_token_stripped(self) -> None:
-        assert file_sequence.strip_sequence_token("render_####") == "render_"
+        assert file_sequence.strip_sequence_token("render_####") == "render"
 
     def test_printf_token_stripped(self) -> None:
-        assert file_sequence.strip_sequence_token("render_%04d") == "render_"
+        assert file_sequence.strip_sequence_token("render_%04d") == "render"
+
+    def test_dot_separator_stripped(self) -> None:
+        assert file_sequence.strip_sequence_token("render.####") == "render"
 
     def test_multiple_tokens_raise(self) -> None:
         with pytest.raises(file_sequence.FileSequenceError):

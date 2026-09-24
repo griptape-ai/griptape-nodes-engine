@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import anyio
 import pytest
 
 from griptape_nodes.utils.file_utils import (
+    DEFAULT_MAX_SEARCH_DEPTH,
     _arecurse_find,
     _AsyncWalkParams,
+    _fsync_directory_best_effort,
     atomic_write_bytes,
     find_all_files_in_directory,
     find_file_in_directory,
     find_files_recursive,
+    promote_scratch_file,
+    promote_scratch_file_async,
 )
 
 if TYPE_CHECKING:
@@ -292,7 +298,9 @@ class TestAfindFilesRecursive:
     @pytest.mark.asyncio
     async def test_when_directory_does_not_exist(self) -> None:
         """Empty list is returned when directory doesn't exist."""
-        result = await find_files_recursive(Path("/non/existent/directory"), "*.json")
+        result = await find_files_recursive(
+            Path("/non/existent/directory"), "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH
+        )
 
         assert result == []
 
@@ -302,7 +310,7 @@ class TestAfindFilesRecursive:
         test_file = temp_dir / "test.txt"
         test_file.write_text("content")
 
-        result = await find_files_recursive(test_file, "*.json")
+        result = await find_files_recursive(test_file, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == []
 
@@ -312,7 +320,7 @@ class TestAfindFilesRecursive:
         (temp_dir / "test.txt").write_text("content")
         (temp_dir / "another.py").write_text("content")
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == []
 
@@ -326,7 +334,7 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file2, file3]
 
@@ -345,7 +353,7 @@ class TestAfindFilesRecursive:
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file3, file2]
 
@@ -359,7 +367,7 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [visible_file]
 
@@ -373,7 +381,7 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", skip_hidden=False)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_hidden=False)
 
         assert set(result) == {hidden_file, visible_file}
 
@@ -386,21 +394,20 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*library*.json")
+        result = await find_files_recursive(temp_dir, "*library*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == sorted([file1, file2])
 
     @pytest.mark.asyncio
     async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path) -> None:
-        """A discovery_max_depth setting of 0 returns only matches directly in the directory."""
+        """A max_depth of 0 returns only matches directly in the directory."""
         root_file = temp_dir / "root.json"
         nested_file = temp_dir / "sub" / "nested.json"
         nested_file.parent.mkdir()
         root_file.write_text("{}")
         nested_file.write_text("{}")
 
-        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=0):
-            result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=0)
 
         assert result == [root_file]
 
@@ -413,8 +420,7 @@ class TestAfindFilesRecursive:
         at_cap.write_text("{}")
         below_cap.write_text("{}")
 
-        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=1):
-            result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=1)
 
         assert result == [at_cap]
 
@@ -424,7 +430,7 @@ class TestAfindFilesRecursive:
         for name in ["a.json", "b.json", "c.json", "d.json"]:
             (temp_dir / name).write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_files=2)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
 
@@ -442,7 +448,7 @@ class TestAfindFilesRecursive:
         scan_root.mkdir()
         (scan_root / "linked").symlink_to(real_dir)
 
-        result = await find_files_recursive(scan_root, "*.json")
+        result = await find_files_recursive(scan_root, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [scan_root / "linked" / "found.json"]
 
@@ -454,7 +460,7 @@ class TestAfindFilesRecursive:
         (nested / "f.json").write_text("{}")
         (nested / "loop").symlink_to(temp_dir)
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert nested / "f.json" in result
 
@@ -464,7 +470,7 @@ class TestAfindFilesRecursive:
         (temp_dir / "real.json").write_text("{}")
         (temp_dir / "broken.json").symlink_to(temp_dir / "does_not_exist")
 
-        result = await find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "real.json"]
 
@@ -489,7 +495,7 @@ class TestAfindFilesRecursive:
             return real_scandir(path)  # type: ignore[arg-type]
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_denying_one_dir):
-            result = await find_files_recursive(temp_dir, "*.json")
+            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "sibling" / "found.json"]
 
@@ -515,7 +521,7 @@ class TestAfindFilesRecursive:
             return _FakeScandir(entries)
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_with_one_bad_entry):
-            result = await find_files_recursive(temp_dir, "*.json")
+            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "good.json"]
 
@@ -619,6 +625,31 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"payload")
         assert [p.name for p in temp_dir.iterdir()] == ["data.bin"]
 
+    def test_overwrite_rides_out_transient_rename_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The headline behavior: a full overwrite survives Windows-style transient denials.
+
+        End-to-end through atomic_write_bytes, not the promote helper directly —
+        two denials on the rename (a reader holding the destination) and the
+        write still lands, with no scratch debris.
+        """
+        target = temp_dir / "served.bin"
+        target.write_bytes(b"old")
+
+        real_replace = Path.replace
+        denials = [PermissionError("held"), PermissionError("held")]
+
+        def transiently_denied(self: Path, other: str | Path) -> Path:
+            if denials:
+                raise denials.pop()
+            return real_replace(self, other)
+
+        monkeypatch.setattr(Path, "replace", transiently_denied)
+
+        atomic_write_bytes(target, b"new")
+
+        assert target.read_bytes() == b"new"
+        assert sorted(p.name for p in temp_dir.iterdir()) == ["served.bin"]
+
     def test_failed_rename_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
         """A rename failure cleans up the temp file and leaves the original intact."""
         target = temp_dir / "data.bin"
@@ -631,3 +662,238 @@ class TestAtomicWriteBytes:
         assert target.read_bytes() == b"original"
         # No stray temp file survives the failure.
         assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+
+    def test_failed_fsync_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
+        """A write that dies before the rename cleans up and leaves the original intact."""
+        target = temp_dir / "data.bin"
+        target.write_bytes(b"original")
+        with (
+            patch("griptape_nodes.utils.file_utils.os.fsync", side_effect=OSError("device error")),
+            pytest.raises(OSError, match="device error"),
+        ):
+            atomic_write_bytes(target, b"new")
+        assert target.read_bytes() == b"original"
+        assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
+    def test_preserves_existing_file_mode(self, temp_dir: Path) -> None:
+        """Overwriting keeps the destination's permissions.
+
+        The scratch file is aligned to the destination's exact mode before any
+        content is written; without that, every atomic overwrite would reset a
+        shared file's permissions to the process default.
+        """
+        import stat
+
+        target = temp_dir / "data.bin"
+        target.write_bytes(b"original")
+        target.chmod(0o604)
+
+        atomic_write_bytes(target, b"new")
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o604  # noqa: PLR2004
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
+    def test_scratch_never_looser_than_strict_destination(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 0600 destination's content is never on disk at a looser mode, even mid-write.
+
+        The scratch is created at a 0600 floor and aligned to the destination's
+        mode while still empty — a secrets file being rewritten must not have its
+        payload readable by other local users during the write window.
+        """
+        import stat
+
+        target = temp_dir / "secrets.env"
+        target.write_bytes(b"OPENAI_API_KEY=old")
+        target.chmod(0o600)
+
+        observed_modes: list[int] = []
+        real_fsync = os.fsync
+
+        def spying_fsync(fd: int) -> None:
+            observed_modes.extend(
+                stat.S_IMODE(scratch.stat().st_mode) for scratch in temp_dir.glob(".gtn-write-partial-*")
+            )
+            real_fsync(fd)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", spying_fsync)
+
+        atomic_write_bytes(target, b"OPENAI_API_KEY=new")
+
+        assert observed_modes  # the spy saw the scratch while content was on disk
+        assert all(mode == 0o600 for mode in observed_modes)  # noqa: PLR2004
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600  # noqa: PLR2004
+
+    def test_scratch_never_matches_destination_extension_glob(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mid-write, an extension glob over the directory sees only real records.
+
+        pathlib.glob matches dotfiles, and pollers glob patterns like *.json over
+        directories this function writes into — the scratch name must never end
+        in the destination's own suffix or it reads as a second record.
+        """
+        target = temp_dir / "record.json"
+        target.write_bytes(b"{}")
+
+        mid_write_glob: list[str] = []
+        real_fsync = os.fsync
+
+        def spying_fsync(fd: int) -> None:
+            mid_write_glob.extend(p.name for p in temp_dir.glob("*.json"))
+            real_fsync(fd)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", spying_fsync)
+
+        atomic_write_bytes(target, b'{"updated": true}')
+
+        # The spy fires for the payload fsync and again for the directory fsync;
+        # neither observation may include the scratch file.
+        assert mid_write_glob
+        assert set(mid_write_glob) == {"record.json"}
+
+    def test_new_file_gets_umask_default_mode(self, temp_dir: Path) -> None:
+        """A brand-new file gets the same mode open(mode="w") would have produced."""
+        import stat
+
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        expected_mode = 0o666 & ~current_umask
+
+        target = temp_dir / "data.bin"
+        atomic_write_bytes(target, b"new")
+
+        assert stat.S_IMODE(target.stat().st_mode) == expected_mode
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
+    def test_writes_through_symlink_destination(self, temp_dir: Path) -> None:
+        """A symlinked destination keeps the link and updates its target.
+
+        Matches in-place open(mode="w") semantics; a naive rename would replace
+        the link itself with a regular file and leave the target stale.
+        """
+        real_target = temp_dir / "real.bin"
+        real_target.write_bytes(b"old")
+        link = temp_dir / "link.bin"
+        link.symlink_to(real_target)
+
+        atomic_write_bytes(link, b"new")
+
+        assert link.is_symlink()
+        assert real_target.read_bytes() == b"new"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
+    def test_dangling_symlink_creates_target(self, temp_dir: Path) -> None:
+        """Writing to a dangling link creates its target, as open() would."""
+        missing_target = temp_dir / "missing.bin"
+        link = temp_dir / "link.bin"
+        link.symlink_to(missing_target)
+
+        atomic_write_bytes(link, b"new")
+
+        assert link.is_symlink()
+        assert missing_target.read_bytes() == b"new"
+
+
+class TestFsyncDirectoryBestEffort:
+    """The directory sync must never fail a write that already completed."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_unopenable_directory_is_swallowed(self, temp_dir: Path) -> None:
+        """A directory that cannot be opened for sync is logged and skipped."""
+        _fsync_directory_best_effort(temp_dir / "does-not-exist")
+
+    def test_fsync_failure_is_swallowed(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An fsync error (unsupported filesystem) is logged and skipped."""
+
+        def failing_fsync(_fd: int) -> None:
+            msg = "fsync not supported here"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
+
+        _fsync_directory_best_effort(temp_dir)
+
+
+class TestPromoteScratchFile:
+    """Shared promote: atomic rename that rides out transient Windows denials."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_promotes_onto_destination(self, temp_dir: Path) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+        destination.write_bytes(b"old")
+
+        promote_scratch_file(scratch, destination)
+
+        assert destination.read_bytes() == b"new"
+        assert not scratch.exists()
+
+    def test_rides_out_transient_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        real_replace = Path.replace
+        denials = [PermissionError("held"), PermissionError("held")]
+
+        def transiently_denied(self: Path, target: str | Path) -> Path:
+            if denials:
+                raise denials.pop()
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", transiently_denied)
+
+        promote_scratch_file(scratch, destination)
+
+        assert destination.read_bytes() == b"new"
+
+    def test_persistent_denial_raises_and_keeps_scratch(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Scratch disposal belongs to the caller, so a failed promote must not unlink it."""
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        def always_denied(_self: Path, _target: str | Path) -> Path:
+            msg = "held open"
+            raise PermissionError(msg)
+
+        monkeypatch.setattr(Path, "replace", always_denied)
+
+        with pytest.raises(PermissionError, match="held open"):
+            promote_scratch_file(scratch, destination)
+
+        assert scratch.exists()
+        assert not destination.exists()
+
+    def test_async_form_promotes_and_retries(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        real_replace = anyio.Path.replace
+        denials = [PermissionError("held")]
+
+        async def transiently_denied(self: anyio.Path, target: str | Path) -> object:
+            if denials:
+                raise denials.pop()
+            return await real_replace(self, target)
+
+        monkeypatch.setattr(anyio.Path, "replace", transiently_denied)
+
+        asyncio.run(promote_scratch_file_async(scratch, destination))
+
+        assert destination.read_bytes() == b"new"

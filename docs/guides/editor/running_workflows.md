@@ -20,8 +20,10 @@ already running, and while no workflow is open.
 ## Running a single node
 
 Two more buttons next to Run Workflow let you run less than the whole
-graph. The buttons require exactly one node to be selected, and both are
-disabled while the workflow is already running.
+graph. The buttons require exactly one node to be selected. Run From
+Selected is disabled while the workflow is already running; Run To
+Selected is not — see [Running a node during a
+run](#running-a-node-during-a-run) below.
 
 - **Run To Selected** resolves the selected node — and everything upstream
     of it that isn't already resolved — without touching anything
@@ -41,6 +43,38 @@ selected — it runs to each of them.
 
 Both single-node actions are also available from the node's right-click
 context menu, and from the multi-node toolbar when applicable.
+
+## Running a node during a run
+
+You don't have to wait for a run to finish to try a node. **Run To
+Selected** stays available while the workflow is running, and the node
+joins the run that's already in progress instead of starting a new one.
+Anything upstream of it that isn't resolved yet is pulled into the same
+run and resolved first, exactly as it would be from a standing start.
+
+When the node actually begins depends on how much of the run is already
+in flight:
+
+- In **Parallel** execution mode it starts as soon as the run has a free
+    slot, which may be immediately. The number of nodes that can run at
+    once is the `max_nodes_in_parallel` setting (5 by default).
+- In **Sequential** execution mode one node runs at a time, so the node
+    you played starts once the node currently running finishes.
+
+Both modes are described in
+[Configuration](../configuration.md).
+
+Two cases are worth knowing about:
+
+- **If the run is paused**, the node is added to it but does not start.
+    It runs when you step or continue the run.
+- **If the node is already part of the run** — already finished, running,
+    or queued behind its dependencies — playing it is refused rather than
+    run twice, and the editor reports that the node is already executing.
+    Cancel the run if you want to start it over.
+
+**Run Workflow** and **Run From Selected** still require an idle
+workflow; they stay disabled until the current run ends.
 
 ## Stopping a run
 

@@ -1,12 +1,16 @@
 """Unit tests for LocalFileDriver."""
 
 import platform
+import sys
+from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
 from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
 from griptape_nodes.files.path_utils import parse_file_uri
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 
 class TestLocalFileDriver:
@@ -153,9 +157,21 @@ class TestLocalFileDriverFileURI:
         result = parse_file_uri(uri)
         assert result == "/path/to/file with spaces.txt"
 
-    def test_parse_file_uri_rejects_remote_host(self, driver: LocalFileDriver) -> None:  # noqa: ARG002
-        """Test that file URIs with non-localhost hosts are rejected."""
-        uri = "file://remote-server/path/to/file.txt"
+    def test_parse_file_uri_unc_host_on_windows(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG002
+        """Test that file URIs with non-localhost hosts parse as UNC paths on Windows."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://remote-server.invalid/path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "//remote-server.invalid/path/to/file.txt"
+
+    def test_parse_file_uri_rejects_unc_host_off_windows(
+        self,
+        driver: LocalFileDriver,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POSIX has no UNC concept, so a non-localhost host is rejected rather than resolved."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        uri = "file://remote-server.invalid/path/to/file.txt"
         result = parse_file_uri(uri)
         assert result is None
 
@@ -191,7 +207,7 @@ class TestLocalFileDriverFileURI:
 
         The driver accepts all locations; invalid URIs fail at read time, not can_handle.
         """
-        uri = "file://remote-server/path/to/file.txt"
+        uri = "file://remote-server.invalid/path/to/file.txt"
         assert driver.can_handle(uri) is True
 
     @pytest.mark.asyncio
@@ -225,12 +241,28 @@ class TestLocalFileDriverFileURI:
         assert "File not found" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_read_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test reading file with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    async def test_read_unc_file_uri_not_found(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reading a UNC file:// URI for a non-existent share raises FileNotFoundError on Windows.
+
+        ``.invalid`` is an RFC 6761-guaranteed unresolvable TLD, so this never depends on the
+        test runner's real DNS/WINS setup for the "not found" outcome to hold.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_read_unc_file_uri_invalid_off_windows(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Off Windows, a UNC file:// URI is rejected at parse time, not silently resolved."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
 
         with pytest.raises(ValueError, match="Invalid file:// URI"):
-            await driver.read(invalid_uri, timeout=10.0)
+            await driver.read(unc_uri, timeout=10.0)
 
     @pytest.mark.asyncio
     async def test_exists_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
@@ -246,10 +278,71 @@ class TestLocalFileDriverFileURI:
         assert await driver.exists(file_uri) is False
 
     @pytest.mark.asyncio
-    async def test_exists_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test exists with invalid file:// URI returns False."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
-        assert await driver.exists(invalid_uri) is False
+    async def test_exists_unc_file_uri_not_found(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test exists with a UNC file:// URI for a non-existent share returns False."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+        assert await driver.exists(unc_uri) is False
+
+    @pytest.mark.asyncio
+    async def test_exists_unc_file_uri_off_windows_returns_false(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exists() swallows the ValueError from a rejected UNC URI, same as any invalid location."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+        assert await driver.exists(unc_uri) is False
+
+    @pytest.mark.asyncio
+    async def test_read_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Normalize a real Windows SMB failure (e.g. WinError 53) into FileNotFoundError.
+
+        Such a failure surfaces from resolve() as a raw OSError rather than our own
+        FileNotFoundError. Mac/Linux never raise this for a UNC-shaped path (there's no SMB
+        layer to fail), so this mocks the failure directly to prove read() normalizes it,
+        rather than relying on a real unreachable host.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_exists_returns_false_for_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exists() must return False, not raise, when the host resolution itself fails."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        assert await driver.exists(unc_uri) is False
+
+    def test_get_size_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same normalization as read(), for the synchronous get_size() path."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
 
     def test_get_size_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
         """Test get_size with file:// URI."""
@@ -266,9 +359,220 @@ class TestLocalFileDriverFileURI:
             driver.get_size(file_uri)
         assert "File not found" in str(exc_info.value)
 
-    def test_get_size_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test get_size with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    def test_get_size_unc_file_uri_not_found(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test get_size with a UNC file:// URI for a non-existent share raises FileNotFoundError."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
 
-        with pytest.raises(ValueError, match="Invalid file:// URI"):
-            driver.get_size(invalid_uri)
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
+
+
+class TestLocalFileDriverRelativePaths:
+    """Tests that relative paths anchor on the workspace directory, never the process CWD."""
+
+    @pytest.fixture
+    def driver(self) -> LocalFileDriver:
+        """Create a LocalFileDriver instance."""
+        return LocalFileDriver()
+
+    @pytest.fixture
+    def workspace_path(self, tmp_path: Path) -> Path:
+        """Create a workspace directory holding the files the driver should find."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "config.json").write_text("workspace copy")
+        (workspace / "foo%20bar.png").write_text("workspace percent copy")
+        (workspace / "report$.txt").write_text("workspace dollar copy")
+        (workspace / "workspace_only.json").write_text("workspace only copy")
+        nested_dir = workspace / "data"
+        nested_dir.mkdir()
+        (nested_dir / "nested.json").write_text("workspace nested copy")
+        return workspace
+
+    @pytest.fixture
+    def cwd_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Create a decoy directory with same-named, different-content files, and chdir into it."""
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        (cwd / "config.json").write_text("cwd copy")
+        (cwd / "foo%20bar.png").write_text("cwd percent copy")
+        (cwd / "report$.txt").write_text("cwd dollar copy")
+        (cwd / "cwd_only.json").write_text("cwd only copy")
+        nested_dir = cwd / "data"
+        nested_dir.mkdir()
+        (nested_dir / "nested.json").write_text("cwd nested copy")
+        monkeypatch.chdir(cwd)
+        return cwd
+
+    @pytest.fixture
+    def home_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Create a fake home directory and point ~ expansion at it."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.json").write_text("home copy")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        return home
+
+    @pytest.fixture
+    def mock_config_manager(self, workspace_path: Path) -> Mock:
+        """Mock the ConfigManager so its workspace_path is our test workspace."""
+        config_manager = Mock(spec=ConfigManager)
+        config_manager.workspace_path = workspace_path
+        return config_manager
+
+    @pytest.fixture
+    def mock_config_manager_accessor(self, mock_config_manager: Mock) -> Iterator[Mock]:
+        """Patch the engine lookup the driver uses to reach the ConfigManager.
+
+        The tests assert on this mock to pin WHETHER the driver consulted the workspace at
+        all, which is the difference between anchoring a bare relative path and trusting the
+        process's cwd.
+        """
+        with patch(
+            "griptape_nodes.files.drivers.local_file_driver.current_engine",
+            return_value=Mock(config_manager=mock_config_manager),
+        ) as accessor:
+            yield accessor
+
+    @pytest.mark.asyncio
+    async def test_read_bare_relative_path_uses_workspace_not_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a bare relative path reads the workspace copy, not the same-named CWD copy."""
+        content = await driver.read("config.json", timeout=10.0)
+
+        assert content == b"workspace copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_relative_path_with_subdirectories_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative path with subdirectories anchors under the workspace."""
+        content = await driver.read("data/nested.json", timeout=10.0)
+
+        assert content == b"workspace nested copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_percent_encoded_relative_path_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative name containing '%' still anchors on the workspace after expansion.
+
+        '%' makes `path_needs_expansion` True, so expansion runs, but a URL-encoded filename
+        has no env var to substitute and comes back relative. It must still be anchored.
+        """
+        content = await driver.read("foo%20bar.png", timeout=10.0)
+
+        assert content == b"workspace percent copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_dollar_relative_path_with_no_matching_env_var_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative name containing '$' with no matching env var anchors on the workspace."""
+        content = await driver.read("report$.txt", timeout=10.0)
+
+        assert content == b"workspace dollar copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_exists_finds_relative_path_present_only_in_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test exists() is True for a relative name that exists only in the workspace."""
+        assert await driver.exists("workspace_only.json") is True
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_exists_misses_relative_path_present_only_in_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test exists() is False for a relative name that exists only in the process CWD."""
+        assert await driver.exists("cwd_only.json") is False
+        mock_config_manager_accessor.assert_called_once_with()
+
+    def test_get_size_bare_relative_path_measures_workspace_not_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test get_size() measures the workspace copy, not the shorter same-named CWD copy."""
+        size = driver.get_size("config.json")
+
+        assert size == len("workspace copy")
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_absolute_path_does_not_consult_workspace(
+        self,
+        driver: LocalFileDriver,
+        tmp_path: Path,
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test an absolute path reads as-is without ever asking for the workspace directory."""
+        absolute_file = tmp_path / "absolute.json"
+        absolute_file.write_text("absolute copy")
+
+        content = await driver.read(str(absolute_file), timeout=10.0)
+
+        assert content == b"absolute copy"
+        mock_config_manager_accessor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_read_tilde_path_expands_to_home_not_workspace(
+        self,
+        driver: LocalFileDriver,
+        home_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a ~ path expands to the home directory without the workspace prefixed onto it."""
+        content = await driver.read("~/config.json", timeout=10.0)
+
+        assert content == b"home copy"
+        mock_config_manager_accessor.assert_not_called()
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    @pytest.mark.asyncio
+    async def test_read_relative_path_through_symlink_collapses_dotdot_lexically(
+        self,
+        driver: LocalFileDriver,
+        tmp_path: Path,
+        workspace_path: Path,
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test '..' after a symlinked directory cancels the link name instead of walking through it."""
+        outside_dir = tmp_path / "mnt"
+        symlink_target = outside_dir / "target"
+        symlink_target.mkdir(parents=True)
+        (outside_dir / "b").write_bytes(b"mnt b")
+        (workspace_path / "b").write_bytes(b"workspace b")
+        (workspace_path / "link").symlink_to(symlink_target, target_is_directory=True)
+
+        content = await driver.read("link/../b", timeout=10.0)
+
+        assert content == b"workspace b"
+        mock_config_manager_accessor.assert_called_once_with()

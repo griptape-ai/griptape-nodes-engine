@@ -20,8 +20,8 @@ from griptape_nodes.exe_types.workflow_node import (
     pair_shape_nodes,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 CONTROL_TYPE = "parametercontroltype"
 
@@ -60,13 +60,13 @@ def _build_live_subflow() -> str:
     Start Flow node, a Start Flow node exposing `text`, and an End Flow node exposing `result`, all
     renamed because their original names were already taken on the canvas.
     """
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_live_routes")
-    flow_result = GriptapeNodes.handle_request(
+    current_engine().context_manager.push_workflow(workflow_name="workflow_node_live_routes")
+    flow_result = current_engine().handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="Subflow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
 
-    flow = GriptapeNodes.FlowManager().get_flow_by_name(flow_result.flow_name)
+    flow = current_engine().flow_manager.get_flow_by_name(flow_result.flow_name)
     flow.add_node(StartNode(name="Start Flow_1"))
 
     start_with_text = StartNode(name="Start Flow_2")

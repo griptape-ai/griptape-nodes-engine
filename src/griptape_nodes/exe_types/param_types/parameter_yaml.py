@@ -59,6 +59,7 @@ class ParameterYaml(Parameter):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -116,6 +117,7 @@ class ParameterYaml(Parameter):
             serializable=serializable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
             parent_container_name=parent_container_name,
@@ -168,9 +170,7 @@ class ParameterYaml(Parameter):
         if value:
             self.update_ui_options_key("button", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("button")
 
     @property
     def button_label(self) -> str | None:
@@ -179,9 +179,7 @@ class ParameterYaml(Parameter):
     @button_label.setter
     def button_label(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button_label", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("button_label")
         else:
             self.update_ui_options_key("button_label", value)
 
@@ -192,9 +190,7 @@ class ParameterYaml(Parameter):
     @button_icon.setter
     def button_icon(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button_icon", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("button_icon")
         else:
             self.update_ui_options_key("button_icon", value)
 
@@ -205,8 +201,6 @@ class ParameterYaml(Parameter):
     @placeholder_text.setter
     def placeholder_text(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("placeholder_text", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("placeholder_text")
         else:
             self.update_ui_options_key("placeholder_text", value)

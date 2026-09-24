@@ -1,8 +1,9 @@
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -91,6 +92,21 @@ class Button(Trait):
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
 
+    RENDERED_STATE_KEYS: ClassVar[dict[str, str]] = {
+        "button_label": "label",
+        "variant": "variant",
+        "size": "size",
+        "state": "state",
+        "full_width": "full_width",
+        "button_icon": "icon",
+        "iconPosition": "icon_position",
+        "icon_class": "icon_class",
+        "loading_label": "loading_label",
+        "loading_icon": "loading_icon",
+        "loading_icon_class": "loading_icon_class",
+        "tooltip": "tooltip",
+    }
+
     # Button styling and behavior properties
     label: str = "Button"
     variant: ButtonVariant = "default"
@@ -107,7 +123,7 @@ class Button(Trait):
     button_link: str | None = None
 
     element_id: str = field(default_factory=lambda: "Button")
-    on_click_callback: OnClickCallback | None = field(default=None, init=False)
+    _on_click_handler: OnClickCallback | None = field(default=None, init=False)
     get_button_state_callback: GetButtonStateCallback | None = field(default=None, init=False)
 
     def __init__(  # noqa: PLR0913
@@ -152,12 +168,46 @@ class Button(Trait):
             )
             raise ValueError(error_msg)
 
-        # If button_link is provided and no custom on_click handler, create a default handler
-        if button_link is not None:
-            self.on_click_callback = self._create_button_link_handler(button_link)
-        else:
-            self.on_click_callback = on_click
+        self._on_click_handler = on_click
         self.get_button_state_callback = get_button_state
+
+    @property
+    def on_click_callback(self) -> OnClickCallback | None:
+        if self._on_click_handler is not None:
+            return self._on_click_handler
+        if self.button_link is None:
+            return None
+        return self._create_button_link_handler(self.button_link)
+
+    @on_click_callback.setter
+    def on_click_callback(self, callback: OnClickCallback | None) -> None:
+        self._on_click_handler = callback
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "variant": self.variant,
+            "size": self.size,
+            "state": self.state,
+            "icon": self.icon,
+            "icon_class": self.icon_class,
+            "icon_position": self.icon_position,
+            "full_width": self.full_width,
+            "loading_label": self.loading_label,
+            "loading_icon": self.loading_icon,
+            "loading_icon_class": self.loading_icon_class,
+            "tooltip": self.tooltip,
+            "button_link": self.button_link,
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        for name in self.to_state():
+            if name in state:
+                setattr(self, name, state[name])
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        return state_from_rendered_keys(ui_options, cls.RENDERED_STATE_KEYS)
 
     def _create_button_link_handler(self, url: str) -> OnClickCallback:
         """Create a default handler for button_link URLs."""
@@ -177,10 +227,6 @@ class Button(Trait):
             )
 
         return handler
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["button", "addbutton"]
 
     def get_button_details(self, state: ButtonState | None = None) -> ButtonDetailsMessagePayload:
         """Create a ButtonDetailsMessagePayload with current or specified button state."""

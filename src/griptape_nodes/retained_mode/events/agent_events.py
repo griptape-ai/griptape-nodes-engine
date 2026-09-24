@@ -312,6 +312,16 @@ class ListThreadsRequest(RequestPayload):
 
 
 @dataclass
+class RunRecord:
+    """Records the provider/model config used for a single agent run."""
+
+    message_index: int
+    provider_name: str
+    model: str | None
+    mcp_servers: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ThreadMetadata:
     """Metadata for a conversation thread."""
 
@@ -322,6 +332,8 @@ class ThreadMetadata:
     message_count: int
     archived: bool
     local_id: str | None = None
+    # None means runs were not fetched (e.g. from list_threads); [] means fetched and empty.
+    runs: list[RunRecord] | None = None
 
 
 @dataclass
@@ -340,6 +352,40 @@ class ListThreadsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class ListThreadsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Thread listing failed. Common causes: storage error, permission error."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetThreadMetadataRequest(RequestPayload):
+    """Fetch full metadata for a single thread, including per-run provider/model info.
+
+    Use when: Opening a thread to display its message history and run details.
+
+    Args:
+        thread_id: ID of the thread to fetch.
+
+    Results: GetThreadMetadataResultSuccess | GetThreadMetadataResultFailure
+    """
+
+    thread_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetThreadMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Thread metadata retrieved successfully.
+
+    Args:
+        thread: Full thread metadata including per-run provider/model info.
+    """
+
+    thread: ThreadMetadata
+
+
+@dataclass
+@PayloadRegistry.register
+class GetThreadMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Thread metadata fetch failed. Common causes: thread not found, storage error."""
 
 
 @dataclass

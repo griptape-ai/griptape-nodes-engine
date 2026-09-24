@@ -10,6 +10,9 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 _LIBRARY_REGISTRY_CREATE_NODE_PATH = "griptape_nodes.retained_mode.managers.node_manager.LibraryRegistry.create_node"
@@ -31,11 +34,30 @@ def _make_mock_obj_mgr(existing_node: MagicMock | None = None) -> MagicMock:
     return mock_obj_mgr
 
 
-def _make_mock_library_manager(*, is_worker: bool) -> MagicMock:
+def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) -> MagicMock:
+    """A stub LibraryManager.
+
+    `library_loaded` matters because the worker-side failure path asks whether the library
+    actually LOADED before blaming the process for not starting. Left as a bare MagicMock, that
+    question answers with a truthy mock and every failure claims the process died -- so the state
+    is set explicitly here rather than left to mock defaults.
+    """
     lib_mgr = MagicMock()
     lib_mgr.is_worker = is_worker
     lib_mgr._is_worker = is_worker
     lib_mgr.get_worker_for_library.return_value = None
+    # The execute path awaits this before consulting get_worker_for_library, so a
+    # plain MagicMock attribute is not awaitable and fails the call.
+    if library_loaded:
+        lib_mgr.get_library_info_by_library_name.return_value.lifecycle_state = (
+            LibraryManager.LibraryLifecycleState.LOADED
+        )
+    else:
+        lib_mgr.get_library_info_by_library_name.return_value.lifecycle_state = (
+            LibraryManager.LibraryLifecycleState.EVALUATED
+        )
+        # The name the code actually calls; configuring the other one left the reason unexercised.
+        lib_mgr.get_collated_problems_for_library.return_value = "Dependency installation failed: no solution found"
     return lib_mgr
 
 
@@ -44,11 +66,22 @@ def _make_node_manager(
     object_manager: MagicMock | None = None,
     library_manager: MagicMock | None = None,
     worker_manager: MagicMock | None = None,
+    event_manager: EventManager | None = None,
 ) -> NodeManager:
-    """Build a NodeManager wired to a mock engine instead of the process-wide facade."""
+    """Build a NodeManager wired to a mock engine instead of the process-wide facade.
+
+    Pass a real `event_manager` to observe the node-execution scope; a mock one answers
+    `in_node_execution()` with a truthy mock whether the scope was opened or not.
+    """
     mock_engine = MagicMock()
     mock_engine.object_manager = object_manager
     mock_engine.library_manager = library_manager
+    if event_manager is not None:
+        mock_engine.event_manager = event_manager
+    # Engine always has a WorkerManager, so a test that leaves it None describes a shape the engine
+    # cannot be in. Routing awaits it, so it needs to be awaitable.
+    worker_manager = worker_manager or MagicMock()
+    worker_manager.wait_until_executable = AsyncMock()
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -103,6 +136,32 @@ class TestExecuteNodeOrchestratorPath:
         mock_obj_mgr.add_object_by_name.assert_not_called()
         mock_node.set_parameter_value.assert_called_once_with("input_param", "input_value")
         mock_node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_node_runs_inside_the_execution_scope(self) -> None:
+        """The scope is what holds a release hook back, so a node running here has to open it too.
+
+        An in-process library can hold an object a parallel node is using, and only the scope keeps a
+        "clear cache" node from freeing it mid-run.
+        """
+        event_manager = EventManager()
+        mock_node = _make_mock_node()
+        scope_open_during_run: list[bool] = []
+        mock_node.aprocess = AsyncMock(
+            side_effect=lambda: scope_open_during_run.append(event_manager.in_node_execution())
+        )
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=mock_node),
+            library_manager=_make_mock_library_manager(is_worker=False),
+            event_manager=event_manager,
+        )
+
+        request = ExecuteNodeRequest(node_name="test_node", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert scope_open_during_run == [True]
+        assert event_manager.in_node_execution() is False
 
     @pytest.mark.asyncio
     async def test_no_params(self) -> None:
@@ -329,9 +388,37 @@ class TestExecuteNodeWorkerPathStateless:
             result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
-        assert "test_node" in str(result.result_details)
-        assert "SomeNodeType" in str(result.result_details)
-        assert "library not loaded" in str(result.result_details)
+        details = str(result.result_details)
+        assert "test_node" in details
+        assert "SomeNodeType" in details
+        # The library itself is LOADED, so this is one broken node type -- not a library that
+        # could not start. The underlying error is the useful thing to report.
+        assert "library not loaded" in details
+        assert "could not start it up" not in details
+
+    @pytest.mark.asyncio
+    async def test_a_library_that_never_loaded_explains_itself_without_the_raw_error(self) -> None:
+        """When the worker could not load the library, say that -- and not "not found".
+
+        "Library 'X' not found" is what LibraryRegistry raises, and it is actively misleading
+        here: the orchestrator holds that library and is drawing its nodes, so it sends the reader
+        hunting for something that is right in front of them. The cause belongs in the log.
+        """
+        mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
+        lib_mgr = _make_mock_library_manager(is_worker=True, library_loaded=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, side_effect=RuntimeError("Library 'some_library' not found")):
+            request = ExecuteNodeRequest(
+                node_name="test_node",
+                node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
+            )
+            result = await node_manager.on_execute_node_request(request)
+
+        details = str(result.result_details)
+        assert "could not start it up" in details
+        assert "Editing the node still works" in details
+        assert "not found" not in details
 
 
 class TestExecuteNodeWorkerRoute:
@@ -386,6 +473,39 @@ class TestExecuteNodeWorkerRoute:
         wm.route_to_worker.assert_awaited_once()
         # The orchestrator stub must not have run aprocess; the worker did.
         mock_node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
+        """A retired worker must fail the node, not cancel it, and say why.
+
+        Letting the cancellation through would have the resolution machine reap it as CANCELED:
+        no NodeErrorEvent, one unnamed log line, and the node handed back UNRESOLVED with nothing
+        anywhere explaining it. The reason is authored by whoever retired the worker, so it has to
+        survive onto the result rather than being reconstructed here.
+        """
+        mock_node = self._make_mock_node()
+        mock_obj_mgr = self._make_mock_obj_mgr(existing_node=mock_node)
+
+        gone = WorkerGoneError("worker 'eng-id' stopped responding and was shut down")
+        wm = MagicMock()
+        wm.route_to_worker = AsyncMock(side_effect=gone)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
+
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "stopped responding and was shut down" in str(result.result_details)
+        # Rides on `exception` so the node-failure formatting can reach it.
+        assert result.exception is gone
 
     @pytest.mark.asyncio
     async def test_worker_failure_returns_failure(self) -> None:

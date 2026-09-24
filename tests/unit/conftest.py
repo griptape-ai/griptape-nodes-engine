@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
+from griptape_nodes.retained_mode.managers import settings as settings_module
 
 
 @pytest.fixture(autouse=True)
@@ -34,13 +35,17 @@ def isolate_user_config() -> Generator[Path, None, None]:
             reset_root_engine()
 
 
+@pytest.fixture(autouse=True)
+def reset_beta_feature_warnings() -> None:
+    """Forget which bad beta feature values were already warned about.
+
+    Settings warns once per (key, value) per process, so a test asserting on that warning would
+    otherwise fail whenever an earlier test in the same process hit the same value.
+    """
+    settings_module._reported_invalid_beta_features.clear()
+
+
 @pytest.fixture
 def engine() -> Engine:
     """Provide the engine for this test, building it on first use."""
-    return current_engine()
-
-
-@pytest.fixture
-def griptape_nodes() -> Engine:
-    """Alias of `engine`, named for the tests written against the old facade."""
     return current_engine()

@@ -433,6 +433,13 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
+        is_registered: Whether a library of this name is in the LibraryRegistry right now.
+                       Metadata is derived from config while the registry holds what actually
+                       loaded, so the two disagree until libraries reload. False means
+                       "declared but not loaded": show it as pending a refresh rather than
+                       following it with a name-keyed call (CheckLibraryUpdate,
+                       GetAllInfoForLibrary) that would fail. Keyed on name because those
+                       follow-up calls are name-keyed too.
     """
 
     library_schema: LibrarySchema
@@ -440,6 +447,7 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     git_remote: str | None
     git_ref: str | None
     enabled: bool
+    is_registered: bool
     registered_path: str | None = None
 
 

@@ -1,5 +1,6 @@
 """Unit tests for ProjectOutputParameter._get_upstream_destination."""
 
+from typing import Protocol, runtime_checkable
 from unittest import mock
 
 import pytest
@@ -8,8 +9,24 @@ from griptape_nodes.exe_types import core_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.retained_mode.events import connection_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.handle_request"
-OBJECT_MANAGER_PATH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ObjectManager"
+
+@runtime_checkable
+class _TestProvider(Protocol):
+    @property
+    def test_destination(self) -> object | None: ...
+
+
+class _ProviderNode:
+    def __init__(self, destination: object | None) -> None:
+        self._destination = destination
+
+    @property
+    def test_destination(self) -> object | None:
+        return self._destination
+
+
+class _PlainNode:
+    pass
 
 
 class _ConcreteParam(project_output_parameter.ProjectOutputParameter):
@@ -32,10 +49,22 @@ class _ConcreteParam(project_output_parameter.ProjectOutputParameter):
         return "str"
 
 
-def _make_param(param_name: str = "output") -> _ConcreteParam:
+def _make_param(
+    connections_result: connection_events.ListConnectionsForNodeResultSuccess
+    | connection_events.ListConnectionsForNodeResultFailure,
+    nodes_by_name: dict[str, object] | None = None,
+    param_name: str = "output",
+) -> _ConcreteParam:
     mock_node = mock.MagicMock()
     mock_node.name = "MyNode"
+    mock_node.engine.handle_request.return_value = connections_result
+    lookup = nodes_by_name or {}
+    mock_node.engine.object_manager.attempt_get_object_by_name.side_effect = lookup.get
     return _ConcreteParam(mock_node, param_name, default_value="default.txt", situation="save_node_output")
+
+
+def _get(param: _ConcreteParam) -> object | None:
+    return param._get_upstream_destination(_TestProvider, lambda p: p.test_destination, "TestDestination")
 
 
 def _make_connections_result(
@@ -61,125 +90,64 @@ def _make_connection(
 
 
 class TestGetUpstreamDestination:
-    """Tests for _get_upstream_destination, which finds an upstream provider via hasattr."""
+    """Tests for _get_upstream_destination, which finds an upstream node implementing a provider protocol."""
 
     def test_returns_none_when_list_connections_fails(self) -> None:
-        param = _make_param()
-        failure = connection_events.ListConnectionsForNodeResultFailure(result_details="error")
-
-        with mock.patch(HANDLE_REQUEST_PATH, return_value=failure):
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is None
+        param = _make_param(connection_events.ListConnectionsForNodeResultFailure(result_details="error"))
+        assert _get(param) is None
 
     def test_returns_none_when_no_incoming_connections(self) -> None:
-        param = _make_param()
-        success = _make_connections_result()
-
-        with mock.patch(HANDLE_REQUEST_PATH, return_value=success):
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is None
+        param = _make_param(_make_connections_result())
+        assert _get(param) is None
 
     def test_returns_none_when_connection_targets_different_parameter(self) -> None:
-        param = _make_param("output")
-        conn = _make_connection(target_param="other_param")
-        success = _make_connections_result(conn)
-        mock_source = mock.MagicMock(spec=[])  # no attributes
-
-        with (
-            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
-            mock.patch(OBJECT_MANAGER_PATH) as mock_om,
-        ):
-            mock_om.return_value.attempt_get_object_by_name.return_value = mock_source
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is None
+        param = _make_param(
+            _make_connections_result(_make_connection(target_param="other_param")),
+            {"UpstreamNode": _ProviderNode(object())},
+        )
+        assert _get(param) is None
 
     def test_returns_none_when_source_node_not_found(self) -> None:
-        param = _make_param()
-        conn = _make_connection(target_param="output")
-        success = _make_connections_result(conn)
+        param = _make_param(_make_connections_result(_make_connection(target_param="output")))
+        assert _get(param) is None
 
-        with (
-            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
-            mock.patch(OBJECT_MANAGER_PATH) as mock_om,
-        ):
-            mock_om.return_value.attempt_get_object_by_name.return_value = None
-            result = param._get_upstream_destination("test_destination", "TestDestination")
+    def test_returns_none_when_source_node_is_not_a_provider(self) -> None:
+        param = _make_param(
+            _make_connections_result(_make_connection(target_param="output")),
+            {"UpstreamNode": _PlainNode()},
+        )
+        assert _get(param) is None
 
-        assert result is None
+    def test_returns_destination_from_provider(self) -> None:
+        expected_dest = object()
+        param = _make_param(
+            _make_connections_result(_make_connection(target_param="output")),
+            {"UpstreamNode": _ProviderNode(expected_dest)},
+        )
+        assert _get(param) is expected_dest
 
-    def test_returns_none_when_source_node_lacks_attribute(self) -> None:
-        param = _make_param()
-        conn = _make_connection(target_param="output")
-        success = _make_connections_result(conn)
-        mock_source = mock.MagicMock(spec=[])  # no attributes at all
-
-        with (
-            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
-            mock.patch(OBJECT_MANAGER_PATH) as mock_om,
-        ):
-            mock_om.return_value.attempt_get_object_by_name.return_value = mock_source
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is None
-
-    def test_returns_destination_when_source_has_attribute(self) -> None:
-        param = _make_param()
-        conn = _make_connection(target_param="output")
-        success = _make_connections_result(conn)
-        expected_dest = mock.MagicMock()
-        mock_source = mock.MagicMock(spec=["test_destination"])
-        mock_source.test_destination = expected_dest
-
-        with (
-            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
-            mock.patch(OBJECT_MANAGER_PATH) as mock_om,
-        ):
-            mock_om.return_value.attempt_get_object_by_name.return_value = mock_source
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is expected_dest
-
-    def test_raises_when_provider_attribute_returns_none(self) -> None:
-        param = _make_param()
-        conn = _make_connection(target_param="output")
-        success = _make_connections_result(conn)
-        mock_source = mock.MagicMock(spec=["test_destination"])
-        mock_source.test_destination = None
-
-        with mock.patch(HANDLE_REQUEST_PATH, return_value=success), mock.patch(OBJECT_MANAGER_PATH) as mock_om:
-            mock_om.return_value.attempt_get_object_by_name.return_value = mock_source
-            with pytest.raises(ValueError, match="UpstreamNode"):
-                param._get_upstream_destination("test_destination", "TestDestination")
+    def test_raises_when_provider_returns_none(self) -> None:
+        param = _make_param(
+            _make_connections_result(_make_connection(target_param="output")),
+            {"UpstreamNode": _ProviderNode(None)},
+        )
+        with pytest.raises(ValueError, match="UpstreamNode"):
+            _get(param)
 
     def test_skips_non_provider_and_returns_provider_destination(self) -> None:
         """A non-provider connection followed by a provider: skips first, returns second."""
-        param = _make_param()
-        conn_non_provider = _make_connection(target_param="output", source_node="PlainNode")
-        conn_provider = _make_connection(target_param="output", source_node="ProviderNode")
-        success = _make_connections_result(conn_non_provider, conn_provider)
-
-        expected_dest = mock.MagicMock()
-        plain_source = mock.MagicMock(spec=[])  # no test_destination
-        provider_source = mock.MagicMock(spec=["test_destination"])
-        provider_source.test_destination = expected_dest
-
-        def get_node(name: str) -> mock.MagicMock:
-            return plain_source if name == "PlainNode" else provider_source
-
-        with (
-            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
-            mock.patch(OBJECT_MANAGER_PATH) as mock_om,
-        ):
-            mock_om.return_value.attempt_get_object_by_name.side_effect = get_node
-            result = param._get_upstream_destination("test_destination", "TestDestination")
-
-        assert result is expected_dest
+        expected_dest = object()
+        param = _make_param(
+            _make_connections_result(
+                _make_connection(target_param="output", source_node="PlainNode"),
+                _make_connection(target_param="output", source_node="ProviderNode"),
+            ),
+            {"PlainNode": _PlainNode(), "ProviderNode": _ProviderNode(expected_dest)},
+        )
+        assert _get(param) is expected_dest
 
     def test_allowed_modes_default(self) -> None:
-        param = _make_param()
+        param = _make_param(_make_connections_result())
         assert param._allowed_modes == {core_types.ParameterMode.INPUT, core_types.ParameterMode.PROPERTY}
 
     def test_custom_allowed_modes(self) -> None:

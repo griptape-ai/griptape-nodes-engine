@@ -5,14 +5,15 @@ DirectoryDestination. Falls back to a sensible default when no situation is conf
 """
 
 from griptape_nodes.common import macro_parser
-from griptape_nodes.common.project_templates import situation_resolver
+from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types import core_types, node_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import directory as directory_mod
+from griptape_nodes.files import situation_resolver
 from griptape_nodes.retained_mode.events import project_events
 from griptape_nodes.traits import file_system_picker
 
-_FALLBACK_DIRECTORY_MACRO = "{outputs}/{node_name?:_}{dir_name}_v{_index:03}"
+_FALLBACK_DIRECTORY_MACRO = "{outputs}/{sub_dirs?:/}{dir_name}_v{###}"
 
 
 class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter):
@@ -36,7 +37,7 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
         self.set_parameter_value("output_dir", directory.location)
     """
 
-    DEFAULT_SITUATION = "save_output_directory"
+    DEFAULT_SITUATION = situation_mod.BuiltInSituation.SAVE_OUTPUT_DIRECTORY
 
     def __init__(  # noqa: PLR0913
         self,
@@ -85,7 +86,7 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
     def build_directory(self, **extra_vars: str | int) -> directory_mod.DirectoryDestination:
         """Build a DirectoryDestination from the parameter's current value.
 
-        If an upstream node exposes a ``directory_destination`` attribute, its
+        If an upstream node implements ``DirectoryDestinationProvider``, its
         ``DirectoryDestination`` is retrieved directly. Otherwise the parameter's
         string value is used as the directory name, combined with the situation macro.
 
@@ -96,17 +97,18 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
             DirectoryDestination with a versioned MacroPath and baked-in policy.
 
         Raises:
-            ValueError: If an upstream node exposes ``directory_destination`` but returns None.
+            ValueError: If an upstream DirectoryDestinationProvider is connected but returns None.
         """
-        upstream = self._get_upstream_destination("directory_destination", "DirectoryDestination")
+        upstream = self._get_upstream_destination(
+            directory_mod.DirectoryDestinationProvider,
+            lambda provider: provider.directory_destination,
+            "DirectoryDestination",
+        )
         if upstream is not None:
-            return upstream  # type: ignore[return-value]
+            return upstream
 
         value = self._node.get_parameter_value(self._name)
         dirname = value if isinstance(value, str) and value else self._default_value
-
-        if "node_name" not in extra_vars:
-            extra_vars["node_name"] = self._node.name
 
         return _build_directory_destination_from_situation(dirname, self._situation_name, **extra_vars)
 

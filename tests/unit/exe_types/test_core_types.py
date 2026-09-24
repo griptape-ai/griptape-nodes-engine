@@ -131,6 +131,7 @@ class TestBaseNodeElement:
                             "settable": True,
                             "serializable": True,
                             "private": False,
+                            "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
                             "ui_options": {},
                             "parent_container_name": None,
@@ -229,6 +230,7 @@ class TestBaseNodeElement:
                             "settable": True,
                             "serializable": True,
                             "private": False,
+                            "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
                             "ui_options": {},
                             "parent_container_name": None,
@@ -327,6 +329,7 @@ class TestBaseNodeElement:
                             "settable": True,
                             "serializable": True,
                             "private": False,
+                            "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
                             "ui_options": {},
                             "parent_container_name": None,
@@ -475,10 +478,6 @@ class TestParameter:
         """A directly-attached converter observes the value after every trait has converted it."""
 
         class _Suffixer(Trait):
-            @classmethod
-            def get_trait_keys(cls) -> list[str]:
-                return ["suffixer"]
-
             def converters_for_trait(self) -> list[Callable[[Any], Any]]:
                 return [lambda value: f"{value}-trait"]
 

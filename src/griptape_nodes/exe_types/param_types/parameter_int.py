@@ -46,6 +46,7 @@ class ParameterInt(ParameterNumber):
         min_val: float | None = None,
         max_val: float | None = None,
         validate_min_max: bool = False,
+        soft_limits: bool = False,
         accept_any: bool = True,
         hide: bool | None = None,
         hide_label: bool = False,
@@ -58,6 +59,7 @@ class ParameterInt(ParameterNumber):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -82,6 +84,8 @@ class ParameterInt(ParameterNumber):
             min_val: Minimum value for constraints (None to disable constraints)
             max_val: Maximum value for constraints (None to disable constraints)
             validate_min_max: Whether to validate min/max with error
+            soft_limits: Whether the slider's min_val/max_val only size the slider track,
+                leaving out-of-range values acceptable. Requires slider=True.
             accept_any: Whether to accept any input type and convert to integer (default: True)
             hide: Whether to hide the entire parameter
             hide_label: Whether to hide the parameter label
@@ -94,6 +98,7 @@ class ParameterInt(ParameterNumber):
             serializable: Whether the parameter is serializable
             user_defined: Whether the parameter is user-defined
             private: Whether this parameter is private
+            exclude_from_metadata: Whether this parameter is excluded from plaintext sidecar and image metadata
             element_id: Element ID
             element_type: Element type
             parent_container_name: Name of parent container
@@ -120,6 +125,7 @@ class ParameterInt(ParameterNumber):
             min_val=min_val,
             max_val=max_val,
             validate_min_max=validate_min_max,
+            soft_limits=soft_limits,
             accept_any=accept_any,
             hide=hide,
             hide_label=hide_label,
@@ -132,6 +138,7 @@ class ParameterInt(ParameterNumber):
             serializable=serializable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
             parent_container_name=parent_container_name,

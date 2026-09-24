@@ -227,10 +227,8 @@ class SyncManager(EngineScoped):
             msg = f"Attempted to reach cloud storage. Failed because {MISSING_CREDENTIAL_MESSAGE}"
             raise RuntimeError(msg)
 
-        workspace_directory = self._config_manager.workspace_path
-
         return GriptapeCloudStorageDriver(
-            workspace_directory,
+            self._config_manager,
             bucket_id=bucket_id,
             base_url=base_url,
             api_key=api_key,

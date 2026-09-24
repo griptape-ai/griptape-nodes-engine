@@ -5,12 +5,11 @@ from typing import Any, Literal
 
 from griptape_nodes.exe_types.core_types import (
     BadgeData,
-    NodeMessageResult,
     Parameter,
     ParameterMode,
     Trait,
 )
-from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload, OnClickMessageResultPayload
+from griptape_nodes.traits.button import Button
 
 # Type aliases matching Button trait
 ButtonVariant = Literal["default", "secondary", "destructive", "outline", "ghost", "link"]
@@ -105,6 +104,7 @@ class ParameterButton(Parameter):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -150,6 +150,7 @@ class ParameterButton(Parameter):
             serializable: Whether the parameter is serializable
             user_defined: Whether the parameter is user-defined
             private: Whether this parameter is private
+            exclude_from_metadata: Whether this parameter is excluded from plaintext sidecar and image metadata
             element_id: Element ID
             element_type: Element type
             parent_container_name: Name of parent container
@@ -161,13 +162,6 @@ class ParameterButton(Parameter):
         else:
             ui_options = ui_options.copy()
 
-        # If href is provided but no on_click callback, create a simple callback that opens the link
-        final_on_click = on_click
-        if href is not None and on_click is None:
-            final_on_click = ParameterButton._create_href_callback(href)
-
-        # Create Button trait with all the button-specific options
-        # Label and value are separate - label is display text, value is stored data
         button_trait = Button(
             label=label,
             variant=variant,
@@ -181,16 +175,11 @@ class ParameterButton(Parameter):
             loading_icon=loading_icon,
             loading_icon_class=loading_icon_class,
             tooltip=tooltip,
-            on_click=final_on_click,
+            button_link=href,
             get_button_state=get_button_state,
         )
-
-        # Store href for property access
-        self._href = href
-
-        # Merge button UI options into parameter UI options
-        button_ui_options = button_trait.ui_options_for_trait()
-        ui_options.update(button_ui_options)
+        # A handler wins over href. Button's constructor rejects the pair, so attach it after.
+        button_trait.on_click_callback = on_click
 
         # Add button trait to traits set
         # Button is a Trait, so it can be added to the traits set
@@ -226,6 +215,7 @@ class ParameterButton(Parameter):
             serializable=serializable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
             parent_container_name=parent_container_name,
@@ -234,26 +224,6 @@ class ParameterButton(Parameter):
 
         # Store button trait reference for property access
         self._button_trait = button_trait
-
-    @staticmethod
-    def _create_href_callback(href: str) -> Button.OnClickCallback:
-        """Create a simple callback that opens a link when the button is clicked."""
-
-        def href_callback(
-            button: Button,  # noqa: ARG001
-            button_details: ButtonDetailsMessagePayload,
-        ) -> NodeMessageResult:
-            return NodeMessageResult(
-                success=True,
-                details=f"Opening link: {href}",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=href,
-                ),
-                altered_workflow_state=False,
-            )
-
-        return href_callback
 
     def _get_button_trait(self) -> Button:
         """Get the Button trait associated with this parameter."""
@@ -273,10 +243,9 @@ class ParameterButton(Parameter):
     @label.setter
     def label(self, value: str) -> None:
         """Set the button label (display text only - separate from parameter value)."""
-        # Update button trait (primary source of truth for display)
+        # Styling is trait-owned; report the change without storing rendered options.
         self._get_button_trait().label = value
-        # Update UI options
-        self.update_ui_options_key("button_label", value)
+        self.report_ui_options_change()
 
     @property
     def variant(self) -> ButtonVariant:
@@ -287,7 +256,7 @@ class ParameterButton(Parameter):
     def variant(self, value: ButtonVariant) -> None:
         """Set the button variant."""
         self._get_button_trait().variant = value
-        self.update_ui_options_key("variant", value)
+        self.report_ui_options_change()
 
     @property
     def size(self) -> ButtonSize:
@@ -298,7 +267,7 @@ class ParameterButton(Parameter):
     def size(self, value: ButtonSize) -> None:
         """Set the button size."""
         self._get_button_trait().size = value
-        self.update_ui_options_key("size", value)
+        self.report_ui_options_change()
 
     @property
     def state(self) -> ButtonState:
@@ -309,7 +278,7 @@ class ParameterButton(Parameter):
     def state(self, value: ButtonState) -> None:
         """Set the button state."""
         self._get_button_trait().state = value
-        self.update_ui_options_key("state", value)
+        self.report_ui_options_change()
 
     @property
     def icon(self) -> str | None:
@@ -320,12 +289,7 @@ class ParameterButton(Parameter):
     def icon(self, value: str | None) -> None:
         """Set the button icon."""
         self._get_button_trait().icon = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button_icon", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("button_icon", value)
+        self.report_ui_options_change()
 
     @property
     def icon_class(self) -> str | None:
@@ -336,12 +300,7 @@ class ParameterButton(Parameter):
     def icon_class(self, value: str | None) -> None:
         """Set the button icon class."""
         self._get_button_trait().icon_class = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("icon_class", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("icon_class", value)
+        self.report_ui_options_change()
 
     @property
     def icon_position(self) -> IconPosition | None:
@@ -352,12 +311,7 @@ class ParameterButton(Parameter):
     def icon_position(self, value: IconPosition | None) -> None:
         """Set the button icon position."""
         self._get_button_trait().icon_position = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("iconPosition", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("iconPosition", value)
+        self.report_ui_options_change()
 
     @property
     def full_width(self) -> bool:
@@ -368,7 +322,7 @@ class ParameterButton(Parameter):
     def full_width(self, value: bool) -> None:
         """Set whether the button is full width."""
         self._get_button_trait().full_width = value
-        self.update_ui_options_key("full_width", value)
+        self.report_ui_options_change()
 
     @property
     def loading_label(self) -> str | None:
@@ -379,12 +333,7 @@ class ParameterButton(Parameter):
     def loading_label(self, value: str | None) -> None:
         """Set the loading label."""
         self._get_button_trait().loading_label = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_label", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_label", value)
+        self.report_ui_options_change()
 
     @property
     def loading_icon(self) -> str | None:
@@ -395,12 +344,7 @@ class ParameterButton(Parameter):
     def loading_icon(self, value: str | None) -> None:
         """Set the loading icon."""
         self._get_button_trait().loading_icon = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_icon", value)
+        self.report_ui_options_change()
 
     @property
     def loading_icon_class(self) -> str | None:
@@ -411,12 +355,7 @@ class ParameterButton(Parameter):
     def loading_icon_class(self, value: str | None) -> None:
         """Set the loading icon class."""
         self._get_button_trait().loading_icon_class = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon_class", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_icon_class", value)
+        self.report_ui_options_change()
 
     @property
     def on_click_callback(self) -> Button.OnClickCallback | None:
@@ -441,18 +380,14 @@ class ParameterButton(Parameter):
     @property
     def href(self) -> str | None:
         """Get the href URL that will be opened when the button is clicked."""
-        return getattr(self, "_href", None)
+        return self._get_button_trait().button_link
 
     @href.setter
     def href(self, value: str | None) -> None:
         """Set the href URL to open when button is clicked.
 
-        This will replace any existing on_click callback with a simple link-opening callback.
+        Clears any ``on_click`` handler, since a handler wins over a link.
         """
-        self._href = value
-        if value is not None:
-            # Replace on_click callback with href callback
-            self.on_click_callback = ParameterButton._create_href_callback(value)
-        else:
-            # Clear the callback if href is removed
-            self.on_click_callback = None
+        trait = self._get_button_trait()
+        trait.on_click_callback = None
+        trait.button_link = value

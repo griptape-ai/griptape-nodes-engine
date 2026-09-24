@@ -3,13 +3,13 @@
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
     SerializedNodeCommands,
     SerializeNodeToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.node_manager import SerializedGroupResult
 from tests.unit.exe_types.mocks import MockNode
 
@@ -88,6 +88,7 @@ class TestSerializeGroupWithChildren:
         group: _ConcreteGroup,
         group_uuid: str,
         child_uuids: list[str],
+        engine: Engine,
     ) -> SerializedGroupResult:
         """Call _serialize_group_with_children with mocked on_serialize_node_to_commands."""
         group_result = _make_serialize_result(
@@ -100,7 +101,7 @@ class TestSerializeGroupWithChildren:
             _make_serialize_result(node_name=child_name, node_uuid=uuid)
             for child_name, uuid in zip(group.nodes.keys(), child_uuids, strict=True)
         ]
-        manager = GriptapeNodes().NodeManager()
+        manager = engine.node_manager
         with patch.object(
             manager,
             "on_serialize_node_to_commands",
@@ -110,7 +111,7 @@ class TestSerializeGroupWithChildren:
 
             return NodeManager._serialize_group_with_children(manager, group, {}, MagicMock())
 
-    def test_node_names_to_add_cleared_on_group_command(self) -> None:
+    def test_node_names_to_add_cleared_on_group_command(self, engine: Engine) -> None:
         """group_command.create_node_command.node_names_to_add is None after serialization.
 
         This prevents on_create_node_request from calling add_nodes_to_group on the original
@@ -119,12 +120,12 @@ class TestSerializeGroupWithChildren:
         group = _ConcreteGroup("MyGroup")
         group.add_nodes_to_group([MockNode("Child")])
 
-        result = self._run_serialize(group, "group-uuid-1", ["child-uuid-1"])
+        result = self._run_serialize(group, "group-uuid-1", ["child-uuid-1"], engine)
 
         assert result.group_command is not None
         assert result.group_command.create_node_command.node_names_to_add is None
 
-    def test_children_embed_parent_group_uuid_in_metadata(self) -> None:
+    def test_children_embed_parent_group_uuid_in_metadata(self, engine: Engine) -> None:
         """Each child command's metadata contains _parent_group_uuid == group's node_uuid.
 
         This allows on_deserialize_selected_nodes_from_commands to set parent_group_name on each
@@ -135,7 +136,7 @@ class TestSerializeGroupWithChildren:
 
         group_uuid = "group-uuid-abc"
         child_uuids = ["child-uuid-1", "child-uuid-2"]
-        result = self._run_serialize(group, group_uuid, child_uuids)
+        result = self._run_serialize(group, group_uuid, child_uuids, engine)
 
         assert len(result.child_commands) == len(child_uuids)
         for child_cmd in result.child_commands:
@@ -200,36 +201,36 @@ class TestCreateNodeWithUnresolvableParentGroup:
     a result, and the node — already registered — was left orphaned.
     """
 
-    def _bootstrap(self, griptape_nodes: GriptapeNodes) -> None:
+    def _bootstrap(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
-        griptape_nodes.ContextManager().push_workflow("parent_group_wf")
-        result = griptape_nodes.handle_request(
+        engine.context_manager.push_workflow("parent_group_wf")
+        result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="parent_group_flow", set_as_new_context=True)
         )
         assert isinstance(result, CreateFlowResultSuccess)
 
-    def test_missing_parent_group_still_returns_success(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_missing_parent_group_still_returns_success(self, engine: Engine) -> None:
         """A parent_group_name naming nothing is logged and skipped; creation still succeeds."""
-        self._bootstrap(griptape_nodes)
+        self._bootstrap(engine)
 
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateNodeRequest(node_type="Note", node_name="Orphan", parent_group_name="NoSuchGroup")
         )
 
         assert isinstance(result, CreateNodeResultSuccess), result
         assert result.parent_group_name is None
-        node = griptape_nodes.NodeManager().get_node_by_name(result.node_name)
+        node = engine.node_manager.get_node_by_name(result.node_name)
         assert node.parent_group is None
 
-    def test_parent_group_name_that_is_not_a_group_still_returns_success(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_parent_group_name_that_is_not_a_group_still_returns_success(self, engine: Engine) -> None:
         """Pointing parent_group_name at an ordinary node is refused without failing the create."""
-        self._bootstrap(griptape_nodes)
+        self._bootstrap(engine)
 
-        existing = griptape_nodes.handle_request(CreateNodeRequest(node_type="Note", node_name="PlainNode"))
+        existing = engine.handle_request(CreateNodeRequest(node_type="Note", node_name="PlainNode"))
         assert isinstance(existing, CreateNodeResultSuccess)
 
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateNodeRequest(node_type="Note", node_name="Orphan", parent_group_name=existing.node_name)
         )
 

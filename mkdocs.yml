@@ -88,6 +88,7 @@ plugins:
         Get started:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install Griptape Nodes via the Desktop app (recommended), a manual engine install, or license activation
+          - uninstalling.md: Fully remove Griptape Nodes — the Desktop app uninstaller, `gtn self uninstall`, and the workspace, caches, and model downloads left behind
           - architecture.md: Deployment architecture for the Griptape Cloud and on-premises models — components, trust boundaries, and what leaves your network
           - faq.md: Frequently asked questions
           - troubleshooting.md: Fixes for commonly encountered issues and states
@@ -110,6 +111,7 @@ plugins:
           - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
           - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
           - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
+          - guides/editor/beta_features.md: Turning experimental beta features on and off
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
@@ -181,14 +183,18 @@ plugins:
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - development/custom_nodes/passing_unserializable_values.md: Passing pipelines, tensors and other unserializable values between nodes across a worker process boundary
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
         Enterprise:
+          - enterprise/on_premises_quick_start.md: Step-by-step rollout of an on-premises deployment, from Cloud API key to activated workstations
           - enterprise/admin_dashboard.md: Manage license keys, access groups, and permission templates from the editor's admin interface
+          - enterprise/cedar_policies.md: Cedar reference for hand-written permission templates - checkpoints, resource attributes, context facts, annotations, examples
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
           - enterprise/using_the_admin_server.md: Activate the desktop app with a license through the Admin Server
+          - enterprise/disabling_app_updates.md: Turn off desktop app updates on a managed machine with a machine-level policy.json file
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node libraries:
@@ -212,7 +218,7 @@ extra:
     - icon: fontawesome/solid/house
       link: https://www.griptape.ai
     - icon: fontawesome/brands/discord
-      link: https://discord.gg/gnWRz88eym
+      link: https://discord.com/invite/rpWWNmgGv9
     - icon: fontawesome/brands/github
       link: https://github.com/griptape-ai/griptape-nodes-engine
 
@@ -259,6 +265,7 @@ nav:
   - Get Started:
       - Overview: index.md
       - Installation: installation.md
+      - Uninstalling: uninstalling.md
       - Architecture: architecture.md
       - Tutorials:
           - Overview: tutorials/index.md
@@ -281,6 +288,7 @@ nav:
           - Running Workflows: guides/editor/running_workflows.md
           - Media Viewers and Editors: guides/editor/media_editors.md
           - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
+          - Beta Features: guides/editor/beta_features.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
@@ -547,6 +555,7 @@ nav:
           - Best Practices and Error Handling: development/custom_nodes/error_handling.md
           - Authoring Libraries: development/custom_nodes/authoring_libraries.md
           - Advanced Libraries: development/custom_nodes/advanced_libraries.md
+          - Passing Unserializable Values: development/custom_nodes/passing_unserializable_values.md
           - Custom Widgets: development/custom_nodes/custom_widgets.md
           - Patterns and Examples: development/custom_nodes/examples.md
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
@@ -557,6 +566,9 @@ nav:
       - Command Line Interface: reference/command_line_interface.md
       - Configuration Reference: reference/configuration_reference.md
   - Enterprise:
+      - On-Premises Quick Start: enterprise/on_premises_quick_start.md
       - Admin Dashboard: enterprise/admin_dashboard.md
+      - Cedar Policies: enterprise/cedar_policies.md
       - Admin Server: enterprise/admin_server.md
       - Using the Admin Server: enterprise/using_the_admin_server.md
+      - Disabling App Updates: enterprise/disabling_app_updates.md

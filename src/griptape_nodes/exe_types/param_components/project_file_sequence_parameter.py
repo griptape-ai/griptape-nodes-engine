@@ -6,15 +6,13 @@ directory layout; falls back to a sensible default when no situation is configur
 """
 
 from griptape_nodes.common import macro_parser
-from griptape_nodes.common.project_templates import situation_resolver
+from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types import core_types, node_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
-from griptape_nodes.files import file_sequence, path_utils
+from griptape_nodes.files import file_sequence, path_utils, situation_resolver
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-_FALLBACK_SEQUENCE_MACRO = (
-    "{outputs}/{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_v{_index:03}_####.{file_extension}"
-)
+_FALLBACK_SEQUENCE_MACRO = "{outputs}/{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}"
 
 
 class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParameter):
@@ -44,7 +42,7 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
             self.set_parameter_value("output_sequence", seq.location)
     """
 
-    DEFAULT_SITUATION = "save_file_sequence"
+    DEFAULT_SITUATION = situation_mod.BuiltInSituation.SAVE_FILE_SEQUENCE
 
     def __init__(  # noqa: PLR0913
         self,
@@ -75,7 +73,7 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
 
     @property
     def _settings_source_param_name(self) -> str:
-        return "sequence_destination"
+        return "file_sequence_destination"
 
     @property
     def _parameter_output_type(self) -> str:
@@ -84,7 +82,7 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
     def build_sequence(self, **extra_vars: str | int) -> file_sequence.FileSequenceDestination:
         """Build a FileSequenceDestination from the parameter's current value.
 
-        If an upstream node exposes a ``file_sequence_destination`` attribute, its
+        If an upstream node implements ``FileSequenceDestinationProvider``, its
         ``FileSequenceDestination`` is retrieved directly. Otherwise the parameter's
         string value (filename or #### pattern) is parsed and combined with the
         situation macro.
@@ -96,18 +94,19 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
         Raises:
-            ValueError: If an upstream node exposes ``file_sequence_destination`` but returns None.
+            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
             FileSequenceError: If no available version index can be found.
         """
-        upstream = self._get_upstream_destination("file_sequence_destination", "FileSequenceDestination")
+        upstream = self._get_upstream_destination(
+            file_sequence.FileSequenceDestinationProvider,
+            lambda provider: provider.file_sequence_destination,
+            "FileSequenceDestination",
+        )
         if upstream is not None:
-            return upstream  # type: ignore[return-value]
+            return upstream
 
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
-
-        if "node_name" not in extra_vars:
-            extra_vars["node_name"] = self._node.name
 
         return _build_sequence_destination_from_situation(filename, self._situation_name, **extra_vars)
 

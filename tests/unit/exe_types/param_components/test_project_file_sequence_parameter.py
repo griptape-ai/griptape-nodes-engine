@@ -99,7 +99,7 @@ class TestBuildSequenceDestinationFromSituation:
         macro_path = mock_build.call_args.args[0]
         assert macro_path.variables["file_extension"] == "exr"
         assert "#" not in macro_path.variables["file_name_base"]
-        assert macro_path.variables["file_name_base"] == "frame_"
+        assert macro_path.variables["file_name_base"] == "frame"
 
     def test_plain_filename_stem_left_unmodified(self) -> None:
         """A filename with no token of its own passes its stem through unchanged."""

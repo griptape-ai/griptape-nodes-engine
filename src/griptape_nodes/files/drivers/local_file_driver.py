@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import anyio
+import anyio.to_thread
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 from griptape_nodes.files.path_utils import (
@@ -10,8 +11,10 @@ from griptape_nodes.files.path_utils import (
     normalize_path_for_platform,
     parse_file_uri,
     path_needs_expansion,
+    resolve_path_safely,
     sanitize_path_string,
 )
+from griptape_nodes.retained_mode.engine import current_engine
 
 
 class LocalFileDriver(BaseFileDriver):
@@ -21,7 +24,8 @@ class LocalFileDriver(BaseFileDriver):
     For writing files, use OSManager directly.
 
     This driver is automatically registered last (priority 100) as it matches all
-    absolute paths and file:// URIs (fallback driver).
+    absolute paths, workspace-relative paths, and file:// URIs (fallback driver).
+    Relative paths are anchored on the workspace directory, never the process CWD.
     """
 
     @property
@@ -51,11 +55,12 @@ class LocalFileDriver(BaseFileDriver):
     def _resolve_path(self, location: str) -> Path:
         """Resolve a location string to a local filesystem Path.
 
-        Handles file:// URI parsing, path sanitization, expansion, and
-        platform normalization.
+        Handles file:// URI parsing, path sanitization, expansion, anchoring of
+        relative paths on the workspace directory, and platform normalization.
 
         Args:
-            location: Absolute file path, file:// URI, or path with ~
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             Resolved Path object
@@ -84,6 +89,13 @@ class LocalFileDriver(BaseFileDriver):
         else:
             path = Path(clean_location)
 
+        # Anchor a relative path on the workspace directory. Mirrors File.resolve()
+        # logic so reported path matches opened path.
+        if not path.is_absolute():
+            workspace_path = current_engine().config_manager.workspace_path
+            # Normalise joined path without evaluating symlinks en route.
+            path = resolve_path_safely(workspace_path / path)
+
         # Normalize for platform (Windows long paths, etc.)
         return Path(normalize_path_for_platform(path))
 
@@ -91,19 +103,33 @@ class LocalFileDriver(BaseFileDriver):
         """Read file from local filesystem with validation.
 
         Args:
-            location: Absolute file path, file:// URI, or path with ~
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
             timeout: Ignored for local files
 
         Returns:
             File contents as bytes
 
         Raises:
-            FileNotFoundError: File does not exist
+            FileNotFoundError: File does not exist, or (for a UNC path) the host
+                could not be reached
             IsADirectoryError: Path is a directory
             PermissionError: No read permission
             ValueError: Invalid file:// URI
         """
-        path = anyio.Path(self._resolve_path(location))
+        # Resolving a UNC path can trigger real DNS/NetBIOS/SMB negotiation, which would
+        # block the event loop if run inline. Offload to a thread to keep this async.
+        try:
+            resolved_path = await anyio.to_thread.run_sync(self._resolve_path, location)
+        except OSError as e:
+            # An unreachable UNC host (e.g. WinError 53/67) surfaces from Path.resolve()
+            # as a raw OSError rather than our own FileNotFoundError; normalize it so
+            # callers see the same "not found" contract regardless of the host being local
+            # or a network share that failed to respond.
+            msg = f"File not found: {location}"
+            raise FileNotFoundError(msg) from e
+
+        path = anyio.Path(resolved_path)
 
         if not await path.exists():
             msg = f"File not found: {location}"
@@ -119,14 +145,20 @@ class LocalFileDriver(BaseFileDriver):
         """Check if file exists on local filesystem.
 
         Args:
-            location: Absolute file path or file:// URI
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             True if file exists and is a file (not directory)
         """
         try:
-            path = anyio.Path(self._resolve_path(location))
-        except ValueError:
+            # Same rationale as read(): keep UNC resolution off the event loop.
+            resolved_path = await anyio.to_thread.run_sync(self._resolve_path, location)
+            path = anyio.Path(resolved_path)
+        except (ValueError, OSError):
+            # ValueError: invalid file:// URI. OSError: an unreachable UNC host failed
+            # to resolve (e.g. WinError 53/67) -- either way, exists() reports False
+            # rather than raising, matching its "never raises" contract.
             return False
 
         return await path.exists() and await path.is_file()
@@ -135,17 +167,24 @@ class LocalFileDriver(BaseFileDriver):
         """Get file size from local filesystem.
 
         Args:
-            location: Absolute file path or file:// URI
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             File size in bytes
 
         Raises:
-            FileNotFoundError: File does not exist
+            FileNotFoundError: File does not exist, or (for a UNC path) the host
+                could not be reached
             IsADirectoryError: Path is a directory
             ValueError: Invalid file:// URI
         """
-        path = self._resolve_path(location)
+        try:
+            path = self._resolve_path(location)
+        except OSError as e:
+            # See read() for why an unreachable UNC host is normalized to FileNotFoundError.
+            msg = f"File not found: {location}"
+            raise FileNotFoundError(msg) from e
 
         if not path.exists():
             msg = f"File not found: {location}"

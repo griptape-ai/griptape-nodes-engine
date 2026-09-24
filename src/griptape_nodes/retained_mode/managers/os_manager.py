@@ -2,9 +2,11 @@ import asyncio
 import base64
 import contextlib
 import ctypes
+import errno
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -22,6 +24,7 @@ from fileseq.exceptions import FileSeqException
 from rich.console import Console
 
 from griptape_nodes.common.macro_parser import (
+    SEQUENCE_VARIABLE_NAME,
     MacroResolutionError,
     MacroResolutionFailure,
     MacroSyntaxError,
@@ -152,6 +155,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
+from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 console = Console()
@@ -164,6 +168,14 @@ MAX_INDEXED_CANDIDATES = 1000
 # string before truncating the rest with "(+N more)". Larger lists overwhelm
 # the artist's status panel; the full list lives on `missing_item_numbers`.
 ABORTED_AT_GAP_PREVIEW_COUNT = 5
+
+# Placeholder bound to the index slot while GetNextVersionIndexRequest resolves the rest of
+# a macro through the project. Picked to be a digit run that never shows up in a real path,
+# so its rendered form can be located in the resolved string and swapped back for the slot.
+VERSION_INDEX_SENTINEL = 918273645
+
+# Matches one `{...}` variable group in a macro template.
+MACRO_VARIABLE_GROUP_PATTERN = re.compile(r"\{[^{}]*\}")
 
 
 @dataclass
@@ -543,7 +555,9 @@ class OSManager(EngineScoped):
             path_str: Path string that may contain ~, environment variables, or special folder names
 
         Returns:
-            Expanded Path object
+            Expanded, absolute Path object. A result that is still relative after expansion is
+            anchored on the workspace directory. Windows special folders resolve to their
+            actual system paths (e.g. OneDrive redirection).
         """
         resolved = None
         if self.is_windows():
@@ -562,17 +576,25 @@ class OSManager(EngineScoped):
             expanded_user = os.path.expanduser(expanded_vars)  # noqa: PTH111
             final_path = Path(expanded_user)
 
+        # Anchor a relative expansion result on the workspace directory. Expansion leaves a
+        # path relative when the string contains '%' or '$' but no resolvable variable
+        # (e.g. "foo%20bar.txt", "report$.txt", "$UNSET_VAR/sub").
+        if not final_path.is_absolute():
+            final_path = self._get_workspace_path() / final_path
+
         return resolve_path_safely(final_path)
 
     def _resolve_file_path(self, path_str: str, *, workspace_only: bool = False) -> Path:
         """Resolve a file path, handling absolute, relative, and tilde paths.
 
         Args:
-            path_str: Path string that may be absolute, relative, or start with ~
+            path_str: Path string that may be absolute, start with ~, or be a path relative
+                to the workspace directory
             workspace_only: If True and path is invalid, fall back to workspace directory
 
         Returns:
-            Resolved Path object
+            Absolute, resolved Path object. Relative paths resolve against the workspace
+            directory.
         """
         try:
             if path_needs_expansion(path_str):
@@ -876,6 +898,70 @@ class OSManager(EngineScoped):
     # ============================================================================
     # CREATE_NEW File Collision Policy - Helper Methods
     # ============================================================================
+
+    def _bind_project_variables_for_index_scan(self, macro_path: MacroPath) -> MacroPath:
+        """Bake project directories and builtins into a macro so only its `{_index}` slot is left open.
+
+        Callers such as `DirectoryDestination` and `build_versioned_sequence_destination` pass
+        project macros like `{outputs}/renders_v{###}` without binding `{outputs}`. The index
+        scan only sees caller variables, so it would find two unresolved variables and fail.
+
+        The macro is resolved through `GetPathForMacroRequest` with a sentinel number in the
+        index slot. The sentinel's rendered text is then swapped back for the original slot
+        text, giving an absolute template such as `/project/outputs/renders_v{###}`.
+
+        Args:
+            macro_path: MacroPath whose template contains an unresolved `{_index}` slot.
+
+        Returns:
+            A MacroPath with only the index slot unresolved. Returns `macro_path` unchanged
+            when project resolution fails or the slot cannot be located, so callers that
+            bind every variable themselves keep their current behavior.
+        """
+        template = macro_path.parsed_macro.template
+        if SEQUENCE_VARIABLE_NAME in macro_path.variables:
+            return macro_path
+
+        slot_groups = [
+            group
+            for group in MACRO_VARIABLE_GROUP_PATTERN.findall(template)
+            if self._is_single_variable_group(group, SEQUENCE_VARIABLE_NAME)
+        ]
+        if not slot_groups:
+            return macro_path
+
+        sentinel_vars: MacroVariables = {SEQUENCE_VARIABLE_NAME: VERSION_INDEX_SENTINEL}
+        rendered_slots = [ParsedMacro(group).resolve(sentinel_vars) for group in slot_groups]
+
+        result = self.engine.handle_request(
+            GetPathForMacroRequest(
+                parsed_macro=macro_path.parsed_macro,
+                variables={**macro_path.variables, **sentinel_vars},
+                failure_log_level=logging.DEBUG,
+            )
+        )
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            return macro_path
+
+        resolved = canonicalize_to_posix(result.absolute_path)
+        pieces: list[str] = []
+        cursor = 0
+        for group, rendered in zip(slot_groups, rendered_slots, strict=True):
+            position = resolved.find(rendered, cursor)
+            if position == -1:
+                return macro_path
+            pieces.append(resolved[cursor:position])
+            pieces.append(group)
+            cursor = position + len(rendered)
+        pieces.append(resolved[cursor:])
+
+        # A resolved path containing literal braces cannot be re-parsed as a macro.
+        try:
+            bound_macro = ParsedMacro("".join(pieces))
+        except MacroSyntaxError:
+            return macro_path
+
+        return MacroPath(parsed_macro=bound_macro, variables={})
 
     def _identify_index_variable(self, parsed_macro: ParsedMacro, variables: MacroVariables) -> ParsedVariable | None:
         """Identify which variable should be used for auto-incrementing.
@@ -1361,7 +1447,23 @@ class OSManager(EngineScoped):
 
     @staticmethod
     def platform() -> str:
+        """Get `sys.platform` as-is, spellings and all ("win32", "darwin", "linux").
+
+        For a value collapsed onto the platforms we support, use `platform_name()`.
+        """
         return sys.platform
+
+    @staticmethod
+    def _is_single_variable_group(group: str, variable_name: str) -> bool:
+        """Return True if a `{...}` template group parses to exactly one variable named `variable_name`."""
+        try:
+            parsed = ParsedMacro(group)
+        except MacroSyntaxError:
+            return False
+        variables = parsed.get_variables()
+        if len(variables) != 1:
+            return False
+        return next(iter(variables)).name == variable_name
 
     @staticmethod
     def is_windows() -> bool:
@@ -1374,6 +1476,23 @@ class OSManager(EngineScoped):
     @staticmethod
     def is_linux() -> bool:
         return os_utils.is_linux()
+
+    @staticmethod
+    def platform_name() -> str:
+        """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
+
+        Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
+        platforms we support -- "win32" reports as "windows", "linux" and "linux2" both as
+        "linux". A platform we do not recognize falls back to `sys.platform`, which is always
+        set, so the result is never empty.
+        """
+        if OSManager.is_windows():
+            return Platform.WINDOWS
+        if OSManager.is_mac():
+            return Platform.DARWIN
+        if OSManager.is_linux():
+            return Platform.LINUX
+        return sys.platform
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1442,7 +1561,7 @@ class OSManager(EngineScoped):
         logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
-            platform_name = sys.platform
+            raw_platform = sys.platform
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
@@ -1484,7 +1603,7 @@ class OSManager(EngineScoped):
                 )
                 logger.info("Opened path on Linux: %s", path)
             else:
-                details = f"Unsupported platform: '{platform_name}'"
+                details = f"Unsupported platform: '{raw_platform}'"
                 logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
@@ -1902,6 +2021,7 @@ class OSManager(EngineScoped):
                 scan_sequences,
                 mapping,
                 mapping.filename_pattern,
+                engine=self.engine,
                 policy=request.policy,
                 no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
@@ -2306,8 +2426,9 @@ class OSManager(EngineScoped):
 
     def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
         """Handle a request to find the next available version index via a single glob pass."""
-        parsed_macro = request.macro_path.parsed_macro
-        variables = request.macro_path.variables
+        scan_macro_path = self._bind_project_variables_for_index_scan(request.macro_path)
+        parsed_macro = scan_macro_path.parsed_macro
+        variables = scan_macro_path.variables
 
         try:
             index_info = self._identify_index_variable(parsed_macro, variables)
@@ -2503,16 +2624,37 @@ class OSManager(EngineScoped):
                 else:
                     mode = "a" if request.append else "w"  # Append or overwrite
 
-                # Perform the write operation using helper
-                result = self._attempt_file_write(
-                    normalized_path=Path(normalized_path),
-                    content=content,
-                    encoding=request.encoding,
-                    mode=mode,
-                    file_path_display=file_path,
-                    fail_if_file_exists=True,  # FAIL policy always fails on file exists
-                    fail_if_file_locked=True,
-                )
+                if mode == "w":
+                    # Whole-file overwrites go through a sibling temp file + rename
+                    # instead of truncating in place, so a concurrent reader (e.g. the
+                    # static server streaming a preview to a browser) never observes a
+                    # zero-length or partially-written destination. The rename replaces
+                    # portalocker as the concurrency mechanism here: concurrent
+                    # overwrites are last-rename-wins, and writer interleaving is
+                    # impossible because each writer fills a private sibling.
+                    result = self._attempt_atomic_file_write(
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        file_path_display=file_path,
+                    )
+                else:
+                    # The other modes cannot use rename semantics and keep the
+                    # portalocker-locked in-place write: append ("a") mutates the
+                    # existing file, so writer mutual exclusion is the only thing
+                    # keeping two appenders from interleaving; exclusive create ("x",
+                    # the FAIL policy) gets its atomicity from O_EXCL, and its
+                    # FileExistsError signal plus the debris cleanup around it are
+                    # load-bearing for the CREATE_NEW candidate walk.
+                    result = self._attempt_file_write(
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        mode=mode,
+                        file_path_display=file_path,
+                        fail_if_file_exists=True,  # FAIL policy always fails on file exists
+                        fail_if_file_locked=True,
+                    )
                 if result.failure_reason is not None:
                     # error_message is guaranteed to be set when failure_reason is set
                     return WriteFileResultFailure(
@@ -2781,7 +2923,7 @@ class OSManager(EngineScoped):
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata)
+            write_sidecar(final_file_path, request.file_metadata, self.engine)
 
         if used_indexed_fallback:
             msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"
@@ -3105,6 +3247,108 @@ class OSManager(EngineScoped):
             return FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
         return None
+
+    def _attempt_atomic_file_write(  # noqa: PLR0911
+        self,
+        normalized_path: Path,
+        content: str | bytes,
+        encoding: str,
+        file_path_display: str | Path,
+    ) -> FileWriteAttemptResult:
+        """Overwrite a file atomically via ``atomic_write_bytes``, mapping errors.
+
+        The destination holds either its prior content or the full new content —
+        readers never see a truncated file, and a failed write (including disk
+        full) leaves the previous file intact instead of destroying it first the
+        way an in-place truncate does.
+
+        Args:
+            normalized_path: The normalized destination path
+            content: Content to write (str or bytes)
+            encoding: Encoding for text content
+            file_path_display: Path to use in error messages
+
+        Returns:
+            FileWriteAttemptResult with either bytes_written set (success) or
+            failure_reason and error_message set (failure). Never returns the
+            continue signal — overwrites have no fallback candidates.
+        """
+        if isinstance(content, bytes):
+            data = content
+        else:
+            # Text mode translates every "\n" to os.linesep ("\r\n" on Windows);
+            # this path writes raw bytes, so translate here or every text save
+            # on Windows lands with bare LF.
+            if os.linesep != "\n":
+                content = content.replace("\n", os.linesep)
+            try:
+                data = content.encode(encoding)
+            except UnicodeEncodeError as e:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the text could not be encoded as {encoding}: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.ENCODING_ERROR,
+                    error_message=msg,
+                )
+
+        try:
+            atomic_write_bytes(normalized_path, data)
+        except IsADirectoryError as e:
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to path is a directory: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IS_DIRECTORY,
+                error_message=msg,
+            )
+        except PermissionError as e:
+            # On Windows, renaming onto a destination that another process holds
+            # open (without FILE_SHARE_DELETE) raises PermissionError. That is
+            # contention, not a permissions problem — retrying after the reader
+            # closes succeeds — so report it as a lock. Classify off the error's
+            # own winerror (sharing/lock violation) rather than probing the
+            # filesystem afterward, which could observe a different state than
+            # the one that caused the failure. winerror is None off-Windows.
+            windows_contention_codes = (32, 33)  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            if getattr(e, "winerror", None) in windows_contention_codes:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the file is in use by another process: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.FILE_LOCKED,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to permission denied: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                error_message=msg,
+            )
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                # The swap needs the old and new file to coexist briefly, so a
+                # nearly-full volume fails here — cleanly, with the previous
+                # file untouched. Say so in terms an artist can act on.
+                msg = (
+                    f"Attempted to write to file '{file_path_display}'. "
+                    f"Failed because the disk holding it is full. The previous version of the file was left unchanged. "
+                    f"Free up space on that drive and try again."
+                )
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.DISK_FULL,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to I/O error: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IO_ERROR,
+                error_message=msg,
+            )
+
+        return FileWriteAttemptResult(
+            bytes_written=len(data),
+            failure_reason=None,
+            error_message=None,
+        )
 
     def _attempt_file_write(  # noqa: PLR0911, PLR0913
         self,
@@ -4020,8 +4264,12 @@ class OSManager(EngineScoped):
         # Get file information
         try:
             is_dir = resolved_path.is_dir()
-            size = 0 if is_dir else resolved_path.stat().st_size
-            modified_time = resolved_path.stat().st_mtime
+            # One stat() call for both fields: two calls can straddle a concurrent
+            # replace and pair one file's size with another's mtime, poisoning the
+            # preview staleness check that compares both against recorded values.
+            stat_result = resolved_path.stat()
+            size = 0 if is_dir else stat_result.st_size
+            modified_time = stat_result.st_mtime
 
             # Get MIME type for files only
             mime_type = None
@@ -4366,7 +4614,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance_direct(self) -> None:
         """Create system OS instance (direct version for init)."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4453,7 +4701,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance(self) -> None:
         """Create system OS instance."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4584,19 +4832,9 @@ class OSManager(EngineScoped):
         logger.debug("MPS detected: Apple Silicon Mac")
         return True
 
-    def _get_platform_name(self) -> str:
-        """Get platform name using existing sys.platform detection."""
-        if self.is_windows():
-            return Platform.WINDOWS
-        if self.is_mac():
-            return Platform.DARWIN
-        if self.is_linux():
-            return Platform.LINUX
-        return sys.platform
-
     def _get_architecture(self) -> str:
         """Get system architecture, normalized across platforms."""
-        platform = self._get_platform_name()
+        platform = self.platform_name()
         if platform == Platform.WINDOWS:
             arch = os.environ.get("PROCESSOR_ARCHITECTURE", "unknown").lower()
         else:

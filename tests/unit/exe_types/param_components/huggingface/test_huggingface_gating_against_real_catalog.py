@@ -42,6 +42,8 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from griptape_nodes.retained_mode.engine import Engine
+
 _LIBRARY_NAME = "hf-gating-real-catalog-test-library"
 _MODULE = "griptape_nodes.exe_types.param_components.huggingface"
 
@@ -193,13 +195,13 @@ def _deny_denied_provider(checkpoint: AuthorizationCheckpoint) -> CheckpointDeni
 
 
 @pytest.fixture
-def denying_policy(griptape_nodes) -> Iterator[None]:  # noqa: ANN001
+def denying_policy(engine: Engine) -> Iterator[None]:
     """Install the real deny hook for the duration of a test."""
-    griptape_nodes.EventManager().add_authorization_hook(_deny_denied_provider)
+    engine.event_manager.add_authorization_hook(_deny_denied_provider)
     try:
         yield
     finally:
-        griptape_nodes.EventManager().remove_authorization_hook(_deny_denied_provider)
+        engine.event_manager.remove_authorization_hook(_deny_denied_provider)
 
 
 class TestRealCatalogResolution:

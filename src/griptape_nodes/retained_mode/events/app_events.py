@@ -119,11 +119,8 @@ class AppInitializationComplete(AppPayload):
     # taken from the first entry in libraries_to_register. Multiple workers can run
     # simultaneously for different libraries.
     is_worker: bool = False
-    # URL of a static file server the host process already runs for this workspace. When set,
-    # the engine points its storage drivers at that server instead of starting one of its own,
-    # so asset URLs outlive this engine. Leave unset when the host serves nothing: the engine
-    # then serves the workspace itself, which is the path that goes away once every shipped
-    # host provides a server (see the fallback in StaticFilesManager).
+    # URL of the static file server the host process runs for this workspace. The engine serves
+    # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
 
 
@@ -234,6 +231,7 @@ class WorkerParameterSchema:
     settable: bool
     serializable: bool
     private: bool
+    exclude_from_metadata: bool
     ui_options: dict | None
 
 
@@ -318,9 +316,10 @@ class CurrentProjectChanged(AppPayload):
     orchestrator's project even on a "shallow" switch (same workspace and
     library config) that would not otherwise restart them.
 
-    Boot-time activation is handled separately: a worker boots like any engine
-    and re-derives the orchestrator's project from shared on-disk config, so
-    ProjectManager only emits this after _initialization_complete.
+    Emitted on every successful activation that changed the project, including
+    during boot: boot activations precede worker spawn, so those emissions fan
+    out to zero workers, and a worker registering into that window is sent its
+    first activation by the registration handler.
 
     Args:
         project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
@@ -445,6 +444,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         workflow_file_path: Path to workflow file (None if none)
         has_active_flow: Whether there's an active flow running
         engine_name: Human-readable engine name
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
         orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
@@ -477,6 +477,14 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # (worker <=> orchestrator_engine_id is not None) and to nest it under its parent.
     # Defaulted for backward compatibility with older clients.
     orchestrator_engine_id: str | None = None
+    # Operating system the engine process is running on, so a client can tell apart several
+    # local engines connected from different machines. Same vocabulary as
+    # GetWorkflowRunCommandResultSuccess.engine_os -- a Platform value ("windows", "darwin",
+    # "linux") for the client to map to a label and icon, not a name to show as-is. An
+    # unrecognized platform falls back to `sys.platform`, so the set is open. A live engine
+    # always fills this in, so the "" default means the heartbeat came from an engine too old
+    # to report it -- a client should show nothing rather than guess.
+    engine_os: str = ""
 
 
 @dataclass

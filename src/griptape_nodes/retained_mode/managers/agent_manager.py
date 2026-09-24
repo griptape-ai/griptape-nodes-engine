@@ -28,7 +28,7 @@ import threading
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -38,7 +38,11 @@ from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
-from griptape_nodes.agents.pydantic_ai.mcp_servers import mcp_server_from_config, streamable_http_local
+from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
+    MCPToolsetCache,
+    MCPToolsetLease,
+)
 from griptape_nodes.agents.pydantic_ai.runner import (
     DEFAULT_SKILLS_DIRECTORY,
     PydanticAgentRunner,
@@ -97,6 +101,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetConversationMemoryRequest,
     GetConversationMemoryResultFailure,
     GetConversationMemoryResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -116,6 +123,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
+    RunRecord,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
@@ -135,6 +143,8 @@ from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
@@ -191,6 +201,22 @@ _IMAGE_TOOL_INSTRUCTION = (
 def _build_agent_instructions(*, include_image_tool: bool) -> str:
     image_tool_line = _IMAGE_TOOL_INSTRUCTION if include_image_tool else ""
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
+
+
+def _compose_server_rules(configs: Sequence[Mapping[str, Any]]) -> str:
+    """Collect the per-server guidance for the MCP servers attached to one run.
+
+    Composed per run rather than baked into the agent so editing a server's
+    rules changes what the model is told on the very next message. Pydantic AI
+    appends run-level instructions to the agent's own, so the result reads the
+    same as when these were concatenated at construction time.
+    """
+    parts = [
+        f"Rules for MCP server '{config['name']}':\n{config['rules'].strip()}"
+        for config in configs
+        if isinstance(config.get("rules"), str) and config["rules"].strip()
+    ]
+    return "\n\n".join(parts)
 
 
 def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
@@ -323,6 +349,34 @@ class _ActiveRun:
     loop: asyncio.AbstractEventLoop
 
 
+class _RunnerCacheKey(NamedTuple):
+    """Everything baked into an agent at construction time.
+
+    MCP servers are deliberately absent: they are attached per run from
+    :class:`MCPToolsetCache`, so two runs differing only in which servers they
+    use share one agent - and one conversation-shaped agent no longer has to be
+    rebuilt when a server's config changes.
+    """
+
+    provider_type: str
+    model_name: str
+    image_model_name: str
+    base_url: str
+    api_key: str
+
+
+@dataclass
+class _MCPAttachment:
+    """The MCP toolsets and guidance to attach to a single agent run.
+
+    ``lease`` must be released once the run is done - use it as an async context
+    manager - or the servers it names can never be torn down.
+    """
+
+    lease: MCPToolsetLease
+    instructions: str
+
+
 @dataclass
 class _RehydratedMessage:
     """A history message copy plus how many of its images were re-inlined.
@@ -362,8 +416,13 @@ class AgentManager(EngineScoped):
             self._threads_dir, config_manager, secrets_manager
         )
 
-        # Cache one runner per (provider-type, model, image-model, base-url, api-key, mcp-set).
-        self._runner_cache: dict[tuple[str, str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
+        # Cache one runner per model identity; see `_RunnerCacheKey`.
+        self._runner_cache: dict[_RunnerCacheKey, PydanticAgentRunner] = {}
+
+        # Live MCP toolsets, shared by every runner and rebuilt per server when
+        # that server's config changes. Held here rather than on a runner so
+        # clearing `_runner_cache` cannot orphan a running MCP subprocess.
+        self._mcp_toolsets = MCPToolsetCache()
 
         # Cancel handles for in-flight runs, keyed by thread_id.
         self._active_runs: dict[str, _ActiveRun] = {}
@@ -376,6 +435,9 @@ class AgentManager(EngineScoped):
                 GetConversationMemoryRequest, self.on_handle_get_conversation_memory_request
             )
             event_manager.assign_manager_to_request_type(CreateThreadRequest, self.on_handle_create_thread_request)
+            event_manager.assign_manager_to_request_type(
+                GetThreadMetadataRequest, self.on_handle_get_thread_metadata_request
+            )
             event_manager.assign_manager_to_request_type(ListThreadsRequest, self.on_handle_list_threads_request)
             event_manager.assign_manager_to_request_type(DeleteThreadRequest, self.on_handle_delete_thread_request)
             event_manager.assign_manager_to_request_type(RenameThreadRequest, self.on_handle_rename_thread_request)
@@ -472,7 +534,6 @@ class AgentManager(EngineScoped):
         is_first_run = len(self._thread_storage.load_history(thread_id)) == 0
 
         runner = self._build_runner(
-            request.additional_mcp_servers,
             provider_name=request.provider_name,
             model_name=request.model_name,
         )
@@ -493,14 +554,20 @@ class AgentManager(EngineScoped):
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
         try:
-            result = await runner.run(
-                composed.live,
-                thread_id=thread_id,
-                event_sink=emit,
-                cancel_event=cancel_event,
-                persist_prompt=composed.persist,
-                history_rehydrator=_rehydrate_history,
-            )
+            # Nothing may sit between this and the `async with` that releases
+            # it: a server left with a stray use count is never shut down.
+            mcp = await self._acquire_mcp_toolsets(request.additional_mcp_servers)
+            async with mcp.lease:
+                result = await runner.run(
+                    composed.live,
+                    thread_id=thread_id,
+                    event_sink=emit,
+                    cancel_event=cancel_event,
+                    persist_prompt=composed.persist,
+                    history_rehydrator=_rehydrate_history,
+                    extra_toolsets=mcp.lease.toolsets,
+                    extra_instructions=mcp.instructions,
+                )
         finally:
             # Only drop our own entry; a newer run for the same thread may have
             # replaced it (shouldn't happen for the chat sidebar, but stay safe).
@@ -513,6 +580,18 @@ class AgentManager(EngineScoped):
         if is_first_run:
             self._thread_storage.update_thread_metadata(
                 result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
+            )
+        # A cancelled run persists nothing, so there is no response to record.
+        if not result.cancelled:
+            resolved_provider = self._get_provider(request.provider_name)
+            self._thread_storage.append_run_record(
+                result.thread_id,
+                RunRecord(
+                    message_index=result.message_count - 1,
+                    provider_name=resolved_provider.name,
+                    model=request.model_name or resolved_provider.model,
+                    mcp_servers=request.additional_mcp_servers or [],
+                ),
             )
 
         if result.cancelled:
@@ -604,6 +683,22 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return CreateThreadResultFailure(result_details=details)
 
+    def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
+        try:
+            if not self._thread_storage.thread_exists(request.thread_id):
+                details = f"Thread {request.thread_id} not found"
+                logger.error(details)
+                return GetThreadMetadataResultFailure(result_details=details)
+
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
+            return GetThreadMetadataResultSuccess(
+                thread=thread, result_details="Thread metadata retrieved successfully."
+            )
+        except Exception as e:
+            details = f"Error retrieving thread metadata: {e}"
+            logger.exception(details)
+            return GetThreadMetadataResultFailure(result_details=details)
+
     def on_handle_list_threads_request(self, _: ListThreadsRequest) -> ResultPayload:
         try:
             threads = self._thread_storage.list_threads()
@@ -652,8 +747,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if meta.get("archived", False):
+            if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
@@ -676,8 +770,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if not meta.get("archived", False):
+            if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
@@ -818,10 +911,17 @@ class AgentManager(EngineScoped):
 
     def _build_runner(
         self,
-        additional_mcp_servers: list[str],
         provider_name: str | None = None,
         model_name: str | None = None,
     ) -> PydanticAgentRunner:
+        """Return the cached agent for this provider/model, building it if needed.
+
+        The runner carries only what is fixed for the life of an agent: the
+        model, the engine's own MCP server, and the base instructions. Anything
+        the user can edit mid-session - their MCP servers and the rules attached
+        to them - is passed to :meth:`PydanticAgentRunner.run` instead, so an
+        edit takes effect on the next run rather than the next engine restart.
+        """
         provider = self._get_provider(provider_name)
         provider_type = provider.type
         model_name = model_name or provider.model
@@ -849,33 +949,26 @@ class AgentManager(EngineScoped):
             # Image generation is Griptape Cloud-specific; disable for other providers.
             image_config = None
 
-        cache_key = (
-            provider_type,
-            model_name,
-            self._image_model_name,
-            base_url,
-            api_key,
-            tuple(sorted(additional_mcp_servers)),
+        cache_key = _RunnerCacheKey(
+            provider_type=provider_type,
+            model_name=model_name,
+            image_model_name=self._image_model_name,
+            base_url=base_url,
+            api_key=api_key,
         )
         if (cached := self._runner_cache.get(cache_key)) is not None:
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
         self._ensure_skills_directory(workspace_root)
+        # The engine's own MCP server is the only one baked into the agent: the
+        # engine owns its lifetime and its address cannot change mid-session.
         mcp_servers: list[AbstractToolset[Any]] = [
             streamable_http_local(
                 f"http://localhost:{self._mcp_server_port}/mcp/",
                 name="GriptapeNodes",
             ),
         ]
-        server_rules: list[str] = []
-        for cfg in self._lookup_mcp_configs(additional_mcp_servers):
-            built = mcp_server_from_config(cfg["name"], cfg)
-            if built is not None:
-                mcp_servers.append(built)
-            rules = cfg.get("rules")
-            if isinstance(rules, str) and rules.strip():
-                server_rules.append(f"Rules for MCP server '{cfg['name']}':\n{rules.strip()}")
 
         runner = PydanticAgentRunner(
             model_name=model_name,
@@ -884,7 +977,7 @@ class AgentManager(EngineScoped):
             base_url=model_base_url,
             workspace_root=workspace_root,
             storage=self._thread_storage,
-            instructions=self._compose_instructions(server_rules, include_image_tool=image_config is not None),
+            instructions=_build_agent_instructions(include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=image_config,
@@ -895,14 +988,13 @@ class AgentManager(EngineScoped):
         return runner
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
-        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+        """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
 
-        Called before every runner construction: the runner only attaches a
-        `SkillsCapability` when the directory exists at construction time, and
-        runners are cached, so creating the directory here guarantees skills
-        added mid-session are picked up on the next scan. Seeds a README the
-        first time so users discovering the folder know what belongs in it.
-        Failure to scaffold is logged but never blocks building the agent.
+        Called before every runner construction: the runner builds its skills
+        capability from this directory on each run, so creating it here means a
+        skill added mid-session is picked up without an engine restart. Seeds a
+        README the first time so users discovering the folder know what belongs
+        in it. Failure to scaffold is logged but never blocks building the agent.
         """
         skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
         try:
@@ -1079,28 +1171,62 @@ class AgentManager(EngineScoped):
         if gc and gc.model != default_model:
             config_manager.set_config_value("agent.griptape_cloud_model", gc.model)
 
-    def _compose_instructions(self, server_rules: list[str], *, include_image_tool: bool) -> str:
-        """Compose the instructions string from base rules and per-MCP-server rules."""
-        parts = [_build_agent_instructions(include_image_tool=include_image_tool)]
-        parts.extend(server_rules)
-        return "\n\n".join(parts)
+    async def _acquire_mcp_toolsets(self, server_names: list[str]) -> _MCPAttachment:
+        """Lease a live toolset for each requested MCP server, plus its rules.
 
-    def _lookup_mcp_configs(self, server_names: list[str]) -> list[dict[str, Any]]:
-        if not server_names:
-            return []
-        result = self.engine.handle_request(GetEnabledMCPServersRequest())
+        Runs on every agent run, and reads the servers' current configuration
+        each time, which is what lets an edit take effect without an engine
+        restart. Servers whose config is unchanged keep their warm connection;
+        an edited one is restarted, and one that has been deleted or disabled is
+        shut down here rather than lingering for the session.
+        """
+        enabled = self._lookup_enabled_mcp_servers()
+        if enabled is None:
+            return _MCPAttachment(lease=await self._mcp_toolsets.acquire([]), instructions="")
+
+        await self._mcp_toolsets.retain_only(enabled)
+
+        unavailable = [name for name in server_names if name not in enabled]
+        if unavailable:
+            logger.warning(
+                "Attempted to give the agent MCP server(s) %s. They are not enabled, so the agent will run without "
+                "them. Enable them in Settings to use their tools.",
+                ", ".join(sorted(unavailable)),
+            )
+
+        configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
+        lease = await self._mcp_toolsets.acquire(configs)
+        instructions = _compose_server_rules(configs)
+        # Config digests answer "my edit didn't take effect": a digest that moved
+        # between runs says the new config really was read. The rules text is
+        # never logged - free-text the user may have pasted anything into.
+        logger.debug(
+            "Agent run attached MCP server(s) %s",
+            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
+        )
+        return _MCPAttachment(lease=lease, instructions=instructions)
+
+    def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
+        """Current config of every enabled MCP server, or ``None`` if unreadable.
+
+        ``None`` and an empty dict must stay distinguishable: an empty dict means
+        the user has no enabled servers and any cached ones should be shut down,
+        while ``None`` means we could not find out and must leave them alone.
+        """
+        # Not broadcast: the answer carries each server's `env` and `headers`
+        # verbatim, and nothing listens for this internal lookup's result.
+        result = self.engine.handle_request(GetEnabledMCPServersRequest(broadcast_result=False))
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")
-            return []
-        return [{**result.servers[name], "name": name} for name in server_names if name in result.servers]
+            return None
+        return dict(result.servers)
 
     def _validate_thread_for_run(self, thread_id: str | None) -> str:
         if thread_id is None or not self._thread_storage.thread_exists(thread_id):
             new_id, _ = self._thread_storage.create_thread()
             return new_id
 
-        meta = self._thread_storage.get_thread_metadata(thread_id)
-        if meta.get("archived", False):
+        if self._thread_storage.is_archived(thread_id):
             details = f"Cannot run agent on archived thread {thread_id}. Unarchive it first."
             raise ValueError(details)
         return thread_id

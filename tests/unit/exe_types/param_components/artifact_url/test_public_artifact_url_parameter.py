@@ -7,8 +7,9 @@ paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
 import re
+from pathlib import Path
 from typing import Any, NamedTuple
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from griptape.artifacts import ErrorArtifact
@@ -158,7 +159,7 @@ class TestGetBucketId:
     def test_valid_bucket_id_passes_through(self, mocker: Any) -> None:
         exists_mock, default_mock = self._patch(mocker, bucket_id_value="bucket-123", bucket_exists=True)
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "bucket-123"
+        assert PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key") == "bucket-123"
         # A configured ID is validated directly; the org default is never consulted.
         exists_mock.assert_called_once()
         default_mock.assert_not_called()
@@ -168,23 +169,23 @@ class TestGetBucketId:
         # `bucket_exists` (a direct GET) must be the source of truth, not the list.
         self._patch(mocker, bucket_id_value="page-2-bucket", bucket_exists=True)
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "page-2-bucket"
+        assert PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key") == "page-2-bucket"
 
     def test_unset_secret_falls_back_to_org_default_bucket(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value=None, default_bucket_id="org-default")
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "org-default"
+        assert PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key") == "org-default"
 
     def test_blank_secret_falls_back_to_org_default_bucket(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value="   ", default_bucket_id="org-default")
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "org-default"
+        assert PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key") == "org-default"
 
     def test_invalid_bucket_id_raises_clear_error(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value="does-not-exist", bucket_exists=False)
 
         with pytest.raises(RuntimeError, match="invalid bucket ID") as excinfo:
-            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+            PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key")
 
         message = str(excinfo.value)
         assert PublicArtifactUrlParameter.BUCKET_ID_NAME in message
@@ -194,10 +195,65 @@ class TestGetBucketId:
         self._patch(mocker, bucket_id_value="", default_bucket_id=None)
 
         with pytest.raises(RuntimeError, match=PublicArtifactUrlParameter.BUCKET_ID_NAME):
-            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+            PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key")
 
     def test_unset_secret_with_no_default_bucket_raises_original_message(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value=None, default_bucket_id=None)
 
         with pytest.raises(RuntimeError, match="No Griptape Cloud storage buckets found"):
-            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+            PublicArtifactUrlParameter._get_bucket_id(MagicMock(), "https://base", "key")
+
+
+class TestUploadPathLifecycle:
+    """Covers gtc_file_path across runs -- see griptape-ai/griptape-nodes-engine#4872.
+
+    A helper instance lives as long as the node, so the path recorded by an upload used to
+    outlive the run that made it. A later run whose input was already public took the
+    pass-through path and then deleted that stale path, 404ing on an asset it had already
+    deleted itself and failing a successful generation in cleanup.
+    """
+
+    STALE_PATH = Path("artifact_url_storage/deadbeef/reference.mp4")
+
+    def test_pass_through_clears_a_path_from_an_earlier_run(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+
+        assert component.gtc_file_path is None
+        driver.upload_file.assert_not_called()
+
+    def test_cleanup_after_a_pass_through_run_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()
+
+    def test_delete_forgets_the_path(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_called_once_with(self.STALE_PATH)
+        assert component.gtc_file_path is None
+
+    def test_second_cleanup_pass_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+        component.delete_uploaded_artifact()
+
+        assert driver.delete_file.call_count == 1
+
+    def test_delete_is_skipped_when_nothing_was_uploaded(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()

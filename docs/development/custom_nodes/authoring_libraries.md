@@ -104,9 +104,10 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **settings**: Register secrets/API keys used by library nodes
     - Use `secrets_to_register` array to declare required secrets
     - Category should be `app_events.on_app_initialization_complete`
-    - Secrets are accessed via `GriptapeNodes.SecretsManager().get_secret()`
+    - Secrets are read with `GriptapeNodes.handle_request(GetSecretValueRequest(key=...))`
 - **metadata.dependencies**: PIP packages installed on library load
 - **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, arbitrary Python execution) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
+- **beta_features**: Experimental features users can turn on from the editor's Beta Features page. See [Beta Features](#beta-features) below.
 - **widgets**: Register custom JS widget components (see [Custom Widgets](custom_widgets.md))
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
@@ -326,6 +327,104 @@ A node can carry any combination of declarations. For example, a Labs node that 
 
 New declaration types added in future engine releases land additively under this same `declarations` field without a schema-version bump.
 
+### Beta Features
+
+A beta feature lets you ship something new in your library but leave it off until users choose to
+try it. Your features show up in the **Engine** group on the editor's
+[Beta Features](../../guides/editor/beta_features.md) settings page, where users turn them on and off.
+Name your library's nodes in each feature's `description`, so users can tell which library it
+belongs to.
+
+Declare each feature in a `beta_features` list at the top level of `griptape_nodes_library.json`,
+next to `name`, `metadata`, and `nodes`. It is not part of `metadata`:
+
+```jsonc
+"beta_features": [
+  {
+    "id": "sharpen_after_upscale",
+    "name": "Sharpen after upscaling",
+    "description": "Adds a Sharpen setting to the Upscale Image node.",
+    "owner": "@your-github-handle",
+    "remove_by": "2027-03-31"
+  }
+]
+```
+
+Set `remove_by` to your own date, no more than 180 days from the day you add the feature.
+
+| Field         | Meaning                                                                                                                 |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `id`          | Lowercase words of letters and digits joined by single underscores, starting with a letter. Unique within your library. |
+| `name`        | Short label shown on the Beta Features page.                                                                            |
+| `description` | One or two sentences telling users what changes and where.                                                              |
+| `default`     | Optional. Whether the feature is on for users who haven't chosen. Defaults to `false`.                                  |
+| `owner`       | Who is responsible for finishing or removing the feature.                                                               |
+| `remove_by`   | `YYYY-MM-DD` date by which you make the feature standard or remove it. At most 180 days after you add it.               |
+
+Check the feature from a node with `self.is_beta_feature_enabled("<id>")`. It returns the user's
+choice, or `default` if they haven't made one. **Always create the parameters a feature uses, and
+only hide or show them based on the feature.** A workflow saved by someone with the feature on then
+still opens for someone with it off, and the other way around.
+
+```python
+from typing import Any
+
+from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.node_types import DataNode
+
+
+class UpscaleImage(DataNode):
+    def __init__(self, name: str, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+
+        self.add_parameter(
+            Parameter(name="image", input_types=["ImageArtifact"], type="ImageArtifact", tooltip="Image to upscale")
+        )
+        self.add_parameter(Parameter(name="upscaled_image", output_type="ImageArtifact", tooltip="The upscaled image"))
+
+        # Created for everyone, shown only to users who turned the beta feature on.
+        self.add_parameter(
+            Parameter(
+                name="sharpen",
+                input_types=["float"],
+                type="float",
+                default_value=0.0,
+                tooltip="How much to sharpen the image after upscaling",
+            )
+        )
+        if not self.is_beta_feature_enabled("sharpen_after_upscale"):
+            self.hide_parameter_by_name("sharpen")
+
+    def process(self) -> None:
+        image = self.get_parameter_value("image")
+        upscaled = upscale(image)
+
+        if self.is_beta_feature_enabled("sharpen_after_upscale"):
+            upscaled = sharpen(upscaled, self.get_parameter_value("sharpen"))
+
+        self.parameter_output_values["upscaled_image"] = upscaled
+```
+
+A few rules worth knowing:
+
+- **A mistake in one entry doesn't stop your library from loading.** A missing field, an invalid
+    `id`, or a repeated `id` is reported as a library problem, and that feature is left out. Your
+    other features and nodes still work.
+- **Checking an id you didn't declare returns `false`** and logs a warning naming the feature.
+- **A check in `__init__` only runs when the node is created.** If a user turns the feature on or
+    off, nodes already on the canvas keep the parameters they were shown with until the user refreshes the
+    node, adds it again, or reopens the workflow. A check in `process` sees the new value on the next run.
+- **After `remove_by`, the feature always uses its `default`.** It disappears from the Beta
+    Features page and the library reports a problem until you make the feature standard or remove it.
+    A `remove_by` more than 180 days away is also reported.
+- **Users' choices are stored per library** under `library_beta_features` in their config, keyed by
+    your library's name in lowercase with spaces and punctuation turned into underscores. "Acme
+    Image Tools" becomes `library_beta_features.acme_image_tools.sharpen_after_upscale`. Only the
+    letters a to z and digits carry over, so a library name without any can't have beta features,
+    and two loaded libraries whose names become the same key are reported as a library problem.
+- **Engines released before library schema `0.14.0` ignore `beta_features`.** Set
+    `library_schema_version` to `0.14.0` or later when you add them.
+
 ## Library Structure with uv Dependency Management
 
 **Modern Approach**: Use `uv` for fast, reproducible dependency management following the Minimax library pattern.
@@ -358,13 +457,15 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "griptape-nodes-engine",
     "requests",
-    # Add other dependencies
+    # Add other packages your nodes import at runtime
 ]
 
+[dependency-groups]
+dev = ["griptape-nodes-engine", "pytest", "pyright", "ruff"]
+
 [tool.uv.sources]
-griptape-nodes-engine = { git = "https://github.com/griptape-ai/griptape-nodes", rev="latest"}
+griptape-nodes-engine = { git = "https://github.com/griptape-ai/griptape-nodes-engine", rev = "latest" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["library_name"]
@@ -373,6 +474,20 @@ packages = ["library_name"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 ```
+
+#### Do not list the engine as a runtime dependency
+
+The engine is the host that loads your library, not a package your library pulls in. Keep `griptape-nodes-engine` out of `[project] dependencies`:
+
+- Installing your library would otherwise install a **second engine**. The engine puts a library's virtual environment at the front of its own import path, so that second copy can shadow the engine that is actually running, and the resulting errors look like engine bugs rather than library ones.
+- `[dependency-groups] dev` still gives your tests, type checker, and editor an engine to resolve against, because `uv sync` installs dev groups by default. Your development workflow is unchanged.
+- The engine version your library needs belongs in `engine_version` in your library JSON. That is the value the engine actually checks when it loads you; the pyproject specifier is never consulted at load time.
+
+Declaring it in both places means maintaining the same fact twice, and the two drift.
+
+!!! note "This changes with library packaging"
+
+    Once libraries are resolved as packages into their own environments, the engine becomes a normal bounded dependency (`griptape-nodes-engine>=X,<Y`) and that single resolution replaces the `engine_version` check. Use the layout above until that ships.
 
 ### Library Configuration (inside subdirectory)
 

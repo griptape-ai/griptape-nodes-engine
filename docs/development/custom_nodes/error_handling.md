@@ -15,9 +15,13 @@ General best practices for production-quality nodes: secrets, imports, code qual
 
 ### Secrets Management
 
-Use `GriptapeNodes.SecretsManager()` to access API keys and secrets:
+Read secrets with `GetSecretValueRequest`:
 
 ```python
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetSecretValueRequest,
+    GetSecretValueResultSuccess,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
@@ -26,16 +30,19 @@ class MyNode(DataNode):
     API_KEY_NAME = "MY_SERVICE_API_KEY"
 
     def _validate_api_key(self) -> str:
-        api_key = GriptapeNodes.SecretsManager().get_secret(self.API_KEY_NAME)
-        if not api_key:
+        result = GriptapeNodes.handle_request(GetSecretValueRequest(key=self.API_KEY_NAME))
+        if not isinstance(result, GetSecretValueResultSuccess) or not result.value:
             raise ValueError(f"Missing {self.API_KEY_NAME}")
-        return api_key
+        return result.value
 ```
 
 **Key Points:**
 
-- Import `GriptapeNodes` at module level, not inside functions
-- Use `SecretsManager().get_secret()` to retrieve secrets
+- Import at module level, not inside functions
+- Use a request rather than `GriptapeNodes.SecretsManager()`. The manager accessor is
+    **refused while a node executes in a worker**, and a helper like this is reachable from
+    both `process` (in the worker) and validation (in the orchestrator) — so the manager
+    version works in one caller and raises in the other. The request is correct in both.
 - Define `API_KEY_NAME` as a class constant for consistency
 - Always validate that the secret exists before using it
 
@@ -48,7 +55,7 @@ A parameter value can end up fully embedded in two places:
 
 Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
 
-`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it.
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it. On an output, the same declaration additionally holds the value in the process that produced it and sends only a key across a worker process boundary - see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md).
 
 !!! warning "Keep parameter values small"
 

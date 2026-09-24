@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import abc
-import logging
 import typing
 
 from griptape_nodes.exe_types import core_types
-from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
 from griptape_nodes.retained_mode import retained_mode as retained_mode_mod
 from griptape_nodes.retained_mode.events import connection_events
 from griptape_nodes.traits import button as button_mod
 
 if typing.TYPE_CHECKING:
-    from griptape_nodes.exe_types import node_types
+    from collections.abc import Callable
 
-logger = logging.getLogger("griptape_nodes")
+    from griptape_nodes.exe_types import node_types
 
 
 class ProjectOutputParameter(abc.ABC):
@@ -127,25 +125,27 @@ class ProjectOutputParameter(abc.ABC):
         self._node.set_parameter_value(self._name, self._default_value)
         self._node.publish_update_to_parameter(self._name, self._default_value)
 
-    def _get_upstream_destination(
+    def _get_upstream_destination[ProviderT, DestinationT](
         self,
-        destination_attr: str,
+        provider_type: type[ProviderT],
+        get_destination: Callable[[ProviderT], DestinationT | None],
         destination_type_name: str,
-    ) -> object | None:
-        """Return the destination from the first upstream node that exposes ``destination_attr``.
+    ) -> DestinationT | None:
+        """Return the destination from the first connected upstream node that implements ``provider_type``.
 
-        Returns None if no connected node has the attribute.
+        Returns None if no connected node implements the provider protocol.
 
         Args:
-            destination_attr: Attribute name to look for on the upstream node
-                (e.g. ``'file_destination'``).
+            provider_type: ``runtime_checkable`` Protocol the upstream node must satisfy
+                (e.g. ``FileDestinationProvider``).
+            get_destination: Reads the destination off a matching provider.
             destination_type_name: Human-readable type name used in error messages
                 (e.g. ``'FileDestination'``).
 
         Raises:
-            ValueError: If a connected node exposes ``destination_attr`` but returns None.
+            ValueError: If a connected provider returns None.
         """
-        result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        result = self._node.engine.handle_request(
             connection_events.ListConnectionsForNodeRequest(node_name=self._node.name)
         )
         if not isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
@@ -154,17 +154,15 @@ class ProjectOutputParameter(abc.ABC):
         for conn in result.incoming_connections:
             if conn.target_parameter_name != self._name:
                 continue
-            source_node = griptape_nodes_mod.GriptapeNodes.ObjectManager().attempt_get_object_by_name(
-                conn.source_node_name
-            )
-            if source_node is None or not hasattr(source_node, destination_attr):
+            source_node = self._node.engine.object_manager.attempt_get_object_by_name(conn.source_node_name)
+            if not isinstance(source_node, provider_type):
                 continue
-            destination = getattr(source_node, destination_attr)
+            destination = get_destination(source_node)
             if destination is None:
                 msg = (
                     f"Attempted to build {destination_type_name} for {self._node.name}.{self._name}. "
-                    f"Failed because upstream node '{conn.source_node_name}' returned None "
-                    f"(likely missing a filename or path)."
+                    f"Failed because upstream node '{conn.source_node_name}' provides a "
+                    f"{destination_type_name} but returned None (likely missing a filename or path)."
                 )
                 raise ValueError(msg)
             return destination
@@ -180,9 +178,7 @@ class ProjectOutputParameter(abc.ABC):
         node_name = self._node.name
 
         has_incoming = False
-        result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            connection_events.ListConnectionsForNodeRequest(node_name=node_name)
-        )
+        result = self._node.engine.handle_request(connection_events.ListConnectionsForNodeRequest(node_name=node_name))
         if isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
             has_incoming = any(conn.target_parameter_name == self._name for conn in result.incoming_connections)
 
@@ -196,6 +192,9 @@ class ProjectOutputParameter(abc.ABC):
 
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4097
         # Replace with a non-RM utility for creating sibling nodes relative to a given node.
+        # Until then this is the one remaining path from exe_types to the facade: RetainedMode is
+        # a re-export, so the TID251 ban does not see it. It resolves the ambient engine, which is
+        # correct here only because button handlers run where the node lives.
         create_result = retained_mode_mod.RetainedMode.create_node_relative_to(
             reference_node_name=node_name,
             new_node_type=self._settings_node_type,
@@ -215,9 +214,7 @@ class ProjectOutputParameter(abc.ABC):
 
         configure_node_name = create_result
 
-        configure_node = griptape_nodes_mod.GriptapeNodes.ObjectManager().attempt_get_object_by_name(
-            configure_node_name
-        )
+        configure_node = self._node.engine.object_manager.attempt_get_object_by_name(configure_node_name)
         if configure_node is not None:
             configure_node.set_parameter_value("situation", self._situation_name)
             configure_node.publish_update_to_parameter("situation", self._situation_name)
@@ -227,9 +224,17 @@ class ProjectOutputParameter(abc.ABC):
                 configure_node.set_parameter_value(self._settings_value_param_name, current_value)
                 configure_node.publish_update_to_parameter(self._settings_value_param_name, current_value)
 
-        connection_result = retained_mode_mod.RetainedMode.connect(
-            source=f"{configure_node_name}.{self._settings_source_param_name}",
-            destination=f"{node_name}.{self._name}",
+        # Dispatched through this node's engine rather than RetainedMode. RetainedMode is a
+        # facade re-export, so going through it resolves the ambient engine -- which the TID251
+        # ban does not catch, and which would answer from a different engine than the request
+        # above it.
+        connection_result = self._node.engine.handle_request(
+            connection_events.CreateConnectionRequest(
+                source_node_name=configure_node_name,
+                source_parameter_name=self._settings_source_param_name,
+                target_node_name=node_name,
+                target_parameter_name=self._name,
+            )
         )
 
         if not connection_result.succeeded():

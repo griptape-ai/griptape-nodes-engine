@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import pickle
 import re
 import sys
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,7 +27,6 @@ from rich.text import Text
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
-from griptape_nodes.common.project_templates.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
@@ -37,6 +38,7 @@ from griptape_nodes.files.path_utils import (
     resolve_workspace_path,
 )
 from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
@@ -79,6 +81,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultFailure,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
@@ -200,6 +203,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidDependencyVersionStringProblem,
     InvalidLibraryVersionStringProblem,
@@ -224,7 +228,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
@@ -244,6 +248,12 @@ NodeParameterMap = dict[str, ParameterShapeInfo]  # {param_name: param_info}
 WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: param_info}}
 
 logger = logging.getLogger("griptape_nodes")
+
+# WorkflowManager.LoadProblemFrame writes this; is_loading_workflow reads it. Scoped to the
+# current context so concurrent loads cannot pop or read each other's frames.
+_load_problem_frames: contextvars.ContextVar[tuple[list[WorkflowProblem], ...]] = contextvars.ContextVar(
+    "workflow_load_problem_frames", default=()
+)
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -373,11 +383,76 @@ class WorkflowManager(EngineScoped):
 
     _referenced_workflow_stack: list[str] = field(default_factory=list)
 
+    class LoadProblemFrame:
+        """Collects one workflow load's problems, bubbling them into the enclosing load on exit.
+
+        A workflow file can import another workflow as a referenced subflow, and that import
+        runs as a nested request dispatched from inside the outer file's exec() -- so the inner
+        load's problems have no return path to the outer one. Without bubbling, an outer load
+        reports GOOD while the canvas holds the inner load's placeholders, and a caller that
+        gates on status (the headless executor) runs an incomplete graph.
+
+        The stack lives in a ContextVar rather than on the manager because loads genuinely run
+        concurrently: in PARALLEL execution mode a WorkflowNode loads its subflow from inside a
+        node body, and those bodies run as separate tasks. A shared list would let one task pop
+        another's frame, so a load would report a library a *different* workflow was missing --
+        or see a sibling's open frame and suppress the only report of its own. A task inherits a
+        copy of the context, so a nested load still reaches the enclosing frame (same task) while
+        siblings stay isolated. `EventSuppressionContext` is contextvar-scoped for the same reason.
+        """
+
+        def __init__(self) -> None:
+            self.problems: list[WorkflowProblem] = []
+            self._tokens: list[contextvars.Token[tuple[list[WorkflowProblem], ...]]] = []
+
+        def __enter__(self) -> WorkflowManager.LoadProblemFrame:
+            self._tokens.append(_load_problem_frames.set((*_load_problem_frames.get(), self.problems)))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            exc_traceback: TracebackType | None,
+        ) -> None:
+            frames = _load_problem_frames.get()
+            if len(frames) > 1:
+                enclosing = frames[-2]
+                # A library the outer file declares for itself AND reaches through a subflow
+                # would otherwise be counted twice, and the collated display would name it
+                # twice while claiming two libraries are missing.
+                enclosing.extend(problem for problem in self.problems if problem not in enclosing)
+            if self._tokens:
+                _load_problem_frames.reset(self._tokens.pop())
+
+    def is_loading_workflow(self) -> bool:
+        """Whether a workflow load is in progress, so its result will report the problems found.
+
+        Read after a nested load has closed, so a frame still on the stack is an ENCLOSING load.
+        That makes this the complement of the bubble in LoadProblemFrame.__exit__: exactly one of
+        the two names any given problem. A frame that stopped bubbling would have to stop
+        answering True here as well, or nothing would report it.
+        """
+        return len(_load_problem_frames.get()) > 0
+
     class WorkflowExecutionResult(NamedTuple):
-        """Result of a workflow execution."""
+        """Result of a workflow execution.
+
+        `status` and `problems` mirror WorkflowInfo's fields, so a load's fitness is described
+        the same way whether it was assessed from the metadata header or observed while
+        replaying the file. Both are populated whether or not the run succeeded: a library that
+        never loads leaves the load FLAWED (its nodes come back as placeholders), and is the
+        likeliest explanation when the load fails outright.
+
+        Keeping the problems typed rather than pre-rendered lets a caller decide per problem
+        class -- an executor can refuse a FLAWED load that the editor is happy to open -- and
+        leaves the wording to each problem's own collate_problems_for_display.
+        """
 
         execution_successful: bool
         execution_details: str
+        status: WorkflowStatus = WorkflowStatus.GOOD
+        problems: tuple[WorkflowProblem, ...] = ()
 
     class SaveWorkflowScenario(StrEnum):
         """Scenarios for saving workflows."""
@@ -693,7 +768,7 @@ class WorkflowManager(EngineScoped):
 
         return find_metadata_blocks(workflow_content, block_name)
 
-    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:  # noqa: PLR0915
+    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:
         workflow_file_paths = self.get_workflows_attempted_to_load()
         workflow_infos = []
         for workflow_file_path in workflow_file_paths:
@@ -777,16 +852,7 @@ class WorkflowManager(EngineScoped):
             if not wf_info.problems:
                 problems = "No problems detected."
             else:
-                # Group problems by type
-                problems_by_type = defaultdict(list)
-                for problem in wf_info.problems:
-                    problems_by_type[type(problem)].append(problem)
-
-                # Collate each group
-                collated_strings = []
-                for problem_class, instances in problems_by_type.items():
-                    collated_display = problem_class.collate_problems_for_display(instances)
-                    collated_strings.append(collated_display)
+                collated_strings = self.collate_problems_by_type(wf_info.problems)
 
                 # Format for display
                 if len(collated_strings) == 1:
@@ -872,6 +938,17 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
+        # Problems found anywhere under this load land in the frame, including those of a
+        # referenced subflow imported from inside exec() -- see LoadProblemFrame.
+        with WorkflowManager.LoadProblemFrame() as frame:
+            return await self._run_workflow_in_frame(
+                relative_file_path=relative_file_path, complete_file_path=complete_file_path, frame=frame
+            )
+
+    async def _run_workflow_in_frame(
+        self, *, relative_file_path: str, complete_file_path: Path, frame: LoadProblemFrame
+    ) -> WorkflowExecutionResult:
+        """Read, resolve libraries for, and exec one workflow file, recording problems in `frame`."""
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -880,53 +957,77 @@ class WorkflowManager(EngineScoped):
             # The metadata header lists every library the workflow uses; each must
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
-            library_resolution_error = await self._ensure_libraries_for_workflow(
-                relative_file_path=relative_file_path,
-                complete_file_path=complete_file_path,
+            frame.problems.extend(await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path))
+
+            # _generate_workflow_run_prerequisite_code emits one registration per header entry,
+            # so each library we just failed to register is about to fail again on a request the
+            # GUI would toast -- that equivalence is what makes suppressing the type here safe.
+            # It is conditional because an unreadable header pre-registers nothing: there the
+            # in-file failures are the only record of what the workflow needs.
+            duplicate_library_failures = (
+                EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
+                if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in frame.problems)
+                else nullcontext()
             )
-            if library_resolution_error is not None:
-                return library_resolution_error
+            with duplicate_library_failures:
+                # Execute the workflow module with a dedicated namespace so `__file__` resolves
+                # to the workflow path and the `if __name__ == "__main__"` guard does not fire
+                # (which would try to spin up a second event loop via asyncio.run).
+                namespace: dict[str, Any] = {
+                    "__file__": str(complete_file_path),
+                    "__name__": "__gtn_workflow__",
+                }
+                exec(workflow_content, namespace)  # noqa: S102
 
-            # Execute the workflow module with a dedicated namespace so `__file__` resolves
-            # to the workflow path and the `if __name__ == "__main__"` guard does not fire
-            # (which would try to spin up a second event loop via asyncio.run).
-            namespace: dict[str, Any] = {
-                "__file__": str(complete_file_path),
-                "__name__": "__gtn_workflow__",
-            }
-            exec(workflow_content, namespace)  # noqa: S102
+                # New-style workflows wrap graph-building requests in `async def build_workflow()`
+                # so the module is inert at import time. Await it here. Legacy workflows without
+                # build_workflow() have already executed their requests top-to-bottom during exec().
+                workflow_builder = namespace.get("build_workflow")
+                if workflow_builder is not None and iscoroutinefunction(workflow_builder):
+                    await workflow_builder()
 
-            # New-style workflows wrap graph-building requests in `async def build_workflow()`
-            # so the module is inert at import time. Await it here. Legacy workflows without
-            # build_workflow() have already executed their requests top-to-bottom during exec().
-            workflow_builder = namespace.get("build_workflow")
-            if workflow_builder is not None and iscoroutinefunction(workflow_builder):
-                await workflow_builder()
-
-            # After workflow execution, ensure there's always a current context by pushing
-            # the top-level flow if the context is empty. This fixes regressions where
-            # with Workflow Schema version 0.6.0+ workflows expect context to be established.
-            await self._ensure_workflow_context_established()
+                # After workflow execution, ensure there's always a current context by pushing
+                # the top-level flow if the context is empty. This fixes regressions where
+                # with Workflow Schema version 0.6.0+ workflows expect context to be established.
+                await self._ensure_workflow_context_established()
 
         except Exception as e:
             return WorkflowManager.WorkflowExecutionResult(
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
+                status=WorkflowStatus.UNUSABLE,
+                problems=tuple(frame.problems),
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
+            # A problem that did not stop the load leaves it recoverable: the graph is on the
+            # canvas, with placeholders where the missing library's nodes belong.
+            status=WorkflowStatus.FLAWED if frame.problems else WorkflowStatus.GOOD,
+            problems=tuple(frame.problems),
         )
 
-    async def _ensure_libraries_for_workflow(
-        self, *, relative_file_path: str, complete_file_path: Path
-    ) -> WorkflowExecutionResult | None:
-        """Ensure every library the workflow declares is registered before exec.
+    async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
+        """Register every library the workflow declares before exec, tolerating the ones that won't.
 
         Reads node_libraries_referenced from the workflow's TOML metadata header
         and dispatches a RegisterLibraryFromFileRequest for each entry via
-        ahandle_request. Returns a failure WorkflowExecutionResult if a library
-        cannot be resolved; None on success.
+        ahandle_request. Returns a LibraryNotRegisteredProblem per library that
+        would not register; an empty list when every library resolved. That is the
+        same problem type on_load_workflow_metadata_request records for the same
+        condition, so the two paths describe it identically.
+
+        A library that cannot be registered does not by itself stop the load. The
+        nodes it owns come back from CreateNodeRequest as ErrorProxyNode placeholders
+        that carry the reason and preserve the graph's values and connections, so the
+        rest of the workflow stays open and editable and only execution is lost.
+        Refusing the load instead would deny the artist the one view that shows
+        which nodes need the library (issue #5505).
+
+        The load can still fail downstream for a reason the missing library causes:
+        a parameter value whose CLASS the library declares is emitted as a hard
+        import inside build_workflow() (see _build_deferred_import_statements), and
+        that raises before any node is created. Only the node types are recoverable.
 
         The engine (not the workflow file itself) owns library registration
         because worker-backed libraries spin up a dedicated subprocess when they
@@ -945,36 +1046,77 @@ class WorkflowManager(EngineScoped):
             # Fall through to exec without pre-registering libraries; the engine
             # startup path may have already loaded them. This mirrors prior
             # behavior where a missing prereq block was survivable.
-            return None
+            return []
+        problems: list[WorkflowProblem] = []
         for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
                     perform_discovery_if_not_found=True,
-                    # The outer RunWorkflowFromRegistry failure already names the missing library
-                    # in a user-readable form; suppressing this inner result keeps the GUI from
-                    # showing a duplicate `RegisterLibraryFromFile Failed` toast on top of it.
+                    # The run result carries this library in a user-readable form already;
+                    # suppressing this inner result keeps the GUI from showing a
+                    # `RegisterLibraryFromFile Failed` toast on top of it.
                     failure_log_level=logging.DEBUG,
                 )
             )
             if not register_result.succeeded():
-                # `library_version` may carry a non-semver placeholder (e.g. when the workflow was
-                # saved while the library was already unavailable, see node_manager._serialize_node_to_commands).
-                # Only render the version suffix when the stored value parses as semver.
-                has_real_version = bool(lib_ref.library_version) and semver.VersionInfo.is_valid(
-                    lib_ref.library_version
+                # The declared version is deliberately not reported. A library that never
+                # registered has no version to compare against, which is why the not-registered
+                # problem carries none -- the version-mismatch problems cover the case where a
+                # library IS present at the wrong version. It also keeps the non-semver
+                # placeholder a workflow stores when saved without its library (see
+                # node_manager._serialize_node_to_commands) from ever reaching the reader.
+                problems.append(
+                    LibraryNotRegisteredProblem(
+                        library_name=lib_ref.library_name,
+                        reason=str(getattr(register_result, "result_details", "")) or None,
+                    )
                 )
-                version_suffix = f" v{lib_ref.library_version}" if has_real_version else ""
-                inner_details = getattr(register_result, "result_details", "")
-                details = (
-                    f"Workflow '{complete_file_path.name}' requires library "
-                    f"'{lib_ref.library_name}'{version_suffix}, which is not loaded. {inner_details}"
+        return problems
+
+    @staticmethod
+    def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
+        """Group problems by type and let each type render its own instances, one string per group.
+
+        Every problem class owns its wording and its singular/plural form, so grouping is what
+        lets a workflow with five unregistered libraries say so once instead of five times.
+        """
+        problems_by_type: dict[type, list[WorkflowProblem]] = defaultdict(list)
+        for problem in problems:
+            problems_by_type[type(problem)].append(problem)
+        return [
+            problem_class.collate_problems_for_display(instances)
+            for problem_class, instances in problems_by_type.items()
+        ]
+
+    @classmethod
+    def _execution_result_details(
+        cls, execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
+    ) -> list[ResultDetail]:
+        """The run's problems as warnings, ahead of its detail (or `message` in its place).
+
+        The problems come first: they explain both the placeholders on a successful load and,
+        on a failed one, the most likely reason the file could not be replayed. Every handler
+        that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
+        caller while its graph is quietly full of placeholders.
+        """
+        details = [
+            ResultDetail(message=problem, level=logging.WARNING)
+            for problem in cls.collate_problems_by_type(execution_result.problems)
+        ]
+        # Only a load that survived has placeholders to point at; a failed one cleared the
+        # canvas. Said once for the whole load rather than per problem, which is what keeps
+        # the problems' own wording intact.
+        if execution_result.problems and execution_result.execution_successful:
+            details.append(
+                ResultDetail(
+                    message="Nodes from the libraries above opened as placeholders. "
+                    "They preserve the graph but cannot run until their library is available.",
+                    level=logging.WARNING,
                 )
-                return WorkflowManager.WorkflowExecutionResult(
-                    execution_successful=False,
-                    execution_details=details,
-                )
-        return None
+            )
+        details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
+        return details
 
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
@@ -996,15 +1138,34 @@ class WorkflowManager(EngineScoped):
             # Run the file, goddamn it
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
             if execution_result.execution_successful:
-                return RunWorkflowFromScratchResultSuccess(result_details=execution_result.execution_details)
+                return RunWorkflowFromScratchResultSuccess(
+                    status=execution_result.status,
+                    result_details=ResultDetails(
+                        *self._execution_result_details(execution_result, level=logging.DEBUG)
+                    ),
+                )
 
             logger.error(execution_result.execution_details)
-            return RunWorkflowFromScratchResultFailure(result_details=execution_result.execution_details)
+            return RunWorkflowFromScratchResultFailure(
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+            )
 
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
+        if self.engine.context_manager.has_current_flow():
+            # Disallow opening a workflow inside another workflow this way. It would
+            # become an invisible child flow (no way to reach it in the UI), persisted
+            # with the parent workflow on save, and executed invisibly whenever the
+            # parent workflow was executed.
+            open_flow_name = self.engine.context_manager.get_current_flow().name
+            details = (
+                f"Attempted to open workflow '{relative_file_path}' while the flow '{open_flow_name}' is still open. "
+                "Close the current workflow first, before opening this one."
+            )
+            return RunWorkflowWithCurrentStateResultFailure(result_details=details)
+
         complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
@@ -1012,9 +1173,14 @@ class WorkflowManager(EngineScoped):
         execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
         if execution_result.execution_successful:
-            return RunWorkflowWithCurrentStateResultSuccess(result_details=execution_result.execution_details)
+            return RunWorkflowWithCurrentStateResultSuccess(
+                status=execution_result.status,
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG)),
+            )
         logger.error(execution_result.execution_details)
-        return RunWorkflowWithCurrentStateResultFailure(result_details=execution_result.execution_details)
+        return RunWorkflowWithCurrentStateResultFailure(
+            result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+        )
 
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
@@ -1066,7 +1232,7 @@ class WorkflowManager(EngineScoped):
                 result_messages = []
                 if context_warning:
                     result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.ERROR))
+                result_messages.extend(self._execution_result_details(execution_result, level=logging.ERROR))
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
@@ -1079,8 +1245,10 @@ class WorkflowManager(EngineScoped):
         result_messages = []
         if context_warning:
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
-        return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
+        result_messages.extend(self._execution_result_details(execution_result, level=logging.DEBUG))
+        return RunWorkflowFromRegistryResultSuccess(
+            status=execution_result.status, result_details=ResultDetails(*result_messages)
+        )
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -1106,6 +1274,10 @@ class WorkflowManager(EngineScoped):
             if isinstance(request.metadata, dict):
                 request.metadata = WorkflowMetadata(**request.metadata)
 
+            request.metadata.name = self._repair_path_shaped_display_name(
+                display_name=request.metadata.name, registry_key=registry_key
+            )
+
             WorkflowRegistry.generate_new_workflow(
                 registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
             )
@@ -1119,6 +1291,39 @@ class WorkflowManager(EngineScoped):
                 level=logging.DEBUG,
             ),
         )
+
+    def _repair_path_shaped_display_name(self, *, display_name: str, registry_key: str) -> str:
+        """Repair a display name that an older branch/merge/reset wrote as a registry key.
+
+        Those three sites used to write the path-derived registry key straight into ``metadata.name``,
+        so a branch of "Shot 010 Comp" living under ``shots/sh010/`` loaded as
+        "shots/sh010/comp_branch_1" everywhere the editor shows a workflow title. Files written by
+        those versions are still on disk, and they carry the *current* schema version -- the bug was
+        never a schema change -- so there is no version to gate on. We key on the damage itself.
+
+        Exact equality with the registry key is the fingerprint: a title someone actually typed does
+        not coincide with its own file path. Everything else is left alone, including a name that
+        merely happens to contain a separator, which may well be deliberate.
+
+        In-memory only. Rewriting headers during load would touch a pile of user files, churning
+        mtimes and git diffs for a cosmetic label; the repaired name persists on its own the next
+        time the workflow is saved for any other reason.
+        """
+        if display_name != registry_key:
+            return display_name
+        if "/" not in registry_key:
+            # A workspace-root workflow whose title matches its file stem. Nothing path-shaped here,
+            # and nothing the three sites broke -- they only read badly with directories in the key.
+            return display_name
+
+        repaired_name = PurePosixPath(registry_key).name
+        logger.debug(
+            "Workflow '%s' carries its registry key as its display name (written by a pre-fix branch, "
+            "merge, or reset). Showing it as '%s'; the file keeps the old name until its next save.",
+            registry_key,
+            repaired_name,
+        )
+        return repaired_name
 
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
@@ -1193,6 +1398,9 @@ class WorkflowManager(EngineScoped):
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == request.name:
             self.engine.clear_current_workflow_data()
+            # clear_current_workflow_data releases what THIS process holds; the worker half must be
+            # awaited, so it belongs here in the async handler rather than in that sync method.
+            await self.engine.worker_manager.broadcast_local_object_teardown()
         try:
             workflow = WorkflowRegistry.delete_workflow_by_name(request.name)
         except Exception as e:
@@ -1403,13 +1611,7 @@ class WorkflowManager(EngineScoped):
 
     def _build_workflow_info_payload(self, wf_info: WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
-        problems_by_type: dict[type, list] = defaultdict(list)
-        for problem in wf_info.problems:
-            problems_by_type[type(problem)].append(problem)
-        collated_problems = [
-            problem_class.collate_problems_for_display(instances)
-            for problem_class, instances in problems_by_type.items()
-        ]
+        collated_problems = self.collate_problems_by_type(wf_info.problems)
         return WorkflowInfoSummary(
             status=wf_info.status,
             workflow_name=wf_info.workflow_name,
@@ -1604,7 +1806,7 @@ class WorkflowManager(EngineScoped):
         return GetWorkflowRunCommandResultSuccess(
             run_command=run_command,
             workflow_shape=workflow_shape,
-            engine_os=self.engine.os_manager._get_platform_name(),
+            engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
 
@@ -1933,8 +2135,10 @@ class WorkflowManager(EngineScoped):
             # See how our desired version compares against the actual library we (may) have.
             # Check if library is registered (silent check - no error logging)
             if library_name not in registered_libraries:
-                # Library not registered
-                had_critical_error = True
+                # Library not registered. Recoverable, not critical: the workflow opens with
+                # ErrorProxyNode placeholders standing in for that library's nodes, so calling it
+                # UNUSABLE would contradict what the editor is about to show (issue #5505). The
+                # version-mismatch and malformed-metadata problems below stay critical.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(
@@ -1952,8 +2156,9 @@ class WorkflowManager(EngineScoped):
             library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
-                # Should not happen since we verified library is registered, but handle gracefully
-                had_critical_error = True
+                # Should not happen since we verified library is registered, but handle gracefully.
+                # Recoverable for the same reason as the unregistered case above: the library IS
+                # in the registry, so its nodes still construct -- only its version is unknown.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(
@@ -2292,6 +2497,60 @@ class WorkflowManager(EngineScoped):
             file_name=parts.stem, destination=destination, relative_file_path=relative_file_path
         )
 
+    class CreatedWorkflowFile(NamedTuple):
+        """Where a newly created workflow file landed, or why it could not be written.
+
+        ``relative_file_path`` is the registry's form of ``absolute_path`` (workspace-relative
+        while the situation keeps the file inside the workspace, absolute otherwise), so the
+        registry key always names the file that is actually on disk.
+        """
+
+        success: bool
+        error_details: str
+        absolute_path: str = ""
+        relative_file_path: str = ""
+
+    def _create_workflow_file(self, file_name: str, content: str) -> CreatedWorkflowFile:
+        """Write ready-made content as a NEW workflow file, wherever ``save_workflow`` says.
+
+        Creating a workflow is a workflow save like any other, so it resolves through the same
+        situation: a project that redirects ``save_workflow`` would otherwise be honored when
+        the user saves and ignored when the engine creates the file on their behalf (branching,
+        or copying a template), leaving those workflows stranded in the workspace root with no
+        way to migrate -- every later save overwrites them in place.
+
+        Callers hold content they generated themselves (a rewritten metadata header over a
+        source file's body), which is why this writes verbatim rather than going through
+        ``_save_workflow_file_inline``'s serialize-and-generate path.
+        """
+        destination, _relative = self._build_workflow_save_path(f"{file_name}.py")
+        write_result = self._write_workflow_file(destination, content, file_name)
+        if not write_result.success:
+            return WorkflowManager.CreatedWorkflowFile(success=False, error_details=write_result.error_details)
+
+        # The written location, not the requested one: the situation's macro decides the
+        # directory, and a CREATE_NEW policy may have walked the filename past a collision.
+        written_file = write_result.written_file
+        if written_file is None:
+            return WorkflowManager.CreatedWorkflowFile(
+                success=False,
+                error_details=f"Attempted to create workflow file '{file_name}'. Failed because the write reported no location.",
+            )
+        try:
+            absolute_path = written_file.resolve()
+        except FileLoadError as err:
+            return WorkflowManager.CreatedWorkflowFile(
+                success=False,
+                error_details=f"Attempted to create workflow file '{file_name}'. Failed resolving the written location: {err}",
+            )
+
+        return WorkflowManager.CreatedWorkflowFile(
+            success=True,
+            error_details="",
+            absolute_path=str(absolute_path),
+            relative_file_path=self._workspace_relative_path(str(absolute_path), self.engine),
+        )
+
     def _write_workflow_file(
         self, destination: ProjectFileDestination, content: str, file_name: str
     ) -> WriteWorkflowFileResult:
@@ -2623,15 +2882,19 @@ class WorkflowManager(EngineScoped):
         2. If collision exists and name ends in a number, find first free prefix + integer
         3. If collision exists and name doesn't end in a number, append _1, _2, etc.
 
+        Candidates are probed where the ``save_workflow`` situation actually puts them rather
+        than at ``<workspace>/<name>.py``: a project that redirects workflow saves would
+        otherwise judge uniqueness against a directory it never writes to, and a creation
+        carrying the situation's overwrite policy would then clobber whatever already sits at
+        the real destination.
+
         Args:
             base_name: The desired base name for the workflow
 
         Returns:
-            A unique filename that doesn't exist in the workspace
+            A unique filename whose save destination is free
         """
-        workspace_path = self.engine.config_manager.workspace_path
-        base_path = workspace_path.joinpath(f"{base_name}.py")
-        if not base_path.exists():
+        if not self._workflow_destination_exists(base_name):
             return base_name
 
         pattern_match = re.search(r"\d+$", base_name)
@@ -2645,10 +2908,23 @@ class WorkflowManager(EngineScoped):
         curr_idx = 1
         while True:
             candidate_name = f"{incremental_prefix}{curr_idx}"
-            candidate_path = workspace_path.joinpath(f"{candidate_name}.py")
-            if not candidate_path.exists():
+            if not self._workflow_destination_exists(candidate_name):
                 return candidate_name
             curr_idx += 1
+
+    def _workflow_destination_exists(self, file_name: str) -> bool:
+        """Whether the ``save_workflow`` destination for ``file_name`` is already occupied.
+
+        A macro that cannot resolve yet answers False: the only reason it can't is an
+        unresolved required ``{x:NN}`` slot, which OSManager seeds to a free value during the
+        write, so there is no single path to probe.
+        """
+        destination, _relative = self._build_workflow_save_path(f"{file_name}.py")
+        try:
+            resolved = destination.resolve()
+        except FileLoadError:
+            return False
+        return Path(resolved).exists()
 
     def _determine_save_target(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -3597,7 +3873,6 @@ class WorkflowManager(EngineScoped):
             )
         )
 
-        # `await build_workflow()` constructs the graph before the executor runs;
         # build_workflow() is the async function emitted by _generate_workflow_file_content
         # that contains all graph-building requests.
         await_main_call = ast.Expr(
@@ -3610,13 +3885,17 @@ class WorkflowManager(EngineScoped):
             )
         )
 
+        # Build the graph inside the executor's context manager. Entering it activates
+        # the project passed via --project-file-path, and only then is a bundle's own
+        # griptape_nodes_config.json read, which is what registers the bundle's required
+        # node libraries.
+        with_stmt.body = [await_main_call, ensure_context_call, *with_stmt.body]
+
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
             name="aexecute_workflow",
             args=args,
             body=[
-                await_main_call,
-                ensure_context_call,
                 executor_assign,
                 with_stmt,
                 return_stmt,
@@ -4216,10 +4495,12 @@ class WorkflowManager(EngineScoped):
         # Emit `await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(...))` once
         # per declared library so build_workflow() registers its own dependencies before any
         # CreateNodeRequest runs. Without this, running the workflow file as a standalone script
-        # (uv run workflow.py) would have no libraries registered when nodes are created, since
-        # LocalWorkflowExecutor's __aenter__ runs after build_workflow() and is gated by
-        # skip_library_loading=True. perform_discovery_if_not_found=True lets the registration
-        # find the library JSON via the engine's normal config-driven discovery path.
+        # (uv run workflow.py) would have no libraries registered when nodes are created:
+        # LocalWorkflowExecutor is constructed with skip_library_loading=True, so app
+        # initialization deliberately loads none. perform_discovery_if_not_found=True lets the
+        # registration find the library JSON via the engine's normal config-driven discovery
+        # path, which resolves against the bundle's own config layer -- activated by entering
+        # the executor's context manager, which build_workflow() now runs inside.
         if library_names:
             import_recorder.add_from_import(
                 "griptape_nodes.retained_mode.events.library_events", "RegisterLibraryFromFileRequest"
@@ -5997,7 +6278,9 @@ class WorkflowManager(EngineScoped):
 
         if not workflow_result.execution_successful:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
+            )
 
         # Get flows after importing to find the new referenced sub flow
         flows_after = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
@@ -6030,8 +6313,24 @@ class WorkflowManager(EngineScoped):
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
         )
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
-            created_flow_name=created_flow_name, result_details=details
+            created_flow_name=created_flow_name,
+            status=workflow_result.status,
+            result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
+
+    def _import_result_details(
+        self, workflow_result: WorkflowExecutionResult, message: str, *, level: int
+    ) -> ResultDetails:
+        """Render an import result, naming the subflow's problems only if nobody else will.
+
+        Nested inside a load, the subflow's problems have already bubbled into the enclosing
+        frame and will be reported on that load's result; naming them here too would warn twice
+        for one condition. Imported on its own -- the editor dropping a workflow into a flow --
+        there is no such load, so this is the only result that can name them.
+        """
+        if self.is_loading_workflow():
+            return ResultDetails(message=message, level=level)
+        return ResultDetails(*self._execution_result_details(workflow_result, level=level, message=message))
 
     @staticmethod
     def _select_top_level_imported_flow(
@@ -6095,25 +6394,38 @@ class WorkflowManager(EngineScoped):
             )
             return BranchWorkflowResultFailure(result_details=details)
 
-        # Generate branch name if not provided
-        branch_name = request.branched_workflow_name
-        if branch_name is None:
-            base_name = request.workflow_name
-            counter = 1
-            branch_name = f"{base_name}_branch_{counter}"
-            while WorkflowRegistry.has_workflow_with_name(branch_name):
-                counter += 1
-                branch_name = f"{base_name}_branch_{counter}"
+        # A caller-supplied display name has to actually say something; a blank label would leave the
+        # branch looking nameless everywhere the editor shows a workflow title.
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None and not requested_display_name.strip():
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' with an empty display name. "
+                "Provide a display name with at least one non-whitespace character, or leave it unset "
+                "to name the branch after the workflow it came from."
+            )
+            return BranchWorkflowResultFailure(result_details=details)
 
-        # Check if branch name already exists
-        if WorkflowRegistry.has_workflow_with_name(branch_name):
-            details = f"Failed to branch workflow '{request.workflow_name}' because branch name '{branch_name}' already exists"
+        branch_naming = self._resolve_branch_naming(request=request, source_workflow=source_workflow)
+        branch_name = branch_naming.registry_key
+        branch_display_name = branch_naming.display_name
+
+        # Refuse a name that is already taken, in either namespace that can claim it. This is the
+        # only collision guard a caller-supplied `branched_workflow_name` passes through -- the
+        # counter walk inside _resolve_branch_naming runs only when the caller named nothing --
+        # so it has to be the same predicate, or a supplied name lands on an existing branch and
+        # the situation's overwrite policy replaces it.
+        if self._branch_name_taken(branch_name):
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' as '{branch_name}'. "
+                "Failed because a workflow is already saved under that name."
+            )
             return BranchWorkflowResultFailure(result_details=details)
 
         try:
             # Create branch metadata by copying source metadata
             branch_metadata = WorkflowMetadata(
-                name=branch_name,
+                # The display name, not the registry key: `branch_name` is a file path.
+                name=branch_display_name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6130,9 +6442,6 @@ class WorkflowManager(EngineScoped):
                 branched_from=request.workflow_name,
             )
 
-            # Prepare branch file path
-            branch_file_path = f"{branch_name}.py"
-
             # Read source workflow content and replace metadata header
             source_file_path = WorkflowRegistry.get_complete_file_path(source_file_path_rel)
             if not Path(source_file_path).exists():
@@ -6147,20 +6456,26 @@ class WorkflowManager(EngineScoped):
                 details = f"Failed to replace metadata header for branch workflow '{branch_name}'"
                 return BranchWorkflowResultFailure(result_details=details)
 
-            # Write branch workflow file to disk BEFORE registering in registry
-            branch_full_path = WorkflowRegistry.get_complete_file_path(branch_file_path)
-            Path(branch_full_path).write_text(branch_content, encoding="utf-8")
+            # Write the branch file to disk BEFORE registering it (the registry requires the
+            # file to exist), through the save_workflow situation so a branch lands where the
+            # project puts workflows rather than at the workspace root.
+            created = self._create_workflow_file(branch_name, branch_content)
+            if not created.success:
+                details = f"Failed to branch workflow '{request.workflow_name}': {created.error_details}"
+                return BranchWorkflowResultFailure(result_details=details)
 
-            # Now create the branch workflow in registry (file must exist on disk first)
+            # Key by the path actually written, and report that key: callers open the branch by
+            # the name they get back.
+            branch_registry_key = derive_registry_key(created.relative_file_path)
             WorkflowRegistry.generate_new_workflow(
-                registry_key=derive_registry_key(branch_file_path),
+                registry_key=branch_registry_key,
                 metadata=branch_metadata,
-                file_path=branch_file_path,
+                file_path=created.relative_file_path,
             )
 
             details = f"Successfully branched workflow '{request.workflow_name}' as '{branch_name}'"
             return BranchWorkflowResultSuccess(
-                branched_workflow_name=branch_name,
+                branched_workflow_name=branch_registry_key,
                 original_workflow_name=request.workflow_name,
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
@@ -6172,7 +6487,95 @@ class WorkflowManager(EngineScoped):
             traceback.print_exc()
             return BranchWorkflowResultFailure(result_details=details)
 
-    def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:
+    class _BranchNaming(NamedTuple):
+        """The two distinct names a new branch needs.
+
+        `registry_key` is the workspace-relative file path minus its extension, used to key the
+        registry. `display_name` is the human-readable title stored as `metadata.name`. Conflating
+        them is what made branches show up in the editor as file paths.
+        """
+
+        registry_key: str
+        display_name: str
+
+    def _resolve_branch_naming(self, *, request: BranchWorkflowRequest, source_workflow: Workflow) -> _BranchNaming:
+        """Pick the registry key and display name for a new branch of ``source_workflow``.
+
+        The two are resolved together because the label depends on how the key was chosen: an
+        auto-generated key contributes its ``_branch_<n>`` counter to the label, while a
+        caller-supplied key does not. ``request.branched_workflow_display_name``, when given, wins
+        over either derivation; ``on_branch_workflow_request`` has already rejected a blank one.
+        """
+        branch_counter = None
+        branch_registry_key = request.branched_workflow_name
+        if branch_registry_key is None:
+            branch_counter = 1
+            branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+            while self._branch_name_taken(branch_registry_key):
+                branch_counter += 1
+                branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None:
+            return self._BranchNaming(registry_key=branch_registry_key, display_name=requested_display_name.strip())
+
+        derived_display_name = self._derive_branch_display_name(
+            source_display_name=source_workflow.metadata.name,
+            source_registry_key=request.workflow_name,
+            branch_registry_key=branch_registry_key,
+            branch_counter=branch_counter,
+        )
+        return self._BranchNaming(registry_key=branch_registry_key, display_name=derived_display_name)
+
+    def _branch_name_taken(self, branch_registry_key: str) -> bool:
+        """Whether a candidate branch name is unavailable, in either namespace that can claim it.
+
+        A branch is registered under the path ``save_workflow`` wrote it to, so a name can be
+        free as a registry key and still resolve onto a file that is already there -- the two
+        never meet when the source is keyed workspace-relative and the destination is outside
+        the workspace. Walking the counter on the registry alone would keep offering the same
+        name, and the situation's overwrite policy would replace the earlier branch with it.
+        """
+        if WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+            return True
+        return self._workflow_destination_exists(branch_registry_key)
+
+    def _derive_branch_display_name(
+        self,
+        *,
+        source_display_name: str | None,
+        source_registry_key: str,
+        branch_registry_key: str,
+        branch_counter: int | None,
+    ) -> str:
+        """Compute the human-readable label (``metadata.name``) for a new branch.
+
+        A registry key is a file path; ``metadata.name`` is a title. Using the key as the label makes
+        a branch of "Shot 010 Comp" read as "shots/sh010/comp_branch_1" everywhere the editor shows a
+        workflow name, and the deeper the folder structure the worse it reads.
+
+        * ``branch_counter`` is set when the caller auto-generated the branch key as
+          ``<source key>_branch_<counter>``. The label mirrors that counter so it stays in step with
+          the key: "Shot 010 Comp (branch 1)".
+        * ``branch_counter`` is None when the caller supplied ``branched_workflow_name`` themselves.
+          They chose the key, so its final path segment is the most faithful label available.
+        """
+        if branch_counter is None:
+            return PurePosixPath(branch_registry_key).name
+
+        source_label = (source_display_name or "").strip()
+        if source_label:
+            # Keep only the final segment. A path-shaped source label is exactly the bug this
+            # derivation exists to fix -- branches created before it carry their full registry key as
+            # their name -- so deriving from one verbatim would carry the path forward.
+            source_label = PurePosixPath(source_label).name.strip()
+        if not source_label:
+            # A blank (or purely separator) display name means the source's own metadata is corrupt.
+            # A label off the file path beats propagating emptiness onto the branch.
+            source_label = PurePosixPath(source_registry_key).name
+        return f"{source_label} (branch {branch_counter})"
+
+    def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
         try:
             template_workflow = WorkflowRegistry.get_workflow_by_name(request.template_name)
@@ -6208,7 +6611,6 @@ class WorkflowManager(EngineScoped):
 
         base_name = request.file_name or Path(template_file_path_rel).stem
         new_file_name = self._generate_unique_filename(base_name)
-        relative_file_path = f"{new_file_name}.py"
 
         new_metadata = WorkflowMetadata(
             name=new_file_name,
@@ -6237,18 +6639,24 @@ class WorkflowManager(EngineScoped):
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        new_full_path = WorkflowRegistry.get_complete_file_path(relative_file_path)
-        Path(new_full_path).write_text(new_content, encoding="utf-8")
+        created = self._create_workflow_file(new_file_name, new_content)
+        if not created.success:
+            details = f"Attempted to create workflow from template '{request.template_name}'. {created.error_details}"
+            return CreateWorkflowFromTemplateResultFailure(result_details=details)
+
+        # Key by the path actually written, and hand that key back: the caller puts the new
+        # workflow into context by this name, so it has to be the name the registry holds.
+        registry_key = derive_registry_key(created.relative_file_path)
         WorkflowRegistry.generate_new_workflow(
-            registry_key=derive_registry_key(relative_file_path),
+            registry_key=registry_key,
             metadata=new_metadata,
-            file_path=relative_file_path,
+            file_path=created.relative_file_path,
         )
 
         details = f"Successfully created workflow '{new_file_name}' from template '{request.template_name}'"
         return CreateWorkflowFromTemplateResultSuccess(
-            workflow_name=new_file_name,
-            file_path=new_full_path,
+            workflow_name=registry_key,
+            file_path=created.absolute_path,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
@@ -6288,7 +6696,11 @@ class WorkflowManager(EngineScoped):
         try:
             # Create updated metadata for source workflow - update timestamp
             merged_metadata = WorkflowMetadata(
-                name=source_workflow_name,
+                # Carry the source's existing display name across. `source_workflow_name` came from
+                # the branch's `branched_from`, which holds a registry key (a file path), so using it
+                # here would overwrite the source's correct title with a path and persist that to disk.
+                # A merge changes the source's contents, never what it is called.
+                name=source_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6389,7 +6801,11 @@ class WorkflowManager(EngineScoped):
 
             # Create updated metadata for branch workflow - preserve branch relationship and source timestamp
             reset_metadata = WorkflowMetadata(
-                name=request.workflow_name,
+                # Keep the branch's own display name. A reset discards the branch's *content* changes;
+                # its identity fields below (creation_date, branched_from, is_template) are likewise
+                # kept from the branch, and its title belongs with them. `request.workflow_name` is a
+                # registry key, so using it would overwrite the branch's title with a path on disk.
+                name=branch_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6734,7 +7150,9 @@ class WorkflowManager(EngineScoped):
                 # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await find_files_recursive(path, "*.py"):
+                for workflow_file in await find_files_recursive(
+                    path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
+                ):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).

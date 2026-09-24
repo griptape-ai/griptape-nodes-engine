@@ -12,6 +12,7 @@ import send2trash
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
@@ -56,8 +57,8 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
 
 # Windows MAX_PATH constant for tests
 WINDOWS_MAX_PATH = 260
@@ -73,16 +74,16 @@ class TestWriteFileRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_write_text_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_text_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully writing a text file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Hello, World!")
 
@@ -94,9 +95,9 @@ class TestWriteFileRequest:
         assert result.bytes_written > 0
         assert file_path.read_text() == "Hello, World!"
 
-    def test_write_binary_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_binary_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully writing a binary file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.bin"
         content = b"\x00\x01\x02\x03"
         request = WriteFileRequest(file_path=str(file_path), content=content)
@@ -109,9 +110,9 @@ class TestWriteFileRequest:
         assert result.bytes_written == len(content)
         assert file_path.read_bytes() == content
 
-    def test_write_file_append_mode(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_append_mode(self, engine: Engine, temp_dir: Path) -> None:
         """Test appending to an existing file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("Initial content\n")
 
@@ -121,9 +122,9 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_text() == "Initial content\nAppended content\n"
 
-    def test_write_file_overwrite_policy(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_overwrite_policy(self, engine: Engine, temp_dir: Path) -> None:
         """Test overwriting an existing file with OVERWRITE policy."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("Old content")
 
@@ -135,9 +136,9 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_text() == "New content"
 
-    def test_write_file_fail_policy(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_fail_policy(self, engine: Engine, temp_dir: Path) -> None:
         """Test FAIL policy when file exists."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("Existing content")
 
@@ -152,9 +153,9 @@ class TestWriteFileRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "exists" in result.result_details.result_details[0].message.lower()
 
-    def test_write_file_create_parents_true(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_create_parents_true(self, engine: Engine, temp_dir: Path) -> None:
         """Test creating parent directories when create_parents=True."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "subdir" / "nested" / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
@@ -164,9 +165,9 @@ class TestWriteFileRequest:
         assert file_path.exists()
         assert file_path.read_text() == "Content"
 
-    def test_write_file_create_parents_false(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_create_parents_false(self, engine: Engine, temp_dir: Path) -> None:
         """Test failure when parent directory missing and create_parents=False."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "nonexistent" / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=False)
 
@@ -175,9 +176,9 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
-    def test_write_file_invalid_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
         """Test invalid path handling - attempting to write to a directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # Create a directory and try to write to it as if it were a file
         dir_path = temp_dir / "test_directory"
         dir_path.mkdir()
@@ -197,13 +198,16 @@ class TestWriteFileRequest:
         else:
             assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
 
-    def test_write_file_permission_denied(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
         """Test permission denied error."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
-        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=PermissionError("Permission denied"),
+        ):
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
@@ -220,48 +224,48 @@ class TestReadFileRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_read_text_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_read_text_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully reading a text file."""
         file_path = temp_dir / "test.txt"
         file_path.write_text("Test content")
 
         request = ReadFileRequest(file_path=str(file_path))
-        result = griptape_nodes.handle_request(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == "Test content"
         assert result.encoding == "utf-8"
 
-    def test_read_binary_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_read_binary_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully reading a binary file."""
         file_path = temp_dir / "test.bin"
         content = b"\x00\x01\x02\x03"
         file_path.write_bytes(content)
 
         request = ReadFileRequest(file_path=str(file_path))
-        result = griptape_nodes.handle_request(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultSuccess)
         # Binary files might be returned as base64 or bytes
         assert result.content is not None
 
-    def test_read_file_not_found(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_read_file_not_found(self, engine: Engine, temp_dir: Path) -> None:
         """Test reading non-existent file returns FILE_NOT_FOUND."""
         request = ReadFileRequest(file_path=str(temp_dir / "nonexistent.txt"))
 
-        result = griptape_nodes.handle_request(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_read_file_permission_denied(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_read_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
         """Test reading file without permission."""
         file_path = temp_dir / "test.txt"
         file_path.write_text("Content")
@@ -270,17 +274,17 @@ class TestReadFileRequest:
 
         # Mock the file operation to raise PermissionError
         with patch.object(Path, "open", side_effect=PermissionError("Permission denied")):
-            result = griptape_nodes.handle_request(request)
+            result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
-    def test_read_file_invalid_path(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_read_file_invalid_path(self, engine: Engine) -> None:
         """Test reading with invalid path - empty path."""
         # Empty path is invalid
         request = ReadFileRequest(file_path="")
 
-        result = griptape_nodes.handle_request(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultFailure)
         # INVALID_PATH is returned for empty path
@@ -297,16 +301,16 @@ class TestCreateFileRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_create_empty_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_empty_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test creating an empty file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = CreateFileRequest(path=str(temp_dir / "test.txt"), workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
@@ -314,9 +318,9 @@ class TestCreateFileRequest:
         assert isinstance(result, CreateFileResultSuccess)
         assert (temp_dir / "test.txt").exists()
 
-    def test_create_file_with_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_file_with_content(self, engine: Engine, temp_dir: Path) -> None:
         """Test creating a file with initial content."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = CreateFileRequest(path=str(temp_dir / "test.txt"), content="Initial content", workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
@@ -324,9 +328,9 @@ class TestCreateFileRequest:
         assert isinstance(result, CreateFileResultSuccess)
         assert (temp_dir / "test.txt").read_text() == "Initial content"
 
-    def test_create_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_directory_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test creating a directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = CreateFileRequest(path=str(temp_dir / "testdir"), is_directory=True, workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
@@ -334,9 +338,9 @@ class TestCreateFileRequest:
         assert isinstance(result, CreateFileResultSuccess)
         assert (temp_dir / "testdir").is_dir()
 
-    def test_create_file_already_exists(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_file_already_exists(self, engine: Engine, temp_dir: Path) -> None:
         """Test creating file that already exists returns success with warning."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("Existing")
 
@@ -349,9 +353,9 @@ class TestCreateFileRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "exists" in result.result_details.result_details[0].message.lower()
 
-    def test_create_file_permission_denied(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
         """Test permission denied when creating file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = CreateFileRequest(path=str(temp_dir / "test.txt"), workspace_only=False)
 
         # CreateFile uses Path.touch() for empty files, not Path.open()
@@ -372,16 +376,16 @@ class TestRenameFileRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_rename_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_rename_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully renaming a file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         old_path = temp_dir / "old.txt"
         new_path = temp_dir / "new.txt"
         old_path.write_text("Content")
@@ -394,9 +398,9 @@ class TestRenameFileRequest:
         assert new_path.exists()
         assert new_path.read_text() == "Content"
 
-    def test_rename_file_source_not_found(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_rename_file_source_not_found(self, engine: Engine, temp_dir: Path) -> None:
         """Test renaming non-existent file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = RenameFileRequest(
             old_path=str(temp_dir / "nonexistent.txt"), new_path=str(temp_dir / "new.txt"), workspace_only=False
         )
@@ -406,9 +410,9 @@ class TestRenameFileRequest:
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_rename_file_destination_exists(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_rename_file_destination_exists(self, engine: Engine, temp_dir: Path) -> None:
         """Test renaming when destination already exists."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         old_path = temp_dir / "old.txt"
         new_path = temp_dir / "new.txt"
         old_path.write_text("Old content")
@@ -420,9 +424,9 @@ class TestRenameFileRequest:
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_rename_file_permission_denied(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_rename_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
         """Test permission denied when renaming."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         old_path = temp_dir / "old.txt"
         new_path = temp_dir / "new.txt"
         old_path.write_text("Content")
@@ -446,16 +450,16 @@ class TestListDirectoryRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_list_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully listing a directory with sequence grouping disabled."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # Create some test files
         (temp_dir / "file1.txt").write_text("Content 1")
         (temp_dir / "file2.txt").write_text("Content 2")
@@ -470,16 +474,14 @@ class TestListDirectoryRequest:
         assert names == {"file1.txt", "file2.txt", "subdir"}
         assert result.sequences == []
 
-    def test_bounds_clip_entire_sequence_files_stay_in_entries(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
         """Files fully clipped by start_number/end_number remain in entries.
 
         Regression: consumed_filenames must not be updated before the active-range
         check — otherwise listing removes sequence-member files from entries even
         though no Sequence is returned for them.
         """
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "render.0001.exr").write_text("f1")
         (temp_dir / "render.0002.exr").write_text("f2")
 
@@ -497,9 +499,7 @@ class TestListDirectoryRequest:
         assert "render.0001.exr" in entry_names
         assert "render.0002.exr" in entry_names
 
-    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
         """Files outside the active range remain in entries even when a Sequence is returned.
 
         Regression: consumed_filenames was populated from the full bare_names set
@@ -507,7 +507,7 @@ class TestListDirectoryRequest:
         [active.first, active.last]. Files clipped by start_number/end_number were
         silently dropped from entries despite never appearing in any Sequence.
         """
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         for i in range(1, 6):
             (temp_dir / f"render.{i:04d}.exr").write_text(f"f{i}")
 
@@ -527,9 +527,9 @@ class TestListDirectoryRequest:
         # Frame 1 is outside the active range — it must not be consumed
         assert "render.0001.exr" in entry_names
 
-    def test_list_directory_groups_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_groups_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """Test that numbered files are grouped into Sequence objects by default."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "render.0001.exr").write_text("frame 1")
         (temp_dir / "render.0002.exr").write_text("frame 2")
         (temp_dir / "render.0003.exr").write_text("frame 3")
@@ -551,9 +551,9 @@ class TestListDirectoryRequest:
         assert seq.first == 1
         assert seq.last == 3  # noqa: PLR2004
 
-    def test_single_sequence_file_stays_in_entries(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_single_sequence_file_stays_in_entries(self, engine: Engine, temp_dir: Path) -> None:
         """A lone file that looks like a sequence pattern must not be grouped into a Sequence."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "render.0001.exr").write_text("frame 1")
         (temp_dir / "readme.txt").write_text("notes")
 
@@ -566,9 +566,9 @@ class TestListDirectoryRequest:
         assert "render.0001.exr" in entry_names
         assert "readme.txt" in entry_names
 
-    def test_list_directory_hidden_files(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_hidden_files(self, engine: Engine, temp_dir: Path) -> None:
         """Test listing directory with hidden files."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "visible.txt").write_text("Content")
         (temp_dir / ".hidden").write_text("Hidden")
 
@@ -587,9 +587,9 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultSuccess)
         assert len(result.entries) == 2  # noqa: PLR2004
 
-    def test_list_directory_not_found(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_not_found(self, engine: Engine, temp_dir: Path) -> None:
         """Test listing non-existent directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = ListDirectoryRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
 
         result = os_manager.on_list_directory_request(request)
@@ -597,9 +597,9 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_list_directory_not_a_directory(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_not_a_directory(self, engine: Engine, temp_dir: Path) -> None:
         """Test listing a file instead of directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "file.txt"
         file_path.write_text("Content")
 
@@ -609,9 +609,9 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_list_directory_permission_denied(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_list_directory_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
         """Test permission denied when listing directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False)
 
         # Mock os.scandir() instead of Path.iterdir() since we now use os.scandir() for better performance
@@ -625,11 +625,9 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
-    def test_list_directory_symlink_to_file_preserves_symlink_path(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_list_directory_symlink_to_file_preserves_symlink_path(self, engine: Engine, temp_dir: Path) -> None:
         """Symlink-to-file entries return the symlink path, not the resolved target."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         target_file = temp_dir / "target.txt"
         target_file.write_text("content")
         symlink_file = temp_dir / "link.txt"
@@ -652,11 +650,9 @@ class TestListDirectoryRequest:
         assert symlink_path.resolve() == target_file.resolve()
         assert str(symlink_path) == str(symlink_file.absolute())
 
-    def test_list_directory_symlink_to_directory_preserves_symlink_path(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_list_directory_symlink_to_directory_preserves_symlink_path(self, engine: Engine, temp_dir: Path) -> None:
         """Symlink-to-directory entries return the symlink path, not the resolved target."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         target_dir = temp_dir / "target_dir"
         target_dir.mkdir()
         (target_dir / "nested.txt").write_text("nested")
@@ -690,15 +686,15 @@ class TestListDirectorySequencesRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_returns_only_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_returns_only_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """Non-sequence files are absent from the result; sequences are present."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "render.0001.exr").write_text("f1")
         (temp_dir / "render.0002.exr").write_text("f2")
         (temp_dir / "readme.txt").write_text("notes")
@@ -713,11 +709,9 @@ class TestListDirectorySequencesRequest:
         assert seq.first == 1
         assert seq.last == 2  # noqa: PLR2004
 
-    def test_empty_directory_returns_success_with_no_sequences(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_empty_directory_returns_success_with_no_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """A directory with no sequences returns an empty success, not a failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "readme.txt").write_text("notes")
 
         request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
@@ -726,9 +720,9 @@ class TestListDirectorySequencesRequest:
         assert isinstance(result, ListDirectorySequencesResultSuccess)
         assert result.sequences == []
 
-    def test_padding_filter_excludes_mismatched_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_padding_filter_excludes_mismatched_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """sequence_options.padding=4 keeps only #### sequences; ### sequences are excluded."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "hi.0001.exr").write_text("f1")  # 4-digit
         (temp_dir / "hi.0002.exr").write_text("f2")
         (temp_dir / "lo.001.exr").write_text("f1")  # 3-digit
@@ -745,9 +739,9 @@ class TestListDirectorySequencesRequest:
         assert len(result.sequences) == 1
         assert result.sequences[0].padding == 4  # noqa: PLR2004
 
-    def test_delegates_failure_from_inner_request(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_delegates_failure_from_inner_request(self, engine: Engine, temp_dir: Path) -> None:
         """A bad directory path surfaces as a failure result."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = ListDirectorySequencesRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
         from griptape_nodes.retained_mode.events.os_events import ListDirectorySequencesResultFailure
 
@@ -766,11 +760,11 @@ class TestDeduceSequencesFromFileListRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     def _write_frames(self, directory: Path, basename: str, ext: str, frames: list[int]) -> list[str]:
         paths = []
@@ -780,9 +774,9 @@ class TestDeduceSequencesFromFileListRequest:
             paths.append(str(p))
         return paths
 
-    def test_detects_sequence_from_absolute_paths(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_detects_sequence_from_absolute_paths(self, engine: Engine, temp_dir: Path) -> None:
         """A list of absolute file paths is grouped into a Sequence."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
@@ -795,23 +789,23 @@ class TestDeduceSequencesFromFileListRequest:
         assert seq.last == 3  # noqa: PLR2004
         assert len(seq.entries) == 3  # noqa: PLR2004
 
-    def test_empty_file_list_returns_empty_success(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_empty_file_list_returns_empty_success(self, engine: Engine) -> None:
         """An empty file list returns success with no sequences."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = DeduceSequencesFromFileListRequest(file_paths=[])
         result = os_manager.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_bare_filenames_yield_empty_directory(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_bare_filenames_yield_empty_directory(self, engine: Engine) -> None:
         """Bare filenames (no directory component) produce Sequence.directory == ''.
 
         Path('render.0001.exr').parent is '.', which must be normalised to ''
         so that Sequence.directory and entry paths match the documented contract
         rather than emitting './render.0001.exr'.
         """
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = DeduceSequencesFromFileListRequest(
             file_paths=["render.0001.exr", "render.0002.exr"],
         )
@@ -823,9 +817,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert seq.directory == ""
         assert not any(e.path.startswith("./") for e in seq.entries)
 
-    def test_non_sequence_names_do_not_produce_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_non_sequence_names_do_not_produce_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """Plain names without numeric tokens produce no sequences (callers filter directories)."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "frame", "exr", [1, 2])
         paths.append(str(temp_dir / "subdir"))  # bare name with no sequence token
 
@@ -835,9 +829,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1  # subdir produces no sequence
 
-    def test_files_from_multiple_directories(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_files_from_multiple_directories(self, engine: Engine, temp_dir: Path) -> None:
         """Files from different parent directories are grouped independently."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_a = temp_dir / "a"
         dir_b = temp_dir / "b"
         dir_a.mkdir()
@@ -851,9 +845,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 2  # noqa: PLR2004
 
-    def test_no_sequence_files_returns_empty_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_no_sequence_files_returns_empty_success(self, engine: Engine, temp_dir: Path) -> None:
         """Files with no sequence tokens return success with an empty sequences list."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         p = temp_dir / "readme.txt"
         p.write_text("notes")
 
@@ -863,9 +857,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_padding_filter(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_padding_filter(self, engine: Engine, temp_dir: Path) -> None:
         """sequence_options.padding filters to only matching zero-fill width."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths_4 = self._write_frames(temp_dir, "hi", "exr", [1, 2])  # 4-digit
         paths_3 = [str(temp_dir / f"lo.{n:03d}.exr") for n in [1, 2]]
         for p in paths_3:
@@ -881,9 +875,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert len(result.sequences) == 1
         assert result.sequences[0].padding == 4  # noqa: PLR2004
 
-    def test_frame_bounds(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_frame_bounds(self, engine: Engine, temp_dir: Path) -> None:
         """start_number / end_number clip the active range."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3, 4, 5])
 
         request = DeduceSequencesFromFileListRequest(
@@ -903,16 +897,14 @@ class TestDeduceSequencesFromFileListRequest:
         assert seq.last == 4  # noqa: PLR2004
         assert [e.number for e in seq.entries] == [2, 3, 4]
 
-    def test_bounds_clip_entire_sequence_files_stay_in_entries(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
         """Files whose sequence is fully clipped by bounds are NOT removed from the result.
 
         Regression: consumed_filenames must not be updated before the active-range
         check, otherwise files that produce no Sequence (because start_number >
         discovered_last) are silently consumed and callers lose them.
         """
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
 
         # Ask for frames 100+, which clips the entire on-disk range out.
@@ -925,9 +917,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_invalid_bounds_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_invalid_bounds_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """A negative start_number surfaces as INVALID_BOUNDS failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
 
         request = DeduceSequencesFromFileListRequest(
@@ -939,9 +931,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.INVALID_BOUNDS
 
-    def test_abort_policy_with_single_gap_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_abort_policy_with_single_gap_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """ABORT policy with exactly one gap returns ABORTED_AT_GAP with a single-gap message."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 3])  # gap at 2
 
         request = DeduceSequencesFromFileListRequest(
@@ -955,11 +947,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "gap at item 2" in result.result_details.result_details[0].message
 
-    def test_abort_policy_with_multiple_gaps_returns_failure(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_abort_policy_with_multiple_gaps_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """ABORT policy with multiple gaps lists all gap positions in the message."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5])  # gaps at 2, 4
 
         request = DeduceSequencesFromFileListRequest(
@@ -973,9 +963,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "2 gaps" in result.result_details.result_details[0].message
 
-    def test_abort_policy_with_many_gaps_truncates_preview(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_abort_policy_with_many_gaps_truncates_preview(self, engine: Engine, temp_dir: Path) -> None:
         """ABORT with more gaps than ABORTED_AT_GAP_PREVIEW_COUNT appends a '+ N more' suffix."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # 6 gaps: missing 2, 4, 6, 8, 10, 12 — exceeds the preview count of 5
         paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5, 7, 9, 11, 13])
 
@@ -990,9 +980,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "more" in result.result_details.result_details[0].message
 
-    def test_unexpected_exception_returns_unknown_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_unexpected_exception_returns_unknown_failure(self, engine: Engine) -> None:
         """An unexpected exception from the scan is caught and returned as UNKNOWN failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         request = DeduceSequencesFromFileListRequest(file_paths=["render.0001.exr"])
         with patch(
@@ -1006,9 +996,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "boom" in result.result_details.result_details[0].message
 
-    def test_single_frame_sequence_not_returned(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_single_frame_sequence_not_returned(self, engine: Engine, temp_dir: Path) -> None:
         """A sequence with only one present frame is not included in the result."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
@@ -1017,11 +1007,9 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_reject_no_token_behavior_skips_token_less_sequences(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_reject_no_token_behavior_skips_token_less_sequences(self, engine: Engine, temp_dir: Path) -> None:
         """NoTokenBehavior.REJECT causes token-less files to be silently skipped."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2])
 
         request = DeduceSequencesFromFileListRequest(
@@ -1104,21 +1092,21 @@ class TestNormalizePathPartsForSpecialFolder:
 class TestTryResolveWindowsSpecialFolder:
     """Test try_resolve_windows_special_folder helper."""
 
-    def test_unknown_folder_returns_none(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_unknown_folder_returns_none(self, engine: Engine) -> None:
         """Unknown first part returns None."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         result = os_manager.try_resolve_windows_special_folder(["unknown", "sub"])
         assert result is None
 
-    def test_empty_parts_returns_none(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_empty_parts_returns_none(self, engine: Engine) -> None:
         """Empty parts returns None."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         result = os_manager.try_resolve_windows_special_folder([])
         assert result is None
 
-    def test_downloads_resolved_returns_path_and_empty_remaining(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_downloads_resolved_returns_path_and_empty_remaining(self, engine: Engine) -> None:
         """Known folder with no remaining parts."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         mock_path = Path("/mock/Downloads")
 
         def mock_get(csidl: int) -> Path:
@@ -1131,9 +1119,9 @@ class TestTryResolveWindowsSpecialFolder:
         assert result.special_path == mock_path
         assert result.remaining_parts == []
 
-    def test_desktop_with_remaining_parts(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_desktop_with_remaining_parts(self, engine: Engine) -> None:
         """Known folder with remaining parts."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         mock_path = Path("/mock/Desktop")
 
         def mock_get(csidl: int) -> Path:
@@ -1146,9 +1134,9 @@ class TestTryResolveWindowsSpecialFolder:
         assert result.special_path == mock_path
         assert result.remaining_parts == ["sub", "file.txt"]
 
-    def test_get_folder_raises_returns_none(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_get_folder_raises_returns_none(self, engine: Engine) -> None:
         """When _get_windows_special_folder_path raises WindowsSpecialFolderError, result is None."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         with patch.object(
             os_manager, "_get_windows_special_folder_path", side_effect=WindowsSpecialFolderError("mock")
         ):
@@ -1166,28 +1154,27 @@ class TestExpandPath:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Set workspace to temp_dir for tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_expand_path_relative_resolved_against_cwd(
+    def test_expand_path_relative_anchored_on_workspace(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         temp_dir: Path,  # noqa: ARG002
     ) -> None:
-        """Relative path is resolved against current working directory."""
-        os_manager = griptape_nodes.OSManager()
+        """A path that is still relative after expansion is anchored on the workspace directory."""
+        os_manager = engine.os_manager
         result = os_manager._expand_path("subdir")
-        # resolve_path_safely resolves relative paths against Path.cwd()
-        assert result.is_absolute()
-        assert result.name == "subdir"
+        expected = engine.config_manager.workspace_path / "subdir"
+        assert result == expected
 
-    def test_expand_path_expands_vars_and_tilde(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_expand_path_expands_vars_and_tilde(self, engine: Engine, temp_dir: Path) -> None:
         """Expandvars and expanduser are applied when not a Windows special folder."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # Use a path that won't match Windows special folder logic on this platform
         result = os_manager._expand_path(str(temp_dir))
         assert result == temp_dir or result.resolve() == temp_dir.resolve()
@@ -1195,11 +1182,11 @@ class TestExpandPath:
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific special folder test")
     def test_expand_path_windows_special_folder_mocked(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         temp_dir: Path,  # noqa: ARG002
     ) -> None:
         """On Windows, special folder is resolved via Shell API when path is ~/Downloads."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         mock_downloads = Path("C:/mock/Downloads")
 
         with patch.object(os_manager, "_get_windows_special_folder_path", return_value=mock_downloads) as mock_get:
@@ -1209,16 +1196,79 @@ class TestExpandPath:
 
     def test_expand_path_non_windows_uses_expanduser(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         temp_dir: Path,  # noqa: ARG002
     ) -> None:
         """On non-Windows, ~/path uses expanduser (no special folder logic)."""
         if platform.system() == "Windows":
             pytest.skip("Non-Windows test")
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         result = os_manager._expand_path("~/Downloads")
         expected = resolve_path_safely(Path.home() / "Downloads")
         assert result == expected
+
+
+class TestResolveFilePath:
+    """Test OSManager._resolve_file_path anchoring behaviour."""
+
+    UNSET_VAR_NAME = "GRIPTAPE_UNSET_VAR_FOR_TEST"
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        """Set workspace to temp_dir for tests."""
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
+        yield
+        engine.config_manager.workspace_path = original_workspace
+
+    @pytest.mark.parametrize(
+        "path_str",
+        [
+            "report$.txt",
+            "foo%20bar.txt",
+            "config.json",
+            "data/nested.json",
+        ],
+    )
+    def test_relative_path_anchored_on_workspace(self, engine: Engine, path_str: str) -> None:
+        """Relative paths resolve against the workspace directory, not the process CWD."""
+        os_manager = engine.os_manager
+        result = os_manager._resolve_file_path(path_str)
+        expected = engine.config_manager.workspace_path / path_str
+        assert result == expected
+
+    def test_unresolvable_variable_anchored_on_workspace(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A path naming an undefined variable stays literal and is anchored on the workspace."""
+        monkeypatch.delenv(self.UNSET_VAR_NAME, raising=False)
+        os_manager = engine.os_manager
+        result = os_manager._resolve_file_path(f"${self.UNSET_VAR_NAME}/sub")
+        expected = engine.config_manager.workspace_path / f"${self.UNSET_VAR_NAME}" / "sub"
+        assert result == expected
+
+    def test_tilde_path_not_anchored_on_workspace(self, engine: Engine) -> None:
+        """A ~ path expands to the user's home directory rather than the workspace."""
+        if platform.system() == "Windows":
+            pytest.skip("Windows resolves ~/Downloads through the Shell API special folder path")
+        os_manager = engine.os_manager
+        workspace_path = engine.config_manager.workspace_path
+        result = os_manager._resolve_file_path("~/Downloads")
+        assert result == resolve_path_safely(Path.home() / "Downloads")
+        assert not result.is_relative_to(workspace_path)
+
+    def test_absolute_path_not_anchored_on_workspace(self, engine: Engine, tmp_path: Path) -> None:
+        """An absolute path is returned unchanged rather than being joined onto the workspace."""
+        os_manager = engine.os_manager
+        workspace_path = engine.config_manager.workspace_path
+        absolute_path = resolve_path_safely(tmp_path / "elsewhere" / "file.txt")
+        result = os_manager._resolve_file_path(str(absolute_path))
+        assert result == absolute_path
+        assert not result.is_relative_to(workspace_path)
 
 
 class TestWindowsLongPathHandling:
@@ -1231,12 +1281,12 @@ class TestWindowsLongPathHandling:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def long_path(self, temp_dir: Path) -> Path:
@@ -1246,7 +1296,7 @@ class TestWindowsLongPathHandling:
         path_parts = [temp_dir] + [long_component] * 6  # Will exceed 260 chars
         return Path(*path_parts)
 
-    def test_normalize_path_short_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:  # noqa: ARG002
+    def test_normalize_path_short_path(self, engine: Engine, temp_dir: Path) -> None:  # noqa: ARG002
         r"""Short paths get the \\?\ prefix on Windows, none elsewhere.
 
         The prefix is applied unconditionally on Windows (not gated on length):
@@ -1262,7 +1312,7 @@ class TestWindowsLongPathHandling:
             assert not result.startswith("\\\\?\\")
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
-    def test_normalize_path_long_path_windows(self, griptape_nodes: GriptapeNodes, long_path: Path) -> None:  # noqa: ARG002
+    def test_normalize_path_long_path_windows(self, engine: Engine, long_path: Path) -> None:  # noqa: ARG002
         r"""Test that long paths on Windows get \\?\ prefix."""
         result = normalize_path_for_platform(long_path)
 
@@ -1271,16 +1321,16 @@ class TestWindowsLongPathHandling:
             assert result.startswith("\\\\?\\")
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="Non-Windows test")
-    def test_normalize_path_long_path_non_windows(self, griptape_nodes: GriptapeNodes, long_path: Path) -> None:  # noqa: ARG002
+    def test_normalize_path_long_path_non_windows(self, engine: Engine, long_path: Path) -> None:  # noqa: ARG002
         """Test that long paths on non-Windows don't get prefix."""
         result = normalize_path_for_platform(long_path)
 
         # On non-Windows, no prefix should be added
         assert not result.startswith("\\\\?\\")
 
-    def test_write_file_with_long_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_write_file_with_long_path(self, engine: Engine, temp_dir: Path) -> None:
         """Test writing file with long path works correctly."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # Create a moderately long path (not exceeding OS limits)
         subdir = temp_dir / ("a" * 30) / ("b" * 30) / ("c" * 30)
         file_path = subdir / "test.txt"
@@ -1305,17 +1355,17 @@ class TestDeleteFileRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.mark.asyncio
-    async def test_delete_file_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_file_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully deleting a file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
@@ -1331,9 +1381,9 @@ class TestDeleteFileRequest:
         assert not file_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_empty_directory(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_empty_directory(self, engine: Engine, temp_dir: Path) -> None:
         """Test deleting an empty directory."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         request = DeleteFileRequest(path=str(dir_path), workspace_only=False)
@@ -1347,9 +1397,9 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_with_contents(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_directory_with_contents(self, engine: Engine, temp_dir: Path) -> None:
         """Test deleting a directory with contents."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1374,10 +1424,10 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_without_collect_returns_only_top_level(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """Test that deleting a directory without collect_deleted_paths returns only the top-level path."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1395,9 +1445,9 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_nonexistent_file_fails(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_nonexistent_file_fails(self, engine: Engine, temp_dir: Path) -> None:
         """Test that deleting a nonexistent file fails."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "nonexistent.txt"
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
 
@@ -1407,9 +1457,9 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
     @pytest.mark.asyncio
-    async def test_delete_invalid_path_fails(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_delete_invalid_path_fails(self, engine: Engine) -> None:
         """Test that deleting with neither path nor file_entry fails."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = DeleteFileRequest(path=None, file_entry=None)
 
         result = await os_manager.on_delete_file_request(request)
@@ -1418,9 +1468,9 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
     @pytest.mark.asyncio
-    async def test_delete_with_permission_error(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_with_permission_error(self, engine: Engine, temp_dir: Path) -> None:
         """Test that permission errors are properly handled."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
 
@@ -1436,9 +1486,9 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_permanently_delete(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_permanently_delete(self, engine: Engine, temp_dir: Path) -> None:
         """Test default PERMANENTLY_DELETE behavior for files."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(
@@ -1454,11 +1504,9 @@ class TestDeleteFileRequest:
         assert not file_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_permanently_delete(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_directory_behavior_permanently_delete(self, engine: Engine, temp_dir: Path) -> None:
         """Test default PERMANENTLY_DELETE behavior for directories."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1476,11 +1524,9 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_recycle_bin_only_success(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_file_behavior_recycle_bin_only_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior successfully sends file to recycle bin."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
 
@@ -1500,11 +1546,9 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_recycle_bin_only_success(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_directory_behavior_recycle_bin_only_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior successfully sends directory to recycle bin."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1526,11 +1570,9 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_recycle_bin_only_failure(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_file_behavior_recycle_bin_only_failure(self, engine: Engine, temp_dir: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior returns failure when recycle bin unavailable."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
 
@@ -1549,11 +1591,9 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_recycle_bin_only_failure(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_directory_behavior_recycle_bin_only_failure(self, engine: Engine, temp_dir: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior returns failure for directories when I/O error occurs."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1573,11 +1613,9 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_prefer_recycle_bin_uses_trash(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_file_behavior_prefer_recycle_bin_uses_trash(self, engine: Engine, temp_dir: Path) -> None:
         """Test PREFER_RECYCLE_BIN behavior uses recycle bin when available."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
 
@@ -1598,10 +1636,10 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_behavior_prefer_recycle_bin_uses_trash(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """Test PREFER_RECYCLE_BIN behavior uses recycle bin for directories when available."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1623,11 +1661,9 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_prefer_recycle_bin_falls_back(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_file_behavior_prefer_recycle_bin_falls_back(self, engine: Engine, temp_dir: Path) -> None:
         """Test PREFER_RECYCLE_BIN behavior falls back to permanent deletion when trash fails."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
 
@@ -1650,10 +1686,10 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_behavior_prefer_recycle_bin_falls_back(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """Test PREFER_RECYCLE_BIN behavior falls back to permanent deletion for directories when trash fails."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
@@ -1677,11 +1713,9 @@ class TestDeleteFileRequest:
         assert isinstance(result.result_details, ResultDetails)
 
     @pytest.mark.asyncio
-    async def test_delete_outcome_default_is_sent_to_recycle_bin(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    async def test_delete_outcome_default_is_sent_to_recycle_bin(self, engine: Engine, temp_dir: Path) -> None:
         """Test that default deletion (no behavior specified) reports SENT_TO_RECYCLE_BIN outcome."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
@@ -1702,16 +1736,16 @@ class TestGetFileInfoRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_get_file_info_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_get_file_info_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully getting file info."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         file_path.write_text("test content")
         request = GetFileInfoRequest(path=str(file_path), workspace_only=False)
@@ -1725,9 +1759,9 @@ class TestGetFileInfoRequest:
         assert result.file_entry.size > 0
         assert result.file_entry.mime_type is not None
 
-    def test_get_directory_info_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_get_directory_info_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test successfully getting directory info."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "testdir"
         dir_path.mkdir()
         request = GetFileInfoRequest(path=str(dir_path), workspace_only=False)
@@ -1740,9 +1774,9 @@ class TestGetFileInfoRequest:
         assert result.file_entry.name == "testdir"
         assert result.file_entry.mime_type is None
 
-    def test_get_file_info_nonexistent_returns_none(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_get_file_info_nonexistent_returns_none(self, engine: Engine, temp_dir: Path) -> None:
         """Test that getting info for nonexistent path returns success with file_entry=None."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "nonexistent.txt"
         request = GetFileInfoRequest(path=str(file_path), workspace_only=False)
 
@@ -1751,9 +1785,9 @@ class TestGetFileInfoRequest:
         assert isinstance(result, GetFileInfoResultSuccess)
         assert result.file_entry is None
 
-    def test_get_file_info_empty_path_fails(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_get_file_info_empty_path_fails(self, engine: Engine) -> None:
         """Test that empty path fails."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = GetFileInfoRequest(path="", workspace_only=False)
 
         result = os_manager.on_get_file_info_request(request)
@@ -1787,16 +1821,16 @@ class TestCreateNewFilePolicy:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_first_file(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_first_file(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW policy creates file with requested name if available."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
         request = WriteFileRequest(
             file_path=str(file_path),
@@ -1812,9 +1846,9 @@ class TestCreateNewFilePolicy:
         assert Path(result.final_file_path).resolve() == expected_path.resolve()
         assert expected_path.read_text() == "First file"
 
-    def test_create_new_increments_suffix(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_increments_suffix(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW policy increments suffix for subsequent files."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # Create first file (gets output.txt since it's available)
@@ -1847,9 +1881,9 @@ class TestCreateNewFilePolicy:
         assert isinstance(result3, WriteFileResultSuccess)
         assert (temp_dir / "output_2.txt").exists()
 
-    def test_create_new_fills_gaps(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_fills_gaps(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW policy fills gaps in sequence."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "render.png"
 
         # Create render.png and files with gaps manually
@@ -1869,7 +1903,7 @@ class TestCreateNewFilePolicy:
         assert Path(result.final_file_path).resolve() == expected_path.resolve()
 
     def test_create_new_with_fully_resolved_macro_should_use_suffix_injection(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """Test CREATE_NEW policy with fully-resolved MacroPath falls back to suffix injection.
 
@@ -1880,7 +1914,7 @@ class TestCreateNewFilePolicy:
         from griptape_nodes.common.macro_parser import ParsedMacro
         from griptape_nodes.retained_mode.events.project_events import MacroPath
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         # Create first file manually
         first_file = temp_dir / "render.png"
@@ -1960,17 +1994,15 @@ class TestGetNextUnusedFilenameRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_base_filename_available_returns_unindexed_path(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_base_filename_available_returns_unindexed_path(self, engine: Engine, temp_dir: Path) -> None:
         """When the base filename is free, preview returns that path and no index."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "render.png"
 
         result = os_manager.on_get_next_unused_filename_request(
@@ -1982,11 +2014,9 @@ class TestGetNextUnusedFilenameRequest:
         assert result.index_used is None
         assert not requested_path.exists()
 
-    def test_existing_base_filename_returns_indexed_candidate(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_existing_base_filename_returns_indexed_candidate(self, engine: Engine, temp_dir: Path) -> None:
         """When base exists, preview switches to indexed naming."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         (temp_dir / "render.png").write_text("base")
 
         result = os_manager.on_get_next_unused_filename_request(
@@ -1997,9 +2027,9 @@ class TestGetNextUnusedFilenameRequest:
         assert result.index_used == 1
         assert Path(result.available_filename).resolve() == (temp_dir / "render_1.png").resolve()
 
-    def test_macro_without_unresolved_index_fails(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_macro_without_unresolved_index_fails(self, engine: Engine, temp_dir: Path) -> None:
         """Macro path without an unresolved index variable cannot be auto-incremented."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         macro_path = MacroPath(parsed_macro=ParsedMacro(f"{temp_dir}/render.png"), variables={})
 
         result = os_manager.on_get_next_unused_filename_request(GetNextUnusedFilenameRequest(file_path=macro_path))
@@ -2007,7 +2037,7 @@ class TestGetNextUnusedFilenameRequest:
         assert isinstance(result, GetNextUnusedFilenameResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_sequence_format_glob_uses_permissive_wildcard(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_sequence_format_glob_uses_permissive_wildcard(self, engine: Engine) -> None:
         """The glob builder emits ``*`` for ``SequenceFormat`` slots, not fixed-width ``?`` chars.
 
         Pins the new branch added for #4902: ``SequenceFormat`` means
@@ -2018,8 +2048,8 @@ class TestGetNextUnusedFilenameRequest:
         """
         from griptape_nodes.common.macro_parser.resolution import partial_resolve
 
-        os_manager = griptape_nodes.OSManager()
-        secrets_manager = GriptapeNodes.SecretsManager()
+        os_manager = engine.os_manager
+        secrets_manager = engine.secrets_manager
 
         # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
         sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
@@ -2043,15 +2073,15 @@ class TestGetNextVersionIndexRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_required_index_returns_one_when_no_matches(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_required_index_returns_one_when_no_matches(self, engine: Engine, temp_dir: Path) -> None:
         """Required index templates start at index 1 when nothing exists yet."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
@@ -2064,9 +2094,9 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 1
 
-    def test_optional_index_is_rejected_as_invalid_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_optional_index_is_rejected_as_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
         """Optional index templates currently fail because no required unresolved index exists."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
@@ -2079,9 +2109,9 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_missing_unresolved_index_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_missing_unresolved_index_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """Requests without an unresolved {_index} variable should fail as invalid path input."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render.png"),
@@ -2094,7 +2124,7 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_sequence_slot_scan_skips_non_numeric_siblings(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sequence_slot_scan_skips_non_numeric_siblings(self, engine: Engine, temp_dir: Path) -> None:
         """Regression: scanning a `{###}` macro with a non-numeric sibling must not crash.
 
         `SequenceFormat` slots use a permissive `*` glob, so `render_vfinal.png`
@@ -2108,12 +2138,32 @@ class TestGetNextVersionIndexRequest:
         (temp_dir / "render_v002.png").touch()
         (temp_dir / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render_v{###}.png"),
                 variables={"outputs": str(temp_dir)},
             )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 3  # noqa: PLR2004
+
+    def test_project_directory_left_for_the_project_to_resolve(self, engine: Engine, temp_dir: Path) -> None:
+        """Regression: `{outputs}` supplied by the project, not the caller, must not count as a second slot.
+
+        DirectoryDestination and build_versioned_sequence_destination pass project macros
+        without binding `{outputs}`. The scan used to see `outputs` and `_index` both
+        unresolved and fail with "requires at most one unresolved variable".
+        """
+        outputs_dir = temp_dir / "outputs"
+        (outputs_dir / "renders_v001").mkdir(parents=True)
+        (outputs_dir / "renders_v002").mkdir()
+
+        os_manager = engine.os_manager
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/renders_v{###}"), variables={})
         )
         result = os_manager.on_get_next_version_index_request(request)
 
@@ -2130,15 +2180,15 @@ class TestMakeDirectoryRequest:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_directory_success(self, engine: Engine, temp_dir: Path) -> None:
         """Creating a directory that does not yet exist returns success with already_existed=False."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "new_dir"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path)))
@@ -2148,9 +2198,9 @@ class TestMakeDirectoryRequest:
         assert not result.already_existed
         assert Path(result.created_path).resolve() == dir_path.resolve()
 
-    def test_directory_already_exists_exist_ok_true(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_directory_already_exists_exist_ok_true(self, engine: Engine, temp_dir: Path) -> None:
         """When the directory already exists and exist_ok=True, returns success with already_existed=True."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "existing_dir"
         dir_path.mkdir()
 
@@ -2159,9 +2209,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultSuccess)
         assert result.already_existed
 
-    def test_directory_already_exists_exist_ok_false(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_directory_already_exists_exist_ok_false(self, engine: Engine, temp_dir: Path) -> None:
         """When the directory already exists and exist_ok=False, returns POLICY_NO_OVERWRITE failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "existing_dir"
         dir_path.mkdir()
 
@@ -2170,9 +2220,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
 
-    def test_file_at_path_returns_invalid_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_file_at_path_returns_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
         """When a file already exists at the requested path, returns INVALID_PATH failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "not_a_dir.txt"
         file_path.write_text("content")
 
@@ -2181,9 +2231,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_create_parents_true(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_parents_true(self, engine: Engine, temp_dir: Path) -> None:
         """With create_parents=True, missing intermediate directories are created."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "a" / "b" / "c"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=True))
@@ -2191,9 +2241,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultSuccess)
         assert dir_path.is_dir()
 
-    def test_create_parents_false_missing_parent(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_parents_false_missing_parent(self, engine: Engine, temp_dir: Path) -> None:
         """With create_parents=False and a missing parent, returns POLICY_NO_CREATE_PARENT_DIRS failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "missing_parent" / "child"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=False))
@@ -2201,9 +2251,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
-    def test_invalid_path_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_invalid_path_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """A path that cannot be resolved returns INVALID_PATH before any filesystem operation."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         with patch.object(OSManager, "_resolve_file_path", side_effect=ValueError("bad path")):
             result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(temp_dir / "any")))
@@ -2211,9 +2261,9 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_permission_denied_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_permission_denied_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
         """A PermissionError from mkdir is surfaced as a PERMISSION_DENIED failure."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         dir_path = temp_dir / "protected_dir"
 
         with patch.object(Path, "mkdir", side_effect=PermissionError("Permission denied")):
@@ -2232,9 +2282,9 @@ class TestCopyFile:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
-    def test_copy_file_copies_contents(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_copy_file_copies_contents(self, engine: Engine, temp_dir: Path) -> None:
         """A basic copy replicates contents and returns the byte count."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         src = temp_dir / "src.txt"
         dst = temp_dir / "dst.txt"
         content = "hello, world"
@@ -2245,14 +2295,14 @@ class TestCopyFile:
         assert dst.read_text() == content
         assert bytes_copied == len(content.encode())
 
-    def test_copy_file_ignores_eperm_from_metadata(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_copy_file_ignores_eperm_from_metadata(self, engine: Engine, temp_dir: Path) -> None:
         """An EPERM from the metadata step (e.g. chflags SF_ARCHIVED on an SMB mount) must not fail the copy.
 
         Regression test for issue #5109: shutil.copy2 propagates the EPERM that chflags raises when
         replicating BSD file flags onto an SMB destination, even though the file contents copy fine.
         _copy_file copies contents first and then best-effort the metadata, swallowing the EPERM.
         """
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         src = temp_dir / "src.txt"
         dst = temp_dir / "dst.txt"
         content = "contents survive metadata failure"
@@ -2264,3 +2314,28 @@ class TestCopyFile:
         # The copy succeeds: contents are on disk and the byte count is returned.
         assert dst.read_text() == content
         assert bytes_copied == len(content.encode())
+
+
+class TestPlatformName:
+    """platform_name collapses sys.platform onto the Platform values keyed off elsewhere.
+
+    Values are asserted against a patched ``sys.platform`` so the tests run identically on
+    any host OS.
+    """
+
+    def test_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "win32")
+        assert OSManager.platform_name() == Platform.WINDOWS
+
+    def test_mac(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "darwin")
+        assert OSManager.platform_name() == Platform.DARWIN
+
+    def test_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "linux")
+        assert OSManager.platform_name() == Platform.LINUX
+
+    def test_unrecognized_platform_falls_back_to_sys_platform(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Reporting something beats reporting nothing, so the result is never empty.
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "freebsd14")
+        assert OSManager.platform_name() == "freebsd14"

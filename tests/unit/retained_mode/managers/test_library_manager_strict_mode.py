@@ -18,7 +18,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import current_engine
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
@@ -92,7 +92,7 @@ class _ViolatingProbe:
 class TestSerializeSchemasStrictMode:
     @pytest.mark.asyncio
     async def test_clean_class_is_included(self, patched_registry: Callable[[dict[str, type]], Any]) -> None:
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"Clean": _CleanProbe}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -103,7 +103,7 @@ class TestSerializeSchemasStrictMode:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.DEBUG, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"Violator": _ViolatingProbe, "Clean": _CleanProbe}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -141,10 +141,10 @@ class TestHuggingFaceRepoParameterSurvivesTheProbe:
             msg = f"bus request issued during probe construction: {type(request).__name__}"
             raise AssertionError(msg)
 
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with (
             patch(f"{module}.huggingface_repo_parameter.list_repo_revisions_in_cache", return_value=[]),
-            patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=_refuse_bus),
+            patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=_refuse_bus),
             patched_registry({"HFNode": _ProbeWithHuggingFaceRepoParam}),
         ):
             schemas = await manager._serialize_library_node_schemas("libA")
@@ -156,10 +156,6 @@ class TestHuggingFaceRepoParameterSurvivesTheProbe:
 
 class _DummyTrait(Trait):
     """Minimal concrete Trait used to exercise the trait-detection path."""
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["dummy"]
 
 
 class _ProbeWithConverterParam:
@@ -208,7 +204,7 @@ class TestParameterBehaviorsDropped:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"Clean": _ProbeWithCleanParams}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -220,7 +216,7 @@ class TestParameterBehaviorsDropped:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"WithBehavior": _ProbeWithConverterParam}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -237,7 +233,7 @@ class TestParameterBehaviorsDropped:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"WithValidator": _ProbeWithValidatorParam}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -251,7 +247,7 @@ class TestParameterBehaviorsDropped:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"WithTrait": _ProbeWithTraitParam}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -314,7 +310,7 @@ class TestInertWorkerHooks:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"WithConnHook": _ProbeWithConnectionHook}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -331,7 +327,7 @@ class TestInertWorkerHooks:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"WithValueHook": _ProbeWithValueHook}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -350,7 +346,7 @@ class TestInertWorkerHooks:
         # griptape_nodes.) is not the author's code; flagging it would nag on
         # something the library author cannot remediate.
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"EngineHook": _ProbeInheritingEngineHook}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
@@ -362,7 +358,7 @@ class TestInertWorkerHooks:
         self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
     ) -> None:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
-        manager = GriptapeNodes.LibraryManager()
+        manager = current_engine().library_manager
         with patched_registry({"Clean": _CleanProbe}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
