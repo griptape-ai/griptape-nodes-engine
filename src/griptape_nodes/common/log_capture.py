@@ -1,22 +1,12 @@
 """Process-wide log capture used to build diagnostics bundles.
 
-Two sinks are attached to the ``griptape_nodes`` logger:
+Two sinks on the ``griptape_nodes`` logger: a ring buffer of recent records, on by default
+so a bundle carries this session without the reporter reproducing anything, and an optional
+rotating file so logs outlive the process.
 
-- A ring buffer of the most recent records, on by default. It exists so a
-  diagnostics bundle carries this session's logs without the person reporting
-  the problem having had to enable a setting and reproduce it first.
-- An optional rotating file, so logs outlive the process and can be collected
-  for a time range rather than only for the current session.
-
-Both handlers sit at DEBUG so they add no filtering of their own, but the
-``griptape_nodes`` logger's own level still gates what reaches them: at the
-default ``log_level`` of INFO, DEBUG records are discarded before any handler
-runs. Raising ``log_level`` to DEBUG is what puts debug detail in a bundle.
-
-Both sinks are process-global, because the ``griptape_nodes`` logger is shared
-by every ``Engine`` in the process. ``configure_diagnostic_logging`` is
-therefore idempotent and last-call-wins, matching how ``ConfigManager`` already
-sets the shared log level.
+Both sit at DEBUG, so the logger's own ``log_level`` is what gates them. Both are
+process-global, shared by every ``Engine``, making ``configure_diagnostic_logging``
+idempotent and last-call-wins.
 """
 
 from __future__ import annotations
@@ -56,11 +46,8 @@ logger = logging.getLogger(LOGGER_NAME)
 class DiagnosticFormatter(logging.Formatter):
     """Renders a record as one plain, greppable line in UTC.
 
-    Deliberately not the Rich console format: a diagnostics bundle is read with
-    a text editor and grep, so it carries an unambiguous ISO timestamp and no
-    escape codes. ``engine_prefix`` (set by the worker-designator filter) and
-    ``node_name`` are included when present so a line can be attributed to the
-    worker and node that produced it.
+    Not the Rich format: a bundle is read with a text editor, so no escape codes. Includes
+    ``engine_prefix`` and ``node_name`` when present, to attribute a line to its worker and node.
     """
 
     converter = time.gmtime
@@ -229,9 +216,8 @@ def configure_diagnostic_logging(
 ) -> bool:
     """Install or update the diagnostic log sinks on the ``griptape_nodes`` logger.
 
-    Safe to call repeatedly: the ring buffer is resized in place so nothing
-    already captured is lost, and the file sink is only reopened when its
-    destination actually changes.
+    Safe to call repeatedly: the ring buffer is resized in place, and the file sink is
+    reopened only when its destination changes.
 
     Args:
         buffer_lines: Lines to retain in memory. Zero or less disables the buffer.
@@ -241,11 +227,9 @@ def configure_diagnostic_logging(
             keeps them forever.
 
     Returns:
-        Whether the sinks now installed are the ones that were asked for. False means
-        file logging was requested and the directory could not be created or the file
-        could not be opened, both of which are logged as warnings here. Callers that
-        remember what they applied must not remember a False: the condition is usually
-        temporary, and the next call is the only chance to pick the setting up again.
+        Whether the sinks now installed are the ones that were asked for. False means file
+        logging was requested and the directory or file could not be opened, both logged as
+        warnings here. Callers must not remember a False: the condition is usually temporary.
     """
     # Held across the whole body: two engines in one process install these shared sinks from
     # their own threads, and interleaved calls leak an open file or split one session's log.
@@ -290,9 +274,8 @@ class _LogFileAge(NamedTuple):
 def find_log_files(directory: Path | None = None) -> list[Path]:
     """Return every engine log file in a directory, newest first.
 
-    Includes rotated backups (``engine-....log.1`` and friends). A missing or
-    unreadable directory yields an empty list rather than raising, so a
-    diagnostics collection never fails just because no log directory exists.
+    Includes rotated backups (``engine-....log.1``). A missing or unreadable directory
+    yields an empty list rather than raising, so a collection never fails for want of one.
     """
     search_dir = directory if directory is not None else default_log_directory()
     if not search_dir.is_dir():
@@ -319,15 +302,11 @@ def find_log_files(directory: Path | None = None) -> list[Path]:
 def prune_log_files(directory: Path, retention_days: int, *, protected_name: str | None = None) -> int:
     """Delete engine log files older than the retention window.
 
-    The file this process is writing is never deleted, and neither is
-    ``protected_name``. Age alone is not enough to keep them: an engine that has been
-    running longer than the retention window has a log file whose modification time
+    The file this process is writing is never deleted, and neither is ``protected_name``.
+    Age alone is not enough: an engine running longer than the window has a log whose mtime
     falls outside it, and on POSIX deleting a file another process holds open silently
-    discards the rest of that engine's session while it keeps writing.
-
-    A file open in a *different* process cannot be recognized from here, so a second
-    engine's current log is still at risk once it ages out. Names carry the start time
-    and pid, so the window for that is the whole retention period rather than a race.
+    discards the rest of that session. A file open in a *different* process cannot be
+    recognized from here, so a second engine's current log is still at risk once it ages out.
 
     Args:
         directory: Directory to prune.
@@ -386,14 +365,9 @@ def _configure_buffer(buffer_lines: int) -> None:
 def _configure_file_handler(directory: Path, retention_days: int) -> bool:
     """Point the rotating file sink at ``directory``, replacing any existing one.
 
-    Returns whether the sink is now writing into ``directory``. A failure leaves any
-    handler already installed alone, so logging keeps working, just somewhere else.
-
-    Nothing in the directory is scanned or deleted until the file is open. A caller that
-    remembers what it applied must not remember a failure, so it asks again on every config
-    load while the destination stays unwritable -- and pruning first meant that directory was
-    re-scanned on each of those loads, which is the work the caller's own guard exists to
-    avoid.
+    Returns whether the sink is now writing into ``directory``. A failure leaves any handler
+    already installed alone. Nothing in the directory is scanned or deleted until the file is
+    open, so a destination that stays unwritable is not re-scanned on every config load.
     """
     file_name = _log_file_name()
     target_path = directory / file_name
@@ -448,11 +422,8 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
 def _warn_once_per_destination(target_path: Path, message: str, *args: object) -> None:
     """Report that file logging is unavailable, once per destination rather than per attempt.
 
-    `configure_diagnostic_logging` is asked again on every config load while it is failing,
-    because the reason is usually temporary -- a volume not mounted yet, a permission fix on
-    its way -- and the next call is the only chance to pick the setting back up. Saying so
-    every time would bury the console log the engine is still writing under a warning whose
-    answer has not changed since the last one.
+    The caller asks again on every config load while it fails, because the reason is usually
+    temporary. Warning each time would bury the console log under an unchanged answer.
     """
     if _state.unwritable_path == target_path:
         return
@@ -464,9 +435,8 @@ def _warn_once_per_destination(target_path: Path, message: str, *args: object) -
 def _remove_file_handler() -> None:
     """Detach and close the rotating file sink, if one is installed.
 
-    Clears the destination `_warn_once_per_destination` is holding either way: a sink being
-    replaced or switched off ends the run of attempts that warning was suppressing, so the
-    next destination to fail -- including this one, if it is asked for again -- is reported.
+    Clears the destination `_warn_once_per_destination` is holding: replacing or switching off
+    a sink ends the run of attempts it was suppressing, so the next failure is reported.
     """
     _state.unwritable_path = None
     if _state.file_handler is None:
@@ -480,13 +450,9 @@ def _remove_file_handler() -> None:
 def _log_file_name() -> str:
     """Return this process's log file name, computing it only once.
 
-    The start timestamp plus the pid keeps two engines on one machine (and two
-    runs whose pids happen to collide) in separate files, while still sorting
-    chronologically in a directory listing.
-
-    Cached for the life of the process, because the settings are applied several
-    times while an engine boots. A name that moved with the clock would open a new
-    file on every reconfiguration and split one session's logs across all of them.
+    Start timestamp plus pid keeps two engines on one machine in separate files while still
+    sorting chronologically. Cached because settings are applied several times during boot,
+    and a name that moved with the clock would split one session across several files.
     """
     if _state.file_name is None:
         started = time.strftime("%Y%m%d-%H%M%S", time.gmtime())

@@ -24,13 +24,9 @@ _session_log_home_patch = patch.object(log_capture, "xdg_state_home", lambda: Pa
 def _real_log_directory() -> Path | None:
     """The developer's real engine log directory, or None on a machine that has no home.
 
-    Deliberately the real one, computed from the unpatched ``xdg_state_home``, so the guard
-    below can check the suite against it. Read, never written.
-
-    Worked out on demand rather than at import time because ``xdg_state_home`` raises when
-    there is no home directory to find -- a Windows service account has none -- and at
-    import that failure takes down collection of every test in the suite rather than
-    skipping the one guard that needs it.
+    The real one, from the unpatched ``xdg_state_home``, so the guard below can check the suite
+    against it. Read, never written. Worked out on demand because ``xdg_state_home`` raises with
+    no home to find, and at import that takes down collection of the whole suite.
     """
     try:
         return xdg_state_home() / "griptape_nodes" / "logs"
@@ -64,14 +60,10 @@ def pytest_unconfigure() -> None:
 def own_log_files_in_real_log_directory() -> list[str]:
     """Log files this process has written into the developer's real engine log directory.
 
-    Empty unless the isolation above stopped working. Snapshotted in ``pytest_configure``
-    rather than in this fixture because the leak it catches happened during collection,
-    when a test module imported one of the modules that builds a ``ConfigManager`` at
-    import time -- earlier than a fixture of any scope can run.
-
-    Pruning needs no guard of its own. Files are only aged out of a directory the file sink
-    was pointed at, and pointing it at one creates a file of this process's own there
-    first, so anything the suite deleted it is also listed here for having created.
+    Empty unless the isolation above stopped working. Snapshotted in ``pytest_configure`` because
+    the leak it catches happened during collection, earlier than a fixture of any scope can run.
+    Pruning needs no guard of its own: a directory the sink was pointed at already holds a file
+    of this process's own, so anything the suite deleted is listed here for having created.
     """
     real_log_directory = _real_log_directory()
     if real_log_directory is None:
@@ -118,14 +110,12 @@ def reset_beta_feature_warnings() -> None:
 def isolate_engine_logs() -> Generator[Path, None, None]:
     """Give each test its own engine log directory.
 
-    ``logging.log_to_file`` is on by default, so every engine a test builds attaches a
-    rotating file sink to the shared logger and ages out anything older than
-    ``log_retention_days``. Per test, so one test's log files are never what another test
-    finds; ``pytest_configure`` above is what keeps the real directory out of reach.
+    ``logging.log_to_file`` is on by default, so every engine a test builds attaches a rotating
+    file sink to the shared logger and ages out old files. Per test, so one test's log files are
+    never what another finds; ``pytest_configure`` is what keeps the real directory out of reach.
 
-    ``xdg_state_home`` is the seam rather than ``default_log_directory``, because tests
-    import that function directly and would otherwise compare a temporary directory
-    against the real one.
+    ``xdg_state_home`` is the seam rather than ``default_log_directory``, which tests import
+    directly and would otherwise compare a temporary directory against the real one.
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         state_home = Path(temp_dir)

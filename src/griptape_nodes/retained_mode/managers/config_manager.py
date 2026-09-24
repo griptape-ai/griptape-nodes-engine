@@ -270,8 +270,8 @@ class _LayerProbe(NamedTuple):
 class _LoggingSettings(NamedTuple):
     """Everything the shared logger and its diagnostic sinks are configured from.
 
-    Held as one value so a config reload can tell whether any of it actually changed:
-    every reload would otherwise re-scan the log directory for files to age out.
+    One value so a config reload can tell whether any of it changed; otherwise every reload
+    would re-scan the log directory for files to age out.
 
     Attributes:
         log_level: Verbosity of the ``griptape_nodes`` logger, which bounds what any
@@ -423,15 +423,12 @@ class ConfigManager(EngineScoped):
     def log_directory(self) -> Path:
         """Directory the engine's log files are written to.
 
-        Resolved from the ``logging.log_directory`` setting, empty meaning the default
-        location. Exposed as a property so a report of where logs go and the sink that
-        puts them there cannot disagree.
+        Resolved from ``logging.log_directory``, empty meaning the default. A property so a
+        report of where logs go and the sink that puts them there cannot disagree.
 
-        Read with secret expansion off. A value beginning with ``$`` would otherwise be
-        looked up through the secrets manager, and this property is read while the
-        ``ConfigManager`` is being constructed -- before the engine has a secrets manager to
-        ask. A log directory written as ``$LOG_DIR`` would take the engine down at startup,
-        with no log to say why. A leading ``$`` is treated as part of the directory name.
+        Read with secret expansion off: this runs while the ``ConfigManager`` is being built,
+        before there is a secrets manager to ask, so a directory written as ``$LOG_DIR`` would
+        take the engine down at startup with no log to say why. A leading ``$`` is part of the name.
         """
         return resolve_log_directory(
             self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str, should_load_env_var_if_detected=False)
@@ -2315,13 +2312,12 @@ class ConfigManager(EngineScoped):
     def _apply_logging_settings(self) -> None:
         """Point the shared logger and its diagnostic sinks at what the config now says.
 
-        The one place logging is configured from, called at the end of every config load
-        so no caller has to remember to. Like ``_set_log_level``, it reaches the
-        process-wide ``griptape_nodes`` logger, so the last engine to load a config in a
-        process wins: there is one logger, so there is one answer to where its output goes.
+        The one place logging is configured from, called at the end of every config load. Like
+        ``_set_log_level`` it reaches the process-wide logger, so the last engine to load a
+        config wins -- one logger, one answer to where its output goes.
 
-        Does nothing when nothing relevant changed. Every config write reloads, and
-        re-applying would re-scan the log directory for files to age out each time.
+        Does nothing when nothing relevant changed, because every config write reloads and
+        re-applying would re-scan the log directory each time.
         """
         settings = self._resolve_logging_settings()
         if settings == self._applied_logging_settings:
@@ -2344,22 +2340,14 @@ class ConfigManager(EngineScoped):
     def _resolve_logging_settings(self) -> _LoggingSettings:
         """Read the settings the logger and its sinks are built from.
 
-        Every one is read with secret expansion off, for the reason the ``log_directory``
-        property gives: expansion looks a ``$``-prefixed value up through
-        ``self.engine.secrets_manager``, and this runs at the end of every config load --
-        including the one inside ``ConfigManager.__init__``, which ``Engine.__init__``
-        performs before it has a ``SecretsManager`` to look anything up in. The
-        ``AttributeError`` would come out of a constructor: not a broken log file, an engine
-        that refuses to start, reported with no log behind it to say why. Nothing is lost by
-        reading these literally, because none of them is a credential -- a line count, a day
-        count, a flag, and a directory.
+        Every one with secret expansion off, for the reason the ``log_directory`` property
+        gives: this runs inside ``ConfigManager.__init__``, before ``Engine.__init__`` has a
+        ``SecretsManager``, so expansion would raise ``AttributeError`` out of a constructor.
+        None of them is a credential -- a line count, a day count, a flag, and a directory.
 
-        Each is also coerced to the type this returns it as. ``load_configs`` validates the
-        merged config against ``Settings``, but keeps the values as written rather than as
-        pydantic parsed them, so a config file saying ``"log_to_file": "false"`` passes
-        validation and leaves a *string* in the config -- one that is perfectly truthy, so
-        file logging would stay on for a user who turned it off. The counts arrive the same
-        way, and reach a comparison against zero that a string cannot be part of.
+        Each is also coerced to the type this returns. ``load_configs`` validates against
+        ``Settings`` but keeps values as written, so ``"log_to_file": "false"`` would leave a
+        truthy *string* in the config and file logging on for a user who turned it off.
         """
         return _LoggingSettings(
             log_level=str(self.merged_config.get("log_level", LogLevel.INFO.value)),

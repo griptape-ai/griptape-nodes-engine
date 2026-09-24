@@ -1,9 +1,8 @@
 """Tests for the process-wide diagnostic log capture.
 
-Both sinks hang off the shared ``griptape_nodes`` logger and are held in module state, so
-the risky behavior here is not formatting but reconfiguration: an engine applies its
-settings several times while it boots, and every one of those calls must leave the same
-single file open and the already-captured lines intact.
+Both sinks hang off the shared ``griptape_nodes`` logger and live in module state, so the
+risky behavior is reconfiguration: an engine applies its settings several times while it
+boots, and every call must leave the same file open and the captured lines intact.
 """
 
 from __future__ import annotations
@@ -246,11 +245,10 @@ class TestDefaultLogDirectory:
     def test_a_machine_with_no_home_directory_still_gets_somewhere_to_log(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The default location sits under the user's data directory, so it needs a home.
+        """The default location sits under the user's state directory, so it needs a home.
 
-        A Windows service account, or a container run without `USERPROFILE`, has none, and
-        the standard library raises rather than returning a guess -- which came out of
-        `ConfigManager.__init__` and stopped the engine starting.
+        A Windows service account, or a container without `USERPROFILE`, has none, and the
+        standard library raises -- which came out of `ConfigManager.__init__` and stopped startup.
         """
         monkeypatch.setattr(log_capture, "xdg_state_home", self._no_home)
 
@@ -298,11 +296,9 @@ class TestResolveLogDirectory:
     ) -> None:
         """This runs from `ConfigManager.__init__`, so raising here stops the engine starting.
 
-        `expanduser` raises rather than leaving the `~` in place, on a machine with no home
-        directory to expand to -- a service account, some containers -- and for `~someone`
-        when that account is not on this machine. Both are reported by the standard library
-        returning the path unchanged, which is what is arranged here, so the real `expanduser`
-        raises for the real reason on every platform.
+        `expanduser` raises rather than leaving the `~` in place when there is no home to expand
+        to, and for `~someone` not on this machine. Arranged by making the standard library
+        return the path unchanged, so the real `expanduser` raises for the real reason everywhere.
         """
         monkeypatch.setattr(os.path, "expanduser", lambda path: path)
 
@@ -316,10 +312,9 @@ class TestResolveLogDirectory:
 class TestSuiteIsolation:
     """The developer's own log directory is not the suite's to write in, or to prune.
 
-    ``log_to_file`` is on by default and the sinks are process-global, so this is on by
-    accident rather than on purpose: nothing in a test has to ask for file logging to get
-    it. Deleting a week-old file is the half that loses something, and it happens without a
-    single assertion noticing.
+    ``log_to_file`` is on by default and the sinks are process-global, so this is on by accident:
+    nothing in a test has to ask for file logging. Deleting a week-old file loses something, and
+    it happens without a single assertion noticing.
     """
 
     def test_this_run_wrote_no_log_file_into_the_real_log_directory(
@@ -335,10 +330,9 @@ class TestSuiteIsolation:
     def test_the_default_log_directory_is_somewhere_temporary(self) -> None:
         """A redirect is in place right now, which the guard above cannot tell on its own.
 
-        It only reports leaks that have already happened, so on the first run after the
-        isolation breaks it fails somewhere unrelated instead. This says so directly, though
-        only for the moment a test runs: the per-test fixture patches the same seam, so
-        passing here does not prove the session-wide patch that covers collection is on.
+        That guard only reports leaks already made, so the first run after isolation breaks fails
+        somewhere unrelated. This says so directly, but only for the moment a test runs: the
+        per-test fixture patches the same seam, so passing does not prove the session-wide patch is on.
         """
         assert xdg_state_home() not in default_log_directory().parents
 
@@ -421,9 +415,8 @@ class TestConfigureDiagnosticLogging:
     ) -> None:
         """Logging is a diagnostic aid; failing to open a file must never fail a startup.
 
-        This is the `mkdir` guard specifically -- the parent is a regular file, so the
-        directory can never be made. Asserted on the message that guard writes, since the
-        one below it says something very similar about a different failure.
+        The `mkdir` guard specifically -- the parent is a regular file, so the directory can never
+        be made. Asserted on that guard's own message, since the one below says something similar.
         """
         blocked = tmp_path / "blocked"
         blocked.write_text("not a directory", encoding="utf-8")
@@ -440,10 +433,8 @@ class TestConfigureDiagnosticLogging:
     ) -> None:
         """The directory exists, so `mkdir` succeeds and only opening the file can fail.
 
-        A log directory on a read-only volume, or one owned by another user, is a real
-        setup. The file is opened while this guard is in scope rather than on the first
-        record, so the failure is reported here instead of surfacing much later as a
-        handler error on stderr.
+        A read-only volume, or a directory owned by another user, is a real setup. The file is
+        opened while this guard is in scope, so the failure is reported here rather than much later.
         """
         read_only = tmp_path / "read-only"
         read_only.mkdir(mode=0o500)
@@ -486,10 +477,9 @@ class TestConfigureDiagnosticLogging:
 class TestWhetherTheSinksWereInstalled:
     """The return value is a caller's only way to tell a working file sink from a wished-for one.
 
-    ``ConfigManager`` remembers the settings it applied so an unrelated config write does not
-    re-scan the log directory. Remembering a failed attempt would short-circuit every later
-    load, and the reasons this fails -- a volume not mounted yet, a permission fix on its way
-    -- are the temporary kind, so the engine would never write a log file again.
+    ``ConfigManager`` remembers what it applied so an unrelated write does not re-scan the log
+    directory. Remembering a failure would short-circuit every later load, and these failures are
+    the temporary kind -- so the engine would never write a log file again.
     """
 
     def test_reports_success_when_the_file_sink_was_installed(self, tmp_path: Path) -> None:
@@ -530,19 +520,17 @@ class TestWhetherTheSinksWereInstalled:
 class TestWhatARetriedFailureCosts:
     """A destination that stays unwritable is asked for again on every config load.
 
-    ``ConfigManager`` deliberately does not remember a failed attempt, because the reasons
-    this fails are the temporary kind and the next call is the only chance to pick the
-    setting back up. That makes the cost of the failing call the thing that matters: it runs
-    for the rest of the process's life, once per config write.
+    ``ConfigManager`` deliberately does not remember a failed attempt, because the next call is
+    the only chance to pick the setting back up. So what the failing call costs is what matters:
+    it runs for the rest of the process's life, once per config write.
     """
 
     @_needs_posix_permissions
     def test_nothing_in_the_directory_is_scanned_when_the_file_cannot_be_opened(self, tmp_path: Path) -> None:
         """Pruning is the expensive half, and there is nothing to keep until the file is open.
 
-        Patched rather than asserted through surviving files: a read-only directory refuses
-        the unlink as well, so an unpruned directory and a pruned-but-undeletable one look
-        identical from outside.
+        Patched rather than asserted through surviving files: a read-only directory refuses the
+        unlink too, so an unpruned directory and a pruned-but-undeletable one look identical.
         """
         read_only = tmp_path / "read-only"
         read_only.mkdir(mode=0o500)
@@ -715,9 +703,8 @@ class TestPruneLogFiles:
     ) -> None:
         """On Windows a file another engine holds open cannot be deleted at all.
 
-        Reported as nothing deleted rather than as a failure: pruning happens on the way to
-        opening a log file, and an engine that will not start because it could not tidy up
-        is a worse outcome than a directory with an extra file in it.
+        Reported as nothing deleted rather than as a failure: pruning happens on the way to opening
+        a log file, and an engine that will not start because it could not tidy up is worse.
         """
         aged = _write_log(tmp_path, f"{LOG_FILE_PREFIX}aged.log", age_days=10)
 

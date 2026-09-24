@@ -1,13 +1,11 @@
 """Tests for how a config load reaches the shared logger and its diagnostic sinks.
 
-Logging is configured from several related settings at once, and any config file can supply
-one of them — the user file, a project file, or a workspace file. So the sinks are applied
-at the end of every load rather than by whichever caller happened to write a setting; a
-load that skipped it left the engine logging somewhere other than where `report.json` said
-it did.
+Any config file can supply one of the related logging settings, so the sinks are applied at the
+end of every load rather than by whichever caller wrote one; a load that skipped it left the
+engine logging somewhere other than where `report.json` said.
 
-The other half is that re-applying is not free. Every config write reloads, and each apply
-re-scans the log directory for files to age out, so an unrelated write must be a no-op.
+Re-applying is not free, though. Every config write reloads and each apply re-scans the log
+directory for files to age out, so an unrelated write must be a no-op.
 """
 
 from __future__ import annotations
@@ -45,11 +43,9 @@ _skip_on_windows = pytest.mark.skipif(
 def restore_the_shared_log_level() -> Generator[None, None, None]:
     """Put the shared logger's level back when a test is done with it.
 
-    Applying the logging settings sets the level on the process-global ``griptape_nodes``
-    logger, and building a ``ConfigManager`` applies them -- so every test in this file
-    changes it, and one that loads DEBUG leaves the rest of the session running at DEBUG.
-    Which tests those are depends on how ``-n auto`` sharded the suite, which is the kind
-    of failure nobody can reproduce.
+    Applying the logging settings sets the level on the process-global logger, and building a
+    ``ConfigManager`` applies them -- so a test that loads DEBUG leaves the rest of the session
+    at DEBUG. Which tests those are depends on how ``-n auto`` sharded, so nobody can reproduce it.
     """
     shared_logger = logging.getLogger("griptape_nodes")
     previous_level = shared_logger.level
@@ -63,9 +59,8 @@ def restore_the_shared_log_level() -> Generator[None, None, None]:
 def manager() -> ConfigManager:
     """A manager whose engine is already built, so nothing builds one inside a patch.
 
-    `ConfigManager()` resolves its engine lazily, and building the root engine constructs a
-    second `ConfigManager` that applies logging settings of its own. Warming it here keeps a
-    test counting only the calls its own manager made.
+    `ConfigManager()` resolves its engine lazily, and building the root engine constructs a second
+    `ConfigManager` that applies logging settings of its own. Warming it here keeps the count honest.
     """
     manager = ConfigManager()
     _ = manager.engine
@@ -98,10 +93,9 @@ class TestLogDirectory:
     ) -> None:
         """Applying the logging settings is part of building one, so this refused to start.
 
-        The default log location sits under the user's data directory, and finding that means
-        finding their home directory. A Windows service account has no `USERPROFILE` and no
-        home directory to find, and the standard library raises rather than guessing -- so
-        the `RuntimeError` came out of `ConfigManager()` itself and took the engine with it.
+        The default log location sits under the user's state directory, so it needs their home.
+        A Windows service account has none, and the standard library raises rather than guessing --
+        so the `RuntimeError` came out of `ConfigManager()` itself and took the engine with it.
         """
 
         def no_home() -> Path:
@@ -180,10 +174,8 @@ class TestApplyLoggingSettings:
     ) -> None:
         """Nothing is remembered as applied until the sinks asked for are really installed.
 
-        The reasons a log file fails to open are the temporary kind -- a volume not mounted
-        yet, a directory someone is about to fix the permissions on. Remembered as done, the
-        no-op check above would then skip every later load, and the engine would go the rest
-        of its life without writing a log file.
+        The reasons a log file fails to open are the temporary kind. Remembered as done, the no-op
+        check above would skip every later load and the engine would never write a log file.
         """
         with patch(_CONFIGURE, return_value=False) as failed:
             manager.set_config_value("logging.log_directory", str(tmp_path))
@@ -219,10 +211,9 @@ class TestApplyLoggingSettings:
 class TestAWrittenSettingIsReadAsTheKindOfThingItIs:
     """A config file holds whatever was typed into it, which is not always the right type.
 
-    Loading validates the merged config against `Settings`, but keeps the values as written
-    rather than as pydantic parsed them. So a setting declared `int` really can arrive as a
-    string of digits, and one declared `bool` as the word "false" -- and both of those are
-    truthy, non-comparable strings by the time the sinks are configured from them.
+    Loading validates the merged config against `Settings` but keeps the values as written, so a
+    setting declared `int` can arrive as a string of digits and one declared `bool` as the word
+    "false" -- both truthy, non-comparable strings by the time the sinks are configured.
     """
 
     @pytest.mark.parametrize(
@@ -234,9 +225,8 @@ class TestAWrittenSettingIsReadAsTheKindOfThingItIs:
     ) -> None:
         """Both counts are compared against zero to decide whether the feature is on at all.
 
-        `"25" <= 0` is a `TypeError`, raised from the end of a config load -- and the first
-        config load happens inside `ConfigManager.__init__`, so it would be an engine that
-        refuses to start rather than a logging setting that misbehaves.
+        `"25" <= 0` is a `TypeError` raised from the end of a config load, and the first load happens
+        inside `ConfigManager.__init__` -- so an engine that refuses to start, not a bad setting.
         """
         isolate_user_config.write_text(json.dumps({"logging": {setting: "25"}}), encoding="utf-8")
 
@@ -259,12 +249,10 @@ class TestAWrittenSettingIsReadAsTheKindOfThingItIs:
     ) -> None:
         """`log_directory` is the one of these four whose declared type accepts a `$` value.
 
-        Reading one with expansion left on resolves it through
-        `self.engine.secrets_manager`, and `Engine.__init__` builds the `ConfigManager`
-        before the `SecretsManager` exists -- so the `AttributeError` would come out of a
-        constructor, with no log file behind it to say why. The other three are declared
-        `int`, `int`, and `bool`, so `Settings` validation rejects a `$` value in one of them
-        and the whole merged config falls back to defaults before any of this runs.
+        Reading one with expansion on resolves it through `self.engine.secrets_manager`, which
+        `Engine.__init__` builds after the `ConfigManager` -- so an `AttributeError` out of a
+        constructor. The other three are declared `int`, `int`, and `bool`, so `Settings` rejects
+        a `$` value and the whole merged config falls back to defaults first.
         """
 
         def no_peers_yet(_manager: object) -> None:
