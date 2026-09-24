@@ -151,11 +151,14 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             **kwargs,
         )
 
-        # Send the run command to actually execute it (fire and forget)
+        # Wait for the run rather than its kickoff, so the result carries the run's verdict, and
+        # keep it on its own task so the event loop below streams the run's events as they happen.
         effective_pickle = (
             pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
         )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(
+            flow_name=flow_name, pickle_control_flow_result=effective_pickle, wait_for_completion=True
+        )
         start_flow_task = asyncio.create_task(GriptapeNodes.ahandle_request(start_flow_request))
 
         is_flow_finished = False

@@ -5,6 +5,7 @@ import base64
 import copy
 import logging
 import pickle
+import time
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
@@ -359,6 +360,10 @@ class FlowManager(EngineScoped):
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder(self.engine)
         self._node_executor = NodeExecutor(self.engine)
+        # The task advancing the live run, and every drive still unwinding. Teardown drops the
+        # live one so a cancelled run stops counting as in progress the moment the cancel returns.
+        self._flow_run_drive: asyncio.Task[None] | None = None
+        self._flow_run_drives: set[asyncio.Task[None]] = set()
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -2768,7 +2773,7 @@ class FlowManager(EngineScoped):
         sanitized_node_name = node_name.replace(" ", "_").replace(".", "_")
         return f"{prefix}{sanitized_node_name}_{parameter_name}"
 
-    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         # which flow
         flow_name = request.flow_name
         if not flow_name:
@@ -2834,7 +2839,7 @@ class FlowManager(EngineScoped):
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
         try:
-            await self.start_flow(
+            run_drive = await self.start_flow(
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
@@ -2844,43 +2849,27 @@ class FlowManager(EngineScoped):
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
-            if resolution_machine.is_errored():
-                error_message = resolution_machine.get_error_message()
-                result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
-                exception = RuntimeError(error_message)
-                # Pass through the error message without adding extra wrapping
-                return StartFlowResultFailure(
-                    validation_exceptions=[exception] if error_message else [], result_details=result_details
-                )
+        # A caller that could not background the run got it inline, so its verdict is already in
+        # and a failed run must not be acknowledged as started.
+        error_message = self._error_from_finished_run(run_drive)
+        if error_message is not None:
+            result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
+            return StartFlowResultFailure(
+                validation_exceptions=[RuntimeError(error_message)], result_details=result_details
+            )
 
-        if request.wait_for_completion:
-            wait_error = await self._await_flow_completion(request.completion_timeout_ms)
-            if wait_error is not None:
-                # On timeout the flow is still running, so cancel it before returning
-                # failure. If the wait ended because the flow already errored, there is
-                # nothing left to cancel and check_for_existing_running_flow() returns False.
-                if self.check_for_existing_running_flow():
-                    try:
-                        await self.cancel_flow_run()
-                    except Exception as cancel_err:
-                        # Defensive: cancellation is best-effort cleanup. Surface a warning
-                        # but keep the original wait_error as the user-visible failure.
-                        logger.warning(
-                            "Attempted to cancel flow '%s' after wait_for_completion failure. "
-                            "Cancellation itself failed because of: %s",
-                            flow_name,
-                            cancel_err,
-                        )
-                exception = RuntimeError(wait_error)
-                return StartFlowResultFailure(
-                    validation_exceptions=[exception],
-                    result_details=f"Flow '{flow_name}' did not complete cleanly: {wait_error}",
-                )
-            details = f"Flow '{flow_name}' kicked off and completed successfully."
-        else:
+        if not request.wait_for_completion:
             details = f"Successfully kicked off flow with name {flow_name}"
+            return StartFlowResultSuccess(result_details=details)
+
+        wait_error = await self._await_run_completion(run_drive, flow_name, request.completion_timeout_ms)
+        if wait_error is not None:
+            return StartFlowResultFailure(
+                validation_exceptions=[RuntimeError(wait_error)],
+                result_details=f"Flow '{flow_name}' did not complete cleanly: {wait_error}",
+            )
+
+        details = f"Flow '{flow_name}' kicked off and completed successfully."
 
         return StartFlowResultSuccess(result_details=details)
 
@@ -2937,7 +2926,7 @@ class FlowManager(EngineScoped):
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
         try:
-            await self.start_flow(
+            run_drive = await self.start_flow(
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
@@ -2947,16 +2936,23 @@ class FlowManager(EngineScoped):
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
-            if resolution_machine.is_errored():
-                error_message = resolution_machine.get_error_message()
-                # Pass through the error message without adding extra wrapping
-                return StartFlowFromNodeResultFailure(
-                    validation_exceptions=[], result_details=error_message or "Flow execution failed"
-                )
+        # See on_start_flow_request: an inline run's verdict is already in.
+        error_message = self._error_from_finished_run(run_drive)
+        if error_message is not None:
+            return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=error_message)
 
-        details = f"Successfully kicked off flow with name {flow_name}"
+        if not request.wait_for_completion:
+            details = f"Successfully kicked off flow with name {flow_name}"
+            return StartFlowFromNodeResultSuccess(result_details=details)
+
+        wait_error = await self._await_run_completion(run_drive, flow_name, request.completion_timeout_ms)
+        if wait_error is not None:
+            return StartFlowFromNodeResultFailure(
+                validation_exceptions=[RuntimeError(wait_error)],
+                result_details=f"Flow '{flow_name}' did not complete cleanly: {wait_error}",
+            )
+
+        details = f"Flow '{flow_name}' kicked off and completed successfully."
 
         return StartFlowFromNodeResultSuccess(result_details=details)
 
@@ -4520,7 +4516,20 @@ class FlowManager(EngineScoped):
         *,
         debug_mode: bool = False,
         pickle_control_flow_result: bool = False,
-    ) -> None:
+    ) -> asyncio.Task[None]:
+        """Seed a run, hand its drive to a task, and return that task.
+
+        The drive is a task rather than an inline await because a run holds its caller for as long
+        as it lasts. Driven inline, `StartFlowRequest` would not answer until the last node
+        finished: the editor's request slot stays open for the whole run, a client-side response
+        timeout turns a healthy run into a visible failure, and the run's own traffic (a cancel, a
+        parameter edit) queues behind a request that has not returned.
+
+        A detached drive needs a loop that is still turning after the request returns, and a caller
+        dispatching synchronously does not have one -- `handle_request` drives async handlers on a
+        throwaway side loop, and a script's `asyncio.run` closes its loop on the way out. Those
+        callers get the run inline instead, so the task is already finished when they see it.
+        """
         if self.check_for_existing_running_flow():
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
@@ -4536,18 +4545,88 @@ class FlowManager(EngineScoped):
 
         # Initialize global control flow machine and DAG builder
 
-        self._global_control_flow_machine = ControlFlowMachine(
+        machine = ControlFlowMachine(
             flow.name, pickle_control_flow_result=pickle_control_flow_result, engine=self.engine
         )
-        # Set off the request here.
+        self._global_control_flow_machine = machine
+        # Seeding is the caller's business: a DAG that cannot be built is a failure to start, and
+        # the caller is still there to be told about it.
         try:
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            await machine.prepare_flow(start_node, debug_mode=debug_mode)
         except Exception:
             await self._abandon_running_flow()
             raise
+
+        run_drive = asyncio.create_task(self._drive_flow_run(machine, flow.name))
+        # asyncio keeps only a weak reference to a running task, so a drive dropped from
+        # `_flow_run_drive` by a teardown could otherwise be collected mid-await.
+        self._flow_run_drives.add(run_drive)
+        run_drive.add_done_callback(self._on_flow_run_drive_done)
+        self._flow_run_drive = run_drive
+
+        if not self._run_can_outlive_request():
+            await run_drive
+
+        return run_drive
+
+    async def _drive_flow_run(self, machine: ControlFlowMachine, flow_name: str) -> None:
+        """Advance one run to its end, and clean up after it either way.
+
+        Raises whatever ended the run so a caller waiting on the drive learns why it ended. The
+        done callback retrieves that same exception for the callers that are not waiting.
+        """
+        try:
+            await machine.drive_flow()
+        except Exception:
+            logger.exception("Run of workflow '%s' ended because of an error.", flow_name)
+            # Only the live run's drive may tear down the live run. A retired drive's run was
+            # already torn down, and the live run by now may be a different one.
+            if self._flow_run_drive is asyncio.current_task():
+                await self._abandon_running_flow()
+            raise
+
+        if self._flow_run_drive is not asyncio.current_task():
+            # The run was torn down under this drive, and whoever tore it down already told the
+            # editor the run is over.
+            return
+
+        if machine.resolution_machine.is_errored():
+            logger.error(
+                "Run of workflow '%s' finished with an error: %s",
+                flow_name,
+                machine.resolution_machine.get_error_message(),
+            )
+
+        # Nothing is blocked on the run any more, which is what an empty involved-nodes list says.
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
+
+    def _error_from_finished_run(self, run_drive: asyncio.Task[None]) -> str | None:
+        """Why a run that has already finished failed. None if it has not finished or did not fail."""
+        if not run_drive.done():
+            return None
+        machine = self._global_control_flow_machine
+        if machine is None or not machine.resolution_machine.is_errored():
+            return None
+        return machine.resolution_machine.get_error_message() or "Flow execution failed"
+
+    def _on_flow_run_drive_done(self, run_drive: asyncio.Task[None]) -> None:
+        """Release the drive, reading its exception so an unwaited run does not look unhandled."""
+        self._flow_run_drives.discard(run_drive)
+        if not run_drive.cancelled():
+            run_drive.exception()
+
+    def _run_can_outlive_request(self) -> bool:
+        """True when this request is being handled on the engine's own loop.
+
+        That loop outlives the request, so a run detached onto it keeps going after the result is
+        published. Any other loop belongs to the caller and stops when the call does.
+        """
+        engine_loop = self.engine.event_manager.event_loop
+        if engine_loop is None:
+            return False
+        return asyncio.get_running_loop() is engine_loop
 
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest
@@ -4671,6 +4750,10 @@ class FlowManager(EngineScoped):
         )
 
     def check_for_existing_running_flow(self) -> bool:
+        # A drive that has been created but has not had its first turn on the loop yet is already a
+        # run in progress: the machine state it would set is not there to be read.
+        if self._flow_run_drive is not None and not self._flow_run_drive.done():
+            return True
         if self._global_control_flow_machine is None:
             return False
         current_state = self._global_control_flow_machine.current_state
@@ -4699,12 +4782,61 @@ class FlowManager(EngineScoped):
             or self._global_control_flow_machine.resolution_machine.is_advancing
         )
 
-    async def _await_flow_completion(self, timeout_ms: int | None) -> str | None:
-        """Block until the current flow resolves, erroring, or the timeout elapses.
+    async def _await_run_completion(
+        self, run_drive: asyncio.Task[None], flow_name: str, timeout_ms: int | None
+    ) -> str | None:
+        """Wait for a kicked-off run to end. Returns None when it ended cleanly, else why it did not.
 
-        Polls `check_for_existing_running_flow()` because the control flow machine does not
-        expose a completion future today; this is the same signal the UI uses to decide when
-        the run is idle. Returns None on clean completion, or an error string describing why
+        The drive is shielded because a timeout here means "stop this run", and stopping a run is
+        `cancel_flow_run`'s job: it unwinds every node politely. Cancelling the drive task instead
+        would drop it mid-node and leave the nodes it was waiting on running.
+        """
+        started_at = time.monotonic()
+        timeout_sec = timeout_ms / 1000 if timeout_ms is not None else None
+        try:
+            await asyncio.wait_for(asyncio.shield(run_drive), timeout=timeout_sec)
+        except TimeoutError:
+            await self._cancel_unfinished_run(flow_name)
+            return f"Timed out waiting for flow completion after {timeout_ms} ms."
+        except Exception as err:
+            # The drive already tore the run down on its way out, so there is nothing to clean up.
+            return str(err) or type(err).__name__
+
+        if self._flow_run_drive is not run_drive:
+            return "The run was cancelled before it finished."
+
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        remaining_ms = None if timeout_ms is None else max(timeout_ms - elapsed_ms, 0)
+        wait_error = await self._await_flow_completion(remaining_ms)
+        if wait_error is not None:
+            await self._cancel_unfinished_run(flow_name)
+        return wait_error
+
+    async def _cancel_unfinished_run(self, flow_name: str) -> None:
+        """Stop a run the caller has given up waiting for, so it is not left going unattended.
+
+        Best-effort: a cancellation that fails on its own account must not replace the reason the
+        wait ended, which is what the caller is told about.
+        """
+        if not self.check_for_existing_running_flow():
+            return
+        try:
+            await self.cancel_flow_run()
+        except Exception as cancel_err:
+            logger.warning(
+                "Attempted to cancel flow '%s' after a wait for it to finish failed. "
+                "Cancellation itself failed because of: %s",
+                flow_name,
+                cancel_err,
+            )
+
+    async def _await_flow_completion(self, timeout_ms: int | None) -> str | None:
+        """Block until the flow reads as idle, erroring, or the timeout elapses.
+
+        Reached with the drive already finished, so the poll only has something to wait for when
+        the run is parked in debug mode: a paused run advances on step requests rather than on its
+        own drive, and `check_for_existing_running_flow()` is the same signal the UI reads to decide
+        whether the run is over. Returns None on clean completion, or an error string describing why
         the wait ended unsuccessfully (timeout, or flow error).
         """
         poll_interval_sec = 0.05
@@ -4734,6 +4866,7 @@ class FlowManager(EngineScoped):
         # Reset control flow machine
         if self._global_control_flow_machine is not None:
             self._global_control_flow_machine.reset_machine(cancel=True)
+        self._retire_live_run_drive()
         self._global_single_node_resolution = False
         self._global_dag_builder.clear()
         logger.debug("Cancelling flow run")
@@ -4773,6 +4906,7 @@ class FlowManager(EngineScoped):
 
         if self._global_control_flow_machine is not None:
             self._global_control_flow_machine.reset_machine(cancel=True)
+        self._retire_live_run_drive()
         self._global_single_node_resolution = False
         self._global_dag_builder.clear()
         self.engine.event_manager.put_event(
@@ -4781,6 +4915,15 @@ class FlowManager(EngineScoped):
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
         )
+
+    def _retire_live_run_drive(self) -> None:
+        """Stop counting the live run's drive as a run in progress.
+
+        The drive notices the teardown and unwinds on its own, which can take as long as the node it
+        is parked on. Dropping the reference here is what lets the next run start straight away
+        instead of waiting for that: an editor Stop followed immediately by Run must not be refused.
+        """
+        self._flow_run_drive = None
 
     def reset_global_execution_state(self) -> None:
         """Reset all global execution state - useful when clearing all workflows."""
@@ -4791,6 +4934,7 @@ class FlowManager(EngineScoped):
             self._global_control_flow_machine.reset_machine()
 
         # Reset control flow machine
+        self._retire_live_run_drive()
         self._global_single_node_resolution = False
 
         # Clear all connections to prevent memory leaks and stale references

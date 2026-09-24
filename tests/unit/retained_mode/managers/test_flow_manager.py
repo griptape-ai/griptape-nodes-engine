@@ -1,11 +1,14 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
+import asyncio
 import base64
 import itertools
 import pickle
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
@@ -16,6 +19,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultFailure
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
@@ -28,7 +32,9 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -340,28 +346,33 @@ class TestStartFlowRequestDefaultsToCurrentContext:
 
 
 class TestStartFlowCancelsOnWaitTimeout:
-    """Tests for the wait_for_completion cancel-on-timeout cleanup in on_start_flow_request."""
+    """Tests for the wait_for_completion cleanup in on_start_flow_request."""
 
-    @pytest.mark.asyncio
-    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, engine: Engine) -> None:
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartFlowRequest,
-            StartFlowResultFailure,
-        )
-        from griptape_nodes.retained_mode.events.validation_events import (
-            ValidateFlowDependenciesResultSuccess,
-        )
-
-        flow_manager = engine.flow_manager
-
+    @staticmethod
+    @contextmanager
+    def _validated_flow(flow_manager: FlowManager, flow_name: str) -> Iterator[None]:
+        """Stand in for everything between the request arriving and the run being kicked off."""
         fake_flow = MagicMock()
-        fake_flow.name = "timeout_flow"
+        fake_flow.name = flow_name
         validate_success = ValidateFlowDependenciesResultSuccess(
             validation_succeeded=True, exceptions=[], result_details="validated"
         )
+        with (
+            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
+            patch.object(
+                flow_manager,
+                "on_validate_flow_dependencies_request",
+                AsyncMock(return_value=validate_success),
+            ),
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
         cancel_mock = AsyncMock()
+        # A drive that outlives the wait, so the timeout is the real one rather than a mocked answer.
+        run_drive = asyncio.create_task(asyncio.sleep(30))
 
         # check_for_existing_running_flow is consulted twice along the wait path:
         # once before kicking off (must be False), and once after the timeout to decide
@@ -369,72 +380,37 @@ class TestStartFlowCancelsOnWaitTimeout:
         running_flow_states = iter([False, True])
 
         with (
-            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
+            self._validated_flow(flow_manager, "timeout_flow"),
             patch.object(
                 flow_manager,
                 "check_for_existing_running_flow",
                 side_effect=lambda: next(running_flow_states),
             ),
-            patch.object(
-                flow_manager,
-                "on_validate_flow_dependencies_request",
-                AsyncMock(return_value=validate_success),
-            ),
-            patch.object(flow_manager, "start_flow", AsyncMock()),
-            patch.object(flow_manager, "_global_control_flow_machine", None),
-            patch.object(
-                flow_manager,
-                "_await_flow_completion",
-                AsyncMock(return_value="Timed out waiting for flow completion after 10 ms."),
-            ),
+            patch.object(flow_manager, "start_flow", AsyncMock(return_value=run_drive)),
             patch.object(flow_manager, "cancel_flow_run", cancel_mock),
         ):
             result = await flow_manager.on_start_flow_request(
                 StartFlowRequest(flow_name="timeout_flow", wait_for_completion=True, completion_timeout_ms=10)
             )
 
+        run_drive.cancel()
         assert isinstance(result, StartFlowResultFailure)
         assert "did not complete cleanly" in str(result.result_details)
         cancel_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_does_not_cancel_when_flow_already_finished_with_error(self, engine: Engine) -> None:
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartFlowRequest,
-            StartFlowResultFailure,
-        )
-        from griptape_nodes.retained_mode.events.validation_events import (
-            ValidateFlowDependenciesResultSuccess,
-        )
-
         flow_manager = engine.flow_manager
-
-        fake_flow = MagicMock()
-        fake_flow.name = "errored_flow"
-        validate_success = ValidateFlowDependenciesResultSuccess(
-            validation_succeeded=True, exceptions=[], result_details="validated"
-        )
         cancel_mock = AsyncMock()
+        run_drive = asyncio.create_task(asyncio.sleep(0))
+        await run_drive
 
-        # First call (kickoff gate) returns False; second call (post-wait cancel gate) also
-        # returns False because the flow already finished with an error.
         with (
-            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
+            self._validated_flow(flow_manager, "errored_flow"),
             patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
-            patch.object(
-                flow_manager,
-                "on_validate_flow_dependencies_request",
-                AsyncMock(return_value=validate_success),
-            ),
-            patch.object(flow_manager, "start_flow", AsyncMock()),
-            patch.object(flow_manager, "_global_control_flow_machine", None),
-            patch.object(
-                flow_manager,
-                "_await_flow_completion",
-                AsyncMock(return_value="boom"),
-            ),
+            patch.object(flow_manager, "start_flow", AsyncMock(return_value=run_drive)),
+            patch.object(flow_manager, "_flow_run_drive", run_drive),
+            patch.object(flow_manager, "_await_flow_completion", AsyncMock(return_value="boom")),
             patch.object(flow_manager, "cancel_flow_run", cancel_mock),
         ):
             result = await flow_manager.on_start_flow_request(

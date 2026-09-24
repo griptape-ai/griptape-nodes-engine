@@ -11,6 +11,7 @@ the reason the engine wedges permanently -- and it must not replace the error th
 the run, which is the one worth reporting.
 """
 
+import asyncio
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
@@ -42,6 +43,8 @@ def _doomed_run(monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool = Fa
     machine.current_state = MagicMock()  # Truthy and not CompleteState: a run in progress.
     machine.resolution_machine.is_complete.return_value = False
     machine.resolution_machine.is_started.return_value = True
+    machine.prepare_flow = AsyncMock()
+    machine.drive_flow = AsyncMock(side_effect=RuntimeError(_RUN_FAILURE))
     machine.start_flow = AsyncMock(side_effect=RuntimeError(_RUN_FAILURE))
 
     def reset_machine(*, cancel: bool = False) -> None:  # noqa: ARG001
@@ -94,6 +97,29 @@ class TestStartFlowCleansUpAfterAFailedRun:
 
         machine.cancel_flow.assert_awaited_once()
         _assert_engine_is_restartable(flow_manager)
+
+
+class TestARetiredDriveLeavesTheLiveRunAlone:
+    @pytest.mark.asyncio
+    async def test_a_drive_that_fails_after_its_run_was_torn_down_does_not_tear_down_the_next_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Stop drops the drive and the next Run starts at once, so the old drive can fail late.
+
+        When it does, the run it would clean up is someone else's.
+        """
+        flow_manager, machine = _doomed_run(monkeypatch)
+        abandon = AsyncMock()
+        monkeypatch.setattr(flow_manager, "_abandon_running_flow", abandon)
+        live_drive = asyncio.create_task(asyncio.sleep(30))
+        flow_manager._flow_run_drive = live_drive
+
+        retired_drive = asyncio.create_task(flow_manager._drive_flow_run(machine, "Flow"))
+        with pytest.raises(RuntimeError, match=_RUN_FAILURE):
+            await retired_drive
+
+        live_drive.cancel()
+        abandon.assert_not_awaited()
 
 
 class TestResolveSingularNodeCleansUpAfterAFailedRun:
