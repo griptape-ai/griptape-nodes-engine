@@ -50,5 +50,9 @@ the engine's request API from working without edits. Migration steps live in
 - `RunWorkflowWithCurrentStateRequest` fails when a workflow is already open, instead of attaching
   the target as a hidden flow that was saved and run along with the open workflow.
   [#5526](https://github.com/griptape-ai/griptape-nodes-engine/issues/5526)
+- Nodes in a library that runs isolated in its own process no longer stop working mid-session while
+  the engine is busy. That process is now dropped for leaving heartbeat challenges unanswered rather
+  than for elapsed time, so `worker.heartbeat_timeout_s` bounds unanswered challenges instead of
+  wall-clock silence.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
