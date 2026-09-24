@@ -14,11 +14,9 @@ from griptape_nodes.common import log_capture
 from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
 from griptape_nodes.retained_mode.managers import settings as settings_module
 
-# The redirect has to be in place before the first test module is imported, which is
-# earlier than a fixture of any scope can run. `agent_manager` and `servers.mcp` build a
-# `ConfigManager` at module level, and building one applies the logging settings, so merely
-# collecting the test module that imports either of them wrote a log file to the real XDG
-# data directory and pruned the files a week old out of it.
+# The redirect must be in place before the first test module is imported, earlier than any
+# fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
+# level, so merely collecting them wrote to the real XDG data directory and pruned it.
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
 _session_log_home_patch = patch.object(log_capture, "xdg_data_home", lambda: Path(_session_log_home.name))
 
@@ -40,11 +38,9 @@ def _real_log_directory() -> Path | None:
         return None
 
 
-# Only this process's own log files are the suite's to answer for. A developer running the
-# engine while the suite runs has that engine writing into the same directory, and counting
-# its files as a leak would fail the guard below for a reason nobody can act on. Log file
-# names carry the pid, so ownership is read off the name rather than guessed. Under
-# `-n auto` each xdist worker is its own process and snapshots its own pid.
+# Only this process's own log files are the suite's to answer for: a developer running the
+# engine alongside the suite writes into the same directory. Names carry the pid, so
+# ownership is read off the name. Under `-n auto` each xdist worker has its own pid.
 _own_log_file_glob = f"{log_capture.LOG_FILE_PREFIX}*-{os.getpid()}.log*"
 _own_names_in_real_log_directory: set[str] = set()
 
@@ -136,10 +132,8 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
         with patch.object(log_capture, "xdg_data_home", lambda: data_home):
             yield data_home / "griptape_nodes" / "logs"
 
-            # Detach the sinks while the directory still exists. They live on the
-            # process-global logger, so a handler left behind holds an open file in a
-            # directory that is about to be deleted and keeps writing into it for the rest
-            # of the session.
+            # Detach the sinks while the directory still exists: they live on the process-global
+            # logger, so one left behind holds an open file in a directory about to be deleted.
             log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
 
 

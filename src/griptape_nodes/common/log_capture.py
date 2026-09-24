@@ -40,9 +40,8 @@ LOGGER_NAME = "griptape_nodes"
 MAX_LOG_FILE_BYTES = 10 * 1024 * 1024
 LOG_FILE_BACKUP_COUNT = 5
 
-# Every engine process writes its own file. Two engines on one machine is a
-# supported (if discouraged) setup, and a shared handle would interleave their
-# output and corrupt rotation.
+# Every engine process writes its own file: a shared handle would interleave output
+# and corrupt rotation.
 LOG_FILE_PREFIX = "engine-"
 LOG_FILE_GLOB = f"{LOG_FILE_PREFIX}*.log*"
 
@@ -103,9 +102,8 @@ class SessionLogBuffer(logging.Handler):
 
     def lines(self) -> list[str]:
         """Return the retained lines, oldest first."""
-        # Taken under the handler's own lock, the one ``logging.Handler.handle`` holds
-        # while ``emit`` runs. A bundle is collected on one thread while every other
-        # thread in the engine is still logging into this deque.
+        # Taken under the handler's own lock, the one `logging.Handler.handle` holds during
+        # `emit`, because a bundle is collected while other threads are still logging.
         self.acquire()
         try:
             return list(self._lines)
@@ -129,11 +127,8 @@ class SessionLogBuffer(logging.Handler):
         try:
             self._lines.append(self.format(record))
         except Exception:
-            # Anything at all, because anything at all can go wrong in formatting: args
-            # that do not match the format string, a mapping missing a `%(name)s` key, a
-            # `__str__` on a logged object that raises. Whatever it is, it would come out
-            # of the `logger.*()` call that made it and turn a bad log line into a failed
-            # operation. `logging.StreamHandler.emit` catches everything for this reason.
+            # Anything at all: a bad format string, a mapping missing a key, a `__str__` that
+            # raises. It would surface at the `logger.*()` call. `StreamHandler.emit` does the same.
             self.handleError(record)
 
 
@@ -163,11 +158,9 @@ def default_log_directory() -> Path:
     Never raises. This is reached from ``ConfigManager.__init__``, so a machine this cannot
     answer for would otherwise be a machine the engine refuses to start on.
     """
-    # FAILURE CASE: the default location lives under the user's data directory, and finding
-    # that means finding their home directory. A Windows service account or a container run
-    # without `USERPROFILE` set has none, and the standard library raises rather than
-    # returning a guess. Logs go to the temporary directory instead, which is the one place
-    # every platform can be asked for without knowing who is logged in.
+    # FAILURE CASE: the default lives under the user's data directory, so it needs a home
+    # directory. A Windows service account or a container without `USERPROFILE` has none and
+    # the standard library raises, so logs go to the temporary directory instead.
     try:
         data_home = xdg_data_home()
     except RuntimeError:
@@ -198,11 +191,9 @@ def resolve_log_directory(configured_directory: str) -> Path:
     if not configured_directory:
         return default_directory
 
-    # FAILURE CASE: `~someone-else/logs` cannot be expanded when that account does not
-    # exist on this machine, and `~/logs` cannot be expanded when the process has no home
-    # directory at all (a service account, some containers). `expanduser` raises rather than
-    # leaving the `~` in place, and this runs from `ConfigManager.__init__`, so a typo in one
-    # setting would stop the engine from starting.
+    # FAILURE CASE: `expanduser` raises rather than leaving the `~` in place when the account
+    # does not exist or the process has no home. This runs from `ConfigManager.__init__`, so a
+    # typo in one setting would stop the engine from starting.
     try:
         configured_path = Path(configured_directory).expanduser()
     except RuntimeError:
@@ -214,10 +205,8 @@ def resolve_log_directory(configured_directory: str) -> Path:
         )
         return default_directory
 
-    # FAILURE CASE: a relative value resolves against the process working directory,
-    # which is not stable for the engine's lifetime. Logs would land wherever the
-    # engine happened to boot, and a later collection from elsewhere would miss them.
-    # The setting is documented as absolute, so refuse rather than scatter logs.
+    # FAILURE CASE: a relative value resolves against the process working directory, so logs
+    # would land wherever the engine booted. The setting is documented as absolute, so refuse.
     if not configured_path.is_absolute():
         logger.warning(
             "The 'logging.log_directory' setting is '%s', which is not an absolute path. Using the "
@@ -258,10 +247,8 @@ def configure_diagnostic_logging(
         remember what they applied must not remember a False: the condition is usually
         temporary, and the next call is the only chance to pick the setting up again.
     """
-    # Held across the whole body. Two engines in one process load their configs on their
-    # own threads, and the sinks they are installing are shared: interleaved, one call can
-    # detach a handler the other has already replaced, leaking an open file, or both can
-    # install a handler and split one session's log across two files.
+    # Held across the whole body: two engines in one process install these shared sinks from
+    # their own threads, and interleaved calls leak an open file or split one session's log.
     with _configuration_lock:
         _configure_buffer(buffer_lines)
 
@@ -317,10 +304,8 @@ def find_log_files(directory: Path | None = None) -> list[Path]:
         logger.warning("Could not list log files in '%s'.", search_dir, exc_info=True)
         return []
 
-    # Ages are read here rather than inside the sort key, so a file that rotation renamed
-    # or removed between being listed and being measured costs one entry instead of
-    # raising out of the sort. This runs while an engine is logging, and it runs during
-    # engine construction, where an exception would stop the engine from starting.
+    # Ages are read here rather than inside the sort key, so a file rotation renamed or removed
+    # mid-scan costs one entry instead of raising out of the sort during engine construction.
     aged: list[_LogFileAge] = []
     for path in matches:
         try:
@@ -357,9 +342,8 @@ def prune_log_files(directory: Path, retention_days: int, *, protected_name: str
     if retention_days <= 0:
         return 0
 
-    # Compared by name, not by path: a name identifies a file uniquely within the one
-    # directory being pruned, and two spellings of the same directory would not compare
-    # equal as paths.
+    # Compared by name, not by path: a name is unique within the one directory being pruned,
+    # and two spellings of the same directory would not compare equal.
     active = active_log_file()
     protected = {name for name in (protected_name, active.name if active is not None else None) if name is not None}
 
@@ -430,12 +414,9 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
         return False
 
     try:
-        # Opened now rather than on the first record (`delay=True`). A directory that
-        # exists but cannot be written to is a real setup -- a log directory pointed at a
-        # read-only volume, or one owned by another user -- and deferring the open moves
-        # that failure out of this guard and into the first log call, where it surfaces as
-        # a handler error on stderr while `active_log_file()` goes on naming a file that
-        # will never exist.
+        # Opened now rather than on the first record (`delay=True`). A directory that exists but
+        # cannot be written to is a real setup, and deferring the open moves that failure out of
+        # this guard into the first log call, while `active_log_file()` names a file that never exists.
         handler = RotatingFileHandler(
             target_path,
             maxBytes=MAX_LOG_FILE_BYTES,
@@ -458,10 +439,8 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
     _state.file_handler = handler
     _state.file_path = target_path
 
-    # Pruned only now that there is a file to keep. Which side of the open this happens is
-    # otherwise immaterial -- the new file is excluded by name either way -- and doing it
-    # here is what keeps a failed open costing a failed `open()` rather than a full scan of
-    # a directory that is going to be scanned again on the next config load.
+    # Pruned only now that there is a file to keep, which keeps a failed open costing a failed
+    # `open()` rather than a full scan of a directory that is scanned again next config load.
     prune_log_files(directory, retention_days, protected_name=file_name)
     return True
 

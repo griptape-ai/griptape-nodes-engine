@@ -1188,11 +1188,9 @@ class ConfigManager(EngineScoped):
             self.merged_config = self.default_config
             self._merged_config_rejection = _MergedConfigRejection(paths=_offending_paths(e, merged_config))
 
-        # Last, from whatever config actually survived above. Any config file can carry a
-        # logging setting -- the user, project, or workspace file -- so applying these only
-        # when the user config is written would leave the engine logging somewhere other
-        # than where it reports it is. `GTN_CONFIG_LOG_LEVEL` reaches this too; the settings
-        # nested under `logging.` do not, because the env layer is a flat mapping.
+        # Last, from whatever config survived above: any config file can carry a logging setting,
+        # so applying these only on a user-config write would leave the engine logging somewhere
+        # other than it reports. Settings nested under `logging.` do not reach the flat env layer.
         self._apply_logging_settings()
 
     def load_project_config(self, project_dir: Path) -> None:
@@ -1498,9 +1496,8 @@ class ConfigManager(EngineScoped):
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/437
-        # Reapplies the log level and sinks as a side effect, from the reloaded merged
-        # config rather than from `value`: logging is configured from several related
-        # settings at once, and a value this write did not persist must not take effect.
+        # Reapplies the log level and sinks from the reloaded merged config rather than from
+        # `value`: logging is configured from several related settings at once.
         self.load_configs()
         logger.debug("Config value '%s' set to '%s'", key, value)
 
@@ -1562,9 +1559,8 @@ class ConfigManager(EngineScoped):
                 )
                 return SetConfigCategoryResultFailure(result_details=result_details)
 
-            # Reloaded so the merged config, the workspace path, and the log sinks
-            # describe what was just written. Without this the engine keeps running on
-            # the config it had, while every reader of `merged_config` reports the new one.
+            # Reloaded so the merged config, the workspace path, and the log sinks describe what was
+            # just written, instead of readers of `merged_config` reporting a config the engine is not on.
             self.load_configs()
 
             result_details = "Successfully assigned the entire config dictionary."
@@ -2339,16 +2335,9 @@ class ConfigManager(EngineScoped):
             retention_days=settings.retention_days,
         )
 
-        # Recorded only once the sinks asked for are the ones actually installed. Failing to
-        # open the log file is usually temporary -- a volume not mounted yet, a directory a
-        # permission fix is coming for -- and remembering the attempt as done would short-
-        # circuit every later load, so the engine would never write a log file again for the
-        # rest of its life. Assigned after the call rather than before for the same reason.
-        #
-        # So a persistently unwritable directory is retried on every load, by design. What
-        # that retry costs is `configure_diagnostic_logging`'s to keep small: it prunes only
-        # after the file is open, and reports an unwritable destination once rather than once
-        # per attempt, so the repeated call is a failed `open()` and nothing else.
+        # Only recorded when the sinks actually installed. A failed log-file open is usually
+        # temporary (unmounted volume, fixable permissions), and marking the attempt done would
+        # stop the engine ever retrying.
         if installed:
             self._applied_logging_settings = settings
 
