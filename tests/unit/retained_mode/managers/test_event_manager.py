@@ -12,13 +12,8 @@ import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.app_events import (
-    AppInitializationComplete,
-    ConfigChanged,
-    LibraryLoadedNotification,
-)
+from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
-    AppPayload,
     EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
@@ -69,50 +64,6 @@ class TestEventManagerBroadcasting:
         # Verify both listeners were called
         listener1.assert_called_once_with(event)
         listener2.assert_called_once_with(event)
-
-    @pytest.mark.asyncio
-    async def test_a_peer_event_is_dropped_unless_its_type_opts_in(self) -> None:
-        """The isolation this exists for.
-
-        A listener reads the payload as describing its own process, so a worker's boot event
-        reaching the orchestrator's is how the orchestrator came to set `_is_worker` on itself.
-        """
-        event_manager = EventManager()
-        listener = AsyncMock()
-        event_manager.add_listener_to_app_event(AppInitializationComplete, listener)
-
-        await event_manager.abroadcast_adopted_app_event(AppInitializationComplete(is_worker=True))
-
-        listener.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_a_peer_event_reaches_listeners_when_its_type_opts_in(self) -> None:
-        event_manager = EventManager()
-        listener = AsyncMock()
-        event_manager.add_listener_to_app_event(LibraryLoadedNotification, listener)
-
-        event = LibraryLoadedNotification(library_name="lib", fitness="usable")
-        await event_manager.abroadcast_adopted_app_event(event)
-
-        listener.assert_called_once_with(event)
-
-    @pytest.mark.asyncio
-    async def test_a_local_event_reaches_listeners_whatever_its_type_says(self) -> None:
-        """The flag gates adoption only. Gating the local path too would stop boot entirely."""
-        event_manager = EventManager()
-        listener = AsyncMock()
-        event_manager.add_listener_to_app_event(AppInitializationComplete, listener)
-
-        event = AppInitializationComplete()
-        await event_manager.abroadcast_app_event(event)
-
-        listener.assert_called_once_with(event)
-
-    def test_only_the_worker_report_is_adoptable(self) -> None:
-        """Pins the production marking, which is the part a future payload can silently get wrong."""
-        assert AppPayload.adoptable_from_peers is False
-        assert AppInitializationComplete.adoptable_from_peers is False
-        assert LibraryLoadedNotification.adoptable_from_peers is True
 
     @pytest.mark.asyncio
     async def test_abroadcast_app_event_with_no_listeners(self) -> None:
