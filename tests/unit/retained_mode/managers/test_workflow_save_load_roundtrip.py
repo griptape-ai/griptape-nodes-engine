@@ -266,7 +266,7 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
 
 
 def _read_saved_source(file_path: str) -> str:
-    source = Path(file_path).read_text()
+    source = Path(file_path).read_text(encoding="utf-8")
     ast.parse(source)  # the written file must always be syntactically valid Python
     return source
 
@@ -367,9 +367,9 @@ class TestSharedValueDeduplication:
         file_path = _save_flow_to_disk(engine, flow_name, tmp_path, "dedup")
         source = _read_saved_source(file_path)
 
-        # The unique-values pool is keyed by the pickled value; the same object must land in
+        # The unique-values pool is keyed by a hash of the value; the same value must land in
         # exactly one pool entry rather than being duplicated once per referencing parameter.
-        assert source.count("pickle.loads(") == 1
+        assert source.count("'shared': ['value', 'payload']") == 1
 
         _reload_from_disk(engine, file_path)
 
@@ -628,27 +628,8 @@ class TestSubFlowRoundTrip:
 
 
 class TestDeterministicSaveOutput:
-    """Whether saving the same live graph twice at the same instant must not churn the diff.
+    """Saving the same live graph twice at the same instant does not churn the diff."""
 
-    Pending the ruling in #5441 on whether saved workflow files must be diff-stable. The
-    mechanism below (a fresh UUID pool key minted on every serialization) is real and
-    deterministic; whether it should be fixed depends on that decision.
-    """
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DECISION: pending #5441 (must saved workflow files be diff-stable?). The disk-save "
-            "path (SaveWorkflowRequest -> SerializeFlowToCommandsRequest -> "
-            "on_serialize_node_to_commands -> handle_parameter_value_saving -> "
-            "_handle_value_hashing, all in node_manager.py) mints a fresh str(uuid4()) pool key "
-            "every time a value is serialized, so two saves of the identical, unedited graph land "
-            "the same pickled bytes under two different unique_values_dict keys. If #5441 rules "
-            "that saves must be diff-stable: saving an unedited graph twice in a row must not move "
-            "the diff, since nothing about the graph changed, and this test should be promoted. If "
-            "not: delete this test, since it asserts a contract nobody has ratified. - see #5441"
-        ),
-    )
     def test_two_saves_of_the_same_graph_are_byte_identical(self, engine: Engine, tmp_path: Path) -> None:
         flow_name, library_name = _fresh_flow(engine, "determinism_workflow", tmp_path)
         node_name = _create_round_trip_node(engine, "Holder", flow_name, library_name)
@@ -674,29 +655,12 @@ class TestDeterministicSaveOutput:
 
 
 class TestIdempotentSaveLoadSave:
-    """Whether save, reload, and save again should reproduce the first file exactly.
+    """Save, reload, and save again reproduces the first file exactly.
 
-    Pending the ruling in #5441 on whether saved workflow files must be diff-stable. If it
-    rules yes, this is the strongest single guarantee in the pipeline: reopening and resaving
-    a workflow with no edits should not move anything, and any drift would mean some piece of
-    state is not round-tripping losslessly through the generated code.
+    Any drift would mean some piece of state is not round-tripping losslessly through the
+    generated code.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DECISION: pending #5441 (must saved workflow files be diff-stable?). The "
-            "unique-values pool on the disk-save path is keyed by a fresh str(uuid4()) on every "
-            "serialization (node_manager.py handle_parameter_value_saving -> "
-            "_handle_value_hashing, reached via SerializeFlowToCommandsRequest -> "
-            "on_serialize_node_to_commands), so reloading a saved workflow and resaving it "
-            "without any edits mints new pool keys for the same values and the resave diffs "
-            "against the original. If #5441 rules that saves must be diff-stable: a "
-            "reopen-and-resave with no edits must reproduce the original file exactly, and this "
-            "test should be promoted. If not: delete this test, since it asserts a contract nobody "
-            "has ratified. - see #5441"
-        ),
-    )
     def test_resaving_a_freshly_reloaded_workflow_reproduces_the_first_save(
         self, engine: Engine, tmp_path: Path
     ) -> None:

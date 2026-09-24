@@ -91,7 +91,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=MagicMock(),
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         # Should return None (no values to serialize) but preserve resolution
@@ -135,7 +134,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         # Resolution should be reset to UNRESOLVED due to serialization failure
@@ -186,14 +184,13 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert not any("Attempted to serialize" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_serializable_true_param_with_pickle_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_serializable_true_param_with_encode_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         """Genuine serialization failures (serializable=True) must still emit the warning."""
         from unittest.mock import MagicMock
 
@@ -230,11 +227,10 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("Attempted to serialize set value for parameter 'test_param'" in msg for msg in warning_messages)
+        assert any("Attempted to save the set value of parameter 'test_param'" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
 

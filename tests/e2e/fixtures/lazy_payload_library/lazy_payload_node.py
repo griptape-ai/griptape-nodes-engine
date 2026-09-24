@@ -1,26 +1,26 @@
 """Fixture nodes for the lazy-loading stable-namespace e2e tests.
 
-LazyPayload is a plain picklable class defined inside a dynamically loaded library module.
-When a workflow holding a LazyPayload parameter value is saved, the generated Python embeds
-a ``from griptape_nodes.node_libraries.lazy_payload_library.lazy_payload_node import
-LazyPayload`` statement plus pickled bytes referencing that stable namespace. Loading that
-workflow therefore requires the stable namespace to be importable, which is exactly what the
+LazyPayload is a dataclass defined inside a dynamically loaded library module. When a workflow
+holding a LazyPayload parameter value is saved, the value is tagged with the stable namespace
+``griptape_nodes.node_libraries.lazy_payload_library.lazy_payload_node``. Loading that workflow
+therefore requires the stable namespace to be importable, which is exactly what the
 lazy-node-loading regression broke (`No module named 'griptape_nodes.node_libraries'`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
 
 
+@dataclass
 class LazyPayload:
-    """Picklable value class whose only home is this dynamically loaded module."""
+    """Value class whose only home is this dynamically loaded module."""
 
-    def __init__(self, tag: str) -> None:
-        self.tag = tag
+    tag: str
 
 
 class LazyPayloadNode(DataNode):

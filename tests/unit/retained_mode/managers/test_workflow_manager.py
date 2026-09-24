@@ -2244,44 +2244,6 @@ class TestWorkflowManager:
         # ast.parse raises SyntaxError if rewrite_string_comments left bad output behind.
         ast.parse(content)
 
-    def test_collect_object_imports_routes_dynamic_module_to_deferred(self, engine: Engine) -> None:
-        """Dynamic library class imports must go into deferred_imports, not import_recorder.
-
-        Regression for #4738: _collect_object_imports previously routed all imports through
-        import_recorder, which put them at module top level. In headless mode this causes
-        ModuleNotFoundError because the library isn't on sys.path until build_workflow() calls
-        RegisterLibraryFromFileRequest.
-        """
-        from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
-
-        workflow_manager = engine.workflow_manager
-        fake_class = type("FakeClass", (), {})
-        fake_module = MagicMock()
-        fake_module.__name__ = "gtn_dynamic_module_foo_py_123"
-
-        import_recorder = ImportRecorder()
-        deferred_imports: dict[str, set[str]] = {}
-
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.workflow_manager.getmodule",
-                return_value=fake_module,
-            ),
-            patch.object(engine.library_manager, "is_dynamic_module", return_value=True),
-            patch.object(
-                engine.library_manager,
-                "get_stable_namespace_for_dynamic_module",
-                return_value="my_lib.foo",
-            ),
-        ):
-            workflow_manager._collect_object_imports(fake_class(), import_recorder, set(), deferred_imports)
-
-        assert "my_lib.foo" in deferred_imports, "Dynamic library import must land in deferred_imports"
-        assert "FakeClass" in deferred_imports["my_lib.foo"]
-        assert "my_lib.foo" not in import_recorder.from_imports, (
-            "Dynamic library import must NOT be in import_recorder (would appear at module top level)"
-        )
-
 
 class TestWorkflowVariablePersistence:
     """Round-trip tests: variables created in a flow must survive save + load."""

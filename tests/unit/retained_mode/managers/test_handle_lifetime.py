@@ -11,7 +11,6 @@ connection goes and can still run with what it has.
 """
 
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -408,7 +407,6 @@ class TestSaving:
             unique_parameter_uuid_to_values=uuid_to_values,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None
@@ -430,7 +428,6 @@ class TestSaving:
             create_node_request=CreateNodeRequest(
                 node_type="_Producer", node_name="Producer", resolution=NodeResolutionState.RESOLVED.value
             ),
-            workflow_manager=MagicMock(),
         )
 
         assert saved is not None
@@ -828,7 +825,6 @@ class TestSavingAndPublishing:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
             serialize_all_parameter_values=publishing,
         )
 
@@ -866,7 +862,6 @@ class TestAKeyThatReachedASerializableParameter:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None

@@ -4,7 +4,6 @@ import ast
 import asyncio
 import contextvars
 import logging
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 import re
 import sys
 from collections import defaultdict
@@ -12,7 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from inspect import getmodule, isclass, iscoroutinefunction
+from inspect import isclass, iscoroutinefunction
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
@@ -222,6 +221,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.serialization.values import is_plain_data
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
@@ -3582,21 +3582,11 @@ class WorkflowManager(EngineScoped):
         )
         main_body.extend(cast("ast.stmt", node) for node in prereq_code)
 
-        # Collect library-derived imports separately so they can be emitted inside
-        # build_workflow() after the RegisterLibraryFromFileRequest calls — those calls
-        # are what add the library directory and venv site-packages to sys.path, so the
-        # imports must come after them, not at module top level.
-        deferred_imports: dict[str, set[str]] = {}
-
         # Generate unique values code AST node
         unique_values_node = self._generate_unique_values_code(
             unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
             prefix="top_level",
-            import_recorder=import_recorder,
-            deferred_imports=deferred_imports,
         )
-        # Emit deferred library imports inside build_workflow(), after sys.path is set up.
-        main_body.extend(self._build_deferred_import_statements(deferred_imports))
         # Helper returns an ast.Module; unpack its body into statements.
         main_body.extend(cast("ast.stmt", stmt) for stmt in unique_values_node.body)
 
@@ -4715,83 +4705,30 @@ class WorkflowManager(EngineScoped):
         self,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         prefix: str,
-        import_recorder: ImportRecorder,
-        deferred_imports: dict[str, set[str]] | None = None,
     ) -> ast.Module:
+        """Write the pool of encoded values as a dict literal, keyed by content hash.
+
+        Each use wraps its lookup in ``decode_value``, so every parameter gets its own object and no
+        value is imported or built until the libraries it needs are registered.
+        """
         if len(unique_parameter_uuid_to_values) == 0:
             return ast.Module(body=[], type_ignores=[])
-
-        import_recorder.add_import("pickle")
-
-        # Get the list of manually-curated, globally available modules
-        global_modules_set = {"builtins", "__main__"}
-
-        # Serialize the unique values as pickled strings.
-        # IMPORTANT: We patch dynamic module names to stable namespaces before pickling
-        # to ensure generated workflows can reliably import the required classes.
-        unique_parameter_dict = {}
-
-        for uuid, unique_parameter_value in unique_parameter_uuid_to_values.items():
-            # Dynamic Module Patching Strategy:
-            # When we pickle objects from dynamically loaded modules (like VideoUrlArtifact),
-            # pickle stores the class's __module__ attribute in the binary data. If we don't
-            # patch this, the pickle data would contain something like:
-            #   "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            #
-            # When the workflow runs later, Python tries to import this module name, which
-            # fails because dynamic modules don't exist in fresh Python processes.
-            #
-            # Our solution: Temporarily patch the class's __module__ to use the stable namespace
-            # before pickling, so the pickle data contains:
-            #   "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
-            #
-            # This includes recursive patching for nested objects in containers (lists, tuples, dicts)
-
-            # Apply recursive dynamic module patching, pickle, then restore
-            unique_parameter_bytes = self._patch_and_pickle_object(unique_parameter_value)
-
-            # Encode the bytes as a string using latin1
-            unique_parameter_byte_str = unique_parameter_bytes.decode("latin1")
-            unique_parameter_dict[uuid] = unique_parameter_byte_str
-
-            # Collect import statements for all classes in the object tree
-            self._collect_object_imports(unique_parameter_value, import_recorder, global_modules_set, deferred_imports)
 
         # Comment lines explaining what we're doing. Each line is emitted as its own bare-string
         # statement so that it unparses onto a single source line. A post-process pass in
         # _generate_workflow_file_content (via rewrite_string_comments) then strips the surrounding
         # quotes to turn each line into a real Python `#` comment.
         comment_lines = [
-            "# 1. We've collated all of the unique parameter values into a dictionary so that we do not have to duplicate them.",
-            "#    This minimizes the size of the code, especially for large objects like serialized image files.",
-            "# 2. We're using a prefix so that it's clear which Flow these values are associated with.",
-            "# 3. The values are serialized using pickle, which is a binary format. This makes them harder to read, but makes",
-            "#    them consistently save and load. It allows us to serialize complex objects like custom classes, which otherwise",
-            "#    would be difficult to serialize.",
+            "# Every unique parameter value, stored once and keyed by a hash of its content.",
+            "# Values that aren't plain data carry a '$type' naming their class; decode_value rebuilds them.",
         ]
 
-        # Generate the dictionary of unique values
         unique_values_dict_name = f"{prefix}_unique_values_dict"
         unique_values_ast = ast.Assign(
             targets=[ast.Name(id=unique_values_dict_name, ctx=ast.Store(), lineno=1, col_offset=0)],
             value=ast.Dict(
-                keys=[ast.Constant(value=str(uuid), lineno=1, col_offset=0) for uuid in unique_parameter_dict],
-                values=[
-                    ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="pickle", ctx=ast.Load(), lineno=1, col_offset=0),
-                            attr="loads",
-                            ctx=ast.Load(),
-                            lineno=1,
-                            col_offset=0,
-                        ),
-                        args=[ast.Constant(value=byte_str.encode("latin1"), lineno=1, col_offset=0)],
-                        keywords=[],
-                        lineno=1,
-                        col_offset=0,
-                    )
-                    for byte_str in unique_parameter_dict.values()
-                ],
+                keys=[ast.Constant(value=str(key), lineno=1, col_offset=0) for key in unique_parameter_uuid_to_values],
+                values=[self._plain_data_literal(value) for value in unique_parameter_uuid_to_values.values()],
                 lineno=1,
                 col_offset=0,
             ),
@@ -4799,30 +4736,44 @@ class WorkflowManager(EngineScoped):
             col_offset=0,
         )
 
-        # Create the final AST with comment lines followed by the dict assignment.
         comment_exprs = [
             ast.Expr(value=ast.Constant(value=line, lineno=1, col_offset=0), lineno=1, col_offset=0)
             for line in comment_lines
         ]
         module_body: list[ast.stmt] = [*comment_exprs, unique_values_ast]
-        full_ast = ast.Module(body=module_body, type_ignores=[])
-        return full_ast
+        return ast.Module(body=module_body, type_ignores=[])
 
-    def _build_deferred_import_statements(self, deferred_imports: dict[str, set[str]]) -> list[ast.stmt]:
-        """Convert deferred library imports into ast.ImportFrom statements for insertion into build_workflow().
+    @staticmethod
+    def _plain_data_literal(value: Any) -> ast.expr:
+        """The Python literal for an encoded value, whose repr is valid Python because it is plain data."""
+        if not is_plain_data(value):
+            msg = f"Attempted to write a saved value into a workflow file. Failed because a '{type(value).__name__}' value was not encoded first."
+            raise ValueError(msg)
+        return ast.parse(repr(value), mode="eval").body
 
-        Sorted by module name (and class names within each module) for deterministic output.
-        """
-        stmts: list[ast.stmt] = []
-        for module, classes in sorted(deferred_imports.items()):
-            node = ast.ImportFrom(
-                module=module,
-                names=[ast.alias(name=cls) for cls in sorted(classes)],
-                level=0,
-            )
-            ast.fix_missing_locations(node)
-            stmts.append(node)
-        return stmts
+    @staticmethod
+    def _decoded_value_lookup(
+        unique_values_dict_name: str,
+        key: SerializedNodeCommands.UniqueParameterValueUUID,
+        import_recorder: ImportRecorder,
+    ) -> ast.expr:
+        """``decode_value(<dict>[<key>])``, rebuilding a fresh object at each use."""
+        import_recorder.add_from_import("griptape_nodes.serialization.values", "decode_value")
+        return ast.Call(
+            func=ast.Name(id="decode_value", ctx=ast.Load(), lineno=1, col_offset=0),
+            args=[
+                ast.Subscript(
+                    value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                    slice=ast.Constant(value=str(key), lineno=1, col_offset=0),
+                    ctx=ast.Load(),
+                    lineno=1,
+                    col_offset=0,
+                )
+            ],
+            keywords=[],
+            lineno=1,
+            col_offset=0,
+        )
 
     def _generate_create_flow(
         self,
@@ -5609,12 +5560,8 @@ class WorkflowManager(EngineScoped):
         create_variable_asts: list[ast.stmt] = []
         for serialized_command in serialized_variable_commands:
             create_variable_request = serialized_command.create_variable_command
-            value_lookup = ast.Subscript(
-                value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
-                slice=ast.Constant(value=str(serialized_command.unique_value_uuid), lineno=1, col_offset=0),
-                ctx=ast.Load(),
-                lineno=1,
-                col_offset=0,
+            value_lookup = self._decoded_value_lookup(
+                unique_values_dict_name, serialized_command.unique_value_uuid, import_recorder
             )
 
             create_variable_call = ast.Expr(
@@ -5685,7 +5632,7 @@ class WorkflowManager(EngineScoped):
             set_parameter_value_commands: Value commands for the nodes of one Flow, keyed by node
             lock_commands: Lock-state commands for those same nodes
             node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
-            unique_values_dict_name: Name of the generated dict holding the pickled values
+            unique_values_dict_name: Name of the generated dict holding the encoded values
             import_recorder: Import recorder for tracking imports
 
         Returns:
@@ -5764,12 +5711,8 @@ class WorkflowManager(EngineScoped):
         )
 
         for command in indirect_set_parameter_value_commands:
-            value_lookup = ast.Subscript(
-                value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
-                slice=ast.Constant(value=str(command.unique_value_uuid), lineno=1, col_offset=0),
-                ctx=ast.Load(),
-                lineno=1,
-                col_offset=0,
+            value_lookup = self._decoded_value_lookup(
+                unique_values_dict_name, command.unique_value_uuid, import_recorder
             )
 
             set_parameter_value_request_call = ast.Expr(
@@ -6927,124 +6870,6 @@ class WorkflowManager(EngineScoped):
         elif hasattr(obj, "__dict__"):
             for attr_value in obj.__dict__.values():
                 self._walk_object_tree(attr_value, process_class_fn, visited)
-
-    def _patch_and_pickle_object(self, obj: Any) -> bytes:
-        """Patch dynamic module references to stable namespaces, pickle object, then restore.
-
-        This solves the "pickle data was truncated" error that occurs when workflows containing
-        objects from dynamically loaded modules (like VideoUrlArtifact, ReferenceImageArtifact)
-        are serialized and later reloaded in a fresh Python process.
-
-        The Problem:
-            Dynamic modules get names like "gtn_dynamic_module_image_to_video_py_123456789"
-            When pickle serializes objects, it embeds these module names in the binary data
-            When workflows run later, Python can't import these non-existent module names
-
-        The Solution:
-            1. Recursively find all objects from dynamic modules (even nested in containers)
-            2. Temporarily patch their __module__ and module_name to stable namespaces
-            3. Pickle with stable references like "griptape_nodes.node_libraries.runwayml_library.image_to_video"
-            4. Restore original names to avoid side effects
-
-        Args:
-            obj: Object to patch and pickle (may contain nested structures)
-
-        Returns:
-            Pickled bytes with stable module references
-
-        Example:
-            Before: pickle contains "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            After:  pickle contains "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
-        """
-        patched_classes: list[tuple[type, str]] = []
-        patched_instances: list[tuple[Any, str]] = []
-
-        def patch_class(class_type: type, instance: Any) -> None:
-            """Patch a single class instance to use stable namespace."""
-            module = getmodule(class_type)
-            if module and self.engine.library_manager.is_dynamic_module(module.__name__):
-                stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(module.__name__)
-                if stable_namespace:
-                    # Patch class __module__ (affects pickle class reference)
-                    if class_type.__module__ != stable_namespace:
-                        patched_classes.append((class_type, class_type.__module__))
-                        class_type.__module__ = stable_namespace
-
-                    # Patch instance module_name field (affects SerializableMixin serialization)
-                    if hasattr(instance, "module_name") and instance.module_name != stable_namespace:
-                        patched_instances.append((instance, instance.module_name))
-                        instance.module_name = stable_namespace
-
-        try:
-            # Apply patches to entire object tree
-            self._walk_object_tree(obj, patch_class)
-            return pickle.dumps(obj)
-        finally:
-            # Always restore original names to avoid affecting other code
-            for class_obj, original_name in patched_classes:
-                class_obj.__module__ = original_name
-            for instance_obj, original_name in patched_instances:
-                instance_obj.module_name = original_name
-
-    def _collect_object_imports(
-        self,
-        obj: Any,
-        import_recorder: Any,
-        global_modules_set: set[str],
-        deferred_imports: dict[str, set[str]] | None = None,
-    ) -> None:
-        """Recursively collect import statements needed for all classes in object tree.
-
-        This ensures that generated workflows have all necessary import statements,
-        including for classes nested deep within containers like ParameterArrays.
-
-        The Process:
-            1. Walk through entire object tree (lists, dicts, object attributes)
-            2. For each class found, determine the correct import statement
-            3. For dynamic modules, use stable namespace imports
-            4. For regular modules, use standard imports
-            5. Record all imports for workflow generation
-
-        Args:
-            obj: Object tree to analyze for required imports
-            import_recorder: Collector that will generate the import statements
-            global_modules_set: Built-in modules that don't need explicit imports
-            deferred_imports: If provided, dynamic library imports are collected here instead
-                of import_recorder so the caller can emit them inside build_workflow() after
-                sys.path has been set up by RegisterLibraryFromFileRequest.
-
-        Example:
-            Input object tree: [ReferenceImageArtifact(), {"data": ImageUrlArtifact()}]
-            Generated imports:
-                from griptape_nodes.node_libraries.runwayml_library.create_reference_image import ReferenceImageArtifact
-                from griptape.artifacts.image_url_artifact import ImageUrlArtifact
-        """
-
-        def collect_class_import(class_type: type, _instance: Any) -> None:
-            """Collect import statement for a single class."""
-            module = getmodule(class_type)
-            if module and module.__name__ not in global_modules_set:
-                if self.engine.library_manager.is_dynamic_module(module.__name__):
-                    # Use stable namespace for dynamic modules. Route into deferred_imports
-                    # so the caller can emit these inside build_workflow() after
-                    # RegisterLibraryFromFileRequest has added the library to sys.path.
-                    stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(
-                        module.__name__
-                    )
-                    if stable_namespace:
-                        if deferred_imports is not None:
-                            deferred_imports.setdefault(stable_namespace, set()).add(class_type.__name__)
-                        else:
-                            import_recorder.add_from_import(stable_namespace, class_type.__name__)
-                    else:
-                        msg = f"Missing stable namespace for {module.__name__} type {class_type.__name__}"
-                        logger.error(msg)
-                        raise RuntimeError(msg)
-                else:
-                    # Use regular module name for standard modules
-                    import_recorder.add_from_import(module.__name__, class_type.__name__)
-
-        self._walk_object_tree(obj, collect_class_import)
 
     async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
         try:
