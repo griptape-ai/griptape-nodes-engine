@@ -34,30 +34,23 @@ logger = logging.getLogger("griptape_nodes")
 REDACTED = "<redacted>"
 REDACTED_USER = "<user>"
 
-# Keys whose values are credentials by construction rather than by name. `env` and
-# `headers` come from MCPServerConfig, where the whole point of the field is to carry
-# an API key to a server.
+# Keys whose values are credentials by construction rather than by name. `env` and `headers`
+# come from MCPServerConfig, where the field exists to carry an API key to a server.
 SENSITIVE_KEY_NAMES = frozenset({"env", "headers"})
 
-# Keys that declare which secrets the engine should look for. Handled as a special case
-# rather than masked wholesale, because the two shapes this setting accepts are not equally
-# safe: a list holds variable *names*, which the report publishes elsewhere by design and
-# which are the only diagnostic signal the setting carries, while a mapping holds names
-# *and default values*, and a default value is a real credential --
-# `SecretsManager.register_all_secrets` writes it as one.
+# Keys naming which secrets the engine looks for. Special-cased rather than masked wholesale
+# because the two accepted shapes differ: a list holds variable names, which the report
+# publishes by design, while a mapping holds names and default values -- real credentials.
 KEY_NAMES_DECLARING_SECRETS = frozenset({"secrets_to_register"})
 
-# Substring match, not whole-word: `api_key`, `openai_api_key`, and `keys` must all
-# match. `auth` covers `authorization` as well as the bare and prefixed spellings
-# (`basic_auth`, `auth_header`). Over-matching (`keyboard`, `monkey`, `author`) costs a
-# hidden value in a report and is the right way to be wrong.
+# Substring match, not whole-word, so `api_key`, `openai_api_key` and `keys` all match.
+# Over-matching (`keyboard`, `author`) only costs a hidden value, which is the safe failure.
 SENSITIVE_KEY_PATTERN = re.compile(
     r"(?i)(key|token|secret|password|passwd|pwd|credential|auth|cookie|signature|bearer)"
 )
 
-# A known secret shorter than this is not searched for in free text. Someone whose
-# secret value is `1`, `true`, or `dev` would otherwise have every occurrence of that
-# string in their logs replaced, destroying the logs to protect nothing.
+# A known secret shorter than this is not searched for in free text: a secret value of `1`
+# or `dev` would have every occurrence replaced, destroying the logs to protect nothing.
 MIN_SEARCHABLE_SECRET_LENGTH = 8
 
 # Same reasoning for usernames: a two-character username appears inside ordinary words.
@@ -100,11 +93,9 @@ _API_KEY_PATTERNS = [
     TextPattern(RedactionReason.API_KEY_PATTERN, re.compile(r"\bhf_[A-Za-z0-9]{8,}"), f"hf_{REDACTED}"),
 ]
 
-# A `bearer`/`basic` token shorter than this is left alone. The value class below matches
-# ordinary letters, so a low threshold redacts English prose: "Bearer credentials
-# required" and "Basic authentication is not supported" would both be counted as hidden
-# credentials. Real bearer tokens are far longer than this, and a genuinely short opaque
-# value is still covered by the known-secret and query-parameter rules.
+# A `bearer`/`basic` token shorter than this is left alone. The value class matches ordinary
+# letters, so a low threshold redacts prose like "Bearer credentials required". Genuinely
+# short opaque values are still covered by the known-secret and query-parameter rules.
 MIN_BEARER_TOKEN_LENGTH = 16
 
 # `Bearer <token>` in a logged header dump or an HTTP error.
@@ -114,23 +105,13 @@ _BEARER_PATTERN = TextPattern(
     rf"\1 {REDACTED}",
 )
 
-# Query-string parameter names whose value grants access on its own. A presigned URL in a
-# log is a working credential for as long as it has not expired, so the parameter names
-# are kept and the values dropped.
-#
-# A name pattern rather than a fixed list of names, so it stays in step with
-# SENSITIVE_KEY_PATTERN and covers a vendor parameter nobody thought to enumerate:
-# `X-Amz-Signature`, `x-goog-credential`, `AWSAccessKeyId`, and `client_secret` all match
-# because each of these words appears somewhere inside the name.
+# Query-string parameters whose value grants access on its own (a presigned URL is live until
+# it expires). A name pattern, not a list, so vendor spellings match without being enumerated.
 _SIGNED_URL_PARAMETER_WORDS = "key|token|secret|password|credential|signature|authorization"
 
-# The abbreviated spellings, which are matched only as the whole parameter name. These are
-# short enough that looking for them anywhere inside a name hides values that are not
-# credentials and are the whole reason someone opened the report: `code` is inside
-# `errorcode`, `sig` is inside `assignee` and `design`, `auth` is inside `author`. Kept at
-# all because the abbreviation is the real spelling of a real credential -- Azure's SAS
-# signature is `sig`, and an OAuth authorization code is `code` -- and in that spelling it is
-# the entire name, never part of a longer one.
+# Abbreviations, matched only as the whole parameter name -- as substrings they hit
+# `errorcode`, `design`, `author`. Kept because each is a real credential's real spelling
+# (Azure SAS `sig`, OAuth `code`).
 _SIGNED_URL_PARAMETER_ABBREVIATIONS = "auth|sig|code"
 
 _SIGNED_URL_PARAMETER_NAME = (
@@ -143,48 +124,22 @@ _SIGNED_URL_PATTERN = TextPattern(
     rf"\1{REDACTED}",
 )
 
-# A password in a URL's userinfo (`scheme://user:password@host`). This is the ordinary way
-# to point `libraries_to_download[].git_url` or an `MCPServerConfig.url` at a private
-# server, and neither key name matches SENSITIVE_KEY_PATTERN, so without this rule a live
-# personal access token is written into the config section verbatim. Only tokens carrying a
-# vendor prefix (`ghp_`, `sk-`) were caught, and GitLab's `glpat-`, Bitbucket app passwords,
-# and plain passwords carry none.
-#
-# The user is kept and only the password dropped, the way git itself reports these: an
-# `oauth2:` or `x-access-token:` prefix tells support which auth scheme was in use and is
-# not itself a credential. The single-component form (`scheme://token@host`) is deliberately
-# left alone, because its overwhelmingly common spelling is `ssh://git@github.com` and
-# redacting that would replace an identifier nobody needs hidden in every URL in a bundle.
-#
-# The password class allows `@`, and the greedy `+` therefore runs to the *last* `@` in the
-# authority. With `@` excluded it stopped at the first one, so `postgres://u:p@ssw0rd@host`
-# redacted only `p` and wrote `ssw0rd` -- most of a live password -- into the bundle. What
-# the class does exclude is everything that ends an authority: whitespace and `/?#`. Without
-# those, an `@` later in the same URL (`https://u:pw@host/?to=a@b.com`) is the one the greedy
-# match backtracks to, and the host would be redacted along with the password.
+# Password in a URL's userinfo (`scheme://user:password@host`). The password class allows `@`
+# and excludes `/?#` and whitespace so the greedy match reaches the last `@` in the authority
+# -- otherwise `postgres://u:p@ssw0rd@host` redacts only `p` and writes `ssw0rd` into the bundle.
 _URL_CREDENTIALS_PATTERN = TextPattern(
     RedactionReason.URL_CREDENTIALS,
     re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]+):[^/?#\s]+@"),
     rf"\1:{REDACTED}@",
 )
 
-# Rules that consume a whole value up to a delimiter. These run before every other rule:
-# their value classes stop at `<`, so an earlier rule that inserted `<redacted>` into the
-# middle of the value would truncate the match and leave the tail of a live credential
-# behind. Running them first also means one credential is counted once rather than twice.
+# Rules that consume a whole value up to a delimiter. They run first because their value
+# classes stop at `<`, so an already-inserted `<redacted>` would truncate the match.
 DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN, _URL_CREDENTIALS_PATTERN]
 
-# What may follow a home directory for it to really be one. Without this, a home of
-# `/Users/sam` rewrites a sibling's `/Users/samantha/x` to `~antha/x`: nothing leaks, but
-# the result reads as this user's home when it is somebody else's.
-#
-# What the set holds is punctuation, and every kind of it: a letter or a digit after the home
-# path continues an identifier, so the path was never this home to begin with, while
-# punctuation ends one. `_`, `.`, and `-` are the three that look like exceptions and are
-# not -- a config key or a suffix is routinely appended to a path with each of them
-# (`/Users/sam_api_key`, `/Users/sam.old`, `/Users/sam-2`). Leaving `-` out of the set meant
-# only that spelling was left in the report verbatim, which in a file whose whole purpose is
-# to err toward hiding too much is the wrong way to be wrong.
+# What may follow a home directory for it to really be one: a home of `/Users/sam` would
+# otherwise rewrite `/Users/samantha/x` to `~antha/x`. Punctuation only -- a letter or digit
+# continues an identifier, so it was never this home. `-` is included (`/Users/sam-2`).
 _HOME_DIRECTORY_BOUNDARY = r"""(?=[/\\_.\-,;:!?*|'")\]}>\s]|$)"""
 
 
@@ -211,12 +166,9 @@ class Redactor:
         if normalize_identity:
             identity_patterns = self._build_identity_patterns()
 
-        # Order matters, and every rule that inserts `<redacted>` constrains what can run
-        # after it. Delimiter-anchored rules go first because their value classes stop at
-        # `<`: a token that had already been partly replaced would truncate their match and
-        # leave its tail behind. Known secrets go next, before the shape-matching patterns
-        # get a chance to rewrite part of one into something the exact match would miss.
-        # Identity last, so a home path inside an already-redacted value is moot.
+        # Order matters: every rule that inserts `<redacted>` constrains what can run after it.
+        # Delimiter-anchored first because their classes stop at `<`, then known secrets before the
+        # shape-matching patterns can rewrite part of one, then identity last.
         self._patterns = [
             *DELIMITED_VALUE_PATTERNS,
             *self._build_secret_patterns(secret_values),
@@ -266,10 +218,8 @@ class Redactor:
             return self._mask(value)
 
         if isinstance(value, dict):
-            # Keys are redacted as well as values. A library is free to add a settings
-            # subtree keyed by absolute path, and a key is as good a place for a home
-            # directory to hide as a value is. Sensitivity is decided on the original key,
-            # so redacting it cannot change whether its value is masked.
+            # Keys are redacted as well as values: a settings subtree can be keyed by absolute path.
+            # Sensitivity is decided on the original key, so redacting it cannot change masking.
             return {
                 self._redact_key(entry_key): self._redact_config_value(entry, key=str(entry_key))
                 for entry_key, entry in value.items()
@@ -300,23 +250,18 @@ class Redactor:
 
     def _mask(self, value: Any) -> Any:
         """Replace a credential value, keeping as much non-secret shape as is safe."""
-        # An unset value is not a secret, and "this is unset" is often the answer support
-        # is looking for. Returning it as-is also keeps it out of the redaction counts,
-        # so the counts only ever mean "something real was hidden".
+        # An unset value is not a secret, and "this is unset" is often the answer support wants.
+        # Returning it as-is also keeps it out of the counts, which then only mean something was hidden.
         if value is None:
             return value
         if isinstance(value, str | dict | list) and len(value) == 0:
             return value
 
-        # Recursing rather than blanket-replacing so an entry that is itself unset stays
-        # visibly unset. `OPENAI_API_KEY: ""` means "declared but never filled in", which
-        # is a common cause of the failures this report is collected to explain.
+        # Recursing rather than blanket-replacing so an entry that is itself unset stays visibly
+        # unset: `OPENAI_API_KEY: ""` means "declared but never filled in".
         if isinstance(value, dict):
-            # Names kept, values dropped: knowing which variables are set is the
-            # diagnostic signal, and the names are not themselves secret. The names still
-            # go through key redaction, because a credential-named mapping is free to be
-            # keyed by absolute path and a home directory hides there as readily as
-            # anywhere else.
+            # Names kept, values dropped: knowing which variables are set is the diagnostic signal. The
+            # names still go through key redaction, since such a mapping can be keyed by absolute path.
             return {self._redact_key(entry_key): self._mask(entry) for entry_key, entry in value.items()}
 
         if isinstance(value, list):
