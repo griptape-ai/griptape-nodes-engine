@@ -41,6 +41,8 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
+- An app event raised in one process is no longer delivered to listeners in another. A library running
+  isolated in its own process reports to the engine by sending a request instead.
 - **Breaking:** When a parameter's `ui_options` and a custom trait set the same key, the trait's
   value now wins, so node code can no longer override a trait's widget settings through
   `ui_options`. Implement `state_from_ui_options()` on the trait to accept these overrides, or
@@ -51,12 +53,12 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Removed
 
+- **Breaking:** `LibraryLoadedNotification` no longer carries `node_schemas`. A library that loaded in
+  its own process reports its schemas to the engine with the new `ReportLibraryLoadedRequest`, and the
+  notification that follows says only how the load went.
 - `TraitRegistry` and `Trait.get_trait_keys()` are removed, with no replacement, since nothing read
   them. Custom traits no longer need to implement `get_trait_keys()`, and existing implementations
   can be deleted.
-
-### Removed
-
 - The engine no longer runs its own static file server. The Griptape Nodes app serves the
   workspace, as it has since v0.95.0. `STATIC_SERVER_ENABLED` is gone.
 
