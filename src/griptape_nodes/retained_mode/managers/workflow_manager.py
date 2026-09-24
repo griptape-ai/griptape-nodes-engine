@@ -39,7 +39,6 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
-    WORKSPACE_WORKFLOW_SOURCE,
     Workflow,
     WorkflowMetadata,
     WorkflowMetadataError,
@@ -50,8 +49,6 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadataTomlError,
     WorkflowRegistry,
     WorkflowShape,
-    WorkflowSource,
-    WorkflowSourceKind,
     find_metadata_blocks,
     read_workflow_metadata,
 )
@@ -1286,7 +1283,7 @@ class WorkflowManager(EngineScoped):
                 registry_key=registry_key,
                 metadata=request.metadata,
                 file_path=request.file_name,
-                source=request.source,
+                library_name=request.library_name,
             )
         except Exception as e:
             details = f"Failed to register workflow with name '{request.metadata.name}'. Error: {e}"
@@ -2355,23 +2352,46 @@ class WorkflowManager(EngineScoped):
             await self.register_list_of_workflows(workflows_to_register)
 
     async def register_list_of_workflows(
-        self, workflows_to_register: list[str], source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE
+        self, workflows_to_register: list[str], library_name: str | None = None
     ) -> WorkflowRegistrationResult:
         """Register every workflow found at the given paths, returning which ones landed.
 
         Only newly registered keys appear in `succeeded`; a path whose key is already in the
         registry is skipped and shows up in neither list.
 
-        Pass `source` when the paths belong to some other population -- a library's `workflows`
-        list, today -- so the registry ties the resulting entries to that owner's lifetime.
+        Pass `library_name` when the paths come from that library's `workflows` list, so the
+        registry ties the resulting entries to the library's lifetime.
         """
-        return await self._process_workflows_for_registration(workflows_to_register, source=source)
+        return await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
+
+    async def refresh_missing_library_verdicts(self) -> None:
+        """Re-read the header of every workflow recorded as depending on a missing library.
+
+        A workflow's dependency verdict is computed once, when its metadata is read, and cached
+        until it is read again. So a workflow registered while a library it references was not
+        installed keeps saying so: install library A whose template references B, then install B,
+        and A's template stays flagged for the rest of the session. Called after a library
+        registers, which is exactly when a cached "not installed" can have stopped being true.
+
+        Only the workflows carrying that verdict are re-read; installing a library does not
+        re-parse every workflow on disk.
+        """
+        stale_paths = [
+            workflow_path
+            for workflow_path, workflow_info in self._workflow_file_path_to_info.items()
+            if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in workflow_info.problems)
+        ]
+        for workflow_path in stale_paths:
+            # The keys are already absolute, and on_load_workflow_metadata_request joins its
+            # file_name onto the workspace, which leaves an absolute path alone. So the recompute
+            # lands back on the same key.
+            await self.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=workflow_path))
 
     def _register_workflow(
         self,
         workflow_to_register: str,
         workflow_metadata: WorkflowMetadata,
-        source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE,
+        library_name: str | None = None,
     ) -> bool:
         """Registers a workflow from a file.
 
@@ -2381,7 +2401,7 @@ class WorkflowManager(EngineScoped):
                 Passed in rather than re-read here: loading it parses the file's TOML
                 header, and the caller has to do that anyway to decide the file is
                 registerable, so re-reading would parse every workflow twice.
-            source: Where this workflow came from; defaults to the workspace scan.
+            library_name: The library contributing this workflow, if any.
 
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
@@ -2393,7 +2413,7 @@ class WorkflowManager(EngineScoped):
 
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
-            metadata=workflow_metadata, file_name=str(workflow_to_register), source=source
+            metadata=workflow_metadata, file_name=str(workflow_to_register), library_name=library_name
         )
         workflow_register_result = self.engine.handle_request(workflow_register_request)
         if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):
@@ -3105,17 +3125,17 @@ class WorkflowManager(EngineScoped):
         """True when saving this workflow has to copy it instead of overwriting it.
 
         A template belonging to someone other than the user: one a library contributed, or one
-        Griptape ships. Provenance is what makes a library's template safe to ship with nothing
-        but `is_template` in its header -- the library author does not have to know to also set
-        `is_griptape_provided` to stop the editor writing the user's changes into their library
-        directory. The copy this produces is registered by the workspace scan, so saving it
-        again overwrites it like any other workflow of the user's.
+        Griptape ships. Using the recorded library is what makes a library's template safe to
+        ship with nothing but `is_template` in its header -- the author does not have to know to
+        also set `is_griptape_provided` to stop the editor writing the user's changes into their
+        library directory. The copy this produces is registered by the workspace scan, so saving
+        it again overwrites it like any other workflow of the user's.
         """
         if workflow is None:
             return False
         if not workflow.metadata.is_template:
             return False
-        return workflow.source.kind is not WorkflowSourceKind.WORKSPACE or bool(workflow.metadata.is_griptape_provided)
+        return workflow.library_name is not None or bool(workflow.metadata.is_griptape_provided)
 
     def _resolve_versioned_save_target(
         self,
@@ -7149,14 +7169,14 @@ class WorkflowManager(EngineScoped):
                 ),
             )
 
-    async def _process_workflows_for_registration(  # noqa: C901
-        self, workflows_to_register: list[str], source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE
+    async def _process_workflows_for_registration(
+        self, workflows_to_register: list[str], library_name: str | None = None
     ) -> WorkflowRegistrationResult:
         """Process a list of workflow paths for registration.
 
         Args:
             workflows_to_register: Files and directories to scan for workflows.
-            source: Where these paths came from; defaults to the workspace scan.
+            library_name: The library these paths belong to, or None for the workspace scan.
 
         Returns:
             WorkflowRegistrationResult with succeeded and failed workflow names
@@ -7164,24 +7184,97 @@ class WorkflowManager(EngineScoped):
         succeeded = []
         failed = []
 
-        # Build the set of registered-library roots (excluding sandbox) so their bundled
-        # workflow files are skipped during the workspace scan. Library-declared workflows
-        # (listed in griptape_nodes_library.json) only ever enter the registry through
-        # LibraryManager, which registers them under the library's own source so they live and
-        # die with it. Letting this scan claim them too would register them a second time as the
-        # workspace's, and that copy would outlive the library. Sandbox libraries are
-        # intentionally left scannable so in-development workflows appear.
+        all_workflow_files = await self._collect_workflow_files_to_register(
+            workflows_to_register, library_name=library_name
+        )
+
+        # A file whose key is already in the registry is dropped here rather than inside the loop
+        # below, so re-running a registration pass neither reports it as a failure nor counts it
+        # towards the progress total. Re-registering a library's workflows is a normal event (a
+        # library sync issues a second whole-set load), and a no-op has no business turning into
+        # a "failed" badge.
+        already_registered = {
+            workflow_file
+            for workflow_file in all_workflow_files
+            if WorkflowRegistry.has_workflow_with_name(self._derive_registry_key_for_file(workflow_file))
+        }
+        for workflow_file in already_registered:
+            logger.debug("Skipping already registered workflow: %s", workflow_file)
+        workflow_files_to_process = sorted(all_workflow_files - already_registered)
+
+        # Track progress
+        total_workflows = len(workflow_files_to_process)
+
+        # The WORKFLOWS phase of EngineInitializationProgress is the boot channel: the editor
+        # reads any of it as the engine still initializing, which blanks the workflow picker and
+        # sets it re-polling the registry. A library registering mid-session must not look like
+        # that, and does not need to -- it announces itself with LibraryWorkflowsChanged instead.
+        report_progress = library_name is None
+
+        # Second pass: process each workflow file with progress events
+        for current_index, workflow_file in enumerate(workflow_files_to_process, start=1):
+            workflow_name = str(workflow_file.name)
+
+            if report_progress:
+                self._report_workflow_scan_progress(
+                    item_name=workflow_name,
+                    status=InitializationStatus.LOADING,
+                    current=current_index,
+                    total=total_workflows,
+                )
+
+            # Process the workflow
+            result_name = await self._process_single_workflow_file(workflow_file, library_name=library_name)
+            if result_name:
+                succeeded.append(result_name)
+                if report_progress:
+                    self._report_workflow_scan_progress(
+                        item_name=workflow_name,
+                        status=InitializationStatus.COMPLETE,
+                        current=current_index,
+                        total=total_workflows,
+                    )
+            else:
+                failed.append(str(workflow_file))
+                if report_progress:
+                    self._report_workflow_scan_progress(
+                        item_name=workflow_name,
+                        status=InitializationStatus.FAILED,
+                        current=current_index,
+                        total=total_workflows,
+                        error="Failed to process workflow file",
+                    )
+
+        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
+
+    async def _collect_workflow_files_to_register(  # noqa: C901
+        self, workflows_to_register: list[str], *, library_name: str | None
+    ) -> set[Path]:
+        """Find every file among these paths that carries a workflow metadata header.
+
+        Args:
+            workflows_to_register: Files and directories to scan for workflows.
+            library_name: The library these paths belong to, or None for the workspace scan.
+
+        Returns:
+            The workflow files found, deduplicated.
+        """
+        # Registered-library roots (excluding sandbox) whose bundled workflow files the workspace
+        # scan must skip. Library-declared workflows (listed in griptape_nodes_library.json) only
+        # ever enter the registry through LibraryManager, which registers them under the library's
+        # name so they live and die with it. Letting this scan claim them too would register them a
+        # second time as the workspace's, and that copy would outlive the library. Sandbox libraries
+        # are intentionally left scannable so in-development workflows appear.
         #
-        # None of that applies when a library is the one registering: its own files are
-        # exactly what it is asking for.
+        # None of that applies when a library is the one registering: its own files are exactly
+        # what it is asking for.
         library_exclusion_roots: list[Path] = []
-        if source.kind is WorkflowSourceKind.WORKSPACE:
+        if library_name is None:
             for library_info in self.engine.library_manager._library_file_path_to_info.values():
                 if library_info.is_sandbox:
                     continue
                 library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
 
-        # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
 
         async def collect_workflow_files(path: Path) -> None:  # noqa: C901
@@ -7226,71 +7319,39 @@ class WorkflowManager(EngineScoped):
                 except Exception as e:
                     logger.debug("Skipping workflow file %s due to error: %s", path, e)
 
-        # Collect all workflow files first
         for workflow_to_register in workflows_to_register:
             await collect_workflow_files(Path(workflow_to_register))
 
-        # Track progress
-        total_workflows = len(all_workflow_files)
+        return all_workflow_files
 
-        # Second pass: process each workflow file with progress events
-        for current_index, workflow_file in enumerate(all_workflow_files, start=1):
-            workflow_name = str(workflow_file.name)
-
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
+    def _report_workflow_scan_progress(
+        self,
+        *,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        total: int,
+        error: str | None = None,
+    ) -> None:
+        """Report one workflow file's place in the boot scan to the initialization progress feed."""
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=total,
+                    error=error,
                 )
             )
+        )
 
-            # Process the workflow
-            result_name = await self._process_single_workflow_file(workflow_file, source=source)
-            if result_name:
-                succeeded.append(result_name)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
-            else:
-                failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
-                )
-
-        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
-
-    async def _process_single_workflow_file(
-        self, workflow_file: Path, source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE
-    ) -> str | None:
+    async def _process_single_workflow_file(self, workflow_file: Path, library_name: str | None = None) -> str | None:
         """Process a single workflow file for registration.
 
         Returns:
-            Workflow name if registered successfully, None if failed or skipped
+            Workflow name if registered successfully, None if it could not be registered
         """
         # Parse metadata once and use it for both registration check and actual registration
         load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_file))
@@ -7300,28 +7361,25 @@ class WorkflowManager(EngineScoped):
             logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
             return None
 
-        # Convert to relative path if the workflow is under workspace_path before checking registry
-        config_mgr = self.engine.config_manager
-        workspace_path = config_mgr.workspace_path
-
-        if workflow_file.is_relative_to(workspace_path):
-            relative_path = workflow_file.relative_to(workspace_path)
-            file_path_to_register = str(relative_path)
-        else:
-            file_path_to_register = str(workflow_file)
-
+        file_path_to_register = self._relative_to_workspace_if_inside(workflow_file)
         registry_key = derive_registry_key(file_path_to_register)
-
-        # Check if workflow is already registered using the path-based registry key
-        if WorkflowRegistry.has_workflow_with_name(registry_key):
-            logger.debug("Skipping already registered workflow: %s", workflow_file)
-            return None
 
         # Hand the already-parsed metadata to the registrar so the file's TOML header is
         # read once per workflow rather than twice.
-        if self._register_workflow(file_path_to_register, load_metadata_result.metadata, source=source):
+        if self._register_workflow(file_path_to_register, load_metadata_result.metadata, library_name=library_name):
             return registry_key
         return None
+
+    def _derive_registry_key_for_file(self, workflow_file: Path) -> str:
+        """The registry key a file on disk would register under."""
+        return derive_registry_key(self._relative_to_workspace_if_inside(workflow_file))
+
+    def _relative_to_workspace_if_inside(self, workflow_file: Path) -> str:
+        """Spell a workflow path the way the registry keys it: workspace-relative when it can be."""
+        workspace_path = self.engine.config_manager.workspace_path
+        if workflow_file.is_relative_to(workspace_path):
+            return str(workflow_file.relative_to(workspace_path))
+        return str(workflow_file)
 
 
 class ASTContainer:

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import sysconfig
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -68,7 +69,6 @@ from griptape_nodes.node_library.library_validation import (
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadataError,
     WorkflowRegistry,
-    WorkflowSource,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -83,9 +83,9 @@ from griptape_nodes.retained_mode.events.app_events import (
     InitializationStatus,
     LibraryLoadedNotification,
     LibraryLoadStatus,
+    LibraryWorkflowsChanged,
     WorkerNodeSchema,
     WorkerParameterSchema,
-    WorkflowsChanged,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -293,7 +293,7 @@ from griptape_nodes.utils.version_utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -2387,51 +2387,15 @@ class LibraryManager(EngineScoped):
         return result
 
     async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:
-        """Bring in one library on request, and register the workflow templates it ships.
-
-        The mid-session door: a client installing a library from a path, and the engine's own
-        install, download and git-reload handlers, all arrive here for a single library while
-        every other one is already loaded. So a workflow's `node_libraries_referenced` resolves
-        against the full set and the templates can go straight in.
-
-        The whole-set loads deliberately do NOT come through here -- they call
-        `_register_library_from_file` and register in one pass afterwards, because a library
-        registering partway through would resolve against a half-loaded registry. Keeping the
-        request handler and the batch loop on separate doors is what lets each say plainly which
-        it is, instead of this having to work it out from shared state.
-
-        One arrival cannot choose its door: a declared library dependency missing from disk
-        downloads and registers from inside another library's lifecycle, so it reaches here even
-        when that lifecycle is running in a batch. `register_workflows_for_library` refuses while
-        the loading gate is closed for exactly that case, and the pass after the load covers it.
-
-        Args:
-            request: RegisterLibraryFromFileRequest containing library_name OR file_path,
-                    perform_discovery_if_not_found, and load_as_default_library
-
-        Returns:
-            RegisterLibraryFromFileResultSuccess if loaded, RegisterLibraryFromFileResultFailure otherwise
-        """
-        result = await self._register_library_from_file(request)
-        if not isinstance(result, RegisterLibraryFromFileResultSuccess):
-            return result
-        if result.was_already_loaded:
-            # Nothing arrived, so there is nothing new to register. Skipped rather than relying on
-            # registration being idempotent: opening a workflow re-requests every library it
-            # references, and each pass would re-read the header of every template on disk.
-            return result
-
-        await self.register_workflows_for_registered_library(result.library_name)
-        return result
-
-    async def _register_library_from_file(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
         """Register a library by name or path, progressing through all lifecycle phases.
 
         Supports loading by library_name OR file_path (mutually exclusive), with optional
         discovery integration. Creates LibraryInfo if not already tracked.
 
-        Split from the handler above so the whole-set loads can reach the lifecycle work without
-        the handler's per-library workflow registration; see there for why they must not have it.
+        A library that newly arrived also gets its declared workflow templates registered. That
+        step defers itself while a whole-set load holds the libraries gate closed, so the batch
+        loops need no bookkeeping of their own -- see `register_workflows_for_library` and
+        `_batch_library_load`.
 
         Args:
             request: RegisterLibraryFromFileRequest containing library_name OR file_path,
@@ -2447,7 +2411,10 @@ class LibraryManager(EngineScoped):
         if isinstance(prereq_result, RegisterLibraryFromFileResultFailure):
             return prereq_result
 
-        # SUCCESS CHECK (library already loaded)
+        # SUCCESS CHECK (library already loaded). Nothing arrived, so there is nothing new to
+        # register. Returning here rather than relying on registration being idempotent: opening
+        # a workflow re-requests every library it references, and each pass would otherwise
+        # re-read the header of every template on disk.
         if isinstance(prereq_result, RegisterLibraryFromFileResultSuccess):
             return prereq_result
 
@@ -2464,27 +2431,36 @@ class LibraryManager(EngineScoped):
         if isinstance(progression_result, RegisterLibraryFromFileResultFailure):
             return progression_result
 
-        # Phase 3: Return appropriate result based on fitness
+        # Phase 3: Build the result from the library's fitness, and register what it ships.
         # At this point, library_name must be set (it's set during METADATA_LOADED phase)
         library_name = library_info.library_name
         if library_name is None:
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
 
+        result = self._build_register_library_result(library_info, library_name=library_name, file_path=file_path)
+        if isinstance(result, RegisterLibraryFromFileResultSuccess):
+            await self.register_workflows_for_library(library_info)
+        return result
+
+    def _build_register_library_result(
+        self, library_info: LibraryManager.LibraryInfo, *, library_name: str, file_path: str
+    ) -> RegisterLibraryFromFileResultSuccess | RegisterLibraryFromFileResultFailure:
+        """Turn a loaded library's fitness into the result its registration reports."""
         match library_info.fitness:
             case LibraryManager.LibraryFitness.GOOD:
                 details = f"Successfully loaded Library '{library_name}' from JSON file at {file_path}"
-                return RegisterLibraryFromFileResultSuccess(
+                result = RegisterLibraryFromFileResultSuccess(
                     library_name=library_name, result_details=ResultDetails(message=details, level=logging.INFO)
                 )
             case LibraryManager.LibraryFitness.FLAWED:
                 details = f"Successfully loaded Library JSON file from '{file_path}', but one or more nodes failed to load. Check the log for more details."
-                return RegisterLibraryFromFileResultSuccess(
+                result = RegisterLibraryFromFileResultSuccess(
                     library_name=library_name, result_details=ResultDetails(message=details, level=logging.WARNING)
                 )
             case LibraryManager.LibraryFitness.UNUSABLE:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because no nodes were loaded. Check the log for more details."
-                return RegisterLibraryFromFileResultFailure(result_details=details)
+                result = RegisterLibraryFromFileResultFailure(result_details=details)
             case LibraryManager.LibraryFitness.NOT_EVALUATED:
                 # Worker-delegated libraries on the orchestrator: node imports are skipped
                 # and fitness will be updated once the worker reports back via
@@ -2493,12 +2469,13 @@ class LibraryManager(EngineScoped):
                 # so we must NOT block here -- doing so would prevent the orchestrator from
                 # sending heartbeats to the worker process, causing it to self-terminate.
                 details = f"Successfully registered Library '{library_name}' from '{file_path}'. Node loading is delegated to a worker process."
-                return RegisterLibraryFromFileResultSuccess(
+                result = RegisterLibraryFromFileResultSuccess(
                     library_name=library_name, result_details=ResultDetails(message=details, level=logging.INFO)
                 )
             case _:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
-                return RegisterLibraryFromFileResultFailure(result_details=details)
+                result = RegisterLibraryFromFileResultFailure(result_details=details)
+        return result
 
     async def _establish_register_library_prerequisites(  # noqa: C901, PLR0911, PLR0912 (prerequisite validation needs branches)
         self, request: RegisterLibraryFromFileRequest
@@ -4123,7 +4100,7 @@ class LibraryManager(EngineScoped):
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""
-        # Emit the LOADING event BEFORE registering: _register_library_from_file installs
+        # Emit the LOADING event BEFORE registering: register_library_from_file_request installs
         # the library's dependencies (a slow pip/uv step), so emitting after it would leave the
         # GUI with no progress signal during the longest part of startup. The library name is
         # populated during discovery; fall back to a path-derived name if it isn't set yet.
@@ -4146,9 +4123,7 @@ class LibraryManager(EngineScoped):
             )
         )
 
-        # The lifecycle work only: this is one library out of a whole set, so its workflows are
-        # registered by the pass `load_all_libraries_from_config` runs once the set is complete.
-        load_result = await self._register_library_from_file(
+        load_result = await self.register_library_from_file_request(
             RegisterLibraryFromFileRequest(
                 file_path=lib_path,
                 load_as_default_library=False,
@@ -4205,6 +4180,29 @@ class LibraryManager(EngineScoped):
             return
         self._libraries_loading_complete = asyncio.Event()
 
+    @asynccontextmanager
+    async def _batch_library_load(self) -> AsyncIterator[None]:
+        """Hold the libraries gate closed for a whole-set load, then register what the set ships.
+
+        Closing the gate is what makes each library's own registration defer: workflow
+        registration reads every template's metadata header through
+        `WorkflowManager.on_load_workflow_metadata_request`, which waits on this gate, so a
+        library registering its templates mid-load would hang the load that closed it. Deferring
+        is also what a whole-set load wants regardless -- a workflow resolves its
+        `node_libraries_referenced` against the registry as it stands, so a template naming a
+        sibling still to load would be recorded as depending on something uninstalled.
+
+        The pass on exit is therefore the one place a batch's templates land, and pairing it with
+        the gate here is what keeps every batch loop from having to remember to run it. It runs
+        after the gate reopens, because it needs the gated API the body could not use.
+        """
+        self._close_libraries_loading_gate()
+        try:
+            yield
+        finally:
+            self._libraries_loading_complete.set()
+        await self.register_workflows_for_all_libraries()
+
     async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> list[str]:
         """Reconcile sourced libraries, then discover and load every enabled library.
 
@@ -4218,32 +4216,13 @@ class LibraryManager(EngineScoped):
 
         Returns the reconcile failure details (empty list on success).
         """
-        # Close the gate for the duration of the rebuild. A reload has already closed it
-        # before unloading, in which case this is a no-op and its waiters are preserved.
-        # The finally below reopens it on every exit path, so "closed" always means a load
-        # is in flight on the current loop.
-        self._close_libraries_loading_gate()
-        try:
-            reconcile_failures = await self._discover_and_load_libraries_from_config(target_library_names)
-        finally:
-            self._libraries_loading_complete.set()
-
-        # One pass over the whole set, after every library in it is registered. Each workflow
-        # resolves its `node_libraries_referenced` against `LibraryRegistry` as it stands when
-        # it registers, so registering a library's workflows partway through the load above
-        # would report one that names a sibling as depending on a library that is not installed
-        # when it is merely not installed yet -- and nothing recomputes that verdict afterwards.
-        # It also has to be out here because registering reads each workflow's metadata header
-        # through `WorkflowManager.on_load_workflow_metadata_request`, which waits on the gate.
-        await self.register_workflows_for_all_libraries()
-        return reconcile_failures
+        # A reload has already closed the gate before unloading, in which case the bracket's
+        # close is a no-op and its waiters are preserved.
+        async with self._batch_library_load():
+            return await self._discover_and_load_libraries_from_config(target_library_names)
 
     async def _discover_and_load_libraries_from_config(self, target_library_names: list[str] | None) -> list[str]:
-        """Discover every enabled library and load it, with the loading gate already closed.
-
-        Split out from `load_all_libraries_from_config` so that method is the gate bracket plus
-        the post-load workflow pass, and this is the load the two wrap.
-        """
+        """Discover every enabled library and load it, with the loading gate already closed."""
         reconcile_failures = await self._reconcile_libraries_from_config()
 
         # Discover all available libraries (config + sandbox)
@@ -4935,19 +4914,11 @@ class LibraryManager(EngineScoped):
             return
 
         if not self._libraries_loading_complete.is_set():
-            # A load of the whole set is in flight and holding this gate closed. Registering reads
-            # each workflow's metadata header through
-            # `WorkflowManager.on_load_workflow_metadata_request`, which waits on the same gate, so
-            # registering now would hang the load that closed it -- forever, since the load is what
-            # reopens it.
-            #
-            # An interlock at the one place that touches the gated API, not a decision about which
-            # caller may register: a library can arrive partway through a batch without the batch
-            # asking for it (a declared library dependency absent from disk downloads and registers
-            # from inside `_progress_library_through_lifecycle`), and every such arrival is covered
-            # by the single pass `load_all_libraries_from_config` runs once the gate is open. That
-            # pass is also the only point where a workflow can resolve its
-            # `node_libraries_referenced` against the complete set.
+            # A whole-set load is in flight and holding this gate closed. Registering reads each
+            # workflow's metadata header through `WorkflowManager.on_load_workflow_metadata_request`,
+            # which waits on the same gate, so registering now would hang the load that closed it.
+            # `_batch_library_load` runs this pass for every library once the gate reopens, so a
+            # library arriving mid-batch is not lost by returning here.
             logger.debug(
                 "Libraries are still loading; leaving library '%s' workflows to the pass that follows the load.",
                 library_name,
@@ -4955,19 +4926,26 @@ class LibraryManager(EngineScoped):
             return
 
         workflow_files = self._collect_workflow_files_for_library(library_info)
-        if not workflow_files:
-            return
+        registered_names: list[str] = []
+        if workflow_files:
+            registration = await self.engine.workflow_manager.register_list_of_workflows(
+                workflow_files, library_name=library_name
+            )
+            registered_names = registration.succeeded
 
-        source = WorkflowSource.for_library(library_name)
-        registration = await self.engine.workflow_manager.register_list_of_workflows(workflow_files, source=source)
-        if not registration.succeeded:
+        # A workflow registered while a library it names was not installed recorded that verdict,
+        # and it stays recorded until the header is read again. This library arriving may be what
+        # it was waiting for -- which holds whether or not this library ships templates itself.
+        await self.engine.workflow_manager.refresh_missing_library_verdicts()
+
+        if not registered_names:
             return
 
         self.engine.event_manager.put_event(
             AppEvent(
-                payload=WorkflowsChanged(
-                    source=source,
-                    workflow_names=registration.succeeded,
+                payload=LibraryWorkflowsChanged(
+                    library_name=library_name,
+                    workflow_names=registered_names,
                     registered=True,
                 )
             )
@@ -5015,15 +4993,14 @@ class LibraryManager(EngineScoped):
             logger.debug("Library '%s' is not known to this engine; leaving its workflows alone.", library_name)
             return
 
-        source = WorkflowSource.for_library(library_name)
-        removed_keys = WorkflowRegistry.remove_workflows_from_source(source)
+        removed_keys = WorkflowRegistry.remove_workflows_from_library(library_name)
         if not removed_keys:
             return
 
         self.engine.event_manager.put_event(
             AppEvent(
-                payload=WorkflowsChanged(
-                    source=source,
+                payload=LibraryWorkflowsChanged(
+                    library_name=library_name,
                     workflow_names=removed_keys,
                     registered=False,
                 )
@@ -6545,22 +6522,12 @@ class LibraryManager(EngineScoped):
 
         This is the legacy entry point that loads all configured libraries.
         New code should use LoadLibraryRequest to load specific libraries instead.
-
-        Library workflows are registered in one pass afterwards rather than as each library
-        loads, for the reason `load_all_libraries_from_config` gives: a workflow resolves the
-        libraries it references against the set registered at that moment, so a library naming
-        a sibling still to load would be reported as depending on something uninstalled.
         """
-        load_result = await self._load_every_discovered_library()
-        await self.register_workflows_for_all_libraries()
-        return load_result
+        async with self._batch_library_load():
+            return await self._load_every_discovered_library()
 
     async def _load_every_discovered_library(self) -> ResultPayload:  # noqa: C901, PLR0912
-        """Discover every enabled library and load it, reporting progress for each.
-
-        Split out from `load_libraries_request` so the handler is only the loop plus the workflow
-        pass that follows it, and this is the loop.
-        """
+        """Discover every enabled library and load it, reporting progress for each."""
         # First, discover all available libraries
         discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
@@ -6589,7 +6556,7 @@ class LibraryManager(EngineScoped):
         total_libraries = len(libraries_to_load)
 
         for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
-            # Emit the LOADING event BEFORE registering: _register_library_from_file
+            # Emit the LOADING event BEFORE registering: register_library_from_file_request
             # installs the library's dependencies (a slow pip/uv step), so emitting after it
             # would leave the GUI with no progress signal during the longest part of startup.
             # The library name isn't resolved until metadata loads, so fall back to a name
@@ -6613,9 +6580,7 @@ class LibraryManager(EngineScoped):
                 )
             )
 
-            # The lifecycle work only; `load_libraries_request` registers this whole set's
-            # workflows in one pass once this loop finishes.
-            load_result = await self._register_library_from_file(
+            load_result = await self.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(
                     file_path=lib_path,
                     load_as_default_library=False,
@@ -8050,7 +8015,6 @@ class LibraryManager(EngineScoped):
         libraries_updated = 0
         libraries_deferred = 0
         libraries_to_update: list[LibraryUpdateInfo] = []
-        updated_library_names: list[str] = []
 
         for library_name, check_result in check_results.items():
             if not isinstance(check_result, CheckLibraryUpdateResultSuccess):
@@ -8111,6 +8075,7 @@ class LibraryManager(EngineScoped):
                 result=update_result,
             )
 
+        # Gather all update results concurrently
         async with asyncio.TaskGroup() as tg:
             update_tasks = [
                 tg.create_task(update_library(info.library_name, info.old_version, info.new_version))
@@ -8154,7 +8119,6 @@ class LibraryManager(EngineScoped):
                 continue
 
             libraries_updated += 1
-            updated_library_names.append(library_name)
             update_summary[library_name] = {
                 "old_version": update_result.old_version,
                 "new_version": update_result.new_version,
@@ -8167,7 +8131,12 @@ class LibraryManager(EngineScoped):
                 update_result.new_version,
             )
 
-        await self._rebuild_workflows_for_updated_libraries(updated_library_names)
+        # The updates above run concurrently, and each one unloads its library and registers it
+        # again. A workflow registering mid-batch resolves its `node_libraries_referenced` against
+        # a registry that is missing whichever siblings sit between their own unload and reload, so
+        # it records a dependency on a library that is merely not installed for another moment.
+        # Every sibling is back by now, so re-reading those verdicts settles them.
+        await self.engine.workflow_manager.refresh_missing_library_verdicts()
 
         # Build result details
         details = f"Downloaded {libraries_downloaded} libraries. Checked {libraries_checked} libraries. {libraries_updated} updated."
@@ -8182,29 +8151,6 @@ class LibraryManager(EngineScoped):
             update_summary=update_summary,
             result_details=details,
         )
-
-    async def _rebuild_workflows_for_updated_libraries(self, library_names: list[str]) -> None:
-        """Take the updated libraries' workflows out and put them back, after every update is done.
-
-        The updates above run concurrently, and each one unloads its library and registers it
-        again. Registering resolves a workflow's `node_libraries_referenced` against
-        `LibraryRegistry` as it stands right then -- which, mid-batch, is missing whichever
-        siblings are between their own unload and reload. So a workflow that names a sibling is
-        recorded as depending on a library that is not installed, when it is merely not installed
-        for another moment, and nothing recomputes that afterwards.
-
-        Out and back in, rather than registering again: a key already in the registry is skipped,
-        so a second registration would leave the mid-batch verdict exactly where it is.
-
-        Only the libraries that updated. Every other library's workflows were registered before
-        this sync began, against a set that was complete at the time.
-        """
-        if not library_names:
-            return
-
-        for library_name in library_names:
-            self._unregister_workflows_for_library(library_name)
-            await self.register_workflows_for_registered_library(library_name)
 
     async def inspect_library_repo_request(self, request: InspectLibraryRepoRequest) -> ResultPayload:
         """Inspect a library's metadata from a git repository without downloading the full repository."""

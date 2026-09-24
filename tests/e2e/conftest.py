@@ -43,7 +43,7 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Ite
     """
     reset_root_engine()
     LibraryRegistry._clear()
-    WorkflowRegistry.clear_workspace_workflows()
+    WorkflowRegistry._clear()
 
     for key in list(os.environ):
         if key.startswith(("GT_CLOUD_", "GTN_CONFIG_")):
@@ -60,7 +60,7 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Ite
     finally:
         reset_root_engine()
         LibraryRegistry._clear()
-        WorkflowRegistry.clear_workspace_workflows()
+        WorkflowRegistry._clear()
 
 
 @pytest.fixture

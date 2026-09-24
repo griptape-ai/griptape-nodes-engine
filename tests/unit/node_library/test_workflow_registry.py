@@ -12,11 +12,8 @@ import pytest
 
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.workflow_registry import (
-    WORKSPACE_WORKFLOW_SOURCE,
     Workflow,
     WorkflowRegistry,
-    WorkflowSource,
-    WorkflowSourceKind,
 )
 
 if TYPE_CHECKING:
@@ -261,22 +258,22 @@ class TestWorkflowRegistryOperations:
             WorkflowRegistry.generate_new_workflow(registry_key="my_workflow", metadata=mock_metadata)
 
 
-class TestWorkflowSourceIsRecordedOnWrite:
-    """Where a workflow came from, recorded when it is registered.
+class TestContributingLibraryIsRecordedOnWrite:
+    """Which library contributed a workflow, recorded when it is registered.
 
     The registry holds populations with different lifetimes: what the workspace scan found, which
     goes away when the workspace changes, and what a library contributed, which goes away when
-    that library unloads. Recording the source on write is what tells them apart -- the metadata
+    that library unloads. Recording the library on write is what tells them apart -- the metadata
     header cannot, because an author sets those flags and they survive the file being copied out
     of the library into the workspace.
     """
 
-    def _register(self, registry_key: str, source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE) -> None:
+    def _register(self, registry_key: str, library_name: str | None = None) -> None:
         WorkflowRegistry.generate_new_workflow(
             registry_key=registry_key,
             metadata=MagicMock(),
             file_path=f"{registry_key}.py",
-            source=source,
+            library_name=library_name,
         )
 
     @pytest.fixture(autouse=True)
@@ -289,31 +286,25 @@ class TestWorkflowSourceIsRecordedOnWrite:
             yield
 
     def test_records_the_contributing_library(self) -> None:
-        self._register("lib_workflow", WorkflowSource.for_library("MyLib"))
+        self._register("lib_workflow", "MyLib")
 
-        source = WorkflowRegistry.get_workflow_by_name("lib_workflow").source
+        assert WorkflowRegistry.get_workflow_by_name("lib_workflow").library_name == "MyLib"
 
-        assert source.kind is WorkflowSourceKind.LIBRARY
-        assert source.library_name == "MyLib"
-
-    def test_the_default_source_is_the_workspace(self) -> None:
+    def test_no_library_by_default(self) -> None:
         self._register("user_workflow")
 
-        source = WorkflowRegistry.get_workflow_by_name("user_workflow").source
-
-        assert source.kind is WorkflowSourceKind.WORKSPACE
-        assert source.library_name is None
+        assert WorkflowRegistry.get_workflow_by_name("user_workflow").library_name is None
 
     def test_clear_workspace_workflows_keeps_library_workflows(self) -> None:
         self._register("user_workflow")
-        self._register("lib_workflow", WorkflowSource.for_library("MyLib"))
+        self._register("lib_workflow", "MyLib")
 
         WorkflowRegistry.clear_workspace_workflows()
 
         assert list(WorkflowRegistry._workflows) == ["lib_workflow"]
 
     def test_clear_workspace_workflows_ignores_the_template_flags(self) -> None:
-        """A rescan must not decide the source from the header.
+        """A rescan must not decide ownership from the header.
 
         A workflow flagged `is_griptape_provided` that no library contributed -- a template the
         user copied into their workspace, most likely -- is the user's, and a rescan finds it
@@ -333,31 +324,21 @@ class TestWorkflowSourceIsRecordedOnWrite:
 
         assert list(WorkflowRegistry._workflows) == []
 
-    def test_remove_workflows_from_source_takes_only_that_source_s_entries(self) -> None:
+    def test_remove_workflows_from_library_takes_only_that_library_s_entries(self) -> None:
         self._register("user_workflow")
-        self._register("mine", WorkflowSource.for_library("MyLib"))
-        self._register("theirs", WorkflowSource.for_library("OtherLib"))
+        self._register("mine", "MyLib")
+        self._register("theirs", "OtherLib")
 
-        removed = WorkflowRegistry.remove_workflows_from_source(WorkflowSource.for_library("MyLib"))
+        removed = WorkflowRegistry.remove_workflows_from_library("MyLib")
 
         assert removed == ["mine"]
         assert sorted(WorkflowRegistry._workflows) == ["theirs", "user_workflow"]
 
-    def test_remove_workflows_from_source_reports_nothing_for_a_source_with_none(self) -> None:
+    def test_remove_workflows_from_library_reports_nothing_for_a_library_with_none(self) -> None:
         self._register("user_workflow")
 
-        assert WorkflowRegistry.remove_workflows_from_source(WorkflowSource.for_library("MyLib")) == []
+        assert WorkflowRegistry.remove_workflows_from_library("MyLib") == []
         assert list(WorkflowRegistry._workflows) == ["user_workflow"]
-
-    def test_two_libraries_of_the_same_name_share_one_source(self) -> None:
-        """The source is compared by value, so it is the library name that identifies its entries.
-
-        Which is what `LibraryRegistry` keys by too, so at most one library of a given name is
-        loaded in a process. `LibraryManager._unregister_workflows_for_library` is what keeps one
-        Engine from removing another's entries for a name it never registered.
-        """
-        assert WorkflowSource.for_library("MyLib") == WorkflowSource.for_library("MyLib")
-        assert WorkflowSource.for_library("MyLib") != WORKSPACE_WORKFLOW_SOURCE
 
 
 class TestGetWorkflowMetadata:

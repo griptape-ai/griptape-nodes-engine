@@ -11,13 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.node_library.library_registry import Library, LibraryMetadata, LibrarySchema
-from griptape_nodes.node_library.workflow_registry import (
-    WORKSPACE_WORKFLOW_SOURCE,
-    WorkflowMetadata,
-    WorkflowRegistry,
-    WorkflowSource,
-)
-from griptape_nodes.retained_mode.events.app_events import WorkflowsChanged
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.retained_mode.events.app_events import LibraryWorkflowsChanged
 from griptape_nodes.retained_mode.events.library_events import (
     CheckLibraryUpdateRequest,
     CheckLibraryUpdateResultSuccess,
@@ -100,15 +95,43 @@ def _workflow_header(name: str = "example") -> str:
     return "\n".join(lines) + "\n"
 
 
-def _emitted_workflow_changes(event_manager: MagicMock) -> list[WorkflowsChanged]:
+def _emitted_workflow_changes(event_manager: MagicMock) -> list[LibraryWorkflowsChanged]:
     """Pull the workflow-change payloads out of a mocked event manager's put_event calls."""
     payloads = [call.args[0].payload for call in event_manager.put_event.call_args_list]
-    return [payload for payload in payloads if isinstance(payload, WorkflowsChanged)]
+    return [payload for payload in payloads if isinstance(payload, LibraryWorkflowsChanged)]
 
 
 def _library_entry() -> MagicMock:
     """A registry entry standing in for one this library contributed."""
-    return MagicMock(source=WorkflowSource.for_library(LIBRARY_NAME))
+    return MagicMock(library_name=LIBRARY_NAME)
+
+
+@contextlib.contextmanager
+def _stub_library_lifecycle(
+    library_manager: LibraryManager,
+    library_info: LibraryManager.LibraryInfo,
+    register_one: AsyncMock | None = None,
+) -> Iterator[None]:
+    """Patch out everything before the fitness match, so only what follows it is exercised.
+
+    There is no library on disk in these tests, so the lifecycle work cannot run. Pass
+    `register_one` to stand in for `register_workflows_for_library` and assert on whether the call
+    under test reaches it; leave it out to let the real registration run.
+    """
+    prerequisites = LibraryManager.RegisterLibraryPrerequisites(
+        library_info=library_info, file_path=library_info.library_path
+    )
+    with (
+        patch.object(
+            library_manager, "_establish_register_library_prerequisites", AsyncMock(return_value=prerequisites)
+        ),
+        patch.object(library_manager, "_progress_library_through_lifecycle", AsyncMock(return_value=None)),
+    ):
+        if register_one is None:
+            yield
+        else:
+            with patch.object(library_manager, "register_workflows_for_library", register_one):
+                yield
 
 
 class TestCollectWorkflowFilesForLibrary:
@@ -174,7 +197,7 @@ class TestRegisterWorkflowsForLibrary:
     async def test_registers_them_under_the_library_name_and_announces_them(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        """The source is what ties the entries to the library, so it has to reach the registry."""
+        """The library name is what ties the entries to the library, so it has to reach the registry."""
         register = AsyncMock(return_value=WorkflowRegistrationResult(succeeded=["example"], failed=[]))
         event_manager = MagicMock()
 
@@ -185,12 +208,10 @@ class TestRegisterWorkflowsForLibrary:
         ):
             await engine.library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json"))
 
-        register.assert_awaited_once_with(
-            [str(tmp_path / "example.py")], source=WorkflowSource.for_library(LIBRARY_NAME)
-        )
+        register.assert_awaited_once_with([str(tmp_path / "example.py")], library_name=LIBRARY_NAME)
         changes = _emitted_workflow_changes(event_manager)
         assert len(changes) == 1
-        assert changes[0].source == WorkflowSource.for_library(LIBRARY_NAME)
+        assert changes[0].library_name == LIBRARY_NAME
         assert changes[0].workflow_names == ["example"]
         assert changes[0].registered is True
 
@@ -212,6 +233,25 @@ class TestRegisterWorkflowsForLibrary:
             await engine.library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json"))
 
         assert _emitted_workflow_changes(event_manager) == []
+
+    @pytest.mark.asyncio
+    async def test_a_library_arriving_re_reads_the_verdicts_that_named_it(self, engine: Engine, tmp_path: Path) -> None:
+        """A "library not installed" verdict is cached, and this arrival may be what was missing.
+
+        Install a library whose template references a second one, then install the second: without
+        this the first library's template stays flagged for the rest of the session. This library
+        declares no workflows of its own, because being the library someone else was waiting for
+        has nothing to do with shipping templates.
+        """
+        refresh = AsyncMock(return_value=None)
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(None)),
+            patch.object(engine.workflow_manager, "refresh_missing_library_verdicts", refresh),
+        ):
+            await engine.library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json"))
+
+        refresh.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_does_not_register_when_the_library_declares_nothing(self, engine: Engine, tmp_path: Path) -> None:
@@ -366,8 +406,8 @@ class TestUnregisterWorkflowsForLibrary:
         library_manager = engine.library_manager
         event_manager = MagicMock()
         mine = _library_entry()
-        theirs = MagicMock(source=WorkflowSource.for_library("OtherLib"))
-        users = MagicMock(source=WORKSPACE_WORKFLOW_SOURCE)
+        theirs = MagicMock(library_name="OtherLib")
+        users = MagicMock(library_name=None)
 
         with (
             patch.dict(
@@ -383,7 +423,7 @@ class TestUnregisterWorkflowsForLibrary:
 
         changes = _emitted_workflow_changes(event_manager)
         assert len(changes) == 1
-        assert changes[0].source == WorkflowSource.for_library(LIBRARY_NAME)
+        assert changes[0].library_name == LIBRARY_NAME
         assert changes[0].workflow_names == ["lib/example"]
         assert changes[0].registered is False
 
@@ -393,7 +433,7 @@ class TestUnregisterWorkflowsForLibrary:
         with (
             patch.dict(
                 WorkflowRegistry._workflows,
-                {"user_workflow": MagicMock(source=WORKSPACE_WORKFLOW_SOURCE)},
+                {"user_workflow": MagicMock(library_name=None)},
                 clear=True,
             ),
             patch.object(engine, "_event_manager", event_manager),
@@ -440,41 +480,13 @@ class TestUnregisterWorkflowsForLibrary:
             assert "lib/example" not in WorkflowRegistry._workflows
 
 
-class TestTheRequestHandlerAndTheBatchLoopUseSeparateDoors:
-    """One library arriving on request registers its workflows; one out of a whole set does not.
+class TestRegisteringALibraryRegistersItsWorkflows:
+    """Every library that newly arrives goes through one door, and that door registers.
 
-    They used to share `register_library_from_file_request`, which is why it could not tell which
-    it was serving and had to work it out from the loading gate. Splitting the lifecycle work into
-    `_register_library_from_file` lets each caller say plainly which it is: the handler is the
-    mid-session door and registers, the batch loops take the inner one and leave it to the pass
-    that runs when their set is complete.
+    No caller has to know whether it is bringing in one library or one of a set: a library arriving
+    mid-batch finds the loading gate closed and leaves its workflows to the pass that follows the
+    batch. See `TestRegisterWorkflowsForLibrary.test_refuses_while_the_loading_gate_is_closed`.
     """
-
-    @contextlib.contextmanager
-    def _stub_lifecycle(
-        self,
-        library_manager: LibraryManager,
-        library_info: LibraryManager.LibraryInfo,
-        register_one: AsyncMock,
-    ) -> Iterator[None]:
-        """Patch out everything before the fitness match, so only what follows it is exercised.
-
-        `register_one` stands in for `register_workflows_for_library`, to assert on whether the
-        call under test reaches it.
-        """
-        prerequisites = LibraryManager.RegisterLibraryPrerequisites(
-            library_info=library_info, file_path=library_info.library_path
-        )
-        with (
-            patch.object(
-                library_manager,
-                "_establish_register_library_prerequisites",
-                AsyncMock(return_value=prerequisites),
-            ),
-            patch.object(library_manager, "_progress_library_through_lifecycle", AsyncMock(return_value=None)),
-            patch.object(library_manager, "register_workflows_for_library", register_one),
-        ):
-            yield
 
     @pytest.mark.parametrize(
         ("fitness", "expected_result", "expect_workflows_registered"),
@@ -507,7 +519,7 @@ class TestTheRequestHandlerAndTheBatchLoopUseSeparateDoors:
         register_one = AsyncMock(return_value=None)
 
         with (
-            self._stub_lifecycle(library_manager, library_info, register_one),
+            _stub_library_lifecycle(library_manager, library_info, register_one),
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=[LIBRARY_NAME]),
             patch.dict(
                 library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
@@ -519,28 +531,6 @@ class TestTheRequestHandlerAndTheBatchLoopUseSeparateDoors:
 
         assert isinstance(result, expected_result)
         assert register_one.await_count == (1 if expect_workflows_registered else 0)
-
-    @pytest.mark.asyncio
-    async def test_the_inner_callee_the_batch_loops_take_registers_nothing(
-        self, engine: Engine, tmp_path: Path
-    ) -> None:
-        """What `_load_and_track_library` and `_load_every_discovered_library` call.
-
-        Register here and a library loading partway through a batch would resolve its workflows'
-        `node_libraries_referenced` against a half-loaded registry, and would deadlock besides:
-        reading a workflow header waits on the very gate the enclosing load holds closed.
-        """
-        library_manager = engine.library_manager
-        library_info = _library_info(tmp_path / "lib.json")
-        register_one = AsyncMock(return_value=None)
-
-        with self._stub_lifecycle(library_manager, library_info, register_one):
-            result = await library_manager._register_library_from_file(
-                RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
-            )
-
-        assert isinstance(result, RegisterLibraryFromFileResultSuccess)
-        register_one.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_already_loaded_library_is_not_re_registered(self, engine: Engine, tmp_path: Path) -> None:
@@ -651,7 +641,7 @@ class TestTheWholeSetRegistersAfterTheLoad:
 
         # The key itself is absolute here, because tmp_path sits outside the workspace. What this
         # asserts is that the pass ran to completion and recorded the library as the owner.
-        assert [workflow.source for workflow in registered] == [WorkflowSource.for_library(LIBRARY_NAME)]
+        assert [workflow.library_name for workflow in registered] == [LIBRARY_NAME]
 
     @pytest.mark.asyncio
     async def test_an_early_exit_still_opens_the_gate_and_still_registers(self, engine: Engine) -> None:
@@ -728,28 +718,34 @@ class TestTheWholeSetRegistersAfterTheLoad:
         assert calls == ["load", "register"]
 
     @pytest.mark.asyncio
-    async def test_the_loop_takes_the_door_that_does_not_register(self, engine: Engine, tmp_path: Path) -> None:
-        """The other half of the split, from the batch side.
+    async def test_the_loop_registers_nothing_while_it_holds_the_gate(self, engine: Engine, tmp_path: Path) -> None:
+        """The pass afterwards is only safe because nothing inside the loop registers.
 
-        The pass afterwards is only safe because nothing inside the loop registers. Point the loop
-        back at `register_library_from_file_request` and every library would register partway
-        through the load -- against a half-loaded registry, behind a gate the load holds closed.
+        The loop takes the same door a mid-session arrival does, so the gate it holds closed is the
+        whole of what defers registration. Open the gate around the loop and every library would
+        register partway through the load -- against a half-loaded registry, and reading a workflow
+        header would suspend on the gate the load itself has to reopen.
         """
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
-        arrival = RegisterLibraryFromFileResultSuccess(library_name=LIBRARY_NAME, result_details="registered")
-        register_one_library = AsyncMock(return_value=arrival)
-        mid_session_door = AsyncMock(return_value=arrival)
+        (tmp_path / "example.py").write_text(_workflow_header(), encoding="utf-8")
+        library_info = _library_info(library_json)
+        library_manager._close_libraries_loading_gate()
 
         with (
-            patch.object(library_manager, "_register_library_from_file", register_one_library),
-            patch.object(library_manager, "register_library_from_file_request", mid_session_door),
-            patch.dict(library_manager._library_file_path_to_info, {}, clear=True),
+            _stub_library_lifecycle(library_manager, library_info),
+            patch.dict(
+                library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
+            ),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
         ):
-            await library_manager._load_and_track_library(str(library_json), index=1, total=1)
+            await asyncio.wait_for(
+                library_manager._load_and_track_library(library_info.library_path, index=1, total=1), timeout=10
+            )
+            registered = list(WorkflowRegistry._workflows)
 
-        register_one_library.assert_awaited_once()
-        mid_session_door.assert_not_awaited()
+        assert registered == []
 
     @pytest.mark.asyncio
     async def test_discover_libraries_request_is_the_shape_these_tests_assume(self, engine: Engine) -> None:
@@ -764,23 +760,22 @@ class TestTheWholeSetRegistersAfterTheLoad:
         assert isinstance(result, DiscoverLibrariesResultSuccess)
 
 
-class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
+class TestEachMidSessionArrivalRegistersItsWorkflows:
     """A library arriving on its own registers its own workflows, and gets there via the handler.
 
     Every other library is already loaded on these paths, so a workflow's
-    `node_libraries_referenced` resolves against the full set and there is no whole-set pass to
-    wait for. Two handlers bring one library in mid-session and both reach it the same way: they
-    dispatch `RegisterLibraryFromFileRequest`, and registering the templates is what that handler
-    does. So neither registers anything itself, and neither may take the inner
-    `_register_library_from_file` shortcut the batch loops use. `TestTheConcurrentSyncBatch` below
-    covers the one caller that drives these doors several at a time.
+    `node_libraries_referenced` resolves against the full set and the gate is open. Two handlers
+    bring one library in mid-session and both reach it the same way: they dispatch
+    `RegisterLibraryFromFileRequest`, and registering the templates is what that handler does. So
+    neither registers anything itself. `TestTheConcurrentSyncBatch` below covers the one caller that
+    drives these paths several at a time.
 
-    These tests run the real handler behind the mocked dispatch for exactly that reason -- asserting
-    only that some request went out would pass just as happily if the path called the inner one.
+    These tests run the real handler behind the mocked dispatch: asserting only that some request
+    went out would pass just as happily if it never reached the registration.
     """
 
     def _register_through_the_real_handler(
-        self, library_manager: LibraryManager, register_one: AsyncMock
+        self, library_manager: LibraryManager, library_info: LibraryManager.LibraryInfo, register_one: AsyncMock
     ) -> Callable[[object], Awaitable[object]]:
         """Build an `ahandle_request` side effect that routes registrations to the real handler.
 
@@ -788,14 +783,10 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         leaving the part under test: whether reaching this handler registers the workflows.
         `register_one` stands in for `register_workflows_for_library`.
         """
-        arrival = RegisterLibraryFromFileResultSuccess(library_name=LIBRARY_NAME, result_details="registered")
 
         async def dispatch(request: object) -> object:
             if isinstance(request, RegisterLibraryFromFileRequest):
-                with (
-                    patch.object(library_manager, "_register_library_from_file", AsyncMock(return_value=arrival)),
-                    patch.object(library_manager, "register_workflows_for_library", register_one),
-                ):
+                with _stub_library_lifecycle(library_manager, library_info, register_one):
                     return await library_manager.register_library_from_file_request(request)
             msg = f"Unexpected request: {type(request).__name__}"
             raise AssertionError(msg)
@@ -814,6 +805,7 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         library_json = tmp_path / "griptape_nodes_library.json"
         library_json.write_text("{}", encoding="utf-8")
         register_one = AsyncMock(return_value=None)
+        dispatch = self._register_through_the_real_handler(library_manager, _library_info(library_json), register_one)
 
         with (
             patch.object(
@@ -822,11 +814,7 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
                 MagicMock(return_value=UnloadLibraryFromRegistryResultSuccess(result_details="unloaded")),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=library_json),
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(side_effect=self._register_through_the_real_handler(library_manager, register_one)),
-            ),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
         ):
             result = await library_manager._reload_library_after_git_operation(
@@ -844,6 +832,7 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
         register_one = AsyncMock(return_value=None)
+        dispatch = self._register_through_the_real_handler(library_manager, _library_info(library_json), register_one)
 
         downloaded = AsyncMock()
         downloaded.mkdir = AsyncMock(return_value=None)
@@ -854,11 +843,7 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.anyio.Path", return_value=downloaded),
             patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=str(library_json)),
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(side_effect=self._register_through_the_real_handler(library_manager, register_one)),
-            ),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine.config_manager, "set_config_value", MagicMock(return_value=None)),
             patch.dict(library_manager._library_file_path_to_info, {}, clear=True),
@@ -877,7 +862,7 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
 
     @pytest.mark.asyncio
     async def test_an_arrival_mid_load_does_not_hang_the_load(self, engine: Engine, tmp_path: Path) -> None:
-        """The one arrival that cannot choose its door, run for real against a closed gate.
+        """An arrival nothing asked for, run for real against a closed gate.
 
         A declared library dependency that is missing from disk is downloaded and registered from
         inside another library's lifecycle, so it reaches this handler even when that lifecycle is
@@ -891,13 +876,13 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
         (tmp_path / "example.py").write_text(_workflow_header(), encoding="utf-8")
-        arrival = RegisterLibraryFromFileResultSuccess(library_name=LIBRARY_NAME, result_details="registered")
+        library_info = _library_info(library_json)
         library_manager._close_libraries_loading_gate()
 
         with (
-            patch.object(library_manager, "_register_library_from_file", AsyncMock(return_value=arrival)),
+            _stub_library_lifecycle(library_manager, library_info),
             patch.dict(
-                library_manager._library_file_path_to_info, {str(library_json): _library_info(library_json)}, clear=True
+                library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
             patch.dict(WorkflowRegistry._workflows, {}, clear=True),
@@ -915,11 +900,11 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
 
 
 class TestTheConcurrentSyncBatch:
-    """Sync is the one batch built out of mid-session doors: it drives `UpdateLibraryRequest`.
+    """Sync is the one batch that leaves the gate open: it drives `UpdateLibraryRequest`.
 
     Each update reloads one library and registers its workflows itself, which is right for a
     library arriving alone and wrong for several at once -- so this batch cannot use the gate to
-    hold them back (it would deadlock), and has to repair the result afterwards instead.
+    hold them back (it would deadlock), and re-reads the verdicts afterwards instead.
     """
 
     @pytest.mark.asyncio
@@ -970,18 +955,17 @@ class TestTheConcurrentSyncBatch:
         assert isinstance(result, SyncLibrariesResultSuccess)
         assert result.libraries_updated == 1
         assert observed == {"gate_open_during_the_check_pass": True, "gate_open_during_the_update_pass": True}
-        # Sync does not touch the whole set: the updates it drives each reload one library, and
-        # the pass afterwards rebuilds exactly those. See the test below.
+        # Sync does not register the whole set: the updates it drives each register the one library
+        # they reloaded. See the test below for what sync owes afterwards.
         register_all.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_sync_rebuilds_the_updated_libraries_workflows_after_the_batch(self, engine: Engine) -> None:
+    async def test_sync_re_reads_the_verdicts_after_the_batch(self, engine: Engine) -> None:
         """The updates run concurrently, so each one registers while siblings are mid-unload.
 
         A workflow naming a sibling that is between its own unload and reload is recorded as
-        depending on a library that is not installed, and nothing recomputes that. So sync takes
-        the updated libraries' entries out and puts them back once every update has finished --
-        out and back in, because re-registering skips a key already in the registry.
+        depending on a library that is not installed, and that verdict is cached. So sync re-reads
+        the affected headers once every update has finished, when every sibling is back.
         """
         library_manager = engine.library_manager
         other_library = "OtherLib"
@@ -1010,34 +994,33 @@ class TestTheConcurrentSyncBatch:
             msg = f"Unexpected request: {type(request).__name__}"
             raise AssertionError(msg)
 
-        def unregister(library_name: str) -> None:
-            sequence.append(f"out:{library_name}")
-
-        async def register(library_name: str) -> None:
-            sequence.append(f"in:{library_name}")
+        async def refresh_verdicts() -> None:
+            sequence.append("refresh")
 
         with (
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
-            patch.object(library_manager, "_unregister_workflows_for_library", MagicMock(side_effect=unregister)),
-            patch.object(library_manager, "register_workflows_for_registered_library", AsyncMock(side_effect=register)),
+            patch.object(
+                engine.workflow_manager, "refresh_missing_library_verdicts", AsyncMock(side_effect=refresh_verdicts)
+            ),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 
         assert isinstance(result, SyncLibrariesResultSuccess)
         assert result.libraries_updated == len(updating)
-        # The updates go first, in whichever order the task group finishes them. Every rebuild
-        # lands after all of them, which is the point: no library is mid-unload by then.
-        updates, rebuilds = sequence[: len(updating)], sequence[len(updating) :]
+        # The updates go first, in whichever order the task group finishes them. The refresh lands
+        # after all of them, which is the point: no library is mid-unload by then.
+        updates, refreshes = sequence[: len(updating)], sequence[len(updating) :]
         assert sorted(updates) == sorted(f"update:{name}" for name in updating)
-        assert rebuilds == [f"out:{LIBRARY_NAME}", f"in:{LIBRARY_NAME}", f"out:{other_library}", f"in:{other_library}"]
+        assert refreshes == ["refresh"]
 
     @pytest.mark.asyncio
-    async def test_sync_rebuilds_nothing_when_no_library_updated(self, engine: Engine) -> None:
-        """Nothing registered during the batch, so there is no mid-batch verdict to redo.
+    async def test_sync_leaves_the_registry_alone(self, engine: Engine) -> None:
+        """Re-reading a verdict is not the same as re-registering the entry.
 
-        Rebuilding anyway would take every library's workflows out of the picker and put them back
-        on every sync, announcing a removal and a re-add to clients for no change.
+        The repair only recomputes what a workflow's header says about its libraries. Taking the
+        entries out and putting them back instead would announce a removal and a re-add to every
+        client showing the workflow list, on every sync, for no change.
         """
         library_manager = engine.library_manager
         unregister = MagicMock(return_value=None)
@@ -1050,28 +1033,31 @@ class TestTheConcurrentSyncBatch:
                 return ListRegisteredLibrariesResultSuccess(libraries=[LIBRARY_NAME], result_details="one library")
             if isinstance(request, CheckLibraryUpdateRequest):
                 return CheckLibraryUpdateResultSuccess(
-                    has_update=False,
+                    has_update=True,
                     current_version="1.0.0",
-                    latest_version="1.0.0",
+                    latest_version="2.0.0",
                     git_remote="https://example.invalid/lib.git",
                     git_ref="main",
                     local_commit="aaaaaaa",
-                    remote_commit="aaaaaaa",
-                    result_details="up to date",
+                    remote_commit="bbbbbbb",
+                    result_details="update available",
                 )
+            if isinstance(request, UpdateLibraryRequest):
+                return UpdateLibraryResultSuccess(old_version="1.0.0", new_version="2.0.0", result_details="updated")
             msg = f"Unexpected request: {type(request).__name__}"
             raise AssertionError(msg)
 
         with (
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
+            patch.object(engine.workflow_manager, "refresh_missing_library_verdicts", AsyncMock(return_value=None)),
             patch.object(library_manager, "_unregister_workflows_for_library", unregister),
             patch.object(library_manager, "register_workflows_for_registered_library", register),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 
         assert isinstance(result, SyncLibrariesResultSuccess)
-        assert result.libraries_updated == 0
+        assert result.libraries_updated == 1
         unregister.assert_not_called()
         register.assert_not_awaited()
 
@@ -1151,7 +1137,7 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
 
             registered = WorkflowRegistry.get_workflow_by_name(registry_key)
             assert registered.metadata.is_griptape_provided is False
-            assert registered.source == WorkflowSource.for_library(LIBRARY_NAME)
+            assert registered.library_name == LIBRARY_NAME
 
             # An empty list skips the workspace scan; the clear is the part under test.
             await workflow_manager.refresh_workflow_registry(workflows_to_register=[])
@@ -1207,8 +1193,9 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
 
         A library hands over explicit file paths today, and those never reach the directory walk
         that consults the exclusion roots. Handing over its own directory is the case that would:
-        the library's own root is an exclusion candidate, so without the source check a library
-        would exclude its own files and registering its workflows would silently do nothing.
+        the library's own root is an exclusion candidate, so without the check on the contributing
+        library it would exclude its own files and registering its workflows would silently do
+        nothing.
         """
         workflow_manager = engine.workflow_manager
         config_manager = engine.config_manager
@@ -1227,9 +1214,7 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
             patch.dict(WorkflowRegistry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", workspace),
         ):
-            await workflow_manager._process_workflows_for_registration(
-                [str(library_dir)], source=WorkflowSource.for_library(LIBRARY_NAME)
-            )
+            await workflow_manager._process_workflows_for_registration([str(library_dir)], library_name=LIBRARY_NAME)
             registered = list(WorkflowRegistry._workflows)
 
         assert registered == ["libraries/test_lib/example"]
@@ -1277,7 +1262,7 @@ class TestRekeyWorkflowsForAllLibraries:
         """Same reason as the register side: `LibraryRegistry` is process-global."""
         library_manager = engine.library_manager
         register_one = AsyncMock(return_value=None)
-        other_engines_workflow = MagicMock(source=WorkflowSource.for_library("AnotherEnginesLib"))
+        other_engines_workflow = MagicMock(library_name="AnotherEnginesLib")
 
         with (
             patch.dict(library_manager._library_file_path_to_info, {}, clear=True),

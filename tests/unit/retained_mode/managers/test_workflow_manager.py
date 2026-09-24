@@ -19,18 +19,18 @@ if TYPE_CHECKING:
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.node_library.library_registry import LibraryMetadata
 from griptape_nodes.node_library.workflow_registry import (
-    WORKSPACE_WORKFLOW_SOURCE,
     Workflow,
     WorkflowMetadata,
     WorkflowRegistry,
     WorkflowShape,
-    WorkflowSource,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+from griptape_nodes.retained_mode.events.library_events import GetLibraryMetadataResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
     BranchWorkflowResultFailure,
@@ -1686,6 +1686,64 @@ class TestWorkflowManager:
         assert isinstance(result, LoadWorkflowMetadataResultSuccess)
         info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "bad_version.py")]
         assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
+
+    @pytest.mark.asyncio
+    async def test_refreshing_verdicts_clears_a_dependency_that_has_since_arrived(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """The verdict is computed when the header is read and cached until it is read again.
+
+        So a template registered while a library it names was uninstalled keeps saying so for the
+        rest of the session, even once that library is installed. The refresh is what re-reads it.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+        workflow_path = tmp_path / "needs_a_library.py"
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        workflow_path.write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "needs_a_library"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Late Library", "1.0.0"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name="needs_a_library.py"))
+        flagged = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in flagged.problems)
+
+        # The library the header names turns up, which is the case nothing recomputed before.
+        arrived = LibraryMetadata(
+            author="Someone", description="Arrived late", library_version="1.0.0", engine_version="0.0.0", tags=[]
+        )
+        with (
+            patch(
+                "griptape_nodes.node_library.library_registry.LibraryRegistry.list_libraries",
+                return_value=["Late Library"],
+            ),
+            patch.object(
+                engine.library_manager,
+                "get_library_metadata_request",
+                MagicMock(
+                    return_value=GetLibraryMetadataResultSuccess(metadata=arrived, result_details="Late Library")
+                ),
+            ),
+        ):
+            await workflow_manager.refresh_missing_library_verdicts()
+
+        settled = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert not any(isinstance(problem, LibraryNotRegisteredProblem) for problem in settled.problems)
+        assert [dependency.status for dependency in settled.workflow_dependencies] == [WorkflowDependencyStatus.PERFECT]
 
     # --- WorkflowInfo payload helpers ---
 
@@ -5551,9 +5609,9 @@ class TestProtectedTemplateOwnership:
     """Which templates saving copies instead of overwriting.
 
     A template that belongs to someone other than the user: one a library contributed, or one
-    Griptape ships. Provenance is what lets a library ship a template with nothing but
-    ``is_template`` in its header -- before this, an author who did not also know to set
-    ``is_griptape_provided`` got the user's edits written into their library directory.
+    Griptape ships. Recording the contributing library is what lets a library ship a template with
+    nothing but ``is_template`` in its header -- before this, an author who did not also know to
+    set ``is_griptape_provided`` got the user's edits written into their library directory.
     """
 
     @staticmethod
@@ -5561,7 +5619,7 @@ class TestProtectedTemplateOwnership:
         *,
         is_template: bool = False,
         is_griptape_provided: bool = False,
-        source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE,
+        library_name: str | None = None,
     ) -> Workflow:
         metadata = WorkflowMetadata(
             name="example",
@@ -5575,16 +5633,16 @@ class TestProtectedTemplateOwnership:
             registry_key=WorkflowRegistry._RegistryKey(),
             metadata=metadata,
             file_path="example.py",
-            source=source,
+            library_name=library_name,
         )
 
     def test_a_library_template_is_protected(self, engine: Engine) -> None:
-        workflow = self._workflow(is_template=True, source=WorkflowSource.for_library("MyLib"))
+        workflow = self._workflow(is_template=True, library_name="MyLib")
 
         assert engine.workflow_manager._is_protected_template(workflow) is True
 
     def test_a_griptape_provided_template_is_protected(self, engine: Engine) -> None:
-        """The pre-existing rule still holds: engine-shipped templates carry the flag, not a source."""
+        """The pre-existing rule still holds: engine-shipped templates carry the flag, not a library."""
         workflow = self._workflow(is_template=True, is_griptape_provided=True)
 
         assert engine.workflow_manager._is_protected_template(workflow) is True
@@ -5592,20 +5650,20 @@ class TestProtectedTemplateOwnership:
     def test_the_users_own_template_is_not_protected(self, engine: Engine) -> None:
         """A workflow the user marked ``is_template`` in their own workspace is theirs to overwrite.
 
-        Which is also what the copy a save produces looks like: the workspace scan registers it as
-        the workspace's, so saving it again overwrites it rather than making a third copy.
+        Which is also what the copy a save produces looks like: the workspace scan registers it
+        with no library, so saving it again overwrites it rather than making a third copy.
         """
         workflow = self._workflow(is_template=True)
 
         assert engine.workflow_manager._is_protected_template(workflow) is False
 
     def test_a_library_workflow_that_is_not_a_template_is_not_protected(self, engine: Engine) -> None:
-        """The source alone does not protect anything -- the header still has to say template.
+        """Coming from a library does not protect anything -- the header still has to say template.
 
         A library can declare a workflow that is not a template, and saving that keeps the
-        overwrite-in-place behaviour it had before the source was recorded at all.
+        overwrite-in-place behaviour it had before the contributing library was recorded at all.
         """
-        workflow = self._workflow(source=WorkflowSource.for_library("MyLib"))
+        workflow = self._workflow(library_name="MyLib")
 
         assert engine.workflow_manager._is_protected_template(workflow) is False
 
@@ -5618,8 +5676,8 @@ class TestProtectedTemplateOwnership:
         assert engine.workflow_manager._is_protected_template(None) is False
 
 
-class TestSaveFromTemplateRoutesOnProvenance:
-    """The provenance rule wired up, through the real ``_determine_save_target``.
+class TestSaveFromTemplateRoutesOnTheOwningLibrary:
+    """The ownership rule wired up, through the real ``_determine_save_target``.
 
     ``TestProtectedTemplateOwnership`` covers the predicate; this covers the dispatch reading it,
     so the two cannot drift apart.
@@ -5660,10 +5718,8 @@ class TestSaveFromTemplateRoutesOnProvenance:
         engine.config_manager.workspace_path = original_workspace
 
     @staticmethod
-    def _register_template(
-        temp_dir: Path, *, registry_key: str, source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE
-    ) -> None:
-        """Materialize a template on disk + in the registry, registered from `source`."""
+    def _register_template(temp_dir: Path, *, registry_key: str, library_name: str | None = None) -> None:
+        """Materialize a template on disk + in the registry, owned by `library_name` when given."""
         file_name = f"{registry_key}.py"
         (temp_dir / file_name).write_text("# stub")
         metadata = WorkflowMetadata(
@@ -5675,7 +5731,7 @@ class TestSaveFromTemplateRoutesOnProvenance:
             is_template=True,
         )
         WorkflowRegistry.generate_new_workflow(
-            registry_key=registry_key, metadata=metadata, file_path=file_name, source=source
+            registry_key=registry_key, metadata=metadata, file_path=file_name, library_name=library_name
         )
 
     def _determine(self, engine: Engine, registry_key: str) -> WorkflowManager.SaveWorkflowTargetInfo:
@@ -5688,7 +5744,7 @@ class TestSaveFromTemplateRoutesOnProvenance:
     def test_saving_a_library_template_copies_it(self, engine: Engine, temp_dir: Path) -> None:
         """No `is_griptape_provided` anywhere -- the library it came from is the whole reason."""
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            self._register_template(temp_dir, registry_key="lib_template", source=WorkflowSource.for_library("MyLib"))
+            self._register_template(temp_dir, registry_key="lib_template", library_name="MyLib")
 
             target = self._determine(engine, "lib_template")
 

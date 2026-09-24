@@ -6,12 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel
 
-from griptape_nodes.node_library.workflow_registry import (
-    WORKSPACE_WORKFLOW_SOURCE,
-    WorkflowMetadata,
-    WorkflowShape,
-    WorkflowSource,
-)
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
@@ -175,17 +170,16 @@ class RegisterWorkflowRequest(RequestPayload):
     Args:
         metadata: Workflow metadata containing name, description, and other properties
         file_name: Name of the workflow file to register
-        source: Where this workflow came from, which is what decides when it goes away. Set it
-            when registering on some other population's behalf -- a library's `workflows` list,
-            today -- so the registry ties the entry to that owner's lifetime. Defaults to the
-            workspace, which covers the workspace scan and everything the user creates.
+        library_name: The library contributing this workflow, when one is. The registry ties the
+            entry to that library's lifetime, so it goes away when the library unloads. Leave it
+            unset for the workspace scan and for anything the user creates.
 
     Results: RegisterWorkflowResultSuccess (with workflow name) | RegisterWorkflowResultFailure (registration error)
     """
 
     metadata: WorkflowMetadata
     file_name: str
-    source: WorkflowSource = WORKSPACE_WORKFLOW_SOURCE
+    library_name: str | None = None
 
 
 @dataclass
