@@ -2398,7 +2398,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
-    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911, C901 (result determination needs multiple returns)
+    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
         """Register a library by name or path, progressing through all lifecycle phases.
 
         Supports loading by library_name OR file_path (mutually exclusive), with optional
@@ -2441,23 +2441,8 @@ class LibraryManager(EngineScoped):
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
 
-        if is_rez_enabled() and library_info.library_name:
-            if library_info.library_path:
-                family = library_file_path_to_rez_family(Path(library_info.library_path))
-                library_info.rez_family = family
-                version = get_library_rez_package_version(
-                    library_info.library_name, library_file_path=Path(library_info.library_path)
-                )
-                library_info.has_rez_package = version is not None
-                library_info.rez_version = version
-            logger.info(
-                "[Rez] Library '%s' registered — rez package '%s': %s",
-                library_info.library_name,
-                f"{library_info.rez_family}-{library_info.rez_version}"
-                if library_info.rez_version
-                else library_info.rez_family or "(unknown)",
-                "available" if library_info.has_rez_package else "not built",
-            )
+        if is_rez_enabled():
+            self._record_rez_package_info(library_info)
 
         match library_info.fitness:
             case LibraryManager.LibraryFitness.GOOD:
@@ -2490,6 +2475,33 @@ class LibraryManager(EngineScoped):
             case _:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
                 return RegisterLibraryFromFileResultFailure(result_details=details)
+
+    def _record_rez_package_info(self, library_info: LibraryManager.LibraryInfo) -> None:
+        """Record which rez package provides a registered library, for status reporting."""
+        if not library_info.library_name:
+            return
+
+        if library_info.library_path:
+            library_file_path = Path(library_info.library_path)
+            library_info.rez_family = library_file_path_to_rez_family(library_file_path)
+            version = get_library_rez_package_version(library_info.library_name, library_file_path=library_file_path)
+            library_info.has_rez_package = version is not None
+            library_info.rez_version = version
+
+        if library_info.rez_version:
+            package_label = f"{library_info.rez_family}-{library_info.rez_version}"
+        else:
+            package_label = library_info.rez_family or "(unknown)"
+        if library_info.has_rez_package:
+            availability = "available"
+        else:
+            availability = "not built"
+        logger.info(
+            "[Rez] Library '%s' registered — rez package '%s': %s",
+            library_info.library_name,
+            package_label,
+            availability,
+        )
 
     async def _establish_register_library_prerequisites(  # noqa: C901, PLR0911, PLR0912 (prerequisite validation needs branches)
         self, request: RegisterLibraryFromFileRequest
@@ -6765,15 +6777,22 @@ class LibraryManager(EngineScoped):
         await self._libraries_loading_complete.wait()
 
         library_info = self.get_library_info_by_library_name(library_name)
-        is_rez_managed = library_info is not None and (
-            library_info.has_rez_package
-            or bool(library_info.registered_path and is_rez_library_path(library_info.registered_path))
+        # Rez packages only resolve while rez is enabled; with it off, every library takes the
+        # git path below regardless of how it was registered.
+        rez_enabled = is_rez_enabled()
+        is_rez_managed = (
+            rez_enabled
+            and library_info is not None
+            and (
+                library_info.has_rez_package
+                or bool(library_info.registered_path and is_rez_library_path(library_info.registered_path))
+            )
         )
 
         # REZ:-sourced libraries have no local git clone to check. Compare the
         # loaded version against the latest in the package store instead.
         if (
-            is_rez_managed
+            rez_enabled
             and library_info is not None
             and library_info.registered_path
             and is_rez_library_path(library_info.registered_path)

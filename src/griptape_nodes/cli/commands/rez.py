@@ -20,6 +20,7 @@ import typer
 from rich.panel import Panel
 from rich.table import Table
 
+import griptape_nodes
 from griptape_nodes.cli.shared import console
 from griptape_nodes.files.path_utils import canonicalize_for_io
 from griptape_nodes.utils.git_utils import clone_repository
@@ -503,15 +504,11 @@ def _resolve_engine_repo(explicit_path: str | None) -> Path | None:
         console.print(f"[red]Engine repo not found at: {p}[/red]")
         return None
 
-    try:
-        import griptape_nodes
-
-        module_path = Path(griptape_nodes.__file__).resolve()
-        candidate = module_path.parent.parent.parent
-        if (candidate / "pyproject.toml").exists():
-            return candidate
-    except (ImportError, AttributeError):
-        pass
+    # When running from a checkout (editable install), the package's own location gives the
+    # repo root: <repo>/src/griptape_nodes/__init__.py.
+    candidate = Path(griptape_nodes.__file__).resolve().parents[2]
+    if (candidate / "pyproject.toml").exists():
+        return candidate
 
     home = Path.home()
     candidates = [

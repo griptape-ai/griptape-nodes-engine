@@ -15,6 +15,13 @@ the engine's request API from working without edits. Migration steps live in
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
   into a separate `.venv-exec` and load only in the library's own process, where its nodes run, so
   libraries with clashing heavy pins can be installed side by side.
+- The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
+  Setting `GTN_REZ_ROOT` turns it on: libraries listed as `REZ:<package>` in
+  `libraries_to_register` load from the Rez package store, each library's worker runs in its own
+  `rez env`, and the engine creates no library venvs and downloads no libraries.
+- `gtn rez build-engine-package` and `gtn rez build-library-package` build the engine or a node
+  library, with every pip dependency, as Rez packages. Both stop with a warning when the store is
+  missing the `platform`, `os`, or `python` packages that `rez bind` creates.
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
 
 ### Changed
