@@ -333,6 +333,17 @@ class _TextFormAdapter:
         return cls(state)
 
 
+class _NamedTupleAdapter:
+    def claims(self, cls: type) -> bool:
+        return issubclass(cls, tuple) and hasattr(cls, "_fields")
+
+    def to_state(self, value: Any) -> dict[str, Any]:
+        return value._asdict()
+
+    def from_state(self, cls: type, state: dict[str, Any]) -> Any:
+        return cls(**state)
+
+
 class _PydanticAdapter:
     def claims(self, cls: type) -> bool:
         return issubclass(cls, BaseModel)
@@ -389,6 +400,7 @@ _adapters: list[ValueAdapter] = [
     _IsoFormatAdapter(),
     _TimedeltaAdapter(),
     _TextFormAdapter(),
+    _NamedTupleAdapter(),
     _PydanticAdapter(),
     _DictMethodsAdapter(),
     _FieldsAdapter(),
