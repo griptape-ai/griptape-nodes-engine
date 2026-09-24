@@ -56,10 +56,8 @@ LOGS_DIRECTORY_NAME = "logs"
 SESSION_LOG_FILE_NAME = "session.log"
 WORKFLOW_DIRECTORY_NAME = "workflow"
 
-# Total budget for log files copied out of the log directory, newest first. Log history can
-# reach 60 MB once rotation has been running a while, and every byte has to be scanned for
-# credentials on the way in. Whatever is dropped is named in the manifest, because a
-# silently shortened log reads as a log that simply has nothing in it.
+# Total budget for log files copied out of the log directory, newest first. History reaches
+# ~60 MB once rotation has run a while, and every byte is scanned for credentials on the way in.
 DEFAULT_MAX_LOG_BYTES = 20 * 1024 * 1024
 
 TRUNCATION_NOTICE = "... earlier lines in this file were left out to keep the bundle small ...\n"
@@ -201,15 +199,9 @@ class DiagnosticsBundle:
         for path in log_files:
             staged_path = f"{LOGS_DIRECTORY_NAME}/{path.name}"
 
-            # Compared case-insensitively, because the staging directory is on whatever
-            # filesystem `tempfile` gave us and the default one on macOS and Windows treats
-            # `Engine.log` and `engine.log` as the same file. Comparing the strings exactly
-            # let the second one past this guard and the write then overwrote the first
-            # one's bytes, while the manifest went on listing both at their own sizes.
+            # Case-insensitive: the default filesystem on macOS and Windows treats `Engine.log` and
+            # `engine.log` as one file, so an exact comparison let the second past and it overwrote the first.
             if any(entry.path.casefold() == staged_path.casefold() for entry in self._entries):
-                # Two log files from different directories can share a name. Staging both
-                # under one name would keep whichever was written last while the manifest
-                # claimed both were here.
                 warnings.append(
                     f"Log file '{path.name}' was left out because another log file with the same name is "
                     "already in this bundle."
@@ -217,13 +209,8 @@ class DiagnosticsBundle:
                 continue
 
             if remaining <= 0:
-                # What was actually copied rather than the budget it was measured against.
-                # The two are the same number today, because the budget is only ever charged
-                # for bytes that reached the staging directory and is only ever charged for
-                # as many as were left -- so reaching here means it was spent exactly. Saying
-                # so in terms of the spend keeps the sentence true of whatever the accounting
-                # becomes, and a message that reads back the configured constant is one that
-                # cannot be wrong and cannot be checked either.
+                # The bytes actually copied, not the configured budget: a message that reads back a
+                # constant cannot be wrong and cannot be checked either.
                 warnings.append(
                     f"Log file '{path.name}' was left out because the bundle already holds "
                     f"{_format_size(self._max_log_bytes - remaining)} of logs."

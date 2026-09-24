@@ -670,11 +670,8 @@ class TestZipAndCleanup:
         bundle = DiagnosticsBundle(_redactor())
         staging = bundle._staging_dir
 
-        # The raise is inside a helper rather than directly under the `with`, so that the
-        # assertion below is plainly reached rather than looking like code after a raise.
-        # `with pytest.raises(...), bundle:` reads as a block that always ends by raising,
-        # and static analysis calls the assertion unreachable and `staging` unused -- which
-        # would mean the one thing this test checks is never checked.
+        # The raise lives in a helper rather than under the `with`, so static analysis does not
+        # call the assertion below unreachable -- which would hide the one thing this test checks.
         def assembly_that_fails() -> None:
             with bundle:
                 raise _AssemblyError
