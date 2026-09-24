@@ -119,6 +119,22 @@ npx -y @modelcontextprotocol/inspector
 
 Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP** as the transport. If the connection fails with `TypeError: NetworkError when attempting to fetch resource`, it's almost always CORS: the engine's MCP server does not currently emit `Access-Control-Allow-Origin` headers, so cross-origin browser fetches are blocked. Use the CLI command above instead, or run the inspector with browser security relaxed.
 
+## Parameter values
+
+Tool results carry parameter values as JSON. A value of a type JSON doesn't have, such as a tuple,
+an enum, or an artifact, names its Python type under `$type`. When the value's own data is a JSON
+object, its fields sit beside `$type`. Anything else sits under `$value`:
+
+```json
+{"$type": "builtins:tuple", "$value": [1, "b"]}
+{"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
+```
+
+Send a value in the same form to `SetParameterValueRequest` or `SetVariableValueRequest` to set it
+with that exact type. A plain
+JSON value is set as it is. A value that has no JSON form, such as an open file, comes back as its
+text.
+
 ## Install the workflow-construction skill
 
 The engine ships a [`griptape-nodes-workflows` skill](https://docs.griptapenodes.com/en/stable/skills/griptape-nodes-workflows/SKILL/) that teaches an agent how to drive the MCP tools described above (cold-start recipe, `EventRequestBatch`, common gotchas). Claude Code, Cursor, and VS Code natively load skills with the `name` + `description` frontmatter convention from [agentskills.io](https://agentskills.io), so installation is a directory drop.
