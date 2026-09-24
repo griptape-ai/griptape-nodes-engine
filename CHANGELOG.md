@@ -61,9 +61,6 @@ the engine's request API from working without edits. Migration steps live in
 - `TraitRegistry` and `Trait.get_trait_keys()` are removed, with no replacement, since nothing read
   them. Custom traits no longer need to implement `get_trait_keys()`, and existing implementations
   can be deleted.
-
-### Removed
-
 - The engine no longer runs its own static file server. The Griptape Nodes app serves the
   workspace, as it has since v0.95.0. `STATIC_SERVER_ENABLED` is gone.
 
