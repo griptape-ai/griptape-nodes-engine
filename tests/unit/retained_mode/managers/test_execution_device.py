@@ -35,9 +35,9 @@ def _no_system_compute(engine: Engine) -> None:
     standing in for it is the only way to assert the choice for a machine we do not have.
     """
     manager = engine.resource_manager
-    for instance_id, instance in list(manager._instances.items()):
+    for instance_id, instance in list(manager._capability_instances.items()):
         if isinstance(instance, ComputeInstance):
-            del manager._instances[instance_id]
+            del manager._capability_instances[instance_id]
 
 
 def _register_compute(engine: Engine, backends: list[str]) -> None:

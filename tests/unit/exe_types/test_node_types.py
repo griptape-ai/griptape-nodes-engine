@@ -4,6 +4,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
+from griptape_nodes.traits.slider import Slider
 
 from .mocks import MockNode
 
@@ -272,3 +273,62 @@ class TestLockedSuccessFailureNodeRouting:
         node._execution_succeeded = None
         assert node.get_next_control_output() is None
         assert node.stop_flow is True
+
+
+class TestOutputValueChangeDetection:
+    """`__setitem__` decides whether to emit by comparing old and new values.
+
+    A node can hold an array-like whose `__ne__` returns an array rather than a bool, so the
+    comparison itself raises and the assignment never completes.
+    """
+
+    class _ArrayLike:
+        """Mimics numpy's refusal to reduce an element-wise comparison to one bool."""
+
+        __hash__ = None  # type: ignore[assignment]
+
+        def __ne__(self, other: object) -> bool:
+            message = "The truth value of an array with more than one element is ambiguous."
+            raise ValueError(message)
+
+    def test_an_uncomparable_value_is_treated_as_changed(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(self._ArrayLike(), self._ArrayLike()) is True
+
+    def test_the_same_object_is_not_a_change(self) -> None:
+        """Identity is checked first, so re-assigning the same array-like never touches `__ne__`."""
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        value = self._ArrayLike()
+
+        assert _values_differ(value, value) is False
+
+    def test_ordinary_values_compare_normally(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(1, 2) is True
+        assert _values_differ("a", "a") is False
+
+
+class TestParameterVisibilityKeepsTraitStateLive:
+    def test_hiding_a_parameter_with_a_trait_stores_no_trait_copy(self) -> None:
+        node = MockNode()
+        parameter = Parameter(name="top", tooltip="t", traits={Slider(min_val=0, max_val=100)})
+        node.add_parameter(parameter)
+
+        node.hide_parameter_by_name("top")
+
+        assert parameter.ui_options["hide"] is True
+        assert "slider" not in parameter.authored_ui_options()
+
+    def test_a_later_trait_change_still_reaches_a_hidden_parameter(self) -> None:
+        node = MockNode()
+        trait = Slider(min_val=0, max_val=100)
+        parameter = Parameter(name="top", tooltip="t", traits={trait})
+        node.add_parameter(parameter)
+        node.hide_parameter_by_name("top")
+
+        trait.max = 512
+
+        assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}

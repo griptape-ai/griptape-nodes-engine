@@ -4,7 +4,7 @@ These tests pin down the two invariants that replaced the old
 ``ForwardFromWorkerMixin`` machinery:
 
 1. ``RemoteHandler`` forwards to the orchestrator only while the worker is
-   inside a ``worker_node_execution_scope``. Outside that scope it delegates
+   inside a ``node_execution_scope``. Outside that scope it delegates
    to the ``original`` handler it displaced, which preserves bootstrap and
    library-load behaviour (e.g. nodes calling ``self.add_parameter(...)``
    during LOAD_PROBE).
@@ -16,16 +16,27 @@ These tests pin down the two invariants that replaced the old
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
     ActivateProjectRequest,
+    DropAllLocalObjectsRequest,
+    DropAllLocalObjectsResultFailure,
+    DropAllLocalObjectsResultSuccess,
+    DropLocalObjectsRequest,
+    DropLocalObjectsResultFailure,
+    DropLocalObjectsResultSuccess,
     ReloadAllLibrariesRequest,
     RemoteHandler,
+    _handle_drop_all_local_objects,
+    _handle_drop_local_objects,
+    register_broadcast_handlers,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
@@ -47,6 +58,7 @@ from griptape_nodes.retained_mode.events.resource_events import GetExecutionDevi
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 
@@ -110,7 +122,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="m2"))
 
         assert isinstance(result, _ProbeResult)
@@ -198,6 +210,29 @@ class TestInstallRemoteHandlersSwap:
         assert ActivateProjectRequest in LOCAL_ONLY_REQUEST_TYPES
         assert ReloadAllLibrariesRequest in LOCAL_ONLY_REQUEST_TYPES
 
+    def test_every_broadcast_a_worker_answers_itself_is_local(self) -> None:
+        """Whatever `register_broadcast_handlers` installs is addressed to THIS worker, so none of it forwards.
+
+        Derived rather than listed by name, because the cost of forgetting is invisible: the wrapping pass
+        skips a type that has no handler yet, and broadcast handlers are registered after it runs. So a
+        missing entry works by call order alone, and swapping those two calls -- or registering one of these
+        earlier -- would start forwarding them. For the drop requests that means the orchestrator answering
+        success having freed nothing, while the worker keeps a pipeline that may be gigabytes.
+        """
+        probe = EventManager()
+        before = set(probe.registered_request_types())
+        register_broadcast_handlers(
+            probe,
+            config_manager=MagicMock(),
+            secrets_manager=MagicMock(),
+            project_manager=MagicMock(),
+        )
+        installed = set(probe.registered_request_types()) - before
+
+        assert installed, "expected register_broadcast_handlers to install something"
+        forwarded = sorted(t.__name__ for t in installed - LOCAL_ONLY_REQUEST_TYPES)
+        assert forwarded == [], f"broadcast handlers that would be forwarded to the orchestrator: {forwarded}"
+
     def test_per_file_project_reads_stay_local(self) -> None:
         """Three project-template reads on the per-saved-file path must not forward.
 
@@ -241,7 +276,7 @@ class TestInstallRemoteHandlersSwap:
         """Bootstrap-path regression guard: LOAD_PROBE-style calls must stay local.
 
         A node's ``__init__`` running under LOAD_PROBE will issue an
-        ``AddParameterToNodeRequest`` outside ``worker_node_execution_scope``.
+        ``AddParameterToNodeRequest`` outside ``node_execution_scope``.
         The RemoteHandler installed for that type must delegate to the
         original handler rather than trying to forward.
         """
@@ -263,3 +298,165 @@ class TestInstallRemoteHandlersSwap:
 
         assert result_event.result.succeeded()
         assert len(local_calls) == 1
+
+
+class TestDropAllLocalObjectsHandler:
+    """The worker half of workflow teardown: release what this process is holding.
+
+    This is the process with the pipeline the orchestrator has no torch to hold, so what this handler
+    accepts decides whether gigabytes stay resident.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_accepts_mid_execution_but_the_hook_waits(self, engine: Engine) -> None:
+        """Teardown arriving mid-render takes the entries now and frees them once the node is done.
+
+        Freeing under a running forward pass is what must not happen; forgetting where the object is cannot
+        hurt a node that already holds it. Declining both would report success for work nothing re-issues.
+        """
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="cfg", on_drop=lambda _v: released.append("gone")
+        )
+
+        with engine.event_manager.node_execution_scope():
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+            assert isinstance(result, DropAllLocalObjectsResultSuccess)
+            assert engine.resource_manager.entry_for(key) is None
+            assert released == []
+
+        assert engine.resource_manager.drain_deferred_releases() == 1
+        assert released == ["gone"]
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
+        release_threads: list[int] = []
+        engine.resource_manager.put_local_object(
+            object(),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            on_drop=lambda _value: release_threads.append(threading.get_ident()),
+        )
+
+        result = await _handle_drop_all_local_objects(DropAllLocalObjectsRequest(), event_manager=engine.event_manager)
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_all_local_objects", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultFailure)
+
+
+class TestDropLocalObjectsHandler:
+    """The worker half of a handle being replaced or its node deleted."""
+
+    @pytest.mark.asyncio
+    async def test_releases_the_named_objects(self, engine: Engine) -> None:
+        released: list[str] = []
+        keys = [
+            engine.resource_manager.put_local_object(
+                object(),
+                owner="Lib A",
+                source="N",
+                key=label,
+                slot=label,
+                on_drop=lambda _v, label=label: released.append(label),
+            )
+            for label in ("one", "two")
+        ]
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=keys), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert sorted(released) == ["one", "two"]
+
+    @pytest.mark.asyncio
+    async def test_a_key_this_worker_never_held_is_not_a_failure(self, engine: Engine) -> None:
+        """The orchestrator broadcasts to every worker, and only one of them holds any given object."""
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=["Lib A:not-here"]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_it_accepts_mid_execution_but_the_hook_waits(self, engine: Engine) -> None:
+        """Accepted rather than declined, yet the object is not freed under a running node.
+
+        The exemption used to rest on the keys having been replaced on the orchestrator before the message
+        was sent, so nothing running here could hold them. That is true of displacement, which never travels
+        this way -- it happens inside the worker. What arrives is node deletion, and there a consumer can be
+        mid-forward-pass on the very object being destroyed.
+        """
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="cfg", slot="out", on_drop=lambda _v: released.append("gone")
+        )
+
+        with engine.event_manager.node_execution_scope():
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+            )
+            assert isinstance(result, DropLocalObjectsResultSuccess)
+            # Entry gone from the map, so nothing resolves it again -- but the hook has not run.
+            assert engine.resource_manager.entry_for(key) is None
+            assert released == []
+
+        assert engine.resource_manager.drain_deferred_releases() == 1
+        assert released == ["gone"]
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
+        release_threads: list[int] = []
+        key = engine.resource_manager.put_local_object(
+            object(),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            slot="out",
+            on_drop=lambda _v: release_threads.append(threading.get_ident()),
+        )
+
+        await _handle_drop_local_objects(DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager)
+
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_parked_local_object", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=["Lib A:cfg"]), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropLocalObjectsResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_a_library_named_entry_is_refused(self, engine: Engine) -> None:
+        """The orchestrator broadcasts keys it cannot check, so the provenance rule is enforced here."""
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="sd-xl-1.0#a1b2c3d4", on_drop=lambda _v: released.append("gone")
+        )
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert released == []
+        assert engine.resource_manager.get_local_object(key, owner="Lib A") is not None

@@ -538,6 +538,12 @@ class EventResultFailure(EventResult[P, R]):
         return False
 
 
+# The `event_type` values that carry an answer to a request. Derived from the classes so a rename
+# cannot leave a transport matching on a name nothing sends. Both carry the request they answer, so a
+# dispatcher that only understands requests reads one as a malformed request rather than a response.
+RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.__name__})
+
+
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     payload: E

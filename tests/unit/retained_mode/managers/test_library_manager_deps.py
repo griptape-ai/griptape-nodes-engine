@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import semver
 
 from griptape_nodes.node_library.library_declarations import (
     LibraryDependencyDeclaration,
@@ -80,7 +81,8 @@ class TestLibraryDependencyDeclaration:
         assert not hasattr(deps, "library_dependencies")
 
     def test_schema_version_bumped(self) -> None:
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.13.0"
+        # Dependency declarations arrived in 0.13.0. Later bumps keep them.
+        assert semver.VersionInfo.parse(LibrarySchema.LATEST_SCHEMA_VERSION) >= semver.VersionInfo.parse("0.13.0")
 
 
 class TestLibraryDependencyProblem:

@@ -119,11 +119,8 @@ class AppInitializationComplete(AppPayload):
     # taken from the first entry in libraries_to_register. Multiple workers can run
     # simultaneously for different libraries.
     is_worker: bool = False
-    # URL of a static file server the host process already runs for this workspace. When set,
-    # the engine points its storage drivers at that server instead of starting one of its own,
-    # so asset URLs outlive this engine. Leave unset when the host serves nothing: the engine
-    # then serves the workspace itself, which is the path that goes away once every shipped
-    # host provides a server (see the fallback in StaticFilesManager).
+    # URL of the static file server the host process runs for this workspace. The engine serves
+    # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
 
 
@@ -251,21 +248,59 @@ class WorkerNodeSchema:
 class LibraryLoadedNotification(AppPayload):
     """Notification that a library has finished loading, including its fitness outcome.
 
-    Emitted after a library reaches LOADED state. The orchestrator re-broadcasts it so
-    all listeners (including the GUI) can update their view of library health.
+    Raised by the process that owns the library's record, so listeners including the GUI can update
+    their view of library health. For a library hosted in a worker that process is the orchestrator,
+    once it has accepted the worker's ``ReportLibraryLoadedRequest``.
 
     Args:
         library_name: Name of the library that was loaded.
         fitness: Final fitness value (LibraryManager.LibraryFitness string).
         problem_details: Human-readable summary of problems, or None if there are none.
-        node_schemas: Serialized node/parameter schemas from the worker process, or None
-            if this notification was not produced by a worker.
+    """
+
+    library_name: str
+    fitness: str
+    problem_details: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by a worker to the orchestrator to report how a library loaded in the worker.
+
+    The orchestrator never imported a worker-hosted library, so the worker's account is the only one
+    there is, and it is what releases anything waiting to route execution to that worker.
+
+    ``SkipTheLineMixin`` because the orchestrator may be executing a node when this arrives, and that
+    node can itself be waiting on this very report through ``WorkerManager.wait_until_executable``.
+    Queued behind execution, the report that ends the wait cannot be handled until the wait ends.
+
+    Args:
+        library_name: Name of the library that finished loading in the worker.
+        fitness: Final fitness value (LibraryManager.LibraryFitness string).
+        problem_details: Human-readable summary of problems, or None if there are none.
+        node_schemas: Serialized node/parameter schemas, set only for a library the orchestrator
+            cannot import, which registers stub classes from them. None for an execution-dependency
+            library, whose real classes the orchestrator already registered itself.
     """
 
     library_name: str
     fitness: str
     problem_details: str | None = None
     node_schemas: list[WorkerNodeSchema] | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The orchestrator recorded the worker's load outcome."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The orchestrator had no record of the library the worker reported on."""
 
 
 @dataclass

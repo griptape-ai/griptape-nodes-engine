@@ -501,6 +501,11 @@ class ExecuteNodeRequest(RequestPayload):
         node_metadata: Full node metadata from the orchestrator. Required when
             the target library spawns a worker (used to construct the transient
             worker-side node). Ignored on the orchestrator path.
+        local_object_source: The orchestrator's identity for this node in the process-local object
+            cache. The worker's transient node adopts it so the objects it caches land in the same slots
+            across runs, and survive the node being renamed. Carried as its own field rather than inside
+            node_metadata, which clients can write: two live nodes sharing one identity would make the
+            second one's first cached object displace and free the first's.
         variables: Workflow variable dict for inline {VAR} substitution, computed
             by the orchestrator from VariablesManager before the request is sent.
             An empty dict means substitution is disabled or there are no variables.
@@ -525,6 +530,7 @@ class ExecuteNodeRequest(RequestPayload):
     parameter_values: dict[str, Any] = field(default_factory=dict)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
+    local_object_source: str | None = None
     workflow_name: str | None = None
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
@@ -545,7 +551,16 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class ExecuteNodeResultFailure(ResultPayloadFailure):
-    """Failed result from executing a node directly."""
+    """Failed result from executing a node directly.
+
+    Args:
+        validation_exceptions: Set when the node refused to run, rather than failing while running --
+            `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
+            without reading the message, because they mean different things to whoever is looking:
+            nothing ran, versus something ran and broke.
+    """
+
+    validation_exceptions: list[Exception] | None = None
 
 
 @dataclass

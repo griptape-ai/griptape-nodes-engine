@@ -55,6 +55,8 @@ class TestExecuteNodeStrictMode:
         node.metadata = {"library": "libA"}
         node._cancellation_requested = threading.Event()
         node.parameters = []
+        # A mock's default return value is truthy, and the executor reads this hook as "reasons not to run".
+        node.validate_in_execution_environment = MagicMock(return_value=None)
 
         async def _aprocess() -> None:
             if aprocess_reports:
