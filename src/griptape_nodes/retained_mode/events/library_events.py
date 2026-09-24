@@ -1012,6 +1012,7 @@ class CheckLibraryUpdateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
     update_gated_by_age: bool = False
     target_commit_age_hours: float | None = None
     minimum_release_age_hours: float | None = None
+    rez_managed: bool = False
 
 
 @dataclass

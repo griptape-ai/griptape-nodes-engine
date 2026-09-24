@@ -17,6 +17,13 @@ the engine's request API from working without edits. Migration steps live in
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
   into a separate `.venv-exec` and load only in the library's own process, where its nodes run, so
   libraries with clashing heavy pins can be installed side by side.
+- The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
+  Setting `GTN_REZ_ROOT` turns it on: libraries listed as `REZ:<package>` in
+  `libraries_to_register` load from the Rez package store, each library's worker runs in its own
+  `rez env`, and the engine creates no library venvs and downloads no libraries.
+- `gtn rez build-engine-package` and `gtn rez build-library-package` build the engine or a node
+  library, with every pip dependency, as Rez packages. Both stop with a warning when the store is
+  missing the `platform`, `os`, or `python` packages that `rez bind` creates.
 - A node in a library that runs isolated in a worker can hand an unserializable value, such as a
   diffusers pipeline or a latent tensor, to the next node. Mark the producing output
   `serializable=False` and the engine holds the object in the worker, sending an opaque key in its

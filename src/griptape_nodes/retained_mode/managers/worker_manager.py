@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -26,6 +27,14 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_TIMEOUT_KEY,
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
+from griptape_nodes.utils.rez_utils import (
+    build_rez_env_prefix,
+    is_library_rez_package_available,
+    is_rez_enabled,
+    library_file_path_to_rez_family,
+    resolve_and_log_rez_context,
+    rez_subprocess_env,
+)
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -446,6 +455,18 @@ class WorkerManager(EngineScoped):
             # block buffer and from being lost on a crash.
             worker_environ["PYTHONUNBUFFERED"] = "1"
 
+            # Forward rez configuration vars so the worker subprocess can resolve rez packages.
+            if is_rez_enabled():
+                rez_vars = {k: v for k, v in os.environ.items() if k.startswith(("REZ_", "GTN_REZ_"))}
+                # The worker's `rez env` must use the same configuration as every other rez
+                # command the engine runs, including a GTN_REZ_CONFIG_FILE opt-in.
+                rez_config = rez_subprocess_env().get("REZ_CONFIG_FILE")
+                if rez_config:
+                    rez_vars["REZ_CONFIG_FILE"] = rez_config
+                worker_environ.update(rez_vars)
+                if rez_vars:
+                    logger.debug("[Rez] forwarding %d rez env vars to worker: %s", len(rez_vars), list(rez_vars.keys()))
+
             # PYTHONPATH precedes site-packages, making this library-first with the engine's own
             # environment as the fallback. It must be the environment rather than a later sys.path
             # splice: sys.modules never reconsiders a module this process has already imported.
@@ -841,7 +862,7 @@ class WorkerManager(EngineScoped):
         # has to exist before the process starts. It does: the orchestrator builds it while
         # registering the library, and a library whose build failed is never asked for a worker --
         # LibraryManager knows its own build result and does not request one.
-        args = [
+        base_args = [
             sys.executable,
             "-m",
             "griptape_nodes_app",
@@ -851,7 +872,41 @@ class WorkerManager(EngineScoped):
             "--library-name",
             library_name,
         ]
+
+        if is_rez_enabled():
+            args = self._build_rez_worker_args(library_name, base_args)
+        else:
+            args = base_args
+
         await self.spawn_worker(args, library_name)
+
+    def _build_rez_worker_args(self, library_name: str, base_args: list[str]) -> list[str]:
+        """Wrap base_args with a rez-env prefix when the library has a rez package.
+
+        The package lookup and the wrap both derive the rez family from the library's
+        path, so they always agree on the repo/folder-named package.
+        """
+        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None or not library_info.library_path:
+            logger.warning(
+                "[Rez][execution] Cannot find library path for '%s' -- skipping rez wrap",
+                library_name,
+            )
+            return base_args
+
+        library_file_path = Path(library_info.library_path)
+        if not is_library_rez_package_available(library_file_path):
+            logger.debug("[Rez][execution] no rez package for '%s' -- spawning without rez wrap", library_name)
+            return base_args
+
+        rez_family = library_file_path_to_rez_family(library_file_path)
+        logger.info("[Rez][execution] wrapping worker for '%s' (family: %s)", library_name, rez_family)
+        resolve_and_log_rez_context([rez_family])
+
+        rez_prefix = build_rez_env_prefix([rez_family])
+        wrapped = [*rez_prefix, *base_args]
+        logger.info("[Rez][execution]   wrapped cmd: %s", " ".join(wrapped))
+        return wrapped
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
         """Record a spawn that raised before producing a worker.
