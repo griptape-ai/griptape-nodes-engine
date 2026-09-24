@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
@@ -17,6 +17,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -233,7 +234,7 @@ class ParameterDescription:
     type: str
     input_types: list[str]
     output_type: str
-    default_value: Any | None
+    default_value: DisplayValue
     tooltip: str | list[dict]
     tooltip_as_input: str | list[dict] | None
     tooltip_as_property: str | list[dict] | None
