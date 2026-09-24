@@ -91,5 +91,9 @@ the engine's request API from working without edits. Migration steps live in
   editor, now also changes which values the parameter accepts. Before, the editor showed the new
   range or choices, but the parameter still checked values against the old ones.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
+- Nodes in a library that runs isolated in its own process no longer stop working mid-session while
+  the engine is busy. That process is now dropped for leaving heartbeat challenges unanswered rather
+  than for elapsed time, so `worker.heartbeat_timeout_s` bounds unanswered challenges instead of
+  wall-clock silence.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
