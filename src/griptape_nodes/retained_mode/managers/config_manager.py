@@ -302,6 +302,8 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
+        # (file, key) pairs already reported as dotted. Files are re-read on every load_configs().
+        self._reported_dotted_keys: set[tuple[Path, str]] = set()
         # The GTN_CONFIG_ variable each env-layer key came from, recorded by load_configs as the
         # names are parsed and keyed by key segments. A name cannot be rebuilt from a config key:
         # segments are separated by ENV_VAR_PATH_SEPARATOR, so a rebuilt name is wrong for every
@@ -1012,7 +1014,33 @@ class ConfigManager(EngineScoped):
             logger.error("Error parsing %s config file: %s", label, error)
             return LoadedConfigFile(contents={}, parse_error=error)
 
+        self._report_dotted_keys(loaded, path)
         return LoadedConfigFile(contents=loaded, parse_error=None)
+
+    def _report_dotted_keys(self, contents: dict, path: Path) -> None:
+        """Warn about top-level keys written in dotted form, once per file and key.
+
+        A flat `"worker.heartbeat_timeout_s"` key merges in beside the real `worker` object and is
+        never read, since `get_dot_value` descends by segment. `Settings` allows extra keys, so
+        validation can't catch it. Only top-level keys are checked: deeper mapping keys, such as
+        `project_workspaces` paths, may legitimately contain dots.
+        """
+        for key in contents:
+            if "." not in key:
+                continue
+            report_key = (path, key)
+            if report_key in self._reported_dotted_keys:
+                continue
+
+            self._reported_dotted_keys.add(report_key)
+            nested_form = json.dumps(set_dot_value({}, key, "..."))
+            logger.warning(
+                "Ignoring setting '%s' in %s: a config file must nest each part of the name, as %s. "
+                "The setting keeps its current value.",
+                key,
+                path,
+                nested_form,
+            )
 
     def _load_file_layer(self, layer: ConfigLayerName, path: Path | None, label: str) -> dict:
         """Load one file-backed config layer and record its parse error under `layer`.
