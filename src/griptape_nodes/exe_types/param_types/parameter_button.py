@@ -5,12 +5,11 @@ from typing import Any, Literal
 
 from griptape_nodes.exe_types.core_types import (
     BadgeData,
-    NodeMessageResult,
     Parameter,
     ParameterMode,
     Trait,
 )
-from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload, OnClickMessageResultPayload
+from griptape_nodes.traits.button import Button
 
 # Type aliases matching Button trait
 ButtonVariant = Literal["default", "secondary", "destructive", "outline", "ghost", "link"]
@@ -163,11 +162,6 @@ class ParameterButton(Parameter):
         else:
             ui_options = ui_options.copy()
 
-        # If href is provided but no on_click callback, create a simple callback that opens the link
-        final_on_click = on_click
-        if href is not None and on_click is None:
-            final_on_click = ParameterButton._create_href_callback(href)
-
         button_trait = Button(
             label=label,
             variant=variant,
@@ -181,10 +175,11 @@ class ParameterButton(Parameter):
             loading_icon=loading_icon,
             loading_icon_class=loading_icon_class,
             tooltip=tooltip,
-            on_click=final_on_click,
+            button_link=href,
             get_button_state=get_button_state,
         )
-        self._href = href
+        # A handler wins over href. Button's constructor rejects the pair, so attach it after.
+        button_trait.on_click_callback = on_click
 
         # Add button trait to traits set
         # Button is a Trait, so it can be added to the traits set
@@ -229,26 +224,6 @@ class ParameterButton(Parameter):
 
         # Store button trait reference for property access
         self._button_trait = button_trait
-
-    @staticmethod
-    def _create_href_callback(href: str) -> Button.OnClickCallback:
-        """Create a simple callback that opens a link when the button is clicked."""
-
-        def href_callback(
-            button: Button,  # noqa: ARG001
-            button_details: ButtonDetailsMessagePayload,
-        ) -> NodeMessageResult:
-            return NodeMessageResult(
-                success=True,
-                details=f"Opening link: {href}",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=href,
-                ),
-                altered_workflow_state=False,
-            )
-
-        return href_callback
 
     def _get_button_trait(self) -> Button:
         """Get the Button trait associated with this parameter."""
@@ -405,13 +380,14 @@ class ParameterButton(Parameter):
     @property
     def href(self) -> str | None:
         """Get the href URL that will be opened when the button is clicked."""
-        return getattr(self, "_href", None)
+        return self._get_button_trait().button_link
 
     @href.setter
     def href(self, value: str | None) -> None:
-        """Set the href URL to open when button is clicked."""
-        self._href = value
-        if value is not None:
-            self.on_click_callback = ParameterButton._create_href_callback(value)
-        else:
-            self.on_click_callback = None
+        """Set the href URL to open when button is clicked.
+
+        Clears any ``on_click`` handler, since a handler wins over a link.
+        """
+        trait = self._get_button_trait()
+        trait.on_click_callback = None
+        trait.button_link = value

@@ -123,7 +123,7 @@ class Button(Trait):
     button_link: str | None = None
 
     element_id: str = field(default_factory=lambda: "Button")
-    on_click_callback: OnClickCallback | None = field(default=None, init=False)
+    _on_click_handler: OnClickCallback | None = field(default=None, init=False)
     get_button_state_callback: GetButtonStateCallback | None = field(default=None, init=False)
 
     def __init__(  # noqa: PLR0913
@@ -168,12 +168,20 @@ class Button(Trait):
             )
             raise ValueError(error_msg)
 
-        # If button_link is provided and no custom on_click handler, create a default handler
-        if button_link is not None:
-            self.on_click_callback = self._create_button_link_handler(button_link)
-        else:
-            self.on_click_callback = on_click
+        self._on_click_handler = on_click
         self.get_button_state_callback = get_button_state
+
+    @property
+    def on_click_callback(self) -> OnClickCallback | None:
+        if self._on_click_handler is not None:
+            return self._on_click_handler
+        if self.button_link is None:
+            return None
+        return self._create_button_link_handler(self.button_link)
+
+    @on_click_callback.setter
+    def on_click_callback(self, callback: OnClickCallback | None) -> None:
+        self._on_click_handler = callback
 
     def to_state(self) -> dict[str, Any]:
         return {
