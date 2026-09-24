@@ -125,6 +125,15 @@ class TestParameterNumberSoftLimits:
         with pytest.raises(ValueError, match=OUT_OF_RANGE_ERROR):
             run_validators(param, 250.0)
 
+    def test_restored_soft_limits_survive_a_min_max_change(self) -> None:
+        param = ParameterFloat(name="defocus", slider=True, min_val=0.0, max_val=1.0)
+        param.find_elements_by_type(Slider)[0].apply_state({"soft_limits": True})
+
+        param.max_val = 100.0
+
+        assert param.soft_limits is True
+        assert param.validators == []
+
     def test_soft_limits_requires_a_slider(self) -> None:
         with pytest.raises(ValueError, match="soft_limits only applies to sliders"):
             ParameterFloat(name="defocus", min_val=MIN_VAL, max_val=MAX_VAL, soft_limits=True)

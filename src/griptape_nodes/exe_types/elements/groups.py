@@ -246,9 +246,7 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
     @BaseNodeElement.emits_update_on_write
     def display_name(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
