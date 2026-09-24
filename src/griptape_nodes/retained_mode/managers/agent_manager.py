@@ -57,6 +57,7 @@ from griptape_nodes.drivers.cloud_credentials import (
     POLICY_DENIED_HINT,
     is_license_credential,
     resolve_cloud_credential,
+    resolve_cloud_host,
 )
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -141,6 +142,9 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
+from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
+from griptape_nodes.utils.budget_refusal import refusal_from_exception
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -514,15 +518,26 @@ class AgentManager(EngineScoped):
     def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
         """Return the user-facing text for a failed agent run.
 
-        A Griptape Cloud request authenticated with a License can authenticate
-        successfully and still be refused: Cloud evaluates an entitlement policy
-        per request and answers HTTP 403. On its own that surfaces as a bare
-        "Forbidden", which reads like a bug rather than a licensing decision, so
-        name the cause. Every other error keeps its original text.
+        Two different Griptape Cloud decisions arrive as the same HTTP 403, and
+        they send the user to different places. A budget refusal names budgets
+        that have no room, and is answered by raising a limit or waiting for a
+        reset. An entitlement refusal means the license is not permitted the
+        action at all, and is answered by an administrator. A budget refusal
+        says so in its body, so ask for one before falling back to entitlement.
+
+        Either way the bare text is "Forbidden", which reads like a bug rather
+        than a decision. Every other error keeps its original text.
         """
         if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
             return str(exc)
-        cloud_host = urlsplit(os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL).hostname or ""
+
+        cloud_host = resolve_cloud_host(secrets_manager)
+
+        refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+        if refusal is not None:
+            logger.error(budget_log_line(refusal))
+            return describe_budget_refusal(refusal)
+
         if _cloud_http_status_of(exc, cloud_host) != HTTPStatus.FORBIDDEN:
             return str(exc)
         if not is_license_credential(resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)):

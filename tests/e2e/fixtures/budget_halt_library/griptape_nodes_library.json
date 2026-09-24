@@ -1,0 +1,37 @@
+{
+  "name": "Budget Halt Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Nodes that spend credits, one of which Griptape Cloud refuses over budget",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "CloudCallNode",
+      "file_path": "budget_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "a call to Griptape Cloud that may be refused over budget",
+        "display_name": "Cloud Call"
+      }
+    }
+  ]
+}

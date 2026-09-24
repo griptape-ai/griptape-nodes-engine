@@ -86,6 +86,45 @@ Canceling a run is also how you get out of the **Cannot Save While Flow is
 Running** dialog (see [Saving](#saving) below) — that dialog offers a
 **Cancel Flow** button that does the same thing.
 
+### When a budget stops a run
+
+If your organization has set a spending budget on Griptape Cloud, a run
+that would go over it stops on its own. You'll see a message in the
+**Execution Log** that names the budget, how many credits it has left, and
+how many the refused call wanted:
+
+> Budget stopped this run. Griptape Cloud refused the next call from
+> 'Generate Poster' because the budget "Marketing Q3" has no room left:
+> 2,000 credits remaining, 15,000 requested. Budgets stop the next call,
+> not the one already running, so any call already in flight will finish
+> and be billed. Raise the limit, or wait for the budget to reset at the
+> start of next month, then run again.
+
+A few things worth knowing:
+
+- **The run stops where it is.** A budget block is not a node error you
+    can route around — if the node has a **Failure** output wired up, the
+    run still stops rather than taking that branch. Retrying spends
+    nothing new, because the call never reached the model.
+- **Work already in flight still costs credits.** Budgets are checked
+    before each call goes out, so a call that was already running when the
+    budget filled up finishes and is billed.
+- **More than one budget can refuse the same call.** When that happens the
+    message lists every one of them, because raising just the first still
+    leaves the run blocked.
+- **Everything is in credits, not dollars.** The numbers in the message
+    match the numbers on your Griptape Cloud budget page.
+
+What to do about it depends on which line you got. "No room left" means
+the budget needs a higher limit, or you wait for its reset — daily,
+weekly, monthly, or yearly, and the message says which. A *frozen* budget
+refuses every call no matter how many credits are left, so only an
+administrator lifting the freeze will let the run through.
+
+Budgets are set and raised on Griptape Cloud, not in the editor. If you
+don't administer your organization's budgets, the budget name in the
+message is what to bring to whoever does.
+
 ## Reading execution state on the canvas
 
 Every node shows a status pill in its header while it's involved in the

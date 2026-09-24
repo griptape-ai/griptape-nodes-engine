@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
+from griptape_nodes.utils.budget_refusal import is_budget_halt
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
@@ -2322,9 +2323,20 @@ class SuccessFailureNode(BaseNode):
         to allow graceful failure handling. If no connections exist, raises the exception
         to crash the flow and provide immediate feedback.
 
+        A budget refusal is the exception, and always stops the run. The Failed
+        output means "this operation failed, here is the recovery path", but a
+        budget block is not this operation failing: it is the organization's
+        authority to spend being withdrawn, and it applies just as much to every
+        node the recovery path leads to. Routing down Failed would run a branch
+        that spends credits, be refused in turn, and turn one clear halt into a
+        confusing one per node.
+
         Args:
             exception: The exception that caused the failure
         """
+        if is_budget_halt(exception):
+            raise exception
+
         if self._has_outgoing_connections(self.failure_output):
             # User has connected something to Failed output, they want to handle errors gracefully
             logger.error(

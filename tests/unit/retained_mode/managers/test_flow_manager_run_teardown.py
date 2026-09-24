@@ -11,14 +11,16 @@ the reason the engine wedges permanently -- and it must not replace the error th
 the run, which is the one worth reporting.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.retained_mode.events.execution_events import ControlFlowCancelledEvent
 from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX
 
 
 class _DoomedRun(NamedTuple):
@@ -139,3 +141,87 @@ class TestResolveSingularNodeCleansUpAfterAFailedRun:
 
         machine.cancel_flow.assert_not_awaited()
         _assert_engine_is_restartable(flow_manager)
+
+
+def _cancellation_events(flow_manager: FlowManager) -> list[ControlFlowCancelledEvent]:
+    """Every ControlFlowCancelledEvent the manager published, in order."""
+    # The engine here is a MagicMock, so put_event records its calls; the declared type says
+    # otherwise, which is what the cast settles.
+    put_event = cast("MagicMock", flow_manager.engine.event_manager.put_event)
+
+    events = []
+    for call in put_event.call_args_list:
+        payload = call.args[0].wrapped_event.payload
+        if isinstance(payload, ControlFlowCancelledEvent):
+            events.append(payload)
+    return events
+
+
+class TestTheCancellationEventSaysWhyTheRunEnded:
+    """A cancelled run and a failed run both end in ControlFlowCancelledEvent, and differ.
+
+    That event is the one signal the editor gets when a run stops without completing. Sending
+    it bare for a failure leaves the editor able to say only that the run stopped -- which is
+    how a budget halt, whose whole value is the sentence naming the budget, arrives as silence.
+    Sending a reason for a deliberate cancel is the opposite error: it reports a problem the
+    artist caused on purpose.
+    """
+
+    @staticmethod
+    def _live_run(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        error_message: str | None,
+        cancel_also_fails: bool = False,
+    ) -> _DoomedRun:
+        """A run in progress whose resolution machine reports `error_message`, or no error.
+
+        Resetting clears the error, the way the real machine does, so a read taken after any
+        of the cleanup paths finds nothing left to report.
+        """
+        run = _doomed_run(monkeypatch, cancel_also_fails=cancel_also_fails)
+        run.flow_manager._global_control_flow_machine = run.machine
+        run.machine.resolution_machine.is_errored.return_value = error_message is not None
+        run.machine.resolution_machine.get_error_message.return_value = error_message
+
+        def reset_machine(*, cancel: bool = False) -> None:  # noqa: ARG001
+            run.machine.current_state = None
+            run.machine.resolution_machine.is_started.return_value = False
+            run.machine.resolution_machine.is_errored.return_value = False
+            run.machine.resolution_machine.get_error_message.return_value = None
+
+        run.machine.reset_machine = MagicMock(side_effect=reset_machine)
+        return run
+
+    @pytest.mark.asyncio
+    async def test_a_deliberate_cancel_carries_no_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The artist pressed Cancel. Nothing went wrong, so nothing is reported as wrong."""
+        flow_manager, _ = self._live_run(monkeypatch, error_message=None)
+
+        await flow_manager.cancel_flow_run()
+
+        assert [event.result_details for event in _cancellation_events(flow_manager)] == [None]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_also_fails", [False, True])
+    async def test_an_abandoned_run_says_why(self, monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool) -> None:
+        """A budget halt reaches the editor as its own sentence rather than as a bare stop.
+
+        Both ways out publish the event, and both must read the reason before the cleanup that
+        clears it -- the fallback especially, since it resets the machine itself first.
+        """
+        halt_message = f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call from 'Doomed'."
+        flow_manager, _ = self._live_run(monkeypatch, error_message=halt_message, cancel_also_fails=cancel_also_fails)
+
+        await flow_manager._abandon_running_flow()
+
+        assert [event.result_details for event in _cancellation_events(flow_manager)] == [halt_message]
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_stopped_without_erroring_reports_no_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Not every abandoned run failed; inventing a reason is worse than sending none."""
+        flow_manager, _ = self._live_run(monkeypatch, error_message=None)
+
+        await flow_manager._abandon_running_flow()
+
+        assert [event.result_details for event in _cancellation_events(flow_manager)] == [None]

@@ -4,6 +4,8 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
+from griptape_nodes.retained_mode.events.event_converter import converter
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, BudgetRefusal
 
 from .mocks import MockNode
 
@@ -272,3 +274,57 @@ class TestLockedSuccessFailureNodeRouting:
         node._execution_succeeded = None
         assert node.get_next_control_output() is None
         assert node.stop_flow is True
+
+
+class TestBudgetHaltsIgnoreTheFailureBranch:
+    """A budget block stops the run even when the node has a Failed path wired up.
+
+    The Failed output means "this operation failed, here is the recovery path". A budget
+    block is not this operation failing: it is the authority to spend being withdrawn, and
+    it applies just as much to every node the recovery path leads to. Routing down Failed
+    would spend on a branch that is refused in turn, turning one clear halt into one
+    confusing error per node.
+    """
+
+    @staticmethod
+    def _node_with_failure_connected() -> SuccessFailureNode:
+        """A node whose Failed output is wired, which is the graceful-handling case."""
+        node = SuccessFailureNode(name="refused_call")
+        node._has_outgoing_connections = Mock(return_value=True)  # type: ignore[method-assign]
+        return node
+
+    @staticmethod
+    def _a_budget_error() -> BudgetExceededError:
+        return BudgetExceededError(
+            f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call.",
+            BudgetRefusal(),
+        )
+
+    def test_a_budget_error_raises_despite_the_failure_branch(self) -> None:
+        node = self._node_with_failure_connected()
+
+        with pytest.raises(BudgetExceededError):
+            node._handle_failure_exception(self._a_budget_error())
+
+    def test_a_forwarded_budget_error_raises_too(self) -> None:
+        """The node may have run in a worker, where `isinstance` no longer answers."""
+        node = self._node_with_failure_connected()
+        forwarded = converter.structure(converter.unstructure(self._a_budget_error()), Exception)
+
+        with pytest.raises(Exception, match=BUDGET_HALT_PREFIX) as caught:
+            node._handle_failure_exception(forwarded)  # type: ignore[arg-type]
+
+        assert caught.value is forwarded
+
+    def test_every_other_error_still_takes_the_graceful_path(self) -> None:
+        """The contract tripwire: only budget refusals override a connected Failed output."""
+        node = self._node_with_failure_connected()
+
+        node._handle_failure_exception(ValueError("the API returned garbage"))
+
+    def test_an_ordinary_error_still_raises_with_nothing_connected(self) -> None:
+        node = SuccessFailureNode(name="unconnected")
+        node._has_outgoing_connections = Mock(return_value=False)  # type: ignore[method-assign]
+
+        with pytest.raises(ValueError, match="the API returned garbage"):
+            node._handle_failure_exception(ValueError("the API returned garbage"))

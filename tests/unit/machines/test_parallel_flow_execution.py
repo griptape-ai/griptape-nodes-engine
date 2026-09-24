@@ -23,6 +23,7 @@ from griptape_nodes.machines.parallel_resolution import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, BudgetRefusal
 
 
 def _engine_with_execution_mode(mode: WorkflowExecutionMode, dag_builder: DagBuilder) -> MagicMock:
@@ -665,6 +666,38 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
         assert context.error_message is not None
+        assert context.error_message.startswith("Node 'n' encountered a problem")
+
+    @pytest.mark.asyncio
+    async def test_a_budget_halt_keeps_its_own_wording(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The halt message is what the artist reads, so the reap must not reframe it.
+
+        Wrapping it in "Node 'n' encountered a problem" would bury the budget name behind a
+        second framing and displace the opening words that `is_budget_halt` recognizes
+        downstream -- which is how a budget block becomes a generic error again.
+        """
+        context = self._context_with_processing_node()
+        dag_node = context.node_to_reference["n"]
+        halt_message = f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call from 'n'."
+
+        async def _refused() -> None:
+            raise BudgetExceededError(halt_message, BudgetRefusal())
+
+        task = asyncio.ensure_future(_refused())
+        await asyncio.sleep(0)  # run the task to completion; it raises internally
+        context.task_to_node[task] = dag_node
+        context.running_tasks_count = 1
+
+        event_manager = MagicMock()
+        event_manager.aput_event = AsyncMock()
+        monkeypatch.setattr(
+            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.EventManager", lambda: event_manager
+        )
+
+        state = await ExecuteDagState.on_update(context)
+
+        assert state is ErrorState
+        assert context.error_message == halt_message
 
 
 class TestLockedNodeIsNeverQueuedOrExecuted:
