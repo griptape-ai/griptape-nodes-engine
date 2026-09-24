@@ -1,11 +1,8 @@
 """Unit tests for File and FileDestination."""
 
-from __future__ import annotations
-
 import base64
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -35,13 +32,12 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
-
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
-CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
-STATIC_SERVER_CONFIG_MANAGER_PATH = "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager"
+# These modules read the workspace off the engine they resolve, so the tests patch that
+# resolution and hand back a stand-in whose config_manager is the mock.
+CURRENT_ENGINE_PATH = "griptape_nodes.files.file.current_engine"
+STATIC_SERVER_CURRENT_ENGINE_PATH = "griptape_nodes.files.drivers.static_server_file_driver.current_engine"
 
 
 class TestFileConstructor:
@@ -872,8 +868,8 @@ class TestFileDestinationWrite:
     def test_resolve_anchors_relative_path_to_workspace(self, tmp_path: Path) -> None:
         dest = FileDestination("output.png")
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             resolved = dest.resolve()
 
         assert Path(resolved) == tmp_path / "output.png"
@@ -1121,16 +1117,16 @@ class TestFileResolve:
 
     def test_resolve_absolute_path_passes_through(self, tmp_path: Path) -> None:
         abs_path = tmp_path / "absolute" / "image.png"
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(str(abs_path)).resolve()
 
         assert Path(result) == abs_path
 
     def test_resolve_anchors_relative_path_to_workspace(self, tmp_path: Path) -> None:
         """A workspace-relative path resolves against the workspace, not the process CWD."""
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File("outputs/images/result.png").resolve()
 
         assert Path(result) == tmp_path / "outputs" / "images" / "result.png"
@@ -1172,8 +1168,8 @@ class TestFileResolveUrls:
         """The reported repro: a Decode Media output wired into a video-processing node."""
         url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(url).resolve()
 
         assert Path(result) == tmp_path / "staticfiles" / "clip.mp4"
@@ -1186,8 +1182,8 @@ class TestFileResolveUrls:
         """
         url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(url).resolve()
 
         assert "http:" not in result
@@ -1203,12 +1199,12 @@ class TestFileResolveUrls:
         url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
         driver = StaticServerFileDriver()
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             resolved = File(url).resolve()
 
-        with patch(STATIC_SERVER_CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(STATIC_SERVER_CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             driver_path = driver._resolve_to_local_path(url)
 
         assert Path(resolved) == driver_path
@@ -1220,8 +1216,8 @@ class TestFileResolveUrls:
         """
         url = "https://example.com/videos/clip.mp4"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(url).resolve()
 
         assert result == url
@@ -1230,8 +1226,8 @@ class TestFileResolveUrls:
         """A signed URL's query string is load-bearing and must survive intact."""
         url = "https://example.com/videos/clip.mp4?token=abc123&expires=1786574231"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(url).resolve()
 
         assert result == url
@@ -1240,8 +1236,8 @@ class TestFileResolveUrls:
         """A localhost URL that isn't a static-file URL names no workspace file."""
         url = "http://localhost:8124/api/videos/clip.mp4"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(url).resolve()
 
         assert result == url
@@ -1250,8 +1246,8 @@ class TestFileResolveUrls:
         """The pre-existing file:// behavior is unchanged."""
         target = tmp_path / "outputs" / "clip.mp4"
 
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File(target.as_uri()).resolve()
 
         assert Path(result) == target
@@ -1261,8 +1257,8 @@ class TestFileResolveUrls:
 
         `C://outputs/clip.mp4` is the spelling a naive `://` check misreads.
         """
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File("C://outputs/clip.mp4").resolve()
 
         assert result != "C://outputs/clip.mp4"
@@ -1270,8 +1266,8 @@ class TestFileResolveUrls:
 
     def test_resolve_relative_path_still_anchors_to_workspace(self, tmp_path: Path) -> None:
         """Non-URL locations are unaffected by the URL branch."""
-        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             result = File("outputs/clip.mp4").resolve()
 
         assert Path(result) == tmp_path / "outputs" / "clip.mp4"
@@ -1292,7 +1288,7 @@ def _jpeg_bytes() -> bytes:
 
 
 @pytest.fixture
-def _registered_providers(engine: Engine) -> None:
+def _registered_providers() -> None:
     """Ensure default artifact providers are registered with the ArtifactManager.
 
     Validation goes through ``ArtifactManager.sniff_extension``, which dispatches
@@ -1300,6 +1296,7 @@ def _registered_providers(engine: Engine) -> None:
     happens on ``AppInitializationComplete``, which doesn't fire in unit tests,
     so we register the default providers manually here.
     """
+    from griptape_nodes.retained_mode.engine import current_engine
     from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
     from griptape_nodes.retained_mode.managers.artifact_providers import (
         AudioArtifactProvider,
@@ -1307,7 +1304,7 @@ def _registered_providers(engine: Engine) -> None:
         VideoArtifactProvider,
     )
 
-    artifact_manager = engine.artifact_manager
+    artifact_manager = current_engine().artifact_manager
     for provider_class in (ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider):
         artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=provider_class)

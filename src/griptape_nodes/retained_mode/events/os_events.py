@@ -713,7 +713,16 @@ class WriteFileRequest(RequestPayload):
         encoding: Text encoding for str content (default: 'utf-8', ignored for bytes)
         append: If True, append to existing file; if False, use existing_file_policy (default: False)
         existing_file_policy: How to handle existing files when append=False:
-            - "overwrite": Replace file content (default)
+            - "overwrite": Replace file content (default). The replacement is atomic —
+              written to a private sibling temp file and renamed into place — so
+              concurrent readers see either the prior content or the full new content,
+              never a truncated file, and a failed write leaves the prior file intact.
+              Deliberate consequence: overwrite sits OUTSIDE the file-lock protocol the
+              other modes use. Concurrent overwrites of one path are last-rename-wins
+              (each writer's content lands whole), and an append racing an overwrite
+              may write to the replaced file and lose those bytes — there is no
+              coherent outcome for that race even with locking, only a different
+              arbitrary loser.
             - "fail": Return failure if file exists
             - "create_new": Create new file with auto-incrementing index (e.g., file_1.txt, file_2.txt)
         create_parents: If True, create parent directories if missing (default: True)

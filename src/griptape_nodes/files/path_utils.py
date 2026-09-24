@@ -385,7 +385,7 @@ def is_url(location: str) -> bool:
         True if the string begins with a URL scheme followed by ``://``.
 
     Examples:
-        >>> is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?t=1")
+        >>> is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?v=1")
         True
         >>> is_url("https://example.com/clip.mp4")
         True
@@ -407,7 +407,7 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     """Map a static file server URL back to the workspace file it serves.
 
     The engine hands node outputs around as static server URLs
-    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?t=<cachebuster>``).
+    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?v=<version>``).
     Those URLs address a file that already exists inside the workspace, so a
     consumer that needs a real path -- to hand to a subprocess like FFmpeg, say --
     can have one without an HTTP round-trip.
@@ -426,7 +426,7 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
 
     Examples:
         >>> parse_static_server_url(
-        ...     "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231",
+        ...     "http://localhost:8124/workspace/staticfiles/clip.mp4?v=1786574231",
         ...     Path("/home/artist/GriptapeNodes"),
         ... )
         PosixPath('/home/artist/GriptapeNodes/staticfiles/clip.mp4')
@@ -438,8 +438,8 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     if not location.startswith(("http://localhost:", "https://localhost:")):
         return None
 
-    # Strip the cachebuster (`?t=...`) before parsing: it is addressing metadata for
-    # the HTTP server, not part of the filename.
+    # Strip the version/cachebuster query (`?v=...`) before parsing: it is addressing
+    # metadata for the HTTP server, not part of the filename.
     url_without_query = location.split("?", maxsplit=1)[0]
     parsed = urlparse(url_without_query)
 

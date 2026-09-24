@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from griptape_nodes.node_library.library_registry import LibraryMetadata
+from griptape_nodes.node_library.library_declarations import LibraryDependencyDeclaration
+from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
 from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    IncompatibleRequirementsProblem,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
 
 def _make_metadata(**kwargs: Any) -> LibraryMetadata:
@@ -24,7 +30,11 @@ def _make_metadata(**kwargs: Any) -> LibraryMetadata:
 
 
 def _make_library_manager() -> LibraryManager:
-    return LibraryManager(event_manager=MagicMock(), worker_manager=MagicMock())
+    worker_manager = MagicMock()
+    # WorkerManager now answers whether a PROCESS is unavailable, and a bare MagicMock answers
+    # truthily -- which reads as "cannot run" for every library.
+    worker_manager.worker_unavailable_reason.return_value = None
+    return LibraryManager(event_manager=MagicMock(), worker_manager=worker_manager)
 
 
 class TestLibraryInfoRequiresWorker:
@@ -69,6 +79,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = (
@@ -106,6 +117,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = None
@@ -117,14 +129,35 @@ class TestGetWorkerForLibrary:
 
 class TestOnLibraryLoadedNotification:
     def _make_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """A legacy worker-mode library awaiting its worker's verdict.
+
+        `requires_worker` is what puts a library in WORKER_PENDING in the first place (see
+        `_start_workers`), so a fixture in that state without the flag describes something the
+        engine never produces.
+        """
         return LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.WORKER_PENDING,
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path="/some/path.json",
             is_sandbox=False,
             library_name=library_name,
+            requires_worker=True,
+            executes_in_worker=True,
         )
 
+    def _make_exec_deps_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """An execution-dependency library that already loaded its real nodes locally."""
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.FLAWED,
+            library_path="/some/exec-deps.json",
+            is_sandbox=False,
+            library_name=library_name,
+            requires_worker=False,
+            executes_in_worker=True,
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_updates_fitness_and_lifecycle_to_loaded(self) -> None:
         mgr = _make_library_manager()
@@ -136,6 +169,28 @@ class TestOnLibraryLoadedNotification:
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.GOOD
 
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_worker_does_not_overwrite_a_locally_derived_fitness(self) -> None:
+        """An exec-deps library's fitness is the orchestrator's own finding, not the worker's.
+
+        It loaded real node classes here, so its FLAWED verdict came from doing that -- an
+        edit-time dependency that failed, a node module that would not import. The worker only
+        knows whether ITS copy came up. Taking the worker's answer would paint over a broken node
+        that is sitting on the canvas, and the reason would not travel with it.
+        """
+        mgr = _make_library_manager()
+        lib_info = self._make_exec_deps_lib_info("exec_deps_lib")
+        mgr._library_file_path_to_info["/some/exec-deps.json"] = lib_info
+
+        await mgr._on_library_loaded_notification(
+            LibraryLoadedNotification(library_name="exec_deps_lib", fitness="GOOD")
+        )
+
+        assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
+        assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
+
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_accepts_flawed_fitness(self) -> None:
         mgr = _make_library_manager()
@@ -149,6 +204,7 @@ class TestOnLibraryLoadedNotification:
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
 
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_does_nothing_for_unknown_library(self) -> None:
         mgr = _make_library_manager()
@@ -174,3 +230,673 @@ class TestRegisterPreReloadCallback:
         mgr.register_pre_reload_callback(second)
 
         assert mgr._pre_reload_callbacks == [*baseline, first, second]
+
+
+class TestResolveExecutesInWorker:
+    """Execution placement is a fact about dependencies, derived not declared."""
+
+    def _metadata(self, *, exec_deps: list[str] | None) -> LibraryMetadata:
+        dependencies = None
+        if exec_deps is not None:
+            dependencies = Dependencies(pip_dependencies=["pillow"], pip_dependencies_exec=exec_deps)
+        return LibraryMetadata(
+            author="t",
+            description="d",
+            library_version="1.0.0",
+            engine_version="0.0.0",
+            tags=[],
+            dependencies=dependencies,
+        )
+
+    def test_exec_dependencies_require_a_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=["torch"])
+        )
+        assert result is True
+
+    def test_no_dependencies_section_means_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is False
+
+    def test_empty_exec_dependencies_mean_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=[])
+        )
+        assert result is False
+
+    def test_legacy_worker_mode_still_executes_in_a_worker(self) -> None:
+        """The two reasons are independent: declaring worker mode is sufficient alone."""
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=True, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is True
+
+
+class TestExecuteWaitsForTheWorkerLibraryLoad:
+    """Execution must not route to a worker that has registered but not yet loaded the library.
+
+    A worker registers BEFORE it loads libraries, so routing on registration alone forwarded into a
+    window where node creation fails over there: stub nodes did not exist until the worker confirmed
+    the load, so nothing could execute.
+
+    The gate lives on WorkerManager, which owns whether a process is available; LibraryManager only
+    reports the news that a load finished.
+    """
+
+    def _managers(self, *, spawned: bool, loaded: bool = False) -> tuple[LibraryManager, WorkerManager]:
+        engine = MagicMock()
+        engine.config_manager.get_config_value.return_value = 30.0
+        worker_manager = WorkerManager(engine=engine, event_manager=MagicMock())
+        library_manager = LibraryManager(event_manager=MagicMock(), worker_manager=worker_manager)
+        info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            executes_in_worker=True,
+        )
+        library_manager._library_file_path_to_info["/some/path.json"] = info
+        if spawned:
+            worker_manager.expect_worker("Lib")
+        if loaded:
+            worker_manager.note_library_loaded("Lib")
+        return library_manager, worker_manager
+
+    @pytest.mark.asyncio
+    async def test_the_wait_releases_when_the_notification_arrives(self) -> None:
+        library_manager, worker_manager = self._managers(spawned=True)
+        order: list[str] = []
+
+        async def executes() -> None:
+            await worker_manager.wait_until_executable("Lib")
+            order.append("routed")
+
+        async def worker_finishes_loading() -> None:
+            order.append("loaded")
+            await library_manager._on_library_loaded_notification(
+                LibraryLoadedNotification(library_name="Lib", fitness="GOOD")
+            )
+
+        await asyncio.gather(executes(), worker_finishes_loading())
+
+        assert order == ["loaded", "routed"], "execution routed before the worker reported the library loaded"
+
+    @pytest.mark.asyncio
+    async def test_an_already_loaded_library_does_not_wait(self) -> None:
+        _, worker_manager = self._managers(spawned=True, loaded=True)
+
+        await worker_manager.wait_until_executable("Lib")
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_no_spawned_worker_does_not_wait(self) -> None:
+        _, worker_manager = self._managers(spawned=False)
+
+        await worker_manager.wait_until_executable("Lib")
+
+    @pytest.mark.asyncio
+    async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
+        _, worker_manager = self._managers(spawned=True)
+        worker_manager.heartbeat_startup_grace_s = 0.01
+
+        with pytest.raises(RuntimeError, match="Lib"):
+            await worker_manager.wait_until_executable("Lib")
+
+    @pytest.mark.asyncio
+    async def test_an_eviction_during_the_wait_releases_it(self) -> None:
+        """The waiter must not hold on for the full grace for a worker that is already gone."""
+        library_manager, worker_manager = self._managers(spawned=True)
+        info = library_manager.get_library_info_by_library_name("Lib")
+        assert info is not None
+        order: list[str] = []
+
+        async def executes() -> None:
+            await worker_manager.wait_until_executable("Lib")
+            order.append("released")
+
+        async def worker_dies() -> None:
+            order.append("evicted")
+            worker_manager.note_worker_unavailable("Lib", "the worker process stopped responding.")
+            library_manager.on_worker_evicted("worker-1", "Lib")
+
+        await asyncio.gather(executes(), worker_dies())
+
+        assert order == ["evicted", "released"]
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED, (
+            "an exec-deps library must stay editable through an eviction"
+        )
+
+
+class TestOnWorkerEvicted:
+    """What an evicted worker leaves behind, per library kind.
+
+    An exec-dependencies library loaded real node classes on the orchestrator before its worker
+    ever spawned, so losing the worker must cost EXECUTION and nothing else: still LOADED, still
+    editable, with a reason the next run can report. A legacy worker-mode library has only stubs
+    until its worker confirms, so losing the worker is a load failure. Neither was covered, and
+    the difference is the whole point of the split.
+    """
+
+    def _info(self, *, requires_worker: bool, lifecycle: LibraryManager.LibraryLifecycleState) -> Any:
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=lifecycle,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+
+    def test_exec_deps_library_stays_loaded_through_an_eviction(self) -> None:
+        """Its nodes loaded locally, so losing the worker costs execution and nothing else.
+
+        Why execution stopped being possible is recorded by WorkerManager, which owns the process;
+        this manager only decides that the library itself is still fine.
+        """
+        manager = _make_library_manager()
+        info = self._info(requires_worker=False, lifecycle=LibraryManager.LibraryLifecycleState.LOADED)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
+
+    def test_legacy_worker_pending_library_becomes_failure(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=True, lifecycle=LibraryManager.LibraryLifecycleState.WORKER_PENDING)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.UNUSABLE
+
+    def test_unknown_library_name_is_a_no_op(self) -> None:
+        manager = _make_library_manager()
+        manager.on_worker_evicted("worker-1", "Never Registered")
+        manager.on_worker_evicted("worker-1", None)
+
+
+class TestSpawnSkipForUnmetRequirements:
+    """A pointless spawn is skipped -- but only where the nodes already exist locally.
+
+    An exec-dependencies library loaded real node classes on the orchestrator, so a worker it can
+    never use costs a whole execution environment -- torch, gigabytes -- for nothing. A legacy
+    worker-mode library is the opposite: the orchestrator skips its node modules entirely and its
+    classes arrive as stubs from the worker, so skipping the spawn would leave it with no node
+    types at all.
+    """
+
+    def _manager(self, *, requires_worker: bool, unmet: bool) -> LibraryManager:
+        manager = _make_library_manager()
+        manager._engine = MagicMock()  # type: ignore[assignment]
+        manager._engine.ahandle_request = AsyncMock()  # type: ignore[union-attr]
+        # No worker registered yet, which is what makes this a first spawn rather than a restart.
+        manager._engine.worker_manager.get_worker_for_key.return_value = None  # type: ignore[union-attr]
+        info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+        if unmet:
+            info.problems = [
+                IncompatibleRequirementsProblem(
+                    requirements={"compute": (["cuda"], "has_any")},
+                    system_capabilities={"compute": ["cpu"]},
+                )
+            ]
+            info.execution_unavailable_reason = "it needs compute cuda, and this machine has cpu."
+        manager._library_file_path_to_info["/some/path.json"] = info
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_a_library_whose_execution_environment_failed_is_not_spawned(self) -> None:
+        """The venv directory survives a failed build, so existence alone says nothing.
+
+        Spawning anyway would front the worker's import path with a partial site-packages -- the
+        unpinned execution the edit/exec split exists to prevent -- and the raw ModuleNotFoundError
+        would bury the recorded uv error. Decided here because this manager built it and knows.
+        """
+        manager = self._manager(requires_worker=False, unmet=False)
+        info = manager._library_file_path_to_info["/some/path.json"]
+        info.execution_env_failure = "its execution dependencies could not be installed (no solution found)."
+        # The manager it collaborates with, not the one hung off the replacement mock engine: it
+        # reaches `self._worker_manager` for this, and `self.engine.worker_manager` only for the
+        # registration lookup.
+        worker_manager = cast("MagicMock", manager._worker_manager)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
+        worker_manager.expect_worker.assert_not_called()
+        # Recorded where a spawn refusal is read from, so the next run says why.
+        reason = worker_manager.note_worker_unavailable.call_args.args[1]
+        assert "could not be installed" in reason
+
+    @pytest.mark.asyncio
+    async def test_exec_deps_library_with_unmet_requirements_is_not_spawned(self) -> None:
+        manager = self._manager(requires_worker=False, unmet=True)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
+        info = manager._library_file_path_to_info["/some/path.json"]
+        assert info.execution_unavailable_reason is not None, "the local refusal must survive"
+
+    @pytest.mark.asyncio
+    async def test_a_library_whose_worker_is_registered_is_not_re_expected(self) -> None:
+        """_start_workers runs again per session join, and spawn_worker refuses the duplicate.
+
+        Re-declaring a worker as coming would install a fresh gate with nothing left to set it, so
+        every later run against a live, loaded worker would wait out the whole startup grace and
+        then blame its library load.
+        """
+        manager = self._manager(requires_worker=False, unmet=False)
+        cast("MagicMock", manager._engine).worker_manager.get_worker_for_key.return_value = ("w-1", "t/w-1")
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
+        cast("MagicMock", manager._worker_manager).expect_worker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_worker_library_still_spawns_even_when_unmet(self) -> None:
+        """Its nodes come from the worker, so no spawn means no node types at all."""
+        manager = self._manager(requires_worker=True, unmet=True)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_spawn_a_legacy_library_still_gets_does_not_clear_its_refusal(self) -> None:
+        """execution_unavailable_reason is the only gate get_worker_for_library has.
+
+        This library's spawn is deliberately not skipped, so clearing the reason on a fresh attempt
+        would let execution dispatch to a worker that cannot load it. An unmet requirement is a
+        standing fact about the machine, not an account of a previous attempt.
+        """
+        manager = self._manager(requires_worker=True, unmet=True)
+
+        await manager._start_workers()
+
+        info = manager._library_file_path_to_info["/some/path.json"]
+        assert info.execution_unavailable_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_met_requirements_spawns(self) -> None:
+        manager = self._manager(requires_worker=False, unmet=False)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
+        # Nothing standing in the way, so a stale account of a previous attempt is cleared.
+        assert manager._library_file_path_to_info["/some/path.json"].execution_unavailable_reason is None
+
+
+class TestLibraryDependencyResolution:
+    """A dependency declaration names a REPO; the registry is keyed by library NAME.
+
+    `griptape-nodes-library-openexr` publishes itself as `OpenEXR Library`, so matching the repo
+    name against library names missed it -- and a miss only warns and skips, so the whole
+    library-dependency mechanism was a silent no-op for any library not named after its repo.
+    Provisioning installs each download under a repo-name directory, which is where the repo name
+    actually appears.
+    """
+
+    def _register(self, manager: LibraryManager, *, path: str, library_name: str) -> None:
+        manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path=path,
+            is_sandbox=False,
+            library_name=library_name,
+        )
+
+    def test_repo_name_resolves_via_the_install_directory(self) -> None:
+        manager = _make_library_manager()
+        self._register(
+            manager,
+            path="/libs/griptape-nodes-library-openexr/griptape-nodes-library.json",
+            library_name="OpenEXR Library",
+        )
+
+        info = manager._library_info_for_repo_name("griptape-nodes-library-openexr")
+
+        assert info is not None
+        assert info.library_name == "OpenEXR Library"
+
+    def test_library_name_still_resolves_when_it_matches_the_repo(self) -> None:
+        manager = _make_library_manager()
+        self._register(manager, path="/libs/whatever/griptape-nodes-library.json", library_name="some-repo-name")
+
+        info = manager._library_info_for_repo_name("some-repo-name")
+
+        assert info is not None
+
+    def test_unknown_repo_name_resolves_to_none(self) -> None:
+        manager = _make_library_manager()
+        self._register(manager, path="/libs/other/griptape-nodes-library.json", library_name="Other Library")
+
+        assert manager._library_info_for_repo_name("griptape-nodes-library-openexr") is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "griptape-ai/griptape-nodes-library-openexr",
+            "griptape-ai/griptape-nodes-library-openexr@v1.2.0",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0",
+        ],
+    )
+    def test_every_spelling_of_a_declaration_url_yields_one_repo_name(self, url: str) -> None:
+        """Every caller reads this field, so it must be derived one way.
+
+        A `@ref` suffix and a `.git` extension both change the final path segment. One call site
+        normalized and the other did not, so a pinned declaration resolved for the transitive
+        resolver and missed for the worker's target expansion -- and a miss only logs.
+        """
+        assert LibraryManager._parse_dependency_url(url).repo_name == "griptape-nodes-library-openexr"
+
+    @pytest.mark.parametrize(
+        ("url", "expected_ref"),
+        [
+            ("griptape-ai/griptape-nodes-library-openexr", None),
+            ("griptape-ai/griptape-nodes-library-openexr@v1.2.0", "v1.2.0"),
+            ("https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0", "v1.2.0"),
+        ],
+    )
+    def test_the_parsed_url_carries_what_the_download_needs(self, url: str, expected_ref: str | None) -> None:
+        """Registration downloads a missing dependency from these two fields, not from the repo name.
+
+        The ref is what pins a declaration to a version, so losing it installs the default branch
+        instead of the declared one -- and the install still reports success.
+        """
+        parsed = LibraryManager._parse_dependency_url(url)
+
+        assert parsed.ref == expected_ref
+        assert parsed.normalized_url == "https://github.com/griptape-ai/griptape-nodes-library-openexr.git"
+
+    def test_a_failed_duplicate_does_not_mask_the_copy_that_loaded(self) -> None:
+        """One path can hold a FAILURE record beside the copy that loaded.
+
+        Both callers need library_name, so answering with the failed entry reports "not installed
+        here" for a library that is.
+        """
+        manager = _make_library_manager()
+        path = "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json"
+        manager._library_file_path_to_info[path + "#failed"] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.FAILURE,
+            fitness=LibraryManager.LibraryFitness.UNUSABLE,
+            library_path=path,
+            is_sandbox=False,
+            library_name=None,
+        )
+        self._register(manager, path=path, library_name="OpenEXR Library")
+
+        info = manager._library_info_for_repo_name("griptape-nodes-library-openexr")
+
+        assert info is not None
+        assert info.library_name == "OpenEXR Library"
+
+
+class TestExpandTargetsWithLibraryDependencies:
+    """A worker must load the libraries its library declares, or a feature works only while editing.
+
+    CorridorKey's OCIO path reaches into the OpenEXR library. The orchestrator loaded it, the
+    worker did not, so selecting an OCIO colour space succeeded on the canvas and failed on run.
+    The declaration names a REPO (`griptape-nodes-library-openexr`) while the registry is keyed by
+    library NAME (`OpenEXR Library`), which is why resolution has to go through the install path.
+    """
+
+    def _manager_with(self, monkeypatch: pytest.MonkeyPatch, libraries: dict[str, Any]) -> LibraryManager:
+        """A manager whose discovery found `libraries`: {library_name: (path, declarations)}."""
+        manager = _make_library_manager()
+        by_path: dict[str, Any] = {}
+        for name, (path, declarations) in libraries.items():
+            manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+            by_path[path] = declarations
+
+        def fake_load(request: Any) -> Any:
+            schema = MagicMock()
+            schema.metadata = _make_metadata(declarations=by_path[request.file_path])
+            result = MagicMock()
+            result.library_schema = schema
+            return result
+
+        monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
+        return manager
+
+    def test_declared_dependency_reaches_the_worker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                ),
+                "OpenEXR Library": ("/libs/griptape-nodes-library-openexr/griptape-nodes-library.json", []),
+            },
+        )
+
+        expanded = manager._expand_targets_with_library_dependencies(["Consumer Library"])
+
+        assert expanded == ["Consumer Library", "OpenEXR Library"]
+
+    def test_dependencies_are_followed_transitively(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "A": (
+                    "/libs/a/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git")],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git")],
+                ),
+                "C Library": ("/libs/griptape-nodes-library-c/griptape-nodes-library.json", []),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["A"]) == ["A", "B Library", "C Library"]
+
+    def test_a_library_with_no_declarations_gains_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Over-broad expansion would put every library in every worker, undoing the isolation."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Solo Library": ("/libs/solo/griptape-nodes-library.json", []),
+                "Unrelated Library": ("/libs/griptape-nodes-library-unrelated/griptape-nodes-library.json", []),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["Solo Library"]) == ["Solo Library"]
+
+    def test_an_uninstalled_dependency_is_skipped_not_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Declarations are optional in practice; refusing to start would be the worse failure."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-absent.git")],
+                ),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["Consumer Library"]) == ["Consumer Library"]
+
+
+class TestExecutionDependenciesOfDeclaredLibraries:
+    """A dependency's execution set is installed into the DEPENDING library's environment.
+
+    A worker loads its library's declared dependencies, so their execution pins have to be on its
+    sys.path too. Building each dependency its own `.venv-exec` and splicing them all back would
+    reproduce between libraries the disagreement the combined edit/exec resolution already avoids
+    within one: two environments resolved apart can choose different versions of anything they
+    share, and whichever landed first would win. It would also have one worker writing a venv
+    another library owns.
+    """
+
+    def _manager_with(self, monkeypatch: pytest.MonkeyPatch, libraries: dict[str, Any]) -> LibraryManager:
+        """A manager whose discovery found `libraries`: {name: (path, declarations, exec_deps)}."""
+        manager = _make_library_manager()
+        by_path: dict[str, Any] = {}
+        for name, (path, declarations, exec_deps) in libraries.items():
+            manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+            by_path[path] = (declarations, exec_deps)
+
+        def fake_load(request: Any) -> Any:
+            declarations, exec_deps = by_path[request.file_path]
+            schema = MagicMock()
+            schema.metadata = _make_metadata(
+                declarations=declarations,
+                dependencies=Dependencies(pip_dependencies_exec=exec_deps),
+            )
+            result = MagicMock()
+            result.library_schema = schema
+            return result
+
+        monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
+        return manager
+
+    def _collect(self, manager: LibraryManager, library_name: str) -> list[str]:
+        """What `library_name`'s dependencies contribute, given the caller already holds its manifest."""
+        schema = manager._library_schema_for_name(library_name)
+        assert schema is not None
+        return manager._execution_dependencies_of_declared_libraries(schema)
+
+    def test_a_dependency_execution_set_is_collected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                    ["consumer-only==1.0"],
+                ),
+                "OpenEXR Library": (
+                    "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json",
+                    [],
+                    ["openexr==3.2"],
+                ),
+            },
+        )
+
+        collected = self._collect(manager, "Consumer Library")
+
+        # Its own set is added by the caller, so only the dependency's appears here.
+        assert collected == ["openexr==3.2"]
+
+    def test_execution_sets_are_collected_transitively(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "A": (
+                    "/libs/a/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git")],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git")],
+                    ["b-pin==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["c-pin==2.0"],
+                ),
+            },
+        )
+
+        assert self._collect(manager, "A") == ["b-pin==1.0", "c-pin==2.0"]
+
+    def test_a_library_with_no_declarations_collects_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Solo Library": ("/libs/solo/griptape-nodes-library.json", [], ["solo==1.0"]),
+            },
+        )
+
+        assert self._collect(manager, "Solo Library") == []
+
+    def test_a_pin_declared_by_two_dependencies_appears_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """It becomes one resolution, so a repeat is noise the install does not need."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git"),
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git"),
+                    ],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+            },
+        )
+
+        assert self._collect(manager, "Consumer Library") == ["shared==1.0"]
+
+    @pytest.mark.asyncio
+    async def test_the_worker_load_path_applies_the_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Guards the call site, not just the method.
+
+        The expansion is only useful if the worker's load path runs it. Testing the method alone
+        left removing the call invisible, so this pins that load_all_libraries_from_config feeds
+        its target list through it -- and that an orchestrator (no target list) is left alone.
+        """
+        manager = _make_library_manager()
+        seen: list[list[str] | None] = []
+
+        def fake_expand(targets: list[str]) -> list[str]:
+            seen.append(targets)
+            return [*targets, "Pulled In Library"]
+
+        monkeypatch.setattr(manager, "_expand_targets_with_library_dependencies", fake_expand)
+        monkeypatch.setattr(manager, "_reconcile_libraries_from_config", AsyncMock(return_value=[]))
+        # Discovery returning nothing ends the load early, which is all this test needs: the
+        # expansion runs before any library is touched.
+        monkeypatch.setattr(
+            manager, "discover_libraries_request", AsyncMock(return_value=MagicMock(libraries_discovered=[]))
+        )
+
+        await manager.load_all_libraries_from_config(target_library_names=["Worker Library"])
+        assert seen == [["Worker Library"]], "the worker load path did not expand its target list"
+
+        seen.clear()
+        await manager.load_all_libraries_from_config(target_library_names=None)
+        assert seen == [], "the orchestrator has no target list and must not be expanded"
