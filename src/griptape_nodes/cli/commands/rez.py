@@ -22,7 +22,7 @@ from rich.table import Table
 
 import griptape_nodes
 from griptape_nodes.cli.shared import console
-from griptape_nodes.files.path_utils import canonicalize_for_io
+from griptape_nodes.files.path_utils import canonicalize_for_io, strip_windows_long_path_prefix
 from griptape_nodes.utils.git_utils import clone_repository
 from griptape_nodes.utils.rez_utils import (
     REZ_PACKAGE_COPY_EXCLUDE_PATTERNS,
@@ -119,6 +119,17 @@ def build_engine_package(
 # ---------------------------------------------------------------------------
 
 
+def _admin_path(value: str) -> Path:
+    r"""Canonicalize a path the administrator typed, in the form they will see and configure.
+
+    These paths are echoed back in the summary and the GTN_REZ_* guidance, so they must
+    not carry the Windows ``\\?\`` prefix that ``canonicalize_for_io`` always adds there.
+    ``canonicalize_for_identity`` does not fit either: it follows symlinks, which can
+    rewrite a mapped studio drive such as ``P:`` to its UNC share.
+    """
+    return Path(strip_windows_long_path_prefix(canonicalize_for_io(value)))
+
+
 def _resolve_and_validate_repo(engine_repo_path: str | None) -> tuple[Path, Path]:
     """Locate and validate the engine repo. Prompts interactively if not found."""
     console.print(Panel("[bold cyan]Rez Engine Package Builder[/bold cyan]", expand=False))
@@ -131,7 +142,7 @@ def _resolve_and_validate_repo(engine_repo_path: str | None) -> tuple[Path, Path
         console.print("The engine repo contains pyproject.toml and src/griptape_nodes/.")
         console.print()
         user_path = typer.prompt("Enter the path to your griptape-nodes-engine checkout")
-        repo_path = canonicalize_for_io(user_path)
+        repo_path = _admin_path(user_path)
         if not repo_path.is_dir():
             console.print(f"[red]Directory not found: {repo_path}[/red]")
             raise typer.Exit(1)
@@ -231,7 +242,7 @@ _DEFAULT_REZ_PATHS: dict[str, str] = {
 def _resolve_studio_root_from_env_or_option(packages_path: str | None) -> tuple[Path, dict[str, str]]:
     """Non-interactive fallback: derive studio root from env or CLI option."""
     if packages_path:
-        packages_root = canonicalize_for_io(packages_path)
+        packages_root = _admin_path(packages_path)
         return packages_root, {**_DEFAULT_REZ_PATHS, "local_packages": "local"}
 
     root = rez_root()
@@ -300,7 +311,7 @@ def _prompt_studio_setup() -> tuple[dict[str, str] | None, Path, dict[str, str]]
     else:
         console.print()
         root_str = typer.prompt("Enter the studio root path (GTN_REZ_ROOT)")
-        studio_root = canonicalize_for_io(root_str)
+        studio_root = _admin_path(root_str)
         cross_platform_roots = None
 
     console.print()
@@ -324,7 +335,7 @@ def _prompt_rez_paths() -> dict[str, str]:
             )
             if use_absolute:
                 val = typer.prompt("  local packages (absolute path)").strip()
-                val = str(canonicalize_for_io(val))
+                val = str(_admin_path(val))
             else:
                 val = typer.prompt(f"  {label}", default=default).strip()
         else:
@@ -517,7 +528,7 @@ def _print_env_var_guidance(
 def _resolve_engine_repo(explicit_path: str | None) -> Path | None:
     """Find the engine repo, checking explicit path, then common locations."""
     if explicit_path:
-        p = canonicalize_for_io(explicit_path)
+        p = _admin_path(explicit_path)
         if p.is_dir():
             return p
         console.print(f"[red]Engine repo not found at: {p}[/red]")
@@ -648,7 +659,7 @@ def build_library_package(
         raise typer.Exit(1)
 
     if packages_path:
-        packages_root = canonicalize_for_io(packages_path)
+        packages_root = _admin_path(packages_path)
     else:
         local_path_resolved = rez_local_packages_path()
         if local_path_resolved:
@@ -701,7 +712,7 @@ def _build_library_from_local(
     skip_installed: bool,
 ) -> None:
     """Build a rez package from a local library directory."""
-    library_dir = canonicalize_for_io(local_path)
+    library_dir = _admin_path(local_path)
     if not library_dir.is_dir():
         console.print(f"[red]Directory not found: {library_dir}[/red]")
         raise typer.Exit(1)

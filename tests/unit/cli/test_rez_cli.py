@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from typer.testing import CliRunner
 
 from griptape_nodes.cli.commands import rez
 from griptape_nodes.cli.commands.rez import (
+    _admin_path,
     _build_library_from_dir,
     _build_library_from_git,
     _build_library_from_local,
@@ -41,7 +43,6 @@ from griptape_nodes.cli.commands.rez import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 MODULE = "griptape_nodes.cli.commands.rez"
 PYTHON_FAMILY = f"python-{sys.version_info.major}.{sys.version_info.minor}"
@@ -218,6 +219,17 @@ class TestPyprojectReading:
 # ---------------------------------------------------------------------------
 
 
+class TestAdminPath:
+    def test_strips_windows_long_path_prefix(self) -> None:
+        # canonicalize_for_io always prefixes on Windows; the prefix must not reach
+        # paths that are printed back to the admin or written into GTN_REZ_* guidance.
+        with patch(f"{MODULE}.canonicalize_for_io", return_value=Path("\\\\?\\C:\\studio")):
+            assert str(_admin_path("C:\\studio")) == "C:\\studio"
+
+    def test_expands_home(self) -> None:
+        assert _admin_path("~/studio") == Path.home() / "studio"
+
+
 class TestResolveEngineRepo:
     def test_explicit_existing_path(self, tmp_path: Path) -> None:
         assert _resolve_engine_repo(str(tmp_path)) == tmp_path
@@ -349,7 +361,7 @@ class TestPromptStudioSetup:
         ):
             roots, studio_root, _ = _prompt_studio_setup()
         assert roots == {"linux": "/mnt/pipeline", "windows": "P:", "osx": "/Volumes/pipeline"}
-        assert str(studio_root) == "/Volumes/pipeline"
+        assert studio_root == Path("/Volumes/pipeline")
 
     @pytest.mark.usefixtures("clean_env")
     def test_cross_platform_falls_back_to_first_entry(self, output: io.StringIO) -> None:
@@ -362,7 +374,7 @@ class TestPromptStudioSetup:
         ):
             roots, studio_root, _ = _prompt_studio_setup()
         assert roots == {"linux": "/mnt/pipeline"}
-        assert str(studio_root) == "/mnt/pipeline"
+        assert studio_root == Path("/mnt/pipeline")
         assert "not in mapping" in output.getvalue()
 
     @pytest.mark.usefixtures("output", "clean_env")
