@@ -9,7 +9,13 @@ from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.files.path_utils import resolve_workspace_path
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
+from griptape_nodes.retained_mode.beta_features import (
+    BetaFeature,
+    get_beta_feature,
+    is_beta_enabled,
+    list_beta_features,
+)
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -37,6 +43,11 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueResultSuccess,
     GetWorkspaceRequest,
     GetWorkspaceResultSuccess,
+    IsBetaFeatureEnabledRequest,
+    IsBetaFeatureEnabledResultFailure,
+    IsBetaFeatureEnabledResultSuccess,
+    ListBetaFeaturesRequest,
+    ListBetaFeaturesResultSuccess,
     ResetConfigRequest,
     ResetConfigResultFailure,
     ResetConfigResultSuccess,
@@ -59,6 +70,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
+    BETA_FEATURES_FROM_ENV_CONTEXT,
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
@@ -349,6 +361,12 @@ class ConfigManager(EngineScoped):
                 GetConfigSchemaRequest, self.on_handle_get_config_schema_request
             )
             event_manager.assign_manager_to_request_type(ResetConfigRequest, self.on_handle_reset_config_request)
+            event_manager.assign_manager_to_request_type(
+                ListBetaFeaturesRequest, self.on_handle_list_beta_features_request
+            )
+            event_manager.assign_manager_to_request_type(
+                IsBetaFeatureEnabledRequest, self.on_handle_is_beta_feature_enabled_request
+            )
 
     @property
     def workspace_path(self) -> Path:
@@ -966,7 +984,7 @@ class ConfigManager(EngineScoped):
         candidate = set_dot_value({}, config_key, raw_value)
 
         try:
-            validated = Settings.model_validate(candidate)
+            validated = Settings.model_validate(candidate, context={BETA_FEATURES_FROM_ENV_CONTEXT: True})
         except ValidationError:
             return _REJECTED_BAD_VALUE
 
@@ -1552,6 +1570,51 @@ class ConfigManager(EngineScoped):
     def on_handle_get_workspace_request(self, request: GetWorkspaceRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the absolute workspace path."
         return GetWorkspaceResultSuccess(workspace_path=str(self.workspace_path), result_details=result_details)
+
+    def on_handle_list_beta_features_request(self, request: ListBetaFeaturesRequest) -> ResultPayload:  # noqa: ARG002
+        all_features = list(list_beta_features())
+        for library_name in LibraryRegistry.list_libraries():
+            all_features.extend(LibraryRegistry.get_library(library_name).get_beta_features().values())
+
+        features = [feature.model_dump(mode="json") for feature in all_features if not feature.is_expired()]
+        result_details = f"Successfully listed {len(features)} beta feature(s)."
+        return ListBetaFeaturesResultSuccess(features=features, result_details=result_details)
+
+    def on_handle_is_beta_feature_enabled_request(self, request: IsBetaFeatureEnabledRequest) -> ResultPayload:
+        feature: BetaFeature | None = None
+        if request.library_name is None:
+            feature = get_beta_feature(request.feature_id)
+            if feature is None:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}'. "
+                    "Failed because the engine has no beta feature with that id."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+        else:
+            try:
+                library = LibraryRegistry.get_library(request.library_name)
+            except LibraryRegistryError:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}' of library '{request.library_name}'. "
+                    "Failed because that library isn't loaded."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+
+            feature = library.get_beta_features().get(request.feature_id)
+            if feature is None:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}' of library '{request.library_name}'. "
+                    "Failed because the library doesn't declare a valid beta feature with that id. "
+                    "Check the beta_features list in its library JSON."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+
+        enabled = is_beta_enabled(feature, self)
+        state = "off"
+        if enabled:
+            state = "on"
+        result_details = f"Beta feature '{request.feature_id}' is {state}."
+        return IsBetaFeatureEnabledResultSuccess(enabled=enabled, result_details=result_details)
 
     def on_handle_get_config_schema_request(self, request: GetConfigSchemaRequest) -> ResultPayload:  # noqa: ARG002
         """Handle request to get the configuration schema with current values and library settings.
