@@ -10,6 +10,8 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+## [0.102.0] - 2026-09-24
+
 ### Added
 
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
@@ -103,4 +105,5 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...HEAD
+[0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0
