@@ -121,7 +121,9 @@ policy:   overwrite, create_dirs: true
 fallback: save_file
 ```
 
-Used when a workflow is saved. The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. Saving a workflow overwrites the existing file rather than versioning it; to produce a numbered sequence of saves instead, see [`create_versioned_workflow`](#create_versioned_workflow) below.
+Used every time a workflow file is written: when you save, and also when the editor creates a workflow file for you — branching a workflow, or making a copy from a template. Those go through this situation too, so pointing `save_workflow` somewhere else moves all of them, not just explicit saves.
+
+The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. Saving a workflow overwrites the existing file rather than versioning it; to produce a numbered sequence of saves instead, see [`create_versioned_workflow`](#create_versioned_workflow) below.
 
 **Example:**
 

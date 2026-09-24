@@ -1,6 +1,7 @@
 """Tests for inline workflow variable substitution in get_parameter_value()."""
 
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,11 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
 from griptape_nodes.exe_types.variable_resolver import _aprocess_variable_cache
 from griptape_nodes.retained_mode.events.base_events import ProgressEvent
+from griptape_nodes.retained_mode.events.connection_events import (
+    IncomingConnection,
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -18,11 +24,11 @@ from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLa
 
 from .mocks import MockNode
 
-# GriptapeNodes is lazy-imported inside _param_has_incoming_connection and
-# _resolve_variables_in_string to break the exe_types <-> retained_mode cycle.
-# Patch it at the source module so the lazy `from ... import GriptapeNodes`
-# picks up the mock at call time.
-_GN_PATCH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes"
+# Node machinery reaches its collaborators through ``self.engine``, and a node built without
+# one falls back to the ambient engine. Patching that fallback is what puts a stand-in engine
+# under a MockNode; it is resolved lazily inside the property, so patching the source module
+# catches it at call time.
+_CURRENT_ENGINE_PATCH = "griptape_nodes.retained_mode.engine.current_engine"
 
 
 def _make_str_param(name: str, default: str = "", modes: set | None = None) -> Parameter:
@@ -51,13 +57,65 @@ def _make_property_output_param(name: str, default: Any) -> Parameter:
     )
 
 
+def _connections_result(connected_params: set[str]) -> ListConnectionsForNodeResultSuccess:
+    """The connections a real ListConnectionsForNodeRequest would report for "mock_node"."""
+    return ListConnectionsForNodeResultSuccess(
+        incoming_connections=[
+            IncomingConnection(
+                source_node_name="upstream",
+                source_parameter_name="out",
+                target_parameter_name=param_name,
+            )
+            for param_name in sorted(connected_params)
+        ],
+        outgoing_connections=[],
+        result_details="ok",
+    )
+
+
+def _engine_mock(
+    variables: dict,
+    connected_params: set[str],
+    captured: list | None = None,
+    *,
+    substitution_enabled: bool = True,
+) -> Any:
+    """A stand-in engine answering everything the substitution path asks of one.
+
+    Every gate is configured here rather than left to MagicMock's defaults, because a
+    MagicMock answers truthily by accident: that is how these tests used to pass while
+    ``_param_has_incoming_connection`` did ``param_name in <MagicMock>``, which is False
+    only because ``MagicMock.__contains__`` defaults to False. Any refactor of a lookup
+    left implicit would flip every assertion for the wrong reason.
+    """
+    engine = MagicMock()
+    engine.handle_request.side_effect = lambda req: (
+        _list_variables_result(variables)
+        if isinstance(req, ListVariablesRequest)
+        else _connections_result(connected_params)
+        if isinstance(req, ListConnectionsForNodeRequest)
+        else MagicMock()
+    )
+    engine.workflow_manager.is_variable_substitution_enabled.return_value = substitution_enabled
+    engine.node_manager.get_node_parent_flow_by_name.return_value = "test_flow"
+    if captured is not None:
+        engine.event_manager.put_event.side_effect = captured.append
+    return engine
+
+
+@contextmanager
+def _patch_engine(engine: Any) -> Iterator[None]:
+    with patch(_CURRENT_ENGINE_PATCH, return_value=engine):
+        yield
+
+
 def _mock_gn(
     variables: dict,
     *,
     connected_params: set[str] | None = None,
     substitution_enabled: bool = True,
 ) -> AbstractContextManager:
-    """Patch GriptapeNodes managers for substitution tests.
+    """Put a stand-in engine under the nodes these tests build.
 
     connected_params: parameter names on "mock_node" that have incoming connections.
     substitution_enabled: value returned by is_variable_substitution_enabled().
@@ -65,19 +123,7 @@ def _mock_gn(
     if connected_params is None:
         connected_params = set()
 
-    mock_gn = MagicMock()
-    mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-    mock_gn.handle_request.side_effect = lambda req: (
-        _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
-    )
-
-    incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
-    mock_connections = MagicMock()
-    mock_connections.incoming_index = incoming_index
-    mock_gn.FlowManager.return_value.get_connections.return_value = mock_connections
-    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = substitution_enabled
-
-    return patch(_GN_PATCH, mock_gn)
+    return _patch_engine(_engine_mock(variables, connected_params, substitution_enabled=substitution_enabled))
 
 
 def _list_variables_result(variables: dict) -> ListVariablesResultSuccess:
@@ -111,24 +157,8 @@ def _payloads_of_type(captured: list, payload_type: type) -> list:
 
 
 def _capturing_gn_mock(captured: list, variables: dict, *, connected_params: set[str] | None = None) -> Any:
-    """A GN patch that captures events and makes every suppression gate explicit.
-
-    Every gate in ``_variable_template_to_preserve`` is configured here rather than
-    left to MagicMock's defaults. Leaving them implicit is how these tests used to
-    pass: ``_param_has_incoming_connection`` did ``param_name in <MagicMock>``, which
-    is False only because ``MagicMock.__contains__`` defaults to False, so any
-    refactor of that lookup would flip every assertion for the wrong reason.
-    """
-    mock_gn = MagicMock()
-    mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-    mock_gn.handle_request.side_effect = lambda req: (
-        _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
-    )
-    incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
-    mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index=incoming_index)
-    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-    mock_gn.EventManager.return_value.put_event.side_effect = captured.append
-    return patch(_GN_PATCH, mock_gn)
+    """Like ``_mock_gn``, and also collects every event the engine is handed."""
+    return _patch_engine(_engine_mock(variables, connected_params or set(), captured))
 
 
 def _run_tracked_set(
@@ -351,13 +381,10 @@ class TestVariableSubstitutionFallbacks:
         node.add_parameter(_make_str_param("text", "{SHOT}"))
         node.parameter_values["text"] = "{SHOT}"
 
-        mock_gn = MagicMock()
-        mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.side_effect = KeyError("mock_node")
-        mock_connections = MagicMock()
-        mock_connections.incoming_index = {}
-        mock_gn.FlowManager.return_value.get_connections.return_value = mock_connections
+        engine = _engine_mock({}, set())
+        engine.node_manager.get_node_parent_flow_by_name.side_effect = KeyError("mock_node")
 
-        with patch(_GN_PATCH, mock_gn), aprocess_scope():
+        with _patch_engine(engine), aprocess_scope():
             value = node.get_parameter_value("text")
 
         assert value == "{SHOT}"

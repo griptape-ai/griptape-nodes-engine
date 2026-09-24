@@ -157,9 +157,21 @@ class TestLocalFileDriverFileURI:
         result = parse_file_uri(uri)
         assert result == "/path/to/file with spaces.txt"
 
-    def test_parse_file_uri_rejects_remote_host(self, driver: LocalFileDriver) -> None:  # noqa: ARG002
-        """Test that file URIs with non-localhost hosts are rejected."""
-        uri = "file://remote-server/path/to/file.txt"
+    def test_parse_file_uri_unc_host_on_windows(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG002
+        """Test that file URIs with non-localhost hosts parse as UNC paths on Windows."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://remote-server.invalid/path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "//remote-server.invalid/path/to/file.txt"
+
+    def test_parse_file_uri_rejects_unc_host_off_windows(
+        self,
+        driver: LocalFileDriver,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POSIX has no UNC concept, so a non-localhost host is rejected rather than resolved."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        uri = "file://remote-server.invalid/path/to/file.txt"
         result = parse_file_uri(uri)
         assert result is None
 
@@ -195,7 +207,7 @@ class TestLocalFileDriverFileURI:
 
         The driver accepts all locations; invalid URIs fail at read time, not can_handle.
         """
-        uri = "file://remote-server/path/to/file.txt"
+        uri = "file://remote-server.invalid/path/to/file.txt"
         assert driver.can_handle(uri) is True
 
     @pytest.mark.asyncio
@@ -229,12 +241,28 @@ class TestLocalFileDriverFileURI:
         assert "File not found" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_read_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test reading file with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    async def test_read_unc_file_uri_not_found(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reading a UNC file:// URI for a non-existent share raises FileNotFoundError on Windows.
+
+        ``.invalid`` is an RFC 6761-guaranteed unresolvable TLD, so this never depends on the
+        test runner's real DNS/WINS setup for the "not found" outcome to hold.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_read_unc_file_uri_invalid_off_windows(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Off Windows, a UNC file:// URI is rejected at parse time, not silently resolved."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
 
         with pytest.raises(ValueError, match="Invalid file:// URI"):
-            await driver.read(invalid_uri, timeout=10.0)
+            await driver.read(unc_uri, timeout=10.0)
 
     @pytest.mark.asyncio
     async def test_exists_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
@@ -250,10 +278,71 @@ class TestLocalFileDriverFileURI:
         assert await driver.exists(file_uri) is False
 
     @pytest.mark.asyncio
-    async def test_exists_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test exists with invalid file:// URI returns False."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
-        assert await driver.exists(invalid_uri) is False
+    async def test_exists_unc_file_uri_not_found(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test exists with a UNC file:// URI for a non-existent share returns False."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+        assert await driver.exists(unc_uri) is False
+
+    @pytest.mark.asyncio
+    async def test_exists_unc_file_uri_off_windows_returns_false(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exists() swallows the ValueError from a rejected UNC URI, same as any invalid location."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+        assert await driver.exists(unc_uri) is False
+
+    @pytest.mark.asyncio
+    async def test_read_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Normalize a real Windows SMB failure (e.g. WinError 53) into FileNotFoundError.
+
+        Such a failure surfaces from resolve() as a raw OSError rather than our own
+        FileNotFoundError. Mac/Linux never raise this for a UNC-shaped path (there's no SMB
+        layer to fail), so this mocks the failure directly to prove read() normalizes it,
+        rather than relying on a real unreachable host.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_exists_returns_false_for_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exists() must return False, not raise, when the host resolution itself fails."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        assert await driver.exists(unc_uri) is False
+
+    def test_get_size_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same normalization as read(), for the synchronous get_size() path."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
 
     def test_get_size_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
         """Test get_size with file:// URI."""
@@ -270,12 +359,13 @@ class TestLocalFileDriverFileURI:
             driver.get_size(file_uri)
         assert "File not found" in str(exc_info.value)
 
-    def test_get_size_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test get_size with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    def test_get_size_unc_file_uri_not_found(self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test get_size with a UNC file:// URI for a non-existent share raises FileNotFoundError."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
 
-        with pytest.raises(ValueError, match="Invalid file:// URI"):
-            driver.get_size(invalid_uri)
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
 
 
 class TestLocalFileDriverRelativePaths:
@@ -334,16 +424,15 @@ class TestLocalFileDriverRelativePaths:
 
     @pytest.fixture
     def mock_config_manager_accessor(self, mock_config_manager: Mock) -> Iterator[Mock]:
-        """Patch the facade accessor the driver uses to reach the ConfigManager.
+        """Patch the engine lookup the driver uses to reach the ConfigManager.
 
-        Patched by dotted string rather than an imported `GriptapeNodes` reference: the
-        driver (src/griptape_nodes/files/drivers/local_file_driver.py) still calls the
-        facade's `ConfigManager()` classmethod, and `patch()` handles saving and restoring
-        the classmethod descriptor correctly on teardown.
+        The tests assert on this mock to pin WHETHER the driver consulted the workspace at
+        all, which is the difference between anchoring a bare relative path and trusting the
+        process's cwd.
         """
         with patch(
-            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.local_file_driver.current_engine",
+            return_value=Mock(config_manager=mock_config_manager),
         ) as accessor:
             yield accessor
 
