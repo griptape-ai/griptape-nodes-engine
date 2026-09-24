@@ -16,9 +16,12 @@ the engine's request API from working without edits. Migration steps live in
   into a separate `.venv-exec` and load only in the library's own process, where its nodes run, so
   libraries with clashing heavy pins can be installed side by side.
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
-- Sliders take `soft_limits=True`, which lets users type a value past the slider's range.
+- The `Slider` trait, and `ParameterInt` and `ParameterFloat` with `slider=True`, take
+  `soft_limits=True`. The slider then spans its range, but a value typed outside it is accepted
+  instead of rejected, matching soft limits in Nuke, Maya, and Houdini.
   [#5269](https://github.com/griptape-ai/griptape-nodes-engine/issues/5269)
-- Custom traits can save changes made at runtime. See
+- Custom traits can keep settings a node changes at runtime, such as a narrowed range, when the
+  workflow is saved and reopened, by implementing `to_state()` and `apply_state()`. See
   [MIGRATION.md](MIGRATION.md#traits-can-save-runtime-state).
 
 ### Changed
@@ -27,11 +30,15 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
-- The error for an out-of-range slider value names the parameter and the allowed range.
+- Setting a value outside a `Slider` range now fails with an error naming the parameter, the value,
+  and the allowed range, instead of "Value out of range".
+  [#5269](https://github.com/griptape-ai/griptape-nodes-engine/issues/5269)
 
 ### Removed
 
-- `TraitRegistry` and `Trait.get_trait_keys()`, which nothing used.
+- `TraitRegistry` and `Trait.get_trait_keys()` are removed, with no replacement, since nothing read
+  them. Custom traits no longer need to implement `get_trait_keys()`, and existing implementations
+  can be deleted.
 
 ### Fixed
 
@@ -54,10 +61,14 @@ the engine's request API from working without edits. Migration steps live in
 - `RunWorkflowWithCurrentStateRequest` fails when a workflow is already open, instead of attaching
   the target as a hidden flow that was saved and run along with the open workflow.
   [#5526](https://github.com/griptape-ai/griptape-nodes-engine/issues/5526)
-- Slider ranges, dropdown choices, and button links a node changes now stay changed after
-  reopening the workflow. Before, the editor showed them but the node ignored them.
+- A slider range, dropdown choices, or button link that a node changes at runtime now survives
+  saving and reopening the workflow. Before, the reopened workflow showed the saved settings but the
+  node did not act on them, so a narrowed slider still accepted values outside its range.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
-- Setting a trait's `ui_options` key, such as `slider`, now updates the trait, so the node checks
-  values against what the editor shows. Custom traits opt in with `state_from_ui_options()`.
+- Setting a `ui_options` key that a trait owns, such as `slider` or `simple_dropdown`, from node
+  code or the editor now updates the trait, so the node checks values against the range or choices
+  the editor shows. Custom traits that do not implement `state_from_ui_options()` ignore these
+  writes and log a warning.
+  [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
