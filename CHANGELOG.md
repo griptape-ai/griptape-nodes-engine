@@ -20,13 +20,22 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
-- **Breaking:** `ControlFlowResolvedEvent` names the type of each value in `parameter_output_values`
-  when JSON has no such type, so a tuple arrives as `{"$type": "builtins:tuple", "$value": [1, 2]}`
-  instead of a list. A value with no plain-data form arrives as `null` instead of as its text, and
-  the event no longer has `unique_parameter_uuid_to_values`.
+- **Breaking:** `ControlFlowResolvedEvent` and `SerializeFlowToCommandsResultSuccess` name the type
+  of each parameter value they carry when JSON has no such type, so a tuple arrives as
+  `{"$type": "builtins:tuple", "$value": [1, 2]}` instead of a list. In `ControlFlowResolvedEvent`, a
+  value with no plain-data form arrives as `null` instead of as its text, and the event no longer
+  has `unique_parameter_uuid_to_values`.
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
+- Saved workflow files store parameter values as readable data instead of pickle, and saving an
+  unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
+  by earlier versions still open. A workflow saved by this version does not open in earlier ones.
+  [#5441](https://github.com/griptape-ai/griptape-nodes-engine/issues/5441)
+- A parameter value with no plain-data form is no longer written to saved workflow files, so its
+  node runs again when the workflow reopens. See
+  [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
+  that are saved, and how to make a class savable.
 - A node in a library running in its own process fails with an error naming the parameter when an
   input or output has no plain-data form, instead of receiving or sending it as text. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
@@ -39,6 +48,8 @@ the engine's request API from working without edits. Migration steps live in
   `PublishWorkflowRequest`, and the workflow executors, and the `--pickle-control-flow-result` CLI
   flag, have no effect. Flow results always travel as plain data. They will be removed in a later
   release.
+- `use_pickling` on `SerializeNodeToCommandsRequest` has no effect. Parameter values are always
+  stored as plain data. It will be removed in a later release.
 
 ### Removed
 
