@@ -68,3 +68,13 @@ jobs:
         uses: ./.github/actions/init-environment
       - name: Run linter
         run: make check/spell
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      # Standard library only, so it skips installing the project.
+      - name: Check changelog
+        run: uv run --no-project scripts/changelog.py check
