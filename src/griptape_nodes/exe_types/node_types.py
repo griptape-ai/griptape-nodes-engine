@@ -1373,7 +1373,37 @@ class BaseNode(ABC):
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:
-        """Runs before this node is run."""
+        """Runs on the ORCHESTRATOR, immediately before this node is dispatched.
+
+        Structural checks only: what a parameter declares, whether a value is present, what the graph
+        looks like. This process may be nothing like the one that runs the node -- a library whose nodes
+        execute in a worker is installed here with its edit-time dependencies only, and a value produced
+        by a worker is held there and cannot be read from here.
+
+        For anything that needs the real thing -- a loaded model, a tensor an upstream node produced --
+        use `validate_in_execution_environment`, which runs where the node runs.
+        """
+        return None
+
+    def validate_in_execution_environment(self) -> list[Exception] | None:
+        """Runs in the process that executes this node, immediately before `aprocess()`.
+
+        The counterpart to `validate_before_node_run`: same purpose, different place. Here the node's
+        execution dependencies are importable and its input values are the objects themselves, so this
+        is where a check that needs a built model or a real tensor belongs.
+
+        Called on both paths, so a library behaves the same whether or not its nodes run in a worker.
+        Returning exceptions fails the node without running it, and the orchestrator reports that as a
+        validation failure rather than as a crash.
+
+        Inspection only: read a tensor's shape, confirm a model is already loaded. Building the thing
+        being checked is what this hook exists to stop. It runs synchronously on the executing process's
+        event loop, so a slow check on a worker leaves the orchestrator's heartbeat challenges
+        unanswered and the worker is evicted mid-run.
+
+        Not a substitute for the other two hooks. This one cannot run before the flow starts, and it
+        sees a transient node with no connections, so a question about the graph has no answer here.
+        """
         return None
 
     def can_queue_for_execution(self) -> bool:

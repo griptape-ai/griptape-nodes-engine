@@ -21,6 +21,10 @@ the engine's request API from working without edits. Migration steps live in
   place that the consuming node's read resolves. See
   [MIGRATION.md](MIGRATION.md#serializablefalse-outputs-are-held-in-their-own-process-across-a-worker-boundary).
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
+- Nodes can implement `validate_in_execution_environment()` to run a check where the node itself runs,
+  which for a library isolated in its own process is where its heavy packages are importable and its
+  inputs are the real objects. A node that fails the check reports why in
+  `ExecuteNodeResultFailure.validation_exceptions` instead of crashing partway through.
 - You can try new features early by turning them on from the **Beta Features** page in the
   editor's settings, and turn them off again at any time. Node libraries can offer beta features
   of their own. See
