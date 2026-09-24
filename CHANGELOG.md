@@ -27,8 +27,6 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
-- Setting a trait's `ui_options` key, such as `slider`, now updates the trait. Custom traits opt in
-  with `state_from_ui_options()`.
 - The error for an out-of-range slider value names the parameter and the allowed range.
 
 ### Removed
@@ -59,5 +57,7 @@ the engine's request API from working without edits. Migration steps live in
 - Slider ranges, dropdown choices, and button links a node changes now stay changed after
   reopening the workflow. Before, the editor showed them but the node ignored them.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
+- Setting a trait's `ui_options` key, such as `slider`, now updates the trait, so the node checks
+  values against what the editor shows. Custom traits opt in with `state_from_ui_options()`.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
