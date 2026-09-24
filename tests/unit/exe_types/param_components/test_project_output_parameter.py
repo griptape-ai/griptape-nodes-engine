@@ -13,7 +13,8 @@ from griptape_nodes.retained_mode.events import connection_events
 @runtime_checkable
 class _TestProvider(Protocol):
     @property
-    def test_destination(self) -> object | None: ...
+    def test_destination(self) -> object | None:
+        """Stand-in destination the lookup under test reads from a provider node."""
 
 
 class _ProviderNode:

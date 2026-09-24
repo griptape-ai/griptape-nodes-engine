@@ -396,4 +396,5 @@ class FileSequenceDestinationProvider(typing.Protocol):
     """Protocol for nodes that provide a FileSequenceDestination without serializing it over the wire."""
 
     @property
-    def file_sequence_destination(self) -> FileSequenceDestination | None: ...
+    def file_sequence_destination(self) -> FileSequenceDestination | None:
+        """The destination downstream nodes should write to, or None if the node has not configured one."""

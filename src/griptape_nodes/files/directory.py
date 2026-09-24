@@ -278,4 +278,5 @@ class DirectoryDestinationProvider(typing.Protocol):
     """Protocol for nodes that provide a DirectoryDestination without serializing it over the wire."""
 
     @property
-    def directory_destination(self) -> DirectoryDestination | None: ...
+    def directory_destination(self) -> DirectoryDestination | None:
+        """The destination downstream nodes should create, or None if the node has not configured one."""
