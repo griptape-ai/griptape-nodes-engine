@@ -110,7 +110,7 @@ class TestLogDirectory:
 
         # Pointed inside `tmp_path` so the fallback's own log file is cleaned up with it.
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-        monkeypatch.setattr(log_capture, "xdg_data_home", no_home)
+        monkeypatch.setattr(log_capture, "xdg_state_home", no_home)
 
         manager = ConfigManager()
 

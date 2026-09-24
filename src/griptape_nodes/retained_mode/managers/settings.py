@@ -432,7 +432,7 @@ class LoggingSettings(BaseModel):
     log_directory: str = Field(
         category=LOGGING,
         default="",
-        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means `<XDG_DATA_HOME>/griptape_nodes/logs`.",
+        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means `<XDG_STATE_HOME>/griptape_nodes/logs`.",
     )
     log_retention_days: int = Field(
         category=LOGGING,

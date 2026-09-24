@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
-from xdg_base_dirs import xdg_data_home
+from xdg_base_dirs import xdg_state_home
 
 from griptape_nodes.common import log_capture
 from griptape_nodes.common.log_capture import (
@@ -239,7 +239,7 @@ class TestDefaultLogDirectory:
 
     @staticmethod
     def _no_home() -> Path:
-        """Stand in for ``xdg_data_home`` on a machine with no home directory to find."""
+        """Stand in for ``xdg_state_home`` on a machine with no home directory to find."""
         msg = "Could not determine home directory."
         raise RuntimeError(msg)
 
@@ -252,7 +252,7 @@ class TestDefaultLogDirectory:
         the standard library raises rather than returning a guess -- which came out of
         `ConfigManager.__init__` and stopped the engine starting.
         """
-        monkeypatch.setattr(log_capture, "xdg_data_home", self._no_home)
+        monkeypatch.setattr(log_capture, "xdg_state_home", self._no_home)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             directory = default_log_directory()
@@ -265,7 +265,7 @@ class TestDefaultLogDirectory:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A configured absolute path needs no home directory, and is used unchanged."""
-        monkeypatch.setattr(log_capture, "xdg_data_home", self._no_home)
+        monkeypatch.setattr(log_capture, "xdg_state_home", self._no_home)
 
         assert resolve_log_directory(str(tmp_path)) == tmp_path
 
@@ -340,7 +340,7 @@ class TestSuiteIsolation:
         only for the moment a test runs: the per-test fixture patches the same seam, so
         passing here does not prove the session-wide patch that covers collection is on.
         """
-        assert xdg_data_home() not in default_log_directory().parents
+        assert xdg_state_home() not in default_log_directory().parents
 
 
 @pytest.mark.usefixtures("isolated_capture")

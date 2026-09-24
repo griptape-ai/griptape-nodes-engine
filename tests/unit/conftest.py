@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from xdg_base_dirs import xdg_data_home
+from xdg_base_dirs import xdg_state_home
 
 from griptape_nodes.common import log_capture
 from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
@@ -16,24 +16,24 @@ from griptape_nodes.retained_mode.managers import settings as settings_module
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
-# level, so merely collecting them wrote to the real XDG data directory and pruned it.
+# level, so merely collecting them wrote to the real XDG state directory and pruned it.
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
-_session_log_home_patch = patch.object(log_capture, "xdg_data_home", lambda: Path(_session_log_home.name))
+_session_log_home_patch = patch.object(log_capture, "xdg_state_home", lambda: Path(_session_log_home.name))
 
 
 def _real_log_directory() -> Path | None:
     """The developer's real engine log directory, or None on a machine that has no home.
 
-    Deliberately the real one, computed from the unpatched ``xdg_data_home``, so the guard
+    Deliberately the real one, computed from the unpatched ``xdg_state_home``, so the guard
     below can check the suite against it. Read, never written.
 
-    Worked out on demand rather than at import time because ``xdg_data_home`` raises when
+    Worked out on demand rather than at import time because ``xdg_state_home`` raises when
     there is no home directory to find -- a Windows service account has none -- and at
     import that failure takes down collection of every test in the suite rather than
     skipping the one guard that needs it.
     """
     try:
-        return xdg_data_home() / "griptape_nodes" / "logs"
+        return xdg_state_home() / "griptape_nodes" / "logs"
     except RuntimeError:
         return None
 
@@ -123,14 +123,14 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
     ``log_retention_days``. Per test, so one test's log files are never what another test
     finds; ``pytest_configure`` above is what keeps the real directory out of reach.
 
-    ``xdg_data_home`` is the seam rather than ``default_log_directory``, because tests
+    ``xdg_state_home`` is the seam rather than ``default_log_directory``, because tests
     import that function directly and would otherwise compare a temporary directory
     against the real one.
     """
     with tempfile.TemporaryDirectory() as temp_dir:
-        data_home = Path(temp_dir)
-        with patch.object(log_capture, "xdg_data_home", lambda: data_home):
-            yield data_home / "griptape_nodes" / "logs"
+        state_home = Path(temp_dir)
+        with patch.object(log_capture, "xdg_state_home", lambda: state_home):
+            yield state_home / "griptape_nodes" / "logs"
 
             # Detach the sinks while the directory still exists: they live on the process-global
             # logger, so one left behind holds an open file in a directory about to be deleted.
