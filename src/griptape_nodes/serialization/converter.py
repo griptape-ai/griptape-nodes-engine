@@ -16,6 +16,7 @@ from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.serialization.values import Value, decode_value, encode_value
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ converter = make_converter()
 
 
 # --- Unstructure hooks (serialization) ---
+
+# Fields annotated `Value` carry any parameter value, as tagged plain data.
+converter.register_unstructure_hook(Value, encode_value)
 
 # SerializableMixin subclasses (BaseArtifact, BaseTool, Structure, etc.)
 converter.register_unstructure_hook_func(
@@ -85,6 +89,8 @@ converter.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
 
 
 # --- Structure hooks (deserialization) ---
+
+converter.register_structure_hook(Value, lambda data, _: decode_value(data))
 
 converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
 

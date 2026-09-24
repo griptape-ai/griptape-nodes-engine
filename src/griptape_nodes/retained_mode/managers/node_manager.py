@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
