@@ -106,10 +106,9 @@ class HealthCheckContext:
     """
 
     report: DiagnosticsReport
-    # Kept out of the generated `repr`, which is the one way this value can be recorded
-    # after all: a `logger.debug("...%s", context)`, an exception message interpolating the
-    # context, or a pytest assertion dump would put the live key in the process log -- where
-    # the session buffer captures it and the next bundle collects it.
+    # `repr=False` because the generated repr is the one way this value reaches a log: a
+    # `logger.debug("...%s", context)` would put the live key in the session buffer, which the
+    # next bundle then collects.
     cloud_api_key: str | None = field(default=None, repr=False)
 
 
@@ -220,11 +219,8 @@ class LibraryCheck(HealthCheck):
     name: ClassVar[str] = "Libraries"
 
     _BROKEN_FITNESS = frozenset({"UNUSABLE", "MISSING"})
-    # The only fitness that means "loaded cleanly". Stated as what passes rather than as
-    # what fails, so anything else -- `NOT_EVALUATED`, or a value a newer engine added
-    # that this reader has never heard of -- is reported instead of falling through to an
-    # all-clear. A library whose state cannot be interpreted is exactly the one the report
-    # is being collected about.
+    # Stated as what passes, so a fitness this reader has never heard of is reported rather
+    # than falling through to an all-clear.
     _HEALTHY_FITNESS = frozenset({"GOOD"})
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
@@ -238,9 +234,8 @@ class LibraryCheck(HealthCheck):
                 remedy="Run 'gtn libraries sync' to install the default libraries.",
             )
 
-        # Only the ones the engine was asked to load. A disabled library is never evaluated,
-        # so its fitness is whatever it was left at -- reported as a library that did not
-        # load cleanly, it sends someone to fix a library they turned off on purpose.
+        # A disabled library is never evaluated, so its fitness is whatever it was left at --
+        # reporting that sends someone to fix a library they turned off on purpose.
         libraries = [library for library in registered if library.enabled]
 
         if not libraries:
@@ -452,9 +447,8 @@ class SecretsCheck(HealthCheck):
     _MAX_NAMES_LISTED = 5
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
-        # Only the declared ones are this check's business. The report also lists every key
-        # it found in the environment and the `.env` files, and counting those made the
-        # all-clear claim to have checked keys nothing is expecting.
+        # Only the declared ones: the report also lists every key found in the environment, and
+        # counting those had the all-clear claim to have checked keys nothing expects.
         expected = [secret for secret in context.report.secrets if secret.declared_in_config]
         missing = [secret.name for secret in expected if not secret.is_set]
 
