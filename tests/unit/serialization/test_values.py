@@ -156,6 +156,20 @@ class TestBuiltinContainers:
         assert _round_trip(value) == value
         assert type(_round_trip(value)[0]) is tuple
 
+    def test_dict_holding_a_type_key_is_wrapped_not_split_into_pairs(self) -> None:
+        value = {TYPE_KEY: "not a tag", "n": (1,)}
+
+        assert encode_value(value) == {
+            TYPE_KEY: "builtins:dict",
+            VALUE_KEY: {TYPE_KEY: "not a tag", "n": {TYPE_KEY: "builtins:tuple", VALUE_KEY: [1]}},
+        }
+
+    def test_encoded_values_held_as_data_come_back_still_encoded(self) -> None:
+        encoded = encode_value([(1, "b"), ImageUrlArtifact("https://example.com/a.png")])
+
+        assert _round_trip(encoded) == encoded
+        assert _round_trip(encode_value(encoded)) == encode_value(encoded)
+
 
 class TestAdapters:
     @pytest.mark.parametrize(

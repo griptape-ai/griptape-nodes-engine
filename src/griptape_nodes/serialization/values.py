@@ -166,10 +166,15 @@ def _encode_as_base_type(value: Any, cls: type, active: set[int]) -> JsonValue:
 
 
 def _encode_dict(value: dict, active: set[int]) -> JsonValue:
-    if all(isinstance(key, str) for key in value) and TYPE_KEY not in value:
-        return {key: _encode(item, active) for key, item in value.items()}
-    # Pairs keep non-text keys, and keep a text "$type" key from reading as a tag.
-    return _tagged(dict, [[_encode(key, active), _encode(item, active)] for key, item in value.items()])
+    if not all(isinstance(key, str) for key in value):
+        # Pairs keep keys that are not text.
+        return _tagged(dict, [[_encode(key, active), _encode(item, active)] for key, item in value.items()])
+    encoded = {key: _encode(item, active) for key, item in value.items()}
+    if TYPE_KEY not in value:
+        return encoded
+    # Wrapped, so a text "$type" key does not read as a tag. Encoded values held as data, such
+    # as a saved workflow's value pool, stay readable this way.
+    return _tagged(dict, encoded)
 
 
 def _adapter_state(adapter: ValueAdapter, value: Any) -> Any:
@@ -206,10 +211,13 @@ def _decode_tagged(data: dict[str, Any]) -> Any:
     except TypeNameError as error:
         # Expected wherever a library's classes live in another process, so no warning.
         return UndecodedValue(data, str(error))
-    if VALUE_KEY in data:
-        state = decode_value(data[VALUE_KEY])
-    else:
+    if VALUE_KEY not in data:
         state = decode_value({key: item for key, item in data.items() if key != TYPE_KEY})
+    elif cls is dict and isinstance(data[VALUE_KEY], dict):
+        # A wrapped dict: its own "$type" key is data, not a tag.
+        state = {key: decode_value(item) for key, item in data[VALUE_KEY].items()}
+    else:
+        state = decode_value(data[VALUE_KEY])
     builtin_decoder = _BUILTIN_DECODERS.get(cls)
     if builtin_decoder is not None:
         return _decode_builtin(builtin_decoder, data, state)
@@ -244,8 +252,10 @@ def _decode_bytearray(state: str) -> bytearray:
     return bytearray(_decode_bytes(state))
 
 
-def _decode_dict(pairs: list[list[Any]]) -> dict:
-    return {key: item for key, item in pairs}  # noqa: C416 pairs arrive as two-item lists, not tuples
+def _decode_dict(state: dict | list[list[Any]]) -> dict:
+    if isinstance(state, dict):
+        return state
+    return {key: item for key, item in state}  # noqa: C416 pairs arrive as two-item lists, not tuples
 
 
 def _adapter_for(cls: type) -> ValueAdapter | None:
