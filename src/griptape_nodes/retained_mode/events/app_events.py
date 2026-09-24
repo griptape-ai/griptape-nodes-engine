@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import Value
 
 
 class InitializationPhase(StrEnum):
@@ -219,7 +220,7 @@ class WorkerParameterSchema:
     type: str
     input_types: list[str]
     output_type: str
-    default_value: Any
+    default_value: Value
     tooltip: Any
     tooltip_as_input: Any
     tooltip_as_property: Any

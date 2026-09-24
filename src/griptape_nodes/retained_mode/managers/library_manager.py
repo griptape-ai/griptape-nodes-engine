@@ -267,6 +267,7 @@ from griptape_nodes.serialization.type_names import (
     is_dynamic_module_name,
     register_stable_module_name,
 )
+from griptape_nodes.serialization.values import ValueEncodeError, encode_value
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
@@ -5712,7 +5713,7 @@ class LibraryManager(EngineScoped):
                         type=param._type or "",
                         input_types=list(param._input_types or []),
                         output_type=param._output_type or "",
-                        default_value=self._try_json_serialize(param.default_value),
+                        default_value=self._encodable_or_none(param.default_value),
                         tooltip=param.tooltip,
                         tooltip_as_input=param.tooltip_as_input,
                         tooltip_as_property=param.tooltip_as_property,
@@ -5741,6 +5742,15 @@ class LibraryManager(EngineScoped):
             return None
         else:
             return value
+
+    @staticmethod
+    def _encodable_or_none(value: Any) -> Any:
+        """Return value if it has a plain-data form, otherwise None."""
+        try:
+            encode_value(value)
+        except ValueEncodeError:
+            return None
+        return value
 
     async def _attempt_generate_sandbox_library_from_schema(  # noqa: C901
         self,

@@ -19,7 +19,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
-from griptape_nodes.serialization.converter import safe_unstructure
+from griptape_nodes.serialization.values import encode_for_display
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -151,10 +151,7 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
             omitted.append(param.name)
             continue
 
-        try:
-            values[param.name] = safe_unstructure(value)
-        except Exception as e:
-            logger.warning("Failed to serialize parameter '%s' on node '%s': %s", param.name, node_name, e)
+        values[param.name] = encode_for_display(value)
 
     return _ParameterCollection(values=values, omitted=omitted)
 

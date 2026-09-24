@@ -5,7 +5,6 @@ import copy
 import logging
 import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
@@ -241,7 +240,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
-from griptape_nodes.serialization.converter import converter, safe_unstructure
+from griptape_nodes.serialization.converter import converter
 from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
@@ -2376,27 +2375,8 @@ class NodeManager(EngineScoped):
                 # Otherwise grab the set value or default value
                 value = node._get_raw_parameter_value(parameter.name)
             if value is not None:
-                element_id = parameter.element_id
-                # Check if the value is in builtins. If it isn't we need to handle it specially.
-                if value.__class__.__module__ != "builtins":
-                    # Enums (including StrEnum/IntEnum) are not builtins but serialize to
-                    # their underlying value. Without this, the __dict__ fallback below
-                    # would send the raw enum internals (e.g. {"_value_": ..., "_name_": ...})
-                    # to the GUI, which renders them as an object instead of the value.
-                    if isinstance(value, Enum):
-                        param_to_value[element_id] = value.value
-                        continue
-                    # Check if it has a to_dict method. Use that, if it's been implemented.
-                    if hasattr(value, "to_dict"):
-                        # If the object has a __dict__, use that
-                        param_to_value[element_id] = value.to_dict()
-                        continue
-                    # Otherwise use __dict__.
-                    if hasattr(value, "__dict__"):
-                        param_to_value[element_id] = value.__dict__
-                        continue
-                # Otherwise, just set it here. It'll be handled in .json() when we send it over.
-                param_to_value[element_id] = value
+                # Encoded where the result is sent; see ElementDocument.
+                param_to_value[parameter.element_id] = value
 
     def modify_alterable_fields(self, request: AlterParameterDetailsRequest, parameter: BaseNodeElement) -> None:
         if isinstance(parameter, Parameter):
@@ -2687,7 +2667,7 @@ class NodeManager(EngineScoped):
             input_types=parameter.input_types,
             type=parameter.type,
             output_type=parameter.output_type,
-            value=safe_unstructure(data_value),
+            value=data_value,
             result_details=details,
         )
         return result
