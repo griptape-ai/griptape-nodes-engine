@@ -555,9 +555,9 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
 
     Args:
         validation_exceptions: Set when the node refused to run, rather than failing while running --
-            `validate_in_execution_environment` returned these. A caller can tell the two apart without
-            reading the message, because they mean different things to whoever is looking: nothing ran,
-            versus something ran and broke.
+            `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
+            without reading the message, because they mean different things to whoever is looking:
+            nothing ran, versus something ran and broke.
     """
 
     validation_exceptions: list[Exception] | None = None

@@ -1,11 +1,8 @@
 """A node validates in the process that runs it, not only in the one that dispatches it.
 
-`validate_before_node_run` runs on the orchestrator. That was the same process as the one executing the
-node until libraries began running in workers, and the hook's contract never said which process it was.
-A library whose nodes execute in a worker is installed on the orchestrator with its edit-time
-dependencies only, and a value a worker produced is held there -- so validation that reaches for a
-loaded model or an upstream tensor cannot run on the orchestrator at all. One diffusers library built a
-multi-gigabyte pipeline there to check latent dimensions, twice per run.
+`validate_before_node_run` runs on the orchestrator, which carries a library's edit-time dependencies
+only, and a value a worker produced stays in that worker -- so validation reaching for a loaded model or
+an upstream tensor cannot run there at all.
 
 `validate_in_execution_environment` is the counterpart that runs where `aprocess` runs, on both the
 worker and in-process paths, so a library behaves the same either way.
@@ -18,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
@@ -66,6 +64,19 @@ class TestTheHookGatesExecution:
         assert isinstance(result, ExecuteNodeResultFailure)
         assert result.validation_exceptions == [reason]
         assert "source_shape" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_check_that_raises_is_still_a_refusal(self) -> None:
+        """An ImportError out of the check is the likeliest outcome, not an engine bug to re-raise."""
+        reason = ImportError("No module named 'torch'")
+        node = _node()
+        node.validate_in_execution_environment = MagicMock(side_effect=reason)
+
+        result = await _manager()._hydrate_and_run_node(node, _request())
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert result.validation_exceptions == [reason]
+        node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_node_with_nothing_to_say_runs(self) -> None:
@@ -139,3 +150,13 @@ class TestTheFailureReadsAsARefusal:
 
         assert "execution failed" in message
         assert "failed validation" not in message
+
+
+class TestTheHookIsOptIn:
+    def test_a_node_that_does_not_implement_it_says_nothing(self) -> None:
+        """Every existing library inherits the default, so it has to read as "no objection"."""
+
+        class _Probe(BaseNode):
+            pass
+
+        assert _Probe(name="Probe").validate_in_execution_environment() is None

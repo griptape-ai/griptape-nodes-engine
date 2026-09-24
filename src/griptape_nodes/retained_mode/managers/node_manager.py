@@ -3670,7 +3670,13 @@ class NodeManager(EngineScoped):
 
             # After hydration and after cached inputs have become objects again, so a check here reads
             # what `aprocess` will read. Before `aprocess`, so a node that cannot run does not half-run.
-            validation_exceptions = node.validate_in_execution_environment()
+            try:
+                validation_exceptions = node.validate_in_execution_environment()
+            except Exception as e:
+                # The check is a library's own code, and it runs where the execution dependencies are, so
+                # an ImportError out of it says the same thing as a returned exception: this node cannot
+                # run here. Letting it escape would report a node that declined as an engine crash.
+                validation_exceptions = [e]
             if validation_exceptions:
                 return ExecuteNodeResultFailure(
                     result_details=(
