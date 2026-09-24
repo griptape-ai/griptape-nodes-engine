@@ -23,9 +23,23 @@ class Slider(Trait):
         self.max = max_val
         self.soft_limits = soft_limits
 
+    def to_state(self) -> dict[str, Any]:
+        return {"min_val": self.min, "max_val": self.max, "soft_limits": self.soft_limits}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "min_val" in state:
+            self.min = state["min_val"]
+        if "max_val" in state:
+            self.max = state["max_val"]
+        if "soft_limits" in state:
+            self.soft_limits = state["soft_limits"]
+
     @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["slider"]
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        slider = ui_options.get("slider")
+        if not isinstance(slider, dict):
+            return {}
+        return {key: slider[key] for key in ("min_val", "max_val", "soft_limits") if key in slider}
 
     def ui_options_for_trait(self) -> dict:
         slider_options: dict[str, Any] = {"min_val": self.min, "max_val": self.max}

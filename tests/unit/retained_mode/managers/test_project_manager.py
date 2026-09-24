@@ -10125,6 +10125,8 @@ class TestSnapshotLibraryConfig:
         mock_config_manager = Mock()
         mock_config_manager.get_config_value.side_effect = lambda key, default=None: values.get(key, default)
         mock_config_manager.workspace_path = Path(workspace_path)
+        # A bare Mock repr embeds id(), which GC can reuse across managers.
+        mock_config_manager.resolved_libraries_root.return_value = Path(workspace_path) / "libraries"
         return ProjectManager(Mock(), mock_config_manager, Mock())
 
     def test_identical_config_snapshots_are_equal(self) -> None:

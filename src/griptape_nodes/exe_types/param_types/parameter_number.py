@@ -415,11 +415,11 @@ class ParameterNumber(Parameter):
             # Type narrowing: assign to variables after None check so type checker understands
             min_val_float: float = min_val  # type: ignore[assignment]
             max_val_float: float = max_val  # type: ignore[assignment]
+            # Read off the slider being replaced: a load restores the flag onto the trait, not _soft_limits.
+            soft_limits = self.soft_limits
             # Python will naturally coerce int to float if needed (no precision loss for reasonable values)
             self._remove_constraint_traits()
-            self.add_trait(
-                Slider(min_val=min_val_float, max_val=max_val_float, soft_limits=getattr(self, "_soft_limits", False))
-            )
+            self.add_trait(Slider(min_val=min_val_float, max_val=max_val_float, soft_limits=soft_limits))
         elif self.validate_min_max:
             # Checked above: both min_val and max_val are available when validate_min_max is enabled.
             # Type narrowing: assign to variables after None check so type checker understands

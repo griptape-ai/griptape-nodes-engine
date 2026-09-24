@@ -22,6 +22,35 @@ A list or dictionary parameter is unaffected: declaring `serializable=False` on 
 saved workflows. It adds no holding, because a container builds its value from its children. Put the value
 on an ordinary parameter marked `serializable=False` if you want it cached.
 
+## Traits can save runtime state
+
+A trait keeps its existing constructor. To persist runtime changes, implement `to_state()` and
+`apply_state()`:
+
+```python
+class Threshold(Trait):
+    def __init__(self, level: int = 5) -> None:
+        super().__init__()
+        self.level = level
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    def apply_state(self, state: dict[str, int]) -> None:
+        if "level" in state:
+            self.level = state["level"]
+```
+
+The default methods save nothing, so existing traits remain compatible. State must contain plain
+JSON-compatible values. The engine applies it to the trait the node already built, preserving
+callbacks and other constructor wiring. For a parameter the node declares, only keys that differ
+from what the node builds are saved, so changing a constructor default still reaches existing
+workflows.
+
+When the node does not build a saved trait, the engine builds it with `from_state()`, which passes
+the state to the constructor. Override it when `to_state()` keys are not constructor arguments.
+The state can hold only some keys, so fall back to defaults for missing ones.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
