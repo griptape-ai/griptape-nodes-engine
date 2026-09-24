@@ -14,16 +14,18 @@ description of what it changes and where, and a toggle to turn it on or
 off. Your choice is saved with the rest of your settings, so it stays
 the same the next time you open the editor.
 
-Features are grouped by where they live:
+Features are grouped by where they come from:
 
 - **Editor** features change how the editor looks or behaves.
 - **Engine** features change what happens behind the scenes, such as
     how workflows run. They come from the engine you're connected to, so
     the list can differ between engines and engine versions.
-- **Library** features come from the node libraries you have loaded, and
-    are grouped under each library's name. They usually add or change
-    something on that library's nodes. They appear when the library is
-    loaded and disappear when it's removed.
+
+Node libraries can offer beta features too. These are listed in the
+**Engine** group, next to the engine's own features. They usually add or
+change something on that library's nodes, and their description says
+which. They appear when the library is loaded and disappear when it's
+removed.
 
 To go back to the standard behavior for everything, click **Reset all**.
 Every feature returns to its default, which is almost always off.

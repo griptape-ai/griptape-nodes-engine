@@ -330,8 +330,10 @@ New declaration types added in future engine releases land additively under this
 ### Beta Features
 
 A beta feature lets you ship something new in your library but leave it off until users choose to
-try it. Your features show up under your library's name on the editor's
+try it. Your features show up in the **Engine** group on the editor's
 [Beta Features](../../guides/editor/beta_features.md) settings page, where users turn them on and off.
+Name your library's nodes in each feature's `description`, so users can tell which library it
+belongs to.
 
 Declare each feature in a `beta_features` list at the top level of `griptape_nodes_library.json`,
 next to `name`, `metadata`, and `nodes`. It is not part of `metadata`:
