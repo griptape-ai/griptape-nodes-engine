@@ -11,6 +11,7 @@ from griptape_nodes.common.project_templates.situation import (
     SituationPolicy,
     SituationTemplate,
 )
+from griptape_nodes.files.os_utils import is_windows
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
@@ -645,31 +646,52 @@ class TestProjectFileDestinationInit:
                 "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1", "save_node_output"
             )
 
-    def test_from_situation_rejects_non_localhost_file_uri(self, save_node_output_situation: SituationTemplate) -> None:
-        """A file:// URI pointing at another host has no local path, so it is refused."""
-        with (
-            patch(
-                HANDLE_REQUEST_PATH,
-                return_value=GetSituationResultSuccess(situation=save_node_output_situation, result_details="ok"),
-            ),
-            pytest.raises(ValueError, match="cannot save to"),
-        ):
-            ProjectFileDestination.from_situation("file://remote-server/renders/out.png", "save_node_output")
+    def test_from_situation_non_localhost_file_uri_needs_unc_support(
+        self, save_node_output_situation: SituationTemplate
+    ) -> None:
+        """A file:// URI naming another host is a destination only where UNC paths exist."""
+        uri = "file://remote-server/renders/out.png"
+        situation_result = GetSituationResultSuccess(situation=save_node_output_situation, result_details="ok")
 
-    @pytest.mark.parametrize("uri", ["file://", "file://localhost", "file:///", "file://localhost/"])
+        if is_windows():
+            # The host is read as a UNC server, so the URI names a real place to write and
+            # takes the same verbatim bypass any other absolute path takes.
+            with patch(HANDLE_REQUEST_PATH, return_value=situation_result):
+                dest = ProjectFileDestination.from_situation(uri, "save_node_output")
+            assert dest._file.location == "//remote-server/renders/out.png"
+            assert dest._file._file_metadata is None
+        else:
+            # POSIX has no UNC concept, so parse_file_uri returns None for any non-local
+            # host rather than `//remote-server/...`, which resolve() would quietly collapse
+            # to the local `/remote-server/...`.
+            with (
+                patch(HANDLE_REQUEST_PATH, return_value=situation_result),
+                pytest.raises(ValueError, match="cannot save to"),
+            ):
+                ProjectFileDestination.from_situation(uri, "save_node_output")
+
+    @pytest.mark.parametrize(
+        ("uri", "refusal"),
+        [
+            ("file://", "cannot save to"),
+            ("file://localhost", "cannot save to"),
+            ("file:///", "does not name a file"),
+            ("file://localhost/", "does not name a file"),
+        ],
+    )
     def test_from_situation_rejects_file_uri_naming_no_file(
-        self, uri: str, save_node_output_situation: SituationTemplate
+        self, uri: str, refusal: str, save_node_output_situation: SituationTemplate
     ) -> None:
         """A file:// URI with no filename component is refused, not turned into an empty destination."""
-        # parse_file_uri returns "" for the host-only forms and "/" for the root ones. Both
-        # are non-None, so the `is not None` bypass check alone would accept them as a
-        # location and build a destination naming no file.
+        # The two shapes are refused by different branches, so each asserts its own message.
+        # A URI with no path component at all parses to None and is refused as a URL naming no
+        # local path, while the root forms parse to "/" -- a real local path that names no file.
         with (
             patch(
                 HANDLE_REQUEST_PATH,
                 return_value=GetSituationResultSuccess(situation=save_node_output_situation, result_details="ok"),
             ),
-            pytest.raises(ValueError, match="does not name a file"),
+            pytest.raises(ValueError, match=refusal),
         ):
             ProjectFileDestination.from_situation(uri, "save_node_output")
 

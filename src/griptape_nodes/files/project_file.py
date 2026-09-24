@@ -122,9 +122,10 @@ class ProjectFileDestination(FileDestination):
         # https://github.com/griptape-ai/griptape-nodes-engine/issues/5360
         local_path_from_uri = parse_file_uri(filename)
         if local_path_from_uri is not None and not Path(local_path_from_uri).name:
-            # `file://`, `file://localhost` and `file:///` parse to "" and "/", naming no
-            # file. Refused here rather than below, where an empty filename would take the
-            # bypass and build a destination pointing at nothing.
+            # `file:///` and `file://localhost/` parse to "/", a real local path naming no file.
+            # Refused here rather than below, where an empty filename would take the bypass and
+            # build a destination pointing at nothing. The host-only `file://` forms parse to
+            # None instead, so the URL branch below is what refuses those.
             msg = (
                 f"Attempted to save to '{filename}'. Failed because that address does not name a file. "
                 f"Add the file name you want, for example 'file:///renders/output.png'."
@@ -149,8 +150,10 @@ class ProjectFileDestination(FileDestination):
             )
             raise ValueError(msg)
         if local_path_from_uri is None and is_url(filename):
-            # Covers a remote web address, a `file://` URI on another host, and any other
-            # scheme. `parse_static_server_url` maps the engine's own
+            # Covers a remote web address, any other scheme, and a `file://` URI naming a
+            # host this OS cannot reach -- on Windows such a host is read as a UNC server
+            # and yields a real path, so it never arrives here.
+            # `parse_static_server_url` maps the engine's own
             # `http://localhost:8124/workspace/staticfiles/...` form back to a real file on
             # the read side, and is deliberately NOT adopted here: that URL names an asset
             # the engine already wrote, so treating it as a save destination would
