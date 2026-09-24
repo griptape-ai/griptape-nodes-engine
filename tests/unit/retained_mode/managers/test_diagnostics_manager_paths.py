@@ -52,10 +52,9 @@ class TestPathsSection:
     def test_a_path_that_is_both_listed_and_missing_is_counted_once(self, home: Path) -> None:
         """It is redacted once and the result reused for both places it appears.
 
-        A redactor counts every match it makes, so redacting a path a second time to put it
-        in the missing list counted its home directory twice. Worst for the workspace
-        directory, which is both always listed and, on a machine worth collecting a bundle
-        from, often the missing one.
+        A redactor counts every match it makes, so redacting a path a second time to put it in
+        the missing list counted its home directory twice. Worst for the workspace directory,
+        which is both always listed and often the missing one.
         """
         redactor = Redactor()
         manager = _manager(home)
@@ -72,10 +71,9 @@ class TestPathsSection:
     def test_a_missing_path_is_listed_the_way_it_is_shown(self, home: Path) -> None:
         """The two lists have to agree, or nothing joins one to the other.
 
-        The missing list is names, not keys, so a reader matches its entries against the
-        paths above by string. A raw path there next to a redacted one above reads as two
-        different directories -- and puts the home directory in a report that says it took it
-        out.
+        The missing list is names, not keys, so a reader matches its entries against the paths
+        above by string. A raw path there next to a redacted one above reads as two different
+        directories -- and puts the home directory in a report that says it took it out.
         """
         redactor = Redactor()
         manager = _manager(home)

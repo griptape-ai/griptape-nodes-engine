@@ -1,13 +1,10 @@
 """Tests for the config-layer part of the diagnostics report.
 
-`ConfigManager.config_layers` reports all six layers, including the three no file backs.
-This section translates that into the two things a reader of a bug report needs: the file
-chain, with a missing or broken file still listed, and the pin that no file holds.
-
-Both directions are easy to get wrong. Dropping a layer that reports no path would drop the
-workspace pin; keeping one would invent a config file at path `None`. And a layer whose
-file exists is not automatically a layer that applied -- a broken file is skipped, and the
-workspace layer stands down when its file is the project's.
+`ConfigManager.config_layers` reports all six layers, including the three no file backs. Both
+directions of translating that are easy to get wrong: dropping a layer that reports no path
+would drop the workspace pin, keeping one would invent a config file at path `None`. And a
+layer whose file exists is not automatically one that applied -- a broken file is skipped, and
+the workspace layer stands down when its file is the project's.
 """
 
 from __future__ import annotations
@@ -174,11 +171,10 @@ class TestRuntimeWorkspacePin:
     def test_a_pin_is_reported_as_the_project_file_spells_it(self, engine: Mock, pinned: str) -> None:
         """A pin is a config value, not a path this machine resolved and can restate.
 
-        Read through `Path` first, every one of these comes back as something nobody wrote:
-        the trailing separator and the doubled one are dropped on any platform, and on
-        Windows a POSIX-spelled pin comes back with backslashes -- so a project authored on
-        a colleague's Mac is reported to its author as a path they would not recognize, in
-        the one field whose point is naming a setting no file holds.
+        Read through `Path` first, these come back as something nobody wrote: a trailing or
+        doubled separator is dropped on any platform, and on Windows a POSIX-spelled pin comes
+        back with backslashes -- so a project authored on a colleague's Mac is reported to its
+        author as a path they would not recognize.
         """
         section = _section(
             engine,

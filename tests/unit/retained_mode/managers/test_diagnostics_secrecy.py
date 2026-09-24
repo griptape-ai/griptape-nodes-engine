@@ -1,15 +1,14 @@
 """The one promise a diagnostics bundle cannot break: no secret value is in it.
 
-Everything else about a bundle is a convenience. A bundle exists to be attached to a bug
-report and handed to somebody else, so a live API key inside one is a credential disclosed
-to whoever that turns out to be. Every other test in this area checks one redaction rule
-against one string; these assemble the finished artifact with the real ``Redactor``, the
-real ``DiagnosticsBundle``, and the report section the config actually flows through, then
-look for the secret in every file the archive contains.
+A bundle exists to be attached to a bug report and handed to somebody else, so a live API key
+inside one is a credential disclosed to whoever that turns out to be. Every other test in this
+area checks one redaction rule against one string; these assemble the finished artifact with the
+real ``Redactor``, the real ``DiagnosticsBundle``, and the report section the config flows
+through, then look for the secret in every file the archive contains.
 
-Read as members, never as raw zip bytes: the archive is deflated, so a plaintext key in a
-member is not plaintext in the bytes, and a search over the bytes would report a clean
-bundle for a leaking one.
+Read as members, never as raw zip bytes: the archive is deflated, so a plaintext key in a member
+is not plaintext in the bytes, and a search over the bytes would report a clean bundle for a
+leaking one.
 """
 
 from __future__ import annotations

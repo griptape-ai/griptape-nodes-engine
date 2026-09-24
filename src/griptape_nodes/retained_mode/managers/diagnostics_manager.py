@@ -115,16 +115,13 @@ def _is_a_plain_file_name(file_name: str) -> bool:
     r"""Whether a name is one file, in whatever directory the caller was told it would go in.
 
     ``Path(file_name).name == file_name`` was the whole test, and it lets ``..`` through:
-    ``Path("..").name`` is ``".."``, so the name comes back from the comparison unchanged and
-    ``destination / ".."`` is then the parent of the directory the bundle was promised in --
-    one level up, through the guard that exists to stop exactly that. Asking for the path's
-    components instead answers the question that was being asked.
+    ``Path("..").name`` is ``".."``, so the name comes back unchanged and ``destination / ".."``
+    is the parent of the directory the bundle was promised in. Asking for the path's components
+    instead answers the question that was being asked.
 
-    Read as a Windows path on every platform, because that is the stricter of the two
-    flavors: it treats ``\`` as a separator as well as ``/``, and it reads a drive letter, so
-    ``..\escaped.zip`` and ``C:\absolute.zip`` are refused here rather than only on the one
-    machine where they would have meant something. The cost is a POSIX name that really does
-    contain a backslash, which is legal and which nobody names a bundle.
+    Read as a Windows path on every platform, the stricter of the two flavors: it treats ``\``
+    as a separator as well as ``/`` and reads a drive letter, so ``..\escaped.zip`` and
+    ``C:\absolute.zip`` are refused here rather than only where they would have meant something.
     """
     parts = PureWindowsPath(file_name).parts
     if len(parts) != 1:
@@ -149,7 +146,6 @@ class SecretLayer(NamedTuple):
     """One place the engine looks for a secret, named as a user would recognize it.
 
     Attributes:
-        label: What to call this source in the report.
         keys_set: The secret keys the source holds, mapped to whether the value there is
             non-empty. A key present with an empty value still shadows a lower layer.
     """
@@ -161,13 +157,11 @@ class SecretLayer(NamedTuple):
 class DiagnosticsManager(EngineScoped):
     """Assembles the troubleshooting snapshot described by ``DiagnosticsReport``.
 
-    Owns no persistent state. Every section is gathered on demand from the peer
-    managers and passed through a single ``Redactor``, so a report is safe to hand to
-    someone else and says what it removed.
-
-    A section that cannot be gathered is recorded in ``collection_warnings`` and the
-    report is still returned. The reason a section is missing is frequently the problem
-    being investigated, and a partial report beats no report.
+    Owns no persistent state. Every section is gathered on demand from the peer managers and
+    passed through a single ``Redactor``, so a report is safe to hand to someone else and says
+    what it removed. A section that cannot be gathered is recorded in ``collection_warnings``
+    and the report is still returned: the reason a section is missing is frequently the problem
+    being investigated.
     """
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
@@ -311,15 +305,14 @@ class DiagnosticsManager(EngineScoped):
     async def _write_bundle_to_path(
         self, output_path: str, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        r"""Write a bundle to a path on the engine's machine.
+        r"""Write a bundle to a path on the engine\'s machine.
 
-        A directory takes the generated file name; anything else is treated as the file
-        name to write. An existing file is never overwritten, because a bundle is
-        evidence and the one already there may be the one someone is waiting for.
+        A directory takes the generated file name; anything else is treated as the file name to
+        write. An existing file is never overwritten, because a bundle is evidence and the one
+        already there may be the one someone is waiting for.
 
-        Every path that reaches the user has the Windows long-path prefix taken off it.
-        Canonicalizing for I/O adds ``\\?\`` on Windows, and a user told their bundle is at
-        ``\\?\C:\Users\sam\bundle.zip`` cannot paste that anywhere useful.
+        Every path that reaches the user has the Windows long-path prefix taken off it: a user
+        told their bundle is at ``\\?\C:\Users\sam\bundle.zip`` cannot paste that anywhere.
         """
         destination = self._resolve_bundle_destination(output_path, file_name)
 
@@ -355,14 +348,12 @@ class DiagnosticsManager(EngineScoped):
     def _resolve_bundle_destination(self, output_path: str, file_name: str) -> Path:
         """Turn a requested output path into the file the bundle is written as.
 
-        Kept out of the async caller because it touches the filesystem to tell a
-        directory from a file name.
-
-        Canonicalized here even though ``WriteFileRequest`` would do it again, because a
-        relative path has to be anchored before the directory test below and the write
-        can agree on what it means. Left relative, ``-o .`` is tested against the working
-        directory and then written relative to the workspace, so the bundle lands
-        somewhere the user was not told about.
+        Kept out of the async caller because it touches the filesystem to tell a directory from
+        a file name. Canonicalized here even though ``WriteFileRequest`` would do it again,
+        because a relative path has to be anchored before the directory test and the write can
+        agree on what it means: left relative, ``-o .`` is tested against the working directory
+        and then written relative to the workspace, so the bundle lands somewhere the user was
+        not told about.
         """
         destination = canonicalize_for_io(output_path)
         if destination.is_dir():
@@ -407,11 +398,10 @@ class DiagnosticsManager(EngineScoped):
     def _file_name_from_url(self, url: str, fallback: str) -> str:
         """Return the file name a download URL points at, or ``fallback`` when it has none.
 
-        Needed because the static files manager hands back a URL rather than the name it
-        wrote, and the name it wrote is not always the name it was given: bundles are
-        saved with ``CREATE_NEW``, so an existing one is kept and this one becomes
-        ``..._1.zip``. Reporting the requested name would point support at the older
-        bundle.
+        The static files manager hands back a URL rather than the name it wrote, and that name
+        is not always the one it was given: bundles are saved with ``CREATE_NEW``, so an existing
+        one is kept and this becomes ``..._1.zip``. Reporting the requested name would point
+        support at the older bundle.
         """
         path = PurePosixPath(unquote(urlparse(url).path))
         if not path.name:
@@ -430,9 +420,8 @@ class DiagnosticsManager(EngineScoped):
     ) -> DiagnosticsReport | None:
         """Assemble the report, or None when the engine's own identity cannot be established.
 
-        Shared by both handlers so a bundle and a bare report can never disagree. The
-        redactor and warning list are the caller's, so a bundle's counts and warnings cover
-        the files it staged before calling this.
+        Shared by both handlers so a bundle and a bare report can never disagree. The redactor
+        and warning list are the caller's, so a bundle's counts cover what it already staged.
         """
         # Engine and host are the only sections that can fail the whole thing: a report
         # that cannot say what is running, on what, identifies nothing.
@@ -483,19 +472,12 @@ class DiagnosticsManager(EngineScoped):
     def _cloud_api_key(self) -> str | None:
         """Return the Griptape Cloud key for the connection check, or None when it cannot be read.
 
-        Reading a secret resolves the workspace, so a workspace that has gone missing
-        raises here. It also parses both ``.env`` files, and a file saved in another
-        encoding raises ``UnicodeDecodeError`` rather than an ``OSError``. Both are exactly
-        the situation these checks exist to report, so either must cost the connection
-        check rather than the whole run.
-
-        Caught broadly on purpose, and this is the one place in this manager that is. The
-        read happens while the health-check context is being built, which is outside
-        ``run_health_checks``'s per-check guard, so anything this raises takes down all six
-        checks instead of one. It resolves a workspace and parses two files the user hand
-        edits, so it can fail in as many ways as a filesystem can, and every one of those
-        ways is something a user runs ``gtn doctor`` to be told about. A key that cannot be
-        read costs the connection check, which reports that it has no key to connect with.
+        Caught broadly on purpose, and the only place in this manager that is. The read happens
+        while the health-check context is being built, outside ``run_health_checks``'s per-check
+        guard, so anything it raises takes down all six checks instead of one. It resolves a
+        workspace and parses two files the user hand edits -- a workspace that has gone missing
+        raises, and a file saved in another encoding raises ``UnicodeDecodeError`` rather than an
+        ``OSError`` -- and every one of those is something ``gtn doctor`` exists to report.
         """
         try:
             return self.engine.secrets_manager.get_secret(CLOUD_API_KEY_NAME, should_error_on_not_found=False)
@@ -519,16 +501,11 @@ class DiagnosticsManager(EngineScoped):
     def _stage_session_log(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
         """Add the in-memory log, unless this session already reached a log file on disk.
 
-        Both sinks are on the same logger at the same level, so a session that wrote a file
-        put the same lines in both places -- the buffer holding its last few thousand and the
-        file holding all of them. Shipping the pair meant two logs to read, one a subset of
-        the other, and no way to tell from the outside which was which.
-
-        Asks what was written rather than what ``log_to_file`` says, because the setting can
-        be on while the file never opened: an unwritable directory leaves the buffer as the
-        only record of the session, and that is the session someone is asking about. It also
-        keeps the buffer when file logging was switched off but earlier runs left files
-        behind, since those files say nothing about this run.
+        Both sinks are on the same logger at the same level, so a session that wrote a file put
+        the same lines in both places. Shipping the pair meant two logs to read, one a subset of
+        the other. Asks what was written rather than what ``log_to_file`` says, because the
+        setting can be on while the file never opened -- an unwritable directory leaves the
+        buffer as the only record of the session someone is asking about.
         """
         if active_log_file() is not None:
             return
@@ -543,11 +520,10 @@ class DiagnosticsManager(EngineScoped):
     def _log_directories(self) -> list[Path]:
         """Return every directory holding this engine's logs, the configured one first.
 
-        Normally just the one. The two differ when the configured directory could not be
-        created or opened: ``log_capture`` keeps the sink it already has rather than dropping
-        file logging altogether, so the file the engine is writing right now lives somewhere
-        the config no longer names. Searching only the configured directory left the current
-        session's log out of the bundle collected to explain it.
+        Normally just the one. They differ when the configured directory could not be created or
+        opened: ``log_capture`` keeps the sink it already has, so the file being written right
+        now lives somewhere the config no longer names. Searching only the configured directory
+        left the current session's log out of the bundle collected to explain it.
         """
         directories = [canonicalize_for_identity(self.engine.config_manager.log_directory)]
 
@@ -734,10 +710,9 @@ class DiagnosticsManager(EngineScoped):
     def _config_file_layers(self, layers: list[ConfigLayer], redactor: Redactor) -> list[ConfigFileDiagnostics]:
         """Report the file-backed layers, including ones whose file does not exist.
 
-        A missing file is still listed: a setting that appears not to apply is often read
-        from a file the user did not realize was absent, and only the full chain answers
-        that. ``default``, ``runtime``, and ``env`` are skipped here because no file backs
-        them; the pin and the variable names are reported separately.
+        A missing file is still listed: a setting that appears not to apply is often read from a
+        file the user did not realize was absent. ``default``, ``runtime``, and ``env`` are
+        skipped because no file backs them; they are reported separately.
         """
         files: list[ConfigFileDiagnostics] = []
         for layer in layers:
@@ -766,9 +741,9 @@ class DiagnosticsManager(EngineScoped):
     def _runtime_workspace_pin(self, layers: list[ConfigLayer], redactor: Redactor) -> str | None:
         """Report the active project's workspace pin, or None when no pin is its own layer.
 
-        The pin is only a layer of its own when it did not come from the config files. An
-        ordinary project activation re-applies the value the user config already holds, and
-        reporting that as a separate owner would suggest a setting the user cannot edit.
+        The pin is only its own layer when it did not come from the config files: an ordinary
+        activation re-applies what the user config already holds, and reporting that as a
+        separate owner would suggest a setting the user cannot edit.
         """
         runtime = next((layer for layer in layers if layer.layer == "runtime"), None)
         if runtime is None or not runtime.present:
@@ -1009,20 +984,14 @@ class DiagnosticsManager(EngineScoped):
     def _known_secret_values(self) -> list[str]:
         """Return the secret values the engine holds, so they can be found in free text.
 
-        These are used to build search patterns and are never written anywhere. The
-        engine is the only thing that knows them, which makes it the only thing that can
-        scrub them out of a log line a library wrote.
+        Used to build search patterns and never written anywhere. The engine is the only thing
+        that knows them, which makes it the only thing that can scrub them out of a log line a
+        library wrote.
 
-        Both places a value can live are read: the ``.env`` files, and the environment for
-        the names the engine expects to find. A key exported in a shell or set by a
-        container never appears in a ``.env`` file, and it is the same credential -- so
-        reading only the files would scrub the keys of a user who stores them the usual way
-        and miss the keys of one who does not.
-
-        Only names the engine already knows about are looked up in the environment. Taking
-        every variable would add hundreds of ordinary values -- ``PATH``, ``HOME``,
-        ``TERM`` -- and each one becomes another search-and-replace over every log line in
-        the bundle.
+        Both places a value can live are read: the ``.env`` files, and the environment for the
+        names the engine expects. Reading only the files would miss a key exported in a shell or
+        set by a container. Only known names are looked up, because taking every variable would
+        add hundreds of ordinary values and another search-and-replace over every log line.
         """
         file_values = self._env_file_secret_values()
         expected_names = set(file_values) | self._declared_secret_names()
@@ -1055,16 +1024,13 @@ class DiagnosticsManager(EngineScoped):
     def _collect_secret_layers(self, declared_names: set[str], warnings: list[str]) -> SecretLayers:
         """Return, per source, which secret keys are present and whether each has a value.
 
-        The only method in this manager that holds a secret value, and it reduces every
-        one to a boolean before returning. Values are read because there is no way to
-        know whether a key is set without reading it, and because the environment layer
-        can only be told apart by comparing.
-
-        The engine copies every ``.env`` entry into ``os.environ`` at startup, so a key's
-        mere presence there means nothing. An environment variable is only reported when
-        its value differs from what the files say, which is exactly the case worth
-        reporting: a shell export or container variable silently beating the ``.env`` the
-        user has been editing.
+        The only method in this manager that holds a secret value, and it reduces every one to a
+        boolean before returning. Values are read because there is no way to know whether a key
+        is set without reading it, and because the environment layer can only be told apart by
+        comparing: the engine copies every ``.env`` entry into ``os.environ`` at startup, so a
+        key's mere presence there means nothing. An environment variable is reported only when
+        its value differs from what the files say -- a shell export silently beating the
+        ``.env`` the user has been editing.
         """
         workspace_values = self._read_env_file(self._workspace_env_path(warnings), warnings)
         global_values = self._read_env_file(ENV_VAR_PATH, warnings)
@@ -1113,11 +1079,10 @@ class DiagnosticsManager(EngineScoped):
     def _worker_ready(self, lib_info: LibraryManager.LibraryInfo) -> bool | None:
         """Whether a worker is serving this library, or None when none is meant to.
 
-        Asks whether a worker is registered rather than whether its readiness gate has
-        settled. A gate exists only once a spawn has been requested, and `has_settled`
-        answers True when there is no gate at all -- so every library whose spawn was never
-        requested would be reported as having a worker up. That is the ordinary case for a
-        bundle collected from the CLI, where workers start with a session that never begins.
+        Asks whether a worker is registered rather than whether its readiness gate has settled.
+        A gate exists only once a spawn has been requested, and `has_settled` answers True when
+        there is no gate at all -- so every library whose spawn was never requested would read
+        as having a worker up. That is the ordinary case for a bundle collected from the CLI.
         """
         if not lib_info.executes_in_worker or lib_info.library_name is None:
             return None
@@ -1127,11 +1092,9 @@ class DiagnosticsManager(EngineScoped):
         """Why no worker is serving this library, or None when one is or none is needed.
 
         Composed from both owners in the order `get_worker_for_library` composes it, so the
-        report names the same cause as the error the user was shown. The library knows the
-        reasons that apply wherever its nodes run -- a declared resource the machine lacks --
-        and the worker manager knows the process-level ones. The failed execution environment
-        build comes last: the spawn path hands that reason to the worker manager, but only
-        once it has run, and the build failing is often why it never did.
+        report names the same cause as the error the user was shown. The failed execution
+        environment build comes last: the spawn path hands that reason over, but only once it
+        has run, and the build failing is often why it never did.
         """
         if not lib_info.executes_in_worker or lib_info.library_name is None:
             return None
@@ -1164,10 +1127,9 @@ class DiagnosticsManager(EngineScoped):
     def _resolved_path_setting(self, key: str, warnings: list[str]) -> Path | None:
         """Resolve a workspace-relative directory setting to an absolute path.
 
-        The read is guarded because a setting written as ``$SOME_VAR`` is resolved through
-        the secrets manager, which resolves the workspace to find the ``.env`` beside it --
-        and a workspace that has gone missing is one of the things this report is collected
-        to explain.
+        The read is guarded because a setting written as ``$SOME_VAR`` resolves through the
+        secrets manager, which resolves the workspace to find the ``.env`` beside it -- and a
+        missing workspace is one of the things this report is collected to explain.
         """
         try:
             configured = self.engine.config_manager.get_config_value(key, default=None)

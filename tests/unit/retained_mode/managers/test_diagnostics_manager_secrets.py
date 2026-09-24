@@ -1,16 +1,14 @@
 """Tests for the secrets section of the diagnostics report.
 
-Two separate promises are kept here.
+The first promise is a hard guarantee: this section reports *which* secrets exist and *where*,
+never what they are. Values are read, because there is no way to know whether a key is set
+without reading it, but every one is reduced to a boolean before it can reach the report.
+`test_no_secret_value_reaches_the_report` is the assertion that matters.
 
-The first is a hard guarantee: this section reports *which* secrets exist and *where*,
-never what they are. Values are read, because there is no way to know whether a key is
-set without reading it, but every one is reduced to a boolean before it can reach the
-report. `test_no_secret_value_reaches_the_report` is the assertion that matters.
-
-The second is usefulness. "My API key is set, so why does it say unauthorized?" is
-usually shadowing: a stale key exported in a shell, or a key blanked in the workspace
-`.env` covering a working one in the global file. So the section reports every source a
-key was found in, in the order the engine searches them, and which one actually won.
+The second is usefulness. "My API key is set, so why does it say unauthorized?" is usually
+shadowing: a stale key exported in a shell, or a key blanked in the workspace `.env` covering a
+working one in the global file. So the section reports every source a key was found in, in the
+order the engine searches them, and which one won.
 """
 
 from __future__ import annotations
@@ -81,9 +79,8 @@ class _Layout:
     def declare(self, *names: str) -> None:
         """Say which secrets the config asks the engine to register.
 
-        Answered for that one key rather than by setting a blanket ``return_value``, which
-        would hand this dict to every config read the section makes and make a test pass
-        for reading the wrong setting.
+        Answered for that one key rather than by setting a blanket ``return_value``, which would
+        hand this dict to every config read the section makes and pass for the wrong setting.
         """
         self.engine.config_manager.get_config_value.side_effect = _config_reader(
             {SECRETS_TO_REGISTER_KEY: dict.fromkeys(names, "")}

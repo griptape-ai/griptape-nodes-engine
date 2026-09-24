@@ -1,16 +1,15 @@
 """Tests for what a report says about a library's worker, and why it cannot run.
 
-A library whose nodes execute in a separate process has two ways of being broken, and they
-send the reader in opposite directions. The worker never started, or the worker started and
-the library inside it did not. `worker_ready` is the field that tells those apart, so a wrong
-answer here costs whoever reads the bundle the one thing it was collected for.
+A library whose nodes execute in a separate process has two ways of being broken that send the
+reader in opposite directions: the worker never started, or the worker started and the library
+inside it did not. `worker_ready` is the field that tells those apart.
 
 The wrong answer is specifically a false yes. Readiness is a gate the worker manager installs
-when a spawn is requested, and it reports an absent gate as settled -- a deliberate choice
-there, since code waiting on a library that will never spawn should not wait forever. Read as
-"settled means up", it says every library whose worker was never asked for has one running.
-That is not an edge case: workers start with a session, and a bundle collected from the CLI is
-collected before any session begins, so it would be every worker library in the report.
+when a spawn is requested, and it reports an absent gate as settled -- deliberate there, since
+code waiting on a library that will never spawn should not wait forever. Read as "settled means
+up", every library whose worker was never asked for has one running. Workers start with a
+session, and a bundle collected from the CLI comes before any session begins, so that would be
+every worker library in the report.
 """
 
 from __future__ import annotations
@@ -150,10 +149,10 @@ class TestWhyNoWorkerIsServingIt:
 class TestWorkerDeclarations:
     """Both flags are reported, because they are not the same question.
 
-    Legacy worker mode keeps a library's nodes from loading in this process at all, so its
-    node classes arrive as stubs from the worker. Execution dependencies load the real nodes
-    here and send only `process()` out. A report that collapsed the two would leave a reader
-    unable to tell an empty sidebar entry from a node that cannot run.
+    Legacy worker mode keeps a library's nodes from loading in this process at all, so they
+    arrive as stubs from the worker; execution dependencies load the real nodes here and send
+    only `process()` out. Collapsing the two leaves a reader unable to tell an empty sidebar
+    entry from a node that cannot run.
     """
 
     def test_a_library_running_only_its_execution_in_a_worker(self) -> None:

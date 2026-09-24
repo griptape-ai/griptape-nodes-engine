@@ -1,14 +1,13 @@
 """The three diagnostics requests, dispatched through a real engine.
 
-Every other test in this area builds one section, or hands the manager a stand-in engine.
-These go through `engine.ahandle_request` the way the editor and the CLI do, because some
-of what a user depends on only exists once the pieces are assembled: that the file written
-is a zip that opens, that the manifest describes the archive it is inside, that a secret
-the engine logged a second ago is not in it, and that a destination which cannot be written
-to comes back as a failure result rather than an exception.
+Every other test in this area builds one section, or hands the manager a stand-in engine. These
+go through `engine.ahandle_request` the way the editor and the CLI do, because some of what a
+user depends on only exists once the pieces are assembled: that the file written is a zip that
+opens, that the manifest describes the archive it is inside, that a secret the engine logged a
+second ago is not in it, and that an unwritable destination comes back as a failure result.
 
-Nothing here touches the network. `CloudConnectionCheck` is the only check that would, and
-the tests that run the checks replace the call that opens the socket.
+Nothing here touches the network. `CloudConnectionCheck` is the only check that would, and the
+tests that run the checks replace the call that opens the socket.
 """
 
 from __future__ import annotations
@@ -89,9 +88,9 @@ def declared_canary(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> str:
 def something_in_the_log(engine: Engine) -> str:  # noqa: ARG001 - the sinks are installed with the engine
     """Log one line and return it, so there is a session log for a bundle to carry.
 
-    An engine that has logged nothing has no session log, and says so in the manifest
-    rather than staging an empty file. Real, but it makes every assertion about a bundle's
-    logs vacuous, so a test that is about the logs puts something in them first.
+    An engine that has logged nothing has no session log, and says so in the manifest rather
+    than staging an empty file -- real, but it makes every assertion about a bundle's logs
+    vacuous.
     """
     message = "the engine did something worth keeping a record of"
     logging.getLogger(LOGGER_NAME).warning(message)
@@ -102,11 +101,10 @@ def something_in_the_log(engine: Engine) -> str:  # noqa: ARG001 - the sinks are
 def logs_under_a_fake_home(engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the engine's log directory inside a home directory this test owns.
 
-    The paths section is where the home directory reaches a report, and a real home
-    directory is not something a test can assert against -- `tmp_path` is not inside one,
-    so with the real `Path.home` there would be nothing to replace and a report that
-    normalized nothing would pass. So `Path.home` is answered with a directory built here,
-    and a setting that really ends up in the report is pointed inside it.
+    The paths section is where the home directory reaches a report, and a real one is not
+    something a test can assert against: `tmp_path` is not inside one, so with the real
+    `Path.home` there would be nothing to replace and a report that normalized nothing would
+    pass. So `Path.home` is answered with a directory built here.
     """
     home = tmp_path / "home"
     log_directory = home / "logs"
@@ -126,9 +124,8 @@ async def _report(engine: Engine, *, normalize_identity: bool = True) -> Diagnos
 async def _collect(engine: Engine, output: Path, **overrides: object) -> CollectDiagnosticsResultSuccess:
     """Collect a bundle into `output` and return the successful result.
 
-    Health checks are off unless a test asks for them, because one of them opens a socket.
-    The open workflow is off because a test engine has none, and asking for one only adds a
-    warning to the manifest.
+    Health checks are off unless a test asks for them, because one opens a socket. The open
+    workflow is off because a test engine has none, and asking only adds a manifest warning.
     """
     options: dict[str, Any] = {
         "output_path": str(output),
@@ -146,10 +143,9 @@ async def _collect(engine: Engine, output: Path, **overrides: object) -> Collect
 def _members(result: CollectDiagnosticsResultSuccess) -> dict[str, str]:
     """Return every file in a written bundle, decoded, keyed by its path inside the zip.
 
-    Read back off the disk rather than from the result, because where the file landed is
-    half of what a collection promises. Read as members rather than as raw zip bytes: the
-    archive is deflated, so a plaintext secret in a member is not plaintext in the bytes,
-    and a search over the bytes would report a clean bundle for a leaking one.
+    Read back off the disk rather than from the result, because where the file landed is half of
+    what a collection promises. Read as members rather than raw zip bytes: the archive is
+    deflated, so a plaintext secret in a member is not plaintext in the bytes.
     """
     assert result.path is not None, "a bundle written to a path reports where it went"
 
@@ -222,10 +218,10 @@ class TestReport:
     ) -> None:
         """Which file holds the session being asked about, out of a directory of them.
 
-        The engine's log directory and the file the sink opened are the same location
-        spelled two ways -- on macOS a temporary directory is reached through `/var`, which
-        is a symlink to `/private/var`. Compared as spellings, nothing was ever marked, and
-        a reader with six log files had no way to tell which one was live.
+        The log directory and the file the sink opened are the same location spelled two ways --
+        on macOS a temporary directory is reached through `/var`, a symlink to `/private/var`.
+        Compared as spellings, nothing was ever marked, and a reader with six log files had no
+        way to tell which one was live.
         """
         assert something_in_the_log
 
@@ -468,10 +464,9 @@ class TestBundle:
     ) -> None:
         """The promise a bundle cannot break, over the whole path from log line to zip.
 
-        A library logging a credential into an error message is the ordinary way one ends
-        up in a log file, and the engine is the only thing that knows enough to take it
-        back out again. Asserted over every file in the archive rather than the one it was
-        planted in, because staging copies text into more than one of them.
+        A library logging a credential into an error message is the ordinary way one ends up in
+        a log file, and the engine is the only thing that knows enough to take it back out.
+        Asserted over every file in the archive, because staging copies text into more than one.
         """
         logging.getLogger(LOGGER_NAME).warning("Request rejected while authenticating with %s", declared_canary)
 
@@ -623,10 +618,9 @@ class TestBundleWrittenToStaticFiles:
     ) -> None:
         """This route is the one that uploads, so the network is one of the ways it fails.
 
-        With the cloud storage backend configured, saving a static file uploads it and then
-        asks for a download URL over HTTP. `httpx` errors are not `OSError`s, so a refused
-        connection came out of the request handler as a raw exception -- and this handler is
-        reached from the editor, which has nothing to show for one.
+        With the cloud storage backend configured, saving a static file uploads it and then asks
+        for a download URL over HTTP. `httpx` errors are not `OSError`s, so a refused connection
+        came out of the handler as a raw exception -- and the editor has nothing to show for one.
         """
         with (
             patch.object(

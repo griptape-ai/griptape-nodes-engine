@@ -2,15 +2,14 @@
 
 Two failures hide here, and both look like an empty log directory.
 
-The first is that the configured log directory is not always the one being written to. When
-it cannot be created or opened, `log_capture` keeps the file sink it already has rather than
-dropping file logging altogether — so the engine goes on writing somewhere the config no
-longer names. Searching only the configured directory left the current session's log out of
-the very bundle collected to explain it.
+The first is that the configured log directory is not always the one being written to. When it
+cannot be created or opened, `log_capture` keeps the file sink it already has — so the engine
+goes on writing somewhere the config no longer names, and searching only the configured
+directory left the current session's log out of the bundle collected to explain it.
 
-The second is the warning. "No log files were found" is true in three unrelated situations
-— file logging switched off, a directory that cannot be written to, an engine that has not
-logged yet — and naming the wrong one sends someone to change a setting that is already on.
+The second is the warning. "No log files were found" is true in three unrelated situations —
+file logging switched off, a directory that cannot be written to, an engine that has not logged
+yet — and naming the wrong one sends someone to change a setting that is already on.
 """
 
 from __future__ import annotations
@@ -192,9 +191,9 @@ class TestOneLogRatherThanTwo:
     def test_files_from_earlier_runs_do_not_stand_in_for_this_one(self, tmp_path: Path) -> None:
         """File logging switched off after earlier runs had already left files behind.
 
-        Those files are still worth carrying, but they say nothing about the run being
-        reported. Asking "are there any log files" rather than "did this session write one"
-        would drop the only record of it.
+        Those files are worth carrying, but they say nothing about the run being reported.
+        Asking "are there any log files" rather than "did this session write one" drops its only
+        record.
         """
         earlier = _write_log(tmp_path)
         manager = _manager(tmp_path, log_to_file=False)

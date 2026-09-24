@@ -2,9 +2,8 @@
 
 Almost everything in this section is the user's own writing: a project's name, the paths it
 declares, and the messages describing what is wrong with it. All of it goes through the
-redactor, which leaves one thing to get right in both directions — a name that is there has
-to be redacted, and a name that is absent has to stay absent rather than becoming an error.
-The engine's own system defaults template is unnamed, and every collection includes it.
+redactor, which leaves one thing to get right in both directions — a name that is there has to
+be redacted, and a name that is absent has to stay absent rather than becoming an error.
 """
 
 from __future__ import annotations

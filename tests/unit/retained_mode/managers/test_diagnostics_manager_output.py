@@ -1,13 +1,12 @@
 """Tests for where a diagnostics bundle goes and what the engine says it was called.
 
 These are the parts a user checks the moment collection finishes: the path printed in the
-terminal and the name in the success message. Both were wrong in ways that are invisible
-until someone goes looking for the file — a relative `--output` tested against one
-directory and written to another, and a name reported as requested when the static files
-manager had saved it under a different one.
+terminal and the name in the success message. Both were wrong in ways invisible until someone
+goes looking for the file — a relative `--output` tested against one directory and written to
+another, and a name reported as requested when static files had saved it under a different one.
 
-`_cloud_api_key` is here for the same reason: reading a secret resolves the workspace, and
-a missing workspace is exactly the thing these checks are collected to report.
+`_cloud_api_key` is here for the same reason: reading a secret resolves the workspace, and a
+missing workspace is exactly what these checks are collected to report.
 """
 
 from __future__ import annotations
@@ -71,11 +70,10 @@ def _destination(manager: DiagnosticsManager, output_path: str) -> Path:
 class TestResolveBundleDestination:
     r"""Which file the bundle is written as, compared as a file rather than as a spelling.
 
-    The destination is resolved for the OS, so on Windows it carries the ``\\?\``
-    long-path prefix that ``canonicalize_for_io`` applies -- the same file, spelled the way
-    the filesystem API wants it. `_destination` strips it before comparing, which is what
-    the manager itself does before a path reaches a result or a message. Compared with the
-    prefix left on, every assertion here fails on Windows over a path that is correct.
+    The destination is resolved for the OS, so on Windows it carries the ``\\?\`` long-path
+    prefix ``canonicalize_for_io`` applies -- the same file, spelled the way the filesystem API
+    wants it. `_destination` strips it before comparing, which is what the manager does before a
+    path reaches a result. Left on, every assertion here fails on Windows over a correct path.
     """
 
     def test_a_directory_gets_the_generated_file_name(self, manager: DiagnosticsManager, tmp_path: Path) -> None:
@@ -246,11 +244,11 @@ class TestCloudApiKey:
     ) -> None:
         """This read is the one place in the manager that catches broadly, and needs to be.
 
-        It happens while the health-check context is being built, which is *outside*
-        `run_health_checks`'s per-check guard -- so anything it raises takes down all six
-        checks rather than one. What it does is resolve a workspace and parse two files the
-        user hand edits, so it can fail in as many ways as a filesystem can, and every one of
-        those ways is something a user runs `gtn doctor` to be told about.
+        It happens while the health-check context is being built, *outside*
+        `run_health_checks`'s per-check guard, so anything it raises takes down all six checks
+        rather than one. It resolves a workspace and parses two files the user hand edits, so it
+        can fail in as many ways as a filesystem can -- each of them something `gtn doctor`
+        exists to report.
         """
         engine = Mock()
         engine.secrets_manager.get_secret.side_effect = failure
