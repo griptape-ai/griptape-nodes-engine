@@ -1,12 +1,30 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 
 @dataclass(eq=False)
 class FileSystemPicker(Trait):
+    RENDERED_STATE_KEYS: ClassVar[dict[str, str]] = {
+        "allowFiles": "allow_files",
+        "allowDirectories": "allow_directories",
+        "allowSequences": "allow_sequences",
+        "multiple": "multiple",
+        "workspaceOnly": "workspace_only",
+        "allowCreate": "allow_create",
+        "allowRename": "allow_rename",
+        "fileTypes": "file_types",
+        "fileExtensions": "file_extensions",
+        "excludePatterns": "exclude_patterns",
+        "includePatterns": "include_patterns",
+        "maxFileSize": "max_file_size",
+        "minFileSize": "min_file_size",
+        "initialPath": "initial_path",
+    }
+
     allow_files: bool = False
     allow_directories: bool = True
     allow_sequences: bool = False
@@ -60,6 +78,33 @@ class FileSystemPicker(Trait):
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["fileSystemPicker", "file_picker", "folder_picker"]
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "allow_files": self.allow_files,
+            "allow_directories": self.allow_directories,
+            "allow_sequences": self.allow_sequences,
+            "multiple": self.multiple,
+            "file_types": self.file_types,
+            "file_extensions": self.file_extensions,
+            "exclude_patterns": self.exclude_patterns,
+            "include_patterns": self.include_patterns,
+            "max_file_size": self.max_file_size,
+            "min_file_size": self.min_file_size,
+            "workspace_only": self.workspace_only,
+            "initial_path": self.initial_path,
+            "allow_create": self.allow_create,
+            "allow_rename": self.allow_rename,
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        for name in self.to_state():
+            if name in state:
+                setattr(self, name, state[name])
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        return state_from_rendered_keys(ui_options.get("fileSystemPicker"), cls.RENDERED_STATE_KEYS)
 
     def ui_options_for_trait(self) -> dict[str, Any]:
         """Generate the fileSystemPicker UI options dictionary."""

@@ -1,5 +1,30 @@
 # Unreleased
 
+## Traits can save runtime state
+
+A trait keeps its existing constructor. To persist runtime changes, implement `to_state()` and
+`apply_state()`:
+
+```python
+class Threshold(Trait):
+    def __init__(self, level: int = 5) -> None:
+        super().__init__()
+        self.level = level
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    def apply_state(self, state: dict[str, int]) -> None:
+        if "level" in state:
+            self.level = state["level"]
+```
+
+The default methods save nothing, so existing traits remain compatible. State must contain plain
+JSON-compatible values. The engine applies it to the trait the node already built, preserving
+callbacks and other constructor wiring. For a parameter the node declares, only keys that differ
+from what the node builds are saved, so changing a constructor default still reaches existing
+workflows.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display

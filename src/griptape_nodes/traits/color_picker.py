@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 
 @dataclass(eq=False)
@@ -19,6 +20,17 @@ class ColorPicker(Trait):
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["color_picker"]
+
+    def to_state(self) -> dict[str, Any]:
+        return {"format": self.format}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "format" in state:
+            self.format = state["format"]
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        return state_from_rendered_keys(ui_options.get("color_picker"), {"format": "format"})
 
     def ui_options_for_trait(self) -> dict:
         return {"color_picker": {"format": self.format}}

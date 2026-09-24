@@ -212,11 +212,23 @@ class ParameterList(ParameterContainer):
     @property
     def ui_options(self) -> dict:
         """Override ui_options to merge convenience parameters in real-time."""
-        # Get base ui_options from parent
-        base_ui_options = super().ui_options
+        return {
+            **super().ui_options,
+            **self._convenience_ui_options(),
+        }
 
-        # Build convenience options from instance parameters
-        convenience_options = {}
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Include layout fields stored outside ``_ui_options``.
+
+        The setter treats a missing ``display`` as disabling grid layout.
+        """
+        return {
+            **super().authored_ui_options(),
+            **self._convenience_ui_options(),
+        }
+
+    def _convenience_ui_options(self) -> dict[str, Any]:
+        convenience_options: dict[str, Any] = {}
 
         if self._collapsed is not None:
             convenience_options["collapsed"] = self._collapsed
@@ -224,17 +236,12 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
-        if self._grid is not None and self._grid:
+        if self._grid:
             convenience_options["display"] = "grid"
+            if self._grid_columns is not None:
+                convenience_options["columns"] = self._grid_columns
 
-        if self._grid_columns is not None and self._grid:
-            convenience_options["columns"] = self._grid_columns
-
-        # Merge convenience options with base ui_options
-        return {
-            **base_ui_options,
-            **convenience_options,
-        }
+        return convenience_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
