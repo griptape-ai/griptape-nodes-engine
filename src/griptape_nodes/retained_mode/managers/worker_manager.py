@@ -994,6 +994,120 @@ class WorkerManager(EngineScoped):
             return
         await self.broadcast_to_workers(EventRequest(request=ReloadConfigRequest()))
 
+    def schedule_pending_local_object_releases(self) -> None:
+        """Send queued handle releases to the workers on the caller's running loop, if there is one.
+
+        Sync because the releases happen on sync paths: a parameter value being written, a node being
+        deleted. Fire-and-forget like `schedule_broadcast`, and for the same reason it is acceptable here --
+        losing the message leaves a worker holding an object until a later teardown.
+
+        With no running loop the keys stay queued and the next drain sends them, so a release issued from a
+        thread or a sync test is not lost.
+        """
+        if self._transport is None or not self._workers:
+            # Nothing to tell. Draining keeps the queue from growing for the life of the process.
+            self.engine.resource_manager.drain_pending_worker_releases()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        keys = self.engine.resource_manager.drain_pending_worker_releases()
+        if not keys:
+            return
+        task = loop.create_task(self._send_local_object_releases(keys))
+        self._inflight_broadcast_tasks.add(task)
+        task.add_done_callback(self._inflight_broadcast_tasks.discard)
+
+    async def _send_local_object_releases(self, keys: list[str]) -> None:
+        """Fan the keys out, putting them back on the queue if the send fails.
+
+        They were drained before this ran, so without the re-queue a task that dies with a transient side
+        loop -- the case `broadcast_drop_all_local_objects` documents below -- would take them with it and
+        nothing would ever retry.
+
+        `broadcast_pending_local_object_releases` does not re-queue, because the drop-all after teardown
+        covers its keys.
+        """
+        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
+
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropLocalObjectsRequest(keys=keys)))
+        except Exception as e:
+            self.engine.resource_manager.requeue_pending_worker_releases(keys)
+            logger.warning(
+                "Could not tell the workers to release %d held object(s): %s. Queued to go with the next "
+                "release or at teardown.",
+                len(keys),
+                e,
+            )
+
+    async def broadcast_pending_local_object_releases(self) -> None:
+        """Tell every worker about keys released here that it may also be holding.
+
+        Drains the queue the sync release paths fill -- a handle parameter's value being replaced, a node
+        being deleted -- so those paths do not each need a loop of their own. Never raises, for the same
+        reason as its sibling below: a send failure must not break whatever triggered the release.
+
+        On failure the keys are discarded, not re-queued: this runs on the teardown path, the drop-all
+        that follows covers them, and a re-queue would cycle keys from a deleted workflow forever. The
+        scheduled sibling `_send_local_object_releases` re-queues, because nothing follows it.
+
+        Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager` from
+        this package.
+        """
+        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
+
+        keys = self.engine.resource_manager.drain_pending_worker_releases()
+        if not keys or self._transport is None or not self._workers:
+            return
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropLocalObjectsRequest(keys=keys)))
+        except Exception as e:
+            logger.warning(
+                "Could not tell the workers to release %d held object(s): %s. A worker that did not get the "
+                "message keeps them until a later teardown.",
+                len(keys),
+                e,
+            )
+
+    async def broadcast_local_object_teardown(self) -> None:
+        """Tell every worker to release named pending keys, then everything its libraries hold.
+
+        One method because both halves are required: the named-key broadcast is what drains the
+        orchestrator's pending-release queue, and the drop-all is what covers whatever a worker still holds.
+        Two teardown sites call this; neither may take half of it.
+        """
+        await self.broadcast_pending_local_object_releases()
+        await self.broadcast_drop_all_local_objects()
+
+    async def broadcast_drop_all_local_objects(self) -> None:
+        """Tell every worker to release the objects its libraries parked in it.
+
+        Awaited rather than scheduled, for the reason recorded on `_on_config_changed` above: this one is
+        called from a workflow teardown that can be dispatched synchronously, and a task created on a
+        transient side loop dies with that loop.
+
+        Never raises. Its callers have already destroyed nodes and flows, one with a registry delete
+        still to come, so a send failure must not abort them or displace the failure they were already
+        reporting.
+
+        Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager`
+        from this package.
+        """
+        from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest
+
+        if self._transport is None or not self._workers:
+            return
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropAllLocalObjectsRequest()))
+        except Exception as e:
+            logger.warning(
+                "Could not tell the workers to release the objects held for their libraries: %s. "
+                "A worker that did not get the message keeps them until a later teardown.",
+                e,
+            )
+
     async def _on_secret_changed(self, _event: SecretChanged) -> None:
         """Fan out a RefreshSecretsRequest after the orchestrator's secret mutation succeeded.
 

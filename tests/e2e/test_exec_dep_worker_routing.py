@@ -460,13 +460,14 @@ class TestUnmetRequirementCostsExecutionNotEditing:
             current_engine().library_manager.get_worker_for_library("Requires The Impossible")
 
 
-class TestUnshippableOutputGuardrail:
+class TestUnshippableOutputIsKept:
     @pytest.mark.asyncio
-    async def test_worker_producing_an_unshippable_value_fails_with_instructions(self, tmp_path: Path) -> None:
-        """A serializable=False output cannot cross the boundary, so say so usefully."""
+    async def test_worker_producing_an_unshippable_value_ships_a_reference(self, tmp_path: Path) -> None:
+        """A serializable=False output stays in the worker and a reference crosses in its place."""
+        from griptape_nodes.exe_types.local_objects import is_reference
         from griptape_nodes.retained_mode.events.execution_events import (
             ExecuteNodeRequest,
-            ExecuteNodeResultFailure,
+            ExecuteNodeResultSuccess,
         )
 
         _register(
@@ -489,56 +490,12 @@ class TestUnshippableOutputGuardrail:
             )
         )
 
-        assert isinstance(result, ExecuteNodeResultFailure)
-        details = str(result.result_details)
-        assert "'session'" in details
-        assert "cannot leave" in details
-        # The message must teach the way forward, not just refuse.
-        assert "descriptor" in details
-
-    @pytest.mark.asyncio
-    async def test_serializable_outputs_are_unaffected(self, tmp_path: Path) -> None:
-        from griptape_nodes.retained_mode.events.execution_events import (
-            ExecuteNodeRequest,
-            ExecuteNodeResultSuccess,
-        )
-
-        _register(
-            tmp_path,
-            fixture_dir=EXEC_FIXTURE,
-            node_file="exec_dep_node.py",
-            name="Guardrail Serializable",
-            # Both sets are declared edit-time so this one process can import both. A real worker
-            # receives the execution set as PYTHONPATH from the spawn, which no single-process test
-            # has; the two environments being separate on disk is pinned in
-            # test_library_execution_dependency_split.py and is not what this test is about.
-            edit_dependencies=["fakeedit", "fakeexec"],
-            # Still declared, so the library is worker-routed and the guardrail applies at all.
-            exec_dependencies=["fakeexec"],
-        )
-        # Flipped after registering, as the sibling guardrail test does: loading a library is the
-        # orchestrator's job, and the flag only selects the execution path under test.
-        current_engine().library_manager._is_worker = True
-        node = LibraryRegistry.create_node(
-            node_type="ExecDepNode", name="Fine", specific_library_name="Guardrail Serializable"
-        )
-        current_engine().object_manager.add_object_by_name("Fine", node)
-
-        result = await current_engine().ahandle_request(
-            ExecuteNodeRequest(
-                node_name="Fine",
-                node_metadata={"node_type": "ExecDepNode", "library": "Guardrail Serializable"},
-            )
-        )
-
-        # A node whose outputs are all serializable must ship them, so the unshippable-output
-        # guardrail must NOT fire. Asserted on success rather than either-branch: the previous
-        # version passed whether or not the node ran.
-        assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
-        # This suite builds both wheels at 1.0.0; the version itself is not the point, having
-        # BOTH outputs is -- one proves the edit environment, the other the execution one.
-        assert result.parameter_output_values["edit_dep_version"] == "1.0.0"
-        assert result.parameter_output_values["exec_dep_version"] == "1.0.0"
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        sent = result.parameter_output_values["session"]
+        assert is_reference(sent), sent
+        entry = current_engine().resource_manager.entry_for(sent["key"])
+        assert entry is not None
+        assert entry.value.marker == "live-session-marker"
 
 
 class TestManagerAccessDuringWorkerExecution:
@@ -548,7 +505,7 @@ class TestManagerAccessDuringWorkerExecution:
         library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope(), pytest.raises(RuntimeError) as excinfo:
+        with event_manager.node_execution_scope(), pytest.raises(RuntimeError) as excinfo:
             GriptapeNodes.ConfigManager()
 
         message = str(excinfo.value)
@@ -559,7 +516,7 @@ class TestManagerAccessDuringWorkerExecution:
         current_engine().library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             with pytest.raises(RuntimeError, match="GetSecretValueRequest"):
                 GriptapeNodes.SecretsManager()
             with pytest.raises(RuntimeError, match="ReadFileRequest"):
@@ -582,7 +539,7 @@ class TestManagerAccessDuringWorkerExecution:
         ]
         assert len(accessors) > minimum_believable_sweep, "sweep found too few accessors to be believed"
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             for name in accessors:
                 if name == "StaticFilesManager":
                     assert getattr(GriptapeNodes, name)() is not None
@@ -601,7 +558,7 @@ class TestManagerAccessDuringWorkerExecution:
         """The refusal is about being in a worker, not about executing."""
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             assert GriptapeNodes.ConfigManager() is not None
 
     def test_static_files_manager_stays_available(self) -> None:
@@ -609,5 +566,5 @@ class TestManagerAccessDuringWorkerExecution:
         current_engine().library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             assert GriptapeNodes.StaticFilesManager() is not None

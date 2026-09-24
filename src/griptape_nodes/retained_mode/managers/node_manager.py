@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import logging
 import pickle
@@ -16,6 +15,7 @@ from griptape_nodes.common.strict_mode import (
     StrictModeScopeKind,
     StrictModeSeverity,
 )
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1421,6 +1421,10 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
+        # What this node owns, collected before the connections come down so a mid-teardown state cannot
+        # affect it.
+        releasable_handle_keys = self._cached_objects_owned_by(node)
+
         with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
@@ -1500,6 +1504,9 @@ class NodeManager(EngineScoped):
                 return DeleteNodeResultFailure(result_details=details)
 
         parent_flow.remove_node(node.name)
+
+        for key in releasable_handle_keys:
+            node.local_objects.release_parked(key)
 
         # Now remove the record keeping
         self.engine.object_manager.del_obj_by_name(node_name)
@@ -2383,7 +2390,7 @@ class NodeManager(EngineScoped):
                 value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
-                value = node.get_parameter_value(parameter.name)
+                value = node._get_raw_parameter_value(parameter.name)
             if value is not None:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
@@ -2950,12 +2957,12 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node.get_parameter_value(request.parameter_name)
+        old_value = node._get_raw_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
         )
         # Get the "converted" value here.
-        finalized_value = node.get_parameter_value(request.parameter_name)
+        finalized_value = node._get_raw_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
@@ -3155,6 +3162,35 @@ class NodeManager(EngineScoped):
         return GetCompatibleParametersResultSuccess(
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
+
+    def _cached_objects_owned_by(self, node: BaseNode) -> list[str]:
+        """The cache references for objects this node owns, which are the ones it produced.
+
+        A cached object belongs to the output parameter that produced it. A consumer holds a reference and
+        borrows the object; it never owns it and is never responsible for its life. So deleting a node
+        releases what that node made and nothing else, and a consumer left holding a reference to it finds
+        it stale and is told to re-run the producer -- which is the same answer it already gets when the
+        producer re-runs and displaces what it made.
+        """
+        owned: set[str] = set()
+        # Its own outputs, and of those only the references it produced itself -- not a reference a
+        # pass-through merely copied into its own outputs, which EndNode and the subflow boundary nodes do
+        # for every parameter they carry.
+        #
+        # Read from the values rather than from this process's store, because the object is cached in the
+        # worker that ran the node while deletion happens on the orchestrator -- so the orchestrator holds
+        # no entry for it and has only the reference to go on. Snapshot: node bodies write outputs from
+        # worker threads.
+        for value in list(node.parameter_output_values.values()):
+            owned |= node.local_objects.keys_this_node_produced(value)
+        # Plus anything this process does hold for the node, which covers an in-process library and an entry
+        # whose parameter was renamed or removed after it was cached.
+        owned.update(
+            self.engine.resource_manager.parked_keys_for(
+                owner=node.local_objects.owner, source=node.local_object_source
+            )
+        )
+        return sorted(owned)
 
     def get_node_by_name(self, name: str) -> BaseNode:
         obj_mgr = self.engine.object_manager
@@ -3377,7 +3413,7 @@ class NodeManager(EngineScoped):
                 ),
             )
         try:
-            return LibraryRegistry.create_node(
+            transient = LibraryRegistry.create_node(
                 node_type=node_type,
                 name=node_name,
                 metadata=dict(request.node_metadata),
@@ -3415,6 +3451,12 @@ class NodeManager(EngineScoped):
                     f"installation; the details are in the engine log."
                 )
             )
+
+        if request.local_object_source is not None:
+            # Adopt the orchestrator's identity. A fresh node is built for every execution, so without this
+            # each run would cache under a new identity and nothing would ever displace anything.
+            transient.local_object_source = request.local_object_source
+        return transient
 
     def _local_library_load_failure(self, library_name: str | None) -> str | None:
         """What THIS process recorded about failing to load ``library_name``, if anything.
@@ -3550,15 +3592,15 @@ class NodeManager(EngineScoped):
     async def _hydrate_and_run_node(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         """Hydrate a node's input parameters and execute it.
 
-        On a worker, hydration and node.aprocess() both run inside
-        worker_node_execution_scope so that any nested handle_request calls
-        originated from node code forward to the orchestrator. Hydration calls
+        Hydration and node.aprocess() both run inside node_execution_scope. On a
+        worker that is what makes any nested handle_request calls originated from
+        node code forward to the orchestrator: hydration calls
         set_parameter_value, which cascades into ListConnectionsForNodeRequest
-        and similar cross-node lookups; those must forward because the worker
+        and similar cross-node lookups, and those must forward because the worker
         only owns its single node copy and cannot resolve parent-flow or peer-
-        node state locally. On the orchestrator we skip the scope entirely --
-        there is no RemoteHandler to read the flag, so opening it there would
-        only bump a refcount nothing observes.
+        node state locally. Everywhere it also marks the window in which a held
+        object must not be freed, which is why it is opened on the orchestrator
+        too.
         """
         # Register this aprocess task under its request_id so
         # CancelExecuteNodeRequest can locate it. Only populated when the caller
@@ -3584,18 +3626,37 @@ class NodeManager(EngineScoped):
         finally:
             if tracked_request_id:
                 self._worker_inflight_aprocesses.pop(tracked_request_id, None)
+            # Release hooks held back while nodes ran. A no-op while any node is still executing, which
+            # parallel resolution makes routine -- the drain enforces that itself.
+            dropped = self.engine.resource_manager.drain_deferred_releases()
+            if dropped:
+                logger.debug("Released %d held object(s) deferred while nodes were running.", dropped)
+
+    @staticmethod
+    def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
+        """Swap each reference in the node's input values for the object it stands for, where held here.
+
+        So a node body reading `self.parameter_values[name]` directly gets what `get_parameter_value` would
+        give it. Authors do read that dict -- hydration already materialises defaults into it for the same
+        reason -- and a reference sitting there hands them something that is not their object.
+
+        Written straight into the dict rather than through `set_parameter_value`: nothing changed as far as
+        the graph is concerned, and the setter would emit a lifecycle event carrying the live object where
+        the reference is what the editor should see.
+
+        Worker-side only. In-process a node's dict already holds the object it was handed, so there is
+        nothing to swap -- except a reference a library made itself through `reference_for`, and replacing
+        that one would blind the save and metadata guards, which look for a reference and would find an
+        object they cannot write out.
+        """
+        for param_name, stored in list(node.parameter_values.items()):
+            resolved = node.local_objects.resolve_what_is_here(stored)
+            if resolved is not stored:
+                node.parameter_values[param_name] = resolved
 
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
-        # The node-execution scope only has meaning on a worker: it is what
-        # RemoteHandler consults to decide whether to forward a request to the
-        # orchestrator. On the orchestrator itself there is no RemoteHandler
-        # installed (register_remote_handlers is worker-only), so opening the
-        # scope there would just bump a refcount that nothing reads. Skip it
-        # to keep the depth counter accurate to its name.
-        is_worker = self.engine.library_manager.is_worker
-        scope_cm = self.engine.event_manager.worker_node_execution_scope() if is_worker else contextlib.nullcontext()
-        with scope_cm:
+        with self.engine.event_manager.node_execution_scope():
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
             hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
@@ -3613,6 +3674,8 @@ class NodeManager(EngineScoped):
                 if param.default_value is None:
                     continue
                 node.parameter_values[param.name] = param.default_value
+            if self.engine.library_manager.is_worker:
+                self._resolve_cached_inputs_in_place(node)
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()
@@ -3635,20 +3698,15 @@ class NodeManager(EngineScoped):
                 # the node still holds here was never torn down, so serialization must treat it
                 # as structure rather than dropping it from every later save.
                 node.forget_parameters_added_during_execution()
+        # Only a worker's result leaves the process. In-process this is handed straight back to
+        # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
+        # dict the node just wrote its object into.
         if self.engine.library_manager.is_worker:
-            unshippable = self._unshippable_output_names(node)
-            if unshippable:
-                library_name = node.metadata.get("library", "its library")
-                details = (
-                    f"Node '{node_name}' produced {', '.join(unshippable)}, which cannot leave "
-                    f"'{library_name}'s isolated process. Either make the value serializable, or keep "
-                    f"it inside the library: cache it library-side and output a small serializable "
-                    f"descriptor that the consuming node trades back."
-                )
-                return ExecuteNodeResultFailure(result_details=details)
-
+            output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
+        else:
+            output_values = dict(node.parameter_output_values)
         return ExecuteNodeResultSuccess(
-            parameter_output_values=dict(node.parameter_output_values),
+            parameter_output_values=output_values,
             result_details=f"Node '{node_name}' executed successfully.",
         )
 
@@ -3715,22 +3773,6 @@ class NodeManager(EngineScoped):
                 param_name,
             )
         return None
-
-    @staticmethod
-    def _unshippable_output_names(node: BaseNode) -> list[str]:
-        """Output parameter names holding values that cannot cross the process boundary.
-
-        ``serializable=False`` is the author declaring the value unreasonable to move (a live
-        tensor, an open pipeline). In a worker those outputs would be dropped or mangled on
-        the wire, so producing one is a failure with an actionable message rather than a
-        silent hole in the graph.
-        """
-        names = []
-        for parameter_name in node.parameter_output_values:
-            parameter = node.get_parameter_by_name(parameter_name)
-            if parameter is not None and not parameter.serializable:
-                names.append(f"'{parameter_name}'")
-        return names
 
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
@@ -3963,11 +4005,13 @@ class NodeManager(EngineScoped):
                     serialized_library_name = library_details.library_name
 
                 # Get the creation details for regular nodes
+                metadata_copy = copy.deepcopy(node.metadata)
+                # Per live node, never per serialized form -- see the group branch above.
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
-                    metadata=copy.deepcopy(node.metadata),
+                    metadata=metadata_copy,
                     # If it is actively resolving, mark as unresolved.
                     resolution=node.state.value,
                     initial_setup=True,
@@ -4917,7 +4961,7 @@ class NodeManager(EngineScoped):
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
-        effective_value = node.get_parameter_value(parameter.name)
+        effective_value = node._get_raw_parameter_value(parameter.name)
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
@@ -4989,6 +5033,14 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # A key into this process's memory means nothing in another, and a workflow that saved one would
+        # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
+        # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
+        # serializable parameter is still skipped.
+        if node.local_objects.contains_a_parked_object(value):
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -5054,7 +5106,7 @@ class NodeManager(EngineScoped):
             if param.name in node.parameter_output_values:
                 param_values[param.name] = node.parameter_output_values[param.name]
             else:
-                param_values[param.name] = node.get_parameter_value(param.name)
+                param_values[param.name] = node._get_raw_parameter_value(param.name)
         simple_values = safe_unstructure(param_values)
         return SerializedParameterValues(simple_values, None)
 
@@ -5107,7 +5159,7 @@ class NodeManager(EngineScoped):
         """
         if param_name in node.parameter_output_values:
             return node.parameter_output_values[param_name]
-        return node.get_parameter_value(param_name)
+        return node._get_raw_parameter_value(param_name)
 
     @staticmethod
     def _process_parameter_for_pickling(  # noqa: PLR0913

@@ -183,6 +183,7 @@ plugins:
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - development/custom_nodes/passing_unserializable_values.md: Passing pipelines, tensors and other unserializable values between nodes across a worker process boundary
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
@@ -554,6 +555,7 @@ nav:
           - Best Practices and Error Handling: development/custom_nodes/error_handling.md
           - Authoring Libraries: development/custom_nodes/authoring_libraries.md
           - Advanced Libraries: development/custom_nodes/advanced_libraries.md
+          - Passing Unserializable Values: development/custom_nodes/passing_unserializable_values.md
           - Custom Widgets: development/custom_nodes/custom_widgets.md
           - Patterns and Examples: development/custom_nodes/examples.md
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
