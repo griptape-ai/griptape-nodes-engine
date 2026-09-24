@@ -25,6 +25,7 @@ import dataclasses
 import datetime
 import decimal
 import enum
+import hashlib
 import inspect
 import json
 import logging
@@ -100,6 +101,24 @@ def decode_value(data: Any) -> Any:
     if TYPE_KEY not in data:
         return {key: decode_value(item) for key, item in data.items()}
     return _decode_tagged(data)
+
+
+def is_plain_data(value: Any) -> bool:
+    """Whether ``value`` is already in the form ``encode_value`` returns: JSON types only."""
+    if value is None or type(value) in (bool, int, str):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(is_plain_data(item) for item in value)
+    if type(value) is dict:
+        return all(type(key) is str and is_plain_data(item) for key, item in value.items())
+    return False
+
+
+def value_key(encoded: JsonValue) -> str:
+    """A key that is the same for every encoding of equal content, for pooling saved values."""
+    return hashlib.sha256(_canonical_json(encoded).encode("utf-8")).hexdigest()[:32]
 
 
 def register_value_adapter(adapter: ValueAdapter) -> None:

@@ -178,6 +178,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
+from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -2510,10 +2511,18 @@ class FlowManager(EngineScoped):
             # Strip the prefix to get the original parameter name for the StartFlow node
             original_param_name = prefixed_param_name.removeprefix(f"{class_name_prefix}_")
 
-            # Create unique parameter UUID for this value
+            try:
+                encoded = encode_value(param_value)
+            except ValueEncodeError as error:
+                logger.warning(
+                    "Attempted to pass '%s' into the packaged flow. Failed because %s The flow runs without it.",
+                    prefixed_param_name,
+                    error,
+                )
+                continue
             value_id = id(param_value)
-            unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-            unique_parameter_uuid_to_values[unique_param_uuid] = param_value
+            unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+            unique_parameter_uuid_to_values[unique_param_uuid] = encoded
             serialized_parameter_value_tracker.add_as_serializable(value_id, unique_param_uuid)
 
             # Create set parameter value command
@@ -2591,7 +2600,6 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 create_node_request=start_create_node_command,
-                workflow_manager=self.engine.workflow_manager,
             )
             if param_value_commands is not None:
                 # Modify each command to target the start node parameter instead
@@ -3685,22 +3693,18 @@ class FlowManager(EngineScoped):
         variable: FlowVariable,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
     ) -> SerializedFlowCommands.SerializedVariableCommand:
-        """Register the variable's value in the unique-values pool and build the indirect command.
-
-        Values are stored as raw Python objects — ``_generate_unique_values_code`` pickles them at
-        AST-generation time. Each variable gets its own UUID even if another entry holds an equal
-        value; matching the existing parameter-value pattern, dedup-by-equality is not attempted here.
-        """
-        unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
+        """Pool the variable's encoded value under a hash of its content and build the indirect command."""
         try:
-            unique_parameter_uuid_to_values[unique_value_uuid] = copy.deepcopy(variable.value)
-        except Exception:
-            # Fall back to by-reference storage; matches the parameter-value code path's warning.
+            encoded = encode_value(variable.value)
+        except ValueEncodeError as error:
             logger.warning(
-                "Attempted to serialize variable '%s'. Value could not be deep-copied; storing by reference.",
+                "Attempted to save variable '%s'. Failed because %s It will reopen with no value.",
                 variable.name,
+                error,
             )
-            unique_parameter_uuid_to_values[unique_value_uuid] = variable.value
+            encoded = None
+        unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+        unique_parameter_uuid_to_values[unique_value_uuid] = encoded
 
         create_variable_command = CreateVariableRequest(
             name=variable.name,
@@ -4499,10 +4503,10 @@ class FlowManager(EngineScoped):
             msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}' because the value was missing."
             raise FlowDeserializationError(msg)
 
-        # Call the SetParameterValueRequest, subbing in the value from our unique value list.
-        indirect_set_value_command.set_parameter_value_command.value = unique_parameter_uuid_to_values[
-            unique_value_uuid
-        ]
+        # Call the SetParameterValueRequest, subbing in a freshly decoded copy of the pooled value.
+        indirect_set_value_command.set_parameter_value_command.value = decode_value(
+            unique_parameter_uuid_to_values[unique_value_uuid]
+        )
         # Update the parameter value command to have the correct name.
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)

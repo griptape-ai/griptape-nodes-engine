@@ -12,6 +12,14 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
+- Saved workflow files store parameter values as readable data instead of pickle, and saving an
+  unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
+  by earlier versions still open. A workflow saved by this version does not open in earlier ones.
+  [#5441](https://github.com/griptape-ai/griptape-nodes-engine/issues/5441)
+- A parameter value with no plain-data form is no longer written to saved workflow files, so its
+  node runs again when the workflow reopens. See
+  [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
+  that are saved, and how to make a class savable.
 - A node in a library running in its own process fails with an error naming the parameter when an
   input or output has no plain-data form, instead of receiving or sending it as text. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types

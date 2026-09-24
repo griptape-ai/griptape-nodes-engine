@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
-    from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
@@ -243,7 +242,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.converter import converter, safe_unstructure
-from griptape_nodes.serialization.values import ValueEncodeError, encode_value
+from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3875,7 +3874,6 @@ class NodeManager(EngineScoped):
                 node_name=group_name,
                 unique_parameter_uuid_to_values=unique_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                use_pickling=True,
                 serialize_all_parameter_values=serialize_all_parameter_values,
             )
         )
@@ -3902,7 +3900,6 @@ class NodeManager(EngineScoped):
                     node_name=child_name,
                     unique_parameter_uuid_to_values=unique_uuid_to_values,
                     serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                    use_pickling=True,
                     serialize_all_parameter_values=serialize_all_parameter_values,
                 )
             )
@@ -4199,8 +4196,6 @@ class NodeManager(EngineScoped):
                     unique_parameter_uuid_to_values=request.unique_parameter_uuid_to_values,
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
-                    workflow_manager=self.engine.workflow_manager,
-                    use_pickling=request.use_pickling,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
                 )
                 if set_param_value_requests is not None:
@@ -4487,7 +4482,6 @@ class NodeManager(EngineScoped):
                         node_name=node_name,
                         unique_parameter_uuid_to_values=unique_uuid_to_values,
                         serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                        use_pickling=True,
                     )
                 )
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
@@ -4554,15 +4548,9 @@ class NodeManager(EngineScoped):
             set_lock_commands_per_node=lock_commands,
         )
 
-        # Encode pickled bytes to latin-1 strings for JSON serialization
-        encoded_values = {}
-        for uuid, value in unique_uuid_to_values.items():
-            if isinstance(value, bytes):
-                # Pickled bytes - encode as latin-1 string for transport
-                encoded_values[uuid] = value.decode("latin1")
-            else:
-                # Non-pickled value - keep as-is (for backward compatibility)
-                encoded_values[uuid] = value
+        # The pool holds encoded values. The clipboard payload still carries each one as a latin-1
+        # pickle string, the shape the editor passes back on paste.
+        encoded_values = {uuid: pickle.dumps(value).decode("latin1") for uuid, value in unique_uuid_to_values.items()}
 
         # Pickle the commands object and encode as latin-1 string for transport
         pickled_commands_bytes = pickle.dumps(final_result)
@@ -4676,14 +4664,8 @@ class NodeManager(EngineScoped):
                     param_request.node_name = result.node_name
                     # Set the new value from decoded_values
                     if decoded_values and parameter_command.unique_value_uuid in decoded_values:
-                        value = decoded_values[parameter_command.unique_value_uuid]
-                        # Using try-except-pass instead of contextlib.suppress because it's clearer.
-                        try:  # noqa: SIM105
-                            # If we're pasting multiple times - we need to create a new copy for each paste so they don't all have the same reference.
-                            value = copy.deepcopy(value)
-                        except Exception:  # noqa: S110
-                            pass
-                        param_request.value = value
+                        # Decoding builds a fresh object each time, so repeated pastes share nothing.
+                        param_request.value = decode_value(decoded_values[parameter_command.unique_value_uuid])
                         set_parameter_result = self.engine.handle_request(parameter_command.set_parameter_value_command)
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
@@ -4887,54 +4869,33 @@ class NodeManager(EngineScoped):
         node_name: str,
         *,
         is_output: bool,
-        workflow_manager: WorkflowManager,
-        use_pickling: bool = False,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
-        try:
-            hash(value)
-            value_id = (type(value), value)
-        except TypeError:
-            # Couldn't get a hash. Use the object's ID
-            value_id = id(value)
+        """Pool ``value``'s encoded form under a hash of its content and return the command that restores it.
 
+        Returns None when the value is not to be saved: the parameter opted out, or the value has no
+        plain-data form. The tracker remembers each object's outcome, so a value shared by several
+        parameters is encoded once.
+        """
+        value_id = id(value)
         tracker_status = serialized_parameter_value_tracker.get_tracker_state(value_id)
         match tracker_status:
             case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                # We have a match on this value. We're all good.
                 unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value_hash(value_id)
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
-                # This value is not serializable. Bail.
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                # This value is new for us.
-
-                # Check if parameter is marked as non-serializable (e.g., ImageDrivers, PromptDrivers, file handles)
+                # Author opt-out, e.g. drivers and file handles.
                 if not parameter.serializable:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
-
-                # Check if we can serialize it.
                 try:
-                    pickle.dumps(value)
-                except Exception:
-                    # Not serializable; don't waste time on future attempts.
+                    encoded = encode_value(value)
+                except ValueEncodeError as error:
+                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, error)
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
-                    # Bail.
                     return None
-                # The value should be serialized. Add it to the map of uniques.
-                unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-
-                if use_pickling:
-                    pickled_bytes = workflow_manager._patch_and_pickle_object(value)
-                    unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
-                else:
-                    # Use existing deep copy approach
-                    try:
-                        unique_parameter_uuid_to_values[unique_uuid] = copy.deepcopy(value)
-                    except Exception:
-                        details = f"Attempted to serialize parameter '{parameter_name}' on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
-                        logger.warning(details)
-                        unique_parameter_uuid_to_values[unique_uuid] = value
+                unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+                unique_parameter_uuid_to_values[unique_uuid] = encoded
                 serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)
 
         # Serialize it
@@ -4958,8 +4919,6 @@ class NodeManager(EngineScoped):
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
         *,
-        workflow_manager: WorkflowManager,
-        use_pickling: bool = False,
         serialize_all_parameter_values: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
@@ -4978,8 +4937,6 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
-            workflow_manager (WorkflowManager): Used to pickle values when use_pickling is True
-            use_pickling (bool): If True, use pickle-based serialization; if False, use deep copy
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
 
         Returns:
@@ -5020,8 +4977,6 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
-            workflow_manager=workflow_manager,
-            use_pickling=use_pickling,
         )
         if internal_command is not None:
             commands.append(internal_command)
@@ -5034,8 +4989,6 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
-            workflow_manager=workflow_manager,
-            use_pickling=use_pickling,
         )
         if output_command is not None:
             commands.append(output_command)
@@ -5052,8 +5005,6 @@ class NodeManager(EngineScoped):
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
-        workflow_manager: WorkflowManager,
-        use_pickling: bool,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         """Serialize one of a parameter's values (internal-set or output) for workflow save.
 
@@ -5085,8 +5036,6 @@ class NodeManager(EngineScoped):
             is_output=is_output,
             parameter_name=parameter.name,
             node_name=node.name,
-            workflow_manager=workflow_manager,
-            use_pickling=use_pickling,
         )
         if command is not None:
             return command
@@ -5099,7 +5048,7 @@ class NodeManager(EngineScoped):
         if not parameter.serializable:
             return None
         # Genuine serialization failure — warn and mark unresolved.
-        details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
+        details = f"Attempted to save the {value_kind} value of parameter '{parameter.name}' on node '{node.name}'. Failed because a '{type(value).__name__}' value has no plain-data form, so the node will run again when the workflow is reopened. To keep the value, give its class to_state() and from_state(), or set serializable=False on the parameter to stop this warning."
         logger.warning(details)
         return None
 
