@@ -1959,6 +1959,37 @@ class TestRegisterSandboxNodeFromSourceRequest:
         assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
         assert "BaseNode" in str(result.result_details)
 
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink creation needs privileges on Windows")
+    def test_linked_sandbox_accepts_paths_through_the_link(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is the folder the link points at
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sandbox folder that is a link still contains the files written through it."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterSandboxNodeFromSourceRequest,
+            RegisterSandboxNodeFromSourceResultSuccess,
+        )
+
+        library_manager = engine.library_manager
+        sandbox_link = tmp_path / "sandbox_link"
+        sandbox_link.symlink_to(_isolate_registry_and_config, target_is_directory=True)
+        monkeypatch.setattr(
+            library_manager,
+            "_get_sandbox_directory",
+            MagicMock(spec=_LibraryManager._get_sandbox_directory, return_value=sandbox_link),
+        )
+        (sandbox_link / self._FILE_NAME).write_text(self._SOURCE_OK)
+
+        for requested_path in (self._FILE_NAME, str(sandbox_link / self._FILE_NAME)):
+            result = library_manager.register_sandbox_node_from_source_request(
+                RegisterSandboxNodeFromSourceRequest(file_path=requested_path)
+            )
+
+            assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), requested_path
+
 
 class _DescribeNodeTypeProbe(BaseNode):
     """Concrete BaseNode used to exercise describe_node_type_request."""

@@ -40,7 +40,12 @@ from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
-from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io, resolve_workspace_path
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity,
+    canonicalize_for_identity_preserving_symlinks,
+    canonicalize_for_io,
+    resolve_workspace_path,
+)
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
     LibraryDependencyDeclaration,
@@ -2107,8 +2112,20 @@ class LibraryManager(EngineScoped):
         if not sandbox_library_subdir:
             return None
 
-        sandbox_library_dir = resolve_workspace_path(Path(sandbox_library_subdir), config_mgr.workspace_path)
+        # Links are kept, not resolved: the workspace scans name files by the link's path, so
+        # resolving a linked sandbox would name the same files a second way.
+        sandbox_library_dir = canonicalize_for_identity_preserving_symlinks(
+            sandbox_library_subdir, base=config_mgr.workspace_path
+        )
         if not sandbox_library_dir.exists():
+            # Log the setting and the path it became, to expose a typo or an unset variable.
+            # A leading `$` never gets here: the config manager reads `$MY_VAR/sub` as a secret
+            # named `MY_VAR_SUB`.
+            logger.debug(
+                "The sandbox library directory '%s' does not exist at '%s', so no sandbox is loaded.",
+                sandbox_library_subdir,
+                sandbox_library_dir,
+            )
             return None
 
         return sandbox_library_dir
@@ -2203,15 +2220,26 @@ class LibraryManager(EngineScoped):
 
         # Canonicalize the requested path against the sandbox dir. Relative paths anchor to
         # the sandbox; absolute paths stay where they are. We then verify the result lives
-        # under the canonical sandbox dir so callers can never reach outside it via `..` or
-        # absolute paths to other locations.
-        sandbox_root = canonicalize_for_identity(sandbox_dir)
+        # under the sandbox dir so callers can never reach outside it. Two steps, links kept then
+        # followed, because links can sit in two places:
+        #   1. Keeping links: the scan names files in a linked subfolder by the link, so
+        #      `<sandbox>/link_name/node.py` is inside even when `link_name` points elsewhere.
+        #   2. Following links: a link above the file can hide one that is really inside, and a
+        #      linked sandbox's real location is the same folder, so it is accepted too.
+        # Safe because every path here is normalized lexically first: `link_name/../x.py` becomes
+        # `<sandbox>/x.py` before any link is followed, so a `..` never reaches past a link.
+        sandbox_root = canonicalize_for_identity_preserving_symlinks(sandbox_dir)
         file_path = canonicalize_for_io(request.file_path, base=sandbox_dir)
-        file_identity = canonicalize_for_identity(request.file_path, base=sandbox_dir)
-        if not file_identity.is_relative_to(sandbox_root):
+        file_identity = canonicalize_for_identity_preserving_symlinks(request.file_path, base=sandbox_dir)
+        is_inside_keeping_links = file_identity.is_relative_to(sandbox_root)
+        # Unlike the paths around it, the import uses the resolved path (as the sandbox load and
+        # library loader do): the module name comes from the path, so one file is one module.
+        resolved_file = resolve_workspace_path(file_identity, sandbox_dir)
+        is_inside_following_links = resolved_file.is_relative_to(canonicalize_for_identity(sandbox_dir))
+        if not is_inside_keeping_links and not is_inside_following_links:
             details = (
                 f"Attempted to register a sandbox node with file_path={request.file_path!r}. "
-                f"Failed because the resolved path '{file_identity}' is not inside the "
+                f"Failed because the path '{file_identity}' is not inside the "
                 f"sandbox directory '{sandbox_root}'."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
@@ -2228,7 +2256,7 @@ class LibraryManager(EngineScoped):
             # is confusing in a user-facing message. file_identity is the un-prefixed form.
             details = (
                 f"Attempted to register a sandbox node with file_path={request.file_path!r}. "
-                f"Failed because no file exists at the resolved path '{file_identity}'. Write "
+                f"Failed because no file exists at the path '{file_identity}'. Write "
                 "the source file into the sandbox directory before calling this request."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
@@ -2237,7 +2265,7 @@ class LibraryManager(EngineScoped):
         # (re-importing an existing module with fresh source), which is exactly what an agent
         # iterating on a draft needs.
         try:
-            module = self._load_module_from_file(file_path, LibraryManager.SANDBOX_LIBRARY_NAME)
+            module = self._load_module_from_file(resolved_file, LibraryManager.SANDBOX_LIBRARY_NAME)
         except ImportError as err:
             # Display file_identity (un-prefixed); file_path may carry the \\?\ prefix on Windows.
             details = f"Attempted to register a sandbox node from '{file_identity}'. Failed at import time: {err}"
@@ -2273,7 +2301,7 @@ class LibraryManager(EngineScoped):
             if sandbox_library.has_node_type(class_name):
                 if not request.replace_if_exists:
                     details = (
-                        f"Attempted to register node type '{class_name}' from '{file_path}'. "
+                        f"Attempted to register node type '{class_name}' from '{file_identity}'. "
                         "Failed because a node type with that name is already registered in "
                         "the Sandbox Library and replace_if_exists=False."
                     )
@@ -2291,19 +2319,19 @@ class LibraryManager(EngineScoped):
 
         if not registered_class_names:
             details = (
-                f"Imported '{file_path}' successfully, but it does not declare any BaseNode "
+                f"Imported '{file_identity}' successfully, but it does not declare any BaseNode "
                 "subclasses (must be `class X(BaseNode):` defined in this file, not "
                 "re-exported from another module). Nothing was registered."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
         summary = (
-            f"Registered {len(registered_class_names)} node type(s) from '{file_path}' "
+            f"Registered {len(registered_class_names)} node type(s) from '{file_identity}' "
             f"into the {LibraryManager.SANDBOX_LIBRARY_NAME} "
             f"(replaced: {len(replaced_class_names)})."
         )
         return RegisterSandboxNodeFromSourceResultSuccess(
-            file_path=str(file_path),
+            file_path=str(file_identity),
             library_name=LibraryManager.SANDBOX_LIBRARY_NAME,
             registered_class_names=registered_class_names,
             replaced_class_names=replaced_class_names,
@@ -5770,7 +5798,8 @@ class LibraryManager(EngineScoped):
         actual_node_definitions = []
         for node_def in library_schema.nodes:
             # Resolve relative path from schema against sandbox directory
-            candidate_path = sandbox_library_dir / node_def.file_path
+            # Resolved, unlike the sandbox paths around it: one file is one module.
+            candidate_path = resolve_workspace_path(Path(node_def.file_path), sandbox_library_dir)
             try:
                 module = self._load_module_from_file(candidate_path, LibraryManager.SANDBOX_LIBRARY_NAME)
             except Exception as err:
@@ -5896,9 +5925,21 @@ class LibraryManager(EngineScoped):
         )
 
     def _find_files_in_dir(self, directory: Path, extension: str) -> list[Path]:
-        """Find all files with given extension in directory, excluding common non-source directories."""
+        """Find all files with given extension in directory, excluding common non-source directories.
+
+        Follows links to folders and keeps each link in the returned paths. A folder reached again
+        (link loop, second link) is skipped, so which spelling survives depends on walk order.
+        """
         ret_val = []
-        for root, dirs, files_found in os.walk(directory):
+        visited_directories: set[Path] = set()
+        for root, dirs, files_found in os.walk(directory, followlinks=True):
+            # Compare real locations so a link back up the tree ends the walk.
+            real_root = canonicalize_for_identity(root)
+            if real_root in visited_directories:
+                dirs[:] = []
+                continue
+            visited_directories.add(real_root)
+
             # Modify dirs in-place to skip excluded directories
             # Also skip any directory starting with '.'
             dirs[:] = [d for d in dirs if d not in EXCLUDED_SCAN_DIRECTORIES and not d.startswith(".")]

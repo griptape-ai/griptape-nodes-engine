@@ -466,7 +466,7 @@ class Settings(BaseModel):
     sandbox_library_directory: str = Field(
         category=FILE_SYSTEM,
         default="sandbox_library",
-        description="Path to the sandbox library directory (useful while developing nodes). Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is.",
+        description="Path to the sandbox library directory (useful while developing nodes). Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. `~` and environment variables later in the path are expanded; a value that starts with `$` is looked up as a secret name instead.",
     )
     libraries_directory: str = Field(
         category=FILE_SYSTEM,

@@ -15,6 +15,9 @@ the engine's request API from working without edits. Migration steps live in
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
+- The sandbox library now loads nodes from folders linked into it, and `~` and environment
+  variables in `sandbox_library_directory` are expanded. A value that starts with `$` is still read
+  as a secret name.
 
 ### Fixed
 
