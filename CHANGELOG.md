@@ -15,6 +15,11 @@ the engine's request API from working without edits. Migration steps live in
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
   into a separate `.venv-exec` and load only in the library's own process, where its nodes run, so
   libraries with clashing heavy pins can be installed side by side.
+- A node in a library that runs isolated in a worker can hand an unserializable value, such as a
+  diffusers pipeline or a latent tensor, to the next node. Mark the producing output
+  `serializable=False` and the engine holds the object in the worker, sending an opaque key in its
+  place that the consuming node's read resolves. See
+  [MIGRATION.md](MIGRATION.md#serializablefalse-outputs-are-held-in-their-own-process-across-a-worker-boundary).
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
 
 ### Changed
@@ -23,6 +28,14 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
+- An app event raised in one process is no longer delivered to listeners in another. A library running
+  isolated in its own process reports to the engine by sending a request instead.
+
+### Removed
+
+- **Breaking:** `LibraryLoadedNotification` no longer carries `node_schemas`. A library that loaded in
+  its own process reports its schemas to the engine with the new `ReportLibraryLoadedRequest`, and the
+  notification that follows says only how the load went.
 
 ### Fixed
 
@@ -45,5 +58,12 @@ the engine's request API from working without edits. Migration steps live in
 - `RunWorkflowWithCurrentStateRequest` fails when a workflow is already open, instead of attaching
   the target as a hidden flow that was saved and run along with the open workflow.
   [#5526](https://github.com/griptape-ai/griptape-nodes-engine/issues/5526)
+- Nodes in a library that runs isolated in its own process no longer stop working mid-session while
+  the engine is busy. That process is now dropped for leaving heartbeat challenges unanswered rather
+  than for elapsed time, so `worker.heartbeat_timeout_s` bounds unanswered challenges instead of
+  wall-clock silence.
+- A node that writes a list or dictionary to an output and reads it back gets the same object rather
+  than a copy of it, and a value that refers to itself no longer fails the node with a
+  `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
