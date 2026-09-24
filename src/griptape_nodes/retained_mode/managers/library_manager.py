@@ -5221,7 +5221,7 @@ class LibraryManager(EngineScoped):
         """
         library_name = library.get_library_data().name
         loader = self._make_node_class_loader(node_file_path, node_definition.class_name, library_name, module_loaders)
-        # Saved workflows import (and unpickle) classes from this file via its stable namespace
+        # Saved workflows import classes, and rebuild values, from this file via its stable namespace
         # (`griptape_nodes.node_libraries.<lib>.<file>`). With eager loading that namespace is in
         # sys.modules by now; with lazy loading it is not, so register a pending loader that the
         # StableNamespaceImportFinder resolves on first import of the namespace.
