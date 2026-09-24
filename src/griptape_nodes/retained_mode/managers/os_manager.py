@@ -2668,7 +2668,6 @@ class OSManager(EngineScoped):
                     # A pre-captured record must not outlive a failed write.
                     if provenance_details is not None:
                         self.engine.provenance_manager.rollback_record(provenance_details)
-                        provenance_details = None
                     # error_message is guaranteed to be set when failure_reason is set
                     return WriteFileResultFailure(
                         failure_reason=result.failure_reason,
