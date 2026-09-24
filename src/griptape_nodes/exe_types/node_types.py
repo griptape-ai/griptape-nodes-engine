@@ -357,12 +357,14 @@ class BaseNode(ABC):
 
     @property
     def parameters_added_during_execution(self) -> set[str]:
-        """Names of parameters the node grew while running, a subset of the set above.
+        """Names of parameters the node is growing while it runs, a subset of the set above.
 
         These are scratch state rather than node shape: a node adds one to feed a helper and drops
-        it when the run ends, so serialization leaves it out entirely. Parameters a node builds from
-        its value hooks are excluded, because those arrive during input hydration and are meant to
-        last, which is why this is narrower than ``parameters_added_after_construction``.
+        it when the run ends, so serialization leaves it out entirely. Only ever populated while a
+        run is in flight -- the framework empties it when the run ends, so a parameter that outlived
+        its run is durable structure from then on. Parameters a node builds from its value hooks are
+        excluded too, because those arrive during input hydration and are meant to last, which is
+        why this is narrower than ``parameters_added_after_construction``.
         """
         return self._parameters_added_during_execution
 
@@ -1927,7 +1929,13 @@ class BaseNode(ABC):
         )
 
     def _record_parameter_add_scope(self, parameter_name: str) -> None:
-        """Populate the two parameter-origin sets, off the same flags as the detector above."""
+        """Populate the two parameter-origin sets from the scope this add arrived in.
+
+        Reads the same flags as the detector above, but not the same way: a sanctioned
+        mutation is exempt from the execution set only, because ``AddParameterToNodeRequest``
+        syncs the parameter back to the orchestrator and so builds durable structure even
+        mid-run, while it is still structure the node did not declare in ``__init__``.
+        """
         # Lazy import: library_registry imports BaseNode from this module,
         # so importing at module load creates a cycle.
         from griptape_nodes.node_library.library_registry import LibraryRegistry
@@ -1935,8 +1943,16 @@ class BaseNode(ABC):
         if LibraryRegistry.is_constructing_node():
             return
         self._parameters_added_after_construction.add(parameter_name)
-        if _in_aprocess.get():
+        if _in_aprocess.get() and not _sanctioned_mutation.get():
             self._parameters_added_during_execution.add(parameter_name)
+
+    def forget_parameters_added_during_execution(self) -> None:
+        """Drop the scratch marker from every parameter still carrying it. Called when a run ends.
+
+        Scratch parameters are torn down by the run that made them, so one that outlives the
+        run was structure after all. Keeping the marker would drop it from every later save.
+        """
+        self._parameters_added_during_execution.clear()
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""

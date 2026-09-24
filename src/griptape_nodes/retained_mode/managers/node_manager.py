@@ -3621,6 +3621,11 @@ class NodeManager(EngineScoped):
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
                 )
+            finally:
+                # The scratch marker only means anything while the run is in flight. A parameter
+                # the node still holds here was never torn down, so serialization must treat it
+                # as structure rather than dropping it from every later save.
+                node.forget_parameters_added_during_execution()
         if self.engine.library_manager.is_worker:
             unshippable = self._unshippable_output_names(node)
             if unshippable:
