@@ -25,6 +25,10 @@ callbacks and other constructor wiring. For a parameter the node declares, only 
 from what the node builds are saved, so changing a constructor default still reaches existing
 workflows.
 
+When the node does not build a saved trait, the engine builds it with `from_state()`, which passes
+the state to the constructor. Override it when `to_state()` keys are not constructor arguments.
+The state can hold only some keys, so fall back to defaults for missing ones.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display

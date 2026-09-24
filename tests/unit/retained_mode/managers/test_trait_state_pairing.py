@@ -1,5 +1,6 @@
 import sys
 from collections.abc import Generator
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -61,6 +62,7 @@ class Ranged(Trait):
 
     def __init__(self, level: int = 1) -> None:
         super().__init__()
+        self._validate_level(level)
         self.level = level
 
     @classmethod
@@ -74,13 +76,42 @@ class Ranged(Trait):
         if "level" not in state:
             return
         level = state["level"]
+        self._validate_level(level)
+        self.level = level
+
+    @staticmethod
+    def _validate_level(level: int) -> None:
         if level not in (1, _ALLOWED_LEVEL, 3):
             msg = "level must be between 1 and 3"
             raise ValueError(msg)
-        self.level = level
 
     def ui_options_for_trait(self) -> dict:
         return {}
+
+
+class Threshold(Trait):
+    """Saves ``level`` while its constructor takes ``threshold``."""
+
+    def __init__(self, threshold: int = 1) -> None:
+        super().__init__()
+        self.level = threshold
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Threshold":
+        return cls(threshold=state["level"])
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
+_SAVED_THRESHOLD = 7
 
 
 @pytest.fixture
@@ -107,10 +138,12 @@ class TestPairingByClass:
             [
                 {
                     "trait_name": "Slider",
+                    "trait_module": "griptape_nodes.traits.slider",
                     "trait_state": {"min_val": 2, "max_val": 8},
                 },
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["b"]},
                 },
             ],
@@ -119,6 +152,45 @@ class TestPairingByClass:
         slider = parameter.find_elements_by_type(Slider)[0]
         assert (slider.min, slider.max) == (2, 8)
         assert parameter.find_elements_by_type(Options)[0].choices == ["b"]
+
+    def test_an_entry_without_a_module_still_reaches_an_attached_trait(self) -> None:
+        slider = Slider(min_val=0, max_val=1)
+        parameter = Parameter(name="p", tooltip="t", traits={slider})
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Slider", "trait_state": {"min_val": 2, "max_val": 8}}],
+        )
+
+        assert (slider.min, slider.max) == (2, 8)
+
+    def test_an_entry_whose_module_moved_still_reaches_an_attached_trait(self) -> None:
+        slider = Slider(min_val=0, max_val=1)
+        parameter = Parameter(name="p", tooltip="t", traits={slider})
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Slider", "trait_module": "moved_away.slider", "trait_state": {"min_val": 2}}],
+        )
+
+        assert slider.min == 2  # noqa: PLR2004
+        assert len(parameter.find_elements_by_type(Slider)) == 1
+
+    def test_a_same_named_trait_from_another_library_is_not_mistaken_for_it(self, foreign_twin: ModuleType) -> None:
+        local = Twin(tag="local")
+        parameter = Parameter(name="p", tooltip="t", traits={local})
+
+        # The saved entry names the other library's Twin, so it describes a trait this
+        # parameter does not carry. Matching on the name alone would overwrite the local one.
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Twin", "trait_module": foreign_twin.__name__, "trait_state": {"tag": "foreign"}}],
+        )
+
+        assert local.tag == "local"
+        attached = parameter.find_elements_by_type(Twin)
+        assert len(attached) == 2  # noqa: PLR2004
+        assert {type(trait).__module__ for trait in attached} == {Twin.__module__, foreign_twin.__name__}
 
 
 class TestPairingIsOneToOne:
@@ -133,10 +205,12 @@ class TestPairingIsOneToOne:
             [
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["first"]},
                 },
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["second"]},
                 },
             ],
@@ -150,8 +224,8 @@ class TestPairingIsOneToOne:
         NodeManager._apply_trait_states(
             parameter,
             [
-                {"trait_name": "Options", "trait_state": {}},
-                {"trait_name": "Options", "trait_state": {}},
+                {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
+                {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
             ],
         )
 
@@ -165,7 +239,7 @@ class TestPartialState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Slider", "trait_state": {"min_val": 2}}],
+            [{"trait_name": "Slider", "trait_module": "griptape_nodes.traits.slider", "trait_state": {"min_val": 2}}],
         )
 
         assert (slider.min, slider.max) == (2, 1)
@@ -204,7 +278,7 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert ranged.level == _ALLOWED_LEVEL
@@ -215,17 +289,30 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
+
+    def test_the_warning_says_the_attached_trait_stays(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits={Ranged(level=_ALLOWED_LEVEL)})
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("keeps the state its node supplied" in message for message in messages)
+        assert not any("loads without" in message for message in messages)
 
     def test_no_trait_is_built_when_none_is_already_attached(self) -> None:
         parameter = Parameter(name="p", tooltip="t", traits=set())
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert parameter.find_elements_by_type(Ranged) == []
@@ -236,7 +323,36 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
+
+
+class TestBuildingFromState:
+    def test_a_trait_can_build_itself_from_state_its_constructor_does_not_take(self) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Threshold", "trait_module": __name__, "trait_state": {"level": _SAVED_THRESHOLD}}],
+        )
+
+        built = parameter.find_elements_by_type(Threshold)
+        assert [trait.level for trait in built] == [_SAVED_THRESHOLD]
+
+    def test_a_broken_trait_module_is_imported_once(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A module that raises on import is not cached, so each resolve runs it again.
+        (tmp_path / "exploding_pairing_module.py").write_text('raise RuntimeError("library blew up on import")')
+        monkeypatch.syspath_prepend(str(tmp_path))
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Slider", "trait_module": "exploding_pairing_module", "trait_state": {}}],
+        )
+
+        assert caplog.text.count("library blew up on import") == 1

@@ -84,6 +84,11 @@ def changed_trait_states(built: list[dict[str, Any]], current: list[dict[str, An
 
 
 def _take_counterpart(candidates: list[dict[str, Any]], entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Pair by name and module, which agree because both sides come from live traits.
+
+    Load-side pairing in ``NodeManager._take_attached_trait`` resolves classes instead, since
+    saved modules are stable names.
+    """
     identity = _trait_identity(entry)
     for candidate in candidates:
         if _trait_identity(candidate) == identity:
@@ -98,9 +103,10 @@ def _trait_identity(entry: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TraitStateEntry:
-    """Saved trait identity and state."""
+    """``trait_module`` disambiguates same-named traits and locates unattached classes."""
 
     trait_name: str
+    trait_module: str | None = None
     trait_state: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -108,10 +114,13 @@ class TraitStateEntry:
         trait_name = entry.get("trait_name")
         if not isinstance(trait_name, str):
             return None
+        trait_module = entry.get("trait_module")
+        if not isinstance(trait_module, str):
+            trait_module = None
         trait_state = entry.get("trait_state")
         if not isinstance(trait_state, dict):
             trait_state = {}
-        return cls(trait_name=trait_name, trait_state=trait_state)
+        return cls(trait_name=trait_name, trait_module=trait_module, trait_state=trait_state)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"trait_name": self.trait_name, "trait_state": self.trait_state}
+        return {"trait_name": self.trait_name, "trait_module": self.trait_module, "trait_state": self.trait_state}

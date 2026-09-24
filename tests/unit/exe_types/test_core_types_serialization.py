@@ -353,6 +353,7 @@ class TestTraitToDict:
         assert param.trait_states() == [
             {
                 "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
                 "trait_state": {
                     "choices": ["updated 1", "updated 2"],
                     "show_search": True,

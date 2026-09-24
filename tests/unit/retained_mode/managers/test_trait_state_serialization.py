@@ -161,6 +161,7 @@ class TestSerializeThenReplay:
         assert model_command.traits == [
             {
                 "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
                 "trait_state": {
                     "choices": ["sdxl", "sd3", "flux"],
                     "show_search": True,
@@ -174,6 +175,7 @@ class TestSerializeThenReplay:
         assert reload_command.traits == [
             {
                 "trait_name": "Button",
+                "trait_module": "griptape_nodes.traits.button",
                 "trait_state": {
                     "label": "Reload",
                     "variant": "secondary",
@@ -191,6 +193,77 @@ class TestSerializeThenReplay:
                 },
             }
         ]
+
+    def test_a_dynamic_trait_module_is_saved_by_stable_name(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        monkeypatch.setattr(Options, "__module__", "gtn_dynamic_module_options_test")
+        monkeypatch.setattr(
+            engine.library_manager,
+            "get_stable_namespace_for_dynamic_module",
+            lambda _module: "stable_library.options",
+        )
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+        traits = commands["model"].traits
+        assert traits is not None
+        assert traits[0]["trait_module"] == "stable_library.options"
+
+    def test_a_dynamic_trait_without_a_stable_name_omits_its_module(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        monkeypatch.setattr(Options, "__module__", "gtn_dynamic_module_options_test")
+        monkeypatch.setattr(engine.library_manager, "get_stable_namespace_for_dynamic_module", lambda _module: None)
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+        traits = commands["model"].traits
+        assert traits is not None
+        assert traits[0]["trait_module"] is None
+
+    def test_replaying_the_commands_restores_state(self, engine: Engine) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        node.set_parameter_value("model", "flux")
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+
+        target = _add_node(engine, "reloaded")
+        for command in commands.values():
+            command.node_name = target.name
+            command.initial_setup = True
+            replay_result = engine.handle_request(command)
+            assert isinstance(replay_result, AddParameterToNodeResultSuccess)
+
+        model = target.get_parameter_by_name("model")
+        assert model is not None
+        assert model.ui_options["simple_dropdown"] == ["sdxl", "sd3", "flux"]
+        converted = "not-a-model"
+        for converter in model.converters:
+            converted = converter(converted)
+        assert converted == "sdxl"  # Options snaps an invalid value to its first choice.
+
+        # A replayed command carries state, not behavior. Behavior comes from the node's own
+        # code, which is why a declared parameter's button still fires: its trait is built by
+        # __init__ and only updated from the save. A bare replay onto a node whose code never
+        # built this button has nothing to supply the handler.
+        reload_button = next(
+            trait
+            for trait in target.get_parameter_by_name("reload").find_elements_by_type(Button)  # type: ignore[union-attr]
+        )
+        assert reload_button.label == "Reload"
+        assert reload_button.on_click_callback is None
 
 
 class _UnsaveableValueTrait(Trait):
@@ -263,6 +336,7 @@ class TestAnUnsaveableTraitValueDegradesTheSaveInsteadOfFailingIt:
         assert broken_command.traits == [
             {
                 "trait_name": "_UnsaveableValueTrait",
+                "trait_module": _UnsaveableValueTrait.__module__,
                 "trait_state": {},
             }
         ]
@@ -338,6 +412,70 @@ class TestTraitStateMissingARequiredArgument:
         )
 
 
+class _IndexingTrait(Trait):
+    """Builds from state by indexing, so partial state raises ``KeyError``."""
+
+    def __init__(self, threshold: int = 1) -> None:
+        super().__init__()
+        self.level = threshold
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def to_state(self) -> dict[str, Any]:
+        return {"level": self.level}
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "_IndexingTrait":
+        return cls(threshold=state["level"])
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
+class TestFromStateRaisingAnUnexpectedError:
+    """Library code can raise anything; the parameter must still load."""
+
+    def test_the_parameter_loads_without_the_trait(self, engine: Engine) -> None:
+        target = _add_node(engine, "target")
+
+        result = engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_IndexingTrait", "trait_module": __name__, "trait_state": {}}],
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = target.get_parameter_by_name("model")
+        assert parameter is not None
+        assert parameter.trait_states() == []
+
+    def test_the_warning_carries_the_error(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        target = _add_node(engine, "target")
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_IndexingTrait", "trait_module": __name__, "trait_state": {}}],
+            )
+        )
+
+        assert any(
+            "_IndexingTrait" in record.getMessage() and "level" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+
 def _add_declared_node(engine: Engine, name: str) -> _DeclaredControls:
     context = engine.handle_request(
         EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")
@@ -387,7 +525,13 @@ class TestOnlyChangedTraitStateIsSaved:
 
         traits = _altered_trait_states(engine, node, "width")
 
-        assert traits == [{"trait_name": "Slider", "trait_state": {"max_val": NARROWED_MAX}}]
+        assert traits == [
+            {
+                "trait_name": "Slider",
+                "trait_module": "griptape_nodes.traits.slider",
+                "trait_state": {"max_val": NARROWED_MAX},
+            }
+        ]
 
     def test_changed_choices_leave_constructor_config_out(self, engine: Engine) -> None:
         node = _add_declared_node(engine, "source")
@@ -395,7 +539,13 @@ class TestOnlyChangedTraitStateIsSaved:
 
         traits = _altered_trait_states(engine, node, "model")
 
-        assert traits == [{"trait_name": "Options", "trait_state": {"choices": ["x", "y"]}}]
+        assert traits == [
+            {
+                "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
+                "trait_state": {"choices": ["x", "y"]},
+            }
+        ]
 
 
 class TestRunTimeStateReachesTheTrait:
