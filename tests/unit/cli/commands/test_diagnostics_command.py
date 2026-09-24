@@ -121,9 +121,8 @@ def _run(result: object, *, library_load: object = None, **kwargs: object) -> _R
     options.update(kwargs)
 
     def dispatch(request: object, **_kwargs: object) -> object:
-        # Answered by request type rather than by call order, because `--skip-libraries`
-        # changes how many requests there are and a positional list would then hand the
-        # library load's answer to the collection.
+        # Answered by request type, not call order: `--skip-libraries` changes how many requests
+        # there are, and a positional list would hand the library load's answer to the collection.
         if isinstance(request, CollectDiagnosticsRequest):
             if isinstance(result, Exception):
                 raise result

@@ -135,9 +135,7 @@ async def _collect_async(output: Path, *, include_logs: bool, load_libraries: bo
             console.print(f"  [yellow]{escape(warning)}[/yellow]")
         console.print()
 
-    # The line printed on every collect, which is where a promise about secrets would
-    # actually be read. It names the two files free text ends up in rather than declaring
-    # the bundle clean: the engine removed what it knows, and what it knows is not
-    # everything a machine might be holding.
+    # Names the two files free text ends up in rather than declaring the bundle clean: the engine
+    # removed what it knows, and what it knows is not everything a machine might be holding.
     console.print("[dim]Read manifest.json to see what was removed.[/dim]")
     console.print("[dim]Skim the logs and the workflow before posting this anywhere public.[/dim]")

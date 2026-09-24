@@ -34,15 +34,9 @@ def doctor_command() -> None:
 
 async def _doctor_async() -> None:
     """Run the engine's health checks and print what they found."""
-    # Libraries are loaded first because "which libraries are broken" is one of the
-    # checks, and an engine that has not loaded any would report none at all.
-    #
-    # Both of these calls are guarded, and guarded broadly, because both of them start the
-    # engine -- and a broken engine is the single most likely reason somebody is running
-    # this command. A library whose import raises, a config file the engine cannot get
-    # past: left unguarded, the tool that exists to explain those answers with a traceback,
-    # which is the same thing the user already saw. A message naming what was being
-    # attempted is the least this command owes somebody who came here for help.
+    # Libraries first because "which libraries are broken" is one of the checks. Both calls are
+    # guarded broadly because both start the engine, and a broken engine is the most likely reason
+    # somebody ran this command -- unguarded, it answers with the traceback they already saw.
     try:
         with console.status("Loading libraries..."):
             await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
@@ -94,9 +88,8 @@ def _print_health_report(health: HealthReport) -> None:
             console.print(Padding(Text(f"{check.name}: {check.remedy}"), (0, 0, 0, 2)))
         return
 
-    # No remedy is not the same as no problem: a check that could not run reports a failure
-    # with nothing to suggest. The all-clear is decided on the overall status, so it can
-    # never be printed underneath a red FAIL row.
+    # No remedy is not the same as no problem: a check that could not run reports a failure with
+    # nothing to suggest. The all-clear is decided on the overall status instead.
     if health.status is not HealthStatus.PASS:
         console.print("[bold yellow]Some checks did not pass. What they found is in the table above.[/bold yellow]")
         return

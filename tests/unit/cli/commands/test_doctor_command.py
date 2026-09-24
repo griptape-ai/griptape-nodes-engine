@@ -25,9 +25,8 @@ _MODULE = "griptape_nodes.cli.commands.doctor"
 
 _ALL_CLEAR = "Everything checks out."
 
-# The table is `expand=True`, so it fills whatever width it is given and its cells wrap to
-# fit. Wide enough here that the short strings these tests look for are never broken across
-# two lines, which would fail a substring assertion on text the user can plainly read.
+# The table is `expand=True`, so cells wrap to the width it is given. Wide enough here that
+# the short strings these tests assert on are never broken across two lines.
 _WIDE_ENOUGH_NOT_TO_WRAP = 200
 
 
@@ -102,9 +101,8 @@ def _run(result: object, *, library_load: object = None) -> _Run:
     )
 
     def dispatch(request: object, **_kwargs: object) -> object:
-        # Answered by request type rather than by call order: a positional list of answers
-        # silently hands the library load's answer to the health checks the day the command
-        # dispatches one more request.
+        # Answered by request type, not call order: a positional list would hand the library load's
+        # answer to the health checks the day the command dispatches one more request.
         if isinstance(request, RunHealthChecksRequest):
             if isinstance(result, Exception):
                 raise result
