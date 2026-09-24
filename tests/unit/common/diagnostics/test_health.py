@@ -1,8 +1,7 @@
 """Tests for the health checks.
 
-Each check turns facts into a verdict, so these pin the verdicts: what counts as broken,
-what counts as merely worth warning about, and that a broken check never takes the run
-down with it.
+Each check turns facts into a verdict, so these pin the verdicts: what counts as broken, what
+counts as merely worth warning about, and that a broken check never takes the run down with it.
 """
 
 from __future__ import annotations
@@ -198,9 +197,8 @@ class TestLibraryCheck:
     async def test_warns_on_a_library_whose_state_it_cannot_interpret(self) -> None:
         """A fitness this check has never heard of must not read as a clean load.
 
-        `NOT_EVALUATED` is one the engine really sets, and a value a newer engine invents
-        lands here too. Either way the library the report is being collected about is the
-        one nobody can say anything about.
+        `NOT_EVALUATED` is one the engine really sets, and a value a newer engine invents lands
+        here too. Either way the library is the one nobody can say anything about.
         """
         libraries = [
             LibraryDiagnostics(name="Never Evaluated", fitness="NOT_EVALUATED"),
@@ -220,8 +218,7 @@ class TestLibraryCheck:
         """A disabled library is never loaded, so it never becomes GOOD.
 
         Reported as one that did not load cleanly, it sends someone to fix a library they
-        turned off deliberately -- and it downgrades an otherwise healthy engine to a
-        warning, which is the state people stop reading.
+        turned off deliberately, and downgrades an otherwise healthy engine to a warning.
         """
         libraries = [
             LibraryDiagnostics(name="In Use", fitness="GOOD"),
@@ -249,10 +246,10 @@ class TestLibraryCheck:
     async def test_only_a_good_library_reads_as_an_all_clear(self, fitness: LibraryManager.LibraryFitness) -> None:
         """Every fitness the engine can report, and only GOOD is allowed to pass.
 
-        The check compares strings so a verdict stays readable from a bundle written by a
-        different engine version, which means a new `LibraryFitness` member compiles fine
-        and would otherwise be discovered by a user whose broken library reported an
-        all-clear. Driven off the enum so adding a member fails here first.
+        The check compares strings so a verdict stays readable from a bundle written by another
+        engine version, which means a new `LibraryFitness` member compiles fine and would
+        otherwise be found by a user whose broken library reported an all-clear. Driven off the
+        enum so adding a member fails here first.
         """
         libraries = [LibraryDiagnostics(name="Under Test", fitness=fitness.value)]
 
@@ -291,9 +288,8 @@ class TestSecretsCheck:
     async def test_the_all_clear_counts_only_the_secrets_something_asked_for(self) -> None:
         """The report lists every key it found, and most of them nothing is expecting.
 
-        Counting those made the all-clear claim to have checked keys it never looked at --
-        "every one of the 14 expected secrets has a value" on an engine where one library
-        declared one key and the rest of the environment happened to hold thirteen.
+        Counting those made the all-clear claim to have checked keys it never looked at -- "all
+        14 expected secrets have a value" on an engine where one library declared one.
         """
         secrets = [
             SecretDiagnostics(name="DECLARED", is_set=True, declared_in_config=True),
@@ -384,9 +380,8 @@ class TestCloudConnectionCheck:
         """The no-key answer is decided before a socket is opened.
 
         The connect call is replaced with one that fails the test, so the second half of the
-        name is enforced rather than asserted in prose. Without this, a check that dialled
-        Griptape Cloud with an empty Authorization header and reported the refusal would
-        still produce a FAIL naming the key, and pass.
+        name is enforced rather than asserted in prose: without it, a check that dialled the
+        API with an empty Authorization header and reported the refusal would also pass.
         """
         check = CloudConnectionCheck()
 
@@ -422,10 +417,9 @@ class TestCloudConnectionCheck:
         """A distinct verdict from "could not be reached", and easily lost.
 
         `TimeoutError` is a subclass of `OSError`, so moving the `OSError` branch above it
-        compiles, passes every other test here, and turns "a firewall is swallowing this"
-        into "check your network connection" -- the wrong thing to go and look at. The
-        timeout is shortened rather than waited out; what is being pinned is which branch
-        catches it.
+        compiles, passes every other test here, and turns "a firewall is swallowing this" into
+        "check your network connection". The timeout is shortened rather than waited out; what
+        is pinned is which branch catches it.
         """
         check = CloudConnectionCheck()
 
@@ -497,9 +491,8 @@ class TestCloudConnectionCheck:
         """Rewriting the scheme by string replacement rewrote every "http" in the URL.
 
         `myhttpserver.example.com` became `mywsserver.example.com`, which resolves to nothing
-        -- so a check that exists to report on the connection reported a hostname failure for
-        a host that was never contacted, and said the deployment was unreachable when it was
-        the check that could not address it.
+        -- so the check reported a hostname failure for a host that was never contacted, and
+        called the deployment unreachable when it was the check that could not address it.
         """
         monkeypatch.setenv("GRIPTAPE_NODES_API_BASE_URL", base_url)
 
@@ -596,10 +589,9 @@ class TestRunHealthChecks:
     async def test_the_checks_run_alongside_each_other(self) -> None:
         """`CloudConnectionCheck` waits on a live round trip, with a ten-second timeout.
 
-        Every other check only reads a report already in memory, so run one after another the
-        whole run costs whatever that one connection costs -- while somebody watches `gtn
-        doctor` and wonders whether it has hung. Each of the two below finishes only once the
-        other has started, so they can both pass only if they really did overlap.
+        Every other check only reads a report already in memory, so run in sequence the whole
+        run costs whatever that one connection costs. Each of the two below finishes only once
+        the other has started, so they can both pass only if they really did overlap.
         """
         first_started = asyncio.Event()
         second_started = asyncio.Event()
@@ -654,8 +646,7 @@ class TestRedactHealthReport:
     """A verdict is mostly quoted from an already-clean report, but a failed check writes its own.
 
     That text can be an exception from the network stack or an OS error carrying the path it
-    failed on, so it is redacted here rather than by whoever writes the report out -- the
-    terminal a user pastes into a ticket needs it as much as a bundle does.
+    failed on, so it is redacted here rather than by whoever writes the report out.
     """
 
     def test_removes_a_secret_a_failing_check_quoted(self) -> None:

@@ -1,18 +1,14 @@
 """Health checks: the engine's verdict on its own setup, with a remedy for each problem.
 
-A ``DiagnosticsReport`` states facts. A health report interprets them: it says which of
-those facts is a problem and what to do about it. That interpretation is what ``gtn
-doctor`` prints and what ``doctor.json`` carries into a diagnostics bundle, so a support
-engineer opening a bundle sees the same verdicts the user saw.
+A ``DiagnosticsReport`` states facts; a health report interprets them. That is what ``gtn
+doctor`` prints and what ``doctor.json`` carries into a bundle, so support sees the same
+verdicts the user saw. Almost every check reads the report and nothing else, which keeps them
+cheap; ``CloudConnectionCheck`` is the exception, because "can this machine reach the API"
+cannot be answered from a snapshot.
 
-Almost every check reads the report and nothing else, which keeps them cheap and
-testable: build a report once, judge it many times. ``CloudConnectionCheck`` is the
-exception, because "can this machine reach the API" cannot be answered from a snapshot.
-
-Statuses are deliberately coarse. ``FAIL`` means something is broken and Griptape Nodes
-will not work properly until it is fixed. ``WARN`` means it works but something will bite
-later, or a bundle collected now will be less useful than it could be. Anything else is
-``PASS``.
+Statuses are coarse. ``FAIL`` means Griptape Nodes will not work properly until it is fixed.
+``WARN`` means it works but something will bite later, or a bundle collected now will be less
+useful than it could be. Anything else is ``PASS``.
 """
 
 from __future__ import annotations
@@ -66,10 +62,8 @@ class HealthCheckResult(BaseModel):
     """The outcome of one check.
 
     Attributes:
-        name: What was checked, in the words a user would use.
-        status: How it turned out.
-        summary: What was found. Written to be read by whoever ran the check, not only
-            by an engineer.
+        summary: What was found, written to be read by whoever ran the check, not only by an
+            engineer.
         remedy: What to do about it, when there is something to do. None on a pass.
     """
 
@@ -83,8 +77,6 @@ class HealthReport(BaseModel):
     """Every check that ran, and the worst thing any of them found.
 
     Attributes:
-        schema_version: Version of this envelope.
-        generated_at: ISO 8601 timestamp (UTC) of when the checks ran.
         status: The worst status among the results. ``PASS`` only when nothing was found.
         results: One entry per check, in the order they ran.
     """
@@ -100,9 +92,8 @@ class HealthCheckContext:
     """Everything the checks are allowed to look at.
 
     Attributes:
-        report: The engine snapshot the report-reading checks judge.
-        cloud_api_key: The Griptape Cloud key, supplied by the caller because it cannot
-            appear in a report. Used to open a connection and never recorded anywhere.
+        cloud_api_key: The Griptape Cloud key, supplied by the caller because it cannot appear
+            in a report. Used to open a connection and never recorded anywhere.
     """
 
     report: DiagnosticsReport
@@ -115,9 +106,8 @@ class HealthCheckContext:
 class HealthCheck(ABC):
     """One thing worth checking about an installation.
 
-    Subclasses state their own ``name`` and return a single result. A check reports what
-    it found rather than raising: a check that cannot run is itself a finding, and one
-    broken check must not stop the rest from running.
+    Subclasses state their own ``name`` and return a single result. A check reports what it
+    found rather than raising: a check that cannot run is itself a finding.
     """
 
     name: ClassVar[str]
@@ -189,15 +179,13 @@ class CloudConnectionCheck(HealthCheck):
     def _websocket_url(self) -> str:
         """Return the events endpoint this engine's connection would actually use.
 
-        Honors the same ``GRIPTAPE_NODES_API_BASE_URL`` override the engine's own client
-        reads, so a check run against a staging API reports on staging rather than always
-        reporting on production.
+        Honors the same ``GRIPTAPE_NODES_API_BASE_URL`` override the engine's own client reads,
+        so a check run against staging reports on staging.
 
-        Only the scheme is rewritten. A ``base_url.replace("http", "ws")`` rewrites every
-        occurrence of that substring, so a staging host named ``myhttpserver.example.com``
-        became ``mywsserver.example.com`` -- and the check then reported on whether a host
-        nobody runs could be reached. An override already spelled ``ws``/``wss`` is left as
-        the user wrote it; anything else is assumed to be TLS, which is what the API is.
+        Only the scheme is rewritten. A ``base_url.replace("http", "ws")`` rewrote every
+        occurrence, so a staging host named ``myhttpserver.example.com`` became
+        ``mywsserver.example.com`` and the check reported on a host nobody runs. An override
+        already spelled ``ws``/``wss`` is left alone; anything else is assumed to be TLS.
         """
         base_url = os.getenv("GRIPTAPE_NODES_API_BASE_URL", self._DEFAULT_API_BASE_URL)
         parts = urlsplit(base_url)
@@ -498,15 +486,13 @@ async def run_health_checks(
 ) -> HealthReport:
     """Run every check and summarize the results.
 
-    A check that raises is reported as a failure of that check rather than taking the run
-    down with it: the other verdicts are still worth having, and a check that cannot
-    answer is itself something to look at.
+    A check that raises is reported as a failure of that check rather than taking the run down
+    with it: the other verdicts are still worth having.
 
-    Run concurrently, because ``CloudConnectionCheck`` waits on a live round trip with a
-    ten-second timeout while every other check only reads a report already in memory. Run
-    one after another, a user with no network paid that timeout before seeing any of the
-    five verdicts that were ready immediately. The results keep the order of ``checks``
-    rather than the order they finished, so a report reads the same every time.
+    Run concurrently: ``CloudConnectionCheck`` waits on a live round trip with a ten-second
+    timeout, and run in sequence a user with no network paid that before seeing any of the
+    verdicts that were ready immediately. The results keep the order of ``checks`` rather than
+    the order they finished, so a report reads the same every time.
 
     Args:
         context: What the checks are allowed to look at.
@@ -549,20 +535,19 @@ def worst_status(results: list[HealthCheckResult]) -> HealthStatus:
 def redact_health_report(health: HealthReport, redactor: Redactor) -> HealthReport:
     """Return a copy of a health report with the checks' free text redacted.
 
-    A check that failed is often quoting an error message from somewhere else -- the
-    network stack, a library, an OS error carrying the path it failed on -- and none of
-    that text is the engine's own. It is redacted here rather than by whoever writes the
-    report out, because every destination needs it: the terminal a user pastes into a
-    ticket as readily as the ``doctor.json`` in a bundle.
+    A check that failed is often quoting an error message from somewhere else -- the network
+    stack, a library, an OS error carrying the path it failed on. It is redacted here rather
+    than by whoever writes the report out, because every destination needs it: the terminal a
+    user pastes into a ticket as readily as the ``doctor.json`` in a bundle.
 
-    Field by field, before serializing. Redacting finished JSON instead would miss any
-    secret whose text has to be escaped to live in a JSON string, since the escaped
-    spelling is not what the redactor is looking for.
+    Field by field, before serializing. Redacting finished JSON would miss any secret whose
+    text has to be escaped to live in a JSON string, since the escaped spelling is not what the
+    redactor is looking for.
 
     Args:
         health: The report to redact.
-        redactor: Applied to each result's summary and remedy. Its counts advance, so pass
-            the same one used for the rest of a bundle.
+        redactor: Applied to each result's summary and remedy. Its counts advance, so pass the
+            same one used for the rest of a bundle.
 
     Returns:
         A copy of the report. The original is left alone.
