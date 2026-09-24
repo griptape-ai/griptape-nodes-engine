@@ -17,17 +17,15 @@ from uuid import uuid4
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
-from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.managers.node_manager import (
     NodeManager,
     SerializedParameterValueTracker,
 )
+from griptape_nodes.serialization.values import encode_value, value_key
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     import pytest
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 
 def _make_param(name: str, *, serializable: bool = True) -> Parameter:
@@ -41,34 +39,41 @@ def _make_param(name: str, *, serializable: bool = True) -> Parameter:
     )
 
 
-class _DeepcopyHostile:
-    """A value that pickles fine but whose deepcopy always raises.
+class _NoPlainDataForm:
+    """A value the value codec cannot encode."""
 
-    Exercises the ``copy.deepcopy`` failure branch inside ``_handle_value_hashing``, which falls
-    back to storing the value by reference and warns rather than losing it.
-    """
+
+class _CountsEncodes:
+    """Supplies its own state, counting how often it is asked for it."""
+
+    encode_count = 0
 
     def __init__(self, payload: str) -> None:
         self.payload = payload
 
-    def __deepcopy__(self, memo: dict) -> _DeepcopyHostile:
-        msg = "this type refuses to be deep-copied"
-        raise RuntimeError(msg)
+    def to_state(self) -> dict[str, str]:
+        type(self).encode_count += 1
+        return {"payload": self.payload}
+
+    @classmethod
+    def from_state(cls, state: dict[str, str]) -> _CountsEncodes:
+        return cls(state["payload"])
 
 
-class _AlwaysFailsPickle:
-    """A hashable value that always fails to pickle, counting how many times it tried.
-
-    Used to assert that a value marked not-serializable is remembered and never retried.
-    """
+class _FailsToEncode:
+    """Its state cannot be produced, counting how many times it was asked."""
 
     def __init__(self) -> None:
         self.attempt_count = 0
 
-    def __reduce__(self) -> tuple:
+    def to_state(self) -> dict:
         self.attempt_count += 1
-        msg = "refuses to be pickled"
+        msg = "refuses to be encoded"
         raise TypeError(msg)
+
+    @classmethod
+    def from_state(cls, _state: dict) -> _FailsToEncode:
+        return cls()
 
 
 class TestSerializedParameterValueTracker:
@@ -101,307 +106,104 @@ class TestSerializedParameterValueTracker:
         assert tracker.get_serializable_count() == 2
 
 
+def _pool_value(
+    value: Any,
+    tracker: SerializedParameterValueTracker,
+    pool: dict[Any, Any],
+    *,
+    parameter: Parameter | None = None,
+    is_output: bool = False,
+) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
+    return NodeManager._handle_value_hashing(
+        value=value,
+        serialized_parameter_value_tracker=tracker,
+        unique_parameter_uuid_to_values=pool,
+        parameter=parameter or _make_param("p"),
+        parameter_name="p",
+        node_name="n",
+        is_output=is_output,
+    )
+
+
 class TestHandleValueHashing:
-    """``_handle_value_hashing`` pools a value once and lets every later reference reuse its UUID."""
+    """``_handle_value_hashing`` pools a value's encoded form under a hash of its content."""
 
-    def test_identical_hashable_value_reused_across_two_calls(self, engine: Engine) -> None:
-        parameter = _make_param("p")
+    def test_pool_holds_the_encoded_value_under_its_content_key(self) -> None:
+        pool: dict[Any, Any] = {}
+
+        command = _pool_value((1, "b"), SerializedParameterValueTracker(), pool)
+
+        assert command is not None
+        encoded = encode_value((1, "b"))
+        assert pool == {value_key(encoded): encoded}
+        assert command.unique_value_uuid == value_key(encoded)
+
+    def test_equal_values_in_distinct_objects_share_one_entry(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
 
-        first = NodeManager._handle_value_hashing(
-            value="shared value",
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-        second = NodeManager._handle_value_hashing(
-            value="shared value",
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
+        first = _pool_value({"k": [1, 2]}, tracker, pool)
+        second = _pool_value({"k": [1, 2]}, tracker, pool)
 
         assert first is not None
         assert second is not None
         assert first.unique_value_uuid == second.unique_value_uuid
         assert len(pool) == 1
 
-    def test_type_disambiguates_int_and_bool_with_equal_hash(self, engine: Engine) -> None:
-        """``hash(True) == hash(1)``, so the pool key must include the type, not just the value."""
-        parameter = _make_param("p")
+    def test_bool_and_int_with_equal_hash_get_distinct_entries(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
 
-        bool_command = NodeManager._handle_value_hashing(
-            value=True,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="flag",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-        int_command = NodeManager._handle_value_hashing(
-            value=1,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="count",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
+        as_int = _pool_value(1, tracker, pool)
+        as_bool = _pool_value(True, tracker, pool)
 
-        assert bool_command is not None
-        assert int_command is not None
-        assert bool_command.unique_value_uuid != int_command.unique_value_uuid
-        assert len(pool) == 2
+        assert as_int is not None
+        assert as_bool is not None
+        assert as_int.unique_value_uuid != as_bool.unique_value_uuid
+        assert set(pool.values()) == {1}
 
-    def test_unhashable_same_object_reuses_its_pool_entry(self, engine: Engine) -> None:
-        parameter = _make_param("p")
+    def test_the_same_object_is_encoded_once(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
-        shared_list = ["a", "b"]
+        shared = _CountsEncodes("payload")
+        _CountsEncodes.encode_count = 0
 
-        first = NodeManager._handle_value_hashing(
-            value=shared_list,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-        second = NodeManager._handle_value_hashing(
-            value=shared_list,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
+        first = _pool_value(shared, tracker, pool)
+        second = _pool_value(shared, tracker, pool)
 
         assert first is not None
         assert second is not None
         assert first.unique_value_uuid == second.unique_value_uuid
-        assert len(pool) == 1
+        assert _CountsEncodes.encode_count == 1
 
-    def test_unhashable_equal_but_distinct_objects_get_separate_pool_entries(self, engine: Engine) -> None:
-        """Two different list objects with equal contents are not the same value for pooling purposes.
-
-        Both lists are kept alive as local variables for the whole test: an unhashable value is
-        pooled by ``id()``, and a value that is garbage-collected between calls can have its id
-        reused by an unrelated object, which is a real hazard but not what this test targets.
-        """
-        parameter = _make_param("p")
+    def test_non_serializable_parameter_skips_and_marks_tracker(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
-        first_list = ["a", "b"]
-        second_list = ["a", "b"]
+        value = "opted out"
 
-        first = NodeManager._handle_value_hashing(
-            value=first_list,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-        second = NodeManager._handle_value_hashing(
-            value=second_list,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
+        command = _pool_value(value, tracker, pool, parameter=_make_param("p", serializable=False))
 
-        assert first is not None
-        assert second is not None
-        assert first.unique_value_uuid != second.unique_value_uuid
-        assert len(pool) == 2
-
-    def test_non_serializable_parameter_skips_and_marks_tracker(self, engine: Engine) -> None:
-        parameter = _make_param("p", serializable=False)
-        tracker = SerializedParameterValueTracker()
-        pool: dict[Any, Any] = {}
-
-        result = NodeManager._handle_value_hashing(
-            value="opted out",
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-
-        assert result is None
+        assert command is None
         assert pool == {}
+        assert tracker.get_tracker_state(id(value)) == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
 
-    def test_pickle_failure_marks_value_not_serializable_and_returns_none(self, engine: Engine) -> None:
-        parameter = _make_param("p")
+    def test_value_with_no_plain_data_form_is_skipped_and_not_retried(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
-        unpicklable = _AlwaysFailsPickle()
+        value = _FailsToEncode()
 
-        result = NodeManager._handle_value_hashing(
-            value=unpicklable,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
+        assert _pool_value(value, tracker, pool) is None
+        assert _pool_value(value, tracker, pool) is None
 
-        assert result is None
         assert pool == {}
-        assert (
-            tracker.get_tracker_state((type(unpicklable), unpicklable))
-            == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
-        )
+        assert value.attempt_count == 1
 
-    def test_pickle_failure_is_not_retried_on_second_call(self, engine: Engine) -> None:
-        parameter = _make_param("p")
-        tracker = SerializedParameterValueTracker()
-        pool: dict[Any, Any] = {}
-        unpicklable = _AlwaysFailsPickle()
-
-        NodeManager._handle_value_hashing(
-            value=unpicklable,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-        NodeManager._handle_value_hashing(
-            value=unpicklable,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-        )
-
-        assert unpicklable.attempt_count == 1
-
-    def test_use_pickling_true_stores_pickled_bytes_in_pool(self, engine: Engine) -> None:
-        parameter = _make_param("p")
-        tracker = SerializedParameterValueTracker()
+    def test_returns_an_indirect_set_parameter_value_command_referencing_the_pool(self) -> None:
         pool: dict[Any, Any] = {}
 
-        command = NodeManager._handle_value_hashing(
-            value="pickle me",
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=True,
-        )
+        command = _pool_value("output value", SerializedParameterValueTracker(), pool, is_output=True)
 
         assert command is not None
-        assert isinstance(pool[command.unique_value_uuid], bytes)
-
-    def test_use_pickling_false_stores_a_deep_copy_not_the_original_reference(self, engine: Engine) -> None:
-        parameter = _make_param("p")
-        tracker = SerializedParameterValueTracker()
-        pool: dict[Any, Any] = {}
-        original = {"nested": ["value"]}
-
-        command = NodeManager._handle_value_hashing(
-            value=original,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
-        )
-
-        assert command is not None
-        stored = pool[command.unique_value_uuid]
-        assert stored == original
-        assert stored is not original
-
-    def test_deepcopy_failure_falls_back_to_storing_the_raw_value_with_a_warning(
-        self, engine: Engine, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        parameter = _make_param("hostile_param")
-        tracker = SerializedParameterValueTracker()
-        pool: dict[Any, Any] = {}
-        hostile_value = _DeepcopyHostile("payload")
-
-        caplog.clear()
-        caplog.set_level(logging.WARNING, logger="griptape_nodes")
-
-        command = NodeManager._handle_value_hashing(
-            value=hostile_value,
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="hostile_param",
-            node_name="hostile_node",
-            is_output=False,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
-        )
-
-        assert command is not None
-        assert pool[command.unique_value_uuid] is hostile_value
-        warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-        assert any(
-            "could not be copied" in message and "'hostile_param'" in message and "'hostile_node'" in message
-            for message in warning_messages
-        )
-
-    def test_returns_an_indirect_set_parameter_value_command_referencing_the_pool(self, engine: Engine) -> None:
-        parameter = _make_param("p")
-        tracker = SerializedParameterValueTracker()
-        pool: dict[Any, Any] = {}
-
-        command = NodeManager._handle_value_hashing(
-            value="v",
-            serialized_parameter_value_tracker=tracker,
-            unique_parameter_uuid_to_values=pool,
-            parameter=parameter,
-            parameter_name="p",
-            node_name="n",
-            is_output=True,
-            workflow_manager=engine.workflow_manager,
-        )
-
-        assert command is not None
-        assert isinstance(command.set_parameter_value_command, SetParameterValueRequest)
         assert command.set_parameter_value_command.parameter_name == "p"
         assert command.set_parameter_value_command.is_output is True
         assert command.set_parameter_value_command.initial_setup is True
@@ -411,7 +213,7 @@ class TestHandleValueHashing:
 class TestSerializeOneParameterValueForSave:
     """``_serialize_one_parameter_value_for_save`` decides whether a single value gets recorded."""
 
-    def test_none_value_returns_none_without_touching_the_tracker(self, engine: Engine) -> None:
+    def test_none_value_returns_none_without_touching_the_tracker(self) -> None:
         parameter = _make_param("p")
         node = MockNode(name="n")
         node.add_parameter(parameter)
@@ -428,8 +230,6 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
         )
 
         assert result is None
@@ -439,7 +239,7 @@ class TestSerializeOneParameterValueForSave:
         assert create_request.resolution != NodeResolutionState.UNRESOLVED.value
 
     def test_serializable_false_records_nothing_and_forces_unresolved_silently(
-        self, engine: Engine, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         from griptape_nodes.exe_types.node_types import NodeResolutionState
 
@@ -462,17 +262,15 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
         )
 
         assert result is None
         assert create_request.resolution == NodeResolutionState.UNRESOLVED.value
         warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-        assert not any("Attempted to serialize" in message for message in warning_messages)
+        assert not any("Attempted to save" in message for message in warning_messages)
 
     def test_genuine_failure_warns_naming_parameter_and_node_and_forces_unresolved(
-        self, engine: Engine, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         from griptape_nodes.exe_types.node_types import NodeResolutionState
 
@@ -487,7 +285,7 @@ class TestSerializeOneParameterValueForSave:
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
         result = NodeManager._serialize_one_parameter_value_for_save(
-            value=_AlwaysFailsPickle(),
+            value=_NoPlainDataForm(),
             value_kind="output",
             is_output=True,
             parameter=parameter,
@@ -495,8 +293,6 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
         )
 
         assert result is None
@@ -507,7 +303,7 @@ class TestSerializeOneParameterValueForSave:
             for message in warning_messages
         )
 
-    def test_successful_serialization_returns_a_command_and_leaves_resolution_untouched(self, engine: Engine) -> None:
+    def test_successful_serialization_returns_a_command_and_leaves_resolution_untouched(self) -> None:
         from griptape_nodes.exe_types.node_types import NodeResolutionState
 
         parameter = _make_param("p")
@@ -526,17 +322,11 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
-            workflow_manager=engine.workflow_manager,
-            use_pickling=False,
         )
 
         assert result is not None
         assert result.unique_value_uuid in pool
         assert create_request.resolution == NodeResolutionState.RESOLVED.value
-
-
-class _NoPlainDataForm:
-    """A value the value codec cannot encode."""
 
 
 class TestResultParameterValues:

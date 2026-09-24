@@ -369,7 +369,7 @@ registers fine, but the editor has no category to file it under.
 
 Definitions added this way are indistinguishable from hand-written ones, which means they
 inherit the loader's behavior: lazy module loading, one memoized import per file even
-when many classes share it, stable-namespace aliasing so saved workflows can unpickle
+when many classes share it, stable-namespace aliasing so saved workflows can rebuild
 values your classes define, per-node problem reporting, and correct fitness.
 
 ### Where the classes come from
@@ -392,7 +392,7 @@ def __getattr__(name: str) -> type[DataNode]:
 
 Cache the built class in module globals. Two lookups of the same node type must return
 the same object, because the engine caches the resolved class, `isinstance` checks
-compare against it, and pickles reference it.
+compare against it, and saved values name it.
 
 !!! warning "Set `__module__` explicitly when you build a class"
 
@@ -402,7 +402,7 @@ compare against it, and pickles reference it.
     is inside the standard library's `abc` module, and your class ends up claiming
     `__module__ == "abc"`.
 
-    Nothing complains at load time. The failure appears later: unpickling a saved
+    Nothing complains at load time. The failure appears later: reopening a saved
     workflow imports `__module__` and looks up `__qualname__` on it, so any workflow
     carrying a value your class defines will fail to reopen. Pass both explicitly:
 
