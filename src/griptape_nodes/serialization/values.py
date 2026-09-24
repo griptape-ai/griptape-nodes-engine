@@ -11,7 +11,10 @@ A class's state comes from the first adapter that claims it. A class can supply 
 defining ``to_state()`` and a ``from_state(state)`` classmethod; other types can be covered with
 ``register_value_adapter``.
 
-Decoding imports the module a ``$type`` names, and builds only classes an adapter claims.
+Decoding imports the module a ``$type`` names, and builds only classes an adapter claims. A value
+this process cannot build, such as one whose class lives in a library another process loads,
+decodes to an ``UndecodedValue`` that encodes back to exactly the data it came from, so it passes
+through to a process that can build it.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import decimal
 import enum
 import inspect
 import json
+import logging
 import math
 import uuid
 import weakref
@@ -48,8 +52,19 @@ class ValueEncodeError(TypeError):
     """A value has no plain-data form."""
 
 
-class ValueDecodeError(ValueError):
-    """Plain data does not describe a value this process can build."""
+logger = logging.getLogger("griptape_nodes")
+
+
+class UndecodedValue(dict):
+    """A value this process cannot build, kept as the plain data it arrived as.
+
+    It encodes back to that same data, so passing it on loses nothing. It is a dict so code that
+    reads artifact-shaped dicts keeps working with it.
+    """
+
+    def __init__(self, data: dict[str, Any], reason: str) -> None:
+        super().__init__(data)
+        self.reason = reason
 
 
 class ValueAdapter(Protocol):
@@ -74,10 +89,8 @@ def encode_value(value: Any) -> JsonValue:
 def decode_value(data: Any) -> Any:
     """Rebuild the value ``encode_value`` produced ``data`` from.
 
-    Objects that are not plain data are already decoded and pass through unchanged.
-
-    Raises:
-        ValueDecodeError: ``data`` names a class this process cannot find or build.
+    A tagged value this process cannot build comes back as an ``UndecodedValue``. Objects that are
+    not plain data are already decoded and pass through unchanged.
     """
     if isinstance(data, list):
         return [decode_value(item) for item in data]
@@ -98,6 +111,8 @@ def _encode(value: Any, active: set[int]) -> JsonValue:
     cls = type(value)
     if value is None or cls in (bool, int, str):
         return value
+    if cls is UndecodedValue:
+        return dict(value)
     if cls is float:
         if math.isfinite(value):
             return value
@@ -185,37 +200,40 @@ def _canonical_json(data: JsonValue) -> str:
 def _decode_tagged(data: dict[str, Any]) -> Any:
     name = data[TYPE_KEY]
     if not isinstance(name, str):
-        msg = f"A saved value's type name is {name!r}, not text."
-        raise ValueDecodeError(msg)
+        return UndecodedValue(data, f"its type name is {name!r}, not text")
+    try:
+        cls = resolve_type_name(name)
+    except TypeNameError as error:
+        # Expected wherever a library's classes live in another process, so no warning.
+        return UndecodedValue(data, str(error))
     if VALUE_KEY in data:
         state = decode_value(data[VALUE_KEY])
     else:
         state = decode_value({key: item for key, item in data.items() if key != TYPE_KEY})
-    try:
-        cls = resolve_type_name(name)
-    except TypeNameError as error:
-        raise ValueDecodeError(str(error)) from error
     builtin_decoder = _BUILTIN_DECODERS.get(cls)
     if builtin_decoder is not None:
-        return _decode_builtin(builtin_decoder, name, state)
+        return _decode_builtin(builtin_decoder, data, state)
     adapter = _adapter_for(cls)
     if adapter is None:
-        msg = f"'{name}' has no plain-data form in this process."
-        raise ValueDecodeError(msg)
+        return UndecodedValue(data, f"'{name}' has no plain-data form in this process")
     try:
         return adapter.from_state(cls, state)
     except Exception as error:
         # Adapters run library code, which can raise anything.
-        msg = f"A saved '{cls.__qualname__}' value could not be rebuilt: {error}"
-        raise ValueDecodeError(msg) from error
+        return _undecodable(data, f"a saved '{cls.__qualname__}' value could not be rebuilt: {error}")
 
 
-def _decode_builtin(decoder: Any, name: str, state: Any) -> Any:
+def _decode_builtin(decoder: Any, data: dict[str, Any], state: Any) -> Any:
     try:
         return decoder(state)
     except (TypeError, ValueError, binascii.Error) as error:
-        msg = f"A saved '{name}' value is malformed: {error}"
-        raise ValueDecodeError(msg) from error
+        return _undecodable(data, f"a saved '{data[TYPE_KEY]}' value is malformed: {error}")
+
+
+def _undecodable(data: dict[str, Any], reason: str) -> UndecodedValue:
+    """Keep data that names a class this process has but does not fit it, as when a library changed."""
+    logger.warning("Kept a saved value as plain data because %s.", reason)
+    return UndecodedValue(data, reason)
 
 
 def _decode_bytes(state: str) -> bytes:
