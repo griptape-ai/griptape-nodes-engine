@@ -162,6 +162,14 @@ class TestRegistry:
         with pytest.raises(ValidationError):
             _make_feature(bad_id)
 
+    @pytest.mark.parametrize("field", ["name", "description", "owner"])
+    def test_blank_text_field_is_rejected(self, field: str) -> None:
+        values = {"id": "x", "name": "X", "description": "X.", "owner": "@someone", "remove_by": _in_days(30)}
+        values[field] = " "
+
+        with pytest.raises(ValidationError, match=field):
+            BetaFeature.model_validate(values)
+
     def test_invalid_remove_by_is_rejected(self) -> None:
         with pytest.raises(ValidationError):
             BetaFeature(id="x", name="X", description="X.", owner="@someone", remove_by="2027-02-30")  # pyright: ignore[reportArgumentType]
@@ -264,6 +272,15 @@ class TestLibraryBetaFeatures:
         assert parsed.features == {}
         assert [issue.feature_id for issue in parsed.issues] == ["one", "#2"]
         assert "no letters or digits" in parsed.issues[0].reason
+
+    @pytest.mark.parametrize("field", ["name", "description", "owner"])
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_a_blank_text_field_drops_the_entry(self, field: str, value: str) -> None:
+        parsed = parse_library_beta_features(LIBRARY_NAME, [_library_entry(**{field: value}), _library_entry("other")])
+
+        assert list(parsed.features) == ["other"]
+        assert parsed.issues[0].feature_id == "fast_upscale"
+        assert field in parsed.issues[0].reason
 
     def test_date_issues(self) -> None:
         features = [

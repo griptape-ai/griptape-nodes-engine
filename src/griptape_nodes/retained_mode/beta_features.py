@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_field
 
@@ -50,6 +50,10 @@ LIBRARY_BETA_FEATURES_KEY = "library_beta_features"
 # The longest a feature may stay in beta. Engine features are held to it by a unit test, library
 # features by a warning when the library loads.
 MAX_BETA_DAYS = 180
+
+# Text that must contain at least one non-space character. The name and description are shown on
+# the Beta Features page, and the owner is who to ask when the feature is due to be removed.
+NonBlankStr = Annotated[str, Field(pattern=r"\S")]
 
 
 class BetaFeature(BaseModel):
@@ -77,10 +81,10 @@ class BetaFeature(BaseModel):
     # Words joined by single underscores. "__" separates path parts in GTN_CONFIG_ variable names,
     # so an id containing it couldn't be set from the environment.
     id: str = Field(pattern=r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
-    name: str
-    description: str
+    name: NonBlankStr
+    description: NonBlankStr
     default: bool = False
-    owner: str
+    owner: NonBlankStr
     remove_by: date
     library: str | None = None
 
