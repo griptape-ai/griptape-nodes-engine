@@ -40,6 +40,8 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
     GetConfigValueResultSuccess,
+    IsBetaFeatureEnabledRequest,
+    IsBetaFeatureEnabledResultSuccess,
     SetConfigValueRequest,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -1456,6 +1458,39 @@ class BaseNode(ABC):
         # path on an accelerated machine with nothing to show why.
         logger.warning("Could not detect compute backends; reporting cpu only. %s", result.result_details)
         return ["cpu"]
+
+    def is_beta_feature_enabled(self, feature_id: str) -> bool:
+        """Whether a beta feature declared by this node's library is on.
+
+        The feature must be listed in the `beta_features` section of the library JSON. Returns the
+        user's choice from the Beta Features settings page, or the feature's default when they
+        haven't made one. Logs a warning and returns False when the library doesn't declare a
+        valid feature with this id.
+
+        Always create the parameters a feature uses, and only hide or show them based on this, so
+        workflows saved with the feature on still open with it off.
+        """
+        library_name = self.metadata.get("library")
+        if library_name is None:
+            logger.warning(
+                "Attempted to check beta feature '%s' for node '%s'. Failed because the node doesn't belong to a library.",
+                feature_id,
+                self.name,
+            )
+            return False
+
+        # A failure here is an author mistake this method reports itself, so keep the dispatcher
+        # from also logging it as an error on every node created and every run.
+        result = self.engine.handle_request(
+            IsBetaFeatureEnabledRequest(
+                feature_id=feature_id, library_name=library_name, failure_log_level=logging.DEBUG
+            )
+        )
+        if not isinstance(result, IsBetaFeatureEnabledResultSuccess):
+            logger.warning("%s The feature is treated as off for node '%s'.", result.result_details, self.name)
+            return False
+
+        return result.enabled
 
     def get_config_value(self, service: str, value: str) -> str:
         warnings.warn(

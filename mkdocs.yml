@@ -111,6 +111,7 @@ plugins:
           - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
           - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
           - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
+          - guides/editor/beta_features.md: Turning experimental beta features on and off
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
@@ -287,6 +288,7 @@ nav:
           - Running Workflows: guides/editor/running_workflows.md
           - Media Viewers and Editors: guides/editor/media_editors.md
           - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
+          - Beta Features: guides/editor/beta_features.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
