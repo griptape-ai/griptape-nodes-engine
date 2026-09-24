@@ -30,6 +30,9 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
+- **Breaking:** Writing to a `ui_options` key that a custom trait draws is ignored with a warning,
+  instead of changing what the editor shows. To accept these writes, implement
+  `state_from_ui_options()` on the trait.
 - Setting a value outside a `Slider` range now fails with an error naming the parameter, the value,
   and the allowed range, instead of "Value out of range".
   [#5269](https://github.com/griptape-ai/griptape-nodes-engine/issues/5269)
@@ -65,10 +68,9 @@ the engine's request API from working without edits. Migration steps live in
   saving and reopening the workflow. Before, the reopened workflow showed the saved settings, but
   sliders checked the old range, dropdowns the old choices, and buttons opened the old link.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
-- Setting a `ui_options` key that a trait owns, such as `slider` or `simple_dropdown`, from node
-  code or the editor now updates the trait, so the node checks values against the range or choices
-  the editor shows. Custom traits that do not implement `state_from_ui_options()` ignore these
-  writes and log a warning.
+- Changing a slider's range or a dropdown's choices through `ui_options`, from node code or the
+  editor, now also changes which values the parameter accepts. Before, the editor showed the new
+  range or choices, but the parameter still checked values against the old ones.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
