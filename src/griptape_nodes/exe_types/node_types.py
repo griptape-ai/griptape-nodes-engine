@@ -337,11 +337,36 @@ class BaseNode(ABC):
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
+    _parameters_added_after_construction: set[str]
+    _parameters_added_during_execution: set[str]
     _engine: Engine | None
 
     @property
     def parameters(self) -> list[Parameter]:
         return self.root_ui_element.find_elements_by_type(Parameter)
+
+    @property
+    def parameters_added_after_construction(self) -> set[str]:
+        """Names of parameters the node grew outside its declarative ``__init__``.
+
+        A parameter declared in ``__init__`` reappears whenever the node is recreated from its
+        create command, even one built from the node's own metadata rather than hardcoded. One
+        added later does not, so serialization has to recreate it by hand.
+        """
+        return self._parameters_added_after_construction
+
+    @property
+    def parameters_added_during_execution(self) -> set[str]:
+        """Names of parameters the node is growing while it runs, a subset of the set above.
+
+        These are scratch state rather than node shape: a node adds one to feed a helper and drops
+        it when the run ends, so serialization leaves it out entirely. Only ever populated while a
+        run is in flight -- the framework empties it when the run ends, so a parameter that outlived
+        its run is durable structure from then on. Parameters a node builds from its value hooks are
+        excluded too, because those arrive during input hydration and are meant to last, which is
+        why this is narrower than ``parameters_added_after_construction``.
+        """
+        return self._parameters_added_during_execution
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -388,6 +413,8 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._inputs_to_reset_after_execution = set()
         self._deferred_inputs_were_reset = False
+        self._parameters_added_after_construction = set()
+        self._parameters_added_during_execution = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -794,6 +821,7 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
@@ -803,6 +831,8 @@ class BaseNode(ABC):
 
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
+        self._parameters_added_after_construction.discard(param.name)
+        self._parameters_added_during_execution.discard(param.name)
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -841,7 +871,7 @@ class BaseNode(ABC):
         for name in names:
             parameter = self.get_parameter_by_name(name)
             if parameter is not None:
-                parameter.ui_options = {**parameter.ui_options, "hide": not visible}
+                parameter.update_ui_options({"hide": not visible})
 
     def get_message_by_name_or_element_id(self, element: str) -> ParameterMessage | None:
         element_items = self.root_ui_element.find_elements_by_type(ParameterMessage)
@@ -863,7 +893,7 @@ class BaseNode(ABC):
         for name in names:
             message = self.get_message_by_name_or_element_id(name)
             if message is not None:
-                message.ui_options = {**message.ui_options, "hide": not visible}
+                message.update_ui_options({"hide": not visible})
 
     def hide_message_by_name(self, names: str | list[str]) -> None:
         self._set_message_visibility(names, visible=False)
@@ -898,9 +928,6 @@ class BaseNode(ABC):
             if traits:
                 trait = traits[0]  # Take the first Options trait
                 trait.choices = choices
-                # Update the manually set UI options to include the new simple_dropdown
-                if hasattr(parameter, "_ui_options") and parameter._ui_options:
-                    parameter._ui_options["simple_dropdown"] = choices
 
                 if default in choices:
                     parameter.default_value = default
@@ -1897,6 +1924,32 @@ class BaseNode(ABC):
                 mutation=mutation,
             ),
         )
+
+    def _record_parameter_add_scope(self, parameter_name: str) -> None:
+        """Populate the two parameter-origin sets from the scope this add arrived in.
+
+        Reads the same flags as the detector above, but not the same way: a sanctioned
+        mutation is exempt from the execution set only, because ``AddParameterToNodeRequest``
+        syncs the parameter back to the orchestrator and so builds durable structure even
+        mid-run, while it is still structure the node did not declare in ``__init__``.
+        """
+        # Lazy import: library_registry imports BaseNode from this module,
+        # so importing at module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if LibraryRegistry.is_constructing_node():
+            return
+        self._parameters_added_after_construction.add(parameter_name)
+        if _in_aprocess.get() and not _sanctioned_mutation.get():
+            self._parameters_added_during_execution.add(parameter_name)
+
+    def forget_parameters_added_during_execution(self) -> None:
+        """Drop the scratch marker from every parameter still carrying it. Called when a run ends.
+
+        Scratch parameters are torn down by the run that made them, so one that outlives the
+        run was structure after all. Keeping the marker would drop it from every later save.
+        """
+        self._parameters_added_during_execution.clear()
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""

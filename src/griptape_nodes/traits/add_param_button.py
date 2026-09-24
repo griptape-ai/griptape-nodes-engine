@@ -13,9 +13,5 @@ class AddParameterButton(Trait):
         super().__init__(element_id="AddParameterButton")
         self.add_child(Button(label="AddParameter"))
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["button", "addbutton"]
-
     def ui_options_for_trait(self) -> dict:
         return {"button": self.type}
