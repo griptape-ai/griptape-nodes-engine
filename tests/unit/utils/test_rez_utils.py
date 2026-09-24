@@ -60,7 +60,7 @@ from griptape_nodes.utils.rez_utils import (
     rez_unsearched_stores,
     rez_version_from_git_ref,
 )
-from griptape_nodes.utils.rez_uv import ResolvedPackage
+from griptape_nodes.utils.rez_uv import ResolvedPackage, RezInstallError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1088,6 +1088,20 @@ class TestInstallLibraryAsRezPackage:
         assert callable(namespace["commands"])
         assert (package_py.parent / "python" / "nodes.py").is_file()
         assert (package_py.parent / "python" / "griptape_nodes_library.json").is_file()
+
+    def test_failed_dependency_install_writes_no_library_package(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "my-library")
+        local = tmp_path / "store" / "local"
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            patch(f"{_RU}.resolve_full", return_value=[ResolvedPackage(pip_name="torch", version="2.7.0")]),
+            patch(f"{_RU}.rez_uv_install", side_effect=RezInstallError(["torch==2.7.0 (download failed: x)"])),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+            pytest.raises(RezInstallError),
+        ):
+            install_library_as_rez_package("My Library", ["torch==2.7.0"], library_file_path=manifest)
+
+        assert not (local / "my_library").exists()
 
     def test_no_store_configured(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "lib")

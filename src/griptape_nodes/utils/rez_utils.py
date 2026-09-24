@@ -1114,6 +1114,10 @@ def install_library_as_rez_package(  # noqa: PLR0913
             already exists. When False, overwrite everything.
         packages_root: Root of the rez package store (parent of ``local/``).
             Defaults to the parent of ``GTN_REZ_LOCAL_PACKAGES_PATH``.
+
+    Raises:
+        RezInstallError: When any dependency could not be installed. The library
+            meta-package is not written, so nothing references missing packages.
     """
     if packages_root is None:
         packages_root = _rez_packages_root()

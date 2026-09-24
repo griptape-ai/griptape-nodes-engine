@@ -6,8 +6,6 @@ import os
 import sys
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.utils.rez_utils import build_rez_env_prefix, is_rez_enabled, resolve_and_log_rez_context
-
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -73,7 +71,6 @@ class PythonSubprocessExecutor:
         args: list[str] | None = None,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
-        rez_package_specs: list[str] | None = None,
     ) -> None:
         """Execute a Python script in a subprocess and wait for completion.
 
@@ -82,28 +79,13 @@ class PythonSubprocessExecutor:
             args: Additional command line arguments
             cwd: Working directory for the subprocess
             env: Extra environment variables to add or override in the subprocess
-            rez_package_specs: When provided and rez is enabled, wraps the
-                command with ``rez env <specs> -- python script``.  Callers pass the
-                rez package family names for the libraries the workflow depends on.
         """
         if self.is_running():
             logger.warning("Another subprocess is already running. Terminating it first.")
             await self.terminate()
 
         args = args or []
-        base_command = [sys.executable, str(script_path), *args]
-
-        if is_rez_enabled() and rez_package_specs:
-            logger.info("[Rez][execution] workflow subprocess — resolving rez context")
-            logger.info("[Rez][execution]   rez_package_specs: %s", rez_package_specs)
-            logger.info("[Rez][execution]   script           : %s", script_path)
-            resolve_and_log_rez_context(rez_package_specs)
-            rez_prefix = build_rez_env_prefix(rez_package_specs)
-            command = [*rez_prefix, *base_command]
-            logger.info("[Rez][execution]   wrapped command  : %s", " ".join(command))
-        else:
-            command = base_command
-
+        command = [sys.executable, str(script_path), *args]
         subprocess_env = _create_subprocess_env(env)
         # Disable Python output buffering so we get real-time output
         subprocess_env["PYTHONUNBUFFERED"] = "1"

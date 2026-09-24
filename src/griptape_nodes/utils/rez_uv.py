@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 _WHEEL_TAG_PARTS = 3
 
 
+class RezInstallError(RuntimeError):
+    """One or more resolved packages could not be installed as rez packages.
+
+    Raised after every other package has been installed, so callers can stop before
+    writing a package whose ``requires`` names packages that are missing.
+    """
+
+    def __init__(self, failures: list[str]) -> None:
+        self.failures = failures
+        super().__init__(f"{len(failures)} package(s) could not be installed: " + "; ".join(failures))
+
+
 # ---------------------------------------------------------------------------
 # Name normalisation
 # ---------------------------------------------------------------------------
@@ -594,10 +606,10 @@ def _install_one(  # noqa: PLR0913
     extra_index_url: str | None,
     extra_flags: list[str] | None,
     python_version: str,
-) -> bool:
+) -> str | None:
     """Download and install a single resolved package as a rez package.
 
-    Returns True on success, False on failure.
+    Returns None on success, otherwise a short reason the package could not be installed.
     """
     logger.info("[Rez][uv] installing %s==%s ...", pkg.pip_name, pkg.version)
 
@@ -627,21 +639,23 @@ def _install_one(  # noqa: PLR0913
                 pkg.pip_name,
                 pkg.version,
             )
-            if dl.stderr:
-                for line in dl.stderr.strip().splitlines()[-5:]:
-                    logger.debug("[Rez][uv]   stderr: %s", line)
-            return False
+            stderr_lines = [line for line in (dl.stderr or "").strip().splitlines() if line.strip()]
+            for line in stderr_lines[-5:]:
+                logger.debug("[Rez][uv]   stderr: %s", line)
+            if stderr_lines:
+                return f"download failed: {stderr_lines[-1].strip()}"
+            return f"download failed (uv exited with {dl.returncode})"
 
         try:
             info = read_wheel_info(tmp, pkg.pip_name, pkg.version)
-        except Exception:
+        except (RuntimeError, OSError) as exc:
             logger.warning(
                 "[Rez][uv] could not read wheel metadata for %s==%s — skipping",
                 pkg.pip_name,
                 pkg.version,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
-            return False
+            return f"could not read its wheel metadata: {exc}"
 
         family_name = rez_name(info.pip_name)
         clean_version = re.sub(r"\+.*$", "", info.version)
@@ -676,9 +690,9 @@ def _install_one(  # noqa: PLR0913
                 exc.strerror or exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
-            return False
+            return f"could not write {exc.filename or version_dir}: {exc.strerror or exc}"
 
-    return True
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +734,11 @@ def install(  # noqa: PLR0913
         When True (default), skip packages whose ``package.py`` already exists.
     uv_cmd:
         Override the uv binary path.  Defaults to ``find_uv_bin()``.
+
+    Raises:
+    ------
+    RezInstallError
+        When any package could not be installed. Every other package is installed first.
     """
     uv = uv_cmd or find_uv_bin()
     if python_version is None:
@@ -743,7 +762,7 @@ def install(  # noqa: PLR0913
             skipped_n += 1
             continue
 
-        success = _install_one(
+        failure = _install_one(
             pkg,
             uv=uv,
             packages_dir=packages_dir,
@@ -751,10 +770,10 @@ def install(  # noqa: PLR0913
             extra_flags=extra_flags,
             python_version=python_version,
         )
-        if success:
+        if failure is None:
             installed_n += 1
         else:
-            failed.append(f"{pkg.pip_name}=={pkg.version}")
+            failed.append(f"{pkg.pip_name}=={pkg.version} ({failure})")
 
     logger.info(
         "[Rez][uv] complete — %d installed, %d skipped%s",
@@ -764,3 +783,4 @@ def install(  # noqa: PLR0913
     )
     if failed:
         logger.warning("[Rez][uv] failed packages: %s", ", ".join(failed))
+        raise RezInstallError(failed)

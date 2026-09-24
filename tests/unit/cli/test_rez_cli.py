@@ -41,6 +41,7 @@ from griptape_nodes.cli.commands.rez import (
     _write_engine_package,
     app,
 )
+from griptape_nodes.utils.rez_uv import RezInstallError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -465,6 +466,17 @@ class TestInstallDeps:
             _install_deps(["requests"], tmp_path, skip_installed=True)
         assert "uv exited with status 2" in output.getvalue()
 
+    def test_partial_install_lists_failures_and_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+        error = RezInstallError(["idna==3.7 (download failed: no matching distribution)"])
+        with (
+            patch(f"{MODULE}.rez_uv_install", side_effect=error),
+            pytest.raises(typer.Exit),
+        ):
+            _install_deps(["requests"], tmp_path, skip_installed=True)
+        text = output.getvalue()
+        assert "1 package(s) could not be installed" in text
+        assert "idna==3.7 (download failed: no matching distribution)" in text
+
     def test_filesystem_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
         with (
             patch(f"{MODULE}.rez_uv_install", side_effect=PermissionError("store is read-only")),
@@ -687,6 +699,20 @@ class TestBuildLibraryFromDir:
         text = output.getvalue()
         assert "Attempted to build a rez package for 'Broken'" in text
         assert "Because torch==99 was not found" in text
+
+    def test_partial_install_lists_failures_and_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+        library_dir = _make_library(tmp_path, {"name": "Broken"})
+        error = RezInstallError(["torch==2.7.0 (download failed: no matching distribution)"])
+        with (
+            patch(f"{MODULE}.install_library_as_rez_package", side_effect=error),
+            patch(f"{MODULE}._validate_rez_package") as validate,
+            pytest.raises(typer.Exit),
+        ):
+            _build_library_from_dir(library_dir, tmp_path / "store", skip_installed=True)
+        text = output.getvalue()
+        assert "Attempted to build a rez package for 'Broken'" in text
+        assert "torch==2.7.0 (download failed: no matching distribution)" in text
+        validate.assert_not_called()
 
     def test_filesystem_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
         library_dir = _make_library(tmp_path, {"name": "Broken"})

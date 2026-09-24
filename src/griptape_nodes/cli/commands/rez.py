@@ -41,6 +41,7 @@ from griptape_nodes.utils.rez_utils import (
     rez_subprocess_env,
     rez_unsearched_stores,
 )
+from griptape_nodes.utils.rez_uv import RezInstallError
 from griptape_nodes.utils.rez_uv import install as rez_uv_install
 
 app = typer.Typer(help="Rez package management.")
@@ -388,6 +389,10 @@ def _install_deps(dependencies: list[str], packages_root: Path, *, skip_installe
         console.print("[red]Attempted to install the engine's dependencies as rez packages. Failed due to:[/red]")
         _print_uv_error(exc)
         raise typer.Exit(1) from exc
+    except RezInstallError as exc:
+        console.print("[red]Attempted to install the engine's dependencies as rez packages. Failed due to:[/red]")
+        _print_install_failures(exc)
+        raise typer.Exit(1) from exc
     except OSError as exc:
         console.print(
             f"[red]Attempted to install the engine's dependencies as rez packages. Failed due to: {exc}[/red]"
@@ -396,6 +401,14 @@ def _install_deps(dependencies: list[str], packages_root: Path, *, skip_installe
 
     console.print("[green]Dependencies installed.[/green]")
     console.print()
+
+
+def _print_install_failures(exc: RezInstallError) -> None:
+    """List the packages that could not be installed, and why."""
+    console.print(f"  {len(exc.failures)} package(s) could not be installed:")
+    for failure in exc.failures:
+        console.print(f"  [dim]- {failure}[/dim]")
+    console.print("  The package was not written, so nothing references the missing packages.")
 
 
 def _print_uv_error(exc: subprocess.CalledProcessError) -> None:
@@ -753,7 +766,7 @@ def _build_library_from_local(
     _build_library_from_dir(library_dir, packages_root, skip_installed=skip_installed)
 
 
-def _build_library_from_dir(  # noqa: C901
+def _build_library_from_dir(  # noqa: C901, PLR0915
     library_dir: Path, packages_root: Path, *, skip_installed: bool
 ) -> None:
     """Build a rez package from a directory containing a library manifest.
@@ -814,6 +827,10 @@ def _build_library_from_dir(  # noqa: C901
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]Attempted to build a rez package for '{library_name}'. Failed due to:[/red]")
         _print_uv_error(exc)
+        raise typer.Exit(1) from exc
+    except RezInstallError as exc:
+        console.print(f"[red]Attempted to build a rez package for '{library_name}'. Failed due to:[/red]")
+        _print_install_failures(exc)
         raise typer.Exit(1) from exc
     except OSError as exc:
         console.print(f"[red]Attempted to build a rez package for '{library_name}'. Failed due to: {exc}[/red]")

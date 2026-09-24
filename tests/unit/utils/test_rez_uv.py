@@ -15,6 +15,7 @@ import pytest
 from griptape_nodes.utils import rez_uv
 from griptape_nodes.utils.rez_uv import (
     ResolvedPackage,
+    RezInstallError,
     WheelInfo,
     _build_requires,
     _copy_payload,
@@ -616,7 +617,7 @@ class TestInstallOne:
             {"torch": {"requires": ("filelock", "sympy>=1.13"), "scripts": ("torchrun",), "tag": "cp312-cp312-linux"}}
         )
         with patch.object(rez_uv.subprocess, "run", side_effect=fake):
-            ok = _install_one(
+            failure = _install_one(
                 ResolvedPackage(pip_name="torch", version="2.7.0+cu128"),
                 uv="uv",
                 packages_dir=tmp_path,
@@ -625,7 +626,7 @@ class TestInstallOne:
                 python_version="3.12",
             )
 
-        assert ok is True
+        assert failure is None
         cmd = fake.calls[0]
         assert cmd[cmd.index("--extra-index-url") + 1] == "https://download.pytorch.org/whl/cu128"
         assert "--torch-backend=auto" in cmd
@@ -640,7 +641,7 @@ class TestInstallOne:
     def test_download_failure(self, tmp_path: Path, mock_logger: MagicMock) -> None:
         fake = FakeUv(fail_install={"ghost"})
         with patch.object(rez_uv.subprocess, "run", side_effect=fake):
-            ok = _install_one(
+            failure = _install_one(
                 ResolvedPackage(pip_name="ghost", version="1.0"),
                 uv="uv",
                 packages_dir=tmp_path,
@@ -649,15 +650,30 @@ class TestInstallOne:
                 python_version="3.12",
             )
 
-        assert ok is False
+        assert failure == "download failed: error: no matching distribution"
         assert "--extra-index-url" not in fake.calls[0]
         mock_logger.warning.assert_called()
         assert not (tmp_path / "local").exists()
 
+    @pytest.mark.usefixtures("mock_logger")
+    def test_download_failure_without_uv_output_reports_exit_code(self, tmp_path: Path) -> None:
+        silent_failure = subprocess.CompletedProcess(["uv"], 2, stdout="", stderr="")
+        with patch.object(rez_uv.subprocess, "run", return_value=silent_failure):
+            failure = _install_one(
+                ResolvedPackage(pip_name="ghost", version="1.0"),
+                uv="uv",
+                packages_dir=tmp_path,
+                extra_index_url=None,
+                extra_flags=None,
+                python_version="3.12",
+            )
+
+        assert failure == "download failed (uv exited with 2)"
+
     def test_metadata_failure(self, tmp_path: Path, mock_logger: MagicMock) -> None:
         fake = FakeUv()  # install "succeeds" but writes no .dist-info
         with patch.object(rez_uv.subprocess, "run", side_effect=fake):
-            ok = _install_one(
+            failure = _install_one(
                 ResolvedPackage(pip_name="empty", version="1.0"),
                 uv="uv",
                 packages_dir=tmp_path,
@@ -666,7 +682,8 @@ class TestInstallOne:
                 python_version="3.12",
             )
 
-        assert ok is False
+        assert failure is not None
+        assert failure.startswith("could not read its wheel metadata: No .dist-info found")
         mock_logger.warning.assert_called()
 
     def test_write_failure_logs_path_and_reason(
@@ -681,7 +698,7 @@ class TestInstallOne:
             patch.object(rez_uv.subprocess, "run", side_effect=fake),
             patch.object(rez_uv, "_write_package_py", side_effect=error),
         ):
-            ok = _install_one(
+            failure = _install_one(
                 ResolvedPackage(pip_name="six", version="1.16.0"),
                 uv="uv",
                 packages_dir=tmp_path,
@@ -690,7 +707,7 @@ class TestInstallOne:
                 python_version="3.12",
             )
 
-        assert ok is False
+        assert failure == f"could not write {tmp_path / 'local' / 'six'}: Permission denied"
         args = mock_logger.error.call_args.args
         assert args[1:] == ("six", "1.16.0", str(tmp_path / "local" / "six"), "Permission denied")
 
@@ -712,16 +729,23 @@ class TestInstall:
             fail_install={"idna"},
         )
 
-        with patch.object(rez_uv.subprocess, "run", side_effect=fake):
+        with (
+            patch.object(rez_uv.subprocess, "run", side_effect=fake),
+            pytest.raises(RezInstallError) as raised,
+        ):
             install("requests", packages_dir=tmp_path, python_version="3.12", uv_cmd="uv")
 
+        # Every other package is still installed before the error is raised.
+        expected_failure = "idna==3.7 (download failed: error: no matching distribution)"
+        assert raised.value.failures == [expected_failure]
+        assert "1 package(s) could not be installed" in str(raised.value)
         installed_specs = [c[c.index("--target") + 2] for c in fake.calls if "install" in c]
         assert installed_specs == ["idna==3.7", "requests==2.32.3"]
         assert (tmp_path / "local" / "requests" / "2.32.3" / "package.py").exists()
         assert not (tmp_path / "local" / "idna").exists()
         summary = mock_logger.info.call_args_list[-1].args
         assert summary[1:] == (1, 1, ", 1 failed")
-        mock_logger.warning.assert_called_with("[Rez][uv] failed packages: %s", "idna==3.7")
+        mock_logger.warning.assert_called_with("[Rez][uv] failed packages: %s", expected_failure)
 
     def test_reinstall_ignores_existing(self, tmp_path: Path, linux_platform: None, mock_logger: MagicMock) -> None:  # noqa: ARG002
         preinstalled = tmp_path / "local" / "six" / "1.16.0"
