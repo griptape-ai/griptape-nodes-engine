@@ -55,6 +55,9 @@ from griptape_nodes.utils.rez_utils import (
     rez_path_map,
     rez_release_packages_path,
     rez_root,
+    rez_search_paths,
+    rez_subprocess_env,
+    rez_unsearched_stores,
     rez_version_from_git_ref,
 )
 from griptape_nodes.utils.rez_uv import ResolvedPackage
@@ -1289,3 +1292,182 @@ class TestRezVersionFromGitRef:
     )
     def test_ref_to_version(self, ref: str | None, expected: str | None) -> None:
         assert rez_version_from_git_ref(ref) == expected
+
+
+# ---------------------------------------------------------------------------
+# Rez configuration: opt-in layering, search path check, local + release lookups
+# ---------------------------------------------------------------------------
+
+
+class TestRezSubprocessEnv:
+    def test_inherits_environment_unchanged_without_opt_in(self) -> None:
+        with patch.dict(os.environ, {"REZ_CONFIG_FILE": "/studio/rezconfig.py", "OTHER": "x"}, clear=True):
+            env = rez_subprocess_env()
+        assert env == {"REZ_CONFIG_FILE": "/studio/rezconfig.py", "OTHER": "x"}
+
+    def test_opt_in_config_used_when_no_studio_config(self, tmp_path: Path) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        with patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(config)}, clear=True):
+            env = rez_subprocess_env()
+        assert env["REZ_CONFIG_FILE"] == str(config)
+
+    def test_opt_in_config_is_layered_after_studio_config(self, tmp_path: Path) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        environ = {"REZ_CONFIG_FILE": "/studio/rezconfig.py", "GTN_REZ_CONFIG_FILE": str(config)}
+        with patch.dict(os.environ, environ, clear=True):
+            env = rez_subprocess_env()
+        assert env["REZ_CONFIG_FILE"] == os.pathsep.join(["/studio/rezconfig.py", str(config)])
+
+    def test_opt_in_config_not_added_twice(self, tmp_path: Path) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        environ = {
+            "REZ_CONFIG_FILE": os.pathsep.join(["/studio/rezconfig.py", str(config)]),
+            "GTN_REZ_CONFIG_FILE": str(config),
+        }
+        with patch.dict(os.environ, environ, clear=True):
+            env = rez_subprocess_env()
+        assert env["REZ_CONFIG_FILE"] == environ["REZ_CONFIG_FILE"]
+
+    def test_does_not_modify_the_process_environment(self, tmp_path: Path) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(tmp_path / "c.py")}, clear=True):
+            rez_subprocess_env()
+            assert "REZ_CONFIG_FILE" not in os.environ
+
+
+class TestRezSearchPaths:
+    def test_reads_packages_path_as_json(self, tmp_path: Path) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout='["/a", "/b"]\n', stderr="")
+        config = tmp_path / "c.py"
+        with (
+            patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(config)}, clear=True),
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", return_value=completed) as run,
+        ):
+            assert rez_search_paths() == [Path("/a"), Path("/b")]
+        assert run.call_args.args[0] == ["rez-config", "--json", "packages_path"]
+        assert run.call_args.kwargs["env"]["REZ_CONFIG_FILE"] == str(config)
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="not json", stderr=""),
+        ],
+    )
+    def test_unreadable_answer_returns_none(self, outcome: subprocess.CompletedProcess[str]) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", return_value=outcome),
+        ):
+            assert rez_search_paths() is None
+
+    def test_missing_rez_returns_none(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", side_effect=FileNotFoundError("rez-config")),
+        ):
+            assert rez_search_paths() is None
+
+
+class TestRezUnsearchedStores:
+    def test_reports_stores_rez_does_not_search(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        release = tmp_path / "release"
+        environ = {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local), "GTN_REZ_RELEASE_PACKAGES_PATH": str(release)}
+        with (
+            patch.dict(os.environ, environ, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=[local, tmp_path / "studio"]),
+        ):
+            assert rez_unsearched_stores() == [release]
+
+    def test_all_stores_searched(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=[local]),
+        ):
+            assert rez_unsearched_stores() == []
+
+    def test_different_spellings_of_the_same_store_match(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        local.mkdir()
+        with patch(f"{_RU}.rez_search_paths", return_value=[tmp_path / "x" / ".." / "local"]):
+            assert rez_unsearched_stores([local]) == []
+
+    def test_unknown_search_path_reports_nothing(self, tmp_path: Path) -> None:
+        with patch(f"{_RU}.rez_search_paths", return_value=None):
+            assert rez_unsearched_stores([tmp_path / "local"]) == []
+
+    def test_no_stores_does_not_ask_rez(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_search_paths") as search:
+            assert rez_unsearched_stores() == []
+        search.assert_not_called()
+
+
+class TestLocalAndReleaseStoreLookups:
+    @pytest.fixture(autouse=True)
+    def _no_git(self) -> Iterator[None]:
+        with patch(f"{_RU}.get_git_repository_root", return_value=None):
+            yield
+
+    def _stores(self, tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+        local = tmp_path / "store" / "local"
+        release = tmp_path / "store" / "release"
+        environ = {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local), "GTN_REZ_RELEASE_PACKAGES_PATH": str(release)}
+        return local, release, environ
+
+    def test_released_package_is_found(self, tmp_path: Path) -> None:
+        _, release, environ = self._stores(tmp_path)
+        _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
+        with patch.dict(os.environ, environ, clear=True):
+            assert get_library_rez_package_version(manifest) == "1.0.0"
+            assert resolve_rez_library_json_path("my_lib") == release / "my_lib" / "1.0.0" / "python" / (
+                "griptape_nodes_library.json"
+            )
+
+    def test_highest_version_across_stores_wins(self, tmp_path: Path) -> None:
+        local, release, environ = self._stores(tmp_path)
+        _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        _make_rez_version(release, "my_lib", "1.2.0", manifest="griptape_nodes_library.json")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
+        with patch.dict(os.environ, environ, clear=True):
+            assert get_library_rez_package_version(manifest) == "1.2.0"
+            json_path = resolve_rez_library_json_path("my_lib")
+        assert json_path is not None
+        assert json_path.is_relative_to(release)
+
+    def test_same_version_in_both_prefers_local(self, tmp_path: Path) -> None:
+        local, release, environ = self._stores(tmp_path)
+        _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        with patch.dict(os.environ, environ, clear=True):
+            json_path = resolve_rez_library_json_path("my_lib")
+        assert json_path is not None
+        assert json_path.is_relative_to(local)
+
+    def test_pinned_version_found_in_release(self, tmp_path: Path) -> None:
+        local, release, environ = self._stores(tmp_path)
+        _make_rez_version(local, "my_lib", "2.0.0", manifest="griptape_nodes_library.json")
+        _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        with patch.dict(os.environ, environ, clear=True):
+            json_path = resolve_rez_library_json_path("my_lib", version="1.0.0")
+            missing = resolve_rez_library_json_path("my_lib", version="3.0.0")
+        assert json_path == release / "my_lib" / "1.0.0" / "python" / "griptape_nodes_library.json"
+        assert missing is None
+
+    def test_local_store_folder_need_not_be_named_local(self, tmp_path: Path) -> None:
+        store = tmp_path / "studio" / "griptape_builds"
+        _make_rez_version(store, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
+        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(store)}, clear=True):
+            assert get_library_rez_package_version(manifest) == "1.0.0"
+            assert resolve_rez_library_json_path("my_lib") is not None
+
+    def test_pinned_requires_read_from_released_package(self, tmp_path: Path) -> None:
+        _, release, environ = self._stores(tmp_path)
+        version_dir = _make_rez_version(release, "my_lib", "1.0.0")
+        (version_dir / "package.py").write_text("requires = ['pillow-10.0.0']\n")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
+        with patch.dict(os.environ, environ, clear=True):
+            assert library_edit_rez_requests(manifest, ["pillow"]) == ["pillow-10.0.0"]

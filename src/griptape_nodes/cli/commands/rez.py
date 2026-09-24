@@ -38,6 +38,8 @@ from griptape_nodes.utils.rez_utils import (
     rez_local_packages_path,
     rez_path_map,
     rez_root,
+    rez_subprocess_env,
+    rez_unsearched_stores,
 )
 from griptape_nodes.utils.rez_uv import install as rez_uv_install
 
@@ -102,6 +104,7 @@ def build_engine_package(
         console.print(f"  [yellow]Existing package {version} will be overwritten.[/yellow]")
     console.print()
 
+    _warn_if_rez_does_not_search(packages_root)
     _check_rez_bindings(interactive=not yes)
 
     if not yes and not typer.confirm("Proceed with build?", default=True):
@@ -156,6 +159,30 @@ def _resolve_and_validate_repo(engine_repo_path: str | None) -> tuple[Path, Path
     return repo_path, pyproject_path
 
 
+def _warn_if_rez_does_not_search(store: Path) -> None:
+    """Warn when the store being built into is not on rez's package search path.
+
+    Read-only: Griptape Nodes never changes rez configuration. Packages in a store rez
+    does not search are written correctly but will not resolve with ``rez env``.
+    """
+    if not rez_unsearched_stores([store]):
+        return
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold yellow]Rez does not search {store}[/bold yellow]\n\n"
+            "Packages built there will not resolve with rez-env until the store is added\n"
+            "to packages_path in your rez configuration. For example, in a file layered\n"
+            "on your studio configuration with REZ_CONFIG_FILE:\n\n"
+            f'  [cyan]packages_path = ModifyList(append=["{store.as_posix()}"])[/cyan]\n\n'
+            "Griptape Nodes never changes your rez configuration.",
+            title="Package Store Not On Rez Search Path",
+            expand=False,
+        )
+    )
+
+
 def _check_rez_bindings(*, interactive: bool = True) -> None:
     """Verify that rez system bindings (platform, os, python) exist.
 
@@ -178,7 +205,7 @@ def _check_rez_bindings(*, interactive: bool = True) -> None:
     for family, bind_hint in required.items():
         try:
             result = subprocess.run(  # noqa: S603
-                [rez_search, family], capture_output=True, text=True, check=False, timeout=10
+                [rez_search, family], capture_output=True, text=True, env=rez_subprocess_env(), check=False, timeout=10
             )
             if result.returncode != 0:
                 missing.append((family, bind_hint))
@@ -192,7 +219,7 @@ def _check_rez_bindings(*, interactive: bool = True) -> None:
     console.print(
         Panel(
             "[bold yellow]Rez system bindings not found[/bold yellow]\n\n"
-            "The following rez system packages are missing from local and release stores:\n"
+            "The following rez system packages were not found on rez's package search path:\n"
             + "".join(f"\n  [red]x[/red] [bold]{family}[/bold]" for family, _ in missing)
             + "\n\n"
             "These are created by [cyan]rez bind[/cyan] and tell rez what platform,\n"
@@ -668,6 +695,7 @@ def build_library_package(
             console.print("[red]Set GTN_REZ_ROOT + GTN_REZ_LOCAL_PACKAGES_PATH or provide --packages-path.[/red]")
             raise typer.Exit(1)
 
+    _warn_if_rez_does_not_search(packages_root / "local")
     _check_rez_bindings()
 
     if git_url:
@@ -815,7 +843,9 @@ def _validate_rez_package(family: str, version: str | None) -> None:
 
     search_cmd = [rez_search, family]
     try:
-        result = subprocess.run(search_cmd, capture_output=True, text=True, check=False, timeout=15)  # noqa: S603
+        result = subprocess.run(  # noqa: S603
+            search_cmd, capture_output=True, text=True, env=rez_subprocess_env(), check=False, timeout=15
+        )
         if result.returncode == 0:
             console.print(f"  [green]rez-search {family}: found[/green]")
         else:
@@ -828,7 +858,9 @@ def _validate_rez_package(family: str, version: str | None) -> None:
         rez_bin = _rez_executable("rez")
         resolve_cmd = [rez_bin, "env", spec, "--", "echo", "ok"]
         try:
-            result = subprocess.run(resolve_cmd, capture_output=True, text=True, check=False, timeout=30)  # noqa: S603
+            result = subprocess.run(  # noqa: S603
+                resolve_cmd, capture_output=True, text=True, env=rez_subprocess_env(), check=False, timeout=30
+            )
             if result.returncode == 0 and "ok" in result.stdout:
                 console.print(f"  [green]rez-env {spec}: resolves successfully[/green]")
             else:

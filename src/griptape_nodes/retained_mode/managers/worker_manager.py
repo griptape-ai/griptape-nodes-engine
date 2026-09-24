@@ -33,6 +33,7 @@ from griptape_nodes.utils.rez_utils import (
     is_rez_enabled,
     library_file_path_to_rez_family,
     resolve_and_log_rez_context,
+    rez_subprocess_env,
 )
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -453,6 +454,11 @@ class WorkerManager(EngineScoped):
             # Forward rez configuration vars so the worker subprocess can resolve rez packages.
             if is_rez_enabled():
                 rez_vars = {k: v for k, v in os.environ.items() if k.startswith(("REZ_", "GTN_REZ_"))}
+                # The worker's `rez env` must use the same configuration as every other rez
+                # command the engine runs, including a GTN_REZ_CONFIG_FILE opt-in.
+                rez_config = rez_subprocess_env().get("REZ_CONFIG_FILE")
+                if rez_config:
+                    rez_vars["REZ_CONFIG_FILE"] = rez_config
                 worker_environ.update(rez_vars)
                 if rez_vars:
                     logger.debug("[Rez] forwarding %d rez env vars to worker: %s", len(rez_vars), list(rez_vars.keys()))

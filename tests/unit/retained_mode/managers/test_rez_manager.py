@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -77,12 +79,43 @@ class TestConstruction:
 class TestStartupHealthCheck:
     @pytest.mark.parametrize("healthy", [True, False])
     def test_caches_health(self, manager: RezManager, *, healthy: bool) -> None:
-        with patch(f"{REZ_MANAGER_MODULE}.check_rez_health_detailed", return_value=_health(healthy=healthy)):
+        with (
+            patch(f"{REZ_MANAGER_MODULE}.check_rez_health_detailed", return_value=_health(healthy=healthy)),
+            patch(f"{REZ_MANAGER_MODULE}.rez_unsearched_stores", return_value=[]),
+        ):
             manager.run_startup_health_check()
 
         assert manager._cached_health == RezHealthStatus(
             healthy=healthy, check_duration_ms=DURATION_MS, package_count=PACKAGE_COUNT, timestamp=TIMESTAMP
         )
+
+
+class TestUnsearchedStoreWarning:
+    def test_warns_for_each_store_rez_does_not_search(
+        self, manager: RezManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stores = [Path("/studio/griptape/local"), Path("/studio/griptape/release")]
+        with (
+            patch(f"{REZ_MANAGER_MODULE}.check_rez_health_detailed", return_value=_health(healthy=True)),
+            patch(f"{REZ_MANAGER_MODULE}.rez_unsearched_stores", return_value=stores),
+            caplog.at_level(logging.WARNING),
+        ):
+            manager.run_startup_health_check()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == len(stores)
+        assert all("Add it to packages_path in your rez configuration" in w for w in warnings)
+        assert str(stores[0]) in warnings[0]
+
+    def test_silent_when_rez_searches_every_store(self, manager: RezManager, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            patch(f"{REZ_MANAGER_MODULE}.check_rez_health_detailed", return_value=_health(healthy=True)),
+            patch(f"{REZ_MANAGER_MODULE}.rez_unsearched_stores", return_value=[]),
+            caplog.at_level(logging.WARNING),
+        ):
+            manager.run_startup_health_check()
+
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 class TestGetRezStatus:

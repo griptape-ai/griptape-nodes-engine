@@ -23,6 +23,7 @@ from griptape_nodes.utils.rez_utils import (
     get_rez_context_string,
     is_rez_enabled,
     rez_path_map,
+    rez_unsearched_stores,
 )
 
 if TYPE_CHECKING:
@@ -63,6 +64,20 @@ class RezManager(EngineScoped):
             result.package_count,
             result.check_duration_ms,
         )
+        self._warn_about_unsearched_stores()
+
+    def _warn_about_unsearched_stores(self) -> None:
+        """Warn when rez is not configured to search a GTN_REZ_* package store.
+
+        Read-only: Griptape Nodes never changes rez configuration. A store rez does not
+        search holds packages the engine can see but ``rez env`` cannot resolve.
+        """
+        for store in rez_unsearched_stores():
+            logger.warning(
+                "[Rez] Attempted to use the rez package store %s. Rez is not configured to search it, "
+                "so libraries from it will fail to load. Add it to packages_path in your rez configuration.",
+                store,
+            )
 
     def _collect_library_statuses(self) -> list[RezLibraryStatus]:
         """Gather rez package status for all registered libraries."""

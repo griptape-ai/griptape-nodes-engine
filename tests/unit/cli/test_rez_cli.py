@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import typer
@@ -37,6 +37,7 @@ from griptape_nodes.cli.commands.rez import (
     _resolve_engine_repo,
     _resolve_studio_root_from_env_or_option,
     _validate_rez_package,
+    _warn_if_rez_does_not_search,
     _write_engine_package,
     app,
 )
@@ -48,6 +49,13 @@ MODULE = "griptape_nodes.cli.commands.rez"
 PYTHON_FAMILY = f"python-{sys.version_info.major}.{sys.version_info.minor}"
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def rez_searches_every_store() -> Iterator[MagicMock]:
+    """Default: rez searches every store, so no test depends on a local rez-config binary."""
+    with patch(f"{MODULE}.rez_unsearched_stores", return_value=[]) as unsearched:
+        yield unsearched
 
 
 @pytest.fixture
@@ -809,6 +817,54 @@ class TestBuildLibrarySources:
 # ---------------------------------------------------------------------------
 
 
+class TestWarnIfRezDoesNotSearch:
+    def test_warns_with_the_store_and_the_config_to_add(
+        self, tmp_path: Path, output: io.StringIO, rez_searches_every_store: MagicMock
+    ) -> None:
+        store = tmp_path / "store" / "local"
+        rez_searches_every_store.return_value = [store]
+
+        _warn_if_rez_does_not_search(store)
+
+        rez_searches_every_store.assert_called_once_with([store])
+        text = output.getvalue()
+        assert "Rez does not search" in text
+        assert f'packages_path = ModifyList(append=["{store.as_posix()}"])' in text
+        assert "never changes your rez configuration" in text
+
+    def test_silent_when_rez_searches_the_store(self, tmp_path: Path, output: io.StringIO) -> None:
+        _warn_if_rez_does_not_search(tmp_path / "store" / "local")
+        assert output.getvalue() == ""
+
+
+class TestRezCommandsUseTheRezEnvironment:
+    @pytest.mark.usefixtures("output")
+    def test_binding_check_runs_with_opt_in_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        monkeypatch.setenv("GTN_REZ_CONFIG_FILE", str(config))
+        monkeypatch.delenv("REZ_CONFIG_FILE", raising=False)
+        with (
+            patch(f"{MODULE}._rez_executable", return_value="rez-search"),
+            patch(f"{MODULE}.subprocess.run", return_value=_completed(0)) as run,
+        ):
+            _check_rez_bindings()
+        assert run.call_args.kwargs["env"]["REZ_CONFIG_FILE"] == str(config)
+
+    @pytest.mark.usefixtures("output")
+    def test_validation_runs_with_opt_in_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        monkeypatch.setenv("GTN_REZ_CONFIG_FILE", str(config))
+        monkeypatch.delenv("REZ_CONFIG_FILE", raising=False)
+        with (
+            patch(f"{MODULE}._rez_executable", side_effect=lambda name: name),
+            patch(f"{MODULE}.subprocess.run", return_value=_completed(0, stdout="ok")) as run,
+        ):
+            _validate_rez_package("my_lib", "1.0.0")
+        assert run.call_count == 2  # noqa: PLR2004 -- rez-search, then rez env
+        for call in run.call_args_list:
+            assert call.kwargs["env"]["REZ_CONFIG_FILE"] == str(config)
+
+
 class TestBuildLibraryPackageCommand:
     @pytest.mark.usefixtures("output")
     def test_rejects_both_sources(self, tmp_path: Path) -> None:
@@ -839,6 +895,19 @@ class TestBuildLibraryPackageCommand:
         assert result.exit_code == 0, result.output
         check.assert_called_once_with()
         build.assert_called_once_with(str(tmp_path), tmp_path / "store", skip_installed=False)
+
+    @pytest.mark.usefixtures("output")
+    def test_checks_that_rez_searches_the_store_it_builds_into(self, tmp_path: Path) -> None:
+        with (
+            patch(f"{MODULE}._warn_if_rez_does_not_search") as warn,
+            patch(f"{MODULE}._check_rez_bindings"),
+            patch(f"{MODULE}._build_library_from_local"),
+        ):
+            result = runner.invoke(
+                app, ["build-library-package", "--local-path", str(tmp_path), "--packages-path", str(tmp_path)]
+            )
+        assert result.exit_code == 0, result.output
+        warn.assert_called_once_with(tmp_path / "local")
 
     @pytest.mark.usefixtures("output")
     def test_git_source_uses_explicit_packages_path(self, tmp_path: Path) -> None:
@@ -898,6 +967,23 @@ class TestBuildEnginePackageCommand:
         install.assert_called_once_with(["requests>=2"], packages_dir=store, skip_installed=True)
         validate.assert_called_once_with("griptape_nodes_engine", "1.2.3")
         assert (store / "local" / "griptape_nodes_engine" / "1.2.3" / "package.py").exists()
+
+    @pytest.mark.usefixtures("output", "clean_env")
+    def test_checks_that_rez_searches_the_store_it_builds_into(self, tmp_path: Path) -> None:
+        repo = _make_engine_repo(tmp_path)
+        store = tmp_path / "store"
+        with (
+            patch(f"{MODULE}._warn_if_rez_does_not_search") as warn,
+            patch(f"{MODULE}._check_rez_bindings"),
+            patch(f"{MODULE}.rez_uv_install"),
+            patch(f"{MODULE}.build_direct_requires", return_value=[]),
+            patch(f"{MODULE}._validate_rez_package"),
+        ):
+            result = runner.invoke(
+                app, ["build-engine-package", "--engine-repo", str(repo), "--packages-path", str(store), "--yes"]
+            )
+        assert result.exit_code == 0, result.output
+        warn.assert_called_once_with(store / "local")
 
     @pytest.mark.usefixtures("clean_env")
     def test_interactive_decline_aborts_before_writing(self, tmp_path: Path, output: io.StringIO) -> None:

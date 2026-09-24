@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,6 +160,18 @@ class TestSpawnWorkerRezEnvironment:
         # Only rez variables are copied from the live environment; the rest comes from the
         # pre-project environ, which is empty here.
         assert "UNRELATED_TEST_VAR" not in env
+
+    @pytest.mark.asyncio
+    async def test_opt_in_config_reaches_the_worker_layered_on_the_studio_config(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = tmp_path / "griptape_rezconfig.py"
+        monkeypatch.setenv("REZ_CONFIG_FILE", "/studio/rezconfig.py")
+        monkeypatch.setenv("GTN_REZ_CONFIG_FILE", str(config))
+
+        env = await self._spawn_env(worker_manager, rez_enabled=True)
+
+        assert env["REZ_CONFIG_FILE"] == os.pathsep.join(["/studio/rezconfig.py", str(config)])
 
     @pytest.mark.asyncio
     async def test_does_not_forward_rez_variables_when_disabled(

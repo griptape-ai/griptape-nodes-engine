@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.utils.file_utils import find_file_in_directory
 from griptape_nodes.utils.git_utils import get_git_repository_root
 from griptape_nodes.utils.rez_uv import install as rez_uv_install
@@ -191,6 +192,72 @@ def _rez_executable(command: str) -> str:
     return shutil.which(command) or command
 
 
+def rez_subprocess_env() -> dict[str, str]:
+    """Return the environment for rez commands run by Griptape Nodes.
+
+    The process environment is inherited unchanged, so a studio's ``REZ_CONFIG_FILE``
+    and ``REZ_PACKAGES_PATH`` are used as-is. ``GTN_REZ_CONFIG_FILE`` is the explicit
+    opt-in: when set, it is layered after any existing ``REZ_CONFIG_FILE`` so its
+    settings apply on top of the studio configuration instead of replacing it.
+    """
+    env = dict(os.environ)
+    config_file = rez_config_file()
+    if config_file is None:
+        return env
+
+    entries = [entry for entry in env.get("REZ_CONFIG_FILE", "").split(os.pathsep) if entry]
+    if str(config_file) not in entries:
+        entries.append(str(config_file))
+    env["REZ_CONFIG_FILE"] = os.pathsep.join(entries)
+    return env
+
+
+def rez_search_paths() -> list[Path] | None:
+    """Return the package search path rez is configured with, or None if rez cannot say.
+
+    Read-only: runs ``rez-config --json packages_path`` in the same environment as
+    every other rez command Griptape Nodes runs.
+    """
+    cmd = [_rez_executable("rez-config"), "--json", "packages_path"]
+    try:
+        result = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, env=rez_subprocess_env(), check=False, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("[Rez] could not read rez packages_path: %s", exc)
+        return None
+    if result.returncode != 0:
+        logger.debug("[Rez] rez-config packages_path failed (rc=%d): %s", result.returncode, result.stderr.strip())
+        return None
+
+    try:
+        paths = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.debug("[Rez] unexpected rez-config output: %s", result.stdout.strip())
+        return None
+    return [Path(path) for path in paths]
+
+
+def rez_unsearched_stores(stores: list[Path] | None = None) -> list[Path]:
+    """Return the package stores that rez's ``packages_path`` does not include.
+
+    Packages in such a store are found by Griptape Nodes on disk but cannot be resolved
+    by ``rez env``. Defaults to the ``GTN_REZ_*`` local and release stores. Returns an
+    empty list when rez cannot report its search path.
+    """
+    if stores is None:
+        stores = _rez_store_dirs()
+    if not stores:
+        return []
+
+    search_paths = rez_search_paths()
+    if search_paths is None:
+        return []
+
+    searched = {canonicalize_for_identity(path) for path in search_paths}
+    return [store for store in stores if canonicalize_for_identity(store) not in searched]
+
+
 def _log_rez_env_context() -> None:
     """Emit debug lines describing the current Rez configuration."""
     logger.debug("[Rez] enabled=%s", is_rez_enabled())
@@ -235,6 +302,35 @@ def _rez_packages_root() -> Path | None:
     """
     local_path = rez_local_packages_path()
     return local_path.parent if local_path is not None else None
+
+
+def _rez_store_dirs() -> list[Path]:
+    """Return the package stores Griptape Nodes reads, in rez's usual order: local, then release."""
+    return [store for store in (rez_local_packages_path(), rez_release_packages_path()) if store is not None]
+
+
+def _find_package_version_dir(rez_family: str, version: str | None, stores: list[Path]) -> Path | None:
+    """Return the version directory of *rez_family* across *stores*, or None.
+
+    A pinned *version* comes from the first store that holds it. Otherwise the highest
+    version across all stores wins, as in a rez resolve; on a tie the earlier store wins.
+    """
+    if version is not None:
+        for store in stores:
+            version_dir = store / rez_family / version
+            if (version_dir / "package.py").is_file():
+                return version_dir
+        return None
+
+    candidates: list[Path] = []
+    for store in stores:
+        family_dir = store / rez_family
+        if not family_dir.is_dir():
+            continue
+        candidates.extend(d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").is_file())
+    if not candidates:
+        return None
+    return max(candidates, key=_version_sort_key)
 
 
 def pip_spec_name(spec: str) -> str:
@@ -403,41 +499,28 @@ def rez_library_package_version(path: str) -> str | None:
     return version
 
 
-def resolve_rez_library_json_path(rez_family: str, version: str | None = None) -> Path | None:  # noqa: PLR0911
+def resolve_rez_library_json_path(rez_family: str, version: str | None = None) -> Path | None:
     """Locate the library JSON file inside a rez package's ``python/`` directory.
 
-    When *version* is provided, looks in exactly that version directory.
-    Otherwise searches for the latest version of *rez_family*.
+    Searches the local store, then the release store. When *version* is provided,
+    looks for exactly that version; otherwise uses the highest version in either store.
 
     Args:
         rez_family: Rez package family name (no version).
         version: Optional specific version to resolve (e.g. "0.81.0").
     """
-    packages_root = _rez_packages_root()
-    if packages_root is None:
+    stores = _rez_store_dirs()
+    if not stores:
         return None
 
-    family_dir = packages_root / "local" / rez_family
-    if not family_dir.is_dir():
-        logger.warning("[Rez] package family '%s' not found in %s", rez_family, packages_root / "local")
+    target_dir = _find_package_version_dir(rez_family, version or None, stores)
+    if target_dir is None:
+        searched = ", ".join(str(store) for store in stores)
+        if version:
+            logger.warning("[Rez] package '%s-%s' not found in %s", rez_family, version, searched)
+        else:
+            logger.warning("[Rez] package family '%s' not found in %s", rez_family, searched)
         return None
-
-    if version:
-        version_dir = family_dir / version
-        if not version_dir.is_dir() or not (version_dir / "package.py").exists():
-            logger.warning("[Rez] version '%s' not found for package '%s'", version, rez_family)
-            return None
-        target_dir = version_dir
-    else:
-        versions = sorted(
-            (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-            key=_version_sort_key,
-            reverse=True,
-        )
-        if not versions:
-            logger.warning("[Rez] no versions found for package '%s'", rez_family)
-            return None
-        target_dir = versions[0]
 
     python_dir = target_dir / "python"
     if not python_dir.is_dir():
@@ -465,35 +548,28 @@ def is_library_rez_package_available(library_file_path: Path) -> bool:
 def get_library_rez_package_version(library_file_path: Path, *, packages_root: Path | None = None) -> str | None:
     """Return the latest version of a library's rez package, or None if unavailable.
 
-    Searches the local package store for version directories containing a
-    ``package.py`` and returns the highest version string found.
+    Searches the local and release stores for version directories containing a
+    ``package.py`` and returns the highest version found in either.
 
     Args:
         library_file_path: Library JSON path. The rez family is derived from the
             library's repo or folder name (see ``library_file_path_to_rez_family``).
-        packages_root: Root of the rez package store (parent of ``local/``).
-            Defaults to the parent of ``GTN_REZ_LOCAL_PACKAGES_PATH``.
+        packages_root: Root of a package store being built (its ``local/`` folder is
+            searched instead of the ``GTN_REZ_*`` stores). Used by the build CLI.
     """
     if packages_root is None:
-        packages_root = _rez_packages_root()
-    if packages_root is None:
+        stores = _rez_store_dirs()
+    else:
+        stores = [packages_root / "local"]
+    if not stores:
         return None
 
     rez_family = library_file_path_to_rez_family(library_file_path)
-
-    family_dir = packages_root / "local" / rez_family
-    if not family_dir.is_dir():
+    version_dir = _find_package_version_dir(rez_family, None, stores)
+    if version_dir is None:
         return None
 
-    versions = sorted(
-        (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-        key=_version_sort_key,
-        reverse=True,
-    )
-    if not versions:
-        return None
-
-    version = versions[0].name
+    version = version_dir.name
     logger.debug("[Rez] found rez package for '%s': %s-%s", library_file_path, rez_family, version)
     return version
 
@@ -607,17 +683,14 @@ def _library_package_dir(library_file_path: Path) -> Path | None:
     """Return the version directory of the rez package that provides a library, or None.
 
     A manifest registered from the store (``REZ:`` entries) sits inside that directory
-    already; a manifest in a local checkout is matched to the latest store version of
-    its repo/folder-named family.
+    already; a manifest in a local checkout is matched to the highest version of its
+    repo/folder-named family in the local or release store.
     """
     if _detect_rez_store_family(library_file_path) is not None:
         return library_file_path.parent.parent
 
-    packages_root = _rez_packages_root()
-    version = get_library_rez_package_version(library_file_path)
-    if packages_root is None or version is None:
-        return None
-    return packages_root / "local" / library_file_path_to_rez_family(library_file_path) / version
+    rez_family = library_file_path_to_rez_family(library_file_path)
+    return _find_package_version_dir(rez_family, None, _rez_store_dirs())
 
 
 def read_library_package_requires(library_file_path: Path) -> list[str]:
@@ -741,6 +814,7 @@ def resolve_and_log_rez_context(package_specs: list[str]) -> list[str]:
             probe_cmd,
             capture_output=True,
             text=True,
+            env=rez_subprocess_env(),
             timeout=30,
             check=False,
         )
@@ -783,6 +857,7 @@ def resolve_rez_pythonpath(package_specs: list[str]) -> list[str]:
             probe_cmd,
             capture_output=True,
             text=True,
+            env=rez_subprocess_env(),
             timeout=30,
             check=False,
         )
@@ -1112,8 +1187,8 @@ def install_library_as_rez_package(  # noqa: PLR0913
 def check_rez_health() -> bool:
     """Verify rez is reachable and list the available package families.
 
-    Runs ``rez-search --type family`` using the configured binary and
-    ``REZ_CONFIG_FILE``.  At INFO level logs the package count; at DEBUG logs
+    Runs ``rez-search --type family`` using the configured binary, in the same
+    environment as every other rez command (see ``rez_subprocess_env``).  At INFO level logs the package count; at DEBUG logs
     every family name found.  Returns True when rez responds successfully,
     False when the binary is missing or exits non-zero (warning is emitted).
 
@@ -1124,10 +1199,7 @@ def check_rez_health() -> bool:
     rez_search = _rez_executable("rez-search")
     cmd = [rez_search, "--type", "family"]
 
-    env = dict(os.environ)
-    config_file = rez_config_file()
-    if config_file:
-        env["REZ_CONFIG_FILE"] = str(config_file)
+    env = rez_subprocess_env()
 
     logger.info("[Rez] health check: %s", " ".join(cmd))
 
@@ -1169,10 +1241,7 @@ def check_rez_health_detailed() -> RezHealthResult:
     rez_search = _rez_executable("rez-search")
     cmd = [rez_search, "--type", "family"]
 
-    env = dict(os.environ)
-    config_file = rez_config_file()
-    if config_file:
-        env["REZ_CONFIG_FILE"] = str(config_file)
+    env = rez_subprocess_env()
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=30)  # noqa: S603
