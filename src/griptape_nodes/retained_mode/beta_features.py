@@ -56,8 +56,10 @@ class BetaFeature(BaseModel):
     """One experimental feature, in the definition shape the editor shares.
 
     Attributes:
-        id: snake_case identifier with single underscores, unique across the editor and the engine. Also the config key
-            under `beta_features`.
+        id: snake_case identifier with single underscores. An engine feature's id is unique across
+            the editor and the engine, because both store values in the shared `beta_features`
+            map. A library feature's id only needs to be unique within its library, because its
+            value is stored under that library in `library_beta_features`.
         name: Short label shown on the editor's Beta settings page.
         description: One or two sentences in user terms: what changes and where.
         default: Whether the feature is on when the user has not set it. Almost always False.

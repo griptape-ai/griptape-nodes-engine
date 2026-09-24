@@ -399,6 +399,19 @@ class TestListBetaFeaturesRequest:
             ("fast_upscale", LIBRARY_NAME, f"library_beta_features.{LIBRARY_SLUG}.fast_upscale"),
         ]
 
+    def test_an_engine_and_a_library_feature_can_share_an_id(self) -> None:
+        """They are stored under different keys, so both are listed and neither shadows the other."""
+        register_beta_feature(_make_feature("fast_upscale"))
+        _register_library([_library_entry("fast_upscale")])
+
+        result = ConfigManager().on_handle_list_beta_features_request(ListBetaFeaturesRequest())
+
+        assert isinstance(result, ListBetaFeaturesResultSuccess)
+        assert [(f["id"], f["library"], f["config_key"]) for f in result.features] == [
+            ("fast_upscale", None, "beta_features.fast_upscale"),
+            ("fast_upscale", LIBRARY_NAME, f"library_beta_features.{LIBRARY_SLUG}.fast_upscale"),
+        ]
+
 
 class _BetaProbeNode(BaseNode):
     """A node from the test library that checks its library's beta feature."""
