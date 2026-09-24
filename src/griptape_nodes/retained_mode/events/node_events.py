@@ -573,6 +573,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         node_name: Name of the node to serialize (None for current context node)
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
+        use_pickling: Deprecated and ignored. The value pool always holds encoded values.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
