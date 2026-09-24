@@ -174,10 +174,6 @@ class _RenderOnlyTrait(Trait):
         super().__init__()
         self.label = label
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def ui_options_for_trait(self) -> dict:
         return {"badge_label": self.label}
 
@@ -308,10 +304,6 @@ class _MisdeclaredTrait(Trait):
         super().__init__()
         self.level = level
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def ui_options_for_trait(self) -> dict:
         return {"misdeclared": self.level}
 
@@ -357,10 +349,6 @@ class _RangeLimitedTrait(Trait):
     def __init__(self, level: int = 1) -> None:
         super().__init__()
         self.level = level
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
 
     def to_state(self) -> dict:
         return {"level": self.level}

@@ -89,10 +89,6 @@ class MultiOptions(Trait):
         )
         return {key: written[key] for key in keys if key in written}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["multi_options"]
-
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:
             if not isinstance(value, list):

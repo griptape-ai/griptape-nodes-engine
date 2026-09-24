@@ -139,7 +139,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         allowed_modes: set[ParameterMode] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,  # We are going to make these children.
+        traits: set[type[Trait] | Trait] | None = None,  # We are going to make these children.
         ui_options: dict | None = None,
         *,
         hide: bool | None = None,

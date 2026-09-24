@@ -36,7 +36,7 @@ class ParameterContainer(Parameter, ABC):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -97,7 +97,7 @@ class ParameterContainer(Parameter, ABC):
 
 
 class ParameterList(ParameterContainer):
-    _original_traits: set[Trait.__class__ | Trait]
+    _original_traits: set[type[Trait] | Trait]
 
     def __init__(  # noqa: PLR0913, PLR0917
         self,
@@ -112,7 +112,7 @@ class ParameterList(ParameterContainer):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -496,20 +496,20 @@ class ParameterKeyValuePair(Parameter):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         # Key and Value specific options
         key_default_value: Any = None,
         key_tooltip: str | list[dict] | None = None,
         key_ui_options: dict | None = None,
-        key_traits: set[Trait.__class__ | Trait] | None = None,
+        key_traits: set[type[Trait] | Trait] | None = None,
         key_converters: list[Callable[[Any], Any]] | None = None,
         key_validators: list[Callable[[Parameter, Any], None]] | None = None,
         value_default_value: Any = None,
         value_tooltip: str | list[dict] | None = None,
         value_ui_options: dict | None = None,
-        value_traits: set[Trait.__class__ | Trait] | None = None,
+        value_traits: set[type[Trait] | Trait] | None = None,
         value_converters: list[Callable[[Any], Any]] | None = None,
         value_validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -622,7 +622,7 @@ class ParameterKeyValuePair(Parameter):
 
 class ParameterDictionary(ParameterContainer):
     _kvp_type: ParameterType.KeyValueTypePair
-    _original_traits: set[Trait.__class__ | Trait]
+    _original_traits: set[type[Trait] | Trait]
 
     def __init__(  # noqa: PLR0913, PLR0917
         self,
@@ -635,7 +635,7 @@ class ParameterDictionary(ParameterContainer):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,

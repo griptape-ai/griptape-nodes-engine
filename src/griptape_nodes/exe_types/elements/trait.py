@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(eq=False)
-class Trait(ABC, BaseNodeElement):
+class Trait(BaseNodeElement):
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
         return hash(self.element_id)
@@ -34,11 +33,6 @@ class Trait(ABC, BaseNodeElement):
         updated["trait_name"] = self.__class__.__name__
         updated["trait_display_options"] = self.display_options_for_trait()
         return updated
-
-    @classmethod
-    @abstractmethod
-    def get_trait_keys(cls) -> list[str]:
-        """This will return keys that trigger this trait."""
 
     def to_state(self) -> dict[str, Any]:
         """Return state that must survive a workflow save."""

@@ -16,10 +16,6 @@ class Clamp(Trait):
         self.min = min_val
         self.max = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["clamp"]
-
     def to_state(self) -> dict[str, Any]:
         return {"min_val": self.min, "max_val": self.max}
 

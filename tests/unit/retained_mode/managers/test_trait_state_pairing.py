@@ -18,10 +18,6 @@ class Twin(Trait):
         super().__init__()
         self.tag = tag
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def to_state(self) -> dict[str, str]:
         return {"tag": self.tag}
 
@@ -65,10 +61,6 @@ class Ranged(Trait):
         self._validate_level(level)
         self.level = level
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def to_state(self) -> dict[str, int]:
         return {"level": self.level}
 
@@ -95,10 +87,6 @@ class Threshold(Trait):
     def __init__(self, threshold: int = 1) -> None:
         super().__init__()
         self.level = threshold
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
 
     def to_state(self) -> dict[str, int]:
         return {"level": self.level}
