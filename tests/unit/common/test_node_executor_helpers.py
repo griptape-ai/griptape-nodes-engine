@@ -17,7 +17,7 @@ These tests describe the observable contract of:
   edge case.
 """
 
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
