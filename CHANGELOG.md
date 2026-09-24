@@ -62,6 +62,11 @@ the engine's request API from working without edits. Migration steps live in
   them. Custom traits no longer need to implement `get_trait_keys()`, and existing implementations
   can be deleted.
 
+### Removed
+
+- The engine no longer runs its own static file server. The Griptape Nodes app serves the
+  workspace, as it has since v0.95.0. `STATIC_SERVER_ENABLED` is gone.
+
 ### Fixed
 
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
@@ -95,5 +100,8 @@ the engine's request API from working without edits. Migration steps live in
   the engine is busy. That process is now dropped for leaving heartbeat challenges unanswered rather
   than for elapsed time, so `worker.heartbeat_timeout_s` bounds unanswered challenges instead of
   wall-clock silence.
+- A node that writes a list or dictionary to an output and reads it back gets the same object rather
+  than a copy of it, and a value that refers to itself no longer fails the node with a
+  `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD

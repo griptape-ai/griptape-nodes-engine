@@ -21,7 +21,6 @@ import logging
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 
@@ -140,8 +139,8 @@ class TestMediaFromAWorker:
         host stays silent still has somewhere durable to point.
         """
         # Deliberately NOT the static server's default port: an earlier version of this test
-        # used 8124, and a broken adoption gate passed it anyway because the self-serve branch
-        # bound the default port and produced the same URL by coincidence.
+        # used 8124, and a broken adoption gate passed it anyway because the fallback branch
+        # produced the same default URL by coincidence.
         orchestrator_url = "http://localhost:18125"
         monkeypatch.setenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV, orchestrator_url)
         static_files_manager = current_engine().static_files_manager
@@ -150,23 +149,14 @@ class TestMediaFromAWorker:
 
         assert static_files_manager.static_server_base_url == orchestrator_url
 
-    def test_without_the_env_var_a_process_serves_the_workspace_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The orchestrator's own path is unchanged: no env var, so it serves and advertises.
-
-        Patched rather than actually started. Letting it bind left a uvicorn thread running for the
-        rest of the session, and the next test's engine reset made that thread raise -- reported
-        against whichever unrelated test happened to be running. What matters here is the branch
-        taken, not that a socket got bound.
-        """
+    def test_without_the_env_var_or_a_host_url_the_default_address_is_assumed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The engine serves nothing itself, so with no source it points where the host listens by default."""
         monkeypatch.delenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV, raising=False)
         static_files_manager = current_engine().static_files_manager
         static_files_manager._static_server_base_url = None
-        with (
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.start_static_server"),
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.bind_free_socket") as mock_bind,
-        ):
-            mock_bind.return_value.getsockname.return_value = ("localhost", 18124)
-            static_files_manager.on_app_initialization_complete(AppInitializationComplete())
+        static_files_manager.on_app_initialization_complete(AppInitializationComplete())
 
         assert static_files_manager.static_server_base_url.startswith("http://")
 

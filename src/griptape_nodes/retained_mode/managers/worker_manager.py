@@ -606,13 +606,13 @@ class WorkerManager(EngineScoped):
             raise
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
-        """The base URL this engine serves the workspace on, awaited until initialization decides it.
+        """The base URL the workspace is served on, awaited until initialization decides it.
 
         On a restart into an existing session, spawning and URL resolution are both reactions to
         AppInitializationComplete, whose listeners fan out as unordered concurrent tasks -- so this
-        waits for the decision rather than sampling mid-fan-out. Returns None when this engine serves
-        nothing itself (cloud storage), in which case the worker's URLs come from the same bucket as
-        the orchestrator's and outlive it regardless.
+        waits for the decision rather than sampling mid-fan-out. Returns None under cloud storage,
+        in which case the worker's URLs come from the same bucket as the orchestrator's and outlive
+        it regardless.
         """
         static_files_manager = self.engine.static_files_manager
         # Normally the decision is already in, so read it without an executor hop. The hop below is
@@ -636,9 +636,8 @@ class WorkerManager(EngineScoped):
         if isinstance(static_files_manager.storage_driver, LocalStorageDriver):
             # Two different failures, and pointing an operator at the wrong one costs real time:
             # initialization can DECIDE there is no server, which settles in microseconds and has
-            # nothing to do with the timeout. That means a resolution that raised -- binding even the
-            # fallback port 0 failed, or the server thread would not start -- since every branch that
-            # returns normally under local storage sets a URL.
+            # nothing to do with the timeout. That means a resolution that raised, since every branch
+            # that returns normally under local storage sets a URL.
             if static_files_manager.static_server_base_url_settled:
                 logger.warning(
                     "Initialization resolved no static server, so a spawned worker will serve assets "
