@@ -33,9 +33,9 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events import artifact_events, os_events
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.serialization.converter import converter
 
 # Sanity floor for the derived list; os_events has 18 request types today.
 _MINIMUM_EXPECTED_REQUESTS = 10

@@ -278,8 +278,8 @@ class TestStateAccessFromAWorker:
         JSON, structure back. `content` is `str | bytes`, and the union resolves to `str`, so the
         bytes come back as mojibake rather than raising -- which is why the corruption was silent.
         """
-        from griptape_nodes.retained_mode.events.event_converter import converter
         from griptape_nodes.retained_mode.events.os_events import WriteFileRequest
+        from griptape_nodes.serialization.converter import converter
 
         original = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
         wire = json.loads(json.dumps(converter.unstructure(WriteFileRequest(file_path="x.png", content=original))))
