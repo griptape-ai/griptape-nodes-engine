@@ -1,20 +1,27 @@
-"""Tests for WorkflowRegistry functionality."""
+"""Tests for the workflow registry and its `WorkflowRegistry` shim."""
 
 from __future__ import annotations
 
 import os
 import platform
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.files.path_utils import derive_registry_key
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowRegistry
-
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.node_library.workflow_registry import (
+    Workflow,
+    WorkflowRegistry,
+    _WorkflowRegistry,
+)
+from griptape_nodes.retained_mode.engine import (
+    Engine,
+    current_engine,
+    engine_scope,
+    has_current_engine,
+    reset_root_engine,
+)
 
 
 class TestDeriveRegistryKey:
@@ -66,10 +73,10 @@ class TestDeriveRegistryKey:
         assert derive_registry_key(key) == "03.07_18"
 
 
-class TestWorkflowRegistry:
-    """Test suite for WorkflowRegistry functionality."""
+class TestGetCompleteFilePath:
+    """Tests for resolving registry file paths against the workspace."""
 
-    def test_get_complete_file_path_with_absolute_path(self) -> None:
+    def test_get_complete_file_path_with_absolute_path(self, engine: Engine) -> None:
         """Test that get_complete_file_path returns absolute paths as-is."""
         # Use a platform-appropriate absolute path
         if os.name == "nt":  # Windows
@@ -77,7 +84,7 @@ class TestWorkflowRegistry:
         else:  # Unix-like
             absolute_path = "/absolute/path/to/workflow.py"
 
-        result = WorkflowRegistry.get_complete_file_path(absolute_path)
+        result = engine.workflow_registry.get_complete_file_path(absolute_path)
 
         # On Windows, paths starting with / are not considered absolute
         # so they get treated as relative paths
@@ -87,10 +94,10 @@ class TestWorkflowRegistry:
         else:
             assert result == absolute_path
 
-    def test_get_complete_file_path_with_unix_style_on_windows(self) -> None:
+    def test_get_complete_file_path_with_unix_style_on_windows(self, engine: Engine) -> None:
         """Test Unix-style paths on Windows (treated as relative)."""
         unix_style_path = "/absolute/path/to/workflow.py"
-        result = WorkflowRegistry.get_complete_file_path(unix_style_path)
+        result = engine.workflow_registry.get_complete_file_path(unix_style_path)
 
         if os.name == "nt":  # Windows
             # Unix-style paths are treated as relative on Windows
@@ -102,11 +109,11 @@ class TestWorkflowRegistry:
             # On Unix, this is an absolute path
             assert result == unix_style_path
 
-    def test_get_complete_file_path_with_absolute_windows_path(self) -> None:
+    def test_get_complete_file_path_with_absolute_windows_path(self, engine: Engine) -> None:
         """Test that get_complete_file_path handles Windows absolute paths."""
         windows_path = "C:\\Users\\test\\workflow.py"
 
-        result = WorkflowRegistry.get_complete_file_path(windows_path)
+        result = engine.workflow_registry.get_complete_file_path(windows_path)
 
         # On Windows, it should be returned as-is
         # On Unix systems, Path.is_absolute() returns False for Windows paths,
@@ -124,18 +131,18 @@ class TestWorkflowRegistry:
         # Get the actual workspace path from the config manager
         workspace_path = engine.config_manager.workspace_path
 
-        result = WorkflowRegistry.get_complete_file_path(relative_path)
+        result = engine.workflow_registry.get_complete_file_path(relative_path)
 
         expected = str(workspace_path / relative_path)
         assert result == expected
 
-    def test_get_complete_file_path_with_home_expansion(self) -> None:
+    def test_get_complete_file_path_with_home_expansion(self, engine: Engine) -> None:
         """Test that get_complete_file_path handles paths with home directory expansion."""
         home_path = "~/workflows/my_workflow.py"
 
         # Home paths starting with ~ are NOT considered absolute by Path.is_absolute()
         # so they will be treated as relative paths
-        result = WorkflowRegistry.get_complete_file_path(home_path)
+        result = engine.workflow_registry.get_complete_file_path(home_path)
 
         # Should be treated as relative and appended to workspace
         if os.name == "nt":  # Windows
@@ -152,7 +159,7 @@ class TestWorkflowRegistry:
         # Get the actual workspace path from the config manager
         workspace_path = engine.config_manager.workspace_path
 
-        result = WorkflowRegistry.get_complete_file_path(current_dir_path)
+        result = engine.workflow_registry.get_complete_file_path(current_dir_path)
 
         expected = str(workspace_path / current_dir_path)
         assert result == expected
@@ -164,7 +171,7 @@ class TestWorkflowRegistry:
         # Get the actual workspace path from the config manager
         workspace_path = engine.config_manager.workspace_path
 
-        result = WorkflowRegistry.get_complete_file_path(parent_dir_path)
+        result = engine.workflow_registry.get_complete_file_path(parent_dir_path)
 
         # resolve_workspace_path normalizes the path by resolving .. components
         expected = str((workspace_path / parent_dir_path).resolve())
@@ -172,85 +179,122 @@ class TestWorkflowRegistry:
 
 
 class TestWorkflowRegistryOperations:
-    """Tests for WorkflowRegistry CRUD operations."""
+    """Tests for workflow registry CRUD operations."""
 
-    def test_rekey_workflow_updates_registry_key(self) -> None:
+    def test_rekey_workflow_updates_registry_key(self, engine: Engine) -> None:
+        registry = engine.workflow_registry
         mock_workflow = MagicMock()
-        with patch.dict(WorkflowRegistry._workflows, {"old_key": mock_workflow}, clear=True):
-            WorkflowRegistry.rekey_workflow("old_key", "new_key")
+        registry._workflows["old_key"] = mock_workflow
 
-            assert "new_key" in WorkflowRegistry._workflows
-            assert "old_key" not in WorkflowRegistry._workflows
-            assert WorkflowRegistry._workflows["new_key"] is mock_workflow
+        registry.rekey_workflow("old_key", "new_key")
 
-    def test_rekey_workflow_missing_key_raises(self) -> None:
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True), pytest.raises(KeyError, match="not_there"):
-            WorkflowRegistry.rekey_workflow("not_there", "new_key")
+        assert "new_key" in registry._workflows
+        assert "old_key" not in registry._workflows
+        assert registry._workflows["new_key"] is mock_workflow
 
-    def test_generate_new_workflow_uses_caller_supplied_key(self) -> None:
+    def test_rekey_workflow_missing_key_raises(self, engine: Engine) -> None:
+        with pytest.raises(KeyError, match="not_there"):
+            engine.workflow_registry.rekey_workflow("not_there", "new_key")
+
+    def test_generate_new_workflow_uses_caller_supplied_key(self, engine: Engine) -> None:
+        registry = engine.workflow_registry
         mock_metadata = MagicMock()
         with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
-            patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
+            patch.object(registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "is_file", return_value=True),
         ):
-            workflow = WorkflowRegistry.generate_new_workflow(
+            workflow = registry.generate_new_workflow(
                 registry_key="my_workflow", metadata=mock_metadata, file_path="my_workflow.py"
             )
 
-            assert "my_workflow" in WorkflowRegistry._workflows
-            assert WorkflowRegistry._workflows["my_workflow"] is workflow
+        assert registry._workflows["my_workflow"] is workflow
 
-    def test_generate_new_workflow_same_key_different_paths_collide(self) -> None:
+    def test_generate_new_workflow_same_key_different_paths_collide(self, engine: Engine) -> None:
+        registry = engine.workflow_registry
         mock_metadata = MagicMock()
         with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
-            patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/some/path.py"),
+            patch.object(registry, "get_complete_file_path", return_value="/workspace/some/path.py"),
             patch.object(Path, "is_file", return_value=True),
         ):
-            WorkflowRegistry.generate_new_workflow(
+            registry.generate_new_workflow(
                 registry_key="subdir_a/my_workflow", metadata=mock_metadata, file_path="subdir_a/my_workflow.py"
             )
-            WorkflowRegistry.generate_new_workflow(
+            registry.generate_new_workflow(
                 registry_key="subdir_b/my_workflow", metadata=mock_metadata, file_path="subdir_b/my_workflow.py"
             )
 
-            assert "subdir_a/my_workflow" in WorkflowRegistry._workflows
-            assert "subdir_b/my_workflow" in WorkflowRegistry._workflows
+        assert "subdir_a/my_workflow" in registry._workflows
+        assert "subdir_b/my_workflow" in registry._workflows
 
-    def test_generate_new_workflow_duplicate_key_raises(self) -> None:
+    def test_generate_new_workflow_duplicate_key_raises(self, engine: Engine) -> None:
+        registry = engine.workflow_registry
         mock_metadata = MagicMock()
         with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
-            patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
+            patch.object(registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "is_file", return_value=True),
         ):
-            WorkflowRegistry.generate_new_workflow(
+            registry.generate_new_workflow(
                 registry_key="my_workflow", metadata=mock_metadata, file_path="my_workflow.py"
             )
 
             with pytest.raises(KeyError, match="my_workflow"):
-                WorkflowRegistry.generate_new_workflow(
+                registry.generate_new_workflow(
                     registry_key="my_workflow", metadata=mock_metadata, file_path="my_workflow.py"
                 )
 
-    def test_generate_new_workflow_unsaved_key_rejects_file_path(self) -> None:
+    def test_generate_new_workflow_unsaved_key_rejects_file_path(self, engine: Engine) -> None:
         mock_metadata = MagicMock()
-        with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
-            pytest.raises(ValueError, match="cannot be paired with a file_path"),
-        ):
-            WorkflowRegistry.generate_new_workflow(
+        with pytest.raises(ValueError, match="cannot be paired with a file_path"):
+            engine.workflow_registry.generate_new_workflow(
                 registry_key="unsaved:abc", metadata=mock_metadata, file_path="my_workflow.py"
             )
 
-    def test_generate_new_workflow_saved_key_requires_file_path(self) -> None:
+    def test_generate_new_workflow_saved_key_requires_file_path(self, engine: Engine) -> None:
         mock_metadata = MagicMock()
-        with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
-            pytest.raises(ValueError, match="requires a file_path"),
-        ):
-            WorkflowRegistry.generate_new_workflow(registry_key="my_workflow", metadata=mock_metadata)
+        with pytest.raises(ValueError, match="requires a file_path"):
+            engine.workflow_registry.generate_new_workflow(registry_key="my_workflow", metadata=mock_metadata)
+
+    def test_engines_do_not_share_workflows(self, engine: Engine) -> None:
+        other = Engine()
+
+        engine.workflow_registry.ensure_unsaved(key="unsaved:mine", display_name="Mine")
+
+        assert engine.workflow_registry.has_workflow_with_name("unsaved:mine")
+        assert not other.workflow_registry.has_workflow_with_name("unsaved:mine")
+
+
+class TestWorkflowRegistryShim:
+    """`WorkflowRegistry` classmethods act on the current engine's registry."""
+
+    def test_reads_what_the_engine_registered(self, engine: Engine) -> None:
+        workflow = engine.workflow_registry.ensure_unsaved(key="unsaved:abc", display_name="Untitled")
+
+        assert WorkflowRegistry.has_workflow_with_name("unsaved:abc")
+        assert WorkflowRegistry.get_workflow_by_name("unsaved:abc") is workflow
+
+    def test_writes_land_in_the_engine_registry(self, engine: Engine) -> None:
+        WorkflowRegistry.ensure_unsaved(key="unsaved:abc", display_name="Untitled")
+
+        assert engine.workflow_registry.has_workflow_with_name("unsaved:abc")
+
+    def test_follows_the_scoped_engine(self) -> None:
+        root = current_engine()
+
+        with engine_scope() as scoped:
+            WorkflowRegistry.ensure_unsaved(key="unsaved:scoped", display_name="Scoped")
+
+        assert scoped.workflow_registry.has_workflow_with_name("unsaved:scoped")
+        assert not root.workflow_registry.has_workflow_with_name("unsaved:scoped")
+
+    def test_unsaved_key_prefix_matches(self) -> None:
+        assert WorkflowRegistry.UNSAVED_KEY_PREFIX == _WorkflowRegistry.UNSAVED_KEY_PREFIX
+
+    def test_clear_user_workflows_does_not_build_an_engine(self) -> None:
+        reset_root_engine()
+
+        WorkflowRegistry.clear_user_workflows()
+
+        assert not has_current_engine()
 
 
 class TestGetWorkflowMetadata:
@@ -258,20 +302,16 @@ class TestGetWorkflowMetadata:
 
     When synced_path and workspace_path are pre-computed by list_workflows(),
     get_workflow_metadata must use them directly instead of calling is_synced,
-    which would instantiate ConfigManager per workflow.
+    which would resolve them per workflow.
     """
 
-    def _make_workflow(self, file_path: str | None = "workflows/test.json") -> Workflow:
+    def _make_workflow(self, engine: Engine, file_path: str | None = "workflows/test.json") -> Workflow:
         mock_metadata = MagicMock()
         mock_metadata.model_dump.return_value = {"name": "test"}
-        return Workflow(
-            registry_key=WorkflowRegistry._RegistryKey(),
-            metadata=mock_metadata,
-            file_path=file_path,
-        )
+        return Workflow(registry=engine.workflow_registry, metadata=mock_metadata, file_path=file_path)
 
-    def test_uses_precomputed_paths_instead_of_is_synced_property(self) -> None:
-        workflow = self._make_workflow()
+    def test_uses_precomputed_paths_instead_of_is_synced_property(self, engine: Engine) -> None:
+        workflow = self._make_workflow(engine)
         synced_path = Path("/synced")
         workspace_path = Path("/workspace")
 
@@ -294,16 +334,16 @@ class TestGetWorkflowMetadata:
 
         assert "is_synced" in result
 
-    def test_falls_back_to_is_synced_when_paths_not_provided(self) -> None:
-        workflow = self._make_workflow()
+    def test_falls_back_to_is_synced_when_paths_not_provided(self, engine: Engine) -> None:
+        workflow = self._make_workflow(engine)
 
         with patch.object(type(workflow), "is_synced", new_callable=lambda: property(lambda _: True)):
             result = workflow.get_workflow_metadata()
 
         assert result["is_synced"] is True
 
-    def test_falls_back_to_is_synced_when_file_path_is_none(self) -> None:
-        workflow = self._make_workflow(file_path=None)
+    def test_falls_back_to_is_synced_when_file_path_is_none(self, engine: Engine) -> None:
+        workflow = self._make_workflow(engine, file_path=None)
         synced_path = Path("/synced")
         workspace_path = Path("/workspace")
 

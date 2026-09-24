@@ -47,7 +47,6 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadataSchemaError,
     WorkflowMetadataSectionCountError,
     WorkflowMetadataTomlError,
-    WorkflowRegistry,
     WorkflowShape,
     find_metadata_blocks,
     read_workflow_metadata,
@@ -711,7 +710,7 @@ class WorkflowManager(EngineScoped):
         # Clear any previously registered user/workspace workflows before re-registering, so that
         # a workspace change (e.g. project switch) takes effect cleanly. Library-provided workflows
         # (is_griptape_provided=True) registered above this call are preserved.
-        WorkflowRegistry.clear_user_workflows()
+        self.engine.workflow_registry.clear_user_workflows()
 
         # Discover workflows from both config and workspace.
         self._workflows_loading_complete.clear()
@@ -1122,7 +1121,9 @@ class WorkflowManager(EngineScoped):
         with WorkflowManager.WorkflowSquelchContext(self):
             # Check if file path exists
             relative_file_path = request.file_path
-            complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
+            complete_file_path = self.engine.workflow_registry.get_complete_file_path(
+                relative_file_path=relative_file_path
+            )
             if not await anyio.Path(complete_file_path).is_file():
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
@@ -1165,7 +1166,7 @@ class WorkflowManager(EngineScoped):
             )
             return RunWorkflowWithCurrentStateResultFailure(result_details=details)
 
-        complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
+        complete_file_path = self.engine.workflow_registry.get_complete_file_path(relative_file_path=relative_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
             return RunWorkflowWithCurrentStateResultFailure(result_details=details)
@@ -1186,7 +1187,7 @@ class WorkflowManager(EngineScoped):
 
         # get workflow from registry
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to get workflow '{request.workflow_name}' from registry."
             return RunWorkflowFromRegistryResultFailure(result_details=details)
@@ -1277,7 +1278,7 @@ class WorkflowManager(EngineScoped):
                 display_name=request.metadata.name, registry_key=registry_key
             )
 
-            WorkflowRegistry.generate_new_workflow(
+            self.engine.workflow_registry.generate_new_workflow(
                 registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
             )
         except Exception as e:
@@ -1335,7 +1336,7 @@ class WorkflowManager(EngineScoped):
         # Check if workflow is already registered by file path (registry key).
         # The registry key is derived from the file path, not metadata.name (the display name).
         workflow_name = derive_registry_key(request.file_path)
-        if WorkflowRegistry.has_workflow_with_name(workflow_name):
+        if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
             # Workflow already exists - no need to re-register
             return ImportWorkflowResultSuccess(
                 workflow_name=workflow_name,
@@ -1351,7 +1352,7 @@ class WorkflowManager(EngineScoped):
 
         # Persist external workflows to global config so they survive restarts and appear in all projects.
         # Workspace workflows are discovered by directory scan and don't need an explicit entry.
-        full_path = WorkflowRegistry.get_complete_file_path(request.file_path)
+        full_path = self.engine.workflow_registry.get_complete_file_path(request.file_path)
         self._persist_external_workflow_registration(full_path)
 
         return ImportWorkflowResultSuccess(
@@ -1365,7 +1366,7 @@ class WorkflowManager(EngineScoped):
         await self._workflows_loading_complete.wait()
 
         try:
-            workflows = WorkflowRegistry.list_workflows()
+            workflows = self.engine.workflow_registry.list_workflows()
         except Exception:
             details = "Failed to list all workflows."
             return ListAllWorkflowsResultFailure(result_details=details)
@@ -1378,7 +1379,9 @@ class WorkflowManager(EngineScoped):
 
         try:
             workflow_names = [
-                key for key, wf in WorkflowRegistry.list_workflows().items() if wf.get("workflow_shape") is not None
+                key
+                for key, wf in self.engine.workflow_registry.list_workflows().items()
+                if wf.get("workflow_shape") is not None
             ]
         except Exception:
             details = "Failed to list callable workflows."
@@ -1401,7 +1404,7 @@ class WorkflowManager(EngineScoped):
             # awaited, so it belongs here in the async handler rather than in that sync method.
             await self.engine.worker_manager.broadcast_local_object_teardown()
         try:
-            workflow = WorkflowRegistry.delete_workflow_by_name(request.name)
+            workflow = self.engine.workflow_registry.delete_workflow_by_name(request.name)
         except Exception as e:
             details = f"Failed to remove workflow from registry with name '{request.name}'. Exception: {e}"
             return DeleteWorkflowResultFailure(result_details=details)
@@ -1452,8 +1455,8 @@ class WorkflowManager(EngineScoped):
         # display-name resolver and post-save bookkeeping so we don't re-query the registry
         # three more times (and can't disagree with ourselves mid-handler).
         source = (
-            WorkflowRegistry.get_workflow_by_name(request.workflow_name)
-            if WorkflowRegistry.has_workflow_with_name(request.workflow_name)
+            self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
+            if self.engine.workflow_registry.has_workflow_with_name(request.workflow_name)
             else None
         )
 
@@ -1621,7 +1624,7 @@ class WorkflowManager(EngineScoped):
 
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Attempted to get workflow info. Failed because workflow '{request.workflow_name}' was not found in the registry."
             return GetWorkflowInfoResultFailure(result_details=details)
@@ -1659,7 +1662,7 @@ class WorkflowManager(EngineScoped):
 
     def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
-            registry_keys = WorkflowRegistry.list_workflows()
+            registry_keys = self.engine.workflow_registry.list_workflows()
         except Exception as e:
             details = f"Attempted to list all workflow info. Failed to list workflows: {e}"
             return ListAllWorkflowInfoResultFailure(result_details=details)
@@ -1667,7 +1670,7 @@ class WorkflowManager(EngineScoped):
         workflow_infos: dict[str, WorkflowInfoSummary] = {}
         for registry_key in registry_keys:
             try:
-                workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
+                workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
             except KeyError:
                 continue
             # Unsaved workflows are registry-only (no on-disk metadata to summarize).
@@ -1686,7 +1689,7 @@ class WorkflowManager(EngineScoped):
 
     def on_get_workflow_metadata_request(self, request: GetWorkflowMetadataRequest) -> ResultPayload:
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to get metadata. Workflow '{request.workflow_name}' not found."
             return GetWorkflowMetadataResultFailure(result_details=details)
@@ -1726,7 +1729,7 @@ class WorkflowManager(EngineScoped):
         workflow_shape: WorkflowShape | None = None
         if workflow_name is not None:
             try:
-                workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+                workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
             except KeyError:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
@@ -1748,7 +1751,7 @@ class WorkflowManager(EngineScoped):
                 )
             )
 
-        complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path)
+        complete_file_path = self.engine.workflow_registry.get_complete_file_path(relative_file_path)
 
         # Failure: workflow file does not exist or is not a file (use GetFileInfoRequest for consistency)
         get_file_info_result = self.engine.handle_request(
@@ -1823,7 +1826,7 @@ class WorkflowManager(EngineScoped):
         to read or update.
         """
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
         except KeyError:
             return WorkflowManager.WorkflowPathResolution(
                 workflow=None, file_path=None, error=f"Failed to set metadata. Workflow '{workflow_name}' not found."
@@ -1836,7 +1839,7 @@ class WorkflowManager(EngineScoped):
                 error=f"Failed to set metadata. Workflow '{workflow_name}' is unsaved (no file on disk).",
             )
 
-        complete_file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
+        complete_file_path = self.engine.workflow_registry.get_complete_file_path(workflow.file_path)
         file_path_obj = Path(complete_file_path)
         if not file_path_obj.is_file():
             return WorkflowManager.WorkflowPathResolution(
@@ -1882,8 +1885,8 @@ class WorkflowManager(EngineScoped):
         # Unsaved workflows have no file on disk; update the in-memory registry entry only.
         # This keeps display-name / description edits in sync with the registry so a refresh
         # re-hydrates the latest state without needing a save.
-        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+        if self.engine.workflow_registry.has_workflow_with_name(request.workflow_name):
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
             if workflow.file_path is None:
                 try:
                     merged = self._merge_metadata(workflow.metadata, request.workflow_metadata)
@@ -1952,7 +1955,7 @@ class WorkflowManager(EngineScoped):
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0915
         try:
             # Validate source workflow exists
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to move workflow '{request.workflow_name}' because it does not exist."
             return MoveWorkflowResultFailure(result_details=details)
@@ -1969,7 +1972,7 @@ class WorkflowManager(EngineScoped):
         config_manager = self.engine.config_manager
 
         # Get current file path
-        current_file_path = WorkflowRegistry.get_complete_file_path(old_relative_path)
+        current_file_path = self.engine.workflow_registry.get_complete_file_path(old_relative_path)
         if not Path(current_file_path).exists():
             details = (
                 f"Failed to move workflow '{request.workflow_name}': File path '{current_file_path}' does not exist."
@@ -2017,7 +2020,7 @@ class WorkflowManager(EngineScoped):
 
             # Update registry key if directory changed
             if old_registry_key != new_registry_key:
-                WorkflowRegistry.rekey_workflow(old_registry_key, new_registry_key)
+                self.engine.workflow_registry.rekey_workflow(old_registry_key, new_registry_key)
                 self._rekey_substitution_flag(old_registry_key, new_registry_key)
                 context_manager = self.engine.context_manager
                 if (
@@ -2804,24 +2807,24 @@ class WorkflowManager(EngineScoped):
         unsaved_source_key: str | None = None
         if (
             current_workflow_name is not None
-            and current_workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
-            and WorkflowRegistry.has_workflow_with_name(current_workflow_name)
+            and current_workflow_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX)
+            and self.engine.workflow_registry.has_workflow_with_name(current_workflow_name)
         ):
             unsaved_source_key = current_workflow_name
 
-        registered_workflows = WorkflowRegistry.list_workflows()
+        registered_workflows = self.engine.workflow_registry.list_workflows()
         if unsaved_source_key is not None and unsaved_source_key != registry_key:
             # Rekey the unsaved entry to the path-derived key if the new key is not already
             # occupied by a separate entry. If the new key already exists (e.g. a saved
             # workflow with the same target path is already registered), fall back to
             # dropping the unsaved entry and updating the existing saved entry below.
             if registry_key in registered_workflows:
-                WorkflowRegistry.delete_workflow_by_name(unsaved_source_key)
+                self.engine.workflow_registry.delete_workflow_by_name(unsaved_source_key)
                 self._drop_substitution_flag(unsaved_source_key)
             else:
-                WorkflowRegistry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
+                self.engine.workflow_registry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
                 self._rekey_substitution_flag(unsaved_source_key, registry_key)
-                rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
+                rekeyed_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
             for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == unsaved_source_key:
@@ -2831,14 +2834,14 @@ class WorkflowManager(EngineScoped):
                     # where it gets one, so record it here or the builtin keeps falling back to
                     # the registry key -- the thing that goes stale on the next project switch.
                     workflow_context_state._file_path = str(save_file_result.file_path)
-            registered_workflows = WorkflowRegistry.list_workflows()
+            registered_workflows = self.engine.workflow_registry.list_workflows()
 
         if registry_key not in registered_workflows:
-            WorkflowRegistry.generate_new_workflow(
+            self.engine.workflow_registry.generate_new_workflow(
                 registry_key=registry_key, metadata=workflow_metadata, file_path=relative_file_path
             )
 
-        existing_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
+        existing_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
         existing_workflow.metadata = workflow_metadata
         # Ensure file_path is populated even for pre-existing entries (defensive).
         if existing_workflow.file_path is None:
@@ -2858,10 +2861,10 @@ class WorkflowManager(EngineScoped):
 
     def _get_existing_metadata(self, file_name: str) -> _ExistingMetadata:
         """Return metadata for an existing workflow, or all-None if not present."""
-        if not WorkflowRegistry.has_workflow_with_name(file_name):
+        if not self.engine.workflow_registry.has_workflow_with_name(file_name):
             return self._ExistingMetadata(None, None, None, None)
         try:
-            existing = WorkflowRegistry.get_workflow_by_name(file_name)
+            existing = self.engine.workflow_registry.get_workflow_by_name(file_name)
         except Exception as err:
             logger.debug("Preserving existing metadata failed for workflow '%s': %s", file_name, err)
             return self._ExistingMetadata(None, None, None, None)
@@ -2953,17 +2956,17 @@ class WorkflowManager(EngineScoped):
         # An unsaved synthetic key ("unsaved:<uuid>") is a registry lookup key, not a
         # usable filename stem. Treat it as "no requested name" so the FIRST_SAVE path
         # derives the filename from the workflow's display-name metadata below.
-        if requested_file_name and requested_file_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX):
+        if requested_file_name and requested_file_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
             requested_file_name = None
 
         # Look up workflows in registry
         target_workflow = None
-        if requested_file_name and WorkflowRegistry.has_workflow_with_name(requested_file_name):
-            target_workflow = WorkflowRegistry.get_workflow_by_name(requested_file_name)
+        if requested_file_name and self.engine.workflow_registry.has_workflow_with_name(requested_file_name):
+            target_workflow = self.engine.workflow_registry.get_workflow_by_name(requested_file_name)
 
         current_workflow = None
-        if current_workflow_name and WorkflowRegistry.has_workflow_with_name(current_workflow_name):
-            current_workflow = WorkflowRegistry.get_workflow_by_name(current_workflow_name)
+        if current_workflow_name and self.engine.workflow_registry.has_workflow_with_name(current_workflow_name):
+            current_workflow = self.engine.workflow_registry.get_workflow_by_name(current_workflow_name)
 
         # Pick the situation up-front: create_versioned diverts EVERY save through
         # create_versioned_workflow (with CREATE_NEW + a padded slot) so each save
@@ -3040,7 +3043,7 @@ class WorkflowManager(EngineScoped):
             creation_date = target_workflow.metadata.creation_date
             branched_from = target_workflow.metadata.branched_from
             relative_file_path = target_workflow.file_path
-            file_path = Path(WorkflowRegistry.get_complete_file_path(relative_file_path))
+            file_path = Path(self.engine.workflow_registry.get_complete_file_path(relative_file_path))
 
         elif requested_file_name and current_workflow:
             # Requested name doesn't exist but we have a current workflow → Save As.
@@ -3184,8 +3187,8 @@ class WorkflowManager(EngineScoped):
             )
             raise ValueError(msg) from err
         # The match handler expects the path to match the macro template
-        # end-to-end. Use WorkflowRegistry.get_complete_file_path — the same
-        # absolutize helper non-versioned saves use — so the anchor value
+        # end-to-end. Use the workflow registry's get_complete_file_path, the same
+        # absolutize helper non-versioned saves use, so the anchor value
         # the macro sees here matches the rest of the save plumbing.
         #
         # Macro templates use forward-slash separators (the cross-platform
@@ -3195,7 +3198,7 @@ class WorkflowManager(EngineScoped):
         # match handler's auto-resolve path POSIX-normalizes the directory
         # builtins it injects, so both sides agree on separator regardless
         # of OS.
-        absolute_path = Path(WorkflowRegistry.get_complete_file_path(file_path)).as_posix()
+        absolute_path = Path(self.engine.workflow_registry.get_complete_file_path(file_path)).as_posix()
 
         match_result = self.engine.handle_request(
             AttemptMatchPathAgainstMacroRequest(
@@ -3405,13 +3408,13 @@ class WorkflowManager(EngineScoped):
         """Save a subflow back to its original workflow file."""
         registry_key = request.workflow_name
 
-        if not WorkflowRegistry.has_workflow_with_name(registry_key):
+        if not self.engine.workflow_registry.has_workflow_with_name(registry_key):
             details = (
                 f"Attempted to save subflow '{request.flow_name}'. Workflow '{registry_key}' not found in registry."
             )
             return SaveSubflowToWorkflowResultFailure(result_details=details)
 
-        workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
+        workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
         if workflow.file_path is None:
             # Saving a subflow back into its parent requires that parent to have a file.
             # Unsaved workflows have no destination to write into.
@@ -3421,7 +3424,7 @@ class WorkflowManager(EngineScoped):
                 "Save the parent workflow before saving a subflow into it."
             )
             return SaveSubflowToWorkflowResultFailure(result_details=details)
-        file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
+        file_path = self.engine.workflow_registry.get_complete_file_path(workflow.file_path)
         file_name = Path(file_path).stem
 
         # Serialize the subflow.
@@ -6092,7 +6095,7 @@ class WorkflowManager(EngineScoped):
             # reference to the engine-registered workflow; the user must choose a save name first.
             workflow_file_name = request.workflow_name
             try:
-                workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+                workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
                 if workflow.file_path is None:
                     msg = (
                         f"Cannot publish unsaved workflow '{request.workflow_name}'. "
@@ -6139,9 +6142,9 @@ class WorkflowManager(EngineScoped):
             if isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
                 workflow_registry_key = derive_registry_key(workflow_file.name)
                 try:
-                    _workflow = WorkflowRegistry.get_workflow_by_name(workflow_registry_key)
+                    _workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_registry_key)
                     # This workflow was registered previously, but now it's been updated (potentially including the metadata), so let's re-register
-                    WorkflowRegistry.delete_workflow_by_name(workflow_registry_key)
+                    self.engine.workflow_registry.delete_workflow_by_name(workflow_registry_key)
                 except KeyError:
                     pass
 
@@ -6247,7 +6250,7 @@ class WorkflowManager(EngineScoped):
 
     def _get_workflow_by_name(self, workflow_name: str) -> Workflow:
         """Get workflow by name from the registry."""
-        return WorkflowRegistry.get_workflow_by_name(workflow_name)
+        return self.engine.workflow_registry.get_workflow_by_name(workflow_name)
 
     async def _execute_workflow_import(
         self, request: ImportWorkflowAsReferencedSubFlowRequest, workflow: Workflow, flow_name: str
@@ -6377,7 +6380,7 @@ class WorkflowManager(EngineScoped):
         """Create a branch (copy) of an existing workflow with branch tracking."""
         try:
             # Validate source workflow exists
-            source_workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            source_workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to branch workflow '{request.workflow_name}' because it does not exist"
             return BranchWorkflowResultFailure(result_details=details)
@@ -6442,7 +6445,7 @@ class WorkflowManager(EngineScoped):
             )
 
             # Read source workflow content and replace metadata header
-            source_file_path = WorkflowRegistry.get_complete_file_path(source_file_path_rel)
+            source_file_path = self.engine.workflow_registry.get_complete_file_path(source_file_path_rel)
             if not Path(source_file_path).exists():
                 details = f"Failed to branch workflow '{request.workflow_name}': File path '{source_file_path}' does not exist. The workflow may have been moved or the workspace configuration may have changed."
                 return BranchWorkflowResultFailure(result_details=details)
@@ -6466,7 +6469,7 @@ class WorkflowManager(EngineScoped):
             # Key by the path actually written, and report that key: callers open the branch by
             # the name they get back.
             branch_registry_key = derive_registry_key(created.relative_file_path)
-            WorkflowRegistry.generate_new_workflow(
+            self.engine.workflow_registry.generate_new_workflow(
                 registry_key=branch_registry_key,
                 metadata=branch_metadata,
                 file_path=created.relative_file_path,
@@ -6535,7 +6538,7 @@ class WorkflowManager(EngineScoped):
         the workspace. Walking the counter on the registry alone would keep offering the same
         name, and the situation's overwrite policy would replace the earlier branch with it.
         """
-        if WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+        if self.engine.workflow_registry.has_workflow_with_name(branch_registry_key):
             return True
         return self._workflow_destination_exists(branch_registry_key)
 
@@ -6577,7 +6580,7 @@ class WorkflowManager(EngineScoped):
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
         try:
-            template_workflow = WorkflowRegistry.get_workflow_by_name(request.template_name)
+            template_workflow = self.engine.workflow_registry.get_workflow_by_name(request.template_name)
         except KeyError:
             details = (
                 f"Attempted to create workflow from template '{request.template_name}'. "
@@ -6600,7 +6603,7 @@ class WorkflowManager(EngineScoped):
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        source_file_path = WorkflowRegistry.get_complete_file_path(template_file_path_rel)
+        source_file_path = self.engine.workflow_registry.get_complete_file_path(template_file_path_rel)
         if not Path(source_file_path).is_file():
             details = (
                 f"Attempted to create workflow from template '{request.template_name}'. "
@@ -6646,7 +6649,7 @@ class WorkflowManager(EngineScoped):
         # Key by the path actually written, and hand that key back: the caller puts the new
         # workflow into context by this name, so it has to be the name the registry holds.
         registry_key = derive_registry_key(created.relative_file_path)
-        WorkflowRegistry.generate_new_workflow(
+        self.engine.workflow_registry.generate_new_workflow(
             registry_key=registry_key,
             metadata=new_metadata,
             file_path=created.relative_file_path,
@@ -6663,7 +6666,7 @@ class WorkflowManager(EngineScoped):
         """Merge a branch back into its source workflow, removing the branch when complete."""
         try:
             # Validate branch workflow exists
-            branch_workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            branch_workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError as e:
             details = f"Failed to merge workflow branch because it does not exist: {e!s}"
             return MergeWorkflowBranchResultFailure(result_details=details)
@@ -6676,7 +6679,7 @@ class WorkflowManager(EngineScoped):
 
         # Validate source workflow exists
         try:
-            source_workflow = WorkflowRegistry.get_workflow_by_name(source_workflow_name)
+            source_workflow = self.engine.workflow_registry.get_workflow_by_name(source_workflow_name)
         except KeyError:
             details = f"Failed to merge workflow branch '{request.workflow_name}' because source workflow '{source_workflow_name}' does not exist"
             return MergeWorkflowBranchResultFailure(result_details=details)
@@ -6718,7 +6721,7 @@ class WorkflowManager(EngineScoped):
             )
 
             # Read branch content and replace metadata header with merged metadata
-            branch_content_file_path = WorkflowRegistry.get_complete_file_path(branch_file_path_rel)
+            branch_content_file_path = self.engine.workflow_registry.get_complete_file_path(branch_file_path_rel)
             branch_content = Path(branch_content_file_path).read_text(encoding="utf-8")
 
             # Replace the metadata header with merged metadata
@@ -6728,7 +6731,7 @@ class WorkflowManager(EngineScoped):
                 return MergeWorkflowBranchResultFailure(result_details=details)
 
             # Write the updated content to the source workflow file
-            source_file_path = WorkflowRegistry.get_complete_file_path(source_file_path_rel)
+            source_file_path = self.engine.workflow_registry.get_complete_file_path(source_file_path_rel)
             Path(source_file_path).write_text(merged_content, encoding="utf-8")
 
             # Update the registry with new metadata for the source workflow
@@ -6737,7 +6740,7 @@ class WorkflowManager(EngineScoped):
             # Remove the branch workflow from registry and delete file
             result_messages = []
             try:
-                WorkflowRegistry.delete_workflow_by_name(request.workflow_name)
+                self.engine.workflow_registry.delete_workflow_by_name(request.workflow_name)
                 self._drop_substitution_flag(request.workflow_name)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
@@ -6765,7 +6768,7 @@ class WorkflowManager(EngineScoped):
         """Reset a branch to match its source workflow, discarding branch changes."""
         try:
             # Validate branch workflow exists
-            branch_workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            branch_workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError as e:
             details = f"Failed to reset workflow branch because it does not exist: {e!s}"
             return ResetWorkflowBranchResultFailure(result_details=details)
@@ -6778,7 +6781,7 @@ class WorkflowManager(EngineScoped):
 
         # Validate source workflow exists
         try:
-            source_workflow = WorkflowRegistry.get_workflow_by_name(source_workflow_name)
+            source_workflow = self.engine.workflow_registry.get_workflow_by_name(source_workflow_name)
         except KeyError:
             details = f"Failed to reset workflow branch '{request.workflow_name}' because source workflow '{source_workflow_name}' does not exist"
             return ResetWorkflowBranchResultFailure(result_details=details)
@@ -6795,7 +6798,7 @@ class WorkflowManager(EngineScoped):
 
         try:
             # Read content from the source workflow (what we're resetting the branch to)
-            source_content_file_path = WorkflowRegistry.get_complete_file_path(source_file_path_rel)
+            source_content_file_path = self.engine.workflow_registry.get_complete_file_path(source_file_path_rel)
             source_content = Path(source_content_file_path).read_text(encoding="utf-8")
 
             # Create updated metadata for branch workflow - preserve branch relationship and source timestamp
@@ -6829,7 +6832,7 @@ class WorkflowManager(EngineScoped):
                 return ResetWorkflowBranchResultFailure(result_details=details)
 
             # Write the updated content to the branch workflow file
-            branch_content_file_path = WorkflowRegistry.get_complete_file_path(branch_file_path_rel)
+            branch_content_file_path = self.engine.workflow_registry.get_complete_file_path(branch_file_path_rel)
             Path(branch_content_file_path).write_text(reset_content, encoding="utf-8")
 
             # Update the registry with new metadata for the branch workflow
@@ -6849,7 +6852,7 @@ class WorkflowManager(EngineScoped):
         """Compare two workflows to determine if one is ahead, behind, or up-to-date relative to the other."""
         try:
             # Get the workflow to evaluate
-            workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to compare workflow '{request.workflow_name}' because it does not exist"
             return CompareWorkflowsResultFailure(result_details=details)
@@ -6859,7 +6862,7 @@ class WorkflowManager(EngineScoped):
 
         # Try to get the source workflow
         try:
-            source_workflow = WorkflowRegistry.get_workflow_by_name(compare_workflow_name)
+            source_workflow = self.engine.workflow_registry.get_workflow_by_name(compare_workflow_name)
         except KeyError:
             # Source workflow no longer exists
             details = f"Source workflow '{compare_workflow_name}' for '{request.workflow_name}' no longer exists"
@@ -7155,7 +7158,7 @@ class WorkflowManager(EngineScoped):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
-                    if workflow_file.name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX):
+                    if workflow_file.name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
                         continue
                     if library_exclusion_roots:
                         resolved_workflow_file = workflow_file.resolve()
@@ -7267,7 +7270,7 @@ class WorkflowManager(EngineScoped):
         registry_key = derive_registry_key(file_path_to_register)
 
         # Check if workflow is already registered using the path-based registry key
-        if WorkflowRegistry.has_workflow_with_name(registry_key):
+        if self.engine.workflow_registry.has_workflow_with_name(registry_key):
             logger.debug("Skipping already registered workflow: %s", workflow_file)
             return None
 

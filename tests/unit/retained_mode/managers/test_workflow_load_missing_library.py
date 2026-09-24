@@ -33,7 +33,7 @@ from griptape_nodes.exe_types.node_types import ErrorProxyNode
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry, read_workflow_metadata
+from griptape_nodes.node_library.workflow_registry import read_workflow_metadata
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -163,16 +163,15 @@ def _library_schema(library_name: str, class_name: str, module_file: str) -> dic
 
 
 @pytest.fixture(autouse=True)
-def _clear_process_global_registries() -> Generator[None, None, None]:
-    """Clear the process-global library and workflow registries around every test in this file.
+def _clear_library_registry() -> Generator[None, None, None]:
+    """Clear the process-global library registry around every test in this file.
 
-    Both keep their state in ``ClassVar`` dicts the engine does not own, so the fixture
-    libraries and saved workflows registered here would otherwise leak into whichever test runs
-    next in the same xdist worker. Sibling files clear ``LibraryRegistry`` the same way.
+    It keeps its state in ``ClassVar`` dicts the engine does not own, so the fixture libraries
+    registered here would otherwise leak into whichever test runs next in the same xdist worker.
+    Sibling files clear it the same way.
     """
     LibraryRegistry._clear()
-    with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-        yield
+    yield
     LibraryRegistry._clear()
 
 
@@ -326,6 +325,9 @@ def _restart_engine(tmp_path: Path) -> Engine:
 
     Every rebuild in this file goes through here, so no case can accidentally keep the
     modules of a library it means to be missing.
+
+    The workflow registry belongs to the engine, so it comes back empty too. Tests re-register
+    the workflows a restarted editor would find in its workspace.
     """
     reset_root_engine()
     LibraryRegistry._clear()
@@ -762,6 +764,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
 
         # Reopen the host on a fresh engine, library still disabled.
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         return reopened, _run(reopened, host_path)
 
     def test_the_outer_load_is_flawed_and_names_the_library(self, engine: Engine, tmp_path: Path) -> None:
@@ -791,6 +794,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         del reopened
 
         with pytest.raises(LocalExecutorError, match="FLAWED"):
@@ -810,6 +814,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
 
         queued: list[Any] = []
         with pytest.MonkeyPatch.context() as monkeypatch:
@@ -863,6 +868,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_flow_as_workflow(building, tmp_path, host_flow.flow_name, "host_workflow")
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         result = _run(reopened, host_path)
 
         assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
@@ -898,6 +904,7 @@ class TestConcurrentLoadsDoNotCrossContaminate:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
