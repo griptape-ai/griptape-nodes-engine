@@ -22,8 +22,7 @@ if TYPE_CHECKING:
 _MODULE = "griptape_nodes.retained_mode.managers.diagnostics_manager"
 
 # The paths a report lists that this fixture controls. `libraries_directory` and
-# `static_files_directory` are left unset, so they resolve to None and are neither shown nor
-# counted.
+# `static_files_directory` are left unset, so they resolve to None and are not counted.
 _CONTROLLED_PATH_COUNT = 6
 
 

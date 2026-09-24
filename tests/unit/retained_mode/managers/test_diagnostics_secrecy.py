@@ -96,10 +96,8 @@ def bundle(tmp_path: Path) -> _Bundle:
         staged.add_report(
             DiagnosticsReport(
                 generated_at="2026-01-01T00:00:00+00:00",
-                # The section the planted settings flow through, built by the real code
-                # against the real redactor. The engine and host sections are required by
-                # the model and hold nothing a secret can reach, so they are filled in
-                # rather than gathered.
+                # The section the planted settings flow through, built by the real code against the real
+                # redactor. Engine and host are required by the model and hold nothing a secret can reach.
                 engine=EngineDiagnostics(python_version="3.12.0", python_executable="/usr/bin/python", process_id=1),
                 host=HostDiagnostics(system="Linux", release="6.0", version="#1", machine="x86_64"),
                 config=manager._build_config_section(redactor),

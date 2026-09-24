@@ -106,9 +106,8 @@ logger = logging.getLogger("griptape_nodes")
 
 _BYTES_PER_GB = 1024 * 1024 * 1024
 
-# Environment variables that override every config file. Their names are reported so a
-# setting that ignores the config file has a visible cause; their values are not,
-# because any of them can carry a credential.
+# Names are reported so a setting that ignores the config file has a visible cause; values
+# are not, because any of them can carry a credential.
 CONFIG_ENV_VAR_PREFIX = "GTN_CONFIG_"
 
 
@@ -229,9 +228,8 @@ class DiagnosticsManager(EngineScoped):
             logger.error(details)
             return RunHealthChecksResultFailure(result_details=details)
 
-        # Redacted like the bundle's copy. Most of a verdict is quoted from the report,
-        # which is already clean, but a check that failed writes its own text and that text
-        # can be an exception from the network stack or the OS.
+        # Redacted like the bundle's copy: most of a verdict is quoted from the already-clean
+        # report, but a check that failed writes its own text, which can be an OS or network error.
         health = redact_health_report(await self._run_health_checks(report), redactor)
         failed = [result.name for result in health.results if result.status is HealthStatus.FAIL]
         warned = [result.name for result in health.results if result.status is HealthStatus.WARN]
@@ -248,11 +246,8 @@ class DiagnosticsManager(EngineScoped):
         self, request: CollectDiagnosticsRequest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
         """Build a diagnostics bundle and return a link to download it."""
-        # A file name is joined onto the requested output directory, and onto the static
-        # files directory when there is no output path. Anything with a directory in it --
-        # `../../.ssh/config`, or an absolute path, or a bare `..` -- would be written
-        # somewhere the caller was never told about, so it is refused before any of the
-        # bundle is assembled.
+        # This name is joined onto the output directory, so anything with a directory in it --
+        # `../../.ssh/config`, an absolute path, a bare `..` -- lands somewhere the caller never saw.
         if request.file_name is not None and not _is_a_plain_file_name(request.file_name):
             details = (
                 f"Attempted to collect a diagnostics bundle named '{request.file_name}'. "
@@ -268,10 +263,8 @@ class DiagnosticsManager(EngineScoped):
         )
         warnings: list[str] = []
 
-        # Every part of assembly is inside the guard, not only the zip. Staging writes files
-        # to a temporary directory, and a temporary directory that is full or unwritable
-        # fails on the first file rather than at the end. A handler that let that OSError
-        # out would reach the user as raw exception text instead of a result they can act on.
+        # All of assembly is inside the guard, not only the zip: staging writes files, so a full or
+        # unwritable temporary directory fails on the first one rather than at the end.
         try:
             with DiagnosticsBundle(redactor) as bundle:
                 # Logs and the workflow are staged before the report so the redaction counts
@@ -299,9 +292,9 @@ class DiagnosticsManager(EngineScoped):
                     generated_at=report.generated_at,
                     engine_version=report.engine.engine_version,
                     identity_normalized=request.normalize_identity,
-                    # The report's copy, which is already redacted and deduplicated. The
-                    # bundle redacts warnings itself as well, and handing it the raw list
-                    # would have the same removals counted twice.
+                    # The report's copy, already redacted and deduplicated. The bundle
+                    # redacts warnings itself, so the raw list would count the same
+                    # removals twice.
                     warnings=report.collection_warnings,
                 )
                 data = bundle.to_zip_bytes()
@@ -391,10 +384,8 @@ class DiagnosticsManager(EngineScoped):
                 ExistingFilePolicy.CREATE_NEW,
                 skip_metadata_injection=True,
             )
-        # `httpx.HTTPError` because the static files manager writes through the configured
-        # storage driver, and the cloud one uploads the bundle and then asks for a download
-        # URL over HTTP. A refused connection or a timeout on either call is a failure this
-        # request has to report, not an exception for the caller to discover.
+        # `httpx.HTTPError` because the cloud storage driver uploads the bundle and then asks for a
+        # download URL over HTTP; a refused connection on either call is this request's to report.
         except (OSError, RuntimeError, httpx.HTTPError) as err:
             details = (
                 f"Attempted to save the diagnostics bundle as '{file_name}'. "
@@ -465,14 +456,9 @@ class DiagnosticsManager(EngineScoped):
             session=await self._build_session_section(redactor, warnings),
         )
 
-        # Both set last: the counts have to cover everything above, and a warning can be
-        # raised by any section. Deduplicated because one unresolvable path can be hit by
-        # more than one section, and a repeated warning reads as more than one problem.
-        #
-        # Redacted like anything else, and before the counts are read. Most of these
-        # warnings quote an OSError, whose text carries the absolute path it failed on --
-        # which is how the home directory would otherwise reach a report that promises it
-        # has been replaced with `~`.
+        # Both set last: the counts have to cover everything above, and any section can raise a
+        # warning. Deduplicated because one unresolvable path is hit by more than one section, and
+        # redacted because these quote an OSError, whose text carries the absolute path it failed on.
         report.collection_warnings = [redactor.redact_text(warning) for warning in dict.fromkeys(warnings)]
         report.redaction = self._redaction_summary(redactor, normalize_identity=normalize_identity)
         return report
@@ -703,11 +689,8 @@ class DiagnosticsManager(EngineScoped):
             "log_directory": self.engine.config_manager.log_directory,
         }
 
-        # Each path is redacted exactly once and the result reused. The redactor counts
-        # every match it makes, so redacting a path a second time for the missing list
-        # counted its home directory twice, and the manifest then claimed more values had
-        # been hidden than there were -- worst for the workspace directory, which is both
-        # reported and, on a machine worth collecting a bundle from, often the missing one.
+        # Redacted once and reused: the redactor counts every match, so redacting a path again for
+        # the missing list counted its home directory twice and inflated the manifest's tally.
         redacted: dict[str, str | None] = {}
         missing: list[str] = []
         for name, path in candidates.items():
@@ -794,10 +777,8 @@ class DiagnosticsManager(EngineScoped):
         pinned = runtime.values.get("workspace_directory")
         if pinned is None:
             return None
-        # Reported as the string the project file holds, not laundered through `Path` first.
-        # This is a config value rather than a path this machine resolved, and on Windows
-        # `str(Path("/home/sam/work"))` rewrites the separators, so a project authored on one
-        # platform would be reported back as something nobody wrote.
+        # The string the project file holds, not laundered through `Path`: on Windows `str(Path(...))`
+        # rewrites the separators, so a project authored elsewhere reads back as something nobody wrote.
         return redactor.redact_path(str(pinned))
 
     def _build_secrets_section(self, warnings: list[str]) -> list[SecretDiagnostics]:
@@ -828,9 +809,9 @@ class DiagnosticsManager(EngineScoped):
                     continue
                 is_first_source = not sources
                 sources.append(layer.label)
-                # The highest-priority source wins outright, even when its value is empty:
-                # a key blanked in the workspace .env really does shadow a working one in
-                # the global .env, and saying so is the point of this section.
+                # The highest-priority source wins even when its value is empty: a key
+                # blanked in the workspace .env really does shadow a working one in the
+                # global .env.
                 if is_first_source:
                     is_set = layer.keys_set[name]
                     if is_set:
@@ -865,8 +846,8 @@ class DiagnosticsManager(EngineScoped):
             entries.append(
                 LibraryDiagnostics(
                     # Falls back to the path: a library that failed before its metadata
-                    # was parsed has no name, and that library is usually the reason a
-                    # report is being collected.
+                    # was parsed has no name, and that library is usually why a report is
+                    # being collected.
                     name=lib_info.library_name or redactor.redact_path(lib_info.library_path),
                     version=lib_info.library_version,
                     path=redactor.redact_path(lib_info.library_path),
@@ -915,10 +896,8 @@ class DiagnosticsManager(EngineScoped):
         directories = self._log_directories()
 
         files: list[LogFileDiagnostics] = []
-        # Canonicalized to match the files found below. They come from the directories
-        # `_log_directories` returns, which are canonical, while the sink recorded whatever
-        # spelling it was handed. A log directory under `/var` on macOS is the same file
-        # spelled two ways, and comparing the spellings marked no file as the active one.
+        # Canonicalized to match the files found below, which come from canonical directories while
+        # the sink recorded whatever spelling it was handed (`/var` vs `/private/var` on macOS).
         active_file = None
         current_file = active_log_file()
         if current_file is not None:
@@ -969,11 +948,8 @@ class DiagnosticsManager(EngineScoped):
         workflow_name = None
         workflow_path = None
         if context_manager.has_current_workflow():
-            # Redacted even though it is a "name": a workflow's registry key is derived from
-            # its path, and `WorkflowManager._workspace_relative_path` falls back to the
-            # absolute path for a workflow saved outside the workspace. So the name of a
-            # workflow saved to the desktop is `/Users/sam/Desktop/flow`, and it would carry
-            # the home directory into a report that promises to have taken it out.
+            # Redacted even though it is a "name": a workflow saved outside the workspace is keyed
+            # by its absolute path, so one saved to the desktop is named `/Users/sam/Desktop/flow`.
             workflow_name = redactor.redact_text(context_manager.get_current_workflow_name())
             current_path = context_manager.get_current_workflow_file_path()
             if current_path is not None:
@@ -1051,9 +1027,8 @@ class DiagnosticsManager(EngineScoped):
         file_values = self._env_file_secret_values()
         expected_names = set(file_values) | self._declared_secret_names()
 
-        # A set because the engine copies .env entries into the environment at startup, so
-        # most values are found twice, and one search pattern per value is enough. Sorted so
-        # a report built twice from the same state redacts in the same order.
+        # A set because the engine copies .env entries into the environment, so most values are
+        # found twice. Sorted so a report built twice from the same state redacts in the same order.
         values = {value for value in file_values.values() if value}
         values.update(value for name in expected_names if (value := os.environ.get(name)))
         return sorted(values)
@@ -1094,9 +1069,8 @@ class DiagnosticsManager(EngineScoped):
         workspace_values = self._read_env_file(self._workspace_env_path(warnings), warnings)
         global_values = self._read_env_file(ENV_VAR_PATH, warnings)
 
-        # Layered by the secrets manager's own function rather than by a copy of it here.
-        # The report exists to say which file a key really came from, so it has to agree
-        # with `get_secret` about which file wins -- forever, not just today.
+        # The secrets manager's own function rather than a copy: the report says which file a key
+        # came from, so it has to agree with `get_secret` about which file wins.
         file_values = merge_env_file_values(global_values=global_values, workspace_values=workspace_values)
 
         candidate_names = {*file_values, *declared_names}

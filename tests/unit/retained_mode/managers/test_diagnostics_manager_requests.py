@@ -60,17 +60,13 @@ if TYPE_CHECKING:
 # S105 reads any name ending in KEY as a credential; this is the key's name, not its value.
 _SECRET_NAME = "GTN_TEST_DIAGNOSTICS_KEY"  # noqa: S105
 
-# A canary, not a credential: a made-up value planted where a real key would be, long
-# enough to be searched for in free text and distinctive enough that finding it anywhere in
-# a bundle is unambiguous rather than a coincidence of the machine it ran on. Named for what
-# it is rather than as a secret, because a value with `secret` in its name flowing into a
-# `logger.warning` below is read as a credential being logged in the clear -- by a reader,
-# and by the security scanner that runs on every pull request.
+# A canary, not a credential: a made-up value planted where a real key would be, long enough
+# to be searched for in free text. Named for what it is rather than as a secret, because a
+# value with `secret` in its name reaching a `logger.warning` trips the PR security scanner.
 _CANARY_VALUE = "gtn-test-canary-value-4b17e9c0"
 
 # Stands in for the real Griptape Cloud key so the connection check has something to
-# authenticate with. Never sent anywhere: every test that runs the checks replaces the
-# call that would open the socket.
+# authenticate with. Never sent anywhere: every test replaces the call that opens the socket.
 _CLOUD_KEY = "gtn-test-cloud-key-not-a-real-one"
 
 _HOST_UNIDENTIFIABLE = "the platform could not be identified"
