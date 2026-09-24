@@ -179,12 +179,9 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
     if not library_config_slug(library_name):
         # Without letters or digits in the name there is no key to store the user's choices under.
         for index, entry in enumerate(entries):
-            feature_id = f"#{index + 1}"
-            if isinstance(entry, dict) and entry.get("id"):
-                feature_id = str(entry["id"])
             issues.append(
                 LibraryBetaFeatureIssue(
-                    feature_id,
+                    _entry_label(index, entry),
                     "can't be used, because the library's name has no letters or digits to store its settings "
                     "under. Add some to the library name",
                 )
@@ -194,11 +191,13 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             issues.append(
-                LibraryBetaFeatureIssue(f"#{index + 1}", f"is not an object with id, name, and so on, got {entry!r}")
+                LibraryBetaFeatureIssue(
+                    _entry_label(index, entry), f"is not an object with id, name, and so on, got {entry!r}"
+                )
             )
             continue
 
-        feature_id = str(entry.get("id") or f"#{index + 1}")
+        feature_id = _entry_label(index, entry)
         unknown_keys = sorted(key for key in entry if key not in _LIBRARY_ENTRY_FIELDS)
         if unknown_keys:
             logger.debug(
@@ -297,6 +296,13 @@ def library_config_slug(library_name: str) -> str:
     in GTN_CONFIG_ variable names, where "__" separates path parts.
     """
     return re.sub(r"[^a-z0-9]+", "_", library_name.lower()).strip("_")
+
+
+def _entry_label(index: int, entry: Any) -> str:
+    """The entry's id, or its position in the list when it has none, for naming it in problems."""
+    if isinstance(entry, dict) and entry.get("id"):
+        return str(entry["id"])
+    return f"#{index + 1}"
 
 
 def _today() -> date:
