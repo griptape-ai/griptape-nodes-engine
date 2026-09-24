@@ -226,8 +226,11 @@ def _resolve_plain_path(path_str: str) -> str:
 
     if is_url(path_str):
         static_server_path = parse_static_server_url(path_str, workspace_path)
-        # A URL naming no local file (remote host, non-localhost `file://`) has no
-        # path to resolve to, so it passes through for the consumer to fetch.
+        # A URL naming no local file (a remote host, e.g. `https://` or a static
+        # server URL served from another machine) has no path to resolve to, so
+        # it passes through for the consumer to fetch. `file://` URLs are
+        # excluded from this branch because parse_file_uri() above already
+        # converted them to a local (possibly UNC) path.
         if static_server_path is None:
             return path_str
         return str(resolve_path_safely(static_server_path))
