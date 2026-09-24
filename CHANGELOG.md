@@ -23,8 +23,7 @@ the engine's request API from working without edits. Migration steps live in
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
 - Nodes can implement `validate_in_execution_environment()` to run a check where the node itself runs,
   which for a library isolated in its own process is where its heavy packages are importable and its
-  inputs are the real objects. `validate_before_node_run` still runs before the flow starts, where the
-  graph is; a node that fails the new check reports why in
+  inputs are the real objects. A node that fails the check reports why in
   `ExecuteNodeResultFailure.validation_exceptions` instead of crashing partway through.
 
 ### Changed
