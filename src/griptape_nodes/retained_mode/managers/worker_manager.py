@@ -240,7 +240,7 @@ class WorkerManager(EngineScoped):
         called, methods that depend on the transport will raise RuntimeError.
 
         `ws_outgoing_queue` is ignored. Accepted so app releases that still pass it keep working.
-        TODO: remove once griptape-nodes-app stops passing it.
+        TODO(https://github.com/griptape-ai/griptape-nodes-app/issues/254): remove.
         """
         self._transport = _WorkerTransport(
             send_message=send_message,
