@@ -241,11 +241,15 @@ class WorkerManager(EngineScoped):
         subscribe_to_topic: Callable[[str], Awaitable[None]],
         unsubscribe_from_topic: Callable[[str], Awaitable[None]],
         request_client: RequestClient,
+        ws_outgoing_queue: asyncio.Queue | None = None,  # noqa: ARG002
     ) -> None:
         """Bind the transport-layer callables used for WebSocket I/O.
 
         Called once the WebSocket client and RequestClient exist. Until this is
         called, methods that depend on the transport will raise RuntimeError.
+
+        `ws_outgoing_queue` is ignored. Accepted so app releases that still pass it keep working.
+        TODO(https://github.com/griptape-ai/griptape-nodes-app/issues/254): remove.
         """
         self._transport = _WorkerTransport(
             send_message=send_message,
