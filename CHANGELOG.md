@@ -28,6 +28,12 @@ the engine's request API from working without edits. Migration steps live in
   place that the consuming node's read resolves. See
   [MIGRATION.md](MIGRATION.md#serializablefalse-outputs-are-held-in-their-own-process-across-a-worker-boundary).
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
+- You can try new features early by turning them on from the **Beta Features** page in the
+  editor's settings, and turn them off again at any time. Node libraries can offer beta features
+  of their own. See
+  [Beta Features](https://docs.griptapenodes.com/en/stable/guides/editor/beta_features/), and
+  [Authoring Libraries](https://docs.griptapenodes.com/en/stable/development/custom_nodes/authoring_libraries/#beta-features)
+  to add them to a library.
 - The `Slider` trait, and `ParameterInt` and `ParameterFloat` with `slider=True`, take
   `soft_limits=True`. The slider then spans its range, but a value typed outside it is accepted
   instead of rejected, matching soft limits in Nuke, Maya, and Houdini.
