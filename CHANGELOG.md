@@ -88,5 +88,8 @@ the engine's request API from working without edits. Migration steps live in
   the engine is busy. That process is now dropped for leaving heartbeat challenges unanswered rather
   than for elapsed time, so `worker.heartbeat_timeout_s` bounds unanswered challenges instead of
   wall-clock silence.
+- A node that writes a list or dictionary to an output and reads it back gets the same object rather
+  than a copy of it, and a value that refers to itself no longer fails the node with a
+  `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
