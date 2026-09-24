@@ -20,7 +20,13 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
-from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, DataNode, NodeDependencies
+from griptape_nodes.exe_types.node_types import (
+    LOCAL_EXECUTION,
+    BaseNode,
+    DataNode,
+    NodeDependencies,
+    aprocess_scope,
+)
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
@@ -28,6 +34,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
@@ -46,6 +53,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
     AlterParameterDetailsRequest,
+    SetParameterValueRequest,
+    SetParameterValueResultSuccess,
 )
 
 if TYPE_CHECKING:
@@ -73,6 +82,90 @@ class _TextNode(DataNode):
 
     def process(self) -> None:
         pass
+
+
+class _MetadataDrivenNode(DataNode):
+    """A node that rebuilds its dynamic parameters in ``__init__`` from its own metadata.
+
+    A node following this pattern already carries those parameters by the time the create command
+    replays, so serialization must not also emit an add for them.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        for dynamic_name in self.metadata.get("dynamic_parameters") or []:
+            self.add_parameter(
+                Parameter(
+                    name=dynamic_name,
+                    tooltip="Dynamic value",
+                    type="str",
+                    default_value="",
+                    allowed_modes={ParameterMode.PROPERTY},
+                )
+            )
+
+    def process(self) -> None:
+        pass
+
+
+class _HookBuiltNode(DataNode):
+    """A node that builds parameters from ``after_value_set`` as an input arrives.
+
+    The dynamic-pipeline diffuser nodes follow this pattern. The parameters are not declared by the
+    class, so ``__init__`` will not rebuild them, and the value replay will not either because
+    ``initial_setup`` suppresses the hooks — serialization has to recreate them itself.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="count",
+                tooltip="How many slots to build",
+                type="int",
+                default_value=0,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name != "count":
+            return
+        for index in range(int(value)):
+            slot_name = f"slot_{index}"
+            if not self.does_name_exist(slot_name):
+                self.add_parameter(
+                    Parameter(
+                        name=slot_name,
+                        tooltip="Slot",
+                        type="str",
+                        default_value="",
+                        allowed_modes={ParameterMode.PROPERTY},
+                    )
+                )
+
+    def process(self) -> None:
+        pass
+
+
+class _RunGrownParameterNode(DataNode):
+    """A node that adds a parameter while it runs and never removes it.
+
+    Strict mode reports mid-run parameter mutation as a warning rather than an error, so a node is
+    permitted to do this. A parameter that outlives the run is node shape rather than scratch:
+    nothing tears it down, so every save after that run has to carry it.
+    """
+
+    def process(self) -> None:
+        self.add_parameter(
+            Parameter(
+                name="grown",
+                tooltip="Kept past the run",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
 
 
 class _ComputedValueNode(DataNode):
@@ -168,6 +261,15 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     library.register_new_node_type(
         _ComputedValueNode, NodeMetadata(category="test", description="d", display_name="Computed")
     )
+    library.register_new_node_type(
+        _MetadataDrivenNode, NodeMetadata(category="test", description="d", display_name="Metadata Driven")
+    )
+    library.register_new_node_type(
+        _HookBuiltNode, NodeMetadata(category="test", description="d", display_name="Hook Built")
+    )
+    library.register_new_node_type(
+        _RunGrownParameterNode, NodeMetadata(category="test", description="d", display_name="Run Grown")
+    )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     engine.handle_request(
         EnsureWorkflowAndFlowRequest(workflow_name="serialization_wf", flow_name="serialization_flow")
@@ -184,6 +286,58 @@ def _create_text_node(engine: Engine, library_name: str, node_name: str, **kwarg
     )
     assert isinstance(result, CreateNodeResultSuccess), result
     return result.node_name
+
+
+def _create_metadata_driven_node(engine: Engine, library_name: str, node_name: str, *dynamic_names: str) -> str:
+    result = engine.handle_request(
+        CreateNodeRequest(
+            node_type="_MetadataDrivenNode",
+            specific_library_name=library_name,
+            node_name=node_name,
+            metadata={"dynamic_parameters": list(dynamic_names)},
+        )
+    )
+    assert isinstance(result, CreateNodeResultSuccess), result
+    return result.node_name
+
+
+def _serialize(engine: Engine, node_name: str) -> tuple[SerializeNodeToCommandsResultSuccess, dict]:
+    """Serialize a node, returning the commands and the value pool its value commands key into."""
+    unique_values: dict = {}
+    serialize_result = engine.node_manager.on_serialize_node_to_commands(
+        SerializeNodeToCommandsRequest(node_name=node_name, unique_parameter_uuid_to_values=unique_values)
+    )
+    assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess), serialize_result
+    return serialize_result, unique_values
+
+
+def _replay(engine: Engine, serialize_result: SerializeNodeToCommandsResultSuccess, unique_values: dict) -> BaseNode:
+    """Replay a serialized node's commands and its saved values, and return the resulting node.
+
+    Values travel separately from the element-modification commands, keyed by UUID into a pool the
+    caller owns, so restoring them mirrors what FlowManager does on paste and workflow load.
+    """
+    deserialize_result = engine.handle_request(
+        DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+    )
+    assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
+
+    for indirect_command in serialize_result.set_parameter_value_commands:
+        set_command = indirect_command.set_parameter_value_command
+        set_command.value = unique_values[indirect_command.unique_value_uuid]
+        set_command.node_name = deserialize_result.node_name
+        set_result = engine.handle_request(set_command)
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+    new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
+    assert isinstance(new_node, BaseNode)
+    return new_node
+
+
+def _round_trip(engine: Engine, node_name: str) -> BaseNode:
+    """Serialize a node and replay the result, the way duplicate and workflow load do."""
+    serialize_result, unique_values = _serialize(engine, node_name)
+    return _replay(engine, serialize_result, unique_values)
 
 
 class TestSerializeNodeToCommandsBasics:
@@ -280,6 +434,194 @@ class TestElementModificationCommands:
         assert len(alter_commands) == 1
         assert alter_commands[0].tooltip == "Changed tooltip"
         assert alter_commands[0].default_value == "changed default"
+
+    def test_parameter_added_during_execution_is_left_out(self, engine: Engine, library_name: str) -> None:
+        """A scratch parameter the node grew mid-run produces no command and no value.
+
+        This is the reported case: resolving a reference image adds a uniquely-named parameter to
+        feed the upload helper and removes it in the run's ``finally``. Duplicating while the run is
+        in flight used to emit an alter against it, which finds no element on the recreated node and
+        fails the whole deserialize. The copy should not carry the parameter at all.
+
+        Serialized inside the scope because that is the only moment the case is reachable: the
+        parameter is gone once the run ends, and the marker goes with it.
+        """
+        node_name = _create_text_node(engine, library_name, "N1")
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        with aprocess_scope():
+            node.add_parameter(
+                Parameter(
+                    name="_scratch_upload",
+                    tooltip="Transient",
+                    type="str",
+                    allowed_modes={ParameterMode.PROPERTY},
+                )
+            )
+            set_result = engine.handle_request(
+                SetParameterValueRequest(node_name=node_name, parameter_name="_scratch_upload", value="scratch")
+            )
+            assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+            serialize_result, unique_values = _serialize(engine, node_name)
+
+        assert not [
+            command
+            for command in serialize_result.serialized_node_commands.element_modification_commands
+            if getattr(command, "parameter_name", None) == "_scratch_upload"
+        ]
+        assert not [
+            command
+            for command in serialize_result.set_parameter_value_commands
+            if command.set_parameter_value_command.parameter_name == "_scratch_upload"
+        ]
+        new_node = _replay(engine, serialize_result, unique_values)
+        assert new_node.get_parameter_by_name("_scratch_upload") is None
+
+    @pytest.mark.asyncio
+    async def test_parameter_that_outlives_its_run_is_kept(self, engine: Engine, library_name: str) -> None:
+        """A parameter added mid-run and never removed is node shape once the run ends.
+
+        Driven through ``_hydrate_and_run_node_inner`` because that function owns the aprocess
+        scope, and the scope's lifetime is the marker's whole meaning. Without the run-end reset the
+        node stays flagged for good, and the parameter plus its value drop out of every later save.
+        """
+        create_result = engine.handle_request(
+            CreateNodeRequest(node_type="_RunGrownParameterNode", specific_library_name=library_name, node_name="R1")
+        )
+        assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        node_name = create_result.node_name
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+
+        execute_result = await engine.node_manager._hydrate_and_run_node_inner(
+            node, ExecuteNodeRequest(node_name=node_name)
+        )
+        assert isinstance(execute_result, ExecuteNodeResultSuccess), execute_result
+        assert node.get_parameter_by_name("grown") is not None
+        assert "grown" not in node.parameters_added_during_execution
+
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name=node_name, parameter_name="grown", value="kept text")
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+        assert new_node.get_parameter_by_name("grown") is not None
+        assert new_node.get_parameter_value("grown") == "kept text"
+
+    def test_request_driven_parameter_added_mid_run_is_kept(self, engine: Engine, library_name: str) -> None:
+        """A parameter added by request mid-run is node shape, not scratch.
+
+        The request path is the sanctioned way to mutate parameters during a run, because it syncs
+        the parameter back to the orchestrator; scratch state never does. ``is_user_defined=False``
+        is what reaches the markers at all, since a user-defined parameter takes the add branch at
+        the top of the serialize chain regardless of them.
+        """
+        node_name = _create_text_node(engine, library_name, "N1")
+        with aprocess_scope():
+            add_result = engine.handle_request(
+                AddParameterToNodeRequest(
+                    node_name=node_name,
+                    parameter_name="synced",
+                    type="str",
+                    default_value="",
+                    tooltip="synced",
+                    is_user_defined=False,
+                )
+            )
+            assert isinstance(add_result, AddParameterToNodeResultSuccess), add_result
+            set_result = engine.handle_request(
+                SetParameterValueRequest(node_name=node_name, parameter_name="synced", value="synced text")
+            )
+            assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+        assert new_node.get_parameter_by_name("synced") is not None
+        assert new_node.get_parameter_value("synced") == "synced text"
+
+    def test_metadata_driven_parameters_are_not_added_twice(self, engine: Engine, library_name: str) -> None:
+        """A node rebuilding its dynamic parameters in ``__init__`` keeps the same parameter names.
+
+        ``__init__`` recreates them from the metadata the create command carries, so an add would
+        collide with the parameter already there and rename it to ``<name>_1``.
+        """
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        names_before = [parameter.name for parameter in node.parameters]
+        assert "prompt_1" in names_before
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        assert not [
+            command
+            for command in result.serialized_node_commands.element_modification_commands
+            if isinstance(command, AddParameterToNodeRequest) and command.parameter_name == "prompt_1"
+        ]
+        new_node = _round_trip(engine, node_name)
+        assert [parameter.name for parameter in new_node.parameters] == names_before
+
+    def test_metadata_driven_parameter_value_survives_the_round_trip(self, engine: Engine, library_name: str) -> None:
+        """A value set on a metadata-driven parameter is saved, since the copy has somewhere to put it.
+
+        The reference instance is built with metadata narrowed to library and node_type, so it lacks
+        this parameter even though the recreated node has it. Reading that absence as "the copy will
+        not have it either" drops the value on every save, not just on paste.
+        """
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name=node_name, parameter_name="prompt_1", value="a typed prompt")
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+
+        assert new_node.get_parameter_value("prompt_1") == "a typed prompt"
+
+    def test_hook_built_parameter_and_its_value_survive_the_round_trip(self, engine: Engine, library_name: str) -> None:
+        """A parameter built from a value hook is recreated by an add, carrying its value.
+
+        Neither ``__init__`` nor the value replay rebuilds it — the replay sets values with
+        ``initial_setup``, which suppresses the very hook that would have built it — so leaving it
+        out would drop both the parameter and whatever the artist typed into it.
+        """
+        create = engine.handle_request(
+            CreateNodeRequest(node_type="_HookBuiltNode", specific_library_name=library_name, node_name="H1")
+        )
+        assert isinstance(create, CreateNodeResultSuccess), create
+        node_name = create.node_name
+        for parameter_name, value in (("count", 2), ("slot_0", "typed A")):
+            set_result = engine.handle_request(
+                SetParameterValueRequest(node_name=node_name, parameter_name=parameter_name, value=value)
+            )
+            assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+
+        assert [parameter.name for parameter in new_node.parameters] == [
+            "exec_in",
+            "exec_out",
+            "count",
+            "slot_0",
+            "slot_1",
+        ]
+        assert new_node.get_parameter_value("slot_0") == "typed A"
+
+    def test_metadata_driven_parameter_alteration_survives_the_round_trip(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """An edit to a metadata-driven parameter's details is saved, for the same reason."""
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        engine.handle_request(
+            AlterParameterDetailsRequest(node_name=node_name, parameter_name="prompt_1", tooltip="Retitled")
+        )
+
+        new_node = _round_trip(engine, node_name)
+
+        altered = new_node.get_parameter_by_name("prompt_1")
+        assert altered is not None
+        assert altered.tooltip == "Retitled"
 
 
 class TestLockState:

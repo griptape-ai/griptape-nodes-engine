@@ -3712,6 +3712,11 @@ class NodeManager(EngineScoped):
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
                 )
+            finally:
+                # The scratch marker only means anything while the run is in flight. A parameter
+                # the node still holds here was never torn down, so serialization must treat it
+                # as structure rather than dropping it from every later save.
+                node.forget_parameters_added_during_execution()
         # Only a worker's result leaves the process. In-process this is handed straight back to
         # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
         # dict the node just wrote its object into.
@@ -4056,6 +4061,9 @@ class NodeManager(EngineScoped):
             # Now creation or alteration of all of the elements.
             element_modification_commands = []
 
+            # Parameters left out of the commands below, so their values must be left out too.
+            omitted_parameter_names: set[str] = set()
+
             # Serialize only user-defined ParameterGroups (like parameters)
             all_groups = node.root_ui_element.find_elements_by_type(ParameterGroup)
             for group in all_groups:
@@ -4096,6 +4104,31 @@ class NodeManager(EngineScoped):
                     param_dict = parameter.save_dict()
                     param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
                     add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
+                    element_modification_commands.append(add_param_request)
+                elif (
+                    parameter.name in node.parameters_added_during_execution
+                    and reference_node.get_parameter_by_name(parameter.name) is None
+                ):
+                    # Scratch state the run owns and tears down, so the copy should not have it at
+                    # all. An alter would find no element on the recreated node and fail the whole
+                    # deserialize, and an add would leave the artist a phantom property.
+                    omitted_parameter_names.add(parameter.name)
+                elif (
+                    parameter.name in node.parameters_added_after_construction
+                    and reference_node.get_parameter_by_name(parameter.name) is None
+                ):
+                    # Added outside ``__init__`` but meant to last — typically built from a value
+                    # hook as an input arrived. The recreated node has no such parameter when the
+                    # element commands replay, and the value replay will not rebuild it either
+                    # because ``initial_setup`` suppresses the hooks, so recreate it outright.
+                    #
+                    # Reference absence cannot pick these out on its own: the reference's metadata is
+                    # narrowed to library and node_type, so it also lacks parameters ``__init__``
+                    # derives from any other metadata key, and adding those would collide with the
+                    # copy's own and land as ``<name>_1``.
+                    param_dict = parameter.to_dict()
+                    param_dict["initial_setup"] = True
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4139,6 +4172,9 @@ class NodeManager(EngineScoped):
             # Only AlterParameterDetailsRequest commands are recorded and replayed
             # Normal node - use current parameter values
             for parameter in node.parameters:
+                # No parameter to receive the value: it was left out of the commands above.
+                if parameter.name in omitted_parameter_names:
+                    continue
                 # SetParameterValueRequest event
                 set_param_value_requests = NodeManager.handle_parameter_value_saving(
                     parameter=parameter,
