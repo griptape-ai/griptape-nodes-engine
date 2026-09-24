@@ -324,9 +324,9 @@ class TestControlFlowResolvedEventCattrsRoundTrip:
     """
 
     def test_bytes_values_survive_unstructure_structure_round_trip(self) -> None:
-        from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
         from griptape_nodes.retained_mode.events.execution_events import ControlFlowResolvedEvent
         from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+        from griptape_nodes.serialization.converter import converter, safe_unstructure
 
         original = {"answer": 42}
         pickled = pickle.dumps(original)
