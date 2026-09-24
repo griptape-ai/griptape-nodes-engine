@@ -54,7 +54,8 @@ def strip_sequence_token(stem: str) -> str:
         situation macro supplies its own (``"render_####"`` becomes ``"render"``).
 
     Raises:
-        FileSequenceError: If stem contains more than one sequence token.
+        FileSequenceError: If stem contains more than one sequence token, or nothing
+            but a sequence token.
     """
     token_count = sequences_scan.count_sequence_tokens(stem)
     if token_count == 0:
@@ -65,7 +66,14 @@ def strip_sequence_token(stem: str) -> str:
             f"Failed because it contains {token_count} sequence tokens; only one is supported."
         )
         raise FileSequenceError(msg)
-    return fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename().rstrip("._-")
+    base = fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename().rstrip("._-")
+    if not base:
+        msg = (
+            f"Attempted to build a file sequence name from '{stem}'. "
+            "Failed because the name has no text besides the frame number. Add a name such as 'render_####'."
+        )
+        raise FileSequenceError(msg)
+    return base
 
 
 def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:

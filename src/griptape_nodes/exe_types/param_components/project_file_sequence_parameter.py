@@ -121,6 +121,10 @@ def _build_sequence_destination_from_situation(
     Parses the filename (or #### pattern) into parts, looks up the situation,
     and builds a versioned destination by updating all available ``_index`` variables.
 
+    A CREATE_NEW situation policy versions the folder only. Frames inside it are
+    written with OVERWRITE so a retried frame replaces itself instead of gaining a
+    renamed sibling. OVERWRITE and FAIL pass through to the frames unchanged.
+
     Args:
         filename: Filename or #### pattern (e.g., ``"render.exr"`` or ``"render_####.exr"``).
         situation: Situation name to look up in the current project.
@@ -139,8 +143,15 @@ def _build_sequence_destination_from_situation(
         **extra_vars,
     }
     macro_path = project_events.MacroPath(macro_parser.ParsedMacro(resolved.macro_template), variables)
+
+    # The folder's {###} slot already gives each run a fresh version, so CREATE_NEW
+    # must not also apply per frame. Renaming individual frames would break the sequence.
+    frame_policy = resolved.existing_file_policy
+    if frame_policy == os_events.ExistingFilePolicy.CREATE_NEW:
+        frame_policy = os_events.ExistingFilePolicy.OVERWRITE
+
     return file_sequence.build_versioned_sequence_destination(
         macro_path,
-        existing_file_policy=resolved.existing_file_policy,
+        existing_file_policy=frame_policy,
         create_parents=resolved.create_parents,
     )

@@ -150,6 +150,39 @@ class TestBuildSequenceDestinationFromSituation:
         call_kwargs = mock_build.call_args.kwargs
         assert call_kwargs["existing_file_policy"] == os_events.ExistingFilePolicy.OVERWRITE
 
+    def test_situation_create_new_policy_writes_frames_with_overwrite(self) -> None:
+        """CREATE_NEW versions the folder; frames must not be renamed on collision."""
+        sit = _make_situation("{outputs}/frames_v{###}/frames.####.exr", on_collision="CREATE_NEW")
+        success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
+        mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
+
+        with (
+            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
+            mock.patch(BUILD_VERSIONED_PATH, return_value=mock_dest) as mock_build,
+        ):
+            project_file_sequence_parameter._build_sequence_destination_from_situation(
+                "frame.exr", "save_file_sequence"
+            )
+
+        call_kwargs = mock_build.call_args.kwargs
+        assert call_kwargs["existing_file_policy"] == os_events.ExistingFilePolicy.OVERWRITE
+
+    def test_situation_fail_policy_forwarded(self) -> None:
+        sit = _make_situation("{outputs}/####.exr", on_collision="FAIL")
+        success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
+        mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
+
+        with (
+            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
+            mock.patch(BUILD_VERSIONED_PATH, return_value=mock_dest) as mock_build,
+        ):
+            project_file_sequence_parameter._build_sequence_destination_from_situation(
+                "frame.exr", "save_file_sequence"
+            )
+
+        call_kwargs = mock_build.call_args.kwargs
+        assert call_kwargs["existing_file_policy"] == os_events.ExistingFilePolicy.FAIL
+
     def test_situation_create_dirs_forwarded(self) -> None:
         sit = _make_situation("{outputs}/####.exr", create_dirs=False)
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")

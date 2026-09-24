@@ -147,6 +147,11 @@ class TestStripSequenceToken:
         with pytest.raises(file_sequence.FileSequenceError):
             file_sequence.strip_sequence_token("render_#### v%04d")
 
+    @pytest.mark.parametrize("stem", ["####", "_####", "%04d"])
+    def test_token_only_stem_raises(self, stem: str) -> None:
+        with pytest.raises(file_sequence.FileSequenceError, match="no text besides the frame number"):
+            file_sequence.strip_sequence_token(stem)
+
 
 class TestFileSequenceDestination:
     """Tests for FileSequenceDestination."""

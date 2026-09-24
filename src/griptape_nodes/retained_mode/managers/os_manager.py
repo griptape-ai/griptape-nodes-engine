@@ -916,7 +916,7 @@ class OSManager(EngineScoped):
         Returns:
             A MacroPath with only the index slot unresolved. Returns `macro_path` unchanged
             when project resolution fails or the slot cannot be located, so callers that
-            bind every variable themselves keep their current behavior.
+            bind every variable themselves are scanned as given.
         """
         template = macro_path.parsed_macro.template
         if SEQUENCE_VARIABLE_NAME in macro_path.variables:
