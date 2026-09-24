@@ -38,8 +38,8 @@ bottom-left gives you zoom in/out/fit-view buttons and a **Toggle
 Clean Mode** button that hides the decorative Griptape logo watermark
 — useful when you're taking a screenshot of your own workflow.
 
-Double-clicking empty canvas opens the **Add Node** menu at your
-cursor. See [Working with Nodes](working_with_nodes.md) for everything
+Press `Tab` with your cursor over the canvas to open the **Add Node**
+menu at your cursor. See [Working with Nodes](working_with_nodes.md) for everything
 you can do with a node once it's placed, and
 [Keyboard Shortcuts](keyboard_shortcuts.md) for the full list of
 canvas shortcuts.
