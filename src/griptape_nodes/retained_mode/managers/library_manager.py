@@ -977,7 +977,7 @@ class LibraryManager(EngineScoped):
                 #
                 # Only for libraries whose nodes already exist here. A legacy worker-mode library
                 # has none: the orchestrator skips its node modules entirely and its classes arrive
-                # as stubs from the worker's LibraryLoadedNotification. Skipping its spawn would
+                # as stubs from the worker's ReportLibraryLoadedRequest. Skipping its spawn would
                 # leave the library with no node types at all -- an empty entry in the sidebar and
                 # placeholder nodes in any workflow using it. It still cannot execute, because the
                 # reset below preserves its refusal.
@@ -2477,7 +2477,7 @@ class LibraryManager(EngineScoped):
             case LibraryManager.LibraryFitness.NOT_EVALUATED:
                 # Worker-delegated libraries on the orchestrator: node imports are skipped
                 # and fitness will be updated once the worker reports back via
-                # LibraryLoadedNotification. Workers are started asynchronously (either by
+                # ReportLibraryLoadedRequest. Workers are started asynchronously (either by
                 # AppStartSessionRequest or by _maybe_start_workers_for_existing_session)
                 # so we must NOT block here -- doing so would prevent the orchestrator from
                 # sending heartbeats to the worker process, causing it to self-terminate.
@@ -2955,7 +2955,7 @@ class LibraryManager(EngineScoped):
                         # etc.) into the orchestrator process.  The library is already registered
                         # in LibraryRegistry (for the editor and workflow loading); the worker
                         # process handles node loading and will report fitness via
-                        # LibraryLoadedNotification once it finishes.
+                        # ReportLibraryLoadedRequest once it finishes.
                         if library_info.requires_worker and not self._is_worker:
                             library_info.fitness = LibraryManager.LibraryFitness.NOT_EVALUATED
                             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
@@ -4916,7 +4916,7 @@ class LibraryManager(EngineScoped):
             await self._start_workers()
 
     async def _await_pending_workers(self, wait_seconds: float | None = None) -> None:
-        """Wait for all WORKER_PENDING libraries to report back via LibraryLoadedNotification.
+        """Wait for all WORKER_PENDING libraries to report back via ReportLibraryLoadedRequest.
 
         On timeout, marks remaining pending libraries as FAILURE/UNUSABLE so the rest of
         initialization can continue.
