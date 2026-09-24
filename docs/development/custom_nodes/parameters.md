@@ -21,7 +21,7 @@ All Parameter attributes:
 - **hide/hide_label/hide_property**: common UI flags (also available via `ui_options`; `ui_options` wins on conflict)
 - **allow_input/allow_property/allow_output**: convenience flags for configuring modes (ignored if `allowed_modes` is explicitly set)
 - **settable**: bool (default True) - False for computed/output parameters
-- **serializable**: bool (default True) - set False for non-serializable values (drivers, file handles, etc.)
+- **serializable**: bool (default True) - set False for non-serializable values (drivers, file handles, etc.). On an output, this also holds the value in the process that produced it and sends a key across a worker process boundary - see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md)
 - **user_defined**: bool (default False)
 - **private**: bool (default False) - hide from general user editing (library/internal use)
 - **exclude_from_metadata**: bool (default False) - exclude this parameter's value from plaintext metadata outputs (sidecar JSON and embedded PNG text chunks). The parameter name is still recorded in `parameters_omitted` so the omission is auditable. Use this for parameters that hold sensitive values such as passwords or user-supplied credentials.

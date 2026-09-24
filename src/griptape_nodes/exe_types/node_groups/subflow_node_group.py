@@ -1319,7 +1319,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 if internal_param.name in internal_node.parameter_output_values:
                     value = internal_node.parameter_output_values[internal_param.name]
                 else:
-                    value = internal_node.get_parameter_value(internal_param.name)
+                    value = internal_node._get_raw_parameter_value(internal_param.name)
 
                 if value is not None:
                     self.parameter_output_values[proxy_param_name] = value
