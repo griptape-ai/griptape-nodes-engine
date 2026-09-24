@@ -61,6 +61,9 @@ profiling = ["austin-dist>=3.7.0"]
 [dependency-groups]
 dev = [
   "griptape-cloud-client",
+  # Markdown: the toc extension's slugify, so scripts/generate_settings_reference.py anchors
+  # match the heading ids mkdocs renders.
+  "markdown>=3.5",
   "mdformat>=0.7.22",
   "mdformat-gfm>=0.4.1",
   "mdformat-frontmatter>=2.0.8",
@@ -194,14 +197,9 @@ ignore = [
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
-"src/griptape_nodes/exe_types/**" = ["TID251"]
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
-# artifact_normalization.py is called from Parameter converter closures in
-# exe_types/param_types/parameter_{image,audio,video,three_d}.py, which have no Engine of
-# their own yet, so it cannot come off this list until exe_types does.
-"src/griptape_nodes/utils/artifact_normalization.py" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]

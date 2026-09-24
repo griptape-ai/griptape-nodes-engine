@@ -5,7 +5,10 @@ from typing import Any, NamedTuple
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMessage
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetSecretValueRequest,
+    GetSecretValueResultSuccess,
+)
 from griptape_nodes.traits.button import Button
 
 
@@ -152,7 +155,7 @@ class ApiKeyProviderParameter:
         Returns:
             bool: True if the API key exists and is not empty, False otherwise
         """
-        api_key_value = GriptapeNodes.SecretsManager().get_secret(api_key)
+        api_key_value = self._get_secret(api_key, should_error_on_not_found=False)
         if api_key_value is None:
             return False
         if isinstance(api_key_value, str):
@@ -172,7 +175,7 @@ class ApiKeyProviderParameter:
             ValueError: If the API key is not set
         """
         api_key_name = self.api_key_name if use_user_api else self.proxy_api_key_name
-        api_key = GriptapeNodes.SecretsManager().get_secret(api_key_name)
+        api_key = self._get_secret(api_key_name, should_error_on_not_found=True)
         if not api_key:
             msg = f"{self._node.name} is missing {api_key_name}. Ensure it's set in the environment/config."
             raise ValueError(msg)
@@ -198,3 +201,17 @@ class ApiKeyProviderParameter:
             user_api_key = self.get_api_key(use_user_api=True)
 
         return ApiKeyValidationResult(proxy_api_key=proxy_api_key, user_api_key=user_api_key)
+
+    def _get_secret(self, secret_name: str, *, should_error_on_not_found: bool) -> str | None:
+        """Ask the engine for a secret.
+
+        Asked as a request rather than read from a local SecretsManager: when the node runs in
+        a worker, the request reaches the orchestrator, while a manager read would answer from
+        the worker's own copy.
+        """
+        result = self._node.engine.handle_request(
+            GetSecretValueRequest(key=secret_name, should_error_on_not_found=should_error_on_not_found)
+        )
+        if not isinstance(result, GetSecretValueResultSuccess):
+            return None
+        return result.value

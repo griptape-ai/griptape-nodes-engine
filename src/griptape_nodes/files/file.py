@@ -18,6 +18,7 @@ from griptape_nodes.files.path_utils import (
     resolve_file_path,
     resolve_path_safely,
 )
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -187,7 +188,7 @@ def _resolve_plain_path(path_str: str) -> str:
 
     1. A ``file://`` URI is converted to the local path it names, then absolutized.
     2. A localhost static file server URL
-       (``http://localhost:8124/workspace/staticfiles/clip.mp4?t=...``) is mapped
+       (``http://localhost:8124/workspace/staticfiles/clip.mp4?v=...``) is mapped
        back to the workspace file it serves. The engine passes node outputs
        between nodes in this form, and the file is already on disk, so a caller
        that needs a real path gets one without an HTTP round-trip.
@@ -221,12 +222,15 @@ def _resolve_plain_path(path_str: str) -> str:
     if local_path is not None:
         path_str = local_path
 
-    workspace_path = GriptapeNodes.ConfigManager().workspace_path
+    workspace_path = current_engine().config_manager.workspace_path
 
     if is_url(path_str):
         static_server_path = parse_static_server_url(path_str, workspace_path)
-        # A URL naming no local file (remote host, non-localhost `file://`) has no
-        # path to resolve to, so it passes through for the consumer to fetch.
+        # A URL naming no local file (a remote host, e.g. `https://` or a static
+        # server URL served from another machine) has no path to resolve to, so
+        # it passes through for the consumer to fetch. `file://` URLs are
+        # excluded from this branch because parse_file_uri() above already
+        # converted them to a local (possibly UNC) path.
         if static_server_path is None:
             return path_str
         return str(resolve_path_safely(static_server_path))
