@@ -33,7 +33,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayload,
     StrictModeViolationDetail,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
@@ -41,6 +40,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
+from griptape_nodes.serialization.converter import converter
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:

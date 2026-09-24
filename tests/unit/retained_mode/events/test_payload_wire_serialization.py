@@ -1,8 +1,8 @@
 """Tests for the event/payload wire-serialization pipeline.
 
 Covers ``retained_mode/events/base_events.py`` (Payload.to_json, the Event envelope classes and
-their ``from_dict``) and ``retained_mode/events/event_converter.py`` (the cattrs converter's
-registered hooks and ``safe_unstructure``). Complements ``test_event_converter.py`` and
+their ``from_dict``) and ``serialization/converter.py`` (the cattrs converter's
+registered hooks and ``safe_unstructure``). Complements ``serialization/test_converter.py`` and
 ``test_from_dict.py``, which already cover JSON-primitive unions, the exception wire form,
 ``SetParameterValueRequest`` structuring, and ``from_dict`` basics -- this file extends into the
 gaps: full round trips, ``ResultDetails``, batches, artifact/pydantic/Path/float/type hooks, the
@@ -43,10 +43,10 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
 from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextSuccess
-from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
 from griptape_nodes.retained_mode.events.workflow_events import GetWorkflowMetadataResultSuccess
+from griptape_nodes.serialization.converter import converter, safe_unstructure
 
 # --- Populate the full PayloadRegistry without constructing an Engine -------------------------
 #
@@ -274,7 +274,7 @@ class TestSweepCoversTheLargeMajorityOfTheRegistry:
 # --- Known, deterministic wire round-trip bugs surfaced by the sweep below ---------------------
 
 _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON = (
-    "API-CONTRACT: event_converter registers an unstructure hook for a bare `type` field (type -> "
+    "API-CONTRACT: the converter registers an unstructure hook for a bare `type` field (type -> "
     "'module.Qualname' string) but no matching structure hook, so a value built from to_json() "
     "cannot be read back with converter.structure(); it raises StructureHandlerNotFoundError. "
     "Intended: a `type` field survives an unstructure/structure round trip like every other field. "

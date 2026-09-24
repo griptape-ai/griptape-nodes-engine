@@ -1,15 +1,15 @@
-"""Tests for event_converter structure/unstructure hooks."""
+"""Tests for the cattrs converter's structure/unstructure hooks."""
 
 from typing import Any
 
 import pytest
 
 from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException
-from griptape_nodes.retained_mode.events.event_converter import (
+from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from griptape_nodes.serialization.converter import (
     _is_json_primitive_union,
     converter,
 )
-from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 
 
 class TestIsJsonPrimitiveUnion:

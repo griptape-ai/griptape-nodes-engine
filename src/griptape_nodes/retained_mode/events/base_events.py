@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from griptape_nodes.retained_mode.events.event_converter import (
+from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
+from griptape_nodes.serialization.converter import (
     converter,
     register_polymorphic_dataclass,
     safe_unstructure,
 )
-from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
 
 if TYPE_CHECKING:
     import builtins
