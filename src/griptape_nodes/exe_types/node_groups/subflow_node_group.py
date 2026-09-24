@@ -5,21 +5,13 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import (
-    ControlParameter,
     ControlParameterInput,
     ControlParameterOutput,
     Parameter,
-    ParameterMode,
-    ParameterTypeBuiltin,
-    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
-from griptape_nodes.exe_types.node_types import (
-    LOCAL_EXECUTION,
-    get_library_names_with_publish_handlers,
-)
-from griptape_nodes.exe_types.param_components.subflow_execution_component import SubflowExecutionComponent
+from griptape_nodes.exe_types.param_components.execution_environment_component import ExecutionEnvironmentComponent
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     DeleteConnectionRequest,
@@ -41,11 +33,11 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.traits.options import Options
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.node_types import BaseNode, Connection
+    from griptape_nodes.exe_types.param_components.subflow_execution_component import SubflowExecutionComponent
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -93,33 +85,16 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.control_out = ControlParameterOutput(name="group_exec_out")
         self.add_parameter(self.control_out)
         self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
-        self.execution_environment = Parameter(
-            name="execution_environment",
-            tooltip="Environment that the group should execute in",
-            type=ParameterTypeBuiltin.STR,
-            allowed_modes={ParameterMode.PROPERTY},
-            default_value=LOCAL_EXECUTION,
-            traits={Options(choices=get_library_names_with_publish_handlers())},
+        self._execution_environment_component = ExecutionEnvironmentComponent(
+            self, tooltip="Environment that the group should execute in"
         )
-        self.add_parameter(self.execution_environment)
+        self.execution_environment = self._execution_environment_component.parameter
+        self._execution_environment_component.add_parameters()
         # Track mapping from proxy parameter name to (original_node, original_param_name)
         self._proxy_param_to_connections = {}
-        if "execution_environment" not in self.metadata:
-            self.metadata["execution_environment"] = {}
-        self.metadata["execution_environment"]["Griptape Nodes Library"] = {
-            "start_flow_node": "StartFlow",
-            "parameter_names": {},
-        }
-        self.metadata["executable"] = True
 
         # Don't create subflow in __init__ - it will be created on-demand when nodes are added
         # or restored during deserialization
-
-        # Add parameters from registered StartFlow nodes for each publishing library
-        self._add_start_flow_parameters()
-
-        # Add subprocess execution status component for real-time GUI updates
-        self._add_subflow_execution_parameters()
 
     def _create_subflow(self) -> None:
         """Create the dedicated subflow that will hold this NodeGroup's nodes.
@@ -179,140 +154,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if not context_manager.has_current_flow():
             return None
         return context_manager.get_current_flow().name
-
-    def _add_start_flow_parameters(self) -> None:
-        """Add parameters from all registered StartFlow nodes to this SubflowNodeGroup.
-
-        For each library that has registered a PublishWorkflowRequest handler with
-        a StartFlow node, this method:
-        1. Creates a temporary instance of that StartFlow node
-        2. Extracts all its parameters
-        3. Adds them to this SubflowNodeGroup with a prefix based on the class name
-        4. Stores metadata mapping execution environments to their parameters
-        """
-        from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        # Initialize metadata structure for execution environment mappings
-        if self.metadata is None:
-            self.metadata = {}
-        if "execution_environment" not in self.metadata:
-            self.metadata["execution_environment"] = {}
-
-        # Get all libraries that have registered PublishWorkflowRequest handlers
-        library_manager = GriptapeNodes.LibraryManager()
-        event_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
-
-        # Process each registered library
-        for library_name, handler in event_handlers.items():
-            self._process_library_start_flow_parameters(library_name, handler)
-
-    def _add_subflow_execution_parameters(self) -> None:
-        """Add parameters for subflow execution tracking."""
-        self._subflow_execution_component = SubflowExecutionComponent(self)
-        self._subflow_execution_component.add_output_parameters()
-
-    def _process_library_start_flow_parameters(self, library_name: str, handler: Any) -> None:
-        """Process and add StartFlow parameters from a single library.
-
-        Args:
-            library_name: Name of the library
-            handler: The registered event handler containing event data
-        """
-        import logging
-
-        from griptape_nodes.node_library.library_registry import LibraryRegistry
-        from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRegisteredEventData
-
-        logger = logging.getLogger(__name__)
-
-        registered_event_data = handler.event_data
-
-        if registered_event_data is None:
-            return
-        if not isinstance(registered_event_data, PublishWorkflowRegisteredEventData):
-            return
-
-        # Get the StartFlow node information
-        start_flow_node_type = registered_event_data.start_flow_node_type
-        start_flow_library_name = registered_event_data.start_flow_node_library_name
-
-        try:
-            # Get the library that contains the StartFlow node
-            library = LibraryRegistry.get_library(name=start_flow_library_name)
-        except KeyError:
-            logger.debug(
-                "Library '%s' not found when adding StartFlow parameters for '%s'",
-                start_flow_library_name,
-                library_name,
-            )
-            return
-
-        try:
-            # Create a temporary instance of the StartFlow node to inspect its parameters
-            temp_start_flow_node = library.create_node(
-                node_type=start_flow_node_type,
-                name=f"temp_{start_flow_node_type}",
-            )
-        except Exception as e:
-            logger.debug(
-                "Failed to create temporary StartFlow node '%s' from library '%s': %s",
-                start_flow_node_type,
-                start_flow_library_name,
-                e,
-            )
-            return
-
-        # Get the class name for prefixing (convert to lowercase for parameter naming)
-        class_name_prefix = start_flow_node_type.lower()
-
-        # Store metadata for this execution environment
-        parameter_names = []
-
-        # Add each parameter from the StartFlow node to this SubflowNodeGroup
-        for param in temp_start_flow_node.parameters:
-            if isinstance(param, ControlParameter):
-                continue
-
-            # Create prefixed parameter name
-            prefixed_param_name = f"{class_name_prefix}_{param.name}"
-            parameter_names.append(prefixed_param_name)
-
-            # Clone and add the parameter
-            self._clone_and_add_parameter(param, prefixed_param_name)
-
-        # Store the mapping in metadata
-        self.metadata["execution_environment"][library_name] = {
-            "start_flow_node": start_flow_node_type,
-            "parameter_names": parameter_names,
-        }
-
-    def _clone_and_add_parameter(self, param: Parameter, new_name: str) -> None:
-        """Clone a parameter with a new name and add it to this node.
-
-        Args:
-            param: The parameter to clone
-            new_name: The new name for the cloned parameter
-        """
-        # Extract traits from parameter children (traits are stored as children of type Trait)
-        traits_set: set[type[Trait] | Trait] | None = {child for child in param.children if isinstance(child, Trait)}
-        if not traits_set:
-            traits_set = None
-
-        # Clone the parameter with the new name
-        cloned_param = Parameter(
-            name=new_name,
-            tooltip=param.tooltip,
-            type=param.type,
-            allowed_modes=param.allowed_modes,
-            default_value=param.default_value,
-            traits=traits_set,
-            parent_container_name=param.parent_container_name,
-            parent_element_name=param.parent_element_name,
-        )
-
-        # Add the parameter to this node
-        self.add_parameter(cloned_param)
 
     def _create_proxy_parameter_for_connection(self, original_param: Parameter, *, is_incoming: bool) -> Parameter:
         """Create a proxy parameter on this SubflowNodeGroup for an external connection.
@@ -717,7 +558,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         super().after_value_set(parameter, value)
-        self.subflow_execution_component.after_value_set(parameter, value)
+        self._execution_environment_component.after_value_set(parameter, value)
 
     def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to the group and track their connections.
@@ -1359,4 +1200,4 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     @property
     def subflow_execution_component(self) -> SubflowExecutionComponent:
         """Get the subflow execution component for real-time status updates."""
-        return self._subflow_execution_component
+        return self._execution_environment_component.subflow_execution_component

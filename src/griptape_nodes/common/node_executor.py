@@ -19,6 +19,7 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeStartNode,
 )
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+from griptape_nodes.exe_types.inner_flow_node import InnerFlowNode
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
     BaseWhileNodeGroup,
@@ -46,6 +47,7 @@ from griptape_nodes.retained_mode.events.base_events import ForwardedException, 
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
+    IncomingConnection,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
@@ -248,19 +250,14 @@ class NodeExecutor(EngineScoped):
                 return
 
             if isinstance(node, SubflowNodeGroup):
-                execution_type = node.get_parameter_value(node.execution_environment.name)
-                if execution_type == LOCAL_EXECUTION:
-                    # Just execute the node normally! This means we aren't doing any special packaging.
-                    await node.aprocess()
-                    return
-                # Clear execution state before subprocess execution starts
-                node.subflow_execution_component.clear_execution_state()
-                if execution_type == PRIVATE_EXECUTION:
-                    # Package the flow and run it in a subprocess.
-                    await self._execute_private_workflow(node)
-                    return
-                # If it isn't Local or Private, it must be a library name. We'll try to execute it, and if the library name doesn't exist, it'll raise an error.
-                await self._execute_library_workflow(node, execution_type)
+                await self._execute_subflow_node_group(node)
+                return
+
+            # Subflow nodes (SubflowNode, LiveSubflowNode, exported subflows) set to anything other than
+            # Local Execution send their inner flow elsewhere. Local Execution falls through to the
+            # normal path below, which runs the inner flow via the node's own aprocess.
+            if isinstance(node, InnerFlowNode) and node.get_execution_environment() != LOCAL_EXECUTION:
+                await self._execute_inner_flow_node(node)
                 return
 
             # Handle iterative loop nodes - check if we need to package and execute the loop
@@ -297,6 +294,21 @@ class NodeExecutor(EngineScoped):
                 node.parameter_output_values[name] = value
         finally:
             current_executing_node_name.reset(token)
+
+    async def _execute_subflow_node_group(self, node: SubflowNodeGroup) -> None:
+        execution_type = node.get_parameter_value(node.execution_environment.name)
+        if execution_type == LOCAL_EXECUTION:
+            # Just execute the node normally! This means we aren't doing any special packaging.
+            await node.aprocess()
+            return
+        # Clear execution state before subprocess execution starts
+        node.subflow_execution_component.clear_execution_state()
+        if execution_type == PRIVATE_EXECUTION:
+            # Package the flow and run it in a subprocess.
+            await self._execute_private_workflow(node)
+            return
+        # If it isn't Local or Private, it must be a library name. We'll try to execute it, and if the library name doesn't exist, it'll raise an error.
+        await self._execute_library_workflow(node, execution_type)
 
     def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.
@@ -359,8 +371,8 @@ class NodeExecutor(EngineScoped):
             file_name: Name of workflow for logging
             package_result: The packaging result containing parameter mappings
         """
-        # Pass node for event updates if it's a SubflowNodeGroup
-        subflow_node = node if isinstance(node, SubflowNodeGroup) else None
+        # Pass node for event updates if it's a SubflowNodeGroup or a subflow node
+        subflow_node = node if isinstance(node, (SubflowNodeGroup, InnerFlowNode)) else None
         my_subprocess_result = await self._execute_subprocess(workflow_path, file_name, node=subflow_node)
         parameter_output_values = self._extract_parameter_output_values(my_subprocess_result)
         self._apply_parameter_values_to_node(node, parameter_output_values, package_result)
@@ -487,6 +499,104 @@ class NodeExecutor(EngineScoped):
             if published_workflow_filename is not None:
                 await self._delete_workflow(workflow_path=published_workflow_filename)
 
+    async def _execute_inner_flow_node(self, node: InnerFlowNode) -> None:
+        """Run a subflow node's inner flow in its selected (non-local) execution environment.
+
+        The inner flow's Start Flow nodes are filled from the subflow node's inputs, the body of the
+        inner flow is packaged and run elsewhere (the same way a SubflowNodeGroup's children are), and
+        the results land back on the body nodes. From there they are handed on to the inner End Flow
+        nodes, and finally onto the subflow node's own outputs.
+        """
+        execution_type = node.get_execution_environment()
+        node.subflow_execution_component.clear_execution_state()
+
+        flow_name = await node.aprepare_inner_flow()
+        self._publish_inner_flow_start_values(flow_name)
+
+        if execution_type == PRIVATE_EXECUTION:
+            await self._execute_private_workflow(node)
+        else:
+            # If it isn't Local or Private, it must be a library name. _execute_library_workflow raises if it isn't.
+            await self._execute_library_workflow(node, execution_type)
+
+        self._pass_inner_flow_values_to_end_nodes(flow_name)
+        node.collect_inner_flow_outputs(flow_name)
+
+    def _get_inner_flow_body_node_names(self, node: InnerFlowNode) -> list[str]:
+        """Names of the nodes in a subflow node's inner flow, excluding its Start/End Flow nodes.
+
+        Packaging the Start/End Flow nodes too would give the packaged workflow a second entry point
+        next to the one packaging adds, so they are left out and treated as external nodes.
+        """
+        flow_name = node.inner_flow_name
+        if flow_name is None:
+            return []
+        flow = self.engine.flow_manager.get_flow_by_name(flow_name)
+        body_node_names = []
+        for inner_node in flow.nodes.values():
+            if isinstance(inner_node, (StartNode, EndNode)):
+                continue
+            body_node_names.append(inner_node.name)
+        return body_node_names
+
+    def _publish_inner_flow_start_values(self, flow_name: str) -> None:
+        """Copy each inner Start Flow node's parameter values onto its outputs.
+
+        This is what running the Start Flow node would do. Packaging reads a connected source's output
+        value before its stored value, so without this a previous local run's outputs would be sent
+        instead of the inputs just applied to the subflow node.
+        """
+        flow = self.engine.flow_manager.get_flow_by_name(flow_name)
+        for inner_node in flow.nodes.values():
+            if not isinstance(inner_node, StartNode):
+                continue
+            for parameter in inner_node.parameters:
+                if parameter.type == ParameterTypeBuiltin.CONTROL_TYPE:
+                    continue
+                inner_node.parameter_output_values[parameter.name] = inner_node.get_parameter_value(parameter.name)
+
+    def _pass_inner_flow_values_to_end_nodes(self, flow_name: str) -> None:
+        """Hand the values connected into each inner End Flow node over as that node's outputs.
+
+        The End Flow nodes did not run (only the body was packaged), so their inputs are read straight
+        from whatever feeds them: a body node that just received its results, or a Start Flow node for a
+        value that passes straight through.
+        """
+        flow = self.engine.flow_manager.get_flow_by_name(flow_name)
+        for inner_node in flow.nodes.values():
+            if not isinstance(inner_node, EndNode):
+                continue
+            list_connections_result = self.engine.handle_request(
+                ListConnectionsForNodeRequest(node_name=inner_node.name)
+            )
+            if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+                logger.warning("Failed to list connections for End Flow node %s", inner_node.name)
+                continue
+            for connection in list_connections_result.incoming_connections:
+                self._pass_connected_value_to_end_node(inner_node, connection)
+
+    def _pass_connected_value_to_end_node(self, end_node: BaseNode, connection: IncomingConnection) -> None:
+        target_parameter = end_node.get_parameter_by_name(connection.target_parameter_name)
+        if target_parameter is None:
+            return
+        if target_parameter.type == ParameterTypeBuiltin.CONTROL_TYPE:
+            return
+        try:
+            source_node = self.engine.node_manager.get_node_by_name(connection.source_node_name)
+        except ValueError:
+            logger.warning(
+                "Source node '%s' feeding End Flow node '%s' was not found, skipping value",
+                connection.source_node_name,
+                end_node.name,
+            )
+            return
+
+        if connection.source_parameter_name in source_node.parameter_output_values:
+            value = source_node.parameter_output_values[connection.source_parameter_name]
+        else:
+            value = source_node.get_parameter_value(connection.source_parameter_name)
+        end_node.parameter_output_values[connection.target_parameter_name] = value
+
     async def _get_workflow_start_end_nodes(self, library: Library | None) -> PublishWorkflowStartEndNodes:
         library_name = "Griptape Nodes Library"
         start_node_type = "StartFlow"
@@ -539,6 +649,10 @@ class NodeExecutor(EngineScoped):
         # If we are packaging a SubflowNodeGroup, that means that we are packaging multiple nodes together, so we have to get the list of nodes from the group node.
         if isinstance(node, SubflowNodeGroup):
             node_names = list(node.get_all_nodes().keys())
+        elif isinstance(node, InnerFlowNode):
+            # A subflow node packages the body of its inner flow. Its own Start/End Flow nodes stay
+            # behind and act as the outside world, the same way nodes around a group do.
+            node_names = self._get_inner_flow_body_node_names(node)
         else:
             # Otherwise, it's a list of one node!
             node_names = [node.name]
@@ -546,8 +660,11 @@ class NodeExecutor(EngineScoped):
         if len(node_names) == 0:
             return None
 
-        # Pass node_group_name if we're packaging a SubflowNodeGroup
-        node_group_name = node.name if isinstance(node, SubflowNodeGroup) else None
+        # Pass node_group_name if we're packaging a SubflowNodeGroup or a subflow node, so the packaged
+        # StartFlow node picks up the library-specific settings (e.g. deadlinecloudstartflow_job_name).
+        node_group_name = None
+        if isinstance(node, (SubflowNodeGroup, InnerFlowNode)):
+            node_group_name = node.name
 
         request = PackageNodesAsSerializedFlowRequest(
             node_names=node_names,
@@ -592,9 +709,9 @@ class NodeExecutor(EngineScoped):
         file_name: str,
         node: BaseNode | None = None,
     ) -> Path:
-        # Define event callback if node is a SubflowNodeGroup for GUI updates
+        # Define event callback if node is a SubflowNodeGroup or a subflow node for GUI updates
         on_event: Callable[[dict], None] | None = None
-        if isinstance(node, SubflowNodeGroup):
+        if isinstance(node, (SubflowNodeGroup, InnerFlowNode)):
             on_event = node.subflow_execution_component.handle_publishing_event
 
         subprocess_workflow_publisher = SubprocessWorkflowPublisher(on_event=on_event)
@@ -622,7 +739,7 @@ class NodeExecutor(EngineScoped):
         file_name: str,
         pickle_control_flow_result: bool = True,  # noqa: FBT001, FBT002
         flow_input: dict[str, Any] | None = None,
-        node: SubflowNodeGroup | None = None,
+        node: SubflowNodeGroup | InnerFlowNode | None = None,
     ) -> dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]:
         """Execute the published workflow in a subprocess.
 
@@ -631,7 +748,7 @@ class NodeExecutor(EngineScoped):
             file_name: Name of the workflow for logging
             pickle_control_flow_result: Whether to pickle control flow results (defaults to True)
             flow_input: Optional dictionary of parameter values to pass to the workflow's StartFlow node
-            node: Optional SubflowNodeGroup to receive real-time event updates
+            node: Optional SubflowNodeGroup or subflow node to receive real-time event updates
 
         Returns:
             The subprocess execution output dictionary
@@ -3739,6 +3856,17 @@ class NodeExecutor(EngineScoped):
                     )
                     continue
                 target_node = node.nodes[target_node_name]
+            elif isinstance(node, InnerFlowNode):
+                # The packaged nodes live in the subflow node's inner flow, not on the node itself.
+                try:
+                    target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                except ValueError:
+                    logger.warning(
+                        "Node '%s' not found in the inner flow of '%s', skipping value application",
+                        target_node_name,
+                        node.name,
+                    )
+                    continue
             else:
                 target_node = node
 

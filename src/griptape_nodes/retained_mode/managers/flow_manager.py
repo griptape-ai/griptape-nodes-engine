@@ -27,6 +27,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.inner_flow_node import InnerFlowNode
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup, SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
@@ -1510,12 +1511,13 @@ class FlowManager(EngineScoped):
         if isinstance(node_connections_dict, PackageNodesAsSerializedFlowResultFailure):
             return node_connections_dict
 
-        # Step 8: Retrieve SubflowNodeGroup if node_group_name was provided
-        node_group_node: SubflowNodeGroup | None = None
+        # Step 8: Retrieve the SubflowNodeGroup or subflow node (InnerFlowNode) if node_group_name was provided.
+        # Both carry the execution_environment metadata and the prefixed StartFlow parameters.
+        node_group_node: SubflowNodeGroup | InnerFlowNode | None = None
         if request.node_group_name:
             try:
                 node = self.engine.node_manager.get_node_by_name(request.node_group_name)
-                if isinstance(node, SubflowNodeGroup):
+                if isinstance(node, (SubflowNodeGroup, InnerFlowNode)):
                     node_group_node = node
             except Exception as e:
                 logger.debug("Failed to retrieve SubflowNodeGroup '%s': %s", request.node_group_name, e)
@@ -2310,7 +2312,7 @@ class FlowManager(EngineScoped):
         external_connections_dict: dict[
             str, ConnectionAnalysis
         ],  # Contains EXTERNAL connections only - used to determine which parameters need start node inputs
-        node_group_node: SubflowNodeGroup | None = None,
+        node_group_node: SubflowNodeGroup | InnerFlowNode | None = None,
     ) -> PackagingStartNodeResult | PackageNodesAsSerializedFlowResultFailure:
         """Create start node commands and connections for external incoming connections."""
         # Generate UUID and name for start node
@@ -2418,7 +2420,7 @@ class FlowManager(EngineScoped):
 
     def _apply_node_group_parameters_to_start_node(  # noqa: PLR0913, PLR0917
         self,
-        node_group_node: SubflowNodeGroup,
+        node_group_node: SubflowNodeGroup | InnerFlowNode,
         start_node_library_name: str,
         start_node_type: str,
         start_node_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand],

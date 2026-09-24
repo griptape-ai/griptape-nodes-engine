@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
+from griptape_nodes.exe_types.inner_flow_node import InnerFlowNode
 from griptape_nodes.exe_types.node_types import ControlNode
 from griptape_nodes.exe_types.workflow_node import SUBFLOW_NAME_KEY, WORKFLOW_NODE_KEY, _get_flow_or_none
 from griptape_nodes.node_library.workflow_registry import WorkflowShape
@@ -35,7 +36,7 @@ SURFACE_PARAMS_KEY = "surface_params"
 SURFACE_PARAMS_DATA_KEY = "surface_params_data"
 
 
-class SubflowNode(ControlNode):
+class SubflowNode(InnerFlowNode, ControlNode):
     """A node backed by a live child flow the user edits interactively.
 
     The inner canvas is opened via OpenNodeInnerCanvasRequest, which creates the child
@@ -43,6 +44,7 @@ class SubflowNode(ControlNode):
     nodes and connect Start Flow / End Flow parameter ports to promote those parameters
     onto the collapsed node's surface. SyncInnerFlowSurfaceRequest re-derives the
     surface. ExportFlowAsLibraryNodeRequest writes the child flow to a portable .py package.
+    The execution_environment parameter (from InnerFlowNode) picks where the child flow runs.
     """
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
@@ -52,10 +54,36 @@ class SubflowNode(ControlNode):
         if SUBFLOW_NAME_KEY in self.metadata:
             self._recreate_surface_params_from_metadata()
 
+    @property
+    def inner_flow_name(self) -> str | None:
+        return self.metadata.get(SUBFLOW_NAME_KEY)
+
     def after_node_deleted(self) -> None:
         self._discard_child_flow()
 
+    async def aprepare_inner_flow(self) -> str:
+        child_flow_name = self._get_live_child_flow_name()
+        workflow_shape = self._extract_child_flow_shape(child_flow_name)
+        self._apply_inputs(child_flow_name, workflow_shape)
+        return child_flow_name
+
+    def collect_inner_flow_outputs(self, flow_name: str) -> None:
+        self._collect_outputs(flow_name, self._extract_child_flow_shape(flow_name))
+
     async def aprocess(self) -> None:
+        child_flow_name = await self.aprepare_inner_flow()
+
+        result = await GriptapeNodes.ahandle_request(StartLocalSubflowRequest(flow_name=child_flow_name))
+        if not isinstance(result, StartLocalSubflowResultSuccess):
+            msg = (
+                f"Attempted to run SubflowNode '{self.name}'. "
+                f"Failed because the inner canvas did not finish: {result.result_details}"
+            )
+            raise RuntimeError(msg)  # noqa: TRY004
+
+        self.collect_inner_flow_outputs(child_flow_name)
+
+    def _get_live_child_flow_name(self) -> str:
         child_flow_name = self.metadata.get(SUBFLOW_NAME_KEY)
         if child_flow_name is None:
             msg = (
@@ -74,6 +102,9 @@ class SubflowNode(ControlNode):
             )
             raise RuntimeError(msg)
 
+        return child_flow_name
+
+    def _extract_child_flow_shape(self, child_flow_name: str) -> WorkflowShape:
         try:
             shape_dict = GriptapeNodes.WorkflowManager().extract_workflow_shape(
                 workflow_name=self.name, flow_name=child_flow_name
@@ -86,18 +117,7 @@ class SubflowNode(ControlNode):
             )
             raise RuntimeError(msg) from err
 
-        workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
-        self._apply_inputs(child_flow_name, workflow_shape)
-
-        result = await GriptapeNodes.ahandle_request(StartLocalSubflowRequest(flow_name=child_flow_name))
-        if not isinstance(result, StartLocalSubflowResultSuccess):
-            msg = (
-                f"Attempted to run SubflowNode '{self.name}'. "
-                f"Failed because the inner canvas did not finish: {result.result_details}"
-            )
-            raise RuntimeError(msg)  # noqa: TRY004
-
-        self._collect_outputs(child_flow_name, workflow_shape)
+        return WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
 
     def sync_surface_params(self, workflow_shape: WorkflowShape) -> tuple[list[str], list[str]]:  # noqa: C901, PLR0912
         desired: dict[str, tuple[dict, set[ParameterMode]]] = {}

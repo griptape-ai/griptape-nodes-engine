@@ -7912,7 +7912,7 @@ class WorkflowManager(EngineScoped):
         else:
             library_data = {}
 
-        library_data.setdefault("name", "Exported Subflows")
+        library_data.setdefault("name", "Subflows")
         library_data.setdefault("library_schema_version", "0.11.0")
         library_data.setdefault("version", "0.1.0")
         library_data.setdefault(
@@ -8072,19 +8072,19 @@ class WorkflowManager(EngineScoped):
         await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=str(library_json_path)))
         logger.info("ExportSubflowAsLocked: library registered, hot-registering node type '%s'", node_type_name)
         self._hot_register_workflow_node(
-            library_name="Exported Subflows",
+            library_name="Subflows",
             node_type_name=node_type_name,
             py_file_path=py_file_path,
             category="subflows",
             description=node_type_name,
             display_name=node_type_name,
         )
-        await self._push_library_info_to_frontend("Exported Subflows")
+        await self._push_library_info_to_frontend("Subflows")
 
         self._place_exported_node_on_canvas(
             original_node=node,
             node_type=node_type_name,
-            library_name="Exported Subflows",
+            library_name="Subflows",
         )
 
         details = f"Exported '{request.node_name}' as locked subflow '{node_type_name}' to '{py_file_path}'."
@@ -8138,7 +8138,7 @@ class WorkflowManager(EngineScoped):
         workflow_nodes.append(new_entry)
 
         library_data = {
-            "name": "Exported Subflows",
+            "name": "Subflows",
             "library_schema_version": "0.11.0",
             "metadata": {
                 "author": "User",

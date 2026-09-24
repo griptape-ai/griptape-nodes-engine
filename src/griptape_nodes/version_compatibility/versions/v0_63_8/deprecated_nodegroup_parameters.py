@@ -59,6 +59,11 @@ class DeprecatedNodeGroupParametersCheck(SetParameterVersionCompatibilityCheck):
         if isinstance(node, SubflowNodeGroup):
             return False
 
+        # Nodes that run an inner flow (subflow nodes, exported subflows) define these parameters
+        # again, so a set on them is a real value rather than a leftover from an old save.
+        if node.get_parameter_by_name(parameter_name) is not None:
+            return False
+
         # Check if current engine version is >= 0.63.8
         engine_version_result = self.engine.handle_request(GetEngineVersionRequest())
         if not isinstance(engine_version_result, GetEngineVersionResultSuccess):

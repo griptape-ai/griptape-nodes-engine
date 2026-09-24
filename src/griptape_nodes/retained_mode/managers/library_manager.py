@@ -6894,7 +6894,7 @@ class LibraryManager(EngineScoped):
 
         # Skip venv creation entirely when there are no pip dependencies and no advanced
         # library (the only caller that needs the venv to exist at hook time). This avoids
-        # a slow `uv venv` subprocess for lightweight libraries such as "Exported Subflows".
+        # a slow `uv venv` subprocess for lightweight libraries such as "Subflows".
         has_advanced_library = bool(library_data.advanced_library_path)
         if not pip_dependencies and not has_advanced_library:
             details = f"Library '{library_name}' has no dependencies to install"

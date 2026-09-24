@@ -43,6 +43,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.inner_flow_node import InnerFlowNode
 from griptape_nodes.exe_types.live_subflow_node import (
     IS_LIVE_KEY,
     IS_LOCALLY_OVERRIDDEN_KEY,
@@ -3632,9 +3633,9 @@ class NodeManager(EngineScoped):
                 # No owning library could be determined. Use an empty name so the
                 # metadata lookup below fails cleanly instead of crashing the save.
                 library_used = ""
-            # For SubflowNodeGroup, also check if execution environment uses a special library
+            # For SubflowNodeGroup and subflow nodes, also check if execution environment uses a special library
             execution_env_library_details = None
-            if isinstance(node, SubflowNodeGroup):
+            if isinstance(node, (SubflowNodeGroup, InnerFlowNode)):
                 execution_env = node.get_parameter_value(node.execution_environment.name)
                 if execution_env not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
                     # Get library details for the execution environment library

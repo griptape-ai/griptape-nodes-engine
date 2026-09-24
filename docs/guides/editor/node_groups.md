@@ -191,6 +191,14 @@ to **Local Execution** — inside the engine process, same as everything else
 on the canvas — with additional options appearing for any installed library
 that registers a way to publish and run workflows remotely.
 
+Subflow nodes have the same **Execution Environment** setting under their
+gear icon. This covers the built-in **Subflow Node** and any exported subflow
+you add from the sidebar, whether you added it as a Copy or as a Live
+Reference. The setting belongs to each node on your canvas, so two copies of
+the same subflow can run in different places. It isn't saved into the
+exported subflow file. A frozen Live Reference still lets you change it,
+because freezing only stops you editing the nodes inside.
+
 While a group is running, it shows the same **Running** / **Resolved** /
 **Unresolved** status pill in its header that ordinary nodes show. A plain
 **Group** never shows this pill, since it never runs as a unit.

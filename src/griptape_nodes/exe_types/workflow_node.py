@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.inner_flow_node import InnerFlowNode
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
@@ -279,11 +280,15 @@ def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: Work
     return registry_key
 
 
-class WorkflowNode(ControlNode):
+class WorkflowNode(InnerFlowNode, ControlNode):
     """Base class for node types generated from a saved workflow file.
 
     ``build_workflow_node_class`` produces the concrete subclasses; the class attributes below are
     filled in per workflow. Instantiating this base class directly is not useful.
+
+    The execution environment is an ordinary per-instance parameter, so two copies of the same
+    exported subflow (Copy or Live Reference) can run in different places. It is not written into
+    the exported workflow file.
     """
 
     # Absolute path to the workflow that backs this node type.
@@ -306,14 +311,24 @@ class WorkflowNode(ControlNode):
         for surface_name, surface_parameter in self.workflow_surface.parameters.items():
             self.add_parameter(_build_surface_parameter(surface_name, surface_parameter))
 
+    @property
+    def inner_flow_name(self) -> str | None:
+        return self.metadata.get(SUBFLOW_NAME_KEY)
+
     def after_node_deleted(self) -> None:
         self._discard_subflow()
 
-    async def aprocess(self) -> None:
+    async def aprepare_inner_flow(self) -> str:
         subflow_name = await self._load_subflow()
         live_routes = self._resolve_live_routes(subflow_name)
-
         self._apply_inputs(subflow_name, live_routes)
+        return subflow_name
+
+    def collect_inner_flow_outputs(self, flow_name: str) -> None:
+        self._collect_outputs(flow_name, self._resolve_live_routes(flow_name))
+
+    async def aprocess(self) -> None:
+        subflow_name = await self.aprepare_inner_flow()
 
         result = await GriptapeNodes.ahandle_request(StartLocalSubflowRequest(flow_name=subflow_name))
         if not isinstance(result, StartLocalSubflowResultSuccess):
@@ -323,7 +338,7 @@ class WorkflowNode(ControlNode):
             )
             raise RuntimeError(msg)  # noqa: TRY004 - the workflow failed at run time; this is not a type error
 
-        self._collect_outputs(subflow_name, live_routes)
+        self.collect_inner_flow_outputs(subflow_name)
 
     def _publish_workflow_registry_key(self) -> None:
         """Register the backing workflow and record its key so the editor can preview it.
