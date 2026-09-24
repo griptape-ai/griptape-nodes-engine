@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
     GriptapeEvent,
     InvolvedNodesEvent,
@@ -399,6 +400,13 @@ class NodeExecutor(EngineScoped):
         ``original_traceback`` here is what actually puts the worker
         frames in front of the user.
         """
+        # A node that declined to run did not fail while running, and saying so sends the reader looking
+        # for a crash that never happened. Matched on the type rather than on the attribute's presence:
+        # `result` is typed `Any` here, and anything at all answers a `getattr`.
+        if isinstance(result, ExecuteNodeResultFailure) and result.validation_exceptions:
+            reasons = "; ".join(str(exception) for exception in result.validation_exceptions)
+            return f"Node '{node_name}' did not run because it failed validation: {reasons}"
+
         type_prefix = ""
         tb_suffix = ""
         if isinstance(exc, ForwardedException):

@@ -1314,6 +1314,12 @@ class EventManager(EngineScoped):
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
+        """Subscribe to an app event raised in this process.
+
+        A listener never sees another process's copy. An app-event listener configures the process it
+        lives in, and a peer's payload describes the peer, so acting on it would corrupt the
+        receiver. A worker that has something to tell the orchestrator sends it a request.
+        """
         listener_set = self._app_event_listeners.get(app_event_type)
         if listener_set is None:
             listener_set = set()

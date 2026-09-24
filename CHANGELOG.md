@@ -28,6 +28,10 @@ the engine's request API from working without edits. Migration steps live in
   place that the consuming node's read resolves. See
   [MIGRATION.md](MIGRATION.md#serializablefalse-outputs-are-held-in-their-own-process-across-a-worker-boundary).
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
+- Nodes can implement `validate_in_execution_environment()` to run a check where the node itself runs,
+  which for a library isolated in its own process is where its heavy packages are importable and its
+  inputs are the real objects. A node that fails the check reports why in
+  `ExecuteNodeResultFailure.validation_exceptions` instead of crashing partway through.
 - You can try new features early by turning them on from the **Beta Features** page in the
   editor's settings, and turn them off again at any time. Node libraries can offer beta features
   of their own. See
@@ -48,6 +52,8 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
+- An app event raised in one process is no longer delivered to listeners in another. A library running
+  isolated in its own process reports to the engine by sending a request instead.
 - **Breaking:** When a parameter's `ui_options` and a custom trait set the same key, the trait's
   value now wins, so node code can no longer override a trait's widget settings through
   `ui_options`. Implement `state_from_ui_options()` on the trait to accept these overrides, or
@@ -58,6 +64,9 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Removed
 
+- **Breaking:** `LibraryLoadedNotification` no longer carries `node_schemas`. A library that loaded in
+  its own process reports its schemas to the engine with the new `ReportLibraryLoadedRequest`, and the
+  notification that follows says only how the load went.
 - `TraitRegistry` and `Trait.get_trait_keys()` are removed, with no replacement, since nothing read
   them. Custom traits no longer need to implement `get_trait_keys()`, and existing implementations
   can be deleted.
