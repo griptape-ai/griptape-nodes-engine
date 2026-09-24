@@ -4,6 +4,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
+from griptape_nodes.traits.slider import Slider
 
 from .mocks import MockNode
 
@@ -308,3 +309,26 @@ class TestOutputValueChangeDetection:
 
         assert _values_differ(1, 2) is True
         assert _values_differ("a", "a") is False
+
+
+class TestParameterVisibilityKeepsTraitStateLive:
+    def test_hiding_a_parameter_with_a_trait_stores_no_trait_copy(self) -> None:
+        node = MockNode()
+        parameter = Parameter(name="top", tooltip="t", traits={Slider(min_val=0, max_val=100)})
+        node.add_parameter(parameter)
+
+        node.hide_parameter_by_name("top")
+
+        assert parameter.ui_options["hide"] is True
+        assert "slider" not in parameter.authored_ui_options()
+
+    def test_a_later_trait_change_still_reaches_a_hidden_parameter(self) -> None:
+        node = MockNode()
+        trait = Slider(min_val=0, max_val=100)
+        parameter = Parameter(name="top", tooltip="t", traits={trait})
+        node.add_parameter(parameter)
+        node.hide_parameter_by_name("top")
+
+        trait.max = 512
+
+        assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}
