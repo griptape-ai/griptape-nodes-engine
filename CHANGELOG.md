@@ -62,8 +62,8 @@ the engine's request API from working without edits. Migration steps live in
   the target as a hidden flow that was saved and run along with the open workflow.
   [#5526](https://github.com/griptape-ai/griptape-nodes-engine/issues/5526)
 - A slider range, dropdown choices, or button link that a node changes at runtime now survives
-  saving and reopening the workflow. Before, the reopened workflow showed the saved settings but the
-  node did not act on them, so a narrowed slider still accepted values outside its range.
+  saving and reopening the workflow. Before, the reopened workflow showed the saved settings, but
+  sliders checked the old range, dropdowns the old choices, and buttons opened the old link.
   [#5440](https://github.com/griptape-ai/griptape-nodes-engine/issues/5440)
 - Setting a `ui_options` key that a trait owns, such as `slider` or `simple_dropdown`, from node
   code or the editor now updates the trait, so the node checks values against the range or choices
