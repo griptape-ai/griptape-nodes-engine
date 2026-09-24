@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from griptape_nodes.utils.rez_utils import (
+    _anchor_drive_letter,
     _detect_rez_store_family,
     _library_rez_name,
     _parse_rez_spec,
@@ -412,6 +413,22 @@ class TestResolveRezPath:
         with patch.dict(os.environ, {"GTN_REZ_ROOT": "P:", "GTN_REZ_LOCAL_PACKAGES_PATH": "rez/packages/local"}):
             result = _resolve_rez_path("GTN_REZ_LOCAL_PACKAGES_PATH")
             assert result == Path("P:/rez/packages/local")
+
+
+class TestAnchorDriveLetter:
+    def test_bare_drive_gets_root(self) -> None:
+        assert _anchor_drive_letter("P:") == "P:/"
+
+    def test_drive_relative_path_gets_root(self) -> None:
+        assert _anchor_drive_letter("P:pipeline") == "P:/pipeline"
+
+    def test_rooted_drive_unchanged(self) -> None:
+        assert _anchor_drive_letter("P:/pipeline") == "P:/pipeline"
+        assert _anchor_drive_letter("P:\\pipeline") == "P:\\pipeline"
+
+    def test_posix_and_unc_unchanged(self) -> None:
+        assert _anchor_drive_letter("/mnt/pipeline") == "/mnt/pipeline"
+        assert _anchor_drive_letter("\\\\server\\share") == "\\\\server\\share"
 
 
 class TestRezExecutable:

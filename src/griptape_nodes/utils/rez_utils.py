@@ -95,7 +95,23 @@ def rez_path_map() -> dict[str, str]:
 def rez_root() -> Path | None:
     """Return the resolved studio root from ``GTN_REZ_ROOT``, or None if unset."""
     val = os.getenv("GTN_REZ_ROOT", "").strip()
-    return Path(val) if val else None
+    if not val:
+        return None
+    return Path(_anchor_drive_letter(val))
+
+
+def _anchor_drive_letter(value: str) -> str:
+    """Anchor a drive-relative Windows path such as ``P:`` to the drive root (``P:/``).
+
+    Studio roots are commonly mapped drive letters (``windows=P:``). On Windows a
+    bare ``P:`` means "the current directory on drive P", so joining it with
+    ``rez/packages`` yields ``P:rez/packages`` instead of ``P:/rez/packages``.
+    """
+    match = re.fullmatch(r"([A-Za-z]:)(?![\\/])(.*)", value)
+    if match is None:
+        return value
+    drive, rest = match.groups()
+    return f"{drive}/{rest}"
 
 
 def _resolve_rez_path(env_var: str) -> Path | None:
