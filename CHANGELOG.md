@@ -30,9 +30,10 @@ the engine's request API from working without edits. Migration steps live in
   workflow's path and the library paths, instead of a list of library paths. See
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
-- **Breaking:** Writing to a `ui_options` key that a custom trait draws is ignored with a warning,
-  instead of changing what the editor shows. To accept these writes, implement
-  `state_from_ui_options()` on the trait.
+- **Breaking:** When a parameter's `ui_options` and a custom trait set the same key, the trait's
+  value now wins, so node code can no longer override a trait's widget settings through
+  `ui_options`. Implement `state_from_ui_options()` on the trait to accept these overrides, or
+  change the trait's own attributes instead.
 - Setting a value outside a `Slider` range now fails with an error naming the parameter, the value,
   and the allowed range, instead of "Value out of range".
   [#5269](https://github.com/griptape-ai/griptape-nodes-engine/issues/5269)
