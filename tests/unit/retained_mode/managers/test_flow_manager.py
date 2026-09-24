@@ -12,10 +12,16 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
+    DeleteConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
@@ -47,6 +53,27 @@ def _param(node: BaseNode, name: str) -> Parameter:
     parameter = node.get_parameter_by_name(name)
     assert parameter is not None, f"{node.name} is missing parameter {name!r}"
     return parameter
+
+
+class _AnyOutputNode(DataNode):
+    """Data node with an unrestricted output that can feed a Flow In port."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.value = Parameter(
+            name="value",
+            output_type=ParameterTypeBuiltin.ALL.value,
+            allowed_modes={ParameterMode.OUTPUT},
+        )
+        self.add_parameter(self.value)
+
+    def process(self) -> None:
+        return None
+
+
+class _FlowInNode(ControlNode):
+    def process(self) -> None:
+        return None
 
 
 class _ClassifyStartNode(StartNode):
@@ -811,6 +838,54 @@ def clean_object_state(engine: Engine) -> Generator[None, None, None]:
         yield
     finally:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestDuplicateConnectionRequest:
+    """Repeated connection requests must not create hidden duplicate edges."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_all_output_to_flow_in_is_idempotent_and_deletes_once(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("duplicate_connection_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(flow_name="duplicate_connection_flow", parent_flow_name=None, set_as_new_context=True)
+        )
+        assert isinstance(flow_result, CreateFlowResultSuccess)
+
+        flow = engine.flow_manager.get_flow_by_name(flow_result.flow_name)
+        source = _AnyOutputNode("Source")
+        target = _FlowInNode("Target")
+        flow.add_node(source)
+        flow.add_node(target)
+        engine.object_manager.add_object_by_name(source.name, source)
+        engine.object_manager.add_object_by_name(target.name, target)
+        engine.node_manager._name_to_parent_flow_name[source.name] = flow.name
+        engine.node_manager._name_to_parent_flow_name[target.name] = flow.name
+
+        request = CreateConnectionRequest(
+            source_node_name=source.name,
+            source_parameter_name=source.value.name,
+            target_node_name=target.name,
+            target_parameter_name=target.control_parameter_in.name,
+        )
+        first = engine.handle_request(request)
+        duplicate = engine.handle_request(request)
+
+        assert isinstance(first, CreateConnectionResultSuccess)
+        assert isinstance(duplicate, CreateConnectionResultSuccess)
+        assert len(engine.flow_manager.get_connections().connections) == 1
+        assert len(engine.flow_manager.get_connections().outgoing_index[source.name][source.value.name]) == 1
+
+        delete_result = engine.handle_request(
+            DeleteConnectionRequest(
+                source_node_name=source.name,
+                source_parameter_name=source.value.name,
+                target_node_name=target.name,
+                target_parameter_name=target.control_parameter_in.name,
+            )
+        )
+
+        assert isinstance(delete_result, DeleteConnectionResultSuccess)
+        assert engine.flow_manager.get_connections().connections == {}
 
 
 class TestSerializeFlowSkipsTransientChildFlows:
