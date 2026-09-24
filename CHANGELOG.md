@@ -25,11 +25,14 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
-- **Breaking:** `ControlFlowResolvedEvent` and `SerializeFlowToCommandsResultSuccess` name the type
-  of each parameter value they carry when JSON has no such type, so a tuple arrives as
-  `{"$type": "builtins:tuple", "$value": [1, 2]}` instead of a list. In `ControlFlowResolvedEvent`, a
-  value with no plain-data form arrives as `null` instead of as its text, and the event no longer
-  has `unique_parameter_uuid_to_values`.
+- **Breaking:** Parameter values the engine sends to the editor and to request API clients name
+  their type when JSON has no such type, so a tuple arrives as
+  `{"$type": "builtins:tuple", "$value": [1, 2]}` instead of a list. A value sent back in the same
+  form is set with that exact type.
+  [Parameter values](docs/guides/mcp/external_clients.md#parameter-values) shows the form enums
+  and artifacts take, and lists the events and requests that carry them.
+- **Breaking:** `ControlFlowResolvedEvent` sends a parameter value with no plain-data form as `null`
+  instead of as its text, and no longer has `unique_parameter_uuid_to_values`.
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
   first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
   Griptape Cloud.
@@ -52,6 +55,11 @@ the engine's request API from working without edits. Migration steps live in
   input or output has no plain-data form, instead of receiving or sending it as text. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
   that can cross.
+- `GetParameterValueRequest` handled inside the engine, as from node code or
+  `RetainedMode.get_value`, returns the parameter's value itself instead of a plain-data copy, so
+  an artifact comes back as the artifact.
+- Parameter values recorded in an image's workflow provenance name their type when JSON has none,
+  the same way the request API sends them.
 
 ### Deprecated
 

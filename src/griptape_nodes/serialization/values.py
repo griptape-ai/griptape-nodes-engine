@@ -69,6 +69,10 @@ VALUE_KEY = "$value"
 type Value = Any
 """Any parameter value. Payload fields annotated with it cross the wire as tagged plain data."""
 
+type DisplayValue = Any
+"""A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
+that a value with no plain-data form is sent as its text instead of failing."""
+
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
 
@@ -113,6 +117,14 @@ def try_encode(value: Any) -> JsonValue | Unencodable:
         return encode_value(value)
     except ValueEncodeError as error:
         return Unencodable(str(error))
+
+
+def encode_for_display(value: Any) -> JsonValue:
+    """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
+    encoded = try_encode(value)
+    if isinstance(encoded, Unencodable):
+        return str(value)
+    return encoded
 
 
 def decode_value(data: Any) -> Any:

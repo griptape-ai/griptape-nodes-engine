@@ -31,6 +31,10 @@ prefixed onto each tool, so the request `CreateNodeRequest` is reachable as
 - **`CreateNodeRequest` does not take parameter values.** Setting a parameter is
     always a separate `SetParameterValueRequest` after the node exists. There is no
     `parameter_values` / `inputs` shortcut on create.
+- **Values that aren't plain JSON carry a `$type` tag.** A tuple reads back as
+    `{"$type": "builtins:tuple", "$value": [1, 2]}`, and an artifact as its fields plus
+    `"$type"`. Send the same form to `SetParameterValueRequest` to set a value with that
+    exact type.
 - **`EventRequestBatch` is the only fan-out primitive.** It is a synthetic tool
     (no matching `RequestPayload` class) that ships an ordered list of inner
     requests in one transport frame. Reach for it whenever you already know the

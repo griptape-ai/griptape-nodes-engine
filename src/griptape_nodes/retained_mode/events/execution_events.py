@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Required, TypedDict
+from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
@@ -12,7 +12,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.values import Value
+from griptape_nodes.serialization.values import DisplayValue, Value
 
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
@@ -400,7 +400,7 @@ class ControlFlowCancelledEvent(ExecutionPayload):
 @PayloadRegistry.register
 class NodeResolvedEvent(ExecutionPayload):
     node_name: str
-    parameter_output_values: dict
+    parameter_output_values: dict[str, DisplayValue]
     node_type: str
     specific_library_name: str | None = None
 
@@ -411,7 +411,7 @@ class ParameterValueUpdateEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -457,7 +457,7 @@ class GriptapeEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     type: str
-    value: Any
+    value: DisplayValue
 
 
 class NodeMetadata(TypedDict, total=False):

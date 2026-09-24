@@ -263,7 +263,7 @@ class ExecuteDagState(State):
                             node_name=current_node.name,
                             parameter_name=parameter_name,
                             data_type=data_type,
-                            value=safe_unstructure(display_value),
+                            value=display_value,
                         )
                     ),
                 )
@@ -280,7 +280,7 @@ class ExecuteDagState(State):
         # displayed values, so raw substituted values (e.g. "25") would
         # overwrite the template (e.g. "{SHOT}") the user sees on the node.
         display_output_values = {
-            param_name: safe_unstructure(current_node.get_display_value_for_output(param_name, val))
+            param_name: current_node.get_display_value_for_output(param_name, val)
             for param_name, val in current_node.parameter_output_values.items()
         }
         await context.engine.event_manager.aput_event(

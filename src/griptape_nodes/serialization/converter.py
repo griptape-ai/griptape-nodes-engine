@@ -16,7 +16,7 @@ from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
-from griptape_nodes.serialization.values import Value, decode_value, encode_value
+from griptape_nodes.serialization.values import DisplayValue, Value, decode_value, encode_for_display, encode_value
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ converter = make_converter()
 
 # Fields annotated `Value` carry any parameter value, as tagged plain data.
 converter.register_unstructure_hook(Value, encode_value)
+converter.register_unstructure_hook(DisplayValue, encode_for_display)
 
 # SerializableMixin subclasses (BaseArtifact, BaseTool, Structure, etc.)
 converter.register_unstructure_hook_func(
@@ -78,6 +79,44 @@ converter.register_unstructure_hook_func(
     _unstructure_exception,
 )
 
+type ElementDocument = dict[str, Any]
+"""A node element and its children, as the editor sees them. Parameter values sit under
+``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
+
+_ELEMENT_VALUE_KEYS = frozenset({"value", "default_value"})
+
+
+def _unstructure_element_document(document: dict[str, Any]) -> dict[str, Any]:
+    return {key: _unstructure_element_entry(key, item) for key, item in document.items()}
+
+
+def _unstructure_element_entry(key: str, item: Any) -> Any:
+    if key in _ELEMENT_VALUE_KEYS:
+        return encode_for_display(item)
+    if key == "element_id_to_value":
+        return {element_id: encode_for_display(value) for element_id, value in item.items()}
+    if key == "children" and isinstance(item, list):
+        return [_unstructure_element_document(child) for child in item]
+    return converter.unstructure(item)
+
+
+def _structure_element_document(document: dict[str, Any], _cls: Any) -> dict[str, Any]:
+    return {key: _structure_element_entry(key, item) for key, item in document.items()}
+
+
+def _structure_element_entry(key: str, item: Any) -> Any:
+    if key in _ELEMENT_VALUE_KEYS:
+        return decode_value(item)
+    if key == "element_id_to_value":
+        return {element_id: decode_value(value) for element_id, value in item.items()}
+    if key == "children" and isinstance(item, list):
+        return [_structure_element_document(child, None) for child in item]
+    return item
+
+
+converter.register_unstructure_hook(ElementDocument, _unstructure_element_document)
+converter.register_structure_hook(ElementDocument, _structure_element_document)
+
 # Bare `type` references (e.g. provider_class: type)
 converter.register_unstructure_hook(type, lambda t: f"{t.__module__}.{t.__qualname__}")
 
@@ -91,6 +130,7 @@ converter.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
 # --- Structure hooks (deserialization) ---
 
 converter.register_structure_hook(Value, lambda data, _: decode_value(data))
+converter.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
 
 converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
 
