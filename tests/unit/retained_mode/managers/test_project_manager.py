@@ -708,10 +708,8 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result.result_details, ResultDetails)
         assert "project_name not yet implemented" in str(result.result_details)
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_mirrored_workflow_context_resolves_the_lenders_folder(
         self,
-        mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
@@ -726,6 +724,7 @@ class TestProjectManagerBuiltinVariables:
         # A real ContextManager with an empty stack: exactly a worker before adopting.
         context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
         project_manager_with_template._engine = MagicMock()
+        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = context_manager
 
         dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
@@ -826,10 +825,8 @@ class TestProjectManagerBuiltinVariables:
         assert snapshot.file_path == "/shows/my_show/my_show.py"
         assert snapshot.working_directory == "/shows/my_show"
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_resolves_correctly(
         self,
-        mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Test that {workflow_dir} resolves to the workflow file's parent directory."""
@@ -841,6 +838,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.get_current_workflow_file_path.return_value = None
         mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
+        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow = Mock()
@@ -898,10 +896,8 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("staticfiles/output.txt")
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_unregistered_workflow_fails(
         self,
-        mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Test that required {workflow_dir} fails when the workflow exists but is not registered (unsaved)."""
@@ -913,6 +909,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.get_current_workflow_file_path.return_value = None
         mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
+        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
@@ -929,10 +926,8 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result.result_details, ResultDetails)
         assert "workflow_5" in str(result.result_details)
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_optional_skipped_when_workflow_unregistered(
         self,
-        mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Test that optional {workflow_dir?:/} falls back gracefully when the workflow is not registered (unsaved)."""
@@ -946,6 +941,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.get_current_workflow_file_path.return_value = None
         mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
+        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
@@ -993,10 +989,8 @@ class TestProjectManagerBuiltinVariables:
             f"Expected a warning about the dropped optional builtin, got: {warning_messages}"
         )
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_survives_stale_registry_key(
         self,
-        mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """{workflow_dir} answers from the retained path when the registry key has gone stale.
@@ -1018,6 +1012,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.get_current_workflow_name.return_value = "stale/key/my_workflow"
         mock_context_manager.get_current_workflow_file_path.return_value = "/elsewhere/shot_042/my_workflow.py"
         project_manager_with_template._engine = MagicMock()
+        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = mock_context_manager
 
         # The registry no longer holds that key -- this is what used to poison the result.
@@ -6899,10 +6894,8 @@ class TestProjectEnvironmentVariableRecursion:
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
         mock_engine = MagicMock()
-        with (
-            patch.object(pm, "_engine", mock_engine),
-            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_workflow_registry,
-        ):
+        mock_workflow_registry = mock_engine.workflow_registry
+        with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = True

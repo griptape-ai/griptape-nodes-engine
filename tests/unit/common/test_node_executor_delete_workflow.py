@@ -3,7 +3,7 @@
 import tempfile
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
@@ -14,8 +14,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowResultSuccess,
     LoadWorkflowMetadataResultSuccess,
 )
-
-MODULE_PATH = "griptape_nodes.common.node_executor"
 
 
 def _make_executor() -> NodeExecutor:
@@ -42,11 +40,11 @@ class TestDeleteWorkflowKeyDerivation:
             mock_engine.config_manager.workspace_path = workspace
             mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
-                # Mark as already registered so key derivation is the only thing being tested.
-                mock_registry.has_workflow_with_name.return_value = True
+            mock_registry = mock_engine.workflow_registry
+            # Mark as already registered so key derivation is the only thing being tested.
+            mock_registry.has_workflow_with_name.return_value = True
 
-                await executor._delete_workflow(workflow_path=Path(workflow_path))
+            await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
@@ -66,10 +64,10 @@ class TestDeleteWorkflowKeyDerivation:
             mock_engine.config_manager.workspace_path = workspace
             mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
-                mock_registry.has_workflow_with_name.return_value = True
+            mock_registry = mock_engine.workflow_registry
+            mock_registry.has_workflow_with_name.return_value = True
 
-                await executor._delete_workflow(workflow_path=Path(workflow_path))
+            await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
@@ -91,10 +89,10 @@ class TestDeleteWorkflowKeyDerivation:
             mock_engine.config_manager.workspace_path = workspace
             mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
-                mock_registry.has_workflow_with_name.return_value = True
+            mock_registry = mock_engine.workflow_registry
+            mock_registry.has_workflow_with_name.return_value = True
 
-                await executor._delete_workflow(workflow_path=Path(workflow_path))
+            await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
@@ -123,10 +121,10 @@ class TestDeleteWorkflowRegistrationFallback:
             # First ahandle_request call loads metadata; second issues DeleteWorkflowRequest.
             mock_engine.ahandle_request = AsyncMock(side_effect=[mock_metadata_result, _make_delete_success()])
 
-            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
-                mock_registry.has_workflow_with_name.return_value = False
+            mock_registry = mock_engine.workflow_registry
+            mock_registry.has_workflow_with_name.return_value = False
 
-                await executor._delete_workflow(workflow_path=Path(workflow_path))
+            await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             mock_registry.generate_new_workflow.assert_called_once_with(
                 registry_key="my_flow", metadata=mock_metadata, file_path="my_flow.py"
@@ -145,9 +143,9 @@ class TestDeleteWorkflowRegistrationFallback:
             mock_engine.config_manager.workspace_path = workspace
             mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
-                mock_registry.has_workflow_with_name.return_value = True
+            mock_registry = mock_engine.workflow_registry
+            mock_registry.has_workflow_with_name.return_value = True
 
-                await executor._delete_workflow(workflow_path=Path(workflow_path))
+            await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             mock_registry.generate_new_workflow.assert_not_called()

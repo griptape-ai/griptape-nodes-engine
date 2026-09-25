@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
@@ -69,7 +68,7 @@ class ContextManager(EngineScoped):
             # at push time, so it goes stale the moment the workspace changes -- a project
             # switch re-registers workflows under the new workspace and the lookup then misses.
             # Callers that want the workflow's location (see ProjectManager's `workflow_dir`
-            # builtin) read this instead of round-tripping through WorkflowRegistry.
+            # builtin) read this instead of round-tripping through the workflow registry.
             self._file_path = file_path
             # The folder this workflow belongs to while it has no file of its own: the folder the
             # user was browsing when they created it. A DIRECTORY, unlike `_file_path`, which is
@@ -304,15 +303,17 @@ class ContextManager(EngineScoped):
         # When no workflow_name is supplied, mint a fresh "unsaved:<uuid>" key here so the
         # engine owns the namespace. Callers doing "create a new workflow" should omit the
         # name and read the resolved key off the success result.
-        resolved_name = request.workflow_name or f"{WorkflowRegistry.UNSAVED_KEY_PREFIX}{uuid.uuid4()}"
+        resolved_name = request.workflow_name or f"{self.engine.workflow_registry.UNSAVED_KEY_PREFIX}{uuid.uuid4()}"
 
         # Auto-register an unsaved registry entry when the caller is activating an
         # "unsaved:<uuid>" key. This makes every workflow (saved or not) a first-class
         # registry entry, so list/metadata/etc. calls don't need special-casing for
         # pre-save state. `ensure_unsaved` is idempotent.
-        if resolved_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX):
+        if resolved_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
             try:
-                WorkflowRegistry.ensure_unsaved(key=resolved_name, display_name=request.display_name or "Untitled")
+                self.engine.workflow_registry.ensure_unsaved(
+                    key=resolved_name, display_name=request.display_name or "Untitled"
+                )
             except ValueError as err:
                 msg = (
                     f"Attempted to auto-register unsaved workflow '{resolved_name}' "
@@ -329,8 +330,8 @@ class ContextManager(EngineScoped):
         is_saved = None
         if self.has_current_workflow():
             workflow_name = self.get_current_workflow_name()
-            if WorkflowRegistry.has_workflow_with_name(workflow_name):
-                is_saved = WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
+            if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
+                is_saved = self.engine.workflow_registry.get_workflow_by_name(workflow_name).is_saved
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             is_saved=is_saved,
@@ -745,12 +746,12 @@ class ContextManager(EngineScoped):
             # callers already handle.
             if file_path is None:
                 try:
-                    workflow = WorkflowRegistry.get_workflow_by_name(resolved_name)
+                    workflow = self.engine.workflow_registry.get_workflow_by_name(resolved_name)
                 except KeyError:
                     file_path = None
                 else:
                     if workflow.file_path is not None:
-                        file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
+                        file_path = self.engine.workflow_registry.get_complete_file_path(workflow.file_path)
         elif file_path is not None:
             resolved = canonicalize_for_identity(file_path)
             workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)

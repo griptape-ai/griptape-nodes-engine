@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextFailure,
@@ -146,10 +146,10 @@ class TestPushWorkflow:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
                     # Registered workspace-RELATIVE, so resolving the key genuinely depends on
                     # which workspace is active.
-                    WorkflowRegistry.generate_new_workflow(
+                    engine.workflow_registry.generate_new_workflow(
                         registry_key="subdir/my_flow", metadata=metadata, file_path="subdir/my_flow.py"
                     )
                     context_manager.push_workflow(workflow_name="subdir/my_flow")
@@ -242,7 +242,7 @@ class TestWorkflowWorkingDirectory:
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
                 # The folder is NOT the registry key: the workflow is still unsaved.
-                assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
+                assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
                 assert context_manager.get_current_workflow_file_path() is None
 
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
@@ -519,7 +519,6 @@ class TestEnsureWorkflowAndFlowRequest:
         self._cleanup(engine)
 
     def test_auto_generates_workflow_name_when_none_given(self, engine: Engine) -> None:
-        from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,
             EnsureWorkflowAndFlowResultSuccess,
@@ -531,8 +530,8 @@ class TestEnsureWorkflowAndFlowRequest:
         result = context_manager.on_ensure_workflow_and_flow_request(EnsureWorkflowAndFlowRequest())
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
-        assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
-        assert WorkflowRegistry.has_workflow_with_name(result.workflow_name)
+        assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+        assert engine.workflow_registry.has_workflow_with_name(result.workflow_name)
         assert result.created_workflow is True
         assert result.created_flow is True
 

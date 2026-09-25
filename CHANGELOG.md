@@ -10,6 +10,18 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- `GriptapeNodes.WorkflowRegistry()` returns the current engine's workflow registry. Node libraries
+  can use it in place of the `WorkflowRegistry` classmethods. Like the manager accessors, it raises
+  when called from a node running in an isolated library process.
+
+### Changed
+
+- Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
+  engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
+  still work and act on the current engine's registry.
+
 ## [0.102.0] - 2026-09-24
 
 ### Added

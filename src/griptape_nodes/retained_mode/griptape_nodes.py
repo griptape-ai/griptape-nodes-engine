@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 
 if TYPE_CHECKING:
+    from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
         RequestPayload,
@@ -335,3 +336,10 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
             "WorkerManager", "nothing: worker lifecycle belongs to the orchestrator"
         )
         return current_engine().worker_manager
+
+    @classmethod
+    def WorkflowRegistry(cls) -> _WorkflowRegistry:
+        _forbid_manager_during_worker_execution(
+            "WorkflowRegistry", "workflow requests (e.g., GetWorkflowMetadataRequest(...))"
+        )
+        return current_engine().workflow_registry

@@ -36,7 +36,6 @@ from griptape_nodes.files.path_utils import (
     strip_windows_long_path_prefix,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -1248,7 +1247,7 @@ dependencies = [
             msg = f"Cannot package unsaved workflow '{workflow.metadata.name}'. Save the workflow before packaging."
             logger.error(msg)
             raise TypeError(msg)
-        full_path = WorkflowRegistry.get_complete_file_path(workflow_file_path)
+        full_path = GriptapeNodes().workflow_registry.get_complete_file_path(workflow_file_path)
         entrypoint_workflow_path = Path(Path(full_path).name)
         self.validate_entrypoint_bundle_destination(entrypoint_workflow_path, workflow.metadata.name, reserved_paths)
         self.copy_file(full_path, destination / entrypoint_workflow_path)

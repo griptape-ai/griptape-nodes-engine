@@ -21,7 +21,6 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Parame
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
 from griptape_nodes.files.path_utils import derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
     StartLocalSubflowResultSuccess,
@@ -39,7 +38,12 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from griptape_nodes.node_library.workflow_registry import NodeParametersMapping, ParameterMinimalDict
+    from griptape_nodes.node_library.workflow_registry import (
+        NodeParametersMapping,
+        ParameterMinimalDict,
+        WorkflowMetadata,
+        _WorkflowRegistry,
+    )
     from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
@@ -252,8 +256,10 @@ def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], r
     return dict(zip(declared_names, live_names, strict=True))
 
 
-def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: WorkflowMetadata) -> str:
-    """Register `workflow_file_path` in the workflow registry if it is not there already.
+def ensure_workflow_registered(
+    workflow_registry: _WorkflowRegistry, workflow_file_path: Path, workflow_metadata: WorkflowMetadata
+) -> str:
+    """Register `workflow_file_path` in `workflow_registry` if it is not there already.
 
     Returns the registry key the workflow is available under. Registration is idempotent, and is
     also re-attempted before each run, because the registry is cleared and rebuilt when the
@@ -269,10 +275,10 @@ def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: Work
         ValueError: The workflow file is no longer on disk.
     """
     registry_key = derive_registry_key(str(workflow_file_path))
-    if WorkflowRegistry.has_workflow_with_name(registry_key):
+    if workflow_registry.has_workflow_with_name(registry_key):
         return registry_key
 
-    WorkflowRegistry.generate_new_workflow(
+    workflow_registry.generate_new_workflow(
         registry_key=registry_key,
         metadata=workflow_metadata,
         file_path=str(workflow_file_path),
@@ -335,7 +341,7 @@ class WorkflowNode(ControlNode):
         """
         try:
             self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
-                self.workflow_file_path, self.workflow_metadata
+                self.engine.workflow_registry, self.workflow_file_path, self.workflow_metadata
             )
         except (KeyError, ValueError):
             logger.warning(
@@ -407,7 +413,9 @@ class WorkflowNode(ControlNode):
     def _register_workflow(self) -> str:
         """Return the backing workflow's registry key, registering it if it is not registered yet."""
         try:
-            return ensure_workflow_registered(self.workflow_file_path, self.workflow_metadata)
+            return ensure_workflow_registered(
+                self.engine.workflow_registry, self.workflow_file_path, self.workflow_metadata
+            )
         except (KeyError, ValueError) as err:
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "

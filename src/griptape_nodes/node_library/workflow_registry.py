@@ -6,7 +6,7 @@ import re
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from pydantic import BaseModel, Field, ValidationError, field_serializer, field_validator
 
@@ -14,7 +14,9 @@ from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import (
     LibraryNameAndVersion,
 )
-from griptape_nodes.utils.metaclasses import SingletonMeta
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -279,22 +281,25 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
         raise WorkflowMetadataSchemaError(msg, section_path=METADATA_TABLE_PATH, error_message=str(err)) from err
 
 
-class WorkflowRegistry(metaclass=SingletonMeta):
-    class _RegistryKey:
-        """Private class for workflow construction."""
+class _WorkflowRegistry:
+    """Workflows known to one engine, keyed by registry key.
+
+    Owned by `Engine` and reached through `engine.workflow_registry`. Node libraries, which have
+    no engine reference, use `GriptapeNodes.WorkflowRegistry()`.
+    """
 
     # Prefix used for synthetic registry keys for unsaved (in-memory) workflows.
     # These keys collide with no possible file-path-derived key because derive_registry_key
     # strips the extension and normalizes separators, but never emits a "unsaved:" literal.
     UNSAVED_KEY_PREFIX: ClassVar[str] = "unsaved:"
 
-    _workflows: ClassVar[dict[str, Workflow]] = {}
-    _registry_key: _RegistryKey = _RegistryKey()
+    def __init__(self, config_manager: ConfigManager) -> None:
+        self._config_manager = config_manager
+        self._workflows: dict[str, Workflow] = {}
 
     # Create a new workflow with everything we'd need.
-    @classmethod
     def generate_new_workflow(
-        cls,
+        self,
         registry_key: str,
         metadata: WorkflowMetadata,
         file_path: str | None = None,
@@ -310,11 +315,10 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         disk; existence is verified at construction time); omit it for unsaved in-memory
         entries. Unsaved keys must start with `UNSAVED_KEY_PREFIX`.
         """
-        instance = cls()
-        if registry_key in instance._workflows:
+        if registry_key in self._workflows:
             msg = f"Workflow with registry key '{registry_key}' already registered."
             raise KeyError(msg)
-        is_unsaved_key = registry_key.startswith(cls.UNSAVED_KEY_PREFIX)
+        is_unsaved_key = registry_key.startswith(self.UNSAVED_KEY_PREFIX)
         if is_unsaved_key and file_path is not None:
             msg = f"Unsaved registry key '{registry_key}' cannot be paired with a file_path."
             raise ValueError(msg)
@@ -322,14 +326,13 @@ class WorkflowRegistry(metaclass=SingletonMeta):
             msg = f"Saved registry key '{registry_key}' requires a file_path."
             raise ValueError(msg)
         if file_path is None:
-            workflow = Workflow(registry_key=instance._registry_key, metadata=metadata, file_path=None)
+            workflow = Workflow(registry=self, metadata=metadata, file_path=None)
         else:
-            workflow = Workflow.from_disk(registry_key=instance._registry_key, file_path=file_path, metadata=metadata)
-        instance._workflows[registry_key] = workflow
+            workflow = Workflow.from_disk(registry=self, file_path=file_path, metadata=metadata)
+        self._workflows[registry_key] = workflow
         return workflow
 
-    @classmethod
-    def ensure_unsaved(cls, key: str, display_name: str) -> Workflow:
+    def ensure_unsaved(self, key: str, display_name: str) -> Workflow:
         """Idempotently register an unsaved workflow under `key`.
 
         Returns the existing entry if `key` is already registered; otherwise constructs
@@ -337,11 +340,11 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         start with `UNSAVED_KEY_PREFIX`; `display_name` is only consulted on first
         registration.
         """
-        if not key.startswith(cls.UNSAVED_KEY_PREFIX):
-            msg = f"Unsaved registry key '{key}' must start with '{cls.UNSAVED_KEY_PREFIX}'."
+        if not key.startswith(self.UNSAVED_KEY_PREFIX):
+            msg = f"Unsaved registry key '{key}' must start with '{self.UNSAVED_KEY_PREFIX}'."
             raise ValueError(msg)
-        if cls.has_workflow_with_name(key):
-            return cls.get_workflow_by_name(key)
+        if self.has_workflow_with_name(key):
+            return self.get_workflow_by_name(key)
         metadata = WorkflowMetadata(
             name=display_name,
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
@@ -349,90 +352,142 @@ class WorkflowRegistry(metaclass=SingletonMeta):
             node_libraries_referenced=[],
             creation_date=datetime.now(UTC),
         )
-        return cls.generate_new_workflow(registry_key=key, metadata=metadata, file_path=None)
+        return self.generate_new_workflow(registry_key=key, metadata=metadata, file_path=None)
 
-    @classmethod
-    def get_workflow_by_name(cls, name: str) -> Workflow:
-        instance = cls()
-        if name not in instance._workflows:
+    def get_workflow_by_name(self, name: str) -> Workflow:
+        if name not in self._workflows:
             msg = f"Failed to get Workflow. Workflow with name '{name}' has not been registered."
             raise KeyError(msg)
-        return instance._workflows[name]
+        return self._workflows[name]
 
-    @classmethod
-    def has_workflow_with_name(cls, name: str) -> bool:
-        instance = cls()
-        return name in instance._workflows
+    def has_workflow_with_name(self, name: str) -> bool:
+        return name in self._workflows
 
-    @classmethod
-    def list_workflows(cls) -> dict[str, dict]:
-        instance = cls()
-
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        # Resolve config once here and pass it down so get_workflow_metadata() can skip
-        # the is_synced property, which instantiates ConfigManager per workflow call.
-        config_mgr = GriptapeNodes.ConfigManager()
-        synced_directory = config_mgr.get_config_value("synced_workflows_directory")
-        synced_path = config_mgr.get_full_path(synced_directory)
-        workspace_path = config_mgr.workspace_path
+    def list_workflows(self) -> dict[str, dict]:
+        # Resolve paths once here and pass them down so get_workflow_metadata() skips
+        # the is_synced property, which resolves them per workflow.
+        synced_path = self.get_synced_workflows_path()
+        workspace_path = self._config_manager.workspace_path
 
         return {
-            key: instance._workflows[key].get_workflow_metadata(synced_path=synced_path, workspace_path=workspace_path)
-            for key in instance._workflows
+            key: workflow.get_workflow_metadata(synced_path=synced_path, workspace_path=workspace_path)
+            for key, workflow in self._workflows.items()
         }
 
-    @classmethod
-    def get_complete_file_path(cls, relative_file_path: str) -> str:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        # Resolve path using utility function
-        config_mgr = GriptapeNodes.ConfigManager()
-        workspace_path = config_mgr.workspace_path
+    def get_complete_file_path(self, relative_file_path: str) -> str:
+        workspace_path = self._config_manager.workspace_path
         resolved_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
         return str(resolved_path)
 
-    @classmethod
-    def delete_workflow_by_name(cls, name: str) -> Workflow:
-        instance = cls()
-        if name not in instance._workflows:
+    def get_synced_workflows_path(self) -> Path:
+        synced_directory = self._config_manager.get_config_value("synced_workflows_directory")
+        return self._config_manager.get_full_path(synced_directory)
+
+    def delete_workflow_by_name(self, name: str) -> Workflow:
+        if name not in self._workflows:
             msg = f"Failed to delete Workflow. Workflow with name '{name}' has not been registered."
             raise KeyError(msg)
-        return instance._workflows.pop(name)
+        return self._workflows.pop(name)
 
-    @classmethod
-    def clear_user_workflows(cls) -> None:
+    def clear_user_workflows(self) -> None:
         """Remove all non-library workflows from the registry.
 
         Library-provided workflows (is_griptape_provided=True) are preserved.
         Called before re-registering workflows so that a workspace change takes effect cleanly.
         """
-        instance = cls()
         keys_to_remove = [
-            key for key, workflow in instance._workflows.items() if not workflow.metadata.is_griptape_provided
+            key for key, workflow in self._workflows.items() if not workflow.metadata.is_griptape_provided
         ]
         for key in keys_to_remove:
-            del instance._workflows[key]
+            del self._workflows[key]
 
-    @classmethod
-    def rekey_workflow(cls, old_key: str, new_key: str) -> None:
+    def rekey_workflow(self, old_key: str, new_key: str) -> None:
         """Re-key a workflow in the registry from old_key to new_key."""
-        instance = cls()
-        if old_key not in instance._workflows:
+        if old_key not in self._workflows:
             msg = f"Failed to rekey Workflow. Workflow with key '{old_key}' has not been registered."
             raise KeyError(msg)
-        workflow = instance._workflows.pop(old_key)
-        instance._workflows[new_key] = workflow
+        workflow = self._workflows.pop(old_key)
+        self._workflows[new_key] = workflow
 
-    @classmethod
-    def get_branches_of_workflow(cls, workflow_name: str) -> list[str]:
+    def get_branches_of_workflow(self, workflow_name: str) -> list[str]:
         """Get all workflows that are branches of the specified workflow."""
-        instance = cls()
         branches = []
-        for name, workflow in instance._workflows.items():
+        for name, workflow in self._workflows.items():
             if workflow.metadata.branched_from == workflow_name:
                 branches.append(name)
         return branches
+
+
+class WorkflowRegistry:
+    """The current engine's workflow registry, for node libraries.
+
+    Kept for node libraries that call these classmethods. Each one forwards to
+    `current_engine().workflow_registry`. Library code should use `GriptapeNodes.WorkflowRegistry()`,
+    and engine-internal code `engine.workflow_registry`.
+    """
+
+    UNSAVED_KEY_PREFIX: ClassVar[str] = _WorkflowRegistry.UNSAVED_KEY_PREFIX
+
+    @classmethod
+    def generate_new_workflow(
+        cls,
+        registry_key: str,
+        metadata: WorkflowMetadata,
+        file_path: str | None = None,
+    ) -> Workflow:
+        return _current_registry().generate_new_workflow(
+            registry_key=registry_key, metadata=metadata, file_path=file_path
+        )
+
+    @classmethod
+    def ensure_unsaved(cls, key: str, display_name: str) -> Workflow:
+        return _current_registry().ensure_unsaved(key=key, display_name=display_name)
+
+    @classmethod
+    def get_workflow_by_name(cls, name: str) -> Workflow:
+        return _current_registry().get_workflow_by_name(name)
+
+    @classmethod
+    def has_workflow_with_name(cls, name: str) -> bool:
+        return _current_registry().has_workflow_with_name(name)
+
+    @classmethod
+    def list_workflows(cls) -> dict[str, dict]:
+        return _current_registry().list_workflows()
+
+    @classmethod
+    def get_complete_file_path(cls, relative_file_path: str) -> str:
+        return _current_registry().get_complete_file_path(relative_file_path)
+
+    @classmethod
+    def delete_workflow_by_name(cls, name: str) -> Workflow:
+        return _current_registry().delete_workflow_by_name(name)
+
+    @classmethod
+    def clear_user_workflows(cls) -> None:
+        # Test suites call this right after reset_root_engine(). Building an engine here would boot
+        # it before their config patches apply, and a fresh engine has nothing to clear anyway.
+        # Deferred import: see _current_registry.
+        from griptape_nodes.retained_mode.engine import has_current_engine
+
+        if not has_current_engine():
+            return
+        _current_registry().clear_user_workflows()
+
+    @classmethod
+    def rekey_workflow(cls, old_key: str, new_key: str) -> None:
+        _current_registry().rekey_workflow(old_key, new_key)
+
+    @classmethod
+    def get_branches_of_workflow(cls, workflow_name: str) -> list[str]:
+        return _current_registry().get_branches_of_workflow(workflow_name)
+
+
+def _current_registry() -> _WorkflowRegistry:
+    # Deferred import: the engine module imports the event payloads, which import this module.
+    from griptape_nodes.retained_mode.engine import current_engine
+
+    return current_engine().workflow_registry
 
 
 class Workflow:
@@ -442,7 +497,7 @@ class Workflow:
     - **Saved**: backed by a file on disk. `file_path` is a string (relative or absolute).
       Created via `Workflow.from_disk`.
     - **Unsaved**: in-memory only. `file_path is None`. Created via
-      `WorkflowRegistry.generate_new_workflow` with `file_path=None`. Transitions to
+      `generate_new_workflow` with `file_path=None`. Transitions to
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
     """
 
@@ -451,21 +506,22 @@ class Workflow:
 
     def __init__(
         self,
-        registry_key: WorkflowRegistry._RegistryKey,
+        registry: _WorkflowRegistry,
         metadata: WorkflowMetadata,
         file_path: str | None,
     ) -> None:
-        if not isinstance(registry_key, WorkflowRegistry._RegistryKey):
-            msg = "Workflows can only be created through WorkflowRegistry"
+        if not isinstance(registry, _WorkflowRegistry):
+            msg = "Workflows can only be created through a workflow registry"
             raise TypeError(msg)
 
+        self._registry = registry
         self.metadata = metadata
         self.file_path = file_path
 
     @classmethod
     def from_disk(
         cls,
-        registry_key: WorkflowRegistry._RegistryKey,
+        registry: _WorkflowRegistry,
         metadata: WorkflowMetadata,
         file_path: str,
     ) -> Workflow:
@@ -475,11 +531,11 @@ class Workflow:
         that saved Workflow entries always point at a real file). Unsaved entries bypass
         this check by constructing the Workflow directly with `file_path=None`.
         """
-        complete_path = WorkflowRegistry.get_complete_file_path(relative_file_path=file_path)
+        complete_path = registry.get_complete_file_path(relative_file_path=file_path)
         if not Path(complete_path).is_file():
             msg = f"File path '{complete_path}' does not exist."
             raise ValueError(msg)
-        return cls(registry_key=registry_key, metadata=metadata, file_path=file_path)
+        return cls(registry=registry, metadata=metadata, file_path=file_path)
 
     @property
     def is_saved(self) -> bool:
@@ -495,18 +551,8 @@ class Workflow:
         if self.file_path is None:
             return False
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        config_mgr = GriptapeNodes.ConfigManager()
-        synced_directory = config_mgr.get_config_value("synced_workflows_directory")
-
-        # Get the full path to the synced workflows directory
-        synced_path = config_mgr.get_full_path(synced_directory)
-
-        # Get the complete file path for this workflow
-        complete_file_path = WorkflowRegistry.get_complete_file_path(self.file_path)
-
-        # Check if the workflow file is within the synced directory
+        synced_path = self._registry.get_synced_workflows_path()
+        complete_file_path = self._registry.get_complete_file_path(self.file_path)
         return Path(complete_file_path).is_relative_to(synced_path)
 
     def get_workflow_metadata(self, synced_path: Path | None = None, workspace_path: Path | None = None) -> dict:
@@ -519,8 +565,8 @@ class Workflow:
         ret_val["is_saved"] = self.is_saved
 
         if synced_path is not None and workspace_path is not None and self.file_path is not None:
-            # Pre-computed paths supplied by list_workflows() to avoid a ConfigManager
-            # instantiation per workflow. Falls back to the property for standalone callers.
+            # Pre-computed paths supplied by list_workflows() so they are resolved once, not per
+            # workflow. Falls back to the property for standalone callers.
             complete_file_path = resolve_workspace_path(Path(self.file_path), workspace_path)
             ret_val["is_synced"] = complete_file_path.is_relative_to(synced_path)
         else:
