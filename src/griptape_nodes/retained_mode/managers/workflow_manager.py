@@ -67,6 +67,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
     SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
@@ -128,7 +129,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowRunCommandRequest,
     GetWorkflowRunCommandResultFailure,
     GetWorkflowRunCommandResultSuccess,
-    ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
@@ -4801,7 +4801,7 @@ class WorkflowManager(EngineScoped):
             ))).created_flow_name
         """
         import_recorder.add_from_import(
-            "griptape_nodes.retained_mode.events.workflow_events", "ImportWorkflowAsReferencedSubFlowRequest"
+            "griptape_nodes.retained_mode.events.flow_events", "ImportWorkflowAsReferencedSubFlowRequest"
         )
 
         # Prepare arguments for ImportWorkflowAsReferencedSubFlowRequest
