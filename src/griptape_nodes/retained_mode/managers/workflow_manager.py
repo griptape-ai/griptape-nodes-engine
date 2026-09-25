@@ -2761,9 +2761,6 @@ class WorkflowManager(EngineScoped):
             is_template=existing.is_template,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
-            pickle_control_flow_result=(
-                request.pickle_control_flow_result if request.pickle_control_flow_result is not None else False
-            ),
         )
         # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
         # (its native result family). on_save_workflow_request's public contract
@@ -3313,7 +3310,6 @@ class WorkflowManager(EngineScoped):
             is_template=request.is_template,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
-            pickle_control_flow_result=request.pickle_control_flow_result,
         )
 
     def _save_workflow_file_inline(  # noqa: PLR0913
@@ -3329,7 +3325,6 @@ class WorkflowManager(EngineScoped):
         is_template: bool | None,
         branched_from: str | None,
         workflow_shape: WorkflowShape | None,
-        pickle_control_flow_result: bool,
     ) -> ResultPayload:
         """Generate the workflow file content and write it to ``destination``.
 
@@ -3361,7 +3356,6 @@ class WorkflowManager(EngineScoped):
             final_code_output = self._generate_workflow_file_content(
                 serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
-                pickle_control_flow_result=pickle_control_flow_result,
             )
         except Exception as err:
             details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"
@@ -3548,8 +3542,6 @@ class WorkflowManager(EngineScoped):
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
-        *,
-        pickle_control_flow_result: bool = False,
     ) -> str:
         """Generate workflow file content from serialized commands and metadata."""
         metadata_block = self._generate_workflow_metadata_header(workflow_metadata=workflow_metadata)
@@ -3653,7 +3645,6 @@ class WorkflowManager(EngineScoped):
         workflow_execution_code = self._generate_workflow_execution(
             import_recorder=import_recorder,
             workflow_metadata=workflow_metadata,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
         if workflow_execution_code is not None:
             for node in workflow_execution_code:
@@ -3727,8 +3718,6 @@ class WorkflowManager(EngineScoped):
         self,
         import_recorder: ImportRecorder,
         workflow_metadata: WorkflowMetadata,
-        *,
-        pickle_control_flow_result: bool = False,
     ) -> list[ast.AST] | None:
         """Generates execute_workflow(...) and the __main__ guard."""
         # Use workflow shape from metadata if available, otherwise skip execution block
@@ -3790,25 +3779,9 @@ class WorkflowManager(EngineScoped):
         ensure_context_call = self._generate_ensure_flow_context_call()
 
         # Construct a default LocalWorkflowExecutor only when the caller did not supply one.
-        # Inside the `if`, seed `kwargs["pickle_control_flow_result"]` with the save-time
-        # default via `setdefault` so direct importers who don't pass it explicitly inherit
-        # the publisher's choice. `**kwargs` is then splatted into the constructor; a typo'd
-        # kwarg surfaces as a TypeError from LocalWorkflowExecutor.__init__.
+        # `**kwargs` is splatted into the constructor; a typo'd kwarg surfaces as a TypeError
+        # from LocalWorkflowExecutor.__init__.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
-        pickle_setdefault_stmt = ast.Expr(
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="kwargs", ctx=ast.Load()),
-                    attr="setdefault",
-                    ctx=ast.Load(),
-                ),
-                args=[
-                    ast.Constant(value="pickle_control_flow_result"),
-                    ast.Constant(value=pickle_control_flow_result),
-                ],
-                keywords=[],
-            )
-        )
         executor_assign = ast.If(
             test=ast.Compare(
                 left=ast.Name(id="workflow_executor", ctx=ast.Load()),
@@ -3816,7 +3789,6 @@ class WorkflowManager(EngineScoped):
                 comparators=[ast.Constant(value=None)],
             ),
             body=[
-                pickle_setdefault_stmt,
                 ast.Assign(
                     targets=[ast.Name(id="workflow_executor", ctx=ast.Store())],
                     value=ast.Call(
@@ -3836,8 +3808,7 @@ class WorkflowManager(EngineScoped):
             orelse=[],
         )
         # Use async context manager for workflow execution. Any leftover `**kwargs` flow
-        # through to `arun` (e.g. `pickle_control_flow_result` if the caller wants to
-        # override the executor's instance default for this run only).
+        # through to `arun`.
         with_stmt = ast.AsyncWith(
             items=[
                 ast.withitem(
@@ -3941,14 +3912,14 @@ class WorkflowManager(EngineScoped):
         ast.fix_missing_locations(sync_func_def)
 
         # === 2) build the `if __name__ == "__main__":` block ===
-        if_node = self._generate_main_block(workflow_shape, pickle_control_flow_result=pickle_control_flow_result)
+        if_node = self._generate_main_block(workflow_shape)
 
         # Generate the ensure flow context function
         ensure_context_func = self._generate_ensure_flow_context_function(import_recorder)
 
         return [ensure_context_func, sync_func_def, async_func_def, if_node]
 
-    def _generate_main_block(self, workflow_shape: dict, *, pickle_control_flow_result: bool = False) -> ast.If:
+    def _generate_main_block(self, workflow_shape: dict) -> ast.If:
         """Generates the `if __name__ == '__main__':` block for the serialized workflow file."""
         main_test = ast.Compare(
             left=ast.Name(id="__name__", ctx=ast.Load()),
@@ -3985,12 +3956,7 @@ class WorkflowManager(EngineScoped):
                         ctx=ast.Load(),
                     ),
                     args=[ast.Name(id="parser", ctx=ast.Load())],
-                    keywords=[
-                        ast.keyword(
-                            arg="pickle_control_flow_result_default",
-                            value=ast.Constant(value=pickle_control_flow_result),
-                        ),
-                    ],
+                    keywords=[],
                 )
             )
         )
