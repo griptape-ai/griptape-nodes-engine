@@ -43,6 +43,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
 from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextSuccess
+from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, SequenceScanFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
 from griptape_nodes.retained_mode.events.workflow_events import GetWorkflowMetadataResultSuccess
@@ -271,57 +272,6 @@ class TestSweepCoversTheLargeMajorityOfTheRegistry:
         )
 
 
-# --- Known, deterministic wire round-trip bugs surfaced by the sweep below ---------------------
-
-_TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON = (
-    "API-CONTRACT: the converter registers an unstructure hook for a bare `type` field (type -> "
-    "'module.Qualname' string) but no matching structure hook, so a value built from to_json() "
-    "cannot be read back with converter.structure(); it raises StructureHandlerNotFoundError. "
-    "Intended: a `type` field survives an unstructure/structure round trip like every other field. "
-    "- see #5437"
-)
-
-_UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON = (
-    "API-CONTRACT: UpdateAgentProviderRequest.provider is an UpdateProviderPayload pydantic model "
-    "whose optional str fields default to None but are validated by a 'non-empty string if "
-    "provided' validator. Unstructuring with model_dump(mode='json') always emits that None "
-    "default explicitly, and re-structuring the dict with model_validate() treats the explicit "
-    "None as 'provided', so the validator rejects it even though the identical unconstructed "
-    "default was legal. Intended: a payload built with only its own declared defaults survives a "
-    "full wire round trip. - see #5439"
-)
-
-_ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON = (
-    "API-CONTRACT: failure_reason is typed `SequenceScanFailureReason | FileIOFailureReason`, a "
-    "union of two StrEnum types. _is_json_primitive_union only recognizes unions of plain JSON "
-    "primitives, so this union falls through to cattrs' default union dispatch, which has no "
-    "discriminator strategy for two unrelated Enum members and raises StructureHandlerNotFoundError. "
-    "Intended: a failure_reason value from either enum survives an unstructure/structure round "
-    "trip. - see #5438"
-)
-
-_KNOWN_WIRE_ROUND_TRIP_BUGS: dict[str, str] = {
-    "RegisterArtifactProviderRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
-    "RegisterPreviewGeneratorRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
-    "UpdateAgentProviderRequest": _UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON,
-    "DeduceSequencesFromFileListResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ListDirectoryResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ListDirectorySequencesResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ScanSequencesResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-}
-
-
-def _sweep_params() -> list[Any]:
-    params = []
-    for name in _BUILDABLE_PAYLOAD_NAMES:
-        reason = _KNOWN_WIRE_ROUND_TRIP_BUGS.get(name)
-        if reason is None:
-            params.append(pytest.param(name, id=name))
-        else:
-            params.append(pytest.param(name, id=name, marks=pytest.mark.xfail(strict=True, reason=reason)))
-    return params
-
-
 class TestPayloadRegistryDefaultInstanceRoundTrip:
     """Sweep every registered payload type that can be built from its own field defaults.
 
@@ -331,12 +281,11 @@ class TestPayloadRegistryDefaultInstanceRoundTrip:
     construct without inventing real domain objects such as ``Parameter`` or
     ``SerializedFlowCommands`` (see ``_EXCLUDED_PAYLOAD_REASONS`` and
     ``TestSweepExclusionsAreKnownFactoryLimitations`` for the rest). That is still enough surface
-    to catch hooks that are missing for only some field shapes, as the xfails below demonstrate
-    (a bare `type` field, a union of two unrelated Enum types, and a pydantic model with a
-    validated-but-optional field).
+    to catch hooks that are missing for only some field shapes, such as a bare `type` field, a
+    union of two unrelated Enum types, or a pydantic model with a validated-but-optional field.
     """
 
-    @pytest.mark.parametrize("payload_name", _sweep_params())
+    @pytest.mark.parametrize("payload_name", _BUILDABLE_PAYLOAD_NAMES)
     def test_default_instance_round_trips_through_wire_form(self, payload_name: str) -> None:
         payload_cls = _FULL_PAYLOAD_REGISTRY[payload_name]
         instance = _build_default_instance(payload_cls)
@@ -531,14 +480,13 @@ class _PlaceholderProviderClass:
 class TestBareTypeFieldHook:
     """RegisterArtifactProviderRequest.provider_class is a bare `type`, not a dataclass instance."""
 
-    def test_type_field_unstructures_to_dotted_module_and_qualname(self) -> None:
+    def test_type_field_unstructures_to_its_type_name(self) -> None:
         request = RegisterArtifactProviderRequest(provider_class=_PlaceholderProviderClass)
 
         data = json.loads(request.to_json())
 
-        assert data["provider_class"] == f"{__name__}._PlaceholderProviderClass"
+        assert data["provider_class"] == f"{__name__}:_PlaceholderProviderClass"
 
-    @pytest.mark.xfail(strict=True, reason=_TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON)
     def test_type_field_round_trips_back_into_the_original_type(self) -> None:
         request = RegisterArtifactProviderRequest(provider_class=_PlaceholderProviderClass)
 
@@ -551,7 +499,6 @@ class TestBareTypeFieldHook:
 class TestPydanticValidatedOptionalFieldRoundTrip:
     """A payload built with only its own defaults must survive a full wire round trip."""
 
-    @pytest.mark.xfail(strict=True, reason=_UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON)
     def test_default_update_agent_provider_request_round_trips(self) -> None:
         request = UpdateAgentProviderRequest()
 
@@ -598,6 +545,22 @@ class TestSafeUnstructureFallback:
         result = safe_unstructure(obj)
 
         assert result == "a value that refuses to serialize"
+
+
+_FAILURE_REASON: Any = SequenceScanFailureReason | FileIOFailureReason
+
+
+class TestEnumUnionFieldHook:
+    """A field typed as a union of enums reads a bare member value back as the enum that has it."""
+
+    def test_member_of_the_second_enum_structures_as_that_enum(self) -> None:
+        restored = converter.structure(FileIOFailureReason.FILE_NOT_FOUND.value, _FAILURE_REASON)
+
+        assert restored is FileIOFailureReason.FILE_NOT_FOUND
+
+    def test_value_no_enum_has_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a member"):
+            converter.structure("no such reason", _FAILURE_REASON)
 
 
 class TestFromDictUnknownPayloadType:
