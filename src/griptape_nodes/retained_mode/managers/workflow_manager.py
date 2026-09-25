@@ -7701,6 +7701,7 @@ class WorkflowManager(EngineScoped):
                 AddParameterToNodeRequest(
                     node_name=start_flow_name,
                     parameter_name=bridge_name,
+                    tooltip=bridge_name,
                     output_type=output_type,
                     input_types=input_types,
                     mode_allowed_input=False,
@@ -7757,6 +7758,7 @@ class WorkflowManager(EngineScoped):
                 AddParameterToNodeRequest(
                     node_name=end_flow_name,
                     parameter_name=bridge_name,
+                    tooltip=bridge_name,
                     output_type=output_type,
                     input_types=input_types,
                     mode_allowed_input=True,
