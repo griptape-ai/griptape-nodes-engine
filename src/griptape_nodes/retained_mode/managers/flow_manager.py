@@ -2851,10 +2851,8 @@ class FlowManager(EngineScoped):
                 result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
                 exception = RuntimeError(error_message)
                 # A short flow can run to its end inside start_flow, so this is where an
-                # errored run usually finishes. Abandoning it sends the cancellation the
-                # editor listens for, carrying the reason: without one the canvas keeps
-                # showing a run in progress, and only the caller ever learns it failed.
-                await self._abandon_running_flow()
+                # errored run usually finishes.
+                self._announce_failed_run(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowResultFailure(
                     validation_exceptions=[exception] if error_message else [], result_details=result_details
@@ -2864,12 +2862,12 @@ class FlowManager(EngineScoped):
             wait_error = await self._await_flow_completion(request.completion_timeout_ms)
             if wait_error is not None:
                 # The wait ends badly two ways. On a timeout the flow is still running and
-                # has to be stopped. On an error it has already stopped, but the editor has
-                # not been told why: it listens for the cancellation event, so a run that
-                # ends without one leaves the canvas showing a run still in progress.
-                # Abandoning covers both -- it cancels a live run and, either way, reads the
-                # reason off the machine before the reset clears it and sends it along.
-                await self._abandon_running_flow()
+                # has to be stopped. On an error it has already stopped, and only the editor
+                # is left to tell.
+                if self.check_for_existing_running_flow():
+                    await self._abandon_running_flow()
+                else:
+                    self._announce_failed_run(self._current_flow_error_message())
                 exception = RuntimeError(wait_error)
                 return StartFlowResultFailure(
                     validation_exceptions=[exception],
@@ -2948,6 +2946,7 @@ class FlowManager(EngineScoped):
             resolution_machine = self._global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
+                self._announce_failed_run(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowFromNodeResultFailure(
                     validation_exceptions=[], result_details=error_message or "Flow execution failed"
@@ -4730,6 +4729,27 @@ class FlowManager(EngineScoped):
         if not resolution_machine.is_errored():
             return None
         return resolution_machine.get_error_message()
+
+    def _announce_failed_run(self, failure_details: str | None) -> None:
+        """Tell the editor a run that has already stopped on an error is over, and why.
+
+        The editor listens for the cancellation event, so a run that ends without
+        one leaves the canvas showing a run still in progress, and only the caller
+        ever learns it failed.
+
+        Deliberately not a cancel. The run is no longer live, and cancelling
+        resets the machine, which clears every node it was holding -- including
+        the upstream nodes that finished, and whose results the artist may have
+        paid for.
+        """
+        self.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
+        )
+        self.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(result_details=failure_details))
+            )
+        )
 
     async def cancel_flow_run(self, failure_details: str | None = None) -> None:
         """Stop the running flow and tell the editor the run is over.

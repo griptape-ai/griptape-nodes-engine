@@ -69,6 +69,11 @@ REFUSED_PATH = "/api/refused"
 BROKEN_PATH = "/api/broken"
 """Stub route that fails for a reason that has nothing to do with budgets."""
 
+OK_PATH = "/api/ok"
+"""Stub route that answers the call, standing in for a node that finished before the failure."""
+
+OK_BODY = {"ok": True}
+
 _RUN_TIMEOUT_MS = 30_000
 
 requires_fixture_library = pytest.mark.skipif(
@@ -124,12 +129,15 @@ def a_refusal_body() -> dict[str, Any]:
 
 
 class _StubCloudHandler(BaseHTTPRequestHandler):
-    """Answers the two routes these tests need and stays silent in the pytest output."""
+    """Answers the routes these tests need and stays silent in the pytest output."""
 
     def do_GET(self) -> None:  # BaseHTTPRequestHandler's spelling
         if self.path == REFUSED_PATH:
             body = json.dumps(a_refusal_body()).encode()
             self.send_response(403)
+        elif self.path == OK_PATH:
+            body = json.dumps(OK_BODY).encode()
+            self.send_response(200)
         else:
             body = json.dumps({"error": "something else went wrong"}).encode()
             self.send_response(500)
@@ -339,6 +347,34 @@ async def test_a_wired_failure_branch_does_not_spend_into_the_same_wall(
     )
     assert not receipt.exists(), (
         "The run followed the Failed branch past a budget block and spent credits into the same wall."
+    )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "execution_mode")
+@pytest.mark.asyncio
+async def test_a_failed_run_keeps_what_the_nodes_before_it_made(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    stub_cloud: str,
+) -> None:
+    """Ending a failed run must not wipe the results of the nodes that finished before it.
+
+    Those may be paid generations; clearing them makes the artist pay again to get them back.
+    """
+    flow_name = _new_flow(engine, "failed_run_keeps_results_wf")
+    create_node(NODE_TYPE, "Finished", flow_name, library_name=LIBRARY_NAME)
+    create_node(UNHANDLED_NODE_TYPE, "Broken", flow_name, library_name=LIBRARY_NAME)
+    connect("Finished", "exec_out", "Broken", "exec_in")
+    _set_parameter(engine, "Finished", "url", f"{stub_cloud}{OK_PATH}")
+    _set_parameter(engine, "Broken", "url", f"{stub_cloud}{BROKEN_PATH}")
+
+    await _run(engine, flow_name)
+
+    finished = engine.node_manager.get_node_by_name("Finished")
+    assert finished.parameter_output_values.get("result") == json.dumps(OK_BODY), (
+        "The failed run cleared a result a node before it had already produced."
     )
 
 
