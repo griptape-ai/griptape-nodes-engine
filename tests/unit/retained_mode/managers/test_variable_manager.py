@@ -861,11 +861,11 @@ class TestProjectVariableSerialization:
 
     def test_get_variable_from_project_serializes(self, engine: Engine, flow_name: str) -> None:
         """The Success payload must survive cattrs unstructure (the broadcast path)."""
-        from griptape_nodes.serialization.converter import safe_unstructure
+        from griptape_nodes.serialization.converter import converter
 
         with project_macros({"workspace_dir": "/proj"}):
             result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, GetVariableResultSuccess)
-        serialized = safe_unstructure(result)
+        serialized = converter.unstructure(result)
         assert serialized["variable"]["name"] == "workspace_dir"
         assert serialized["variable"]["value"] == "/proj"

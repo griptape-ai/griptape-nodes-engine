@@ -199,6 +199,11 @@ class ConvertColorspaceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
     pass
 ```
 
+A field that holds a parameter value, such as an artifact, needs the `Value` annotation from
+`griptape_nodes.serialization.values` (`image: Value`). The value then crosses tagged with its type
+and reads back as the same type. Typed `Any`, a griptape object or a value JSON has no form for
+fails to send.
+
 Put them in their own module that both your advanced library and your nodes import. The
 library directory is on `sys.path` by the time either loads, so a plain
 `import colorspace_events` resolves, and both files get the same module object and
