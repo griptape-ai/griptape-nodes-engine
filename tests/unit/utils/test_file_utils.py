@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import anyio
 import pytest
 
 from griptape_nodes.utils.file_utils import (
@@ -22,6 +23,8 @@ from griptape_nodes.utils.file_utils import (
     find_all_files_in_directory,
     find_file_in_directory,
     find_files_recursive,
+    promote_scratch_file,
+    promote_scratch_file_async,
 )
 
 if TYPE_CHECKING:
@@ -622,6 +625,31 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"payload")
         assert [p.name for p in temp_dir.iterdir()] == ["data.bin"]
 
+    def test_overwrite_rides_out_transient_rename_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The headline behavior: a full overwrite survives Windows-style transient denials.
+
+        End-to-end through atomic_write_bytes, not the promote helper directly —
+        two denials on the rename (a reader holding the destination) and the
+        write still lands, with no scratch debris.
+        """
+        target = temp_dir / "served.bin"
+        target.write_bytes(b"old")
+
+        real_replace = Path.replace
+        denials = [PermissionError("held"), PermissionError("held")]
+
+        def transiently_denied(self: Path, other: str | Path) -> Path:
+            if denials:
+                raise denials.pop()
+            return real_replace(self, other)
+
+        monkeypatch.setattr(Path, "replace", transiently_denied)
+
+        atomic_write_bytes(target, b"new")
+
+        assert target.read_bytes() == b"new"
+        assert sorted(p.name for p in temp_dir.iterdir()) == ["served.bin"]
+
     def test_failed_rename_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
         """A rename failure cleans up the temp file and leaves the original intact."""
         target = temp_dir / "data.bin"
@@ -792,3 +820,80 @@ class TestFsyncDirectoryBestEffort:
         monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
 
         _fsync_directory_best_effort(temp_dir)
+
+
+class TestPromoteScratchFile:
+    """Shared promote: atomic rename that rides out transient Windows denials."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_promotes_onto_destination(self, temp_dir: Path) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+        destination.write_bytes(b"old")
+
+        promote_scratch_file(scratch, destination)
+
+        assert destination.read_bytes() == b"new"
+        assert not scratch.exists()
+
+    def test_rides_out_transient_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        real_replace = Path.replace
+        denials = [PermissionError("held"), PermissionError("held")]
+
+        def transiently_denied(self: Path, target: str | Path) -> Path:
+            if denials:
+                raise denials.pop()
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", transiently_denied)
+
+        promote_scratch_file(scratch, destination)
+
+        assert destination.read_bytes() == b"new"
+
+    def test_persistent_denial_raises_and_keeps_scratch(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Scratch disposal belongs to the caller, so a failed promote must not unlink it."""
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        def always_denied(_self: Path, _target: str | Path) -> Path:
+            msg = "held open"
+            raise PermissionError(msg)
+
+        monkeypatch.setattr(Path, "replace", always_denied)
+
+        with pytest.raises(PermissionError, match="held open"):
+            promote_scratch_file(scratch, destination)
+
+        assert scratch.exists()
+        assert not destination.exists()
+
+    def test_async_form_promotes_and_retries(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = temp_dir / ".scratch.partial"
+        scratch.write_bytes(b"new")
+        destination = temp_dir / "served.bin"
+
+        real_replace = anyio.Path.replace
+        denials = [PermissionError("held")]
+
+        async def transiently_denied(self: anyio.Path, target: str | Path) -> object:
+            if denials:
+                raise denials.pop()
+            return await real_replace(self, target)
+
+        monkeypatch.setattr(anyio.Path, "replace", transiently_denied)
+
+        asyncio.run(promote_scratch_file_async(scratch, destination))
+
+        assert destination.read_bytes() == b"new"

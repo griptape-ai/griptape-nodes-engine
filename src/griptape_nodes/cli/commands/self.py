@@ -2,26 +2,27 @@
 
 import asyncio
 import json
-import platform
 import shutil
-import sys
 
 import typer
+from rich.markup import escape
 from rich.table import Table
 
 from griptape_nodes.cli.shared import (
     CONFIG_DIR,
-    CONFIG_FILE,
     DATA_DIR,
     console,
 )
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.common.diagnostics.report import ConfigFileDiagnostics, DiagnosticsReport
+from griptape_nodes.retained_mode.events.diagnostics_events import (
+    GetDiagnosticsReportRequest,
+    GetDiagnosticsReportResultSuccess,
+)
 from griptape_nodes.retained_mode.events.library_events import LoadLibrariesRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.utils.uv_utils import find_uv_bin
 from griptape_nodes.utils.version_utils import (
     get_complete_version_string,
-    get_install_source,
 )
 
 config_manager = GriptapeNodes.ConfigManager()
@@ -44,9 +45,21 @@ def version() -> None:
 
 
 @app.command()
-def info() -> None:
-    """Display system information for debugging."""
-    asyncio.run(_print_system_info_async())
+def info(
+    *,
+    show_identity: bool = typer.Option(
+        False,
+        "--show-identity",
+        help="Show real home directory paths and username instead of '~' and '<user>'.",
+    ),
+) -> None:
+    """Display system information for debugging.
+
+    Safe to paste into a bug report: secret values are never shown, credential-shaped
+    settings are replaced with '<redacted>', and your home directory and username are
+    replaced with '~' and '<user>' unless --show-identity is passed.
+    """
+    asyncio.run(_print_system_info_async(normalize_identity=not show_identity))
 
 
 def _print_current_version() -> None:
@@ -97,138 +110,319 @@ def _uninstall_self() -> None:
     os_manager.replace_process([uv_path, "tool", "uninstall", "griptape-nodes"])
 
 
-async def _print_system_info_async() -> None:
-    """Print comprehensive system information (async wrapper to load libraries)."""
-    # Load libraries from configuration first
-    load_request = LoadLibrariesRequest()
-    await GriptapeNodes.ahandle_request(load_request)
+async def _print_system_info_async(*, normalize_identity: bool) -> None:
+    """Collect a diagnostics report and print it."""
+    # Libraries are loaded first so the report can say which ones failed, which is the
+    # single most useful thing this command prints.
+    await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
 
-    # Now print all the info
-    _print_system_info()
+    result = await GriptapeNodes.ahandle_request(
+        GetDiagnosticsReportRequest(normalize_identity=normalize_identity, broadcast_result=False)
+    )
+    if not isinstance(result, GetDiagnosticsReportResultSuccess):
+        console.print("[red]Attempted to collect system information. Failed to build a diagnostics report.[/red]")
+        console.print(f"[red]{escape(str(result.result_details))}[/red]")
+        raise typer.Exit(code=1)
+
+    _print_report(result.report)
 
 
-def _print_system_info() -> None:
-    """Print comprehensive system information."""
+def _print_report(report: DiagnosticsReport) -> None:
+    """Print every section of a diagnostics report."""
     console.print("\n[bold cyan]Griptape Nodes System Information[/bold cyan]\n")
 
-    _print_engine_info()
-    _print_platform_info()
-    _print_paths_info()
-    _print_config_layers()
-    _print_configuration()
-    _print_registered_libraries()
+    _print_engine_info(report)
+    _print_platform_info(report)
+    _print_paths_info(report)
+    _print_logs_info(report)
+    _print_config_layers(report)
+    _print_configuration(report)
+    _print_secrets_info(report)
+    _print_libraries_info(report)
+    _print_projects_info(report)
+    _print_warnings(report)
+    _print_redaction_notice(report)
 
 
-def _print_engine_info() -> None:
-    """Print engine version information."""
-    version_string = get_complete_version_string()
-    install_source, commit_id = get_install_source()
+def _print_engine_info(report: DiagnosticsReport) -> None:
+    """Print engine and interpreter information."""
+    engine = report.engine
 
     console.print("[bold]Engine:[/bold]")
-    console.print(f"  Version: {version_string}")
-    console.print(f"  Install Source: {install_source}")
-    if commit_id:
-        console.print(f"  Commit ID: {commit_id}")
+    console.print(f"  Version: {escape(engine.engine_version or 'unknown')}")
+    console.print(f"  Install Source: {escape(engine.install_source or 'unknown')}")
+    if engine.commit_id:
+        console.print(f"  Commit ID: {escape(engine.commit_id)}")
+    if engine.engine_name:
+        console.print(f"  Engine Name: {escape(engine.engine_name)}")
+    if engine.engine_id:
+        console.print(f"  Engine ID: {escape(engine.engine_id)}")
+    if engine.session_id:
+        console.print(f"  Session ID: {escape(engine.session_id)}")
+    console.print(f"  Process ID: {engine.process_id}")
     console.print()
 
 
-def _print_platform_info() -> None:
-    """Print platform information."""
+def _print_platform_info(report: DiagnosticsReport) -> None:
+    """Print information about the machine the engine is running on."""
+    host = report.host
+    engine = report.engine
+
     console.print("[bold]Platform:[/bold]")
-    console.print(f"  OS: {platform.system()}")
-    console.print(f"  OS Version: {platform.version()}")
-    console.print(f"  OS Release: {platform.release()}")
-    console.print(f"  Architecture: {platform.machine()}")
-    console.print(f"  Python Version: {platform.python_version()}")
-    console.print(f"  Python Implementation: {platform.python_implementation()}")
-    console.print(f"  Python Executable: {sys.executable}")
+    console.print(f"  OS: {escape(host.system)}")
+    console.print(f"  OS Version: {escape(host.version)}")
+    console.print(f"  OS Release: {escape(host.release)}")
+    console.print(f"  Architecture: {escape(host.machine)}")
+    if host.cpu_count is not None:
+        console.print(f"  CPUs: {host.cpu_count}")
+    if host.workspace_disk_free_gb is not None and host.workspace_disk_total_gb is not None:
+        console.print(f"  Workspace Disk: {host.workspace_disk_free_gb} GB free of {host.workspace_disk_total_gb} GB")
+    # `sys.version` wraps onto several lines on some builds; collapse it to one.
+    python_version = " ".join(engine.python_version.split())
+    console.print(f"  Python Version: {escape(python_version)}")
+    console.print(f"  Python Executable: {escape(engine.python_executable)}")
     console.print()
 
 
-def _print_paths_info() -> None:
-    """Print configuration paths."""
+def _print_paths_info(report: DiagnosticsReport) -> None:
+    """Print the paths the engine reads and writes, marking the ones that do not exist."""
+    paths = report.paths
+    missing = set(paths.missing_paths)
+
+    labelled = [
+        ("Workspace Directory", paths.workspace_directory),
+        ("Config Directory", paths.config_directory),
+        ("Config File", paths.user_config_file),
+        ("Global Secrets File", paths.global_env_file),
+        ("Workspace Secrets File", paths.workspace_env_file),
+        ("Libraries Directory", paths.libraries_directory),
+        ("Static Files Directory", paths.static_files_directory),
+        ("Log Directory", paths.log_directory),
+    ]
+
     console.print("[bold]Paths:[/bold]")
-    console.print(f"  Config Directory: {CONFIG_DIR}")
-    console.print(f"  Config File: {CONFIG_FILE}")
-    console.print(f"  Data Directory: {DATA_DIR}")
-
-    workspace_dir = config_manager.get_config_value("file_system.directories.workspace_directory")
-    if workspace_dir:
-        console.print(f"  Workspace Directory: {workspace_dir}")
+    for label, path in labelled:
+        if path is None:
+            continue
+        suffix = ""
+        if path in missing:
+            suffix = " [yellow](missing)[/yellow]"
+        console.print(f"  {label}: {escape(path)}{suffix}")
     console.print()
 
 
-def _print_config_layers() -> None:
-    """Print the config layer stack: each layer's file/path, presence, and any parse error.
+def _print_logs_info(report: DiagnosticsReport) -> None:
+    """Print how logging is configured and what log history exists."""
+    logs = report.logs
 
-    Complements `_print_configuration` below, which shows only the merged blob and so cannot say
-    which layer set what. The `env` and `runtime` layers have no file to point at, so their own
-    contents are printed inline instead.
+    console.print("[bold]Logging:[/bold]")
+    console.print(f"  Log Level: {escape(str(logs.log_level))}")
+    console.print(f"  Write Log Files: {logs.log_to_file}")
+    if logs.retention_days > 0:
+        console.print(f"  Keep Log Files For: {logs.retention_days} day(s)")
+    else:
+        console.print("  Keep Log Files For: forever")
+    console.print(f"  Log Files Available: {len(logs.files)}")
+    console.print(f"  Lines Captured This Session: {logs.session_lines_captured}")
+    console.print()
+
+
+def _print_config_layers(report: DiagnosticsReport) -> None:
+    """Print the config layer stack: each layer's file, whether it applies, and any parse error.
+
+    `_print_configuration` below shows only the merged blob, so it cannot say which layer set
+    what. `env` and `runtime` have no file to point at and print their contents inline; `env`
+    names the variables without their values, which the merged configuration already shows.
     """
-    console.print("[bold]Config Layers (lowest to highest priority):[/bold]")
-    try:
-        for layer in config_manager.config_layers():
-            path_display = layer.path or "-"
-            presence = "present" if layer.present else "absent"
-            presence_style = "green" if layer.present else "dim"
-            console.print(
-                f"  [cyan]{layer.layer:<10}[/cyan] {path_display}  [{presence_style}]{presence}[/{presence_style}]"
-            )
-            if layer.parse_error:
-                console.print(f"    [red]parse error: {layer.parse_error}[/red]")
-            if layer.env_vars:
-                for env_var_name, raw_value in layer.env_vars.items():
-                    console.print(f"    {env_var_name} = {raw_value}")
-            if layer.layer == "runtime" and layer.values:
-                for key, value in layer.values.items():
-                    console.print(f"    {key} = {value}  [dim](pinned by the active project)[/dim]")
-    except Exception as e:
-        console.print(f"  [red]Error retrieving config layers: {e}[/red]")
+    config = report.config
+
+    console.print("[bold]Config Layers[/bold] (lowest to highest priority):")
+    for entry in config.files:
+        console.print(f"  [cyan]{escape(entry.layer):<10}[/cyan] {escape(entry.path)}  {_layer_status(entry)}")
+        if entry.parse_error:
+            console.print(f"    [red]parse error: {escape(entry.parse_error)}[/red]")
+
+    if config.runtime_workspace_pin is not None:
+        console.print(f"  [cyan]{'runtime':<10}[/cyan] -  [green](applied: pinned by the active project)[/green]")
+        console.print(f"    workspace_directory = {escape(config.runtime_workspace_pin)}")
+
+    if config.environment_overrides:
+        console.print(f"  [cyan]{'env':<10}[/cyan] -  [green](applied)[/green]")
+        for name in config.environment_overrides:
+            console.print(f"    {escape(name)}")
+
     console.print()
 
 
-def _print_configuration() -> None:
-    """Print full configuration."""
+def _layer_status(entry: ConfigFileDiagnostics) -> str:
+    """Say whether one file layer reached the merged settings, and if not, why not.
+
+    Every way a layer can contribute nothing comes first: "applied" is the only answer that
+    needs no qualification, and each of the others is a layer the user edited and thinks is live.
+    """
+    if not entry.exists:
+        return "[dim](not present)[/dim]"
+    if entry.parse_error:
+        # Skipped by the merge, which logs and moves on. The error itself is printed below.
+        return "[red](not read)[/red]"
+    if not entry.contributes:
+        # The workspace directory is the project directory: one file, read once, as
+        # `project`. Saying "applied" twice would read as two layers in the merge.
+        return "[dim](same file as project)[/dim]"
+    return "[green](applied)[/green]"
+
+
+def _print_configuration(report: DiagnosticsReport) -> None:
+    """Print the merged settings every layer above resolved to."""
+    config = report.config
+
     console.print("[bold]Configuration:[/bold]")
-    try:
-        full_config = config_manager.merged_config
-        config_json = json.dumps(full_config, indent=2, default=str)
-        console.print(f"[dim]{config_json}[/dim]")
-    except Exception as e:
-        console.print(f"  [red]Error retrieving configuration: {e}[/red]")
+    config_json = json.dumps(config.merged, indent=2, default=str)
+    # Markup off: the config holds arbitrary strings, and a value containing square
+    # brackets would otherwise be eaten as a style tag.
+    console.print(config_json, style="dim", markup=False, highlight=False)
     console.print()
 
 
-def _print_registered_libraries() -> None:
-    """Print registered libraries information."""
-    console.print("[bold]Registered Libraries:[/bold]")
-    try:
-        library_names = LibraryRegistry.list_libraries()
-        if not library_names:
-            console.print("  [yellow]No libraries registered[/yellow]")
-            console.print()
-            return
+def _print_secrets_info(report: DiagnosticsReport) -> None:
+    """Print which secrets exist and whether they have a value. Never the values."""
+    console.print("[bold]Secrets[/bold] (names and status only, never values):")
+    if not report.secrets:
+        console.print("  [yellow]No secrets found[/yellow]")
+        console.print()
+        return
 
-        table = Table(show_header=True, header_style="bold magenta")
-        table.add_column("Library Name", style="cyan")
-        table.add_column("Version", style="green")
-        table.add_column("Engine Version", style="yellow")
-        table.add_column("Author", style="blue")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Secret", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_column("Used From", style="blue")
+    table.add_column("Also Found In", style="yellow")
 
-        for library_name in library_names:
-            try:
-                library = LibraryRegistry.get_library(library_name)
-                metadata = library.get_metadata()
-                table.add_row(
-                    library_name,
-                    metadata.library_version,
-                    metadata.engine_version,
-                    metadata.author,
-                )
-            except KeyError:
-                table.add_row(library_name, "[red]Error[/red]", "[red]Error[/red]", "[red]Error[/red]")
+    for secret in report.secrets:
+        status = "set"
+        if not secret.is_set:
+            status = "[yellow]not set[/yellow]"
+        # Only the sources after the winning one; the winning one is its own column, and
+        # repeating it would make every row look like a shadowing problem.
+        shadowed = ", ".join(secret.sources[1:])
+        table.add_row(
+            escape(secret.name),
+            status,
+            escape(secret.effective_source or "-"),
+            escape(shadowed),
+        )
 
-        console.print(table)
-    except Exception as e:
-        console.print(f"  [red]Error retrieving libraries: {e}[/red]")
+    console.print(table)
+    console.print()
+
+
+def _print_libraries_info(report: DiagnosticsReport) -> None:
+    """Print every library the engine tried to load, then the problems it hit."""
+    console.print("[bold]Libraries:[/bold]")
+    if not report.libraries:
+        console.print("  [yellow]No libraries registered[/yellow]")
+        console.print()
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Library Name", style="cyan")
+    table.add_column("Version", style="green")
+    table.add_column("Health", style="yellow")
+    table.add_column("Loaded To", style="blue")
+
+    for library in report.libraries:
+        name = escape(library.name)
+        if not library.enabled:
+            name = f"{name} [dim](disabled)[/dim]"
+        table.add_row(
+            name,
+            escape(library.version or "unknown"),
+            escape(str(library.fitness)),
+            escape(str(library.lifecycle_state)),
+        )
+
+    console.print(table)
+    console.print()
+
+    libraries_with_problems = [library for library in report.libraries if library.problems]
+    if not libraries_with_problems:
+        return
+
+    console.print("[bold]Library Problems:[/bold]")
+    for library in libraries_with_problems:
+        console.print(f"  [bold]{escape(library.name)}[/bold]")
+        console.print(str(library.problems), style="yellow", markup=False, highlight=False)
+    console.print()
+
+
+def _print_projects_info(report: DiagnosticsReport) -> None:
+    """Print the project templates the engine loaded, and any problems found in them."""
+    if not report.projects:
+        return
+
+    console.print("[bold]Projects:[/bold]")
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Project", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_column("Active", style="blue")
+    table.add_column("Problems", style="yellow")
+
+    for project in report.projects:
+        status = str(project.validation_status)
+        if not project.loaded:
+            status = f"{status} (failed to load)"
+        active = ""
+        if project.is_current:
+            active = "yes"
+        problem_count = ""
+        if project.problems:
+            problem_count = str(len(project.problems))
+        table.add_row(escape(project.name or project.project_id), escape(status), active, problem_count)
+
+    console.print(table)
+    console.print()
+
+    projects_with_problems = [project for project in report.projects if project.problems]
+    if not projects_with_problems:
+        return
+
+    console.print("[bold]Project Problems:[/bold]")
+    for project in projects_with_problems:
+        console.print(f"  [bold]{escape(project.name or project.project_id)}[/bold]")
+        for problem in project.problems:
+            location = escape(problem.field_path)
+            if problem.line_number is not None:
+                location = f"{location}:{problem.line_number}"
+            console.print(
+                f"    {escape(problem.severity)}: {location}: {escape(problem.message)}",
+                style="yellow",
+            )
+    console.print()
+
+
+def _print_warnings(report: DiagnosticsReport) -> None:
+    """Print anything that could not be collected, so no section reads as empty by accident."""
+    if not report.collection_warnings:
+        return
+
+    console.print("[bold yellow]Could Not Be Collected:[/bold yellow]")
+    for warning in report.collection_warnings:
+        console.print(f"  [yellow]{escape(warning)}[/yellow]")
+    console.print()
+
+
+def _print_redaction_notice(report: DiagnosticsReport) -> None:
+    """State what was removed, so a hidden value is never mistaken for an absent one."""
+    redaction = report.redaction
+    if redaction.total == 0:
+        console.print("[dim]No values were hidden from this output.[/dim]")
+        console.print()
+        return
+
+    reasons = ", ".join(f"{reason}: {count}" for reason, count in redaction.counts.items())
+    console.print(
+        f"[dim]{redaction.total} value(s) were hidden from this output and shown as "
+        f"'<redacted>' ({escape(reasons)}).[/dim]"
+    )
     console.print()

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import anyio
 import anyio.to_thread
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,54 @@ def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
         True when the two times are within the tolerance window.
     """
     return abs(mtime_a - mtime_b) <= MTIME_MATCH_TOLERANCE_SECONDS
+
+
+# Windows denies a rename while another handle holds the destination open: a
+# competing promote clears in microseconds, a reader serving the old file clears
+# when its response completes. Ride out the transient cases; a persistent holder
+# still raises. POSIX never denies a rename for an open handle; a PermissionError
+# there (unwritable parent directory) is permanent, so it spends the bounded
+# retry before reporting the same failure.
+# Captured by the decorator at import; not runtime tunables.
+_PROMOTE_MAX_ATTEMPTS = 3
+_PROMOTE_RETRY_WAIT_SECONDS = 0.05
+
+# One decorator for both promote forms, so the policy cannot drift between
+# them; tenacity applies AsyncRetrying automatically to the coroutine form.
+_retry_transient_rename_denials = retry(
+    retry=retry_if_exception_type(PermissionError),
+    stop=stop_after_attempt(_PROMOTE_MAX_ATTEMPTS),
+    wait=wait_fixed(_PROMOTE_RETRY_WAIT_SECONDS),
+    before_sleep=before_sleep_log(logger, logging.DEBUG),
+    reraise=True,
+)
+
+
+@_retry_transient_rename_denials
+def promote_scratch_file(scratch: Path, destination: Path) -> None:
+    """Rename a finished scratch file onto the destination it was staged for.
+
+    Same-directory rename, so it is atomic: a reader sees either the previous
+    destination content or the complete new content. Retries transiently denied
+    renames; re-raises ``PermissionError`` when the denial persists. The
+    scratch file is left in place on failure — its disposal policy belongs to
+    the caller that created it.
+
+    Under contention this form sleeps up to ~100ms (two 50ms waits) on the
+    calling thread; a caller on an event loop should offload it (or the whole
+    write) to a worker thread, as with any blocking filesystem call.
+
+    Args:
+        scratch: The completed scratch file, in the destination's directory.
+        destination: The served path to promote onto.
+    """
+    scratch.replace(destination)
+
+
+@_retry_transient_rename_denials
+async def promote_scratch_file_async(scratch: Path, destination: Path) -> None:
+    """Async form of :func:`promote_scratch_file`; same contract, loop-safe waits."""
+    await anyio.Path(scratch).replace(destination)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -110,7 +159,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             # rename can promote the temp file into the destination name.
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        tmp_path.replace(path)
+        promote_scratch_file(tmp_path, path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
         raise

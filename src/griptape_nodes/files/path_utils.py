@@ -47,10 +47,24 @@ _URL_SCHEME_MATCH_PATTERN = r"^[A-Za-z][A-Za-z0-9+.\-]+://"
 # The path segment that the static file server mounts the workspace directory under.
 _STATIC_SERVER_WORKSPACE_SEGMENT = "/workspace/"
 
+# A `file://` netloc that is actually a drive letter, from a hand-written or legacy URI
+# (`file://C:/Users/...`, `file://c|/Users/...`). This names a local Windows path, not a
+# UNC host, and is folded into the local-path branch of parse_file_uri.
+_DRIVE_LETTER_NETLOC_MATCH_PATTERN = r"^[A-Za-z][:|]$"
+
+# A plausible NetBIOS/DNS host name for a `file://` UNC netloc: alphanumerics, dots,
+# hyphens, and underscores, not starting or ending on a dot/hyphen. This is what keeps
+# path traversal (`file://../../etc/passwd`, netloc `..`), userinfo/port
+# (`file://user:pass@host:445/...`), and IPv6 literals (`file://[::1]/...`) from being
+# accepted as a UNC host -- none of them is a name any real host actually answers to.
+_UNC_HOST_MATCH_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
+
 _WINDOWS_DRIVE_PATTERN = re.compile(_WINDOWS_DRIVE_MATCH_PATTERN, re.IGNORECASE)
 _WINDOWS_SEPARATOR_PATTERN = re.compile(_WINDOWS_SEPARATOR_MATCH_PATTERN, re.IGNORECASE)
 _URL_SCHEME_PATTERN = re.compile(_URL_SCHEME_MATCH_PATTERN)
 _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
+_DRIVE_LETTER_NETLOC_PATTERN = re.compile(_DRIVE_LETTER_NETLOC_MATCH_PATTERN)
+_UNC_HOST_PATTERN = re.compile(_UNC_HOST_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
 
@@ -206,16 +220,86 @@ class FilenameParts(NamedTuple):
         return cls(directory=path.parent, stem=path.stem, extension=path.suffix.lstrip("."))
 
 
+def _parse_unc_host(netloc: str, path: str) -> str | None:
+    """Validate a non-local netloc as a UNC host and build the UNC path, or None if invalid.
+
+    UNC paths only exist on Windows: POSIX has no such concept and silently resolves
+    ``//server/share/f`` to a real-looking but bogus local path rather than erroring, so
+    a non-Windows caller gets None for any non-local host, same as before UNC support
+    existed. On Windows, the netloc must look like a plausible NetBIOS/DNS name (no
+    userinfo, port, or IPv6 literal), and the combined ``//host/path`` must include a
+    share, per ``_WINDOWS_UNC_MATCH_PATTERN``.
+
+    Args:
+        netloc: Decoded netloc from the parsed file:// URI.
+        path: Decoded path from the parsed file:// URI.
+
+    Returns:
+        UNC path (``//host/share/...``) if valid, None otherwise.
+    """
+    if not is_windows():
+        return None
+    if not _UNC_HOST_PATTERN.match(netloc):
+        return None
+    if _WINDOWS_UNC_PATTERN.match(f"//{netloc}{path}") is None:
+        return None
+    return f"//{netloc}{path}"
+
+
+def _parse_local_path(path: str) -> str | None:
+    """Normalize the decoded path component of a local (non-UNC) file:// URI.
+
+    Args:
+        path: Decoded path from the parsed file:// URI.
+
+    Returns:
+        The local filesystem path, or None if the URI names no file at all.
+    """
+    if not path:
+        # `file://` or `file://localhost` alone names no file at all; returning ""
+        # here would let a caller treat it as a real (empty) path rather than
+        # recognizing the URI as unusable.
+        return None
+
+    # Windows paths in file:// URIs have format file:///C:/path
+    # Unix paths have format file:///path
+    # The path component includes the leading slash, so we need to handle Windows specially
+    if path.startswith("/") and len(path) > 2 and path[2] == ":":  # noqa: PLR2004
+        # Windows path like /C:/Users/... -> C:/Users/...
+        path = path[1:]
+
+    return path
+
+
 def parse_file_uri(location: str) -> str | None:
-    """Parse file:// URI and return local path, or None if not a valid file URI.
+    r"""Parse file:// URI and return local path, or None if not a valid file URI.
 
     Supports:
     - file:///path/to/file (Unix absolute path)
-    - file://localhost/path/to/file (localhost)
+    - file://localhost/path/to/file (localhost, case-insensitive)
     - file:///C:/path/to/file (Windows absolute path)
+    - file://C:/path/to/file, file://c|/path/to/file (a drive letter landed in the
+      netloc slot -- a hand-written or legacy spelling of a local Windows path, not a host)
+    - file://server/share/path (UNC network path -- Windows only, see below)
 
-    Rejects:
-    - file://hostname/path (non-localhost network paths)
+    The scheme check is case-insensitive (``FILE://`` counts), matching ``is_url()`` and
+    RFC 3986; a mismatch here previously made ``FILE://`` URIs pass ``is_url()`` while
+    this function saw them as not a file URI at all.
+
+    An empty netloc, ``localhost`` (decoded and compared case-insensitively), and a bare
+    drive letter all mean "a path on this machine" and collapse to the same local-path
+    result -- decoding happens before any of these comparisons, so a percent-encoded
+    ``local%68ost`` still collapses correctly.
+
+    Any other netloc is a candidate UNC host. UNC paths only exist on Windows: POSIX has
+    no such concept, and silently resolves ``//server/share/f`` to a real-looking but
+    bogus local path (``Path("//server/share/f").resolve()`` -> ``/server/share/f``)
+    rather than erroring, so a non-Windows caller gets ``None`` for any non-local host,
+    same as before UNC support existed. On Windows, the netloc must look like a
+    plausible NetBIOS/DNS name (letters, digits, dots, hyphens, underscores; no
+    userinfo, port, or IPv6 literal), and the combined ``//host/path`` must match
+    ``_WINDOWS_UNC_MATCH_PATTERN`` -- a share is required, since a bare host with no
+    share (``file://server``) is not a path ``PureWindowsPath`` treats as absolute.
 
     Args:
         location: Location string to parse
@@ -236,32 +320,44 @@ def parse_file_uri(location: str) -> str | None:
         parse_file_uri("file:///path/with%20spaces.txt")
         -> "/path/with spaces.txt"
 
-        parse_file_uri("file://remote-server/path")
+        parse_file_uri("file://server/share/render.exr")  # on Windows
+        -> "//server/share/render.exr"
+
+        parse_file_uri("file://server/share/render.exr")  # on POSIX
         -> None
     """
-    if not location.startswith("file://"):
+    if location[:7].lower() != "file://":
         return None
 
-    parsed = urlparse(location)
-
-    if parsed.scheme != "file":
+    try:
+        parsed = urlparse(location)
+    except ValueError:
+        # A malformed authority (e.g. an unterminated "[" IPv6 literal) is not a URI
+        # this function can make sense of.
         return None
 
-    # Reject non-localhost network paths
-    if parsed.netloc and parsed.netloc.lower() not in ("", "localhost"):
+    if parsed.scheme.lower() != "file":
         return None
 
-    # Get the path component and decode percent-encoding
+    # Decode percent-encoding on both components up front, before any comparison or
+    # validation runs against them.
     path = unquote(parsed.path)
+    netloc = unquote(parsed.netloc)
 
-    # Windows paths in file:// URIs have format file:///C:/path
-    # Unix paths have format file:///path
-    # The path component includes the leading slash, so we need to handle Windows specially
-    if path.startswith("/") and len(path) > 2 and path[2] == ":":  # noqa: PLR2004
-        # Windows path like /C:/Users/... -> C:/Users/...
-        path = path[1:]
+    drive_letter_match = _DRIVE_LETTER_NETLOC_PATTERN.match(netloc)
+    if drive_letter_match:
+        # A bare drive letter in the netloc slot (file://C:/... or file://c|/...) names a
+        # local Windows path, not a host. Fold it into the path so the local branch below
+        # handles it the same way as file:///C:/... -- one drive-letter fixup, not two.
+        drive_letter = netloc[0]
+        netloc = ""
+        path = f"/{drive_letter}:{path}"
 
-    return path
+    is_local = not netloc or netloc.lower() == "localhost"
+
+    if is_local:
+        return _parse_local_path(path)
+    return _parse_unc_host(netloc, path)
 
 
 def is_url(location: str) -> bool:
@@ -289,7 +385,7 @@ def is_url(location: str) -> bool:
         True if the string begins with a URL scheme followed by ``://``.
 
     Examples:
-        >>> is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?t=1")
+        >>> is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?v=1")
         True
         >>> is_url("https://example.com/clip.mp4")
         True
@@ -311,7 +407,7 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     """Map a static file server URL back to the workspace file it serves.
 
     The engine hands node outputs around as static server URLs
-    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?t=<cachebuster>``).
+    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?v=<version>``).
     Those URLs address a file that already exists inside the workspace, so a
     consumer that needs a real path -- to hand to a subprocess like FFmpeg, say --
     can have one without an HTTP round-trip.
@@ -330,7 +426,7 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
 
     Examples:
         >>> parse_static_server_url(
-        ...     "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231",
+        ...     "http://localhost:8124/workspace/staticfiles/clip.mp4?v=1786574231",
         ...     Path("/home/artist/GriptapeNodes"),
         ... )
         PosixPath('/home/artist/GriptapeNodes/staticfiles/clip.mp4')
@@ -342,8 +438,8 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     if not location.startswith(("http://localhost:", "https://localhost:")):
         return None
 
-    # Strip the cachebuster (`?t=...`) before parsing: it is addressing metadata for
-    # the HTTP server, not part of the filename.
+    # Strip the version/cachebuster query (`?v=...`) before parsing: it is addressing
+    # metadata for the HTTP server, not part of the filename.
     url_without_query = location.split("?", maxsplit=1)[0]
     parsed = urlparse(url_without_query)
 

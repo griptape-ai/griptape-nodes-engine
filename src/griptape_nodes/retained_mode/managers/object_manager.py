@@ -148,6 +148,13 @@ class ObjectManager(EngineScoped):
             details = f"Attempted to clear all object state and delete everything. Failed with exception: {e}"
             logger.error(details)
             return ClearAllObjectStateResultFailure(result_details=details)
+        finally:
+            # clear_current_workflow_data releases the objects this process holds; the workers hold their
+            # own. The fan-out has to be awaited, which is why it is here and not in that sync method.
+            #
+            # In the finally because nothing retries this request, so a worker that was never told keeps
+            # its objects for the life of the process.
+            await self.engine.worker_manager.broadcast_local_object_teardown()
 
         if self._name_to_objects:
             details = f"Attempted to clear all object state, but {len(self._name_to_objects)} object(s) remained after workflow teardown."

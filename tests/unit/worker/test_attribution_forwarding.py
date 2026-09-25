@@ -3,7 +3,7 @@
 A worker's project manager is a replica populated by broadcast, so it can serve a stale
 chain; the orchestrator holds the authoritative one. So `GetAttributionContextRequest` stays
 out of `LOCAL_ONLY_REQUEST_TYPES` and a worker-side `RemoteHandler` forwards it -- but only
-inside a `worker_node_execution_scope`, which is the only time a node spends credits.
+inside a `node_execution_scope`, which is the only time a node spends credits.
 
 No shipping library runs worker-hosted today; a `worker_mode_override` config entry can
 flip one, which is why this is wired now rather than deferred.
@@ -56,7 +56,7 @@ class TestAttributionIsForwardedFromWorkers:
         harness.worker.assign_manager_to_request_type(GetAttributionContextRequest, worker_local_handler)
         harness.install_remote_handler(GetAttributionContextRequest)
 
-        with harness.worker.worker_node_execution_scope():
+        with harness.worker.node_execution_scope():
             result_event = await harness.worker.ahandle_request(GetAttributionContextRequest())
 
         assert result_event.succeeded()
@@ -136,7 +136,7 @@ class TestAttributionForwardingIsWired:
             RemoteHandler(original=local_handler, event_manager=event_manager),
         )
 
-        with event_manager.worker_node_execution_scope(), ThreadPoolExecutor(max_workers=1) as pool:
+        with event_manager.node_execution_scope(), ThreadPoolExecutor(max_workers=1) as pool:
             event_result = pool.submit(event_manager.handle_request, GetAttributionContextRequest()).result()
 
         assert isinstance(event_result.result, GetAttributionContextResultSuccess)
