@@ -178,7 +178,8 @@ class PublicArtifactUrlParameter:
         if isinstance(parameter_value, UrlArtifact):
             url = parameter_value.value
         elif isinstance(parameter_value, dict):
-            # The editor sets artifact parameters to artifact-shaped dicts.
+            # Artifact-shaped dict: an UndecodedValue from a library this process doesn't load,
+            # or an untagged dict from a client or an older saved workflow.
             url = parameter_value.get("value")
 
         # check if the URL is already public
