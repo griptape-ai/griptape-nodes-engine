@@ -13,7 +13,9 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -243,6 +245,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     RequestHandlerRegistrationProblem,
     RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
+    ShadowedEnginePackagesProblem,
     UpdateConfigCategoryProblem,
     WorkflowNodeLoadProblem,
 )
@@ -292,11 +295,14 @@ from griptape_nodes.utils.library_utils import (
 )
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 from griptape_nodes.utils.version_utils import (
+    ShadowedPackage,
+    engine_package_floors,
     engine_version_failure_detail,
+    packages_shadowing_the_engine,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -2869,6 +2875,23 @@ class LibraryManager(EngineScoped):
                         for problem in library_info.problems
                         if not isinstance(problem, DependencyInstallationFailedProblem)
                     ]
+
+                    # Checked on every load rather than only after an install that ran: an
+                    # environment built by an older engine can hold an older copy of something
+                    # this engine imports, and a dependency set that has not changed gives the
+                    # installer nothing to re-resolve. Replaced and cleared for the same
+                    # LibraryInfo-is-preserved reason as the marker above.
+                    shadowed_packages = await self._shadowed_engine_packages(
+                        library_info.library_name, library_info.library_path
+                    )
+                    library_info.problems = [
+                        problem
+                        for problem in library_info.problems
+                        if not isinstance(problem, ShadowedEnginePackagesProblem)
+                    ]
+                    if shadowed_packages:
+                        library_info.problems.append(ShadowedEnginePackagesProblem(packages=shadowed_packages))
+
                     library_info.lifecycle_state = (
                         LibraryManager.LibraryLifecycleState.WORKER_DELEGATED
                         if delegated_to_worker
@@ -3196,19 +3219,21 @@ class LibraryManager(EngineScoped):
 
                 logger.info("Installing dependency '%s' with pip in venv at %s", package_name, venv_path)
                 is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
-                await subprocess_run(
-                    [
-                        uv_path,
-                        "pip",
-                        "install",
-                        request.requirement_specifier,
-                        "--python",
-                        str(library_python_venv_path),
-                    ],
-                    check=True,
-                    capture_output=not is_debug,
-                    text=True,
-                )
+                async with self._engine_version_constraints() as constraint_flags:
+                    await subprocess_run(
+                        [
+                            uv_path,
+                            "pip",
+                            "install",
+                            request.requirement_specifier,
+                            *constraint_flags,
+                            "--python",
+                            str(library_python_venv_path),
+                        ],
+                        check=True,
+                        capture_output=not is_debug,
+                        text=True,
+                    )
             else:
                 logger.debug(
                     "Skipping dependency installation for package '%s' - venv location at %s is not writable",
@@ -7809,6 +7834,43 @@ class LibraryManager(EngineScoped):
                 raise RuntimeError(msg) from e
         return (await self._init_library_venv(venv_path)).python_path
 
+    async def _shadowed_engine_packages(
+        self, library_name: str | None, library_file_path: str
+    ) -> list[ShadowedPackage]:
+        """Return the components a library holds at an older version than the engine's own.
+
+        Both of its environments, because both precede the engine's where they are used: the
+        edit-time one is spliced into this process, and the execution one reaches a worker as
+        PYTHONPATH.
+        """
+        site_packages_paths = []
+        for execution in (False, True):
+            # A library whose name did not parse still has a path, and the path is what locates
+            # both environments -- the name only places one for a library installed under xdg.
+            venv_path = self._get_library_venv_path(library_name or "", library_file_path, execution=execution)
+            site_packages = Path(
+                sysconfig.get_path("purelib", vars={"base": str(venv_path), "platbase": str(venv_path)})
+            )
+            if await anyio.Path(site_packages).exists():
+                site_packages_paths.append(site_packages)
+
+        return list(await asyncio.to_thread(packages_shadowing_the_engine, site_packages_paths))
+
+    @staticmethod
+    @asynccontextmanager
+    async def _engine_version_constraints() -> AsyncIterator[list[str]]:
+        """Yield uv flags constraining an install to versions the engine can still import.
+
+        A library environment sits ahead of the engine's own on the import path, so any package it
+        resolves below the engine's version is the one engine code binds. The floors make a library
+        resolve such a package newer or not at all, in place of an import error somewhere else in
+        the engine that nothing connects back to this library.
+        """
+        with tempfile.TemporaryDirectory() as constraint_dir:
+            constraint_file = Path(constraint_dir) / "engine-constraints.txt"
+            await anyio.Path(constraint_file).write_text("\n".join(engine_package_floors()) + "\n")
+            yield ["--constraint", str(constraint_file)]
+
     async def _run_uv_pip_install(
         self,
         library_venv_python_path: Path,
@@ -7819,25 +7881,46 @@ class LibraryManager(EngineScoped):
     ) -> None:
         """Run ``uv pip install`` for the given dependencies against a venv.
 
+        Installs under the engine's own versions as floors first, then without them if that cannot
+        resolve. A library whose dependencies genuinely need an older copy of something the engine
+        also has still installs: the shadowing it leaves behind is reported against the library by
+        `_shadowed_engine_packages`, which an artist can act on, where a refused install would only
+        have left them a library that does not work.
+
+        So this raises in exactly the cases it raised before the floors existed, which is what
+        `_install_deps_with_recovery` depends on: it reads a failure here as a corrupt environment
+        and deletes the venv, and a version conflict is not that.
+
         Raises:
-            subprocess.CalledProcessError: If uv exits with a non-zero status.
+            subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
         """
-        await subprocess_run(
-            [
-                sys.executable,
-                "-m",
-                "uv",
-                "pip",
-                "install",
-                *pip_dependencies,
-                *pip_install_flags,
-                "--python",
-                str(library_venv_python_path),
-            ],
-            check=True,
-            capture_output=capture_output,
-            text=True,
-        )
+        argv = [
+            sys.executable,
+            "-m",
+            "uv",
+            "pip",
+            "install",
+            *pip_dependencies,
+            *pip_install_flags,
+            "--python",
+            str(library_venv_python_path),
+        ]
+
+        async with self._engine_version_constraints() as constraint_flags:
+            try:
+                await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
+            except subprocess.CalledProcessError as constrained_error:
+                logger.warning(
+                    "Attempted to install dependencies into %s under the versions this engine runs on. Failed due "
+                    "to: the installer exited with code %s. Installing without them; the result may hold components "
+                    "older than the engine's own.",
+                    library_venv_python_path,
+                    constrained_error.returncode,
+                )
+            else:
+                return
+
+        await subprocess_run(argv, check=True, capture_output=capture_output, text=True)
 
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""

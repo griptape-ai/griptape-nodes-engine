@@ -1,10 +1,13 @@
 """Tests for inter-library dependency resolution (GH#4740)."""
 
+import subprocess
 import sys
 import sysconfig
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
 import semver
 
@@ -26,13 +29,17 @@ from griptape_nodes.retained_mode.events.library_events import (
     DownloadLibraryResultSuccess,
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
+    InstallLibraryDependenciesResultSuccess,
+    LoadLibraryMetadataFromFileResultFailure,
     LoadLibraryMetadataFromFileResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
+    RegisterLibraryFromRequirementSpecifierRequest,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DependencyInstallationFailedProblem,
     LibraryDependencyProblem,
+    ShadowedEnginePackagesProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import (
     DependencyInstallCounts,
@@ -40,6 +47,7 @@ from griptape_nodes.retained_mode.managers.library_manager import (
     LibraryManager,
 )
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
+from griptape_nodes.utils.version_utils import ShadowedPackage
 
 
 class TestLibraryDependencyDeclaration:
@@ -148,6 +156,22 @@ def _metadata_success(schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuc
 
 # Sentinel failure used to stop the lifecycle after EVALUATED without entering the LOADED step.
 _INSTALL_STOP = InstallLibraryDependenciesResultFailure(result_details="stop-sentinel")
+
+# For the cases that need the install to SUCCEED: the lifecycle then leaves EVALUATED, and the
+# metadata sentinel stops it at the load step instead.
+_INSTALL_DONE = InstallLibraryDependenciesResultSuccess(
+    library_name="test_lib",
+    dependencies_installed=0,
+    result_details=ResultDetails(message="OK", level=20),
+)
+_METADATA_STOP = LoadLibraryMetadataFromFileResultFailure(
+    library_path="/mock.json",
+    library_name="test_lib",
+    status=LibraryManager.LibraryFitness.UNUSABLE,
+    problems=[],
+    library_version=None,
+    result_details=ResultDetails(message="stop-sentinel", level=40),
+)
 
 
 class TestLibraryDependencyResolution:
@@ -1221,3 +1245,278 @@ class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
 
         assert "\\.venv-exec" not in sys.path[0]
         assert ".venv" in sys.path[0]
+
+
+class TestEveryLibraryInstallIsConstrainedToVersionsTheEngineCanImport:
+    """Every install into a library environment carries the engine's own versions as floors.
+
+    Both library environments precede the engine's own on the import path, so a package resolves at
+    or above the engine's version wherever the library's own requirements leave room for it.
+    """
+
+    def _capture_constraints(self, seen: dict[str, str]) -> Callable[..., Awaitable[MagicMock]]:
+        """Read the constraint file while it exists: it is deleted when the install returns."""
+
+        async def fake_subprocess_run(args: list[str], **_: object) -> MagicMock:
+            constraint_file = anyio.Path(args[args.index("--constraint") + 1])
+            seen["contents"] = await constraint_file.read_text()
+            return MagicMock(returncode=0)
+
+        return fake_subprocess_run
+
+    @pytest.mark.asyncio
+    async def test_the_dependency_install_carries_the_floors(self, engine: Engine, tmp_path: Path) -> None:
+        """Covers the edit-time and execution installs, and both of the recovery retries."""
+        seen: dict[str, str] = {}
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("griptape>=1.13.0", "pydantic>=2.13.5"),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=self._capture_constraints(seen),
+            ),
+        ):
+            await engine.library_manager._run_uv_pip_install(tmp_path / "python", ["torch"], [], capture_output=True)
+
+        assert seen["contents"] == "griptape>=1.13.0\npydantic>=2.13.5\n"
+
+    @pytest.mark.asyncio
+    async def test_the_requirement_specifier_install_carries_them_too(self, engine: Engine, tmp_path: Path) -> None:
+        """This install builds a venv that is spliced onto sys.path like any other library's."""
+        seen: dict[str, str] = {}
+        venv_init = MagicMock(python_path=tmp_path / "python", reused=False)
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("griptape>=1.13.0",),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=self._capture_constraints(seen),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch("griptape_nodes.retained_mode.managers.library_manager.files"),
+            patch.object(engine.library_manager, "_init_library_venv", AsyncMock(return_value=venv_init)),
+            patch.object(engine.library_manager, "_can_write_to_venv_location", return_value=True),
+            patch.object(engine, "ahandle_request", AsyncMock(return_value=MagicMock())),
+        ):
+            await engine.library_manager.register_library_from_requirement_specifier_request(
+                RegisterLibraryFromRequirementSpecifierRequest(requirement_specifier="some-lib")
+            )
+
+        assert seen["contents"] == "griptape>=1.13.0\n"
+
+
+class TestALibraryThatCannotMeetTheFloorsStillInstalls:
+    """A library needing an older copy of something the engine has is installed anyway.
+
+    Its author may have pinned that version for a reason, and the artist installing it cannot read
+    a resolver conflict, let alone act on one. So the floors are dropped and the shadowing is
+    reported against the library instead, which leaves them a library that works.
+    """
+
+    def _fails_only_under_the_floors(self, calls: list[list[str]]) -> Callable[..., Awaitable[MagicMock]]:
+        async def fake_subprocess_run(args: list[str], **_: object) -> MagicMock:
+            calls.append(args)
+            if "--constraint" in args:
+                raise subprocess.CalledProcessError(1, args, stderr="No solution found")
+            return MagicMock(returncode=0)
+
+        return fake_subprocess_run
+
+    @pytest.mark.asyncio
+    async def test_the_install_runs_again_without_the_floors(self, engine: Engine, tmp_path: Path) -> None:
+        calls: list[list[str]] = []
+        expected_uv_runs = 2
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("numpy>=2.3.4",),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=self._fails_only_under_the_floors(calls),
+            ),
+        ):
+            await engine.library_manager._run_uv_pip_install(tmp_path / "python", ["numpy<2"], [], capture_output=True)
+
+        assert len(calls) == expected_uv_runs
+        assert "--constraint" not in calls[1]
+        assert "numpy<2" in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_the_venv_is_not_rebuilt_when_the_floors_are_what_failed(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """The recovery ladder reads a failed install as a corrupt environment and deletes it.
+
+        A developer's `.venv` is their own, so a conflict the engine introduced must never be what
+        destroys it. This holds only because the retry happens below that ladder.
+        """
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("numpy>=2.3.4",),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=self._fails_only_under_the_floors([]),
+            ),
+            patch.object(engine.library_manager, "_reset_and_init_library_venv", AsyncMock()) as rebuild,
+        ):
+            await engine.library_manager._install_deps_with_recovery(
+                venv_path=tmp_path / ".venv",
+                library_venv_python_path=tmp_path / "python",
+                pip_dependencies=["numpy<2"],
+                pip_install_flags=[],
+                capture_output=True,
+            )
+
+        rebuild.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_install_that_fails_without_them_too_reports_its_own_failure(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A bad package name must read as one, not as a version conflict nobody asked for."""
+
+        async def always_fails(args: list[str], **_: object) -> MagicMock:
+            raise subprocess.CalledProcessError(
+                1, args, stderr="under the floors" if "--constraint" in args else "nonexistent-package"
+            )
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("numpy>=2.3.4",),
+            ),
+            patch("griptape_nodes.retained_mode.managers.library_manager.subprocess_run", side_effect=always_fails),
+            pytest.raises(subprocess.CalledProcessError) as install_error,
+        ):
+            await engine.library_manager._run_uv_pip_install(
+                tmp_path / "python", ["nonexistent-package"], [], capture_output=True
+            )
+
+        assert install_error.value.stderr == "nonexistent-package"
+
+
+class TestShadowedComponentsAreRecordedOnTheLibrary:
+    """What a library supplies older than the engine is reported against that library.
+
+    Nothing else connects the two: the failure it causes surfaces as an import error or a
+    TypeError somewhere else entirely, in engine code the artist never installed.
+    """
+
+    def _metadata_until_the_install_is_done(self, lib_info: LibraryManager.LibraryInfo) -> Callable[..., object]:
+        """Let the lifecycle reach the install, then stop it before the load step."""
+        schema = _make_schema_mock([])
+
+        def metadata_result(*_: object, **__: object) -> object:
+            if lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.EVALUATED:
+                return _metadata_success(schema)
+            return _METADATA_STOP
+
+        return metadata_result
+
+    @pytest.mark.asyncio
+    async def test_an_older_component_becomes_a_problem_on_the_library(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        shadowed = [ShadowedPackage(name="numpy", library_version="1.26.4", engine_version="2.3.4")]
+
+        with (
+            patch.object(
+                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+            ),
+            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
+            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=shadowed)),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        problems = [p for p in lib_info.problems if isinstance(p, ShadowedEnginePackagesProblem)]
+        assert len(problems) == 1
+        assert problems[0].packages == shadowed
+        # Named in the message the settings panel shows, with both versions.
+        collated = mgr.collate_problems_for_lib_info(lib_info)
+        assert collated is not None
+        assert "numpy 1.26.4 instead of 2.3.4" in collated
+
+    @pytest.mark.asyncio
+    async def test_a_library_that_shadows_nothing_gets_no_problem(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+
+        with (
+            patch.object(
+                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+            ),
+            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
+            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=[])),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        assert not [p for p in lib_info.problems if isinstance(p, ShadowedEnginePackagesProblem)]
+
+    @pytest.mark.asyncio
+    async def test_both_environments_of_a_library_are_read(self, engine: Engine, tmp_path: Path) -> None:
+        """A site-packages path derived wrongly reports nothing, which reads as a clean library."""
+        mgr = engine.library_manager
+        library_json = tmp_path / "lib" / "library.json"
+        library_json.parent.mkdir(parents=True)
+        library_json.write_text("{}")
+        for execution, version in ((False, "1.9.4"), (True, "1.12.0")):
+            venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=execution)
+            site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+            dist_info = site_packages / f"griptape-{version}.dist-info"
+            dist_info.mkdir(parents=True)
+            (dist_info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: griptape\nVersion: {version}\n")
+
+        with patch("griptape_nodes.utils.version_utils.engine_package_versions", return_value={"griptape": "1.13.0"}):
+            shadowed = await mgr._shadowed_engine_packages("test_lib", str(library_json))
+
+        assert shadowed == [ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0")]
+
+    @pytest.mark.asyncio
+    async def test_a_reload_replaces_the_problem_rather_than_stacking_one(self, engine: Engine) -> None:
+        """The LibraryInfo survives a reload, and the display reads the oldest instance."""
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        stale = ShadowedPackage(name="numpy", library_version="1.26.4", engine_version="2.3.4")
+        lib_info.problems.append(ShadowedEnginePackagesProblem(packages=[stale]))
+        current = [ShadowedPackage(name="numpy", library_version="2.0.1", engine_version="2.3.4")]
+
+        with (
+            patch.object(
+                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+            ),
+            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
+            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=current)),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        problems = [p for p in lib_info.problems if isinstance(p, ShadowedEnginePackagesProblem)]
+        assert len(problems) == 1
+        assert problems[0].packages == current

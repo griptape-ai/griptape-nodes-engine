@@ -1041,7 +1041,9 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
         schema.metadata.dependencies.pip_dependencies_exec = None
-        expected_attempts = 2
+        # Corrupt metadata fails under the engine's version floors and again without them, then
+        # installs once the rebuild has cleared it.
+        expected_uv_runs = 3
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -1065,6 +1067,7 @@ class TestLibraryManagerInstallLibraryDependencies:
                 new_callable=AsyncMock,
                 side_effect=[
                     subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
+                    subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
                     MagicMock(),
                 ],
             ) as mock_subprocess,
@@ -1077,7 +1080,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
         assert result.dependencies_installed == 1
         mock_reset.assert_called_once()
-        assert mock_subprocess.await_count == expected_attempts
+        assert mock_subprocess.await_count == expected_uv_runs
 
     @pytest.mark.asyncio
     async def test_does_not_rebuild_freshly_built_venv_on_install_failure(self, engine: Engine) -> None:
@@ -1118,7 +1121,10 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         assert isinstance(result, InstallLibraryDependenciesResultFailure)
         mock_reset.assert_not_called()
-        mock_subprocess.assert_awaited_once()
+        # Under the engine's version floors and again without them, which rules the floors out as
+        # the cause before the failure is reported.
+        expected_uv_runs = 2
+        assert mock_subprocess.await_count == expected_uv_runs
 
     @pytest.mark.asyncio
     async def test_returns_failure_when_install_fails_after_rebuild(self, engine: Engine) -> None:
@@ -1130,7 +1136,8 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
         schema.metadata.dependencies.pip_dependencies_exec = None
-        expected_attempts = 2
+        # Both runs of both attempts: the floors are ruled out before and after the rebuild.
+        expected_uv_runs = 4
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -1154,6 +1161,8 @@ class TestLibraryManagerInstallLibraryDependencies:
                 new_callable=AsyncMock,
                 side_effect=[
                     subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
+                    subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
+                    subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="still broken"),
                     subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="still broken"),
                 ],
             ) as mock_subprocess,
@@ -1165,7 +1174,7 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         assert isinstance(result, InstallLibraryDependenciesResultFailure)
         mock_reset.assert_called_once()
-        assert mock_subprocess.await_count == expected_attempts
+        assert mock_subprocess.await_count == expected_uv_runs
 
     def _schema_without_its_own_execution_set(self, mgr: _LibraryManager) -> MagicMock:
         """An orchestrator registering `test_lib`, whose manifest declares no execution deps.
