@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import sysconfig
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion
 from packaging.version import Version as PackagingVersion
 from rich.console import Console
@@ -17,6 +19,14 @@ console = Console()
 ENGINE_PACKAGE_NAME = "griptape-nodes-engine"
 
 engine_version = importlib.metadata.version(ENGINE_PACKAGE_NAME)
+
+
+class ShadowedPackage(NamedTuple):
+    """A package a library environment supplies at an older version than the engine's own."""
+
+    name: str
+    library_version: str
+    engine_version: str
 
 
 def engine_version_failure_detail(spec_string: str | None) -> str | None:
@@ -138,3 +148,86 @@ def get_complete_version_string() -> str:
         Complete version string with source and commit info.
     """
     return format_version_string(get_current_version(), ENGINE_PACKAGE_NAME)
+
+
+def engine_package_versions() -> dict[str, str]:
+    """Return the canonical name and installed version of every package in the engine's environment.
+
+    Scoped to the running interpreter's site-packages rather than `sys.path`, which carries library
+    environments spliced ahead of the engine's own: a path-wide scan reports those versions as the
+    engine's, so the floors below would name the very copies they exist to displace.
+
+    The engine's own distribution is excluded: every library declares it, and the copy in a library
+    environment is frequently someone's editable checkout, which a floor would replace with a wheel.
+    """
+    purelib = sysconfig.get_path("purelib")
+    platlib = sysconfig.get_path("platlib")
+    search_paths = [purelib] if purelib == platlib else [purelib, platlib]
+
+    engine_name = canonicalize_name(ENGINE_PACKAGE_NAME)
+    versions: dict[str, str] = {}
+    for distribution in importlib.metadata.distributions(path=search_paths):
+        raw_name = distribution.metadata.get("Name")
+        if not raw_name or not distribution.version:
+            continue
+        name = canonicalize_name(raw_name)
+        if name == engine_name:
+            continue
+        # PEP 610 records this for a git or local install only, and the version it reports is not a
+        # version any index has to carry, so a floor on it can make a valid resolution impossible.
+        if distribution.read_text("direct_url.json") is not None:
+            continue
+        versions[name] = distribution.version
+
+    return versions
+
+
+def engine_package_floors() -> tuple[str, ...]:
+    """Return a `name>=version` floor for every package in the engine's own environment.
+
+    Passed as constraints to a library's dependency install. A library environment precedes the
+    engine's own on the import path, so a package the library resolves BELOW the engine's version
+    is the one engine code binds. Floors let a library resolve newer, never older.
+    """
+    return tuple(f"{name}>={version}" for name, version in sorted(engine_package_versions().items()))
+
+
+def packages_shadowing_the_engine(site_packages_paths: list[Path]) -> tuple[ShadowedPackage, ...]:
+    """Return the packages in the given directories that are older than the engine's own copy.
+
+    These are what the engine binds once such a directory precedes its own on the import path, so
+    they are the versions engine code runs against rather than the ones it was tested with.
+
+    Reported rather than prevented. Installing under `engine_package_floors` keeps most of them
+    from arriving, but a library whose dependencies cannot satisfy a floor installs without them,
+    and a package left behind by an earlier install is outside the resolution a later one
+    constrains.
+    """
+    engine_versions = engine_package_versions()
+    shadowed: dict[str, ShadowedPackage] = {}
+    for site_packages in site_packages_paths:
+        for distribution in importlib.metadata.distributions(path=[str(site_packages)]):
+            raw_name = distribution.metadata.get("Name")
+            if not raw_name or not distribution.version:
+                continue
+            name = canonicalize_name(raw_name)
+            engine_version = engine_versions.get(name)
+            if engine_version is None:
+                continue
+            try:
+                library_version = PackagingVersion(distribution.version)
+                if library_version >= PackagingVersion(engine_version):
+                    continue
+            except InvalidVersion:
+                # Nothing comparable, so nothing to report.
+                continue
+            # A library's two environments resolve separately and can hold different older copies
+            # of the same package. The oldest is the one worth naming.
+            already_found = shadowed.get(name)
+            if already_found is not None and PackagingVersion(already_found.library_version) <= library_version:
+                continue
+            shadowed[name] = ShadowedPackage(
+                name=name, library_version=distribution.version, engine_version=engine_version
+            )
+
+    return tuple(sorted(shadowed.values()))

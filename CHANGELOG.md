@@ -28,6 +28,15 @@ the engine's request API from working without edits. Migration steps live in
 - A library whose isolated process shuts down before loading it now reports that as soon as the
   process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
   load that never finished.
+- Installing a library's dependencies no longer gives the engine an older copy of a package the
+  engine itself imports. A library's environment comes ahead of the engine's own on the import path,
+  so a library that resolved, for instance, an older `griptape` handed that copy to the engine too.
+  Library installs now carry the engine's own versions as minimum versions, so such a package
+  resolves no older than the engine's. A library that genuinely needs an older one is still
+  installed and still works; it is now listed in that library's problems, naming what it supplies
+  and what the engine expected, where before nothing connected the two.
+  [#5681](https://github.com/griptape-ai/griptape-nodes-engine/issues/5681)
+  [#5682](https://github.com/griptape-ai/griptape-nodes-engine/issues/5682)
 - Creating a versioned output folder or file sequence in a project no longer fails with "requires
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
   `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
