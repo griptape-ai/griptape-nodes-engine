@@ -524,6 +524,9 @@ class ExecuteNodeRequest(RequestPayload):
 
     node_name: str
     parameter_values: dict[str, Value] = field(default_factory=dict)
+    # Plumbing between the flow and wherever the node runs, so no client needs the result. Values
+    # cross strictly here, so broadcasting one the node holds in memory would fail to send.
+    broadcast_result: bool = field(default=False, kw_only=True)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None

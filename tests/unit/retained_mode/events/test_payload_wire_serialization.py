@@ -2,11 +2,11 @@
 
 Covers ``retained_mode/events/base_events.py`` (Payload.to_json, the Event envelope classes and
 their ``from_dict``) and ``serialization/converter.py`` (the cattrs converter's
-registered hooks and ``safe_unstructure``). Complements ``serialization/test_converter.py`` and
+registered hooks). Complements ``serialization/test_converter.py`` and
 ``test_from_dict.py``, which already cover JSON-primitive unions, the exception wire form,
 ``SetParameterValueRequest`` structuring, and ``from_dict`` basics -- this file extends into the
-gaps: full round trips, ``ResultDetails``, batches, artifact/pydantic/Path/float/type hooks, the
-``safe_unstructure`` fallback, unknown-type errors, and a registry-wide sweep.
+gaps: full round trips, ``ResultDetails``, batches, pydantic/Path/float/type/enum-union hooks,
+errors for values with no JSON form, unknown-type errors, and a registry-wide sweep.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import pytest
-from griptape.artifacts import TextArtifact
+from griptape.artifacts import ImageUrlArtifact
 
 import griptape_nodes.retained_mode.events as events_pkg
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
@@ -35,7 +35,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventRequestBatch,
     EventResultFailure,
     EventResultSuccess,
+    EventSerializationError,
     Payload,
+    RequestPayload,
     ResultDetail,
     ResultDetails,
     StrictModeViolationDetail,
@@ -47,7 +49,8 @@ from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, S
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
 from griptape_nodes.retained_mode.events.workflow_events import GetWorkflowMetadataResultSuccess
-from griptape_nodes.serialization.converter import converter, safe_unstructure
+from griptape_nodes.serialization.converter import converter
+from griptape_nodes.serialization.values import Value  # noqa: TC001 cattrs reads annotations at runtime
 
 # --- Populate the full PayloadRegistry without constructing an Engine -------------------------
 #
@@ -413,20 +416,6 @@ class TestEventRequestBatchRoundTrip:
         assert second.request.source_parameter_name == "out"
 
 
-class TestSerializableArtifactHook:
-    """SerializableMixin subclasses (griptape artifacts) unstructure via their own to_dict()."""
-
-    def test_artifact_unstructures_via_to_dict_and_restructures_into_the_artifact(self) -> None:
-        artifact = TextArtifact("hold onto this")
-
-        unstructured = converter.unstructure(artifact, TextArtifact)
-        assert unstructured == artifact.to_dict()
-
-        restored = converter.structure(unstructured, TextArtifact)
-        assert isinstance(restored, TextArtifact)
-        assert restored.value == artifact.value
-
-
 class TestPydanticModelFieldHook:
     """A pydantic BaseModel field (e.g. WorkflowMetadata) must unstructure with mode="json"."""
 
@@ -508,43 +497,55 @@ class TestPydanticValidatedOptionalFieldRoundTrip:
         assert restored == request
 
 
-class _RaisesOnUnstructure:
-    """A field value whose custom unstructure hook always raises, to exercise the fallback path."""
+class _NoJsonForm:
+    """A value neither the converter nor JSON knows how to write."""
 
-    def _cattrs_unstructure(self, converter: Any) -> dict[str, Any]:  # noqa: ARG002
-        msg = "this value refuses to serialize"
-        raise RuntimeError(msg)
 
-    def __str__(self) -> str:
-        return "a value that refuses to serialize"
+class _HasToDict:
+    """Not a griptape object, but has the `to_dict()` griptape's JSON encoder patch looks for."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"lossy": True}
 
 
 @dataclasses.dataclass
-class _HasOneBadField:
-    """Local dataclass with one field that raises during unstructure and one that does not."""
-
-    good_field: str
-    bad_field: _RaisesOnUnstructure
+class _PayloadHoldingAnything(RequestPayload):
+    anything: Any = None
 
 
-class TestSafeUnstructureFallback:
-    """safe_unstructure must not let one bad field lose the rest of the object."""
+@dataclasses.dataclass
+class _PayloadHoldingAValue(RequestPayload):
+    value: Value = None
 
-    def test_dataclass_with_one_unserializable_field_keeps_every_other_field(self) -> None:
-        obj = _HasOneBadField(good_field="hello", bad_field=_RaisesOnUnstructure())
 
-        result = safe_unstructure(obj)
+class TestValuesWithNoJsonForm:
+    """A payload holding a value with no JSON form fails to send with an error naming it."""
 
-        assert result["good_field"] == "hello"
-        # The bad field is not lost: the raw value survives even though it could not be unstructured.
-        assert isinstance(result["bad_field"], _RaisesOnUnstructure)
+    def test_to_json_names_the_payload_and_the_type(self) -> None:
+        with pytest.raises(
+            EventSerializationError, match=r"_PayloadHoldingAnything.*'_NoJsonForm' value has no plain-data form"
+        ):
+            _PayloadHoldingAnything(anything=_NoJsonForm()).to_json()
 
-    def test_non_dataclass_falls_back_to_str(self) -> None:
-        obj = _RaisesOnUnstructure()
+    def test_to_dict_is_not_used_as_a_json_form(self) -> None:
+        with pytest.raises(EventSerializationError, match="'_HasToDict' value has no plain-data form"):
+            _PayloadHoldingAnything(anything=_HasToDict()).to_json()
 
-        result = safe_unstructure(obj)
+    def test_event_json_names_the_payload(self) -> None:
+        event = EventRequest(request=_PayloadHoldingAnything(anything=_NoJsonForm()))
 
-        assert result == "a value that refuses to serialize"
+        with pytest.raises(EventSerializationError, match="_PayloadHoldingAnything"):
+            event.json()
+
+    def test_griptape_object_outside_a_value_field_names_the_payload_and_the_object(self) -> None:
+        payload = _PayloadHoldingAnything(anything=ImageUrlArtifact("https://example.com/cat.png"))
+
+        with pytest.raises(EventSerializationError, match=r"_PayloadHoldingAnything.*'ImageUrlArtifact'"):
+            payload.to_json()
+
+    def test_value_field_names_the_class_that_has_no_plain_data_form(self) -> None:
+        with pytest.raises(EventSerializationError, match="'_NoJsonForm' value has no plain-data form"):
+            _PayloadHoldingAValue(value=_NoJsonForm()).to_json()
 
 
 _FAILURE_REASON: Any = SequenceScanFailureReason | FileIOFailureReason

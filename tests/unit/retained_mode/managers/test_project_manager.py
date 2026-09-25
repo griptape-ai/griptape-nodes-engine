@@ -12468,13 +12468,13 @@ class TestProjectVariableResolution:
 
     def test_resolved_snapshot_serializes_cleanly(self) -> None:
         """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
-        from griptape_nodes.serialization.converter import safe_unstructure
+        from griptape_nodes.serialization.converter import converter
 
         pm = self._pm()
         synthetic_ws = Path("/synthetic/ws")
         pm._config_manager.workspace_path = synthetic_ws
         variable = pm.resolve_project_variable("workspace_dir", project_id=None)
-        serialized = safe_unstructure(variable)
+        serialized = converter.unstructure(variable)
         assert serialized["name"] == "workspace_dir"
         # Compare via str(Path): Windows stringifies with backslash separators.
         assert serialized["value"] == str(synthetic_ws)
