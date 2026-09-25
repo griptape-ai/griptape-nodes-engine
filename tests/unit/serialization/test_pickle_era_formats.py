@@ -6,8 +6,9 @@ files in ``fixtures/`` were captured from that engine and stand in for files alr
 artists' disks. Never regenerate them; a later engine writes a different format.
 
 Every fixture holds the same node, ``Holder``, whose values are listed in ``_expected_values``.
-``pickle_era_image.png`` leaves out the two library-defined values; see
-``test_image_metadata_restores_library_defined_values`` for why.
+``pickle_era_image.png`` leaves out the two library-defined values.
+``pickle_era_image_library_values.png`` holds them, pickled under the saving process's own
+``gtn_dynamic_module_*`` name for the library file.
 """
 
 from __future__ import annotations
@@ -118,15 +119,6 @@ class TestPickleEraFormats:
 
         _assert_holder_restored(node, skip=_LIBRARY_DEFINED_VALUES)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DATA-LOSS: image metadata pickles library-defined values under the saving process's "
-            "gtn_dynamic_module_* name, which no other process can import, so the whole flow fails "
-            "to restore. Saved workflows are unaffected: they patch in the stable name first. "
-            "Tracked under #5442."
-        ),
-    )
     @pytest.mark.usefixtures("flow_name")
     def test_image_metadata_restores_library_defined_values(self, engine: Engine) -> None:
         node = _restore_from_image(engine, "pickle_era_image_library_values.png")

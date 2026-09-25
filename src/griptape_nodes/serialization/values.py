@@ -133,6 +133,11 @@ def value_key(encoded: JsonValue) -> str:
     return hashlib.sha256(_canonical_json(encoded).encode("utf-8")).hexdigest()[:32]
 
 
+def has_plain_data_form(cls: type) -> bool:
+    """Whether instances of ``cls`` encode to plain data that decodes back to ``cls``."""
+    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or _adapter_for(cls) is not None
+
+
 def register_value_adapter(adapter: ValueAdapter) -> None:
     """Consult ``adapter`` before every adapter registered earlier and every built-in one."""
     _adapters.insert(0, adapter)
@@ -424,6 +429,8 @@ class _FieldsAdapter:
     def from_state(self, cls: type, state: dict[str, Any]) -> Any:
         return cls(**state)
 
+
+_PLAIN_TYPES: frozenset[type] = frozenset({type(None), bool, int, str, list, dict})
 
 _BUILTIN_DECODERS: dict[type, Any] = {
     tuple: tuple,

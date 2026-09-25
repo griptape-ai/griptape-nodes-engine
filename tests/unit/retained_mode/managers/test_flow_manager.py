@@ -1,8 +1,7 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
-import base64
 import itertools
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
+import json
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -27,11 +26,13 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
+    SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.serialization.commands import encode_commands
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -108,15 +109,29 @@ def image_with_unrelated_metadata() -> Generator[str, None, None]:
         Path(path).unlink(missing_ok=True)
 
 
-@pytest.fixture
-def image_with_flow_commands() -> Generator[str, None, None]:
-    """A PNG whose FLOW_COMMANDS_KEY payload is a valid pickle."""
-    payload = base64.b64encode(pickle.dumps({"sentinel": "flow"})).decode("ascii")
+def _image_with_flow_commands_text(text: str) -> str:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, payload)
+        info.add_text(FLOW_COMMANDS_KEY, text)
         Image.new("RGB", (4, 4), color="blue").save(f, format="PNG", pnginfo=info)
-        path = f.name
+        return f.name
+
+
+@pytest.fixture
+def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
+    """Commands for a flow with nothing in it."""
+    engine.context_manager.push_workflow(workflow_name="image_metadata_workflow")
+    create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=False))
+    assert isinstance(create_result, CreateFlowResultSuccess)
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=create_result.flow_name))
+    assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess)
+    return serialize_result.serialized_flow_commands
+
+
+@pytest.fixture
+def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands) -> Generator[str, None, None]:
+    """A PNG whose FLOW_COMMANDS_KEY payload is flow commands encoded as JSON."""
+    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)))
     try:
         yield path
     finally:
@@ -159,7 +174,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
     def test_returns_commands_when_flow_commands_key_present(
-        self, engine: Engine, image_with_flow_commands: str
+        self, engine: Engine, image_with_flow_commands: str, empty_flow_commands: SerializedFlowCommands
     ) -> None:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
@@ -167,8 +182,29 @@ class TestExtractFlowCommandsFromImageMetadata:
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
-        assert result.serialized_flow_commands == {"sentinel": "flow"}
+        assert result.serialized_flow_commands == empty_flow_commands
         assert result.altered_workflow_state is False
+
+    @pytest.mark.parametrize(
+        ("text", "reason"),
+        [
+            (json.dumps({"sentinel": "flow"}), "not in a layout Griptape Nodes writes"),
+            (json.dumps({"version": 1, "commands": {"flow_name": "x"}}), "incomplete or damaged"),
+            (json.dumps({"version": 2, "commands": {}}), "saved by a later version"),
+            ("not json or base64!", "neither JSON nor base64"),
+        ],
+    )
+    def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
+        path = _image_with_flow_commands_text(text)
+        try:
+            result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
+            )
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert reason in str(result.result_details)
 
 
 class TestAwaitFlowCompletion:

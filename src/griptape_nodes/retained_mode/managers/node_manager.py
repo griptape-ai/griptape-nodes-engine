@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
@@ -240,8 +240,20 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
-from griptape_nodes.serialization.converter import converter
-from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
+from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
+from griptape_nodes.serialization.converter import converter, dump_json
+from griptape_nodes.serialization.legacy_pickle import (
+    LegacyPickleError,
+    read_legacy_clipboard_commands,
+    read_legacy_clipboard_value,
+)
+from griptape_nodes.serialization.values import (
+    JsonValue,
+    ValueEncodeError,
+    decode_value,
+    encode_value,
+    value_key,
+)
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -309,6 +321,10 @@ class SerializedGroupResult:
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
     child_uuids: list[SerializedNodeCommands.NodeUUID]
+
+
+class CopiedNodesError(Exception):
+    """Copied nodes could not be read for pasting. The message completes 'Failed because ...'."""
 
 
 class _NodeInstantiationDeniedError(Exception):
@@ -3835,7 +3851,7 @@ class NodeManager(EngineScoped):
 
         Args:
             group_node: The group node to serialize
-            unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
+            unique_uuid_to_values: Shared pool of encoded parameter values, keyed by content
             serialized_parameter_value_tracker: Tracker for parameter value hashes
             serialize_all_parameter_values: If True, capture every parameter value on the group and
                 on each child, not just the ones the ordinary save condition would record
@@ -4528,16 +4544,16 @@ class NodeManager(EngineScoped):
             set_lock_commands_per_node=lock_commands,
         )
 
-        # The pool holds encoded values. The clipboard payload still carries each one as a latin-1
-        # pickle string, the shape the editor passes back on paste.
-        encoded_values = {uuid: pickle.dumps(value).decode("latin1") for uuid, value in unique_uuid_to_values.items()}
-
-        # Pickle the commands object and encode as latin-1 string for transport
-        pickled_commands_bytes = pickle.dumps(final_result)
-        pickled_commands_string = pickled_commands_bytes.decode("latin1")
+        try:
+            commands_text = dump_json(encode_commands(final_result))
+        except ValueEncodeError as error:
+            details = f"Attempted to copy {len(request.nodes_to_serialize)} nodes. Failed because {error}"
+            return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
+        # The pool already holds encoded values, so each one only needs to become text.
+        serialized_values = {uuid: json.dumps(value) for uuid, value in unique_uuid_to_values.items()}
         return SerializeSelectedNodesToCommandsResultSuccess(
-            pickled_commands_string,  # Send pickled string instead of object
-            pickled_values=encoded_values,
+            serialized_selected_node_commands=commands_text,
+            pickled_values=serialized_values,
             node_names_serialized=node_names_in_order,
             result_details=f"Successfully serialized {len(request.nodes_to_serialize)} selected nodes to commands.",
         )
@@ -4546,31 +4562,12 @@ class NodeManager(EngineScoped):
         self,
         request: DeserializeSelectedNodesFromCommandsRequest,
     ) -> ResultPayload:
-        # Decode latin-1 encoded pickled strings back to Python objects
-        decoded_values = {}
-        if request.pickled_values:
-            for uuid, latin1_string in request.pickled_values.items():
-                if isinstance(latin1_string, str):
-                    try:
-                        # Decode: latin-1 string → bytes → unpickled object
-                        pickled_bytes = latin1_string.encode("latin1")
-                        decoded_values[uuid] = pickle.loads(pickled_bytes)  # noqa: S301 Expecting this from the GUI.
-                    except Exception:
-                        details = f"Failed to unpickle parameter value for UUID {uuid}"
-                        logger.warning(details)
-                        # Keep original value if unpickling fails
-                        decoded_values[uuid] = latin1_string
-                else:
-                    # Not a string, keep as-is
-                    decoded_values[uuid] = latin1_string
-
-        # Unpickle the commands string into SerializedSelectedNodesCommands
         try:
-            pickled_commands_bytes = request.deserialize_commands.encode("latin1")
-            commands = pickle.loads(pickled_commands_bytes)  # noqa: S301 Expecting this from the GUI.
-        except Exception as e:
-            details = f"Failed to unpickle commands: {e}"
+            commands = self._read_copied_commands(request.deserialize_commands)
+        except CopiedNodesError as error:
+            details = f"Attempted to paste nodes. Failed because {error}."
             return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
+        copied_values = self._read_copied_values(request.pickled_values)
         connections = commands.serialized_connection_commands
         node_uuid_to_name = {}
         created_node_names: list[str] = []
@@ -4642,10 +4639,9 @@ class NodeManager(EngineScoped):
                     param_request = parameter_command.set_parameter_value_command
                     # Set the Node name
                     param_request.node_name = result.node_name
-                    # Set the new value from decoded_values
-                    if decoded_values and parameter_command.unique_value_uuid in decoded_values:
+                    if parameter_command.unique_value_uuid in copied_values:
                         # Decoding builds a fresh object each time, so repeated pastes share nothing.
-                        param_request.value = decode_value(decoded_values[parameter_command.unique_value_uuid])
+                        param_request.value = decode_value(copied_values[parameter_command.unique_value_uuid])
                         set_parameter_result = self.engine.handle_request(parameter_command.set_parameter_value_command)
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
@@ -4678,6 +4674,41 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully deserialized {len(node_uuid_to_name)} nodes from commands.",
         )
 
+    def _read_copied_commands(self, text: str) -> SerializedSelectedNodesCommands:
+        """Read copied node commands, sent as JSON, or as pickle by earlier engines.
+
+        Raises:
+            CopiedNodesError: The text holds no readable node commands.
+        """
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                return read_legacy_clipboard_commands(text, self.engine.library_manager.stable_module_names())
+            except LegacyPickleError as error:
+                raise CopiedNodesError(str(error)) from error
+        try:
+            return decode_commands(data, SerializedSelectedNodesCommands)
+        except CommandsFormatError as error:
+            raise CopiedNodesError(str(error)) from error
+
+    def _read_copied_values(self, texts: dict[str, str]) -> dict[str, JsonValue]:
+        """Read copied parameter values, keeping them encoded until each use decodes its own copy.
+
+        A value that cannot be read is left out, so its parameter pastes with its default.
+        """
+        values: dict[str, JsonValue] = {}
+        library_modules = self.engine.library_manager.stable_module_names()
+        for uuid, text in texts.items():
+            try:
+                values[uuid] = json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    values[uuid] = read_legacy_clipboard_value(text, library_modules)
+                except LegacyPickleError as error:
+                    logger.warning("Attempted to paste a copied parameter value. Failed because %s.", error)
+        return values
+
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
         serialize_result = self.engine.handle_request(
             SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=request.nodes_to_duplicate)
@@ -4686,7 +4717,6 @@ class NodeManager(EngineScoped):
             details = "Failed to serialized selected nodes."
             return DuplicateSelectedNodesResultFailure(result_details=details)
 
-        # Pass the pickled commands and values to deserialization
         deserialize_request = DeserializeSelectedNodesFromCommandsRequest(
             deserialize_commands=serialize_result.serialized_selected_node_commands,
             pickled_values=serialize_result.pickled_values,

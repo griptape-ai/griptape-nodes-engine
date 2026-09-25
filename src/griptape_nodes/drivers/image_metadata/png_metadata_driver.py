@@ -6,6 +6,10 @@ from PIL import Image, PngImagePlugin
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
 
+# Text longer than this, such as an embedded workflow, is stored compressed. Shorter text stays
+# uncompressed, where image viewers that only show plain text chunks can still read it.
+_COMPRESS_TEXT_LONGER_THAN = 1024
+
 
 class PngMetadataDriver(BaseImageMetadataDriver):
     """Bidirectional driver for PNG metadata using text chunks.
@@ -47,11 +51,12 @@ class PngMetadataDriver(BaseImageMetadataDriver):
             # Only preserve string key-value pairs (text chunks), skip binary data
             # Don't preserve keys that will be overwritten by new metadata
             if isinstance(key, str) and isinstance(value, str) and key not in metadata:
-                png_info.add_text(key, value)
+                png_info.add_text(key, value, zip=len(value) > _COMPRESS_TEXT_LONGER_THAN)
 
         # Add new metadata
         for key, value in metadata.items():
-            png_info.add_text(key, str(value))
+            text = str(value)
+            png_info.add_text(key, text, zip=len(text) > _COMPRESS_TEXT_LONGER_THAN)
 
         # Save with metadata
         output_buffer = BytesIO()
