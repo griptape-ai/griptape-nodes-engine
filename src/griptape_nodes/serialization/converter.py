@@ -6,6 +6,7 @@ import types
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin
 
@@ -16,6 +17,7 @@ from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.serialization.type_names import resolve_type_name, type_name
 from griptape_nodes.serialization.values import DisplayValue, Value, decode_value, encode_for_display, encode_value
 
 logger = logging.getLogger(__name__)
@@ -117,8 +119,8 @@ def _structure_element_entry(key: str, item: Any) -> Any:
 converter.register_unstructure_hook(ElementDocument, _unstructure_element_document)
 converter.register_structure_hook(ElementDocument, _structure_element_document)
 
-# Bare `type` references (e.g. provider_class: type)
-converter.register_unstructure_hook(type, lambda t: f"{t.__module__}.{t.__qualname__}")
+# Bare `type` references (e.g. provider_class: type), named the way the value codec names classes.
+converter.register_unstructure_hook(type, type_name)
 
 # ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
 # never set by a caller, so the template is the entire value: sending the segments would send a
@@ -133,6 +135,8 @@ converter.register_structure_hook(Value, lambda data, _: decode_value(data))
 converter.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
 
 converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
+
+converter.register_structure_hook(type, lambda name, _: resolve_type_name(name))
 
 # The JSON preset strict mode rejects ints for float fields, but JSON has
 # no distinction between int and float, so coerce int -> float on input.
@@ -161,6 +165,33 @@ converter.register_structure_hook_func(
     _is_json_primitive_union,
     lambda v, _: v,
 )
+
+
+# Unions of enums (e.g. `SequenceScanFailureReason | FileIOFailureReason`) arrive as a bare member
+# value, which cattrs cannot attribute to one enum. The first enum with that value claims it.
+def _enum_union_members(cls: Any) -> list[type[Enum]] | None:
+    origin = get_origin(cls)
+    if origin is not Union and origin is not types.UnionType:
+        return None
+    args = [arg for arg in get_args(cls) if arg is not type(None)]
+    if not args or not all(isinstance(arg, type) and issubclass(arg, Enum) for arg in args):
+        return None
+    return args
+
+
+def _structure_enum_union(value: Any, cls: Any) -> Enum | None:
+    if value is None and type(None) in get_args(cls):
+        return None
+    for enum_cls in _enum_union_members(cls) or []:
+        try:
+            return enum_cls(value)
+        except ValueError:
+            continue
+    msg = f"{value!r} is not a member of any of {cls}."
+    raise ValueError(msg)
+
+
+converter.register_structure_hook_func(lambda cls: _enum_union_members(cls) is not None, _structure_enum_union)
 
 # Pydantic BaseModel subclasses
 converter.register_structure_hook_func(
