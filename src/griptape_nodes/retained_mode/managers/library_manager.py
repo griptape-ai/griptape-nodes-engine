@@ -333,7 +333,8 @@ class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Lo
 
     Saved workflows reference node-file classes through their stable namespace
     (``griptape_nodes.node_libraries.<lib>.<file>``), both as ``from`` imports emitted into the
-    generated Python and inside pickled parameter values. With eager node loading those modules
+    generated Python and in the ``$type`` tags of saved parameter values (and, in files saved by
+    earlier engines, inside pickled ones). With eager node loading those modules
     are already aliased into ``sys.modules`` when the library registers, so the imports resolve.
     With lazy loading nothing is imported until a node class is first resolved, so opening a
     workflow before then would fail with ``No module named 'griptape_nodes.node_libraries'``.
@@ -3919,6 +3920,10 @@ class LibraryManager(EngineScoped):
         del self._library_to_stable_modules[library_key]
         details = f"Completed cleanup of stable aliases for library: '{library_name}'."
         logger.debug(details)
+
+    def stable_module_names(self) -> set[str]:
+        """Return the stable namespace of every registered library file, whether or not it has loaded yet."""
+        return {*self._pending_stable_module_loaders, *self._stable_to_dynamic_module_mapping}
 
     def get_stable_namespace_for_dynamic_module(self, dynamic_module_name: str) -> str | None:
         """Get the stable namespace for a dynamic module name.

@@ -8,7 +8,6 @@ deferred loader and imports on first use, so a broken node is not reported until
 from __future__ import annotations
 
 import importlib
-import pickle  # noqa: TID251 pickle-era saved workflows unpickle stable namespace references
 import sys
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -32,6 +31,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_modul
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibrarySettings
+from griptape_nodes.serialization.type_names import resolve_type_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -272,7 +272,7 @@ class TestStableNamespaceImportUnderLazyLoading:
     """Lazily registered node files must be importable via their stable namespace.
 
     Saved workflows reference library classes through
-    ``griptape_nodes.node_libraries.<lib>.<file>`` imports and pickled values. With lazy
+    ``griptape_nodes.node_libraries.<lib>.<file>`` imports and saved values' type tags. With lazy
     loading nothing is in ``sys.modules`` at registration time, so these imports resolve
     through the StableNamespaceImportFinder meta-path hook instead.
     """
@@ -318,14 +318,12 @@ class TestStableNamespaceImportUnderLazyLoading:
         library = LibraryRegistry.get_library("Lazy Flag Test Library")
         assert library.get_node_class("GoodNode") is module.GoodNode
 
-    def test_unpickle_resolves_stable_namespace_reference(self, engine: Engine, tmp_path: Path) -> None:
+    def test_type_name_resolves_stable_namespace_reference(self, engine: Engine, tmp_path: Path) -> None:
         self._register_lazy_library(engine, tmp_path)
         assert self.GOOD_STABLE_NAMESPACE not in sys.modules
 
-        # A GLOBAL-opcode pickle referencing the stable namespace, as found inside saved
-        # workflow parameter values. Unpickling must import the module on demand.
-        payload = f"c{self.GOOD_STABLE_NAMESPACE}\nGoodNode\n.".encode()
-        node_class = pickle.loads(payload)  # noqa: S301 - crafted in-test payload
+        # Saved parameter values name their class by stable namespace in their "$type" tag.
+        node_class = resolve_type_name(f"{self.GOOD_STABLE_NAMESPACE}:GoodNode")
 
         assert node_class.__name__ == "GoodNode"
 

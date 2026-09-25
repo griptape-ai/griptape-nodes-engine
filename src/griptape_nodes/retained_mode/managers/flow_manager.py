@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
+import json
 import logging
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
@@ -178,7 +177,14 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
-from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
+from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands
+from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_legacy_image_flow_commands
+from griptape_nodes.serialization.values import (
+    ValueEncodeError,
+    decode_value,
+    encode_value,
+    value_key,
+)
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -254,6 +260,13 @@ class MultiNodeEndNodeResult(NamedTuple):
     parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter]
     alter_parameter_commands: list[AlterParameterDetailsRequest]
     end_node_name: str
+
+
+class ImageFlowCommandsError(Exception):
+    """An image's metadata holds flow commands this engine cannot read.
+
+    The message completes "Failed because ...".
+    """
 
 
 class FlowDeserializationError(Exception):
@@ -4601,6 +4614,9 @@ class FlowManager(EngineScoped):
 
         # An image without embedded flow commands is a valid state, not an error.
         metadata = pil_image.info if hasattr(pil_image, "info") else {}
+        # Closed now: a failure reading the commands can keep this frame, and the open file, alive
+        # until garbage collection, and Windows won't delete or replace an open file.
+        pil_image.close()
         if not metadata:
             return ExtractFlowCommandsFromImageMetadataResultSuccess(
                 result_details=f"Image has no metadata: {file_url_or_path}",
@@ -4617,25 +4633,11 @@ class FlowManager(EngineScoped):
                 altered_workflow_state=False,
             )
 
-        encoded_flow_commands = metadata[FLOW_COMMANDS_KEY]
-
-        # Decode base64
         try:
-            pickled_data = base64.b64decode(encoded_flow_commands)
-        except Exception as e:
+            serialized_flow_commands = self._read_image_flow_commands(metadata[FLOW_COMMANDS_KEY])
+        except ImageFlowCommandsError as error:
             return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Failed to decode base64 flow commands: {e}",
-                file_path=file_url_or_path,
-            )
-
-        # Unpickle SerializedFlowCommands
-        try:
-            # Pickle is safe here: we're deserializing workflow data from images saved by this application
-            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands
-            serialized_flow_commands = pickle.loads(pickled_data)  # noqa: S301
-        except Exception as e:
-            return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Failed to unpickle flow commands: {e}",
+                result_details=f"Attempted to read the workflow saved in image '{file_url_or_path}'. Failed because {error}.",
                 file_path=file_url_or_path,
             )
 
@@ -4667,6 +4669,24 @@ class FlowManager(EngineScoped):
             serialized_flow_commands=serialized_flow_commands,
             altered_workflow_state=False,
         )
+
+    def _read_image_flow_commands(self, text: str) -> SerializedFlowCommands:
+        """Read the flow commands an image's metadata holds as JSON, or as pickle from earlier engines.
+
+        Raises:
+            ImageFlowCommandsError: The text holds no readable flow commands.
+        """
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                return read_legacy_image_flow_commands(text, self.engine.library_manager.stable_module_names())
+            except LegacyPickleError as error:
+                raise ImageFlowCommandsError(str(error)) from error
+        try:
+            return decode_commands(data, SerializedFlowCommands)
+        except CommandsFormatError as error:
+            raise ImageFlowCommandsError(str(error)) from error
 
     def check_for_existing_running_flow(self) -> bool:
         if self._global_control_flow_machine is None:
