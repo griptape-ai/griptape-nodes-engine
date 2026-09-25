@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import base64
 import logging
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -19,7 +17,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
-from griptape_nodes.serialization.values import encode_for_display
+from griptape_nodes.serialization.commands import encode_commands
+from griptape_nodes.serialization.converter import dump_json
+from griptape_nodes.serialization.values import ValueEncodeError, encode_for_display
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -61,44 +61,36 @@ def _serialize_node(node_name: str, engine: Engine) -> str | None:
 
 
 def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
-    """Serialize a flow to pickle + base64 encoded commands.
+    """Serialize a flow's commands to JSON for image metadata.
 
     Args:
         engine: The engine whose request bus and context manager perform the serialization
         flow_name: Name of the flow to serialize (None for current context flow)
 
     Returns:
-        Base64-encoded pickle string of serialized flow commands, or None if serialization fails
+        The flow's commands as JSON text, or None if serialization fails
     """
-    # Validation: Check if we have a flow context
     if flow_name is None and not engine.context_manager.has_current_flow():
         logger.warning("Cannot serialize flow: no current flow context available")
         return None
 
-    # Create serialize request
     serialize_request = SerializeFlowToCommandsRequest(
         flow_name=flow_name,
         include_create_flow_command=False,
     )
     serialize_result = engine.handle_request(serialize_request)
-
-    # Validation: Check if serialization succeeded
     if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
         logger.warning("Failed to serialize flow '%s' to commands", flow_name or "current")
         return None
 
-    # Success path: Serialize using pickle + base64
     try:
-        serialized_flow_commands = serialize_result.serialized_flow_commands
-        # Pickle is safe here: serializing workflow data for metadata injection into saved images
-        # The data will only be deserialized by this same application
-        pickled_data = pickle.dumps(serialized_flow_commands)
-        encoded_data = base64.b64encode(pickled_data).decode("ascii")
-    except Exception as e:
-        logger.warning("Failed to pickle/encode flow '%s': %s", flow_name or "current", e)
+        text = dump_json(encode_commands(serialize_result.serialized_flow_commands), separators=(",", ":"))
+    except ValueEncodeError as error:
+        logger.warning(
+            "Attempted to embed flow '%s' in image metadata. Failed because %s", flow_name or "current", error
+        )
         return None
-    else:
-        return encoded_data
+    return text
 
 
 def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterCollection | None:
@@ -304,7 +296,7 @@ def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
         metadata[f"{METADATA_NAMESPACE}node_name"] = ", ".join(resolving_nodes)
 
     # Serialize the entire flow to commands. Only needed for embedded image metadata,
-    # not the sidecar (the pickle+base64 blob is too large and not useful in JSON).
+    # not the sidecar (the command tree is too large to be useful there).
     flow_commands = _serialize_flow(engine)
     if flow_commands:
         metadata[FLOW_COMMANDS_KEY] = flow_commands

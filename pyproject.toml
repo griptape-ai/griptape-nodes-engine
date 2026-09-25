@@ -175,6 +175,9 @@ ignore = [
   "TID251",
 ]
 
+# The one reader of pickle-era data. Delete it, and this entry, to drop that support.
+"src/griptape_nodes/serialization/legacy_pickle.py" = ["TID251"]
+
 # TID251 allowlist for the GriptapeNodes facade. Two groups, and the difference matters.
 #
 # Group 1 -- legitimate facade users. These are process entry points or the public

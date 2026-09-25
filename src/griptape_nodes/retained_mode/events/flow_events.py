@@ -447,9 +447,10 @@ class ExtractFlowCommandsFromImageMetadataRequest(RequestPayload):
     """Extract flow commands from PNG image metadata.
 
     This request reads a PNG image file, extracts the embedded workflow metadata
-    (specifically the gtn_flow_commands field), decodes it from base64, unpickles it,
-    and returns the SerializedFlowCommands object. Optionally, it can automatically
-    deserialize the flow by calling DeserializeFlowFromCommandsRequest.
+    (specifically the gtn_flow_commands field), decodes it, and returns the
+    SerializedFlowCommands object. Images saved by earlier engines, which stored it as
+    pickle, still load. Optionally, it can automatically deserialize the flow by calling
+    DeserializeFlowFromCommandsRequest.
 
     Use when: Loading flow commands from an exported image, inspecting workflow
     structure before deserialization, extracting flows shared as PNG files.
