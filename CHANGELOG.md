@@ -24,6 +24,10 @@ the engine's request API from working without edits. Migration steps live in
   `GetVariablesRequest`, and `ListVariablesRequest`. A value sent in the same form to
   `SetParameterValueRequest` or `SetVariableValueRequest` is set with that exact type. See
   [Parameter values](docs/guides/mcp/external_clients.md#parameter-values).
+- **Breaking:** In `SerializeFlowToCommandsResultSuccess` and
+  `ExtractFlowCommandsFromImageMetadataResultSuccess`, each node's `element_modification_commands`
+  lists `{"request_type": ..., "request": {...}}` entries, the form `EventRequestBatch` takes,
+  instead of each request's fields alone, so each request reads back as its own type.
 - Saved workflow files store parameter values as readable data instead of pickle, and saving an
   unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
   by earlier versions still open. A workflow saved by this version does not open in earlier ones.
@@ -55,6 +59,9 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- `DeserializeFlowFromCommandsRequest` and `SaveWorkflowFileFromSerializedFlowRequest` sent as JSON
+  read their nested node, connection, and parameter commands back as commands, instead of as plain
+  dicts the request could not use.
 - Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
   the same types, instead of as plain dicts.
 - A loop or subflow run in a separate process no longer hands back one parameter's value in place

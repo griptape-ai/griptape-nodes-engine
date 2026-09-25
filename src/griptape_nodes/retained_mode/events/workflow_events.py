@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -15,12 +15,13 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import ExecutionPayload
+from griptape_nodes.retained_mode.events.flow_events import (
+    # Re-exported: saved workflows and node libraries import it from here.
+    ImportWorkflowAsReferencedSubFlowRequest as ImportWorkflowAsReferencedSubFlowRequest,  # noqa: PLC0414
+)
+from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-
-if TYPE_CHECKING:
-    # Circular import: flow_events <-> workflow_events
-    from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 
 
 class WorkflowStatus(StrEnum):
@@ -401,23 +402,6 @@ class SaveWorkflowRequest(RequestPayload):
     display_name: str | None = None
     create_versioned: bool = False
     overwrite_existing: bool = True
-
-
-@dataclass
-@PayloadRegistry.register
-class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
-    """Import a workflow as a referenced sub-flow.
-
-    Use when: Reusing workflows as components, creating modular workflows,
-    importing workflow templates, building composite workflows.
-
-    Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
-    """
-
-    workflow_name: str
-    flow_name: str | None = None  # If None, import into current context flow
-    imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
-    track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
 
 
 @dataclass
@@ -1190,7 +1174,7 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
     Results: SaveWorkflowFileFromSerializedFlowResultSuccess (with file path) | SaveWorkflowFileFromSerializedFlowResultFailure (save error)
     """
 
-    serialized_flow_commands: "SerializedFlowCommands"
+    serialized_flow_commands: SerializedFlowCommands
     file_name: str
     file_path: str | None = None
     creation_date: datetime | None = None

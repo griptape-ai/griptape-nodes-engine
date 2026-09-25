@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.node_library.library_registry import (
@@ -20,8 +21,6 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from griptape_nodes.exe_types.core_types import Parameter
 
     # Circular import: library_events -> library_manager -> library_events
