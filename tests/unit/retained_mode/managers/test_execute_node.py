@@ -2,6 +2,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -14,6 +15,7 @@ from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+from griptape_nodes.serialization.values import encode_value
 
 _LIBRARY_REGISTRY_CREATE_NODE_PATH = "griptape_nodes.retained_mode.managers.node_manager.LibraryRegistry.create_node"
 
@@ -570,3 +572,102 @@ class TestExecuteNodeWorkerRoute:
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.aprocess.assert_awaited_once()
         wm.route_to_worker.assert_not_awaited()
+
+
+class _NoPlainDataForm:
+    """A value the value codec cannot encode."""
+
+
+def _make_worker_owned_node() -> MagicMock:
+    node = _make_mock_node("worker_node")
+    node.metadata = {"library": "worker_library"}
+    return node
+
+
+def _make_orchestrator_library_manager() -> MagicMock:
+    lib_mgr = MagicMock()
+    lib_mgr.is_worker = False
+    lib_mgr._is_worker = False
+    lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
+    return lib_mgr
+
+
+class TestExecuteNodeWorkerValues:
+    """Values cross the worker boundary as tagged plain data and arrive as the same values."""
+
+    @pytest.mark.asyncio
+    async def test_worker_outputs_arrive_as_values(self) -> None:
+        artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
+        wm = MagicMock()
+        wm.route_to_worker = AsyncMock(
+            return_value={
+                "result_type": ExecuteNodeResultSuccess.__name__,
+                "result": {
+                    "parameter_output_values": {"image": encode_value(artifact), "pair": encode_value((1, 2))},
+                    "result_details": "ok",
+                },
+            }
+        )
+        lib_mgr = _make_orchestrator_library_manager()
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=_make_worker_owned_node()),
+            library_manager=lib_mgr,
+            worker_manager=wm,
+        )
+
+        result = await node_manager.on_execute_node_request(
+            ExecuteNodeRequest(
+                node_name="worker_node",
+                node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert type(result.parameter_output_values["image"]) is ImageUrlArtifact
+        assert result.parameter_output_values["image"].to_dict() == artifact.to_dict()
+        assert result.parameter_output_values["pair"] == (1, 2)
+
+    @pytest.mark.asyncio
+    async def test_input_with_no_plain_data_form_fails_before_reaching_the_worker(self) -> None:
+        wm = MagicMock()
+        wm.route_to_worker = AsyncMock()
+        lib_mgr = _make_orchestrator_library_manager()
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=_make_worker_owned_node()),
+            library_manager=lib_mgr,
+            worker_manager=wm,
+        )
+
+        result = await node_manager.on_execute_node_request(
+            ExecuteNodeRequest(
+                node_name="worker_node",
+                parameter_values={"handle": _NoPlainDataForm()},
+                node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "'handle'" in str(result.result_details)
+        assert "_NoPlainDataForm" in str(result.result_details)
+        wm.route_to_worker.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_output_with_no_plain_data_form_fails_on_the_worker(self) -> None:
+        mock_node = _make_mock_node()
+        mock_node.parameter_output_values = {"handle": _NoPlainDataForm(), "text": "fine"}
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=None),
+            library_manager=_make_mock_library_manager(is_worker=True),
+        )
+
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node):
+            result = await node_manager.on_execute_node_request(
+                ExecuteNodeRequest(
+                    node_name="test_node",
+                    node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
+                )
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "'handle'" in str(result.result_details)
+        assert "'text'" not in str(result.result_details)
