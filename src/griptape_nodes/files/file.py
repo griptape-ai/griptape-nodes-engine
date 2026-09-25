@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceFailurePolicy
 from griptape_nodes.files.path_utils import (
     is_url,
     parse_file_uri,
@@ -805,18 +806,24 @@ class File:
     def _build_provenance(self) -> ProvenanceContent | None:
         """Build the provenance election for writes through this file.
 
-        Caller-provided provenance takes full precedence. A legacy caller that
-        supplied only ``file_metadata`` gets its situation carried into a
-        default election. Otherwise a MacroPath-backed file elects capture with
-        a minimal situation context (macro template + variables, mirroring the
-        old sidecar behavior); a plain-string path elects nothing.
+        Caller-provided provenance takes full precedence and resolves its
+        failure policy through the project default. The two SYNTHESIZED
+        elections below (legacy ``file_metadata`` carried forward, and the
+        MacroPath minimal context mirroring the old sidecar behavior) are
+        warn-and-continue: nobody elected provenance on these writes, so a
+        record failure must not start hard-failing saves that used to be
+        best-effort. A plain-string path elects nothing.
         """
         if self._provenance is not None:
             return self._provenance
         if self._file_metadata is not None:
-            return ProvenanceContent(situation=self._file_metadata.situation)
+            return ProvenanceContent(
+                failure_policy=ProvenanceFailurePolicy.WARN_AND_CONTINUE,
+                situation=self._file_metadata.situation,
+            )
         if isinstance(self._file_path, MacroPath):
             return ProvenanceContent(
+                failure_policy=ProvenanceFailurePolicy.WARN_AND_CONTINUE,
                 situation=SituationMetadata(
                     macro=self._file_path.parsed_macro.template,
                     variables={k: str(v) for k, v in self._file_path.variables.items()},

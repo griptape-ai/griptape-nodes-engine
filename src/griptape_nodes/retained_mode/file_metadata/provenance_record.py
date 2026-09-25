@@ -46,6 +46,9 @@ BY_PATH_DIR_NAME = "by-path"
 BY_HASH_DIR_NAME = "by-hash"
 
 CONTENT_HASH_ALGORITHM = "blake2b-256"
+
+# A blake2b-256 digest is 32 bytes = 64 hex characters.
+CONTENT_HASH_HEX_LENGTH = 64
 _CONTENT_HASH_DIGEST_SIZE = 32
 # Fan-out sharding for by-hash/: first N hex chars of the digest become an
 # intermediate directory so one directory never accumulates every hash.
@@ -393,14 +396,26 @@ def hash_content(data: bytes) -> str:
 def hash_hex_from_content_hash(content_hash: str) -> str:
     """Extract the bare hex digest from a 'algorithm:<hex>' content-hash string.
 
+    The digest is validated as exactly 64 lowercase hex characters, not just
+    prefix-checked: it becomes path segments under by-hash/, and a
+    caller-supplied 'blake2b-256:../../..' must never walk out of the store.
+
     Raises:
-        ValueError: If the value does not carry the expected algorithm prefix.
+        ValueError: If the value does not carry the expected algorithm prefix,
+            or the digest is not exactly 64 lowercase hex characters.
     """
     prefix = f"{CONTENT_HASH_ALGORITHM}:"
     if not content_hash.startswith(prefix):
         msg = f"Content hash '{content_hash}' does not use the expected '{prefix}' form"
         raise ValueError(msg)
-    return content_hash.removeprefix(prefix)
+    hex_digest = content_hash.removeprefix(prefix)
+    if len(hex_digest) != CONTENT_HASH_HEX_LENGTH or any(c not in "0123456789abcdef" for c in hex_digest):
+        msg = (
+            f"Content hash '{content_hash}' does not carry a valid digest: expected exactly "
+            f"{CONTENT_HASH_HEX_LENGTH} lowercase hex characters after '{prefix}'"
+        )
+        raise ValueError(msg)
+    return hex_digest
 
 
 def by_hash_relative_path(content_hash: str, record_id: str) -> str:

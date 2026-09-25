@@ -375,6 +375,8 @@ Scans are O(records) by design (no index); the central root and filename prefilt
 
 ## 10. Cloud backend
 
+> **Status: deferred follow-up — [#5662](https://github.com/griptape-ai/griptape-nodes-engine/issues/5662).** The initial implementation (#5658) is local-only: the cloud driver drops the election and no post-upload capture runs. Nothing below is blocked on design — the cloud path reuses the record schema and store layout verbatim.
+
 Today the Griptape Cloud storage driver skips all metadata — cloud artifacts have zero provenance. Under this design:
 
 - `StaticFilesManager` (not the driver — drivers stay engine-agnostic) invokes capture after a successful upload.

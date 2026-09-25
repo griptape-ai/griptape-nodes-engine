@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceFailurePolicy
 from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
 from griptape_nodes.files.file import (
     File,
@@ -1008,6 +1009,9 @@ class TestFileBuildProvenance:
 
         assert isinstance(result, ProvenanceContent)
         assert result.situation is metadata.situation
+        # Synthesized election: nobody elected provenance, so a record failure
+        # must not hard-fail a save that used to be best-effort sidecar.
+        assert result.failure_policy == ProvenanceFailurePolicy.WARN_AND_CONTINUE
 
     def test_returns_election_for_macro_path(self) -> None:
         from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
@@ -1023,6 +1027,8 @@ class TestFileBuildProvenance:
         assert result.situation is not None
         assert result.situation.macro == "{outputs}/image.png"
         assert result.situation.variables == {"outputs": "/workspace/outputs"}
+        # Synthesized election (see the legacy-metadata test): warn, never fail.
+        assert result.failure_policy == ProvenanceFailurePolicy.WARN_AND_CONTINUE
 
     def test_macro_path_election_includes_all_variables(self) -> None:
         macro_path = MacroPath(

@@ -1090,6 +1090,32 @@ class TestLookupDegradation:
     def test_find_record_by_hash_with_no_pointers_is_none(self, engine: Engine) -> None:
         assert engine.provenance_manager._find_record_by_hash(hash_content(b"never saved")) is None
 
+    def test_hash_match_judges_staleness_against_the_queried_file(self, engine: Engine, temp_dir: Path) -> None:
+        """A moved copy is judged by ITS bytes; the overwritten original says nothing about it."""
+        original = temp_dir / "hero.txt"
+        first = engine.handle_request(
+            WriteFileRequest(file_path=str(original), content="take one", provenance=_sample_provenance())
+        )
+        assert isinstance(first, WriteFileResultSuccess)
+        assert first.provenance is not None
+        moved_copy = temp_dir / "kept_aside.txt"
+        moved_copy.write_bytes(original.read_bytes())
+        second = engine.handle_request(
+            WriteFileRequest(file_path=str(original), content="take two", provenance=_sample_provenance())
+        )
+        assert isinstance(second, WriteFileResultSuccess)
+
+        result = engine.handle_request(GetProvenanceForArtifactRequest(macro_path=str(moved_copy)))
+        assert isinstance(result, GetProvenanceForArtifactResultSuccess)
+        assert result.matched_by == ProvenanceMatchOrigin.HASH
+        assert result.record.record_id == first.provenance.record_id
+        # The copy's bytes match its record even though the original moved on.
+        assert result.is_stale is False
+        # And record_path names the record's REAL home (the original's mirror), not
+        # a never-written path under the copy's location.
+        assert Path(result.record_path).is_file()
+        assert "hero.txt" in result.record_path
+
     def test_staleness_is_unjudgeable_when_the_artifact_vanished(self, engine: Engine, temp_dir: Path) -> None:
         file_path = temp_dir / "hero.txt"
         write_result = engine.handle_request(

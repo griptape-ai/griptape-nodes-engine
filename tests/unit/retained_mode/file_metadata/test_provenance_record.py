@@ -67,6 +67,21 @@ class TestContentHash:
         with pytest.raises(ValueError, match="does not use the expected"):
             hash_hex_from_content_hash("sha256:abcdef")
 
+    def test_traversal_shaped_digest_raises(self) -> None:
+        # The digest becomes by-hash/ path segments; a caller-supplied
+        # '../../..' must never walk out of the store root.
+        with pytest.raises(ValueError, match="does not carry a valid digest"):
+            hash_hex_from_content_hash("blake2b-256:../../../etc/passwd")
+
+    def test_wrong_length_digest_raises(self) -> None:
+        with pytest.raises(ValueError, match="does not carry a valid digest"):
+            hash_hex_from_content_hash("blake2b-256:abc123")
+
+    def test_uppercase_digest_raises(self) -> None:
+        digest = "A" * 64
+        with pytest.raises(ValueError, match="does not carry a valid digest"):
+            hash_hex_from_content_hash(f"blake2b-256:{digest}")
+
 
 class TestStoreLayoutPaths:
     def test_by_hash_path_is_sharded_and_time_sorted(self) -> None:

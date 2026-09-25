@@ -374,7 +374,10 @@ class ProvenanceManager(EngineScoped):
         else:
             record = records[0]
 
-        record_dir = self._record_dir_for_path(artifact_path)
+        # Derive the on-disk location from the record's OWN path: on a hash
+        # match the record lives under the ORIGINAL location's by-path mirror,
+        # not the queried (moved/renamed) path's.
+        record_dir = self._record_dir_for_path(Path(record.artifact.path_at_save))
         record_path = str(record_dir / f"{record.record_id}.yaml") if record_dir is not None else ""
         return GetProvenanceForArtifactResultSuccess(
             record=ProvenanceRecordHeader.from_record(record),
@@ -684,12 +687,15 @@ class ProvenanceManager(EngineScoped):
         return records
 
     def _compute_is_stale(self, record: ProvenanceRecord, artifact_path: Path) -> bool | None:
-        """Whether the artifact's live bytes still match the record; None when unjudgeable."""
-        live_path = Path(record.artifact.path_at_save)
-        if not live_path.exists():
-            live_path = artifact_path
+        """Whether the QUERIED file's live bytes still match the record; None when unjudgeable.
+
+        Always judged against the path the caller asked about, never the
+        record's original location: on a hash match (moved/renamed file) the
+        original path may have been overwritten with different bytes since,
+        which says nothing about the file in hand.
+        """
         try:
-            live_hash = hash_content(live_path.read_bytes())
+            live_hash = hash_content(artifact_path.read_bytes())
         except OSError:
             return None
         return live_hash != record.artifact.content_hash
