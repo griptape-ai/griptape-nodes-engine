@@ -201,10 +201,12 @@ class TestPackagesShadowingTheEngine:
 
     def test_the_oldest_copy_across_environments_is_the_one_named(self) -> None:
         """A library's two environments resolve separately, so they can disagree."""
-        edit_venv = "/library/.venv"
+        edit_venv = Path("/library/.venv")
 
+        # Matched as the caller renders it, since a directory separator is not the same character
+        # on every platform. Exact equality, because `.venv` is a prefix of `.venv-exec`.
         def fake_distributions(*, path: list[str]) -> list[MagicMock]:
-            if path == [edit_venv]:
+            if path == [str(edit_venv)]:
                 return [_distribution("griptape", "1.9.4")]
             return [_distribution("griptape", "1.12.0")]
 
@@ -212,7 +214,7 @@ class TestPackagesShadowingTheEngine:
             patch(f"{_MODULE}.engine_package_versions", return_value={"griptape": "1.13.0"}),
             patch.object(version_utils.importlib.metadata, "distributions", fake_distributions),
         ):
-            shadowed = packages_shadowing_the_engine([Path("/library/.venv-exec"), Path(edit_venv)])
+            shadowed = packages_shadowing_the_engine([Path("/library/.venv-exec"), edit_venv])
 
         assert shadowed == (ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0"),)
 
