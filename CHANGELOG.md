@@ -10,6 +10,12 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Fixed
+
+- The engine starts again under Griptape Nodes app releases that pass `ws_outgoing_queue` to
+  `WorkerManager.attach_transport`, instead of failing with a `TypeError`.
+  [#254](https://github.com/griptape-ai/griptape-nodes-app/issues/254)
+
 ## [0.102.0] - 2026-09-24
 
 ### Added
