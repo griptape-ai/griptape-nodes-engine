@@ -280,7 +280,7 @@ class TestGenerateImportWorkflow:
         assert "flow2_name = (await GriptapeNodes.ahandle_request(ImportWorkflowAsReferencedSubFlowRequest(" in source
         assert ").created_flow_name" in source
         assert "ImportWorkflowAsReferencedSubFlowRequest" in import_recorder.from_imports.get(
-            "griptape_nodes.retained_mode.events.workflow_events", set()
+            "griptape_nodes.retained_mode.events.flow_events", set()
         )
 
 
