@@ -269,7 +269,6 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return f"{file_stem}.py"
@@ -290,7 +289,6 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(saved, SaveWorkflowFileFromSerializedFlowResultSuccess), saved
     return f"{file_stem}.py"

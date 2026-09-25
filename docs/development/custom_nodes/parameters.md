@@ -31,7 +31,8 @@ All Parameter attributes:
 ## Parameter Values
 
 Parameter values are serialized when a node runs in its library's own process (see
-[Node Isolation with Workers](node_isolation_with_workers.md)). These types serialize as-is:
+[Node Isolation with Workers](node_isolation_with_workers.md)), and when a loop or subflow group
+runs with an **Execution Environment** other than **Local Execution**. These types serialize as-is:
 
 - `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
 - tuples, named tuples, sets, `bytes`, and dicts with non-string keys
