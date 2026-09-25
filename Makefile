@@ -33,7 +33,8 @@ version/commit: ## Commit version.
 	@git commit -m "chore: bump v$$(make version/get)"
 
 # Commits the roll on a detached HEAD so the local branch still matches its remote. On main, the
-# bump-next PR repeats the roll.
+# bump-next PR repeats the roll. Pushes only the release tags, since GitHub fires no events for a
+# push of more than 3 tags.
 .PHONY: version/publish
 version/publish: ## Roll the changelog, then create and push git tags. Pass allow_empty=1 to release with no entries.
 	@git fetch --tags --force
@@ -42,7 +43,7 @@ version/publish: ## Roll the changelog, then create and push git tags. Pass allo
 	@git commit --quiet -m "chore: release v$$(make version/get)" CHANGELOG.md
 	@git tag v$$(make version/get)
 	@git tag stable -f
-	@git push -f --tags
+	@git push -f origin refs/tags/v$$(make version/get) refs/tags/stable
 	@git push origin HEAD:refs/heads/release/v$$(make version/get | awk -F. '{print $$1 "." $$2}')
 	@git checkout --quiet -
 	
