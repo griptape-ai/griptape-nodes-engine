@@ -20,9 +20,11 @@ from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.utils.budget_refusal import (
     BUDGET_EXCEEDED_CODE,
     BUDGET_HALT_PREFIX,
+    BUDGET_REPLY_HALT_PREFIX,
     BudgetExceededError,
     BudgetRefusal,
     describe,
+    describe_reply,
     halt_message,
     is_budget_halt,
     log_line,
@@ -541,6 +543,34 @@ class TestTheMessage:
         assert "scope=ORG" in line
         assert "enforcement=HARD" in line
         assert "SOMETHING" not in line
+
+
+class TestTheChatReplyMessage:
+    """The sidebar chat has no run to stop, so its halt speaks of the reply."""
+
+    def test_it_names_the_budget_and_the_administrator(self) -> None:
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+
+        assert describe_reply(refusal) == (
+            f'{BUDGET_REPLY_HALT_PREFIX} It was blocked by the budget "tight". Contact your Griptape administrator.'
+        )
+
+    def test_it_names_every_budget_that_refused(self) -> None:
+        body = a_refusal_body(
+            a_rejection(budget_name="tight"),
+            a_rejection(budget_name="daily cap", budget_id="b-2", frozen=True),
+        )
+        refusal = refusal_from_body(body)
+        assert refusal is not None
+
+        assert 'the budgets "tight" and "daily cap" (frozen).' in describe_reply(refusal)
+
+    def test_it_never_speaks_of_a_run(self) -> None:
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+
+        assert "run" not in describe_reply(refusal)
 
 
 class TestTheVerdictSurvivesTheWorkerBoundary:

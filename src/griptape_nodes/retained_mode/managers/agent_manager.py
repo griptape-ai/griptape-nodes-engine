@@ -142,10 +142,10 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
-from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
-from griptape_nodes.utils.budget_refusal import refusal_from_exception
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -512,7 +512,12 @@ class AgentManager(EngineScoped):
             return await self._run_agent(request)
         except Exception as e:
             message = self._explain_agent_run_error(e, request.provider_name)
-            err_msg = f"Error running agent: {message}"
+            # A budget halt is complete as worded, and the editor recognizes it by
+            # its opening words so the chat thread is the only place it appears.
+            if message.startswith(BUDGET_REPLY_HALT_PREFIX):
+                err_msg = message
+            else:
+                err_msg = f"Error running agent: {message}"
             logger.exception(err_msg)
             return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
 
@@ -520,11 +525,10 @@ class AgentManager(EngineScoped):
         """Return the user-facing text for a failed agent run.
 
         Two different Griptape Cloud decisions arrive as the same HTTP 403, and
-        they send the user to different places. A budget refusal names budgets
-        that have no room, and is answered by raising a limit or waiting for a
-        reset. An entitlement refusal means the license is not permitted the
-        action at all, and is answered by an administrator. A budget refusal
-        says so in its body, so ask for one before falling back to entitlement.
+        they mean different things. A budget refusal names budgets that have no
+        room; an entitlement refusal means the license is not permitted the
+        action at all. A budget refusal says so in its body, so ask for one
+        before falling back to entitlement.
 
         Either way the bare text is "Forbidden", which reads like a bug rather
         than a decision. Every other error keeps its original text.

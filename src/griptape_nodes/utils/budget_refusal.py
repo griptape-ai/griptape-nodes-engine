@@ -8,7 +8,7 @@ with a generic error or, worse, carries on as though the call had succeeded.
 
 The four jobs live together because they are one contract seen from four sides:
 :func:`refusal_from_body` reads Cloud's wire format, :class:`BudgetRefusal`
-models it, :func:`describe` words it for the artist, and :func:`is_budget_halt`
+models it, :func:`describe` and :func:`describe_reply` word it for the artist, and :func:`is_budget_halt`
 recognizes the verdict again on the far side of a worker boundary. Splitting
 them lets the wording drift from the shape that produced it.
 
@@ -56,6 +56,14 @@ A worker flattens an exception to type, message, and traceback, and one library
 call site loses the exception object entirely, so in those cases the prefix is
 all that survives. Rewording it silently turns a budget halt back into a generic
 error; a round-trip test pins it.
+"""
+
+BUDGET_REPLY_HALT_PREFIX = "Budget stopped this reply."
+"""Opening words of a halt in the sidebar chat, where there is no run to stop.
+
+The chat shows the halt in the thread, beside the question it stopped, so it
+needs no bar. The editor still recognizes it by these words, so it does not
+raise a toast repeating what the thread already says.
 """
 
 _REMEDY = "Contact your Griptape administrator."
@@ -230,12 +238,20 @@ def describe(refusal: BudgetRefusal, *, node_name: str | None = None) -> str:
         subject = f"'{node_name}'"
     else:
         subject = "The next call"
+    return f"{BUDGET_HALT_PREFIX} {subject} was blocked by {_blocked_by(refusal)}. {_REMEDY}"
 
-    if len(refusal.budgets) == 1:
-        blocked_by = f"the budget {_label(refusal.budgets[0])}"
-    else:
-        blocked_by = f"the budgets {_joined([_label(budget) for budget in refusal.budgets])}"
-    return f"{BUDGET_HALT_PREFIX} {subject} was blocked by {blocked_by}. {_REMEDY}"
+
+def describe_reply(refusal: BudgetRefusal) -> str:
+    """Word a refusal for the artist whose sidebar chat reply just stopped.
+
+    Args:
+        refusal: The parsed refusal.
+
+    Returns:
+        A short message naming every budget that refused, and sending the artist
+        to their administrator.
+    """
+    return f"{BUDGET_REPLY_HALT_PREFIX} It was blocked by {_blocked_by(refusal)}. {_REMEDY}"
 
 
 def log_line(refusal: BudgetRefusal) -> str:
@@ -462,6 +478,13 @@ def _budget_from_entry(entry: object) -> BlockedBudget | None:
         requested_credits=_optional_int(entry.get("requested_credits")),
         frozen=entry.get("frozen") is True,
     )
+
+
+def _blocked_by(refusal: BudgetRefusal) -> str:
+    """Name every budget that refused, as the object of "was blocked by"."""
+    if len(refusal.budgets) == 1:
+        return f"the budget {_label(refusal.budgets[0])}"
+    return f"the budgets {_joined([_label(budget) for budget in refusal.budgets])}"
 
 
 def _label(budget: BlockedBudget) -> str:

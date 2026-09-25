@@ -26,7 +26,7 @@ import httpx
 from pydantic_ai.exceptions import ModelRetry
 
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
-from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 
 if TYPE_CHECKING:

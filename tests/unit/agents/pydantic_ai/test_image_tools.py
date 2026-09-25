@@ -14,7 +14,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     ImageGenerationToolset,
     ImageGenerationToolsetConfig,
 )
-from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
 from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 if TYPE_CHECKING:
@@ -196,7 +196,7 @@ class TestGenerateImage:
 
         with pytest.raises(BudgetExceededError) as raised:
             await toolset.generate_image("a cat")
-        assert str(raised.value).startswith(BUDGET_HALT_PREFIX)
+        assert str(raised.value).startswith(BUDGET_REPLY_HALT_PREFIX)
         assert "tight" in str(raised.value)
         assert static_files.saved == []
 
