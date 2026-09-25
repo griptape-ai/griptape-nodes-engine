@@ -357,16 +357,23 @@ class EventManager(EngineScoped):
             and self._event_loop is not None
         )
 
-    def put_event(self, event: Any) -> None:
+    def put_event(self, event: Any) -> bool:
         """Put event into async queue from sync context (non-blocking).
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
             event: The event to publish to the queue
+
+        Returns:
+            True once the event is on the queue, False when there is no queue to put it on --
+            which is the state before `initialize_queue` runs, so an event emitted during engine
+            construction or by a workflow file a script replays reaches nobody. Most callers can
+            ignore this; a caller that tracks what it has already announced needs it, so a
+            dropped event stays owed rather than being remembered as sent.
         """
         if self._event_queue is None:
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -380,17 +387,22 @@ class EventManager(EngineScoped):
         # streamed token to a parameter) enqueues its own events *after* the triggering
         # event, preserving source order on the queue.
         self._dispatch_to_execution_listeners(event)
+        return True
 
-    async def aput_event(self, event: Any) -> None:
+    async def aput_event(self, event: Any) -> bool:
         """Put event into async queue from async context.
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
             event: The event to publish to the queue
+
+        Returns:
+            True once the event is on the queue, False when there is no queue to put it on. See
+            `put_event`.
         """
         if self._event_queue is None:
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -403,6 +415,7 @@ class EventManager(EngineScoped):
         # Dispatch after enqueuing so a re-entrant emission from a callback lands on the
         # queue after its triggering event (see put_event).
         self._dispatch_to_execution_listeners(event)
+        return True
 
     def add_pre_dispatch_hook(
         self,
