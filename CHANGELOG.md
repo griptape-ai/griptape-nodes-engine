@@ -20,6 +20,10 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
+- **Breaking:** `ControlFlowResolvedEvent` names the type of each value in `parameter_output_values`
+  when JSON has no such type, so a tuple arrives as `{"$type": "builtins:tuple", "$value": [1, 2]}`
+  instead of a list. A value with no plain-data form arrives as `null` instead of as its text, and
+  the event no longer has `unique_parameter_uuid_to_values`.
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
@@ -27,6 +31,14 @@ the engine's request API from working without edits. Migration steps live in
   input or output has no plain-data form, instead of receiving or sending it as text. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
   that can cross.
+
+### Deprecated
+
+- `pickle_control_flow_result` on `StartFlowRequest`, `StartFlowFromNodeRequest`,
+  `StartLocalSubflowRequest`, `SaveWorkflowRequest`, `SaveWorkflowFileFromSerializedFlowRequest`,
+  `PublishWorkflowRequest`, and the workflow executors, and the `--pickle-control-flow-result` CLI
+  flag, have no effect. Flow results always travel as plain data. They will be removed in a later
+  release.
 
 ### Removed
 
@@ -48,6 +60,11 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
+  the same types, instead of as plain dicts.
+- A loop or subflow run in a separate process no longer hands back one parameter's value in place
+  of another's when one is `True` and the other is `1`.
+  [#5435](https://github.com/griptape-ai/griptape-nodes-engine/issues/5435)
 - Outputs of a node in a library running in its own process reach downstream nodes as the same
   types, instead of as plain dicts. Artifact classes a library defines itself, such as
   `VideoUrlArtifact`, arrive as that class instead of griptape's class of the same name. A value

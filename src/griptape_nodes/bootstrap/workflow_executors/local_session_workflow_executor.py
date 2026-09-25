@@ -46,13 +46,12 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         save_on_failure_path: str | None = None,
         *,
         project_file_path: Path | None = None,
-        pickle_control_flow_result: bool = False,
+        pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
     ):
         super().__init__(
             storage_backend=storage_backend,
             project_file_path=project_file_path,
             save_on_failure_path=save_on_failure_path,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
         self._init_websocket_sender(session_id)
         self._on_start_flow_result = on_start_flow_result
@@ -92,7 +91,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         flow_input: Any,
         storage_backend: StorageBackend | None = None,
         *,
-        pickle_control_flow_result: bool | None = None,
+        pickle_control_flow_result: bool | None = None,  # noqa: ARG002 deprecated and ignored
         **kwargs: Any,
     ) -> None:
         """Executes a local workflow.
@@ -105,8 +104,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             storage_backend: Accepted for compatibility with the base-class run path,
                 but ignored here: the storage backend is applied once at construction
                 via `_set_storage_backend`. Passing it to the run path has no effect.
-            pickle_control_flow_result: Per-call override for the executor's
-                save-time default. None means "use the instance default".
+            pickle_control_flow_result: Deprecated and ignored.
 
         Returns:
             None
@@ -115,7 +113,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             await self._arun(
                 flow_input=flow_input,
                 storage_backend=storage_backend,
-                pickle_control_flow_result=pickle_control_flow_result,
                 **kwargs,
             )
         except Exception as e:
@@ -137,8 +134,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         self,
         flow_input: Any,
         storage_backend: StorageBackend | None = None,  # noqa: ARG002
-        *,
-        pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
     ) -> None:
         """Internal async run method with detailed event handling and websocket integration.
@@ -152,10 +147,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         )
 
         # Send the run command to actually execute it (fire and forget)
-        effective_pickle = (
-            pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
-        )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(flow_name=flow_name)
         start_flow_task = asyncio.create_task(GriptapeNodes.ahandle_request(start_flow_request))
 
         is_flow_finished = False
