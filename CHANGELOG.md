@@ -38,6 +38,11 @@ the engine's request API from working without edits. Migration steps live in
   `ExtractFlowCommandsFromImageMetadataResultSuccess`, each node's `element_modification_commands`
   lists `{"request_type": ..., "request": {...}}` entries, the form `EventRequestBatch` takes,
   instead of each request's fields alone, so each request reads back as its own type.
+- **Breaking:** A request or event field typed `Any` that holds a griptape object, or a value JSON
+  has no form for, fails to send with an error naming the payload. It used to be sent as the
+  object's `to_dict()` or as its text. Annotate a field that carries parameter values `Value` to
+  send them tagged with their type, as described in
+  [`get_request_handlers`](docs/development/custom_nodes/advanced_libraries.md#get_request_handlers).
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
   first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
   Griptape Cloud.
@@ -69,6 +74,8 @@ the engine's request API from working without edits. Migration steps live in
 - A class in a request field typed `type`, such as `RegisterArtifactProviderRequest.provider_class`,
   is sent as `module:Qualname` instead of `module.Qualname`, the form parameter values name
   classes by.
+- `ExecuteNodeRequest` results are no longer broadcast to clients by default. The request carries
+  a node's run between its flow and the process it runs in, and no client uses the result.
 
 ### Deprecated
 
@@ -79,6 +86,10 @@ the engine's request API from working without edits. Migration steps live in
   release.
 - `use_pickling` on `SerializeNodeToCommandsRequest` has no effect. Parameter values are always
   stored as plain data. It will be removed in a later release.
+- `safe_unstructure` from `griptape_nodes.retained_mode.events.event_converter` is deprecated and
+  will be removed in a later release. Use `encode_value` from `griptape_nodes.serialization.values`
+  to turn a parameter value into plain data. It no longer uses a griptape object's `to_dict()`, or
+  falls back to a value's text.
 
 ### Removed
 
