@@ -4952,7 +4952,7 @@ class LibraryManager(EngineScoped):
         On timeout, marks remaining pending libraries as FAILURE/UNUSABLE so the rest of
         initialization can continue.
 
-        When wait_seconds is None, reads the worker heartbeat startup grace from config:
+        When wait_seconds is None, reads the worker library load timeout from config:
         first-time installs of large libraries can easily exceed the heartbeat timeout, so
         boot waits on the load deadline rather than on a heartbeat one.
         """
