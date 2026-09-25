@@ -11,10 +11,12 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
     LocalWorkflowExecutor,
 )
 from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.exe_types.node_types import StartNode
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
 )
+from griptape_nodes.serialization.values import encode_value
 
 # A Windows path that exceeds the legacy MAX_PATH (260 chars).
 # Total length is ~300 characters including the drive letter.
@@ -160,7 +162,6 @@ class TestPrepareWorkflowForRunStorageBackend:
     async def test_arun_tolerates_forwarded_storage_backend(self) -> None:
         """`arun` must accept a forwarded storage_backend (base-class run path) and ignore it."""
         executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
-        executor._pickle_control_flow_result = False
 
         mock_start_result = MagicMock()
         mock_start_result.failed.return_value = True  # short-circuit before the event loop
@@ -274,22 +275,35 @@ class TestLocalWorkflowExecutorCli:
 
         assert kwargs["project_file_path"] == Path("/some/project.yaml")
 
-    def test_cli_constructor_kwargs_pickle_inherits_argparse_default(self) -> None:
-        # When `add_cli_arguments` was seeded with the save-time default, that
-        # value flows through `_cli_constructor_kwargs` into the constructor.
+    def test_deprecated_pickle_flag_still_parses_and_is_ignored(self) -> None:
+        # Workflow files saved by earlier engines seed the default and callers may pass the flag.
         parser = ArgumentParser()
         LocalWorkflowExecutor.add_cli_arguments(parser, pickle_control_flow_result_default=True)
-        args = parser.parse_args([])
-
-        kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(args)
-
-        assert kwargs["pickle_control_flow_result"] is True
-
-    def test_cli_constructor_kwargs_pickle_flag_overrides_seeded_default(self) -> None:
-        parser = ArgumentParser()
-        LocalWorkflowExecutor.add_cli_arguments(parser, pickle_control_flow_result_default=False)
         args = parser.parse_args(["--pickle-control-flow-result"])
 
         kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(args)
 
-        assert kwargs["pickle_control_flow_result"] is True
+        assert "pickle_control_flow_result" not in kwargs
+        LocalWorkflowExecutor(pickle_control_flow_result=True)
+
+
+class TestSetInputForFlow:
+    @pytest.mark.asyncio
+    async def test_tagged_input_values_are_decoded(self) -> None:
+        """Inputs sent as encoded values, as a subprocess run's are, reach the start node as values."""
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        start_node = MagicMock(spec=StartNode)
+        flow = MagicMock()
+        flow.nodes = {"Start": start_node}
+        set_result = MagicMock()
+        set_result.failed.return_value = False
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.FlowManager.return_value.get_flow_by_name.return_value = flow
+            mock_gn.ahandle_request = AsyncMock(return_value=set_result)
+            await executor._set_input_for_flow(
+                flow_name="flow", flow_input={"Start": {"pair": encode_value((1, 2)), "text": "plain"}}
+            )
+
+        values = {call.args[0].parameter_name: call.args[0].value for call in mock_gn.ahandle_request.await_args_list}
+        assert values == {"pair": (1, 2), "text": "plain"}

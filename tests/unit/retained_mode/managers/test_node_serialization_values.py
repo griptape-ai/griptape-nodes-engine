@@ -2,9 +2,9 @@
 
 These functions decide, for a single parameter value, whether it needs to be recorded at all,
 whether it has already been recorded (so it can be referenced by UUID instead of duplicated), and
-what happens when recording it fails. They are the foundation both the workflow-save path
-(``handle_parameter_value_saving`` / ``_handle_value_hashing``) and the output-value pickling path
-(``serialize_parameter_output_values`` / ``_serialize_with_pickling``) build on.
+what happens when recording it fails. The workflow-save path (``handle_parameter_value_saving`` /
+``_handle_value_hashing``) builds on them. ``result_parameter_values`` gathers a finished flow's
+values for its result event.
 """
 
 # ruff: noqa: PLR2004
@@ -15,19 +15,18 @@ import logging
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-import pytest
-
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.managers.node_manager import (
     NodeManager,
-    SerializedParameterValues,
     SerializedParameterValueTracker,
 )
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
+    import pytest
+
     from griptape_nodes.retained_mode.engine import Engine
 
 
@@ -536,160 +535,44 @@ class TestSerializeOneParameterValueForSave:
         assert create_request.resolution == NodeResolutionState.RESOLVED.value
 
 
-class TestGetParameterValueForSerialization:
-    """Output values take precedence over set values when both exist for a parameter."""
-
-    def test_prefers_output_value_over_set_value(self) -> None:
-        parameter = _make_param("p")
-        node = MockNode(name="n")
-        node.add_parameter(parameter)
-        node.parameter_values["p"] = "set value"
-        node.parameter_output_values["p"] = "output value"
-
-        value = NodeManager._get_parameter_value_for_serialization(node, "p")
-
-        assert value == "output value"
-
-    def test_falls_back_to_set_value_when_no_output_value(self) -> None:
-        parameter = _make_param("p")
-        node = MockNode(name="n")
-        node.add_parameter(parameter)
-        node.parameter_values["p"] = "set value"
-
-        value = NodeManager._get_parameter_value_for_serialization(node, "p")
-
-        assert value == "set value"
+class _NoPlainDataForm:
+    """A value the value codec cannot encode."""
 
 
-class TestSerializeParameterOutputValues:
-    """``serialize_parameter_output_values`` is the entry point used by control-flow execution."""
+class TestResultParameterValues:
+    """``result_parameter_values`` gathers a finished flow's values for its result event."""
 
-    def test_node_with_no_parameters_returns_empty_values_and_no_pool(self, engine: Engine) -> None:
-        node = MockNode(name="n")
+    def test_node_with_no_parameters_has_no_values(self) -> None:
+        assert NodeManager.result_parameter_values(MockNode(name="n")) == {}
 
-        result = NodeManager.serialize_parameter_output_values(node, workflow_manager=engine.workflow_manager)
-
-        assert result == SerializedParameterValues({}, None)
-
-    def test_without_pickling_every_parameter_has_an_entry_and_pool_is_none(self, engine: Engine) -> None:
+    def test_every_parameter_has_an_entry(self) -> None:
         node = MockNode(name="n")
         node.add_parameter(_make_param("has_value"))
         node.add_parameter(_make_param("no_value"))
         node.parameter_values["has_value"] = "set"
 
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=False
-        )
+        assert NodeManager.result_parameter_values(node) == {"has_value": "set", "no_value": None}
 
-        assert result.parameter_output_values == {"has_value": "set", "no_value": None}
-        assert result.unique_parameter_uuid_to_values is None
-
-    def test_without_pickling_prefers_output_value(self, engine: Engine) -> None:
+    def test_output_value_wins_over_set_value(self) -> None:
         node = MockNode(name="n")
         node.add_parameter(_make_param("p"))
         node.parameter_values["p"] = "set value"
         node.parameter_output_values["p"] = "output value"
 
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=False
-        )
+        assert NodeManager.result_parameter_values(node) == {"p": "output value"}
 
-        assert result.parameter_output_values == {"p": "output value"}
-
-    def test_without_pickling_output_is_json_safe_for_nested_containers(self, engine: Engine) -> None:
-        import json
-
+    def test_value_with_no_plain_data_form_becomes_none(self, caplog: pytest.LogCaptureFixture) -> None:
         node = MockNode(name="n")
-        node.add_parameter(_make_param("p"))
-        node.parameter_output_values["p"] = {"nested": [1, 2, {"deep": True}]}
+        node.add_parameter(_make_param("bad"))
+        node.add_parameter(_make_param("good"))
+        node.parameter_output_values["bad"] = _NoPlainDataForm()
+        node.parameter_output_values["good"] = "kept"
 
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=False
-        )
+        with caplog.at_level(logging.WARNING):
+            values = NodeManager.result_parameter_values(node)
 
-        json.dumps(result.parameter_output_values)
-
-    def test_with_pickling_every_parameter_maps_to_a_uuid(self, engine: Engine) -> None:
-        node = MockNode(name="n")
-        node.add_parameter(_make_param("p"))
-        node.parameter_output_values["p"] = "value"
-
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=True
-        )
-
-        assert result.unique_parameter_uuid_to_values is not None
-        assert result.parameter_output_values["p"] in result.unique_parameter_uuid_to_values
-
-    def test_with_pickling_unserializable_value_maps_to_none_without_raising(self, engine: Engine) -> None:
-        node = MockNode(name="n")
-        node.add_parameter(_make_param("p"))
-        node.parameter_output_values["p"] = _AlwaysFailsPickle()
-
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=True
-        )
-
-        assert result.parameter_output_values["p"] is None
-
-    def test_with_pickling_dedups_the_same_value_shared_by_two_parameters(self, engine: Engine) -> None:
-        node = MockNode(name="n")
-        node.add_parameter(_make_param("first"))
-        node.add_parameter(_make_param("second"))
-        shared_value = "shared string"
-        node.parameter_output_values["first"] = shared_value
-        node.parameter_output_values["second"] = shared_value
-
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=True
-        )
-
-        assert result.parameter_output_values["first"] == result.parameter_output_values["second"]
-        assert result.unique_parameter_uuid_to_values is not None
-        assert len(result.unique_parameter_uuid_to_values) == 1
-
-
-class TestBoolIntPoolCollisionBug:
-    """Pinned bug: the pickling dedup pool keys by raw value, so ``True`` and ``1`` alias.
-
-    ``_process_parameter_for_pickling`` / ``_handle_new_value_for_pickling`` key their dedup cache
-    by ``param_value`` alone (``hash(True) == hash(1)`` and ``True == 1``), unlike the safer
-    ``_handle_value_hashing`` used by the workflow-save path, which keys by ``(type(value),
-    value)``. As a result, a bool-valued parameter and an int-valued parameter whose values are
-    pickle-equal collapse into ONE pool entry: the second parameter silently reads back the
-    first parameter's stored value instead of its own. Intended contract: each parameter's pooled
-    value is keyed by its own type-and-value identity, so ``True`` and ``1`` never alias.
-    """
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DATA-LOSS: bug, scoped to the runtime output-value pickling path only "
-            "(_process_parameter_for_pickling/_handle_new_value_for_pickling, reached via "
-            "serialize_parameter_output_values(use_pickling=True), whose only caller is "
-            "machines/control_flow.py): they dedup by raw `param_value` alone (hash(True) == "
-            "hash(1) and True == 1), so a bool output value and an int output value collapse "
-            "into one pool entry and the second parameter reads back the first's UUID. The "
-            "disk-save path is NOT affected: _handle_value_hashing (node_manager.py, reached via "
-            "on_serialize_node_to_commands) already keys its dedup cache by `(type(value), "
-            "value)`, so the two functions have diverged and only this one needs the fix. "
-            "- see #5435"
-        ),
-    )
-    def test_bool_and_int_output_values_get_distinct_pool_entries(self, engine: Engine) -> None:
-        node = MockNode(name="n")
-        node.add_parameter(_make_param("flag"))
-        node.add_parameter(_make_param("count"))
-        node.parameter_output_values["flag"] = True
-        node.parameter_output_values["count"] = 1
-
-        result = NodeManager.serialize_parameter_output_values(
-            node, workflow_manager=engine.workflow_manager, use_pickling=True
-        )
-
-        assert result.parameter_output_values["flag"] != result.parameter_output_values["count"]
-        assert result.unique_parameter_uuid_to_values is not None
-        assert len(result.unique_parameter_uuid_to_values) == 2
+        assert values == {"bad": None, "good": "kept"}
+        assert "'bad'" in caplog.text
 
 
 def _make_create_node_request(*, resolution: str | None = None) -> Any:
