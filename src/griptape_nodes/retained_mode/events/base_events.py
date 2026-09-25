@@ -129,7 +129,7 @@ def _unstructure(payload: Any) -> Any:
     try:
         return converter.unstructure(payload)
     except (ValueEncodeError, TypeNameError) as error:
-        msg = f"Attempted to send a '{type(payload).__name__}'. Failed because {error}"
+        msg = f"Attempted to send a '{type(payload).__name__}'. Failed because: {error}"
         raise EventSerializationError(msg) from error
 
 
@@ -137,7 +137,7 @@ def _to_json(data: Any, payload_type: str, **kwargs) -> str:
     try:
         return dump_json(data, **kwargs)
     except (TypeError, ValueError) as error:
-        msg = f"Attempted to send a '{payload_type}'. Failed because {error}"
+        msg = f"Attempted to send a '{payload_type}'. Failed because: {error}"
         raise EventSerializationError(msg) from error
 
 
