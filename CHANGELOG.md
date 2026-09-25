@@ -41,6 +41,9 @@ the engine's request API from working without edits. Migration steps live in
   an artifact comes back as the artifact.
 - Parameter values recorded in an image's workflow provenance name their type when JSON has none,
   the same way the request API sends them.
+- A class in a request field typed `type`, such as `RegisterArtifactProviderRequest.provider_class`,
+  is sent as `module:Qualname` instead of `module.Qualname`, the form parameter values name
+  classes by.
 
 ### Deprecated
 
@@ -63,6 +66,16 @@ the engine's request API from working without edits. Migration steps live in
   whose class belongs to a library the receiving process does not load still arrives as a dict, and
   reaches the next process that does load it unchanged.
   [#4475](https://github.com/griptape-ai/griptape-nodes-engine/issues/4475)
+- A request with a field typed `type`, such as `RegisterArtifactProviderRequest`, reads back from
+  JSON into the class it names, instead of failing.
+  [#5437](https://github.com/griptape-ai/griptape-nodes-engine/issues/5437)
+- `ScanSequencesResultFailure`, `ListDirectoryResultFailure`, `ListDirectorySequencesResultFailure`,
+  and `DeduceSequencesFromFileListResultFailure` read back from JSON with their `failure_reason`,
+  instead of failing because it may come from either of two enums.
+  [#5438](https://github.com/griptape-ai/griptape-nodes-engine/issues/5438)
+- `UpdateAgentProviderRequest` sent as JSON with only some provider fields set reads back with just
+  those fields, instead of failing validation on the ones left out.
+  [#5439](https://github.com/griptape-ai/griptape-nodes-engine/issues/5439)
 
 ## [0.102.0] - 2026-09-24
 
