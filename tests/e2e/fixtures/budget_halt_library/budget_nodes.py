@@ -110,7 +110,7 @@ class CloudCallNode(SuccessFailureNode):
         if refusal is not None:
             halt = describe_budget_refusal(refusal, node_name=self.name)
             self._set_status_results(was_successful=False, result_details=halt)
-            self._handle_failure_exception(BudgetExceededError(halt, refusal))
+            self._handle_failure_exception(BudgetExceededError(halt, refusal, node_name=self.name))
             return
 
         details = f"The call failed: {exc}"

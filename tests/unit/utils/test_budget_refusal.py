@@ -237,6 +237,23 @@ class TestRecognizingARefusal:
 
         assert refusal_from_exception(a_cloud_error(body), cloud_host=CLOUD_HOST) is None
 
+    def test_a_streamed_error_whose_body_was_never_read_is_not_a_refusal(self) -> None:
+        """`raise_for_status` inside a `stream` block fires before anything reads the body.
+
+        Every node failure is asked this question from inside an `except`, so raising here
+        would replace the node's real error with one about unread response content.
+        """
+        body = json.dumps(a_refusal_body()).encode()
+        transport = httpx.MockTransport(lambda _request: httpx.Response(403, stream=httpx.ByteStream(body)))
+        with (
+            httpx.Client(transport=transport) as client,
+            client.stream("POST", f"https://{CLOUD_HOST}/api/images/generations") as response,
+            pytest.raises(httpx.HTTPStatusError) as caught,
+        ):
+            response.raise_for_status()
+
+        assert refusal_from_exception(caught.value, cloud_host=CLOUD_HOST) is None
+
     def test_a_403_from_another_host_is_not_ours_to_explain(self) -> None:
         """A workflow also calls MCP servers and third-party APIs that raise the same error."""
         error = a_cloud_error(a_refusal_body(), host="api.example.com")

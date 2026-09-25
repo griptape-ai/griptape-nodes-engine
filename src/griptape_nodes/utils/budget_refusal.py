@@ -441,10 +441,15 @@ def _parsed_body(parse: Callable[[], object]) -> object | None:
 
 
 def _body_of(response: httpx.Response) -> object | None:
-    """Parse a response body, tolerating one that is not JSON."""
+    """Parse a response body, tolerating one that is not JSON or was never read.
+
+    A streamed response raises ``ResponseNotRead`` when ``raise_for_status`` runs
+    inside the ``stream`` block, before anything read the body. Its status is
+    still an answer; its body is simply not there to read a refusal out of.
+    """
     try:
         return response.json()
-    except ValueError:
+    except (ValueError, httpx.ResponseNotRead):
         return None
 
 

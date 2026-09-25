@@ -1,11 +1,13 @@
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, BudgetRefusal
+from tests.unit.utils.test_budget_refusal import CLOUD_HOST, a_refusal_body
 
 from .mocks import MockNode
 
@@ -315,6 +317,24 @@ class TestBudgetHaltsIgnoreTheFailureBranch:
             node._handle_failure_exception(forwarded)  # type: ignore[arg-type]
 
         assert caught.value is forwarded
+
+    def test_a_raw_cloud_refusal_raises_despite_the_failure_branch(self) -> None:
+        """A node that wraps the Cloud 403 in its own error has not recognized the refusal.
+
+        It is refused just the same, and the recovery path would be too.
+        """
+        node = self._node_with_failure_connected()
+        node._cloud_host = Mock(return_value=CLOUD_HOST)  # type: ignore[method-assign]
+        request = httpx.Request("POST", f"https://{CLOUD_HOST}/api/assets")
+        response = httpx.Response(403, json=a_refusal_body(), request=request)
+        http_error = httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
+        wrapped = RuntimeError("Attempted to register the asset. Failed due to a 403.")
+        wrapped.__cause__ = http_error
+
+        with pytest.raises(RuntimeError) as caught:
+            node._handle_failure_exception(wrapped)
+
+        assert caught.value is wrapped
 
     def test_every_other_error_still_takes_the_graceful_path(self) -> None:
         """The contract tripwire: only budget refusals override a connected Failed output."""
