@@ -20,11 +20,11 @@ from griptape_nodes.retained_mode.events.connection_events import (
     OutgoingConnection,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
-    GetParameterDetailsResultSuccess,
-    GetParameterValueResultSuccess,
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.converter import ElementDocument
+from griptape_nodes.serialization.values import DisplayValue
 
 
 class NewPosition(NamedTuple):
@@ -370,12 +370,6 @@ class GetAllNodeInfoRequest(RequestPayload):
 
 
 @dataclass
-class ParameterInfoValue:
-    details: GetParameterDetailsResultSuccess
-    value: GetParameterValueResultSuccess
-
-
-@dataclass
 @PayloadRegistry.register
 class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Comprehensive node information retrieved successfully.
@@ -384,7 +378,7 @@ class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
         metadata: Node metadata (position, display properties, etc.)
         node_resolution_state: Current execution state
         connections: All incoming and outgoing connections
-        element_id_to_value: Parameter details and values by element ID
+        element_id_to_value: Parameter values by element ID
         root_node_element: Root element information
     """
 
@@ -392,8 +386,8 @@ class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     node_resolution_state: str
     locked: bool
     connections: ListConnectionsForNodeResultSuccess
-    element_id_to_value: dict[str, ParameterInfoValue]
-    root_node_element: dict[str, Any]
+    element_id_to_value: dict[str, DisplayValue]
+    root_node_element: ElementDocument
 
 
 @dataclass

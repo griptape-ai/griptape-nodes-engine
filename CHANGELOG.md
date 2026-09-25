@@ -12,6 +12,18 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
+- **Breaking:** Parameter values the engine sends to the editor and to request API clients name
+  their type when JSON has no such type. A tuple arrives as
+  `{"$type": "builtins:tuple", "$value": [1, 2]}` instead of a list, an enum as its value under
+  `$value` instead of the bare value, and an artifact with a `$type` key beside its fields. This
+  covers `ParameterValueUpdateEvent`, `NodeResolvedEvent`, `AlterElementEvent`, and the results of
+  `GetParameterValueRequest`, `SetParameterValueRequest`, `GetParameterDetailsRequest`,
+  `GetNodeElementDetailsRequest`, `GetAllNodeInfoRequest`, and `RunArbitraryPythonStringRequest`
+  (its `found_variable_values`). Flow variable values cross the same way, in `CreateVariableRequest`,
+  `SetVariableValueRequest`, and the results of `GetVariableRequest`, `GetVariableValueRequest`,
+  `GetVariablesRequest`, and `ListVariablesRequest`. A value sent in the same form to
+  `SetParameterValueRequest` or `SetVariableValueRequest` is set with that exact type. See
+  [Parameter values](docs/guides/mcp/external_clients.md#parameter-values).
 - Saved workflow files store parameter values as readable data instead of pickle, and saving an
   unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
   by earlier versions still open. A workflow saved by this version does not open in earlier ones.
@@ -24,6 +36,11 @@ the engine's request API from working without edits. Migration steps live in
   input or output has no plain-data form, instead of receiving or sending it as text. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
   that can cross.
+- `GetParameterValueRequest` handled inside the engine, as from node code or
+  `RetainedMode.get_value`, returns the parameter's value itself instead of a plain-data copy, so
+  an artifact comes back as the artifact.
+- Parameter values recorded in an image's workflow provenance name their type when JSON has none,
+  the same way the request API sends them.
 
 ### Deprecated
 

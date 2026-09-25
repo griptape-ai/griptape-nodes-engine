@@ -57,7 +57,6 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
-from griptape_nodes.serialization.converter import safe_unstructure
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
@@ -1702,7 +1701,7 @@ class BaseNode(ABC):
                 node_name=self.name,
                 parameter_name=parameter_name,
                 data_type=data_type,
-                value=safe_unstructure(self.get_display_value_for_output(parameter_name, value)),
+                value=self.get_display_value_for_output(parameter_name, value),
             )
 
             self.engine.event_manager.put_event(

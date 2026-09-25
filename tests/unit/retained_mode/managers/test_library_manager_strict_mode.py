@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.app_events import WorkerNodeSchema
+from griptape_nodes.serialization.converter import converter
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
@@ -152,6 +155,38 @@ class TestHuggingFaceRepoParameterSurvivesTheProbe:
         # Before the construction-time deferral, the component's bus requests fired
         # reentrant-bus-in-init here and the class was dropped from the schemas.
         assert [s.class_name for s in schemas] == ["HFNode"]
+
+
+class _NoPlainDataForm:
+    """A default value the value codec cannot encode."""
+
+
+class _ProbeWithDefaults:
+    """Node class whose probe parameters default to an artifact and to a value with no plain-data form."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.parameters = [
+            Parameter(name="image", default_value=ImageUrlArtifact("https://example.com/cat.png")),
+            Parameter(name="handle", default_value=_NoPlainDataForm()),
+        ]
+
+
+class TestSchemaDefaultValues:
+    @pytest.mark.asyncio
+    async def test_defaults_cross_with_their_type_or_as_none(
+        self, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        manager = current_engine().library_manager
+        with patched_registry({"Defaults": _ProbeWithDefaults}):
+            (schema,) = await manager._serialize_library_node_schemas("libA")
+
+        received = converter.structure(converter.unstructure(schema), WorkerNodeSchema)
+
+        image, handle = received.parameters
+        assert isinstance(image.default_value, ImageUrlArtifact)
+        assert image.default_value.value == "https://example.com/cat.png"
+        assert handle.default_value is None
 
 
 class _DummyTrait(Trait):
