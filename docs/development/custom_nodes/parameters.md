@@ -30,11 +30,11 @@ All Parameter attributes:
 
 ## Parameter Values
 
-A value that leaves the engine's process travels as plain data. Today that happens when a node
-runs in its library's own process (see
+A value that leaves the engine's process travels as plain data. That happens when a workflow is
+saved, and when a node runs in its library's own process (see
 [Node Isolation with Workers](node_isolation_with_workers.md)).
 
-These values make the trip and arrive as the same type:
+These values make the trip and come back as the same type:
 
 - `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
 - tuples, named tuples, sets, `bytes`, and dicts with keys that aren't text
@@ -63,9 +63,11 @@ A value whose class belongs to a library the receiving process doesn't load arri
 of its plain data, and continues unchanged to the next process that does load it. A class defined
 inside a function can't make the trip at all, because no other process can find it.
 
-A value with no plain-data form fails the node with an error that names the parameter, unless the
-parameter is `serializable=False`: then the engine keeps the value in the process that built it
-(see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md)).
+A value with no plain-data form isn't written to the saved workflow, so its node runs again when
+the workflow reopens. Sent to or from a library's own process, it fails the node with an error that
+names the parameter, unless the parameter is `serializable=False`: then the engine keeps the value
+in the process that built it (see
+[Passing Values That Cannot Be Serialized](passing_unserializable_values.md)).
 
 ## Traits
 
