@@ -59,20 +59,28 @@ from griptape_nodes.retained_mode.events.provenance_events import (
     GetProvenanceForArtifactResultFailure,
     GetProvenanceForArtifactResultSuccess,
     GetProvenancePayloadRequest,
+    GetProvenancePayloadResultFailure,
     GetProvenancePayloadResultSuccess,
     ListProvenancedArtifactsRequest,
     ListProvenancedArtifactsResultSuccess,
     ListProvenanceRecordsForArtifactRequest,
+    ListProvenanceRecordsForArtifactResultFailure,
     ListProvenanceRecordsForArtifactResultSuccess,
     ListProvenanceRecordsForHashRequest,
+    ListProvenanceRecordsForHashResultFailure,
     ListProvenanceRecordsForHashResultSuccess,
     ProvenanceMatchOrigin,
     ProvenanceQueryFailureReason,
 )
 from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    ArtifactIdentity,
     ProducingNodeIdentity,
+    ProducingNodeIdentitySource,
     ProvenanceContent,
     ProvenanceRecord,
+    ProvenanceWriteDetails,
+    by_hash_relative_path,
+    dump_record_yaml,
     hash_content,
     load_record_yaml,
 )
@@ -80,7 +88,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifa
     ImageArtifactProvider,
 )
 from griptape_nodes.retained_mode.managers.os_manager import FileWriteAttemptResult
-from griptape_nodes.retained_mode.managers.provenance_manager import ProvenanceCaptureResult
+from griptape_nodes.retained_mode.managers.provenance_manager import ArtifactWriteFacts, ProvenanceCaptureResult
 
 PROVENANCE_STORE_DIR = "griptape-nodes-provenance"
 
@@ -843,3 +851,373 @@ class TestQueryRequests:
         assert text_entry.record_count == 1
         # Latest record id is the newest save.
         assert image_entry.latest_record_id == max(f.stem for f in _record_dir_for(temp_dir, "hero.png").glob("*.yaml"))
+
+
+class TestSummaryExcerptSource:
+    """The summary excerpt prefers prompt, then the longest substantial string, then anything."""
+
+    def test_empty_preview_yields_nothing(self, engine: Engine) -> None:
+        assert engine.provenance_manager._summary_excerpt_source(None) is None
+        assert engine.provenance_manager._summary_excerpt_source({}) is None
+
+    def test_prompt_wins_over_longer_strings(self, engine: Engine) -> None:
+        preview = {"negative_prompt": "x" * 50, "prompt": "hero"}
+        assert engine.provenance_manager._summary_excerpt_source(preview) == ("prompt", "hero")
+
+    def test_longest_substantial_string_wins_without_prompt(self, engine: Engine) -> None:
+        preview = {"style": "noir", "description": "a fortress carved into a cliff face"}
+        excerpt = engine.provenance_manager._summary_excerpt_source(preview)
+        assert excerpt == ("description", "a fortress carved into a cliff face")
+
+    def test_first_entry_is_the_last_resort(self, engine: Engine) -> None:
+        preview = {"api_key_provider": True, "steps": 30}
+        assert engine.provenance_manager._summary_excerpt_source(preview) == ("api_key_provider", True)
+
+
+class TestReconstructArtifactPath:
+    """Inverting the by-path mirror for the inventory: heuristic, never guesses wrong."""
+
+    def test_drive_mirror_reconstructs_a_drive_anchored_path(self, engine: Engine) -> None:
+        reconstructed = engine.provenance_manager._reconstruct_artifact_path(Path("C:") / "renders" / "out.png")
+        assert reconstructed == Path("C:/renders/out.png")
+
+    def test_rooted_mirror_reconstructs_when_the_root_location_exists(self, engine: Engine, temp_dir: Path) -> None:
+        # A mirror of a real rooted directory: the workspace-relative candidate
+        # does not exist, so reconstruction re-roots it at / and finds it there.
+        mirror = temp_dir.relative_to(Path(temp_dir.anchor))
+        reconstructed = engine.provenance_manager._reconstruct_artifact_path(mirror)
+        assert reconstructed == temp_dir
+
+    def test_deleted_artifact_falls_back_to_the_workspace_shape(self, engine: Engine, temp_dir: Path) -> None:
+        reconstructed = engine.provenance_manager._reconstruct_artifact_path(Path("ghost/gone.png"))
+        assert reconstructed == temp_dir / "ghost" / "gone.png"
+
+
+class TestRecordLoadingSkips:
+    """The store is user-editable: unreadable or newer-major records are skipped, not raised."""
+
+    def _saved_record_dir(self, engine: Engine, temp_dir: Path) -> Path:
+        result = engine.handle_request(
+            WriteFileRequest(file_path=str(temp_dir / "hero.txt"), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(result, WriteFileResultSuccess)
+        return _record_dir_for(temp_dir, "hero.txt")
+
+    def test_unreadable_record_is_skipped(self, engine: Engine, temp_dir: Path) -> None:
+        record_dir = self._saved_record_dir(engine, temp_dir)
+        good_record = _load_single_record(record_dir)
+        # Sorts after every timestamped record id, so it is tried FIRST.
+        (record_dir / "99990101T000000000000Z-aaaaaaaa.yaml").write_text("{{{ not yaml")
+
+        latest = engine.provenance_manager.find_latest_record_for_path(temp_dir / "hero.txt")
+        assert latest is not None
+        assert latest.record_id == good_record.record_id
+
+    def test_newer_major_schema_record_is_skipped(self, engine: Engine, temp_dir: Path) -> None:
+        record_dir = self._saved_record_dir(engine, temp_dir)
+        good_record = _load_single_record(record_dir)
+        from_the_future = good_record.model_copy(update={"schema_version": "99.0.0"})
+        (record_dir / "99990101T000000000000Z-bbbbbbbb.yaml").write_text(dump_record_yaml(from_the_future))
+
+        latest = engine.provenance_manager.find_latest_record_for_path(temp_dir / "hero.txt")
+        assert latest is not None
+        assert latest.record_id == good_record.record_id
+
+
+class TestProducingNodeInference:
+    """No attested identity: the resolving-node heuristic fills in, flagged as inferred."""
+
+    def test_resolving_node_is_inferred_and_flagged(self, engine: Engine) -> None:
+        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="inf_wf", flow_name="inf_flow"))
+        try:
+            with patch.object(type(engine.flow_manager), "flow_state", return_value=(set(), ["GhostNode"], set())):
+                identity = engine.provenance_manager._resolve_producing_node(ProvenanceContent())
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        assert identity is not None
+        assert identity.name == "GhostNode"
+        # The node is not in the object manager, so the type falls back to the name.
+        assert identity.node_type == "GhostNode"
+        assert identity.identity_source == ProducingNodeIdentitySource.INFERRED_RESOLVING_NODE
+
+    def test_no_resolving_nodes_means_no_identity(self, engine: Engine) -> None:
+        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="inf_wf2", flow_name="inf_flow2"))
+        try:
+            with patch.object(type(engine.flow_manager), "flow_state", return_value=(set(), [], set())):
+                identity = engine.provenance_manager._resolve_producing_node(ProvenanceContent())
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        assert identity is None
+
+
+class TestScratchPathEdges:
+    def test_non_temp_absolute_path_is_not_scratch(self, engine: Engine) -> None:
+        assert engine.provenance_manager._is_engine_scratch_path(Path("/definitely/not/temp/out.png")) is False
+
+    def test_temp_path_outside_workspace_is_scratch(self, engine: Engine) -> None:
+        scratch = Path(tempfile.gettempdir()) / "gtn_scratch_probe" / "out.png"
+        assert engine.provenance_manager._is_engine_scratch_path(scratch) is True
+
+
+class TestRollbackBestEffort:
+    def test_rollback_tolerates_undeletable_files(self, engine: Engine, temp_dir: Path) -> None:
+        """Rollback is best-effort: an OSError on either unlink warns instead of raising."""
+        content_hash = hash_content(b"doomed")
+        # Directories where the files should be: unlink raises OSError on both.
+        record_path = temp_dir / "record_squatter"
+        record_path.mkdir()
+        store_root = temp_dir / PROVENANCE_STORE_DIR
+        pointer_path = store_root / by_hash_relative_path(content_hash, "rid")
+        pointer_path.mkdir(parents=True)
+
+        details = ProvenanceWriteDetails(
+            record_id="rid",
+            record_path=str(record_path),
+            content_hash=content_hash,
+            capture_policy=ProvenanceCapturePolicy.PRODUCING_NODE_ONLY,
+        )
+        engine.provenance_manager.rollback_record(details)
+        assert record_path.exists()
+        assert pointer_path.exists()
+
+
+class TestQueryFailureBranches:
+    def test_payload_request_with_unresolvable_path_fails(self, engine: Engine) -> None:
+        result = engine.handle_request(GetProvenancePayloadRequest(macro_path=""))
+        assert isinstance(result, GetProvenancePayloadResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.PATH_UNRESOLVABLE
+
+    def test_payload_request_without_records_fails(self, engine: Engine, temp_dir: Path) -> None:
+        (temp_dir / "plain.txt").write_text("no history")
+        result = engine.handle_request(GetProvenancePayloadRequest(macro_path=str(temp_dir / "plain.txt")))
+        assert isinstance(result, GetProvenancePayloadResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.NO_PROVENANCE_RECORDS
+
+    def test_payload_request_for_missing_record_id_fails(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "hero.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        result = engine.handle_request(
+            GetProvenancePayloadRequest(macro_path=str(file_path), record_id="20200101T000000000000Z-deadbeef")
+        )
+        assert isinstance(result, GetProvenancePayloadResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.RECORD_NOT_FOUND
+
+    def test_hash_listing_rejects_an_unknown_hash_algorithm(self, engine: Engine) -> None:
+        result = engine.handle_request(ListProvenanceRecordsForHashRequest(content_hash="sha256:abcdef"))
+        assert isinstance(result, ListProvenanceRecordsForHashResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.PATH_UNRESOLVABLE
+
+    def test_hash_listing_for_unknown_content_is_empty_success(self, engine: Engine) -> None:
+        result = engine.handle_request(ListProvenanceRecordsForHashRequest(content_hash=hash_content(b"nobody")))
+        assert isinstance(result, ListProvenanceRecordsForHashResultSuccess)
+        assert result.records == []
+
+
+class TestCaptureNeverRaises:
+    def test_capture_blowup_becomes_a_failed_result(self, engine: Engine, temp_dir: Path) -> None:
+        plan = engine.provenance_manager.plan_capture(_sample_provenance(), temp_dir / "hero.txt")
+        facts = ArtifactWriteFacts(final_file_path=temp_dir / "hero.txt", final_content_bytes=b"pixels")
+        with patch.object(
+            type(engine.provenance_manager), "_record_artifact_save", side_effect=RuntimeError("meteor strike")
+        ):
+            capture = engine.provenance_manager.record_artifact_save(facts, _sample_provenance(), plan)
+        assert capture.failed
+        assert capture.error_message is not None
+        assert "meteor strike" in capture.error_message
+
+
+class TestPathSpellingResolution:
+    """The `str | MacroPath` request surface: every spelling resolves or fails readably."""
+
+    def test_unresolvable_macro_string_fails_the_lookup(self, engine: Engine) -> None:
+        result = engine.handle_request(
+            ListProvenanceRecordsForArtifactRequest(macro_path="{no_such_macro_anywhere}/x.png")
+        )
+        assert isinstance(result, ListProvenanceRecordsForArtifactResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.PATH_UNRESOLVABLE
+
+    def test_empty_path_fails_the_lookup(self, engine: Engine) -> None:
+        result = engine.handle_request(ListProvenanceRecordsForArtifactRequest(macro_path=""))
+        assert isinstance(result, ListProvenanceRecordsForArtifactResultFailure)
+        assert result.failure_reason == ProvenanceQueryFailureReason.PATH_UNRESOLVABLE
+        get_result = engine.handle_request(GetProvenanceForArtifactRequest(macro_path=""))
+        assert isinstance(get_result, GetProvenanceForArtifactResultFailure)
+        assert get_result.failure_reason == ProvenanceQueryFailureReason.PATH_UNRESOLVABLE
+
+    def test_macro_syntax_error_degrades_to_a_plain_relative_path(self, engine: Engine) -> None:
+        # "{unclosed" is not a macro; it is treated as a workspace-relative path.
+        result = engine.handle_request(ListProvenanceRecordsForArtifactRequest(macro_path="{unclosed/x.png"))
+        assert isinstance(result, ListProvenanceRecordsForArtifactResultSuccess)
+        assert result.records == []
+
+    def test_relative_path_resolves_against_the_workspace(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "rel.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        result = engine.handle_request(ListProvenanceRecordsForArtifactRequest(macro_path="rel.txt"))
+        assert isinstance(result, ListProvenanceRecordsForArtifactResultSuccess)
+        assert len(result.records) == 1
+
+
+class TestLookupDegradation:
+    def test_missing_artifact_with_no_records_lists_empty(self, engine: Engine, temp_dir: Path) -> None:
+        # No record dir AND unreadable live bytes: the hash fallback degrades to empty.
+        result = engine.handle_request(
+            ListProvenanceRecordsForArtifactRequest(macro_path=str(temp_dir / "never_existed.png"))
+        )
+        assert isinstance(result, ListProvenanceRecordsForArtifactResultSuccess)
+        assert result.records == []
+
+    def test_unreadable_by_hash_pointer_is_skipped(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "hero.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        content_hash = hash_content(b"pixels")
+        pointer_dir = (temp_dir / PROVENANCE_STORE_DIR / by_hash_relative_path(content_hash, "_")).parent
+        (pointer_dir / "99990101T000000000000Z-cccccccc.yaml").write_text("{{{ not yaml")
+
+        result = engine.handle_request(ListProvenanceRecordsForHashRequest(content_hash=content_hash))
+        assert isinstance(result, ListProvenanceRecordsForHashResultSuccess)
+        assert len(result.records) == 1
+
+    def test_find_record_by_hash_with_no_pointers_is_none(self, engine: Engine) -> None:
+        assert engine.provenance_manager._find_record_by_hash(hash_content(b"never saved")) is None
+
+    def test_staleness_is_unjudgeable_when_the_artifact_vanished(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "hero.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        file_path.unlink()
+
+        result = engine.handle_request(GetProvenanceForArtifactRequest(macro_path=str(file_path)))
+        assert isinstance(result, GetProvenanceForArtifactResultSuccess)
+        assert result.is_stale is None
+
+    def test_all_unreadable_records_yield_no_latest(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "hero.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        record_dir = _record_dir_for(temp_dir, "hero.txt")
+        for record_file in record_dir.glob("*.yaml"):
+            record_file.write_text("{{{ not yaml")
+        assert engine.provenance_manager.find_latest_record_for_path(file_path) is None
+
+    def test_payload_request_without_record_id_returns_the_latest(self, engine: Engine, temp_dir: Path) -> None:
+        file_path = temp_dir / "hero.txt"
+        write_result = engine.handle_request(
+            WriteFileRequest(file_path=str(file_path), content="pixels", provenance=_sample_provenance())
+        )
+        assert isinstance(write_result, WriteFileResultSuccess)
+        assert write_result.provenance is not None
+        result = engine.handle_request(GetProvenancePayloadRequest(macro_path=str(file_path)))
+        assert isinstance(result, GetProvenancePayloadResultSuccess)
+        assert result.record_id == write_result.provenance.record_id
+
+
+class TestClassificationGuards:
+    def test_empty_declared_string_is_not_a_source(self, engine: Engine, temp_dir: Path) -> None:
+        assert engine.provenance_manager._classify_declared_path_string("", temp_dir) is None
+
+    def test_hostile_length_string_probe_degrades_to_no_source(self, engine: Engine, temp_dir: Path) -> None:
+        # The ENAMETOOLONG regression: an over-long name raises from stat()
+        # instead of answering "no"; the guard answers "not a source".
+        assert engine.provenance_manager._classify_declared_path_string("x" * 4096, temp_dir) is None
+
+    def test_remote_url_artifact_is_not_a_local_source(self, engine: Engine, temp_dir: Path) -> None:
+        from griptape.artifacts import ImageUrlArtifact
+
+        artifact = ImageUrlArtifact("https://example.com/render.png")
+        assert engine.provenance_manager._classify_url_artifact(artifact, temp_dir) is None
+
+    def test_parameter_value_enumeration_degrades_per_parameter(self, engine: Engine) -> None:
+        node = _ProvProbeNode("Probe_Z")
+        node.set_parameter_value("prompt", "fine")
+        with patch.object(type(node), "get_parameter_value", side_effect=RuntimeError("resolver exploded")):
+            assert engine.provenance_manager._iter_input_values(node) == []
+
+    def test_dict_values_flatten_one_level(self, engine: Engine) -> None:
+        node = _ProvProbeNode("Probe_D")
+        node.set_parameter_value("prompt", "fine")
+        with patch.object(type(node), "get_parameter_value", return_value={"a": "one", "b": "two"}):
+            entries = engine.provenance_manager._iter_input_values(node)
+        values = [value for _, value in entries]
+        assert values.count("one") > 0
+        assert values.count("two") > 0
+
+
+class TestWorkflowAttachmentGuards:
+    def test_no_current_flow_leaves_the_payload_without_a_workflow(self, engine: Engine, temp_dir: Path) -> None:
+        record = ProvenanceRecord(
+            record_id="20260924T000000000000Z-abcd1234",
+            saved_at="2026-09-24T00:00:00+00:00",
+            capture_policy=ProvenanceCapturePolicy.FULL_WORKFLOW_SNAPSHOT,
+            artifact=ArtifactIdentity(
+                path_at_save=str(temp_dir / "hero.txt"),
+                file_name="hero.txt",
+                content_hash=hash_content(b"pixels"),
+                size_bytes=6,
+            ),
+        )
+        engine.provenance_manager._attach_workflow_file(record)
+        assert record.payload.serialized_workflow is None
+
+
+class TestSourceDiscoveryDegradation:
+    """Source discovery never fails a save: every per-source error degrades."""
+
+    def test_unfindable_node_yields_no_sources(self, engine: Engine) -> None:
+        identity = ProducingNodeIdentity(name="Nobody_1", node_type="Nobody")
+        assert engine.provenance_manager._discover_sources(identity) == []
+
+    def test_node_lookup_blowup_yields_no_sources(self, engine: Engine) -> None:
+        identity = ProducingNodeIdentity(name="Nobody_1", node_type="Nobody")
+        with patch.object(
+            type(engine.object_manager), "attempt_get_object_by_name_as_type", side_effect=RuntimeError("boom")
+        ):
+            assert engine.provenance_manager._discover_sources(identity) == []
+
+    def test_link_failure_becomes_a_chain_break_with_the_cause(self, engine: Engine, temp_dir: Path) -> None:
+        node = _ProvProbeNode("Probe_X")
+        reference = temp_dir / "ref.png"
+        reference.write_bytes(_tiny_png_bytes())
+        node.set_parameter_value("reference_image", str(reference))
+        identity = ProducingNodeIdentity(name=node.name, node_type="_ProvProbeNode")
+
+        with (
+            patch.object(type(engine.object_manager), "attempt_get_object_by_name_as_type", return_value=node),
+            patch.object(type(engine.provenance_manager), "_link_source", side_effect=RuntimeError("store on fire")),
+        ):
+            sources = engine.provenance_manager._discover_sources(identity)
+        assert len(sources) == 1
+        assert sources[0].parameter_name == "reference_image"
+        assert sources[0].discovery_error is not None
+        assert "store on fire" in sources[0].discovery_error
+
+    def test_classification_blowup_skips_the_value(self, engine: Engine, temp_dir: Path) -> None:
+        node = _ProvProbeNode("Probe_Y")
+        reference = temp_dir / "ref2.png"
+        reference.write_bytes(_tiny_png_bytes())
+        node.set_parameter_value("reference_image", str(reference))
+        identity = ProducingNodeIdentity(name=node.name, node_type="_ProvProbeNode")
+
+        with (
+            patch.object(type(engine.object_manager), "attempt_get_object_by_name_as_type", return_value=node),
+            patch.object(
+                type(engine.provenance_manager),
+                "_classify_file_backed_value",
+                side_effect=OSError("ENAMETOOLONG"),
+            ),
+        ):
+            sources = engine.provenance_manager._discover_sources(identity)
+        assert sources == []
