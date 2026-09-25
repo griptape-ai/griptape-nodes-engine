@@ -10,6 +10,8 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+## [0.102.0] - 2026-09-24
+
 ### Added
 
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
@@ -124,4 +126,5 @@ the engine's request API from working without edits. Migration steps live in
   library is installed, and starts saying so when the library is uninstalled. Before, whichever
   verdict was reached when the template was first read stood for the rest of the session.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...HEAD
+[0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0

@@ -222,7 +222,51 @@ The Python installation on your machine doesn't have access to verified SSL cert
 
 ## Exporting engine logs
 
-When you report an issue (or dig into one yourself), the engine logs are usually the first thing to look at. Where to get them depends on how you run the engine.
+When you report an issue (or dig into one yourself), the engine logs are usually the first thing to look at. On their own, though, logs rarely explain what happened — which libraries loaded, which settings were in effect, and which API keys were set all matter too. A diagnostics bundle collects all of it in one step.
+
+### Collecting everything at once
+
+A **diagnostics bundle** is one zip file holding:
+
+| Inside the bundle  | What it tells whoever reads it                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `logs/*.log`       | The log files kept on disk, newest first. The top one covers the session you made the bundle in                                |
+| `logs/session.log` | Everything the engine logged this session, from memory. Only when none of it reached a log file                                |
+| `report.json`      | Which engine version was running, on what machine, with which settings, and how every library and project fared when it loaded |
+| `doctor.json`      | The [`doctor`](reference/command_line_interface.md#doctor) health checks: what is wrong and what to do about each one          |
+| `workflow/`        | The workflow that was open, as it was last saved. Only when the editor made the bundle                                         |
+| `manifest.json`    | Every file above, and a count of everything that was removed for safety                                                        |
+| `README.md`        | A plain-language guide to all of it                                                                                            |
+
+To make one:
+
+```bash
+gtn diagnostics collect
+```
+
+A bundle made this way has no `workflow/` folder: the command starts an engine of its own, and that engine has no workflow open. To include the workflow you are working on, make the bundle from the editor instead.
+
+That writes `griptape-nodes-diagnostics-<version>-<timestamp>.zip` into the current directory. To put it somewhere easier to find:
+
+```bash
+gtn diagnostics collect --output ~/Desktop
+```
+
+Attach the file to your bug report. Nothing is uploaded anywhere — the bundle is written to your machine, and sharing it is your call.
+
+!!! note "What is taken out, and what to check before you share it"
+
+    The bundle is written by the engine, which knows its own API keys, so it searches every file it collects and takes them out — along with anything else shaped like a credential. Home directory paths become `~` and your username becomes `<user>`; pass `--show-identity` if you would rather keep them. Anything removed shows up as `<redacted>`, and `manifest.json` counts every removal, so a setting that looks empty can be told apart from one that was hidden.
+
+    What it cannot find is a secret it was never told about that is not shaped like one — a password typed into a node's text field, or a token a library wrote to its own log in its own format. Skim the files under `logs/` and the workflow file before attaching the bundle to anything public, because what is left depends on what was on your machine.
+
+If you only want the health checks and not a file to send, run:
+
+```bash
+gtn doctor
+```
+
+It prints a table of what it found, with a fix for anything that needs one.
 
 ### From the desktop application
 
@@ -244,8 +288,14 @@ The desktop application keeps its own log files for the local engine it manages,
 
 If you run the engine manually (with `gtn` or `gtn engine`), logs print directly to that terminal. Scroll back and copy the relevant portion from there.
 
+The engine also keeps its own log files, so you don't have to catch a problem while the terminal is still open. Each engine process writes one file in `<XDG_DATA_HOME>/griptape_nodes/logs`, rolls it over at 10 MB, and deletes files that haven't been touched for a week. Three settings control this: `logging.log_to_file`, `logging.log_directory`, and `logging.log_retention_days` (see the [Configuration Reference](reference/configuration_reference.md)). `gtn diagnostics collect` gathers these files for you.
+
 If the logs don't show enough detail, raise the engine's log level: open the Configuration Editor (**Settings → All Settings**), search for "log level", set it to `DEBUG`, and reproduce the issue (see [Editing Settings in the Editor](guides/configuration.md#editing-settings-in-the-editor)). When running headless with no editor attached, you can set it through an environment variable instead:
 
 ```bash
 GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 ```
+
+!!! tip
+
+    The engine keeps the most recent 5,000 log lines in memory, so making a bundle right after a problem captures it even if log files are turned off — they arrive as `logs/session.log`. When the engine did write a log file, that file already holds the same lines and more, so the bundle ships the file instead and leaves `session.log` out. Either way the lines carry whatever the log level allows, so set the log level to `DEBUG` before reproducing the problem if you need debug detail. `logging.session_log_buffer_lines` controls how many lines are kept.
