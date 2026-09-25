@@ -217,7 +217,7 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
-        self._resource_manager = ResourceManager(self._event_manager)
+        self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
@@ -570,6 +570,17 @@ class Engine:
                 context_manager.pop_node()
             context_manager.pop_flow()
         context_manager.pop_workflow()
+
+        # Every key referring to a held object lived on a node just deleted, so each entry would hold
+        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
+        #
+        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
+        # teardown shares: deleting the open workflow reaches this without going through that handler.
+        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
+        # workers about theirs.
+        dropped = self._resource_manager.drop_all_local_objects()
+        if dropped:
+            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:

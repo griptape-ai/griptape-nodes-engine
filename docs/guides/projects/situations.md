@@ -170,6 +170,17 @@ The filename parameter *is* the `ProjectFileParameter`. Whatever you type there 
 
 Nearly every generation and save node uses `save_node_output`. The other situations are used by the parts of the system they name: dragging a file in uses `copy_external_file`, a URL download uses `download_url`, thumbnails use `save_preview`, and saving a workflow uses `save_workflow`.
 
+### Sending one node's output somewhere else entirely
+
+Typing a plain name like `render.png` lets the situation decide the destination, which is what you want nearly always. Two other things you can type override that for the one node:
+
+- **A relative folder path** — `lighting/pass_a/render.png` nests the file inside the situation's directory, so `save_node_output` puts it in `outputs/lighting/pass_a/`. The situation still decides the starting point.
+- **An absolute path** — `/mnt/studio/renders/render.png`, `C:\renders\render.png`, or the `file:///mnt/studio/renders/render.png` spelling of either. Here you are naming the exact location on disk, so the situation no longer builds the path and the file lands where you said: no `outputs` directory, no node-name prefix, no version number added to the name. The situation still decides what happens when a file is already at that location — under `save_node_output` you get `render_1.png` rather than losing the earlier render — and it still creates any folders in the path that don't exist yet.
+
+A web address is not a destination. A node cannot save to `https://example.com/render.png`, and typing one gives you an error rather than a file in an unexpected place.
+
+Because an absolute path skips the project system, it also skips what the project system gives you: the path is specific to your machine, so a workflow carrying one will not find that location on someone else's computer. A path naming a drive the machine doesn't have — a `C:` path opened on macOS or Linux — gives you an error rather than a folder called `C:` somewhere unexpected. When you want *every* node to write somewhere new, edit the situation in your project file instead.
+
 ### Finding out which situation a node uses
 
 Hover the node's filename parameter. Its tooltip names the situation, for example:

@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
@@ -24,6 +25,8 @@ def _make_mock_node(name: str = "test_node") -> MagicMock:
     node.parameter_values = {}
     node.parameter_output_values = {"output_param": "output_value"}
     node.metadata = {}
+    # A mock's default return value is truthy, and the executor reads this hook as "reasons not to run".
+    node.validate_in_execution_environment = MagicMock(return_value=None)
     return node
 
 
@@ -65,11 +68,18 @@ def _make_node_manager(
     object_manager: MagicMock | None = None,
     library_manager: MagicMock | None = None,
     worker_manager: MagicMock | None = None,
+    event_manager: EventManager | None = None,
 ) -> NodeManager:
-    """Build a NodeManager wired to a mock engine instead of the process-wide facade."""
+    """Build a NodeManager wired to a mock engine instead of the process-wide facade.
+
+    Pass a real `event_manager` to observe the node-execution scope; a mock one answers
+    `in_node_execution()` with a truthy mock whether the scope was opened or not.
+    """
     mock_engine = MagicMock()
     mock_engine.object_manager = object_manager
     mock_engine.library_manager = library_manager
+    if event_manager is not None:
+        mock_engine.event_manager = event_manager
     # Engine always has a WorkerManager, so a test that leaves it None describes a shape the engine
     # cannot be in. Routing awaits it, so it needs to be awaitable.
     worker_manager = worker_manager or MagicMock()
@@ -128,6 +138,32 @@ class TestExecuteNodeOrchestratorPath:
         mock_obj_mgr.add_object_by_name.assert_not_called()
         mock_node.set_parameter_value.assert_called_once_with("input_param", "input_value")
         mock_node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_node_runs_inside_the_execution_scope(self) -> None:
+        """The scope is what holds a release hook back, so a node running here has to open it too.
+
+        An in-process library can hold an object a parallel node is using, and only the scope keeps a
+        "clear cache" node from freeing it mid-run.
+        """
+        event_manager = EventManager()
+        mock_node = _make_mock_node()
+        scope_open_during_run: list[bool] = []
+        mock_node.aprocess = AsyncMock(
+            side_effect=lambda: scope_open_during_run.append(event_manager.in_node_execution())
+        )
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=mock_node),
+            library_manager=_make_mock_library_manager(is_worker=False),
+            event_manager=event_manager,
+        )
+
+        request = ExecuteNodeRequest(node_name="test_node", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert scope_open_during_run == [True]
+        assert event_manager.in_node_execution() is False
 
     @pytest.mark.asyncio
     async def test_no_params(self) -> None:
@@ -402,6 +438,7 @@ class TestExecuteNodeWorkerRoute:
         node.metadata = {"library": "worker_library"}
         node.parameter_values = {}
         node.parameter_output_values = {}
+        node.validate_in_execution_environment = MagicMock(return_value=None)
         return node
 
     def _make_mock_obj_mgr(self, existing_node: MagicMock | None = None) -> MagicMock:

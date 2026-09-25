@@ -95,7 +95,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
         return [FFmpegPreviewGenerator]
 
     @classmethod
-    def detect_format(cls, data: bytes) -> str | None:  # noqa: C901, PLR0911
+    def detect_format(cls, data: bytes) -> str | None:  # noqa: PLR0911
         """Magic-byte sniff for common video container formats."""
         if len(data) < cls._SNIFF_MIN_HEADER_BYTES:
             return None
@@ -121,8 +121,6 @@ class VideoArtifactProvider(BaseArtifactProvider):
         # AVI: RIFF....AVI .
         if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
             return "avi"
-        if head[:6] in (b"GIF87a", b"GIF89a"):
-            return "gif"
         return None
 
     @classmethod

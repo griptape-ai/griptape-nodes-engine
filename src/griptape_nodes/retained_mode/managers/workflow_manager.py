@@ -1397,6 +1397,9 @@ class WorkflowManager(EngineScoped):
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == request.name:
             self.engine.clear_current_workflow_data()
+            # clear_current_workflow_data releases what THIS process holds; the worker half must be
+            # awaited, so it belongs here in the async handler rather than in that sync method.
+            await self.engine.worker_manager.broadcast_local_object_teardown()
         try:
             workflow = WorkflowRegistry.delete_workflow_by_name(request.name)
         except Exception as e:

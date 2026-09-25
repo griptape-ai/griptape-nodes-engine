@@ -127,7 +127,8 @@ class ProjectFileParameter:
             FileDestination with a MacroPath and baked-in write policy for deferred path resolution
 
         Raises:
-            ValueError: If an upstream FileDestinationProvider is connected but returns None.
+            ValueError: If an upstream FileDestinationProvider is connected but returns None,
+                or if the parameter's value is a URL that names no local file.
         """
         result = self._node.engine.handle_request(ListConnectionsForNodeRequest(node_name=self._node.name))
         if isinstance(result, ListConnectionsForNodeResultSuccess):

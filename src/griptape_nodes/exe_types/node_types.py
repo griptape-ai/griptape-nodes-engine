@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 import warnings
 from abc import ABC
 from collections.abc import Callable, Generator, Iterable, Iterator
@@ -27,6 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
+from griptape_nodes.exe_types.local_objects import LocalObjectScope
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
@@ -38,6 +40,8 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
     GetConfigValueResultSuccess,
+    IsBetaFeatureEnabledRequest,
+    IsBetaFeatureEnabledResultSuccess,
     SetConfigValueRequest,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -326,6 +330,7 @@ class BaseNode(ABC):
     current_spotlight_parameter: Parameter | None = None
     parameter_values: dict[str, Any]
     parameter_output_values: TrackedParameterOutputValues
+    _local_objects: LocalObjectScope | None
     stop_flow: bool = False
     root_ui_element: BaseNodeElement
     _state: NodeResolutionState
@@ -337,11 +342,36 @@ class BaseNode(ABC):
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
+    _parameters_added_after_construction: set[str]
+    _parameters_added_during_execution: set[str]
     _engine: Engine | None
 
     @property
     def parameters(self) -> list[Parameter]:
         return self.root_ui_element.find_elements_by_type(Parameter)
+
+    @property
+    def parameters_added_after_construction(self) -> set[str]:
+        """Names of parameters the node grew outside its declarative ``__init__``.
+
+        A parameter declared in ``__init__`` reappears whenever the node is recreated from its
+        create command, even one built from the node's own metadata rather than hardcoded. One
+        added later does not, so serialization has to recreate it by hand.
+        """
+        return self._parameters_added_after_construction
+
+    @property
+    def parameters_added_during_execution(self) -> set[str]:
+        """Names of parameters the node is growing while it runs, a subset of the set above.
+
+        These are scratch state rather than node shape: a node adds one to feed a helper and drops
+        it when the run ends, so serialization leaves it out entirely. Only ever populated while a
+        run is in flight -- the framework empties it when the run ends, so a parameter that outlived
+        its run is durable structure from then on. Parameters a node builds from its value hooks are
+        excluded too, because those arrive during input hydration and are meant to last, which is
+        why this is narrower than ``parameters_added_after_construction``.
+        """
+        return self._parameters_added_during_execution
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -378,8 +408,17 @@ class BaseNode(ABC):
             self.metadata = {}
         else:
             self.metadata = metadata
+        # The identity cached objects are held under. Display names are recycled -- delete Producer_1 and
+        # the next node created gets Producer_1 back -- so caching under the name would let a new node
+        # displace and free a dead node's object while a consumer still holds its key. An attribute rather
+        # than a metadata entry, because metadata is client-writable and a replayed copy would give two
+        # live nodes one identity. A worker's transient node adopts the orchestrator's through
+        # ExecuteNodeRequest.local_object_source; it survives rename, so a renamed node keeps displacing
+        # its own prior objects.
+        self.local_object_source = f"{name}@{uuid.uuid4().hex[:8]}"
         self.parameter_values = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)
+        self._local_objects = None
         self.root_ui_element = BaseNodeElement()
         # Set the node context for the root element
         self.root_ui_element._node_context = self
@@ -388,6 +427,8 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._inputs_to_reset_after_execution = set()
         self._deferred_inputs_were_reset = False
+        self._parameters_added_after_construction = set()
+        self._parameters_added_during_execution = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -794,6 +835,7 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
@@ -803,6 +845,8 @@ class BaseNode(ABC):
 
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
+        self._parameters_added_after_construction.discard(param.name)
+        self._parameters_added_during_execution.discard(param.name)
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -841,7 +885,7 @@ class BaseNode(ABC):
         for name in names:
             parameter = self.get_parameter_by_name(name)
             if parameter is not None:
-                parameter.ui_options = {**parameter.ui_options, "hide": not visible}
+                parameter.update_ui_options({"hide": not visible})
 
     def get_message_by_name_or_element_id(self, element: str) -> ParameterMessage | None:
         element_items = self.root_ui_element.find_elements_by_type(ParameterMessage)
@@ -863,7 +907,7 @@ class BaseNode(ABC):
         for name in names:
             message = self.get_message_by_name_or_element_id(name)
             if message is not None:
-                message.ui_options = {**message.ui_options, "hide": not visible}
+                message.update_ui_options({"hide": not visible})
 
     def hide_message_by_name(self, names: str | list[str]) -> None:
         self._set_message_visibility(names, visible=False)
@@ -898,9 +942,6 @@ class BaseNode(ABC):
             if traits:
                 trait = traits[0]  # Take the first Options trait
                 trait.choices = choices
-                # Update the manually set UI options to include the new simple_dropdown
-                if hasattr(parameter, "_ui_options") and parameter._ui_options:
-                    parameter._ui_options["simple_dropdown"] = choices
 
                 if default in choices:
                     parameter.default_value = default
@@ -1132,6 +1173,35 @@ class BaseNode(ABC):
             self.engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
 
     def get_parameter_value(self, param_name: str) -> Any:
+        """The value a node reads, with a held object substituted for the key standing in for it.
+
+        A `serializable=False` parameter's value is held in the process that produced it and travels as a
+        key, so this is where the key becomes the object again -- the node reads its parameter normally.
+        Engine code that moves values between nodes, saves them, or sends them to the editor wants the key
+        and calls `_get_raw_parameter_value`, which is also the one to override for a computed value.
+
+        The reading parameter's own declaration is not consulted. Only the producer declares the flag, and
+        its key travels down connections to consumers that declare nothing -- gating translation on the
+        reader would hand those consumers the key string instead of the object.
+
+        Raises:
+            RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
+        """
+        value = self._get_raw_parameter_value(param_name)
+        return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
+
+    def _get_raw_parameter_value(self, param_name: str) -> Any:
+        """The value as stored, with no cached-object substitution. Engine-internal.
+
+        What is in a parameter is a reference when the object is cached, and a reference is what has to
+        travel to a worker, into a saved workflow, or to the editor. Node authors want
+        `get_parameter_value` and have no use for this one, which is why it is private: two public readers
+        would only raise the question of which to pick.
+
+        Saving, dispatch, events and metadata all read through here, so an engine subclass computing a
+        value rather than storing it overrides this rather than the public wrapper -- an override there
+        would be bypassed by every one of them.
+        """
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
@@ -1192,7 +1262,10 @@ class BaseNode(ABC):
             # special handling if it's in a container.
             if parameter.parent_container_name and parameter.parent_container_name in self.parameter_values:
                 del self.parameter_values[parameter.parent_container_name]
-                new_val = self.get_parameter_value(parameter.parent_container_name)
+                # Raw: this copies the remaining rows along rather than reading them for use. Resolving
+                # here would raise on a key whose object sits in a worker, out of a connection delete and
+                # out of the run's finally, and would write live objects back into parameter_values.
+                new_val = self._get_raw_parameter_value(parameter.parent_container_name)
                 if new_val is not None:
                     # Don't set the container to None (that would make it empty)
                     self.set_parameter_value(parameter.parent_container_name, new_val)
@@ -1300,7 +1373,37 @@ class BaseNode(ABC):
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:
-        """Runs before this node is run."""
+        """Runs on the ORCHESTRATOR, immediately before this node is dispatched.
+
+        Structural checks only: what a parameter declares, whether a value is present, what the graph
+        looks like. This process may be nothing like the one that runs the node -- a library whose nodes
+        execute in a worker is installed here with its edit-time dependencies only, and a value produced
+        by a worker is held there and cannot be read from here.
+
+        For anything that needs the real thing -- a loaded model, a tensor an upstream node produced --
+        use `validate_in_execution_environment`, which runs where the node runs.
+        """
+        return None
+
+    def validate_in_execution_environment(self) -> list[Exception] | None:
+        """Runs in the process that executes this node, immediately before `aprocess()`.
+
+        The counterpart to `validate_before_node_run`: same purpose, different place. Here the node's
+        execution dependencies are importable and its input values are the objects themselves, so this
+        is where a check that needs a built model or a real tensor belongs.
+
+        Called on both paths, so a library behaves the same whether or not its nodes run in a worker.
+        Returning exceptions fails the node without running it, and the orchestrator reports that as a
+        validation failure rather than as a crash.
+
+        Inspection only: read a tensor's shape, confirm a model is already loaded. Building the thing
+        being checked is what this hook exists to stop. It runs synchronously on the executing process's
+        event loop, so a slow check on a worker leaves the orchestrator's heartbeat challenges
+        unanswered and the worker is evicted mid-run.
+
+        Not a substitute for the other two hooks. This one cannot run before the flow starts, and it
+        sees a transient node with no connections, so a question about the graph has no answer here.
+        """
         return None
 
     def can_queue_for_execution(self) -> bool:
@@ -1386,6 +1489,39 @@ class BaseNode(ABC):
         logger.warning("Could not detect compute backends; reporting cpu only. %s", result.result_details)
         return ["cpu"]
 
+    def is_beta_feature_enabled(self, feature_id: str) -> bool:
+        """Whether a beta feature declared by this node's library is on.
+
+        The feature must be listed in the `beta_features` section of the library JSON. Returns the
+        user's choice from the Beta Features settings page, or the feature's default when they
+        haven't made one. Logs a warning and returns False when the library doesn't declare a
+        valid feature with this id.
+
+        Always create the parameters a feature uses, and only hide or show them based on this, so
+        workflows saved with the feature on still open with it off.
+        """
+        library_name = self.metadata.get("library")
+        if library_name is None:
+            logger.warning(
+                "Attempted to check beta feature '%s' for node '%s'. Failed because the node doesn't belong to a library.",
+                feature_id,
+                self.name,
+            )
+            return False
+
+        # A failure here is an author mistake this method reports itself, so keep the dispatcher
+        # from also logging it as an error on every node created and every run.
+        result = self.engine.handle_request(
+            IsBetaFeatureEnabledRequest(
+                feature_id=feature_id, library_name=library_name, failure_log_level=logging.DEBUG
+            )
+        )
+        if not isinstance(result, IsBetaFeatureEnabledResultSuccess):
+            logger.warning("%s The feature is treated as off for node '%s'.", result.result_details, self.name)
+            return False
+
+        return result.enabled
+
     def get_config_value(self, service: str, value: str) -> str:
         warnings.warn(
             "get_config_value() is deprecated. Use GetSecretValueRequest for secrets/API keys or "
@@ -1413,6 +1549,18 @@ class BaseNode(ABC):
         )
 
         self.engine.handle_request(SetConfigValueRequest(category_and_key=f"nodes.{service}.{value}", value=new_value))
+
+    @property
+    def local_objects(self) -> LocalObjectScope:
+        """This node's view of the process-local object store, for a resource it reuses across runs.
+
+        A value passed between nodes does not need this: mark the output parameter `serializable=False` and
+        assign the object to it. The engine holds it, sends the key on, and releases it when the value is
+        replaced or this node goes away.
+        """
+        if self._local_objects is None:
+            self._local_objects = LocalObjectScope(node=self, library=self.metadata.get("library"))
+        return self._local_objects
 
     def clear_node(self) -> None:
         # set state to unresolved
@@ -1898,6 +2046,32 @@ class BaseNode(ABC):
             ),
         )
 
+    def _record_parameter_add_scope(self, parameter_name: str) -> None:
+        """Populate the two parameter-origin sets from the scope this add arrived in.
+
+        Reads the same flags as the detector above, but not the same way: a sanctioned
+        mutation is exempt from the execution set only, because ``AddParameterToNodeRequest``
+        syncs the parameter back to the orchestrator and so builds durable structure even
+        mid-run, while it is still structure the node did not declare in ``__init__``.
+        """
+        # Lazy import: library_registry imports BaseNode from this module,
+        # so importing at module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if LibraryRegistry.is_constructing_node():
+            return
+        self._parameters_added_after_construction.add(parameter_name)
+        if _in_aprocess.get() and not _sanctioned_mutation.get():
+            self._parameters_added_during_execution.add(parameter_name)
+
+    def forget_parameters_added_during_execution(self) -> None:
+        """Drop the scratch marker from every parameter still carrying it. Called when a run ends.
+
+        Scratch parameters are torn down by the run that made them, so one that outlives the
+        run was structure after all. Keeping the marker would drop it from every later save.
+        """
+        self._parameters_added_during_execution.clear()
+
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
@@ -1913,9 +2087,9 @@ class BaseNode(ABC):
             event_data = parameter.to_event(self)
             # Display-preservation guard. Gated on _in_aprocess here, unlike
             # TrackedParameterOutputValues._emit_parameter_change_event, because this
-            # value comes from Parameter.to_event -> node.get_parameter_value(), which
-            # only substitutes inside aprocess. Outside it the value is already the
-            # template, so the guard would be a no-op.
+            # value comes from Parameter.to_event -> node._get_raw_parameter_value(),
+            # and substitution only happens inside aprocess. Outside it the value is
+            # already the template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
@@ -2058,6 +2232,23 @@ class BaseNode(ABC):
         return element_names.index(element_name)
 
 
+def _values_differ(old_value: Any, new_value: Any) -> bool:
+    """Whether a parameter's value changed, for values that may not support `!=` as a bool.
+
+    A node can hold an array-like whose `__ne__` returns another array rather than a bool, so
+    `old != new` raises instead of answering ("The truth value of an array with more than one
+    element is ambiguous"). Identity is checked first because it answers the common re-assignment
+    without touching `__ne__` at all, and an uncomparable pair is reported as changed: emitting an
+    event the editor ignores costs a message, while swallowing one leaves it showing a stale value.
+    """
+    if old_value is new_value:
+        return False
+    try:
+        return bool(old_value != new_value)
+    except (ValueError, TypeError):
+        return True
+
+
 class TrackedParameterOutputValues(dict[str, Any]):
     """A dictionary that tracks modifications and emits AlterElementEvent when parameter output values change."""
 
@@ -2073,8 +2264,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get():
-            param = self._node.get_parameter_by_name(key)
-            if param is None or param.allow_variable_substitution:
+            parameter = self._node.get_parameter_by_name(key)
+            if parameter is None or parameter.allow_variable_substitution:
                 value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
@@ -2083,7 +2274,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # None -- self.get(key) returns None for both, so without the had_key
         # check an unset -> None transition would be silently dropped and the UI
         # would keep showing the stale prior value.
-        if not had_key or old_value != value:
+        if not had_key or _values_differ(old_value, value):
             self._emit_parameter_change_event(key, value)
 
     def __delitem__(self, key: str) -> None:
@@ -2098,7 +2289,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
             for key in keys_to_clear:
                 # Some nodes still have values set, even if their output values are cleared
                 # Here, we are emitting an event with those set values, to not misrepresent the values of the parameters in the UI.
-                value = self._node.get_parameter_value(key)
+                # Raw: this goes to the editor, which shows the stored value. Translating here would put
+                # a held object into an event payload and json-serialize it on the way out.
+                value = self._node._get_raw_parameter_value(key)
                 self._emit_parameter_change_event(key, value, deleted=True)
 
     def silent_clear(self) -> None:
@@ -2409,7 +2602,9 @@ class EndNode(BaseNode):
         # Update all values to use the output value
         for param in self.parameters:
             if param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                value = self.get_parameter_value(param.name)
+                # Raw: this copies a value along rather than reading it for use, so a held value
+                # stays the key it already is instead of being resolved and parked a second time.
+                value = self._get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
@@ -2706,7 +2901,11 @@ def handle_container_parameter(current_node: BaseNode, parameter: Parameter) -> 
             build_parameter_value = {}
         build_parameter_value = []
         for child in children:
-            value = current_node.get_parameter_value(child.name)
+            # Raw, because what this builds is cached into the container's own entry in
+            # `parameter_values`, and that dict is the payload of an ExecuteNodeRequest. Translating here
+            # would put a live object in it and send it to a worker as JSON. The node still sees objects:
+            # its read resolves the whole list on the way out.
+            value = current_node._get_raw_parameter_value(child.name)
             if value is not None:
                 build_parameter_value.append(value)
         return build_parameter_value

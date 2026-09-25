@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from hashlib import blake2b
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ import httpx
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, WriteFileRequest, WriteFileResultSuccess
+from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL
 from griptape_nodes.utils import resolve_workspace_path
 
 if TYPE_CHECKING:
@@ -24,7 +26,7 @@ logger = logging.getLogger("griptape_nodes")
 
 
 class LocalStorageDriver(BaseStorageDriver):
-    """Stores files using the engine's local static server."""
+    """Stores files in the local workspace, served by the host's static file server."""
 
     def __init__(
         self,
@@ -42,16 +44,6 @@ class LocalStorageDriver(BaseStorageDriver):
         super().__init__(config_manager)
         self._os_manager = os_manager
 
-        from griptape_nodes.servers.static import (
-            STATIC_SERVER_ENABLED,
-            STATIC_SERVER_HOST,
-            STATIC_SERVER_PORT,
-            STATIC_SERVER_URL,
-        )
-
-        if not STATIC_SERVER_ENABLED:
-            msg = "Static server is not enabled. Please set STATIC_SERVER_ENABLED to True."
-            raise ValueError(msg)
         if base_url is None:
             # Default to localhost - the storage driver creator can pass a proxy URL if needed
             self.base_url = f"http://{STATIC_SERVER_HOST}:{STATIC_SERVER_PORT}{STATIC_SERVER_URL}"
@@ -193,13 +185,28 @@ class LocalStorageDriver(BaseStorageDriver):
             base_without_workspace = self.base_url.rsplit("/workspace", 1)[0]
             url = f"{base_without_workspace}/external/{path_str}"
 
-        # Add a cache-busting query parameter to the URL so that the browser always reloads
-        # the file. Millisecond resolution: with whole seconds, two URLs minted in the same
-        # second are identical strings, so the browser serves one cached response for both —
-        # and if that response was bad (e.g. a failed load), every same-second consumer
-        # inherits it.
-        cache_busted_url = f"{url}?t={time.time_ns() // 1_000_000}"
-        return cache_busted_url
+        # Version the URL by the served file's identity rather than by mint time:
+        # unchanged content yields the same URL on every mint, so the browser's
+        # cache HITS instead of refetching, and a rewrite changes the URL.
+        # mtime alone cannot carry that guarantee — kernels write timestamps from
+        # a coarse clock (millisecond-scale ticks on Linux, regardless of the
+        # nanosecond field ext4 stores), so a same-size rewrite lands inside one
+        # tick roughly half the time. st_ino closes that for the engine's own
+        # writes: every OVERWRITE promotes a scratch file by rename, which
+        # allocates a fresh inode per rewrite. The residual bound — an external
+        # tool rewriting IN PLACE, same size, within one clock tick — is what
+        # #5607's content-identity design exists to close.
+        # Stat the pre-strip path: on Windows, a >MAX_PATH file can only be
+        # stat'ed with the \\?\ prefix that the URL branches above had to drop.
+        try:
+            stat_result = resolved_path.stat()
+        except OSError:
+            # Nothing to fingerprint yet (file still being staged, unreachable
+            # mount): fall back to mint time so the URL still busts caches.
+            return f"{url}?v={time.time_ns() // 1_000_000}"
+        fingerprint = f"{stat_result.st_ino}:{stat_result.st_size}:{stat_result.st_mtime_ns}"
+        version = blake2b(fingerprint.encode(), digest_size=8).hexdigest()
+        return f"{url}?v={version}"
 
     def delete_file(self, path: Path) -> None:
         """Delete a file from local storage.

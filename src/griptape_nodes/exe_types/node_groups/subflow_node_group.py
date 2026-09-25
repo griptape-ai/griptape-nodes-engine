@@ -1193,16 +1193,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.engine.handle_request(create_first_connection)
         self.engine.handle_request(create_second_connection)
 
-    def delete_nodes_from_group(self, nodes: list[BaseNode]) -> None:
-        """Delete nodes from the group and untrack their connections.
-
-        Args:
-            nodes: List of nodes to delete from the group
-        """
-        for node in nodes:
-            self.nodes.pop(node.name)
-        self.metadata["node_names_in_group"] = list(self.nodes.keys())
-
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Move nodes back out to this group's own flow and stop claiming them.
 
@@ -1319,7 +1309,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 if internal_param.name in internal_node.parameter_output_values:
                     value = internal_node.parameter_output_values[internal_param.name]
                 else:
-                    value = internal_node.get_parameter_value(internal_param.name)
+                    value = internal_node._get_raw_parameter_value(internal_param.name)
 
                 if value is not None:
                     self.parameter_output_values[proxy_param_name] = value

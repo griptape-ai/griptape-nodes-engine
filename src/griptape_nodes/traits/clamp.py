@@ -16,9 +16,14 @@ class Clamp(Trait):
         self.min = min_val
         self.max = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["clamp"]
+    def to_state(self) -> dict[str, Any]:
+        return {"min_val": self.min, "max_val": self.max}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "min_val" in state:
+            self.min = state["min_val"]
+        if "max_val" in state:
+            self.max = state["max_val"]
 
     def _clamp_number(self, value: float) -> float:
         # Keep this as a tiny helper so the converter stays readable and so we can

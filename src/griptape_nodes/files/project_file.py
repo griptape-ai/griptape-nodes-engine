@@ -1,12 +1,12 @@
 """ProjectFileDestination - project-aware FileDestination built from a situation template."""
 
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination
-from griptape_nodes.files.path_utils import FilenameParts
+from griptape_nodes.files.path_utils import FilenameParts, is_url, parse_file_uri
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -112,7 +112,71 @@ class ProjectFileDestination(FileDestination):
                 recorded in the provenance record. When omitted, the engine
                 infers the node from flow state and flags the record as inferred.
             **extra_vars: Additional macro variables (e.g., node_name="MyNode", _index=1).
+
+        Raises:
+            ValueError: If the filename is a URL that names no local file.
         """
+        # Classify the input before any path handling: FilenameParts.from_filename is a
+        # plain Path() split with no URL awareness, so a URL that reaches it is mangled
+        # rather than rejected. `file:///something.png` split that way yields
+        # directory=Path("file:"), which is neither "." nor absolute, so the sub_dirs
+        # branch below would fire and produce `{outputs}/file:/something.png` -- a path
+        # pointing nowhere, with no error raised.
+        #
+        # The read side already classifies its input this way (`_resolve_plain_path`
+        # calls parse_file_uri first), so doing it here is what makes build_file() and
+        # File.resolve() agree about what a `file://` string means.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/5360
+        local_path_from_uri = parse_file_uri(filename)
+        if local_path_from_uri is not None and not Path(local_path_from_uri).name:
+            # `file:///` and `file://localhost/` parse to "/", a real local path naming no file.
+            # Refused here rather than below, where an empty filename would take the bypass and
+            # build a destination pointing at nothing. The host-only `file://` forms parse to
+            # None instead, so the URL branch below is what refuses those.
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that address does not name a file. "
+                f"Add the file name you want, for example 'file:///renders/output.png'."
+            )
+            raise ValueError(msg)
+        if (
+            local_path_from_uri is not None
+            and PureWindowsPath(local_path_from_uri).is_absolute()
+            and not Path(local_path_from_uri).is_absolute()
+        ):
+            # A drive-anchored path on a host that has no drives. `file:///C:/renders/out.png`
+            # yields `C:/renders/out.png`, which POSIX reads as relative, so the bypass below
+            # would hand a relative string to File.resolve() and land at
+            # `{workspace}/C:/renders/out.png` -- a directory named `C:` inside the workspace.
+            # Tested against PureWindowsPath rather than the host's own is_absolute() so a
+            # leading-slash path, which Windows resolves against the current drive, still
+            # reaches the bypass on Windows.
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that address does not name a location "
+                f"on this computer. A path from another operating system, such as a 'C:' drive on macOS or "
+                f"Linux, has no equivalent here."
+            )
+            raise ValueError(msg)
+        if local_path_from_uri is None and is_url(filename):
+            # Covers a remote web address, any other scheme, and a `file://` URI naming a
+            # host this OS cannot reach -- on Windows such a host is read as a UNC server
+            # and yields a real path, so it never arrives here.
+            # `parse_static_server_url` maps the engine's own
+            # `http://localhost:8124/workspace/staticfiles/...` form back to a real file on
+            # the read side, and is deliberately NOT adopted here: that URL names an asset
+            # the engine already wrote, so treating it as a save destination would
+            # overwrite one node's output from another node.
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that address points somewhere this "
+                f"computer cannot save to. Enter a file name, a folder path, or a 'file://' address "
+                f"naming a file on this machine."
+            )
+            raise ValueError(msg)
+        if local_path_from_uri is not None:
+            # A file:// URI names an explicit on-disk location, so swap in the local path it
+            # names. It is absolute by the check above, so it reaches the same verbatim
+            # bypass an absolute filename takes below.
+            filename = local_path_from_uri
+
         result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation))
 
         if isinstance(result, GetSituationResultSuccess):
@@ -129,6 +193,26 @@ class ProjectFileDestination(FileDestination):
             create_dirs = True
 
         parts = FilenameParts.from_filename(filename)
+
+        # An explicit on-disk location bypasses the situation macro: the caller is
+        # declaring where the file goes, so honor it verbatim rather than treating the
+        # leading-slash directory as sub_dirs within {outputs}/etc. Two shapes qualify --
+        # an absolute filename, and a file:// URI, whose local path we substituted above.
+        # The URI keeps its own flag because `file:///renders/out.png` is not is_absolute()
+        # on Windows, where a driveless path is current-drive-relative; without it that URI
+        # would fall into sub_dirs on Windows only.
+        # Provenance still captures (the record's path, hash, and node are the
+        # on-disk truth), but its situation block is dropped -- the situation
+        # macro + variables won't re-resolve to the actual on-disk location, so
+        # recording them would produce a dishonest provenance trail.
+        if local_path_from_uri is not None or parts.directory.is_absolute():
+            return cls(
+                filename,
+                existing_file_policy=existing_file_policy,
+                create_parents=create_dirs,
+                provenance=ProvenanceContent(producing_node=producing_node, situation=None),
+            )
+
         variables: dict[str, str | int] = {
             "file_name_base": parts.stem,
             "file_extension": parts.extension,
@@ -137,11 +221,9 @@ class ProjectFileDestination(FileDestination):
         # When the filename carries its own relative directory component (e.g.
         # "foo/bar/output.png"), populate sub_dirs so situations with {sub_dirs?:/}
         # route the file into that sub-directory. An explicit sub_dirs kwarg in
-        # extra_vars takes precedence. Absolute filenames still flow through the
-        # macro; we skip the sub_dirs override for them so we don't feed a
-        # leading-slash value into the macro substitution.
+        # extra_vars takes precedence.
         directory_str = str(parts.directory)
-        if directory_str and directory_str != "." and not parts.directory.is_absolute() and "sub_dirs" not in variables:
+        if directory_str and directory_str != "." and "sub_dirs" not in variables:
             variables["sub_dirs"] = directory_str
 
         # Derived variables (e.g. file_extension_directory) are injected by the
@@ -164,21 +246,6 @@ class ProjectFileDestination(FileDestination):
             if situation_obj is not None
             else None
         )
-
-        # Absolute filenames bypass the situation macro: the caller is declaring
-        # an explicit on-disk location, so honor it verbatim rather than treating
-        # the leading-slash directory as sub_dirs within {outputs}/etc. Provenance
-        # still captures (the record's path, hash, and node are the on-disk truth),
-        # but its situation block is dropped -- the situation macro + variables we
-        # computed above won't re-resolve to the actual on-disk location, so
-        # recording them would produce a dishonest provenance trail.
-        if parts.directory.is_absolute():
-            return cls(
-                filename,
-                existing_file_policy=existing_file_policy,
-                create_parents=create_dirs,
-                provenance=ProvenanceContent(producing_node=producing_node, situation=None),
-            )
 
         return cls(
             macro_path,

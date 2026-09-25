@@ -66,6 +66,11 @@ from griptape_nodes.node_library.library_validation import (
     validate_library_declarations,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.retained_mode.beta_features import (
+    LIBRARY_BETA_FEATURES_KEY,
+    find_library_config_slug_collision,
+    library_config_slug,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -78,6 +83,9 @@ from griptape_nodes.retained_mode.events.app_events import (
     InitializationStatus,
     LibraryLoadedNotification,
     LibraryLoadStatus,
+    ReportLibraryLoadedRequest,
+    ReportLibraryLoadedResultFailure,
+    ReportLibraryLoadedResultSuccess,
     WorkerNodeSchema,
     WorkerParameterSchema,
 )
@@ -210,6 +218,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
     BeforeLibraryCallbackProblem,
+    BetaFeatureSettingsCollisionProblem,
     CreateConfigCategoryProblem,
     DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
@@ -635,6 +644,10 @@ class LibraryManager(EngineScoped):
     _stable_namespace_finder: StableNamespaceImportFinder
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
+    # How a worker reaches the orchestrator to report a load. Registered by whatever owns the
+    # transport, because this manager has no way to send a request to another process. Stays None
+    # on the orchestrator and on a single-process engine, where there is nobody to report to.
+    _library_load_reporter: Callable[[ReportLibraryLoadedRequest], Awaitable[None]] | None = None
 
     def __init__(
         self, event_manager: EventManager, *, worker_manager: WorkerManager, engine: Engine | None = None
@@ -745,11 +758,8 @@ class LibraryManager(EngineScoped):
         event_manager.assign_manager_to_request_type(
             PreviewProjectProvisioningRequest, self.on_preview_project_provisioning_request
         )
+        event_manager.assign_manager_to_request_type(ReportLibraryLoadedRequest, self.on_report_library_loaded_request)
 
-        event_manager.add_listener_to_app_event(
-            LibraryLoadedNotification,
-            self._on_library_loaded_notification,
-        )
         event_manager.add_listener_to_app_event(
             AppInitializationComplete,
             self.on_app_initialization_complete,
@@ -780,40 +790,71 @@ class LibraryManager(EngineScoped):
         """
         self._pre_reload_callbacks.append(callback)
 
-    async def _on_library_loaded_notification(self, notification: LibraryLoadedNotification) -> None:
-        """Update LibraryInfo fitness and state when a library load outcome is reported."""
-        library_info = self.get_library_info_by_library_name(notification.library_name)
-        if library_info is None:
-            logger.warning(
-                "Received LibraryLoadedNotification for unknown library '%s'.",
-                notification.library_name,
+    def register_library_load_reporter(self, reporter: Callable[[ReportLibraryLoadedRequest], Awaitable[None]]) -> None:
+        """Register how this worker reports a library load to the orchestrator.
+
+        Registered by whatever owns the transport between the two processes, since this manager can
+        build the report but has no way to send it. Absent on the orchestrator and on a
+        single-process engine, where there is nobody to report to.
+        """
+        self._library_load_reporter = reporter
+
+    async def _report_library_loaded(self, request: ReportLibraryLoadedRequest) -> None:
+        """Tell the orchestrator how a library loaded here, or say why it never heard."""
+        if self._library_load_reporter is None:
+            logger.error(
+                "No load reporter is registered, so the orchestrator will not learn that library "
+                "'%s' loaded here and will wait out its startup grace before giving up on it.",
+                request.library_name,
             )
             return
+        await self._library_load_reporter(request)
+
+    async def on_report_library_loaded_request(self, request: ReportLibraryLoadedRequest) -> ResultPayload:
+        """Record how a library loaded in the worker that hosts it.
+
+        The notification raised at the end is this process's own. A peer's copy never reaches a
+        listener, so the GUI hears about a worker's library from the orchestrator accepting the
+        report rather than from a relayed event.
+        """
+        library_info = self.get_library_info_by_library_name(request.library_name)
+        if library_info is None:
+            details = f"Received a library load report for unknown library '{request.library_name}'."
+            logger.warning(details)
+            return ReportLibraryLoadedResultFailure(result_details=details)
         # Only a legacy worker-mode library takes its fitness from the worker: the orchestrator
         # never loaded it, so the worker's verdict is the only one there is. An exec-deps library
         # loaded REAL nodes here and derived its own fitness from doing so, and overwriting that
         # misreports in both directions without the reason travelling -- only the log gets
         # problem_details.
         if library_info.requires_worker:
-            library_info.fitness = LibraryManager.LibraryFitness(notification.fitness)
+            library_info.fitness = LibraryManager.LibraryFitness(request.fitness)
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.LOADED
-        if notification.problem_details:
+        if request.problem_details:
             logger.warning(
                 "Worker reported problems loading library '%s': %s",
-                notification.library_name,
-                notification.problem_details,
+                request.library_name,
+                request.problem_details,
             )
-        # Register stub node classes from the worker-reported schemas so the orchestrator
-        # can display nodes in the sidebar and recreate them during workflow loading.
-        # Skip on the worker itself -- it already has the real node classes registered.
-        # Exec-deps libraries registered REAL node classes locally at load; overwriting
-        # them with schema stubs would throw away converters/validators/traits/hooks.
-        # Only legacy worker-mode libraries (requires_worker) use stub registration.
-        if notification.node_schemas and not self._is_worker and library_info.requires_worker:
-            self._register_nodes_from_worker_schemas(notification.library_name, notification.node_schemas)
+        # Stubs stand in for node classes this process cannot import, so the sidebar and workflow
+        # loading have something to work with. An exec-deps library's real classes are already
+        # registered here, and replacing them with stubs would throw away converters, validators,
+        # traits and hooks.
+        if request.node_schemas and library_info.requires_worker:
+            self._register_nodes_from_worker_schemas(request.library_name, request.node_schemas)
         # Whoever is waiting to route execution here is waiting on WorkerManager, which owns
         # whether a process is available; this is only the news that it loaded.
-        self._worker_manager.note_library_loaded(notification.library_name)
+        self._worker_manager.note_library_loaded(request.library_name)
+        await self.engine.abroadcast_app_event(
+            LibraryLoadedNotification(
+                library_name=request.library_name,
+                fitness=request.fitness,
+                problem_details=request.problem_details,
+            )
+        )
+        return ReportLibraryLoadedResultSuccess(
+            result_details=f"Recorded the worker's load of library '{request.library_name}' as {request.fitness}."
+        )
 
     @property
     def is_worker(self) -> bool:
@@ -942,7 +983,7 @@ class LibraryManager(EngineScoped):
                 #
                 # Only for libraries whose nodes already exist here. A legacy worker-mode library
                 # has none: the orchestrator skips its node modules entirely and its classes arrive
-                # as stubs from the worker's LibraryLoadedNotification. Skipping its spawn would
+                # as stubs from the worker's ReportLibraryLoadedRequest. Skipping its spawn would
                 # leave the library with no node types at all -- an empty entry in the sidebar and
                 # placeholder nodes in any workflow using it. It still cannot execute, because the
                 # reset below preserves its refusal.
@@ -2442,7 +2483,7 @@ class LibraryManager(EngineScoped):
             case LibraryManager.LibraryFitness.NOT_EVALUATED:
                 # Worker-delegated libraries on the orchestrator: node imports are skipped
                 # and fitness will be updated once the worker reports back via
-                # LibraryLoadedNotification. Workers are started asynchronously (either by
+                # ReportLibraryLoadedRequest. Workers are started asynchronously (either by
                 # AppStartSessionRequest or by _maybe_start_workers_for_existing_session)
                 # so we must NOT block here -- doing so would prevent the orchestrator from
                 # sending heartbeats to the worker process, causing it to self-terminate.
@@ -2915,12 +2956,16 @@ class LibraryManager(EngineScoped):
                         if library_data.settings is not None:
                             library_info.problems.extend(self._persist_library_settings(library_data))
 
+                        library_info.problems.extend(
+                            self._check_beta_feature_settings_collision(library_data.name, library)
+                        )
+
                         # For worker-delegated libraries on the orchestrator, skip node module
                         # imports entirely -- importing them would pull heavy deps (torch, triton,
                         # etc.) into the orchestrator process.  The library is already registered
                         # in LibraryRegistry (for the editor and workflow loading); the worker
                         # process handles node loading and will report fitness via
-                        # LibraryLoadedNotification once it finishes.
+                        # ReportLibraryLoadedRequest once it finishes.
                         if library_info.requires_worker and not self._is_worker:
                             library_info.fitness = LibraryManager.LibraryFitness.NOT_EVALUATED
                             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
@@ -2937,18 +2982,23 @@ class LibraryManager(EngineScoped):
                             )
                             self._library_file_path_to_info[file_path] = library_info
 
-                        # On a worker process, broadcast the notification so app.py can relay it
-                        # to the orchestrator over the transport layer. Include serialized node
-                        # schemas so the orchestrator can register stub classes without importing
-                        # the library.
+                        # A worker reports its load to the orchestrator, which never imported this
+                        # library and so has no other account of how it went. Schemas travel only
+                        # for a library the orchestrator cannot import: an exec-deps library already
+                        # registered its real classes there, and probing every node class to build
+                        # schemas it will discard costs a timeout apiece and can exceed 100 KB.
                         if (
                             self._is_worker
                             and library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
                             and library_info.library_name
                         ):
-                            node_schemas = await self._serialize_library_node_schemas(library_info.library_name)
-                            await self.engine.abroadcast_app_event(
-                                LibraryLoadedNotification(
+                            node_schemas = (
+                                await self._serialize_library_node_schemas(library_info.library_name)
+                                if library_info.requires_worker
+                                else None
+                            )
+                            await self._report_library_loaded(
+                                ReportLibraryLoadedRequest(
                                     library_name=library_info.library_name,
                                     fitness=library_info.fitness,
                                     problem_details=self.collate_problems_for_lib_info(library_info),
@@ -3015,6 +3065,27 @@ class LibraryManager(EngineScoped):
         library_info.problems.extend(metadata_result.problems)
         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
         self._library_file_path_to_info[library_info.library_path] = library_info
+
+    def _check_beta_feature_settings_collision(self, library_name: str, library: Library) -> list[LibraryProblem]:
+        """Report another loaded library that would store its beta feature choices in the same place.
+
+        Runs after registration, because the fitness check runs before any library is registered
+        and so can't see the others. Only libraries that both declare beta features can collide.
+        """
+        if not library.get_beta_features():
+            return []
+
+        other_names_with_features = [
+            name
+            for name in LibraryRegistry.list_libraries()
+            if name != library_name and LibraryRegistry.get_library(name).get_beta_features()
+        ]
+        other_name = find_library_config_slug_collision(library_name, other_names_with_features)
+        if other_name is None:
+            return []
+
+        config_key = f"{LIBRARY_BETA_FEATURES_KEY}.{library_config_slug(library_name)}"
+        return [BetaFeatureSettingsCollisionProblem(other_library_name=other_name, config_key=config_key)]
 
     def _persist_library_settings(self, library_data: LibrarySchema) -> list[LibraryProblem]:
         """Inject a library's declared settings into the user config, returning any problems.
@@ -3490,6 +3561,19 @@ class LibraryManager(EngineScoped):
         except Exception as e:
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
+
+        # Release anything this library was holding in THIS process, so it cannot come back holding
+        # objects its previous code built.
+        #
+        # This process only. Reloading every library restarts the workers, which takes their copies with
+        # them, but updating or switching the ref of a single library does not.
+        dropped = self.engine.resource_manager.drop_objects_for_group(request.library_name)
+        if dropped:
+            logger.debug(
+                "Released %d held object(s) belonging to library '%s' as it unloaded.",
+                dropped,
+                request.library_name,
+            )
 
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
@@ -4863,7 +4947,7 @@ class LibraryManager(EngineScoped):
             await self._start_workers()
 
     async def _await_pending_workers(self, wait_seconds: float | None = None) -> None:
-        """Wait for all WORKER_PENDING libraries to report back via LibraryLoadedNotification.
+        """Wait for all WORKER_PENDING libraries to report back via ReportLibraryLoadedRequest.
 
         On timeout, marks remaining pending libraries as FAILURE/UNUSABLE so the rest of
         initialization can continue.

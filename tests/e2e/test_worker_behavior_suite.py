@@ -21,10 +21,10 @@ import logging
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -139,8 +139,8 @@ class TestMediaFromAWorker:
         host stays silent still has somewhere durable to point.
         """
         # Deliberately NOT the static server's default port: an earlier version of this test
-        # used 8124, and a broken adoption gate passed it anyway because the self-serve branch
-        # bound the default port and produced the same URL by coincidence.
+        # used 8124, and a broken adoption gate passed it anyway because the fallback branch
+        # produced the same default URL by coincidence.
         orchestrator_url = "http://localhost:18125"
         monkeypatch.setenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV, orchestrator_url)
         static_files_manager = current_engine().static_files_manager
@@ -149,23 +149,14 @@ class TestMediaFromAWorker:
 
         assert static_files_manager.static_server_base_url == orchestrator_url
 
-    def test_without_the_env_var_a_process_serves_the_workspace_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The orchestrator's own path is unchanged: no env var, so it serves and advertises.
-
-        Patched rather than actually started. Letting it bind left a uvicorn thread running for the
-        rest of the session, and the next test's engine reset made that thread raise -- reported
-        against whichever unrelated test happened to be running. What matters here is the branch
-        taken, not that a socket got bound.
-        """
+    def test_without_the_env_var_or_a_host_url_the_default_address_is_assumed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The engine serves nothing itself, so with no source it points where the host listens by default."""
         monkeypatch.delenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV, raising=False)
         static_files_manager = current_engine().static_files_manager
         static_files_manager._static_server_base_url = None
-        with (
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.start_static_server"),
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.bind_free_socket") as mock_bind,
-        ):
-            mock_bind.return_value.getsockname.return_value = ("localhost", 18124)
-            static_files_manager.on_app_initialization_complete(AppInitializationComplete())
+        static_files_manager.on_app_initialization_complete(AppInitializationComplete())
 
         assert static_files_manager.static_server_base_url.startswith("http://")
 
@@ -376,15 +367,11 @@ class TestEditorTimeBehaviorOnRealNodes:
         assert node.get_parameter_by_name("dynamic_extra") is None
 
 
-class TestUnshippableOutputsAreRefused:
-    """A value the author declared unserializable must not silently vanish across the boundary.
-
-    Dropping it would leave the consuming node reading None with no error anywhere, which is
-    the failure mode this guardrail exists to convert into a message an author can act on.
-    """
+class TestUnshippableOutputsAreKept:
+    """A value the author declared unserializable stays in the worker and a reference travels."""
 
     @pytest.mark.asyncio
-    async def test_a_worker_refuses_to_ship_an_unserializable_output(self) -> None:
+    async def test_a_worker_keeps_an_unserializable_output_and_ships_a_reference(self) -> None:
         current_engine().library_manager._is_worker = True
         _make("UnshippableOutputNode", "Unshippable")
 
@@ -396,11 +383,14 @@ class TestUnshippableOutputsAreRefused:
             )
         )
 
-        assert result.failed()
-        details = str(result.result_details)
-        # The message has to name the parameter and tell the author what to do instead.
-        assert "live_handle" in details
-        assert "serializable" in details
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        sent = result.parameter_output_values["live_handle"]
+        assert is_reference(sent), sent
+        # The object itself never left. A fresh transient node runs the execution, so the entry belongs to
+        # that instance -- what matters is that this process is holding the object the reference names.
+        entry = current_engine().resource_manager.entry_for(sent["key"])
+        assert entry is not None
+        assert not isinstance(entry.value, str)
 
     @pytest.mark.asyncio
     async def test_the_same_node_is_fine_on_the_orchestrator(self) -> None:

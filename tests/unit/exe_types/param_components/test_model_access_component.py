@@ -500,9 +500,11 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
     Two guarantees, tested here:
 
-    - Setup + dropdown continue to work (permissive at UI). No badge, no
-      decoration. Artists can still open workflows built against an
-      unregistered node type without hitting a raise on load.
+    - Setup + dropdown continue to work: construction never raises, so artists
+      can still open workflows built against an unregistered node type. Every
+      row and the badge do carry decoration, because fail-closed denies every
+      choice -- see ``test_no_surface_blames_the_artists_license`` for which
+      decoration, and why it must not be the licensing one.
     - Runtime denial checks fail CLOSED. ``query_for_denial()`` returns a
       synthesized CheckpointDenial saying the models could not be checked, so a
       developer's setup bug cannot silently let denied models through at run
@@ -566,7 +568,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         denial = helper.query_for_denial("alpha")
         assert denial is not None, "Fail-closed contract: unresolved node type must not return None."
-        assert any("could not be checked against your license" in m for m in denial.messages())
+        assert any("couldn't check which models this node is allowed to use" in m for m in denial.messages())
         # The node type is developer detail: it belongs in the log, not on an artist's badge.
         assert not any("_AccessProbeNode" in m for m in denial.messages())
         assert "_AccessProbeNode" in caplog.text
@@ -580,8 +582,31 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
-        with pytest.raises(RuntimeError, match="could not be checked against your license"):
+        with pytest.raises(RuntimeError, match="couldn't check which models this node is allowed to use"):
             helper.raise_if_denied("alpha")
+
+    def test_no_surface_blames_the_artists_license(self, caplog) -> None:  # noqa: ANN001
+        """Fail-closed denies every choice, so every row and the badge carry this state at once.
+
+        That breadth is what makes the wording matter: a dropdown where every row reads "Not
+        permitted by your license" is indistinguishable from a plan that does not cover this node.
+        So the detail string is not enough on its own -- the row subtitle and the badge title have
+        to say "couldn't be checked" too.
+        """
+        import logging
+
+        self._register_library_without_probe_node()
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            helper = self._build_component_against_unresolved_node()
+
+        param = helper._parameter
+        for row in param.ui_options["data"]:
+            assert row["icon"] == "alert-triangle"
+            assert row["subtitle"] == "Couldn't be checked"
+        badge = param.get_badge()
+        assert badge is not None
+        assert badge.title == "Model Check Failed"
 
     def test_query_for_denial_still_ignores_non_string_values(self, caplog) -> None:  # noqa: ANN001
         """Non-string values (driver objects) bypass even the fail-closed path."""
