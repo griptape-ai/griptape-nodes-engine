@@ -420,68 +420,58 @@ class TestTheMessage:
 
         assert BUDGET_EXCEEDED_CODE not in describe(refusal, node_name="Generate Poster")
 
-    def test_it_says_budgets_stop_the_next_call(self) -> None:
-        """An artist who saw credits move during the run needs the timing explained."""
+    def test_it_is_short_enough_for_the_run_blocked_bar(self) -> None:
+        """The editor shows this in a one-line bar; the figures live on the budget page."""
         refusal = refusal_from_body(a_refusal_body())
         assert refusal is not None
 
-        assert "stop the next call, not the one already running" in describe(refusal)
+        message = describe(refusal, node_name="Generate Poster")
 
-    def test_it_quotes_credits_and_never_dollars(self) -> None:
-        """Two Cloud surfaces disagree about credits-per-dollar by 1000x, so never convert."""
+        assert message == (
+            f"{BUDGET_HALT_PREFIX} 'Generate Poster' was blocked by the budget \"tight\". "
+            "Raise its limit, or wait for it to reset at the start of next month."
+        )
+
+    def test_it_never_shows_dollars(self) -> None:
+        """Two Cloud surfaces have disagreed about credits-per-dollar, so never convert."""
         refusal = refusal_from_body(a_refusal_body())
         assert refusal is not None
 
-        message = describe(refusal)
-
-        assert "10 credits remaining" in message
-        assert "50 requested" in message
-        assert "$" not in message
-
-    def test_one_credit_is_not_one_credits(self) -> None:
-        refusal = refusal_from_body(a_refusal_body(a_rejection(remaining_credits=1)))
-        assert refusal is not None
-
-        assert "1 credit remaining" in describe(refusal)
+        assert "$" not in describe(refusal)
 
     def test_it_names_every_budget_that_refused(self) -> None:
         """Raising one limit must not reveal the next by surprise."""
         body = a_refusal_body(
             a_rejection(budget_name="tight", remaining_credits=10),
             a_rejection(budget_name="daily cap", budget_id="b-2", reset_period="DAILY", remaining_credits=4),
+            a_rejection(budget_name="Star Wars X", budget_id="b-3", remaining_credits=7),
         )
         refusal = refusal_from_body(body)
         assert refusal is not None
 
         message = describe(refusal, node_name="Generate Poster")
 
-        assert '"tight"' in message
-        assert '"daily cap"' in message
+        assert message == (
+            f"{BUDGET_HALT_PREFIX} 'Generate Poster' was blocked by the budgets "
+            '"tight", "daily cap" and "Star Wars X". Each one needs room before the run can go through.'
+        )
 
-    def test_the_multi_budget_close_quotes_the_tightest(self) -> None:
-        """`effective_remaining_credits` is what "how much could I have spent" resolves to."""
+    def test_two_budgets_join_without_a_comma(self) -> None:
         body = a_refusal_body(
-            a_rejection(budget_name="tight", remaining_credits=10),
-            a_rejection(budget_name="daily cap", budget_id="b-2", remaining_credits=4),
+            a_rejection(budget_name="tight"),
+            a_rejection(budget_name="daily cap", budget_id="b-2"),
         )
         refusal = refusal_from_body(body)
         assert refusal is not None
 
-        message = describe(refusal)
+        assert 'the budgets "tight" and "daily cap".' in describe(refusal)
 
-        assert "Every budget above must have room" in message
-        assert "the tightest has 4 credits left" in message
-
-    def test_a_budget_name_keeps_its_capitalization(self) -> None:
-        """A list entry is turned into a sentence; `str.capitalize` would rewrite the name."""
-        body = a_refusal_body(
-            a_rejection(budget_name="Star Wars X"),
-            a_rejection(budget_name="Second", budget_id="b-2"),
-        )
-        refusal = refusal_from_body(body)
+    def test_an_unnamed_node_still_reads_as_a_sentence(self) -> None:
+        """A driver raises before the engine knows which node it was serving."""
+        refusal = refusal_from_body(a_refusal_body())
         assert refusal is not None
 
-        assert '"Star Wars X"' in describe(refusal)
+        assert describe(refusal).startswith(f"{BUDGET_HALT_PREFIX} The next call was blocked by the budget")
 
     def test_a_frozen_budget_is_not_told_to_wait_or_raise(self) -> None:
         """Frozen refuses at any headroom, so both ordinary remedies are wrong."""
@@ -490,10 +480,10 @@ class TestTheMessage:
 
         message = describe(refusal)
 
-        assert "frozen" in message
+        assert '"tight" (frozen)' in message
         assert "unfreeze" in message
-        assert "no room left" not in message
-        assert "Raise the limit" not in message
+        assert "Raise" not in message
+        assert "wait for" not in message
 
     def test_a_zero_limit_budget_is_not_told_to_wait_for_a_reset(self) -> None:
         """Zero is Cloud's documented block-everything idiom; the reset changes nothing."""
@@ -502,8 +492,8 @@ class TestTheMessage:
 
         message = describe(refusal)
 
-        assert "block every call" in message
-        assert "wait for the budget to reset" not in message
+        assert "Raise its limit" in message
+        assert "wait for" not in message
 
     def test_a_lifetime_budget_is_not_waited_out(self) -> None:
         """A LIFETIME budget never resets; sending someone to watch the dashboard is cruel."""

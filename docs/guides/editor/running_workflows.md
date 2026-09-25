@@ -89,16 +89,16 @@ Running** dialog (see [Saving](#saving) below) — that dialog offers a
 ### When a budget stops a run
 
 If your organization has set a spending budget on Griptape Cloud, a run
-that would go over it stops on its own. You'll see a message in the
-**Execution Log** that names the budget, how many credits it has left, and
-how many the refused call wanted:
+that would go over it stops on its own. A **Run blocked** bar appears
+across the top of the canvas naming the node that was stopped and the
+budget that stopped it:
 
-> Budget stopped this run. Griptape Cloud refused the next call from
-> 'Generate Poster' because the budget "Marketing Q3" has no room left:
-> 2,000 credits remaining, 15,000 requested. Budgets stop the next call,
-> not the one already running, so any call already in flight will finish
-> and be billed. Raise the limit, or wait for the budget to reset at the
-> start of next month, then run again.
+> Budget stopped this run. 'Generate Poster' was blocked by the budget
+> "Marketing Q3". Raise its limit, or wait for it to reset at the start of
+> next month.
+
+Click **✕** on the bar to close it. It also closes on its own when you run
+the workflow again.
 
 A few things worth knowing:
 
@@ -110,16 +110,13 @@ A few things worth knowing:
     before each call goes out, so a call that was already running when the
     budget filled up finishes and is billed.
 - **More than one budget can refuse the same call.** When that happens the
-    message lists every one of them, because raising just the first still
+    bar names every one of them, because raising just the first still
     leaves the run blocked.
-- **Everything is in credits, not dollars.** The numbers in the message
-    match the numbers on your Griptape Cloud budget page.
 
-What to do about it depends on which line you got. "No room left" means
-the budget needs a higher limit, or you wait for its reset — daily,
-weekly, monthly, or yearly, and the message says which. A *frozen* budget
-refuses every call no matter how many credits are left, so only an
-administrator lifting the freeze will let the run through.
+To see how much a budget has spent and how much room it has left, open its
+page on Griptape Cloud. A budget marked *(frozen)* refuses every call no
+matter how many credits are left, so only an administrator lifting the
+freeze will let the run through.
 
 Budgets are set and raised on Griptape Cloud, not in the editor. If you
 don't administer your organization's budgets, the budget name in the
