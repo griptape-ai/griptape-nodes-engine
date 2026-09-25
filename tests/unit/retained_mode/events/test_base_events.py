@@ -12,7 +12,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultDetails,
     StrictModeViolationDetail,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
 from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
 from griptape_nodes.retained_mode.events.project_events import (
@@ -20,6 +19,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetAllSituationsForProjectResultFailure,
     GetAllSituationsForProjectResultSuccess,
 )
+from griptape_nodes.serialization.converter import converter
 
 
 class TestBroadcastResultDefaults:

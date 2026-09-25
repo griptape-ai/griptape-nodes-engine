@@ -9,7 +9,7 @@ cattrs dispatches structure hooks by target type. ``parameter_values`` and
 valid parameter types is user-extensible (any node library can introduce
 new artifact types). With ``Any`` as the target, cattrs has nothing to
 dispatch on, so a ``SerializableMixin`` structure hook in
-``event_converter`` would never fire for these fields. Registering a
+``serialization.converter`` would never fire for these fields. Registering a
 broader ``Any`` hook would fire for every ``Any``-typed field across every
 event -- too much collateral damage.
 

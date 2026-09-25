@@ -41,9 +41,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.serialization.converter import converter
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
