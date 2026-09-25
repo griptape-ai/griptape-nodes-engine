@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType, WorkflowShape
@@ -16,10 +16,6 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
-
-if TYPE_CHECKING:
-    # Circular import: flow_events <-> workflow_events
-    from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowRequest
 
 # Flow-metadata flag marking a flow as a runtime-only artifact the engine must never serialize.
 # A flow tagged with ``metadata[TRANSIENT_KEY] = True`` is skipped by the flow serializer, so it is
@@ -81,6 +77,23 @@ class CreateFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class CreateFlowResultFailure(ResultPayloadFailure):
     """Flow creation failed. Common causes: parent flow not found, name conflicts, invalid parameters."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
+    """Import a workflow as a referenced sub-flow.
+
+    Use when: Reusing workflows as components, creating modular workflows,
+    importing workflow templates, building composite workflows.
+
+    Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
+    """
+
+    workflow_name: str
+    flow_name: str | None = None  # If None, import into current context flow
+    imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
+    track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
 
 
 @dataclass

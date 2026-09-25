@@ -31,6 +31,7 @@ from griptape_nodes.exe_types.core_types import (
 from griptape_nodes.exe_types.local_objects import LocalObjectScope
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -57,15 +58,14 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.retained_mode.variable_types import VariableScope  # noqa: TC001 - read at runtime by the converter
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
-    from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.variable_types import VariableScope
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -1615,9 +1615,6 @@ class BaseNode(ABC):
                 })
                 return deps
         """
-        # Lazy import to avoid circular dependency: library_registry imports BaseNode
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
-
         widget_libraries: set[LibraryNameAndVersion] = set()
 
         logger.debug("Getting dependencies for node: %s", self.name)
