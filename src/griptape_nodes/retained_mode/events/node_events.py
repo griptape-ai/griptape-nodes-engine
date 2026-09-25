@@ -476,6 +476,12 @@ class SerializedNodeCommands:
 
     This is useful for encapsulating a Node, either for saving a workflow, copy/paste, etc.
 
+    PERSISTENCE COUPLING: artifact provenance records persist this shape (see
+    SerializedNodePayload in retained_mode/file_metadata/provenance_record.py)
+    and rehydrate it via the event converter. Renaming or reshaping these
+    fields -- or SerializeNodeToCommandsResultSuccess's outputs -- must keep
+    old records structurable, or bump the provenance record schema version.
+
     Attributes:
         create_node_command (CreateNodeRequest): The command to create the node.
         element_modification_commands (list[RequestPayload]): A list of commands to create or modify the elements (including Parameters) of the node.

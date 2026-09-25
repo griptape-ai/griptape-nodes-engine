@@ -13,6 +13,10 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    ProvenanceContent,
+    ProvenanceWriteDetails,
+)
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 
 
@@ -50,6 +54,7 @@ class FileIOFailureReason(StrEnum):
 
     # Content errors
     ENCODING_ERROR = "encoding_error"  # Text encoding/decoding failed
+    PROVENANCE_WRITE_FAILED = "provenance_write_failed"  # Elected provenance record could not be written
     EXTENSION_MISMATCH = (
         "extension_mismatch"  # Sniffed byte format disagrees with destination suffix and coercion is disabled
     )
@@ -729,7 +734,12 @@ class WriteFileRequest(RequestPayload):
         skip_metadata_injection: If True, skip automatic workflow metadata injection for supported file types
             (default: False). Use when the content already contains metadata to avoid double-injection.
         file_metadata: Optional caller-provided situation and variable context to include in the sidecar
-            metadata file.
+            metadata file. Deprecated: superseded by `provenance`; kept one release as a shim.
+        provenance: Optional provenance election for this save. None means no capture at all (this is
+            what keeps internal writes -- previews, temp files, and provenance record/pointer/snapshot
+            writes themselves -- out of the provenance system). When set, the resolved capture policy
+            decides what is recorded and the resolved failure policy decides whether a record failure
+            fails the save.
         coerce_extension_to_match_bytes: If True (default), when the sniffed format of the bytes disagrees
             with the destination suffix, the on-disk file is renamed to match the sniffed extension and a
             warning is logged. If False, a WriteFileResultFailure with EXTENSION_MISMATCH is returned and
@@ -749,6 +759,7 @@ class WriteFileRequest(RequestPayload):
     create_parents: bool = True
     skip_metadata_injection: bool = False
     file_metadata: SidecarContent | None = None
+    provenance: ProvenanceContent | None = None
     coerce_extension_to_match_bytes: bool = True
 
 
@@ -761,10 +772,14 @@ class WriteFileResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         final_file_path: The actual path where file was written
                         (may differ from requested path if create_new policy used)
         bytes_written: Number of bytes written to the file
+        provenance: Capture outcome when provenance was elected and recorded; None when
+                    no capture was elected or the policy resolved to no record. Carries a
+                    warning instead of failing the save under warn_and_continue.
     """
 
     final_file_path: str
     bytes_written: int
+    provenance: ProvenanceWriteDetails | None = None
 
 
 @dataclass

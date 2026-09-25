@@ -14,7 +14,7 @@ from griptape_nodes.common.project_templates.situation import (
 from griptape_nodes.files.os_utils import is_windows
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.project_file.GriptapeNodes.handle_request"
 CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
@@ -53,11 +53,11 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("image.png", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert isinstance(dest._file._file_metadata, SidecarContent)
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.name == "save_node_output"
-        assert dest._file._file_metadata.situation.macro == "{outputs}/{file_name_base}.{file_extension}"
+        assert dest._file._provenance is not None
+        assert isinstance(dest._file._provenance, ProvenanceContent)
+        assert dest._file._provenance.situation is not None
+        assert dest._file._provenance.situation.name == "save_node_output"
+        assert dest._file._provenance.situation.macro == "{outputs}/{file_name_base}.{file_extension}"
 
     def test_file_metadata_contains_variables(self) -> None:
         """SidecarContent variables include filename parts and extra_vars."""
@@ -79,22 +79,23 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("render.png", "save_node_output", node_name="MyNode")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.variables is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        assert dest._file._provenance.situation.variables is not None
+        variables = dest._file._provenance.situation.variables
         assert variables["file_name_base"] == "render"
         assert variables["file_extension"] == "png"
         assert variables["node_name"] == "MyNode"
 
-    def test_file_metadata_is_none_when_situation_not_found(self) -> None:
-        """file_metadata is None when the situation lookup fails (fallback path)."""
+    def test_provenance_has_no_situation_when_situation_not_found(self) -> None:
+        """The election still exists on the fallback path, but with no situation block."""
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
 
         with patch(HANDLE_REQUEST_PATH, return_value=GetSituationResultFailure(result_details="not found")):
             dest = ProjectFileDestination.from_situation("image.png", "missing_situation")
 
-        assert dest._file._file_metadata is None
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is None
 
     def _make_extension_directory_handle_request(
         self,
@@ -188,9 +189,9 @@ class TestProjectFileDestinationInit:
         with patch(HANDLE_REQUEST_PATH, side_effect=dispatch):
             dest = ProjectFileDestination.from_situation("foo.png", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert variables["file_name_base"] == "foo"
         assert variables["file_extension"] == "png"
@@ -218,9 +219,9 @@ class TestProjectFileDestinationInit:
         with patch(HANDLE_REQUEST_PATH, side_effect=dispatch):
             dest = ProjectFileDestination.from_situation("foo.xyz", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert "file_extension_directory" not in variables
 
@@ -248,9 +249,9 @@ class TestProjectFileDestinationInit:
                 "foo.png", "save_node_output", file_extension_directory="custom"
             )
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert variables["file_extension_directory"] == "custom"
 
@@ -276,9 +277,9 @@ class TestProjectFileDestinationInit:
         with patch(HANDLE_REQUEST_PATH, side_effect=dispatch):
             dest = ProjectFileDestination.from_situation("FOO.PNG", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         # Derived values (file_extension_directory) no longer stored in sidecar;
         # the case-insensitive lookup is exercised at resolve time instead.
@@ -306,14 +307,14 @@ class TestProjectFileDestinationInit:
             psd_dest = ProjectFileDestination.from_situation("bar.psd", "save_node_output")
 
         # Derived values no longer persisted in sidecar -- re-computed at resolve time.
-        assert png_dest._file._file_metadata is not None
-        assert png_dest._file._file_metadata.situation is not None
-        assert png_dest._file._file_metadata.situation.variables is not None
-        assert "file_extension_directory" not in png_dest._file._file_metadata.situation.variables
-        assert psd_dest._file._file_metadata is not None
-        assert psd_dest._file._file_metadata.situation is not None
-        assert psd_dest._file._file_metadata.situation.variables is not None
-        assert "file_extension_directory" not in psd_dest._file._file_metadata.situation.variables
+        assert png_dest._file._provenance is not None
+        assert png_dest._file._provenance.situation is not None
+        assert png_dest._file._provenance.situation.variables is not None
+        assert "file_extension_directory" not in png_dest._file._provenance.situation.variables
+        assert psd_dest._file._provenance is not None
+        assert psd_dest._file._provenance.situation is not None
+        assert psd_dest._file._provenance.situation.variables is not None
+        assert "file_extension_directory" not in psd_dest._file._provenance.situation.variables
 
     def test_from_situation_file_extension_directory_resolution_failure_falls_through(self) -> None:
         """Resolution failures leave file_extension_directory unset so the optional slot degrades."""
@@ -349,10 +350,10 @@ class TestProjectFileDestinationInit:
         with patch(HANDLE_REQUEST_PATH, side_effect=dispatch):
             dest = ProjectFileDestination.from_situation("clip.mp4", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.variables is not None
-        assert "file_extension_directory" not in dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        assert dest._file._provenance.situation.variables is not None
+        assert "file_extension_directory" not in dest._file._provenance.situation.variables
 
     def test_from_situation_explicit_file_extension_directory_skips_resolution(self) -> None:
         """Explicit caller override wins and never consults the project taxonomy or resolver."""
@@ -386,10 +387,10 @@ class TestProjectFileDestinationInit:
                 "clip.mp4", "save_node_output", file_extension_directory="caller_wins"
             )
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.variables is not None
-        assert dest._file._file_metadata.situation.variables["file_extension_directory"] == "caller_wins"
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        assert dest._file._provenance.situation.variables is not None
+        assert dest._file._provenance.situation.variables["file_extension_directory"] == "caller_wins"
         # Neither the project lookup nor the macro resolver should fire.
         assert not any(isinstance(req, GetCurrentProjectRequest) for req in call_log)
         assert not any(isinstance(req, GetPathForMacroRequest) for req in call_log)
@@ -414,9 +415,9 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("renders/foo.png", "save_workflow")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert variables["sub_dirs"] == "renders"
         assert variables["file_name_base"] == "foo"
@@ -442,9 +443,9 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("act_1/scene_3/intro.py", "save_workflow")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert variables["sub_dirs"] == str(Path("act_1/scene_3"))
         assert variables["file_name_base"] == "intro"
@@ -470,9 +471,9 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("image.png", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert "sub_dirs" not in variables
 
@@ -498,9 +499,9 @@ class TestProjectFileDestinationInit:
                 "renders/foo.png", "save_workflow", sub_dirs="explicit_override"
             )
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        variables = dest._file._file_metadata.situation.variables
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        variables = dest._file._provenance.situation.variables
         assert variables is not None
         assert variables["sub_dirs"] == "explicit_override"
 
@@ -528,9 +529,12 @@ class TestProjectFileDestinationInit:
 
         # The resolved path should be the absolute path as-is, not routed under {outputs}.
         assert dest._file.location == absolute_filename
-        # No sidecar metadata: the situation macro+variables don't re-resolve to
-        # the absolute path we honored verbatim, so recording them would be a lie.
-        assert dest._file._file_metadata is None
+        # Provenance still captures (the record's path/hash/node are the on-disk
+        # truth), but its situation block is dropped: the situation macro+variables
+        # don't re-resolve to the absolute path we honored verbatim, so recording
+        # them would be a lie.
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is None
 
     def test_from_situation_file_uri_resolves_to_local_path(
         self, save_node_output_situation: SituationTemplate
@@ -543,7 +547,8 @@ class TestProjectFileDestinationInit:
             dest = ProjectFileDestination.from_situation("file:///something.png", "save_node_output")
 
         assert dest._file.location == "/something.png"
-        assert dest._file._file_metadata is None
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is None
 
     def test_from_situation_file_uri_resolves_to_the_path_it_names(
         self, save_node_output_situation: SituationTemplate, tmp_path: Path
@@ -601,7 +606,8 @@ class TestProjectFileDestinationInit:
             if Path("C:/renders/out.png").is_absolute():
                 dest = ProjectFileDestination.from_situation("file:///C:/renders/out.png", "save_node_output")
                 assert dest._file.location == "C:/renders/out.png"
-                assert dest._file._file_metadata is None
+                assert dest._file._provenance is not None
+                assert dest._file._provenance.situation is None
             else:
                 with pytest.raises(ValueError, match="does not name a location on this computer"):
                     ProjectFileDestination.from_situation("file:///C:/renders/out.png", "save_node_output")
@@ -659,7 +665,8 @@ class TestProjectFileDestinationInit:
             with patch(HANDLE_REQUEST_PATH, return_value=situation_result):
                 dest = ProjectFileDestination.from_situation(uri, "save_node_output")
             assert dest._file.location == "//remote-server/renders/out.png"
-            assert dest._file._file_metadata is None
+            assert dest._file._provenance is not None
+            assert dest._file._provenance.situation is None
         else:
             # POSIX has no UNC concept, so parse_file_uri returns None for any non-local
             # host rather than `//remote-server/...`, which resolve() would quietly collapse
@@ -711,12 +718,13 @@ class TestProjectFileDestinationInit:
         # drive letter in sub_dirs).
         if Path("C://renders").is_absolute():
             assert dest._file.location == "C://renders/out.png"
-            assert dest._file._file_metadata is None
+            assert dest._file._provenance is not None
+            assert dest._file._provenance.situation is None
         else:
-            assert dest._file._file_metadata is not None
-            assert dest._file._file_metadata.situation is not None
-            assert dest._file._file_metadata.situation.variables is not None
-            assert dest._file._file_metadata.situation.variables["file_name_base"] == "out"
+            assert dest._file._provenance is not None
+            assert dest._file._provenance.situation is not None
+            assert dest._file._provenance.situation.variables is not None
+            assert dest._file._provenance.situation.variables["file_name_base"] == "out"
 
     def test_file_metadata_policy_matches_situation(self) -> None:
         """SidecarContent.situation.policy mirrors the situation's policy."""
@@ -738,9 +746,9 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("data.json", "save_node_output")
 
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.policy is not None
-        policy = dest._file._file_metadata.situation.policy
+        assert dest._file._provenance is not None
+        assert dest._file._provenance.situation is not None
+        assert dest._file._provenance.situation.policy is not None
+        policy = dest._file._provenance.situation.policy
         assert policy.on_collision == SituationFilePolicy.CREATE_NEW
         assert policy.create_dirs is False

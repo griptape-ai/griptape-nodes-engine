@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceFailurePolicy
 from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
 from griptape_nodes.files.file import (
     File,
@@ -980,14 +981,23 @@ class TestFileName:
         assert f.name == _Path(f.location).name
 
 
-class TestFileBuildFileMetadata:
-    """Tests for File._build_file_metadata()."""
+class TestFileBuildProvenance:
+    """Tests for File._build_provenance()."""
 
-    def test_returns_none_for_plain_string_path_without_metadata(self) -> None:
+    def test_returns_none_for_plain_string_path_without_election(self) -> None:
         f = File("workspace/output.txt")
-        assert f._build_file_metadata() is None
+        assert f._build_provenance() is None
 
-    def test_returns_provided_file_metadata(self) -> None:
+    def test_returns_provided_provenance(self) -> None:
+        from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
+        from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SituationMetadata
+
+        provenance = ProvenanceContent(situation=SituationMetadata(name="save_node_output"))
+        f = File("workspace/output.txt", provenance=provenance)
+        assert f._build_provenance() is provenance
+
+    def test_legacy_file_metadata_carries_situation_into_election(self) -> None:
+        from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
         from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
             SidecarContent,
             SituationMetadata,
@@ -995,30 +1005,38 @@ class TestFileBuildFileMetadata:
 
         metadata = SidecarContent(situation=SituationMetadata(name="save_node_output"))
         f = File("workspace/output.txt", file_metadata=metadata)
-        assert f._build_file_metadata() is metadata
+        result = f._build_provenance()
 
-    def test_returns_sidecar_content_for_macro_path(self) -> None:
-        from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+        assert isinstance(result, ProvenanceContent)
+        assert result.situation is metadata.situation
+        # Synthesized election: nobody elected provenance, so a record failure
+        # must not hard-fail a save that used to be best-effort sidecar.
+        assert result.failure_policy == ProvenanceFailurePolicy.WARN_AND_CONTINUE
+
+    def test_returns_election_for_macro_path(self) -> None:
+        from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 
         macro_path = MacroPath(
             ParsedMacro("{outputs}/image.png"),
             {"outputs": "/workspace/outputs"},
         )
         f = File(macro_path)
-        result = f._build_file_metadata()
+        result = f._build_provenance()
 
-        assert isinstance(result, SidecarContent)
+        assert isinstance(result, ProvenanceContent)
         assert result.situation is not None
         assert result.situation.macro == "{outputs}/image.png"
         assert result.situation.variables == {"outputs": "/workspace/outputs"}
+        # Synthesized election (see the legacy-metadata test): warn, never fail.
+        assert result.failure_policy == ProvenanceFailurePolicy.WARN_AND_CONTINUE
 
-    def test_macro_path_metadata_includes_all_variables(self) -> None:
+    def test_macro_path_election_includes_all_variables(self) -> None:
         macro_path = MacroPath(
             ParsedMacro("{outputs}/{node_name}/image.png"),
             {"outputs": "/workspace/outputs", "node_name": "MyNode"},
         )
         f = File(macro_path)
-        result = f._build_file_metadata()
+        result = f._build_provenance()
 
         assert result is not None
         assert result.situation is not None
@@ -1027,27 +1045,25 @@ class TestFileBuildFileMetadata:
             "node_name": "MyNode",
         }
 
-    def test_file_metadata_passed_through_write_bytes(self) -> None:
-        from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
-            SidecarContent,
-            SituationMetadata,
-        )
+    def test_provenance_passed_through_write_bytes(self) -> None:
+        from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
+        from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SituationMetadata
 
-        metadata = SidecarContent(situation=SituationMetadata(name="save_node_output"))
+        provenance = ProvenanceContent(situation=SituationMetadata(name="save_node_output"))
         success_result = WriteFileResultSuccess(
             result_details="OK",
             final_file_path="/workspace/output.txt",
             bytes_written=5,
         )
         with patch(HANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
-            File("workspace/output.txt", file_metadata=metadata).write_bytes(b"hello")
+            File("workspace/output.txt", provenance=provenance).write_bytes(b"hello")
 
         request = mock_handle.call_args.args[0]
-        assert request.file_metadata is metadata
+        assert request.provenance is provenance
 
     def test_macro_path_metadata_passed_through_write_bytes(self) -> None:
         from griptape_nodes.retained_mode.events.os_events import WriteFileRequest
-        from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+        from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 
         macro_path = MacroPath(
             ParsedMacro("{outputs}/image.png"),
@@ -1077,9 +1093,9 @@ class TestFileBuildFileMetadata:
             File(macro_path).write_bytes(b"\x89PNG")
 
         assert write_request is not None
-        assert isinstance(write_request.file_metadata, SidecarContent)
-        assert write_request.file_metadata.situation is not None
-        assert write_request.file_metadata.situation.macro == "{outputs}/image.png"
+        assert isinstance(write_request.provenance, ProvenanceContent)
+        assert write_request.provenance.situation is not None
+        assert write_request.provenance.situation.macro == "{outputs}/image.png"
 
 
 class TestFileDestinationLocation:

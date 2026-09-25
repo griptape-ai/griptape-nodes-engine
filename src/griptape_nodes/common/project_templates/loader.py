@@ -38,6 +38,7 @@ FIELD_PARENT_PROJECT_PATH = "parent_project_path"
 FIELD_PARENT_PROJECT_ID = "parent_project_id"
 FIELD_WORKSPACE_DIR = "workspace_dir"
 FIELD_LIBRARIES_DIR = "libraries_dir"
+FIELD_PROVENANCE = "provenance"
 
 # Special constants
 ROOT_FIELD_PATH = "<root>"
@@ -111,6 +112,10 @@ class ProjectOverlayData(NamedTuple):
     clears_parent_project_id: bool = False
     clears_workspace_dir: bool = False
     clears_libraries_dir: bool = False
+    # Raw provenance-settings block (validated during merge). Absent = inherit base;
+    # explicit null = tombstone (clears_provenance).
+    provenance: dict[str, Any] | None = None
+    clears_provenance: bool = False
 
 
 def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
@@ -432,6 +437,23 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         )
         project_id = None
 
+    # Optional field: provenance. Same absent-vs-null semantics as description:
+    # absent = inherit base, explicit null = tombstone the inherited block. The
+    # block stays a raw dict here; pydantic validation happens during merge so a
+    # bad block becomes a merge validation error, not a load crash.
+    clears_provenance = FIELD_PROVENANCE in data and data.get(FIELD_PROVENANCE) is None
+    provenance_raw = data.get(FIELD_PROVENANCE)
+    provenance: dict[str, Any] | None = None
+    if provenance_raw is not None:
+        if isinstance(provenance_raw, dict):
+            provenance = dict(provenance_raw)
+        else:
+            validation_info.add_error(
+                field_path=FIELD_PROVENANCE,
+                message=f"Must be dict, got {type(provenance_raw).__name__}",
+                line_number=line_info.get_line(FIELD_PROVENANCE),
+            )
+
     # Optional field: description. Distinguish absent (inherit base) from
     # explicit null (clear base value).
     clears_description = FIELD_DESCRIPTION in data and data.get(FIELD_DESCRIPTION) is None
@@ -579,6 +601,8 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         clears_parent_project_id=clears_parent_project_id,
         clears_workspace_dir=clears_workspace_dir,
         clears_libraries_dir=clears_libraries_dir,
+        provenance=provenance,
+        clears_provenance=clears_provenance,
     )
 
 
