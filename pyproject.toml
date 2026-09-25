@@ -39,6 +39,7 @@ dependencies = [
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
   "cattrs>=26.1.0",
+  "attrs>=25.4.0",
   "fileseq>=3.2.0",
   # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside
   # FastMCP 3", pydantic/pydantic-ai#6738) is the first where the `[mcp]` extra's `fastmcp-slim`
@@ -148,6 +149,7 @@ ignore = [
 "libraries.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of libraries.griptape_nodes_library"
 "libraries.griptape_nodes_advanced_media_library".msg = "Import from griptape_nodes_advanced_media_library instead of libraries.griptape_nodes_advanced_media_library"
 "libraries.griptape_cloud".msg = "Import from griptape_cloud instead of libraries.griptape_cloud"
+"pickle".msg = "Values cross process and file boundaries as plain data through griptape_nodes.serialization. Pickle runs code from whatever produced the bytes, and ties saved data to one Python process's class layout."
 "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
 
 [tool.ruff.lint.per-file-ignores]

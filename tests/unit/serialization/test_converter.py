@@ -1,8 +1,11 @@
 """Tests for the cattrs converter's structure/unstructure hooks."""
 
+import json
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
@@ -10,6 +13,39 @@ from griptape_nodes.serialization.converter import (
     _is_json_primitive_union,
     converter,
 )
+from griptape_nodes.serialization.values import Value  # noqa: TC001 cattrs resolves the annotations at runtime
+
+
+@dataclass
+class _ValuePayload:
+    """String annotations, as in event modules that use ``from __future__ import annotations``."""
+
+    value: "Value" = None
+    by_name: "dict[str, Value]" = field(default_factory=dict)
+    items: "list[Value]" = field(default_factory=list)
+    maybe: "Value | None" = None
+
+
+class TestValueFields:
+    """Fields annotated ``Value`` cross the wire as tagged plain data and come back as values."""
+
+    def test_value_fields_round_trip_through_json(self) -> None:
+        artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
+        payload = _ValuePayload(value=(1, 2), by_name={"image": artifact}, items=[b"x"], maybe={1: "one"})
+
+        wire = json.loads(json.dumps(converter.unstructure(payload)))
+        restored = converter.structure(wire, _ValuePayload)
+
+        assert restored.value == (1, 2)
+        assert type(restored.by_name["image"]) is ImageUrlArtifact
+        assert restored.by_name["image"].to_dict() == artifact.to_dict()
+        assert restored.items == [b"x"]
+        assert restored.maybe == {1: "one"}
+
+    def test_value_fields_are_tagged_on_the_wire(self) -> None:
+        wire = converter.unstructure(_ValuePayload(value=(1, 2)))
+
+        assert wire["value"] == {"$type": "builtins:tuple", "$value": [1, 2]}
 
 
 class TestIsJsonPrimitiveUnion:

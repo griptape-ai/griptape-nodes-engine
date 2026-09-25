@@ -10,7 +10,7 @@ module (`test_sidecar_metadata.py`) or `ExtractFlowCommandsFromImageMetadata`
 
 import base64
 import json
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from collections.abc import Generator
 
 import pytest

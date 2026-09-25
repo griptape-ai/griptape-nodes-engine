@@ -2,7 +2,7 @@
 
 import base64
 import itertools
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 import tempfile
 from collections.abc import Generator
 from pathlib import Path

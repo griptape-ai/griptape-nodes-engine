@@ -8,7 +8,7 @@ deferred loader and imports on first use, so a broken node is not reported until
 from __future__ import annotations
 
 import importlib
-import pickle
+import pickle  # noqa: TID251 pickle-era saved workflows unpickle stable namespace references
 import sys
 from typing import TYPE_CHECKING
 from unittest.mock import patch

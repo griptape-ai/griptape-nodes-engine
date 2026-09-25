@@ -261,6 +261,12 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
 )
+from griptape_nodes.serialization.type_names import (
+    DYNAMIC_MODULE_PREFIX,
+    forget_stable_module_name,
+    is_dynamic_module_name,
+    register_stable_module_name,
+)
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
@@ -3845,6 +3851,7 @@ class LibraryManager(EngineScoped):
 
         # Register the stable alias in sys.modules
         sys.modules[stable_namespace] = module
+        register_stable_module_name(dynamic_module_name, stable_namespace)
 
         # The module is importable through sys.modules now; retire its pending loader so the
         # meta-path finder can never serve a stale module object after this one is unloaded.
@@ -3874,6 +3881,7 @@ class LibraryManager(EngineScoped):
             # Remove from our mappings
             del self._dynamic_to_stable_module_mapping[dynamic_module_name]
             del self._stable_to_dynamic_module_mapping[stable_namespace]
+            forget_stable_module_name(dynamic_module_name)
 
             details = f"Unregistered stable alias: {stable_namespace}"
             logger.debug(details)
@@ -3903,6 +3911,7 @@ class LibraryManager(EngineScoped):
             dynamic_module_name = self._stable_to_dynamic_module_mapping.get(stable_namespace)
             if dynamic_module_name:
                 self._dynamic_to_stable_module_mapping.pop(dynamic_module_name, None)
+                forget_stable_module_name(dynamic_module_name)
             self._stable_to_dynamic_module_mapping.pop(stable_namespace, None)
 
         # Clear the library's module set
@@ -3944,7 +3953,7 @@ class LibraryManager(EngineScoped):
             >>> manager.is_dynamic_module("griptape.artifacts")
             False
         """
-        return module_name.startswith("gtn_dynamic_module_")
+        return is_dynamic_module_name(module_name)
 
     @staticmethod
     def _get_root_cause_from_exception(exception: BaseException) -> BaseException:
@@ -4011,7 +4020,7 @@ class LibraryManager(EngineScoped):
         file_path = Path(file_path)
 
         # Generate a unique module name
-        module_name = f"gtn_dynamic_module_{file_path.name.replace('.', '_')}_{hash(str(file_path))}"
+        module_name = f"{DYNAMIC_MODULE_PREFIX}{file_path.name.replace('.', '_')}_{hash(str(file_path))}"
 
         # Create stable namespace
         stable_namespace = self._create_stable_namespace(library_name, file_path)
