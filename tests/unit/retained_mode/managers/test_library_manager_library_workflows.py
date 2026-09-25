@@ -101,9 +101,9 @@ def _emitted_workflow_changes(event_manager: MagicMock) -> list[LibraryWorkflows
     return [payload for payload in payloads if isinstance(payload, LibraryWorkflowsChanged)]
 
 
-def _library_entry() -> MagicMock:
+def _library_entry(file_path: str = "lib/example.py") -> MagicMock:
     """A registry entry standing in for one this library contributed."""
-    return MagicMock(library_name=LIBRARY_NAME)
+    return MagicMock(library_name=LIBRARY_NAME, file_path=file_path)
 
 
 @contextlib.contextmanager
@@ -247,7 +247,7 @@ class TestRegisterWorkflowsForLibrary:
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(None)),
-            patch.object(engine.workflow_manager, "refresh_missing_library_verdicts", refresh),
+            patch.object(engine.workflow_manager, "refresh_verdicts_for_library", refresh),
         ):
             await engine.library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json"))
 
@@ -462,7 +462,8 @@ class TestUnregisterWorkflowsForLibrary:
 
         assert _emitted_workflow_changes(event_manager) == []
 
-    def test_unloading_a_library_removes_its_workflows(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_unloading_a_library_removes_its_workflows(self, engine: Engine) -> None:
         """Nothing else does: a workspace rescan deliberately spares library-owned entries.
 
         Without this, an install -> uninstall -> reinstall cycle piles up stale entries and an
@@ -472,12 +473,73 @@ class TestUnregisterWorkflowsForLibrary:
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"),
             patch.dict(WorkflowRegistry._workflows, {"lib/example": _library_entry()}, clear=True),
         ):
-            result = engine.library_manager.unload_library_from_registry_request(
+            result = await engine.library_manager.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
             )
 
             assert result.succeeded()
             assert "lib/example" not in WorkflowRegistry._workflows
+
+    def test_forgets_the_verdicts_of_the_workflows_it_took_out(self, engine: Engine) -> None:
+        """Their entries are gone, so nothing can ask about them and nothing would clean them up.
+
+        The verdicts are kept per file, and the file paths only reach here through the removal:
+        once the entries are out of the registry there is no way back from a library name to them.
+        """
+        forget = MagicMock(return_value=None)
+
+        with (
+            patch.dict(WorkflowRegistry._workflows, {"lib/example": _library_entry()}, clear=True),
+            patch.object(engine.workflow_manager, "forget_verdicts_for_workflows", forget),
+        ):
+            engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
+
+        forget.assert_called_once_with(["lib/example.py"])
+
+    @pytest.mark.asyncio
+    async def test_unloading_re_reads_the_verdicts_that_named_the_library(self, engine: Engine) -> None:
+        """The workflows that stay behind recorded this library as installed, and it no longer is.
+
+        The arrival direction is covered where a library registers; this is the same cached verdict
+        going the other way, which nothing else recomputes.
+        """
+        refresh = AsyncMock(return_value=None)
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"),
+            patch.object(engine.workflow_manager, "refresh_verdicts_for_library", refresh),
+        ):
+            result = await engine.library_manager.unload_library_from_registry_request(
+                UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
+            )
+
+        assert result.succeeded()
+        refresh.assert_awaited_once_with(LIBRARY_NAME)
+
+    @pytest.mark.asyncio
+    async def test_unloading_mid_load_leaves_the_verdicts_to_the_pass_after_the_load(self, engine: Engine) -> None:
+        """Re-reading a verdict waits on the libraries gate, and a whole-set load holds it closed.
+
+        A load unloads every library before registering it again, so refreshing here would wait on
+        the load that is doing the unloading. The pass that follows the load settles them instead.
+        """
+        library_manager = engine.library_manager
+        refresh = AsyncMock(return_value=None)
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"),
+            patch.object(engine.workflow_manager, "refresh_verdicts_for_library", refresh),
+        ):
+            library_manager._close_libraries_loading_gate()
+            try:
+                result = await library_manager.unload_library_from_registry_request(
+                    UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
+                )
+            finally:
+                library_manager._libraries_loading_complete.set()
+
+        assert result.succeeded()
+        refresh.assert_not_awaited()
 
 
 class TestRegisteringALibraryRegistersItsWorkflows:
@@ -692,6 +754,28 @@ class TestTheWholeSetRegistersAfterTheLoad:
         register_all.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_the_pass_settles_the_verdicts_of_a_library_the_load_did_not_bring_back(self, engine: Engine) -> None:
+        """A load unloads every library first, and one dropped from the config never comes back.
+
+        Its unload could not re-read the verdicts naming it, because the gate was closed, and
+        registering the workflows afterwards only re-reads the libraries that did return. The
+        workflows left naming the departed one would otherwise keep claiming it is installed.
+        """
+        library_manager = engine.library_manager
+        refresh = AsyncMock(return_value=None)
+        registered = iter([["Stayed", "Departed"], ["Stayed"]])
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", side_effect=lambda: next(registered)),
+            patch.object(library_manager, "_load_every_discovered_library", AsyncMock(return_value=None)),
+            patch.object(library_manager, "register_workflows_for_all_libraries", AsyncMock(return_value=None)),
+            patch.object(engine.workflow_manager, "refresh_verdicts_for_library", refresh),
+        ):
+            await library_manager.load_libraries_request(LoadLibrariesRequest())
+
+        refresh.assert_awaited_once_with("Departed")
+
+    @pytest.mark.asyncio
     async def test_load_libraries_request_runs_the_pass_after_its_own_loop(self, engine: Engine) -> None:
         """The other whole-set load: a registered handler any client can send.
 
@@ -788,6 +872,8 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
             if isinstance(request, RegisterLibraryFromFileRequest):
                 with _stub_library_lifecycle(library_manager, library_info, register_one):
                     return await library_manager.register_library_from_file_request(request)
+            if isinstance(request, UnloadLibraryFromRegistryRequest):
+                return UnloadLibraryFromRegistryResultSuccess(result_details="unloaded")
             msg = f"Unexpected request: {type(request).__name__}"
             raise AssertionError(msg)
 
@@ -808,11 +894,6 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
         dispatch = self._register_through_the_real_handler(library_manager, _library_info(library_json), register_one)
 
         with (
-            patch.object(
-                engine,
-                "handle_request",
-                MagicMock(return_value=UnloadLibraryFromRegistryResultSuccess(result_details="unloaded")),
-            ),
             patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=library_json),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
@@ -994,14 +1075,14 @@ class TestTheConcurrentSyncBatch:
             msg = f"Unexpected request: {type(request).__name__}"
             raise AssertionError(msg)
 
-        async def refresh_verdicts() -> None:
-            sequence.append("refresh")
+        async def refresh_verdicts(library_name: str) -> None:
+            sequence.append(f"refresh:{library_name}")
 
         with (
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch.object(
-                engine.workflow_manager, "refresh_missing_library_verdicts", AsyncMock(side_effect=refresh_verdicts)
+                engine.workflow_manager, "refresh_verdicts_for_library", AsyncMock(side_effect=refresh_verdicts)
             ),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
@@ -1012,7 +1093,7 @@ class TestTheConcurrentSyncBatch:
         # after all of them, which is the point: no library is mid-unload by then.
         updates, refreshes = sequence[: len(updating)], sequence[len(updating) :]
         assert sorted(updates) == sorted(f"update:{name}" for name in updating)
-        assert refreshes == ["refresh"]
+        assert sorted(refreshes) == sorted(f"refresh:{name}" for name in updating)
 
     @pytest.mark.asyncio
     async def test_sync_leaves_the_registry_alone(self, engine: Engine) -> None:
@@ -1050,7 +1131,7 @@ class TestTheConcurrentSyncBatch:
         with (
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
-            patch.object(engine.workflow_manager, "refresh_missing_library_verdicts", AsyncMock(return_value=None)),
+            patch.object(engine.workflow_manager, "refresh_verdicts_for_library", AsyncMock(return_value=None)),
             patch.object(library_manager, "_unregister_workflows_for_library", unregister),
             patch.object(library_manager, "register_workflows_for_registered_library", register),
         ):

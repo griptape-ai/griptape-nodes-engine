@@ -331,13 +331,28 @@ class TestContributingLibraryIsRecordedOnWrite:
 
         removed = WorkflowRegistry.remove_workflows_from_library("MyLib")
 
-        assert removed == ["mine"]
+        assert removed.registry_keys == ["mine"]
         assert sorted(WorkflowRegistry._workflows) == ["theirs", "user_workflow"]
+
+    def test_remove_workflows_from_library_reports_the_files_it_took(self) -> None:
+        """The caller has no other way back to them.
+
+        `WorkflowManager` keys its dependency verdicts by file path, and once the entry is gone
+        there is nothing left to find those rows by.
+        """
+        self._register("mine", "MyLib")
+
+        removed = WorkflowRegistry.remove_workflows_from_library("MyLib")
+
+        assert removed.file_paths == ["mine.py"]
 
     def test_remove_workflows_from_library_reports_nothing_for_a_library_with_none(self) -> None:
         self._register("user_workflow")
 
-        assert WorkflowRegistry.remove_workflows_from_library("MyLib") == []
+        removed = WorkflowRegistry.remove_workflows_from_library("MyLib")
+
+        assert removed.registry_keys == []
+        assert removed.file_paths == []
         assert list(WorkflowRegistry._workflows) == ["user_workflow"]
 
 

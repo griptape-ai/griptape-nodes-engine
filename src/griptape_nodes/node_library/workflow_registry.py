@@ -282,6 +282,13 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
         raise WorkflowMetadataSchemaError(msg, section_path=METADATA_TABLE_PATH, error_message=str(err)) from err
 
 
+class RemovedWorkflows(NamedTuple):
+    """What a removal took out of the registry: the keys it held, and the files they pointed at."""
+
+    registry_keys: list[str]
+    file_paths: list[str]
+
+
 class WorkflowRegistry(metaclass=SingletonMeta):
     class _RegistryKey:
         """Private class for workflow construction."""
@@ -429,9 +436,22 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         cls._remove_workflows_where(lambda workflow: workflow.library_name is None)
 
     @classmethod
-    def remove_workflows_from_library(cls, library_name: str) -> list[str]:
-        """Remove every workflow `library_name` contributed and return the keys removed."""
-        return cls._remove_workflows_where(lambda workflow: workflow.library_name == library_name)
+    def remove_workflows_from_library(cls, library_name: str) -> RemovedWorkflows:
+        """Remove every workflow `library_name` contributed and report what went.
+
+        The files come back alongside the keys because a caller holding per-file state about
+        these workflows, such as `WorkflowManager`'s dependency verdicts, has no way to find it
+        once the entries are gone.
+        """
+        instance = cls()
+        removed_keys = [key for key, workflow in instance._workflows.items() if workflow.library_name == library_name]
+        removed_file_paths = []
+        for key in removed_keys:
+            file_path = instance._workflows[key].file_path
+            if file_path is not None:
+                removed_file_paths.append(file_path)
+            del instance._workflows[key]
+        return RemovedWorkflows(registry_keys=removed_keys, file_paths=removed_file_paths)
 
     @classmethod
     def _clear(cls) -> None:
@@ -558,6 +578,9 @@ class Workflow:
         # Customers of this function need that, so let's stuff it in.
         ret_val["file_path"] = self.file_path
         ret_val["is_saved"] = self.is_saved
+        # Not in the schema either: which library contributed the entry is a property of the
+        # registration, not of the file. Clients group templates by it.
+        ret_val["library_name"] = self.library_name
 
         if synced_path is not None and workspace_path is not None and self.file_path is not None:
             # Pre-computed paths supplied by list_workflows() to avoid a ConfigManager

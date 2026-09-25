@@ -3575,7 +3575,7 @@ class LibraryManager(EngineScoped):
             logger.debug("Could not check venv write permissions for %s: %s", venv_path, e)
             return False
 
-    def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
+    async def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
         try:
             LibraryRegistry.unregister_library(
                 library_name=request.library_name, event_manager=self.engine.event_manager
@@ -3607,6 +3607,10 @@ class LibraryManager(EngineScoped):
         # Take the library's workflows back out of the WorkflowRegistry so an unloaded library
         # stops offering them.
         self._unregister_workflows_for_library(request.library_name)
+
+        # Workflows that stay behind and name this library recorded it as installed, and that
+        # verdict stands until their headers are read again.
+        await self._refresh_workflow_verdicts_for_library(request.library_name)
 
         # Remove the library from our library info list. This prevents it from still showing
         # up in the table of attempted library loads. Remove ALL entries for this name, not
@@ -4278,14 +4282,17 @@ class LibraryManager(EngineScoped):
 
         The pass on exit is therefore the one place a batch's templates land, and pairing it with
         the gate here is what keeps every batch loop from having to remember to run it. It runs
-        after the gate reopens, because it needs the gated API the body could not use.
+        after the gate reopens, because it needs the gated API the body could not use -- as does
+        settling the verdicts of any library the body unloaded and did not bring back.
         """
+        libraries_before = set(LibraryRegistry.list_libraries())
         self._close_libraries_loading_gate()
         try:
             yield
         finally:
             self._libraries_loading_complete.set()
         await self.register_workflows_for_all_libraries()
+        await self._refresh_workflow_verdicts_for_departed_libraries(libraries_before)
 
     async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> list[str]:
         """Reconcile sourced libraries, then discover and load every enabled library.
@@ -5020,7 +5027,7 @@ class LibraryManager(EngineScoped):
         # A workflow registered while a library it names was not installed recorded that verdict,
         # and it stays recorded until the header is read again. This library arriving may be what
         # it was waiting for -- which holds whether or not this library ships templates itself.
-        await self.engine.workflow_manager.refresh_missing_library_verdicts()
+        await self.engine.workflow_manager.refresh_verdicts_for_library(library_name)
 
         if not registered_names:
             return
@@ -5077,19 +5084,49 @@ class LibraryManager(EngineScoped):
             logger.debug("Library '%s' is not known to this engine; leaving its workflows alone.", library_name)
             return
 
-        removed_keys = WorkflowRegistry.remove_workflows_from_library(library_name)
-        if not removed_keys:
+        removed = WorkflowRegistry.remove_workflows_from_library(library_name)
+        if not removed.registry_keys:
             return
+
+        # Nothing can ask about these workflows now, so their dependency verdicts are dead weight
+        # that every later refresh would still re-read from a library that is gone.
+        self.engine.workflow_manager.forget_verdicts_for_workflows(removed.file_paths)
 
         self.engine.event_manager.put_event(
             AppEvent(
                 payload=LibraryWorkflowsChanged(
                     library_name=library_name,
-                    workflow_names=removed_keys,
+                    workflow_names=removed.registry_keys,
                     registered=False,
                 )
             )
         )
+
+    async def _refresh_workflow_verdicts_for_library(self, library_name: str) -> None:
+        """Re-read the verdicts of workflows naming this library, or leave them to the batch pass.
+
+        Re-reading a verdict waits on the libraries gate, and a whole-set load unloads every
+        library while holding that gate closed, so refreshing there would hang the load that
+        closed it. `_batch_library_load` settles whatever did not come back.
+        """
+        if not self._libraries_loading_complete.is_set():
+            logger.debug(
+                "Libraries are still loading; leaving the workflow verdicts naming library '%s' to the pass that "
+                "follows the load.",
+                library_name,
+            )
+            return
+
+        await self.engine.workflow_manager.refresh_verdicts_for_library(library_name)
+
+    async def _refresh_workflow_verdicts_for_departed_libraries(self, libraries_before: set[str]) -> None:
+        """Settle the verdicts of libraries a whole-set load unloaded and did not bring back.
+
+        Only those: a library the load registered again had its verdicts re-read as part of
+        registering its workflows.
+        """
+        for library_name in libraries_before - set(LibraryRegistry.list_libraries()):
+            await self.engine.workflow_manager.refresh_verdicts_for_library(library_name)
 
     async def _on_session_started(self, _event: AppSessionStartedEvent) -> None:
         """Spawn workers for all libraries that require one now that a session is active.
@@ -6295,7 +6332,7 @@ class LibraryManager(EngineScoped):
         try:
             for library_name in all_libraries_result.libraries:
                 unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
-                unload_library_result = self.engine.handle_request(unload_library_request)
+                unload_library_result = await self.engine.ahandle_request(unload_library_request)
                 if not unload_library_result.succeeded():
                     details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
                     logger.error(details)
@@ -7163,7 +7200,7 @@ class LibraryManager(EngineScoped):
             On failure: ResultPayloadFailure instance
         """
         # Unload the library
-        unload_result = self.engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
+        unload_result = await self.engine.ahandle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
         if not unload_result.succeeded():
             details = f"Failed to unload Library '{library_name}' after git operation."
             return failure_result_class(result_details=details)
@@ -8218,9 +8255,11 @@ class LibraryManager(EngineScoped):
         # The updates above run concurrently, and each one unloads its library and registers it
         # again. A workflow registering mid-batch resolves its `node_libraries_referenced` against
         # a registry that is missing whichever siblings sit between their own unload and reload, so
-        # it records a dependency on a library that is merely not installed for another moment.
-        # Every sibling is back by now, so re-reading those verdicts settles them.
-        await self.engine.workflow_manager.refresh_missing_library_verdicts()
+        # it records a dependency on a library that is merely not installed for another moment, or
+        # on the version it is replacing. Every sibling is settled by now, so re-reading the
+        # verdicts that name one of them settles those too.
+        for touched_library_name in update_summary:
+            await self.engine.workflow_manager.refresh_verdicts_for_library(touched_library_name)
 
         # Build result details
         details = f"Downloaded {libraries_downloaded} libraries. Checked {libraries_checked} libraries. {libraries_updated} updated."

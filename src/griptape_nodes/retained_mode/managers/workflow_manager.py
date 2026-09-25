@@ -2367,28 +2367,39 @@ class WorkflowManager(EngineScoped):
         """
         return await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
 
-    async def refresh_missing_library_verdicts(self) -> None:
-        """Re-read the header of every workflow recorded as depending on a missing library.
+    async def refresh_verdicts_for_library(self, library_name: str) -> None:
+        """Re-read the header of every workflow recorded as depending on the named library.
 
         A workflow's dependency verdict is computed once, when its metadata is read, and cached
-        until it is read again. So a workflow registered while a library it references was not
-        installed keeps saying so: install library A whose template references B, then install B,
-        and A's template stays flagged for the rest of the session. Called after a library
-        registers, which is exactly when a cached "not installed" can have stopped being true.
+        until it is read again, so a library arriving or leaving does not on its own change what
+        the workflow list says about it. Install library A whose template references B, then
+        install B, and A's template stays flagged as needing something uninstalled; uninstall B
+        afterwards and it goes back to claiming it has everything. Called whenever a library's
+        presence or version changes, which is exactly when those verdicts stop being true.
 
-        Only the workflows carrying that verdict are re-read; installing a library does not
-        re-parse every workflow on disk.
+        Only the workflows naming that library are re-read, found through the dependencies each
+        verdict already records; a library changing does not re-parse every workflow on disk.
         """
         stale_paths = [
             workflow_path
             for workflow_path, workflow_info in self._workflow_file_path_to_info.items()
-            if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in workflow_info.problems)
+            if any(dependency.library_name == library_name for dependency in workflow_info.workflow_dependencies)
         ]
         for workflow_path in stale_paths:
             # The keys are already absolute, and on_load_workflow_metadata_request joins its
             # file_name onto the workspace, which leaves an absolute path alone. So the recompute
             # lands back on the same key.
             await self.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=workflow_path))
+
+    def forget_verdicts_for_workflows(self, workflow_file_paths: list[str]) -> None:
+        """Drop the cached verdicts for workflows that are no longer registered.
+
+        Their entries went out of the registry, so nothing can ask about them again, and leaving
+        the rows behind means every later refresh re-reads files belonging to a library that is
+        gone.
+        """
+        for workflow_file_path in workflow_file_paths:
+            self._workflow_file_path_to_info.pop(self._build_workflow_info_key(workflow_file_path), None)
 
     def _register_workflow(
         self,

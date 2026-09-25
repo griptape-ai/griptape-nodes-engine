@@ -38,6 +38,11 @@ the engine's request API from working without edits. Migration steps live in
 - Custom traits can keep settings a node changes at runtime, such as a narrowed range, when the
   workflow is saved and reopened, by implementing `to_state()` and `apply_state()`. See
   [MIGRATION.md](MIGRATION.md#traits-can-save-runtime-state).
+- Clients showing the workflow list are told when a library's templates come or go, by the new
+  `LibraryWorkflowsChanged` app event, instead of finding out the next time they ask.
+- `RegisterWorkflowRequest` takes a `library_name`, which ties the entry to that library: it goes
+  away when the library unloads, and survives a workspace rescan. Leave it unset for workflows the
+  user creates.
 
 ### Changed
 
@@ -54,6 +59,10 @@ the engine's request API from working without edits. Migration steps live in
 - Setting a value outside a `Slider` range now fails with an error naming the parameter, the value,
   and the allowed range, instead of "Value out of range".
   [#5269](https://github.com/griptape-ai/griptape-nodes-engine/issues/5269)
+- Saving a workflow template that came from a library now always writes a new copy in the workspace,
+  leaving the library's file as the author shipped it. Before, only templates from Griptape's own
+  libraries were protected this way; a template from any other library was overwritten in place. A
+  workflow the user marked `is_template` themselves still saves normally.
 
 ### Removed
 
@@ -102,5 +111,17 @@ the engine's request API from working without edits. Migration steps live in
 - A node that writes a list or dictionary to an output and reads it back gets the same object rather
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
+- Installing a library mid-session puts its workflow templates in the workflow picker, and
+  uninstalling one takes them out again, without restarting the engine. Updating or reloading a
+  library picks up edits to its template files. Before, templates only appeared at engine start, an
+  uninstalled library kept offering them, and an install -> uninstall -> reinstall cycle piled up
+  stale entries.
+  [#3448](https://github.com/griptape-ai/griptape-nodes-engine/issues/3448)
+- Templates from libraries other than Griptape's own stay in the workflow picker. Before, they
+  dropped out whenever the workspace was rescanned, which happens at engine start and whenever the
+  workspace folder changes.
+- A template that reports needing a library you do not have installed stops saying so once that
+  library is installed, and starts saying so when the library is uninstalled. Before, whichever
+  verdict was reached when the template was first read stood for the rest of the session.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...HEAD

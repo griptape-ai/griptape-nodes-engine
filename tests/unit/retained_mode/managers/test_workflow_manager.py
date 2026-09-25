@@ -2,6 +2,7 @@ import ast
 import asyncio
 import logging
 import re
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -85,6 +86,47 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+
+
+def _write_workflow_naming_library(directory: Path, file_name: str, library_name: str) -> Path:
+    """Write a workflow file whose header says it needs `library_name` at 1.0.0."""
+    workflow_path = directory / file_name
+    workflow_path.write_text(
+        "\n".join(
+            [
+                f"# /// {WorkflowManager.WORKFLOW_METADATA_HEADER}",
+                "# [tool.griptape-nodes]",
+                f'# name = "{workflow_path.stem}"',
+                f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                '# engine_version_created_with = "0.0.0"',
+                f'# node_libraries_referenced = [["{library_name}", "1.0.0"]]',
+                "# ///",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return workflow_path
+
+
+@contextmanager
+def _library_installed(engine: Engine, library_name: str) -> "Generator[None, None, None]":
+    """Make the dependency check see `library_name` registered at the version headers ask for."""
+    metadata = LibraryMetadata(
+        author="Someone", description=library_name, library_version="1.0.0", engine_version="0.0.0", tags=[]
+    )
+    with (
+        patch(
+            "griptape_nodes.node_library.library_registry.LibraryRegistry.list_libraries",
+            return_value=[library_name],
+        ),
+        patch.object(
+            engine.library_manager,
+            "get_library_metadata_request",
+            MagicMock(return_value=GetLibraryMetadataResultSuccess(metadata=metadata, result_details=library_name)),
+        ),
+    ):
+        yield
 
 
 def _register_unsaved_workflow(key: str, name: str) -> None:
@@ -1699,51 +1741,86 @@ class TestWorkflowManager:
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
         engine.library_manager._libraries_loading_complete.set()
-        workflow_path = tmp_path / "needs_a_library.py"
-
-        header = WorkflowManager.WORKFLOW_METADATA_HEADER
-        workflow_path.write_text(
-            "\n".join(
-                [
-                    f"# /// {header}",
-                    "# [tool.griptape-nodes]",
-                    '# name = "needs_a_library"',
-                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
-                    '# engine_version_created_with = "0.0.0"',
-                    '# node_libraries_referenced = [["Late Library", "1.0.0"]]',
-                    "# ///",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        workflow_path = _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Late Library")
 
         await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name="needs_a_library.py"))
         flagged = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
         assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in flagged.problems)
 
-        # The library the header names turns up, which is the case nothing recomputed before.
-        arrived = LibraryMetadata(
-            author="Someone", description="Arrived late", library_version="1.0.0", engine_version="0.0.0", tags=[]
-        )
-        with (
-            patch(
-                "griptape_nodes.node_library.library_registry.LibraryRegistry.list_libraries",
-                return_value=["Late Library"],
-            ),
-            patch.object(
-                engine.library_manager,
-                "get_library_metadata_request",
-                MagicMock(
-                    return_value=GetLibraryMetadataResultSuccess(metadata=arrived, result_details="Late Library")
-                ),
-            ),
-        ):
-            await workflow_manager.refresh_missing_library_verdicts()
+        with _library_installed(engine, "Late Library"):
+            await workflow_manager.refresh_verdicts_for_library("Late Library")
 
         settled = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
         assert not any(isinstance(problem, LibraryNotRegisteredProblem) for problem in settled.problems)
         assert [dependency.status for dependency in settled.workflow_dependencies] == [WorkflowDependencyStatus.PERFECT]
+
+    @pytest.mark.asyncio
+    async def test_refreshing_verdicts_flags_a_dependency_that_has_gone_away(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """The other direction: uninstall a library and the workflows needing it said they were fine.
+
+        Same cached verdict, so the same refresh has to settle both -- which is why it goes by the
+        library a workflow names rather than by the problem that was recorded.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+        workflow_path = _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Departing Library")
+
+        with _library_installed(engine, "Departing Library"):
+            await workflow_manager.on_load_workflow_metadata_request(
+                LoadWorkflowMetadata(file_name="needs_a_library.py")
+            )
+        healthy = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert [dependency.status for dependency in healthy.workflow_dependencies] == [WorkflowDependencyStatus.PERFECT]
+
+        await workflow_manager.refresh_verdicts_for_library("Departing Library")
+
+        settled = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert settled.status is WorkflowManager.WorkflowStatus.FLAWED
+        assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in settled.problems)
+
+    @pytest.mark.asyncio
+    async def test_refreshing_verdicts_leaves_workflows_naming_another_library_alone(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Only the workflows that name the library are re-read, and re-reading means a file read each."""
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+        _write_workflow_naming_library(tmp_path, "needs_this_one.py", "Arriving Library")
+        _write_workflow_naming_library(tmp_path, "needs_another.py", "Unrelated Library")
+        for file_name in ("needs_this_one.py", "needs_another.py"):
+            await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_name))
+
+        with patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock()) as reread:
+            await workflow_manager.refresh_verdicts_for_library("Arriving Library")
+
+        assert [call_args.args[0].file_name for call_args in reread.call_args_list] == [
+            str(tmp_path / "needs_this_one.py")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_forgetting_verdicts_drops_the_rows_for_unregistered_workflows(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """An unloaded library's templates leave the registry, so nothing can ask about them again.
+
+        Their verdicts would otherwise sit in the cache for the life of the process, and every
+        later refresh would re-read files belonging to a library that is gone.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+        _write_workflow_naming_library(tmp_path, "template.py", "Departing Library")
+        _write_workflow_naming_library(tmp_path, "mine.py", "Departing Library")
+        for file_name in ("template.py", "mine.py"):
+            await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_name))
+
+        workflow_manager.forget_verdicts_for_workflows(["template.py"])
+
+        assert list(workflow_manager._workflow_file_path_to_info) == [str(tmp_path / "mine.py")]
 
     # --- WorkflowInfo payload helpers ---
 
