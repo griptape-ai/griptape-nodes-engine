@@ -408,7 +408,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
     @pytest.mark.asyncio
     async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
         _, worker_manager = self._managers(spawned=True)
-        worker_manager.heartbeat_startup_grace_s = 0.01
+        worker_manager.library_load_timeout_s = 0.01
 
         with pytest.raises(RuntimeError, match="Lib"):
             await worker_manager.wait_until_executable("Lib")

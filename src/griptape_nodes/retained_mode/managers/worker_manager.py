@@ -22,8 +22,8 @@ from griptape_nodes.retained_mode.events.app_events import ConfigChanged, Curren
 from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
-    WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
+    WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -95,11 +95,14 @@ class WorkerManager(EngineScoped):
     # is the sleep in both heartbeat loops, so a non-positive value is a ZeroDivisionError on one
     # path and a hot loop on the other. Low enough that any interval meant seriously survives it.
     MINIMUM_HEARTBEAT_INTERVAL_S: float = 0.1
+    # Floor on the silence a worker tolerates before shutting itself down. Deliberately above the
+    # heartbeat timeout; see `orchestrator_silence_allowed_s` for why the two sides differ.
+    MINIMUM_ORCHESTRATOR_SILENCE_S: float = 30.0
     # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
     # on the boot wait for worker libraries, on `wait_until_executable`, and on each worker's reply to
-    # a project-switch fan-out. It does not delay heartbeat enforcement on either side, because a
-    # worker keeps answering challenges while it loads; see `worker_heartbeat_monitor`.
-    DEFAULT_HEARTBEAT_STARTUP_GRACE_S: float = 600.0
+    # a project-switch fan-out. Not a heartbeat bound on either side: a worker keeps answering
+    # challenges while it loads.
+    DEFAULT_LIBRARY_LOAD_TIMEOUT_S: float = 600.0
     # How long to wait for a worker to exit after SIGTERM before escalating to
     # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
     # loop; a wedged loop never services it, so SIGTERM alone can leak the process.
@@ -177,9 +180,9 @@ class WorkerManager(EngineScoped):
         self.heartbeat_timeout_s: float = config.get_config_value(
             WORKER_HEARTBEAT_TIMEOUT_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_TIMEOUT_S, cast_type=float
         )
-        self.heartbeat_startup_grace_s: float = config.get_config_value(
-            WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
-            default=WorkerManager.DEFAULT_HEARTBEAT_STARTUP_GRACE_S,
+        self.library_load_timeout_s: float = config.get_config_value(
+            WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
+            default=WorkerManager.DEFAULT_LIBRARY_LOAD_TIMEOUT_S,
             cast_type=float,
         )
 
@@ -213,10 +216,23 @@ class WorkerManager(EngineScoped):
 
         Note that the timeout is read two ways. Here it sizes an allowance in challenges, which is
         why a slow sweep cannot evict a worker that was never asked. On the worker,
-        `worker_heartbeat_monitor` compares it against elapsed time, because a worker can only
+        `orchestrator_silence_allowed_s` turns it into elapsed time, because a worker can only
         measure silence from a peer it cannot poll.
         """
         return max(1, math.ceil(self.heartbeat_timeout_s / self.heartbeat_interval_s))
+
+    @property
+    def orchestrator_silence_allowed_s(self) -> float:
+        """How much orchestrator silence a worker tolerates before shutting itself down.
+
+        Above `heartbeat_timeout_s`, because the two sides do not measure the same thing. The
+        orchestrator counts unanswered challenges, so its sweep running late costs a worker nothing.
+        The worker has only wall-clock time, and a late sweep is indistinguishable there from an
+        orchestrator that is gone. That sweep shares an event loop with library loading and has been
+        measured 18 seconds late during boot, so a worker held to the eviction timeout would kill
+        itself over the orchestrator's own latency.
+        """
+        return max(self.heartbeat_timeout_s, WorkerManager.MINIMUM_ORCHESTRATOR_SILENCE_S)
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -337,6 +353,11 @@ class WorkerManager(EngineScoped):
                 logger.debug(
                     "Worker unregistered: removed managed process for key '%s' (pid %s)", worker_key, removed.pid
                 )
+            # A worker leaving before its library settled releases nothing otherwise: the registry pop
+            # above also removes the entry eviction would have released it through. A clean shutdown
+            # unregisters too, but with its gate already set, so has_settled keeps it out.
+            if not self.has_settled(worker_key):
+                self.note_worker_unavailable(worker_key, "the worker process that runs it shut down before loading it.")
         logger.info("Worker unregistered: %s", wid)
         return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
 
@@ -392,6 +413,9 @@ class WorkerManager(EngineScoped):
         loads libraries. Silence is measured from the later of the last heartbeat and this monitor
         starting, so a first challenge still in flight is not counted as silence.
 
+        Tolerates `orchestrator_silence_allowed_s` rather than the eviction timeout, which is longer
+        by the margin the orchestrator's sweep needs to run late without being mistaken for a dead one.
+
         Does not mutate `_worker_heartbeat_last_received_at`; that attribute is owned by
         `handle_worker_heartbeat_request`.
         """
@@ -400,7 +424,7 @@ class WorkerManager(EngineScoped):
             await asyncio.sleep(self.heartbeat_interval_s)
             last_heard_at = max(self._worker_heartbeat_last_received_at, started_at)
             elapsed = time.monotonic() - last_heard_at
-            if elapsed > self.heartbeat_timeout_s:
+            if elapsed > self.orchestrator_silence_allowed_s:
                 msg = f"Orchestrator heartbeat lost ({elapsed:.1f}s since last heartbeat); worker is shutting down."
                 logger.warning(msg)
                 raise RuntimeError(msg)
@@ -943,12 +967,12 @@ class WorkerManager(EngineScoped):
             return
         logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
         try:
-            with anyio.fail_after(self.heartbeat_startup_grace_s):
+            with anyio.fail_after(self.library_load_timeout_s):
                 await self._execution_ready[library_name].wait()
         except TimeoutError:
             msg = (
                 f"Attempted to run a node from library '{library_name}'. Failed because its worker "
-                f"process did not finish loading the library within {self.heartbeat_startup_grace_s:.0f} seconds."
+                f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
             )
             raise RuntimeError(msg) from None
 
@@ -1270,10 +1294,10 @@ class WorkerManager(EngineScoped):
             try:
                 raw = await asyncio.wait_for(
                     self.route_to_worker(per_worker, worker_engine_id, request_topic),
-                    timeout=self.heartbeat_startup_grace_s,
+                    timeout=self.library_load_timeout_s,
                 )
             except TimeoutError:
-                return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
+                return f"{worker_engine_id}: no reply within {self.library_load_timeout_s:g} seconds"
             except Exception as e:
                 return f"{worker_engine_id}: {type(e).__name__}: {e}"
             # endswith, not a substring test: that would read any type merely CONTAINING "Success".

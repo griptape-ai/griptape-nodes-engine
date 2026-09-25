@@ -256,7 +256,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_LAZY_NODE_LOADING_KEY,
     LIBRARY_MINIMUM_RELEASE_AGE_KEY,
     REQUIRES_ENGINE_KEY,
-    WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
+    WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
     LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
@@ -4952,9 +4952,9 @@ class LibraryManager(EngineScoped):
         On timeout, marks remaining pending libraries as FAILURE/UNUSABLE so the rest of
         initialization can continue.
 
-        When wait_seconds is None, reads the worker heartbeat startup grace from config so
-        the orchestrator ceiling stays aligned with the worker self-timeout; first-time
-        installs of large libraries can easily exceed the default heartbeat timeout.
+        When wait_seconds is None, reads the worker heartbeat startup grace from config:
+        first-time installs of large libraries can easily exceed the heartbeat timeout, so
+        boot waits on the load deadline rather than on a heartbeat one.
         """
         # WORKER_PENDING only: an exec-dependencies library also has a worker whose readiness
         # execution routing waits on, but its nodes loaded locally already and boot must not block
@@ -4971,7 +4971,7 @@ class LibraryManager(EngineScoped):
         if wait_seconds is None:
             config_mgr = self.engine.config_manager
             wait_seconds = float(
-                config_mgr.get_config_value(WORKER_HEARTBEAT_STARTUP_GRACE_KEY, default=600.0, cast_type=float)
+                config_mgr.get_config_value(WORKER_LIBRARY_LOAD_TIMEOUT_KEY, default=600.0, cast_type=float)
             )
 
         unsettled = await self._worker_manager.wait_for_libraries(list(pending), wait_seconds)
