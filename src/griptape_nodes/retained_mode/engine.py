@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         ArbitraryCodeExecManager,
     )
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+    from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
@@ -170,6 +171,7 @@ class Engine:
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
+    _budget_manager: BudgetManager
     _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
 
@@ -180,6 +182,7 @@ class Engine:
             ArbitraryCodeExecManager,
         )
         from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+        from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
         from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
@@ -248,6 +251,7 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        self._budget_manager = BudgetManager(self._event_manager, engine=self)
         self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
@@ -363,6 +367,10 @@ class Engine:
         return self._manifest_manager
 
     @property
+    def budget_manager(self) -> BudgetManager:
+        return self._budget_manager
+
+    @property
     def diagnostics_manager(self) -> DiagnosticsManager:
         return self._diagnostics_manager
 
@@ -455,6 +463,9 @@ class Engine:
 
     def ManifestManager(self) -> ManifestManager:
         return self._manifest_manager
+
+    def BudgetManager(self) -> BudgetManager:
+        return self._budget_manager
 
     def DiagnosticsManager(self) -> DiagnosticsManager:
         return self._diagnostics_manager
