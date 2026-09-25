@@ -3219,21 +3219,18 @@ class LibraryManager(EngineScoped):
 
                 logger.info("Installing dependency '%s' with pip in venv at %s", package_name, venv_path)
                 is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
-                async with self._engine_version_constraints() as constraint_flags:
-                    await subprocess_run(
-                        [
-                            uv_path,
-                            "pip",
-                            "install",
-                            request.requirement_specifier,
-                            *constraint_flags,
-                            "--python",
-                            str(library_python_venv_path),
-                        ],
-                        check=True,
-                        capture_output=not is_debug,
-                        text=True,
-                    )
+                await self._install_under_engine_floors(
+                    [
+                        uv_path,
+                        "pip",
+                        "install",
+                        request.requirement_specifier,
+                        "--python",
+                        str(library_python_venv_path),
+                    ],
+                    library_python_venv_path,
+                    capture_output=not is_debug,
+                )
             else:
                 logger.debug(
                     "Skipping dependency installation for package '%s' - venv location at %s is not writable",
@@ -7871,6 +7868,40 @@ class LibraryManager(EngineScoped):
             await anyio.Path(constraint_file).write_text("\n".join(engine_package_floors()) + "\n")
             yield ["--constraint", str(constraint_file)]
 
+    async def _install_under_engine_floors(
+        self, argv: list[str], library_venv_python_path: Path, *, capture_output: bool
+    ) -> None:
+        """Run a ``uv pip install`` argv under the engine's own versions as floors.
+
+        Runs the same argv without them if that cannot resolve. A library whose dependencies
+        genuinely need an older copy of something the engine also has still installs: the shadowing
+        it leaves behind is reported against the library by `_shadowed_engine_packages`, which an
+        artist can act on, where a refused install would only have left them a library that does not
+        work.
+
+        So this raises in exactly the cases the install raised before the floors existed, which is
+        what `_install_deps_with_recovery` depends on: it reads a failure here as a corrupt
+        environment and deletes the venv, and a version conflict is not that.
+
+        Raises:
+            subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
+        """
+        async with self._engine_version_constraints() as constraint_flags:
+            try:
+                await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
+            except subprocess.CalledProcessError as constrained_error:
+                logger.warning(
+                    "Attempted to install dependencies into %s under the versions this engine runs on. Failed due "
+                    "to: the installer exited with code %s. Installing without them; the result may hold components "
+                    "older than the engine's own.",
+                    library_venv_python_path,
+                    constrained_error.returncode,
+                )
+            else:
+                return
+
+        await subprocess_run(argv, check=True, capture_output=capture_output, text=True)
+
     async def _run_uv_pip_install(
         self,
         library_venv_python_path: Path,
@@ -7880,16 +7911,6 @@ class LibraryManager(EngineScoped):
         capture_output: bool,
     ) -> None:
         """Run ``uv pip install`` for the given dependencies against a venv.
-
-        Installs under the engine's own versions as floors first, then without them if that cannot
-        resolve. A library whose dependencies genuinely need an older copy of something the engine
-        also has still installs: the shadowing it leaves behind is reported against the library by
-        `_shadowed_engine_packages`, which an artist can act on, where a refused install would only
-        have left them a library that does not work.
-
-        So this raises in exactly the cases it raised before the floors existed, which is what
-        `_install_deps_with_recovery` depends on: it reads a failure here as a corrupt environment
-        and deletes the venv, and a version conflict is not that.
 
         Raises:
             subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
@@ -7906,21 +7927,7 @@ class LibraryManager(EngineScoped):
             str(library_venv_python_path),
         ]
 
-        async with self._engine_version_constraints() as constraint_flags:
-            try:
-                await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
-            except subprocess.CalledProcessError as constrained_error:
-                logger.warning(
-                    "Attempted to install dependencies into %s under the versions this engine runs on. Failed due "
-                    "to: the installer exited with code %s. Installing without them; the result may hold components "
-                    "older than the engine's own.",
-                    library_venv_python_path,
-                    constrained_error.returncode,
-                )
-            else:
-                return
-
-        await subprocess_run(argv, check=True, capture_output=capture_output, text=True)
+        await self._install_under_engine_floors(argv, library_venv_python_path, capture_output=capture_output)
 
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""

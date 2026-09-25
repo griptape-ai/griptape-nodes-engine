@@ -35,6 +35,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromRequirementSpecifierRequest,
+    RegisterLibraryFromRequirementSpecifierResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DependencyInstallationFailedProblem,
@@ -1285,7 +1286,7 @@ class TestEveryLibraryInstallIsConstrainedToVersionsTheEngineCanImport:
 
     @pytest.mark.asyncio
     async def test_the_requirement_specifier_install_carries_them_too(self, engine: Engine, tmp_path: Path) -> None:
-        """This install builds a venv that is spliced onto sys.path like any other library's."""
+        """A library installed by specifier gets an environment too, so it is floored as well."""
         seen: dict[str, str] = {}
         venv_init = MagicMock(python_path=tmp_path / "python", reused=False)
 
@@ -1351,6 +1352,40 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
         assert len(calls) == expected_uv_runs
         assert "--constraint" not in calls[1]
         assert "numpy<2" in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_a_requirement_specifier_install_is_not_refused_over_the_floors(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Installing a library by specifier makes the same promise as installing its dependencies."""
+        calls: list[list[str]] = []
+        venv_init = MagicMock(python_path=tmp_path / "python", reused=False)
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                return_value=("griptape>=1.13.0",),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=self._fails_only_under_the_floors(calls),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch("griptape_nodes.retained_mode.managers.library_manager.files"),
+            patch.object(engine.library_manager, "_init_library_venv", AsyncMock(return_value=venv_init)),
+            patch.object(engine.library_manager, "_can_write_to_venv_location", return_value=True),
+            patch.object(engine, "ahandle_request", AsyncMock(return_value=MagicMock())),
+        ):
+            result = await engine.library_manager.register_library_from_requirement_specifier_request(
+                RegisterLibraryFromRequirementSpecifierRequest(requirement_specifier="some-lib==1.0.0")
+            )
+
+        assert isinstance(result, RegisterLibraryFromRequirementSpecifierResultSuccess)
+        assert "--constraint" not in calls[1]
+        assert "some-lib==1.0.0" in calls[1]
 
     @pytest.mark.asyncio
     async def test_the_venv_is_not_rebuilt_when_the_floors_are_what_failed(
