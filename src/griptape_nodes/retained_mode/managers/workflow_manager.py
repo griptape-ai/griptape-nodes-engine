@@ -37,7 +37,8 @@ from griptape_nodes.files.path_utils import (
     derive_registry_key,
     resolve_workspace_path,
 )
-from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectFileDestination
+from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
