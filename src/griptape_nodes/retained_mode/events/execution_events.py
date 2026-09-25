@@ -13,6 +13,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import Value
 
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
@@ -529,7 +530,7 @@ class ExecuteNodeRequest(RequestPayload):
     """
 
     node_name: str
-    parameter_values: dict[str, Any] = field(default_factory=dict)
+    parameter_values: dict[str, Value] = field(default_factory=dict)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
@@ -547,7 +548,7 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
         parameter_output_values: Output parameter values from the node.
     """
 
-    parameter_output_values: dict[str, Any] = field(default_factory=dict)
+    parameter_output_values: dict[str, Value] = field(default_factory=dict)
 
 
 @dataclass

@@ -327,6 +327,12 @@ hook fires the
 library load. If your node needs to react to wiring (the
 dynamic-parameter pattern), run the library in Shared mode.
 
+### Parameter values cross as plain data
+
+Inputs sent to the worker and outputs sent back travel as plain data and arrive as the same
+types. [Parameter Values](parameters.md#parameter-values) lists the types that can make the trip
+and shows how to add one.
+
 ### Parameter `converters`, `validators`, and `traits` do not cross to the orchestrator
 
 When the schema probe exports your library, only the scalar-shaped

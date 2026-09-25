@@ -202,12 +202,12 @@ A library that declares them runs differently, in three ways:
     instead. The library's process holds no settings or secrets of
     its own, so a direct read would be answering from the wrong
     place. Saving static files still works normally.
-- **Values that can't leave the process must stay inside it.** If a
-    node outputs something marked `serializable=False` (a live
-    model handle, a tensor), you'll get an error explaining the two
-    ways forward: make the value serializable, or keep it inside
-    the library by caching it library-side and outputting a small
-    descriptor that the next node trades back.
+- **Values without a plain-data form stay in the process that
+    built them.** Mark such an output `serializable=False` (a live
+    model handle, a tensor) and the engine keeps the object in the
+    library's process, sending the next node a reference to it. An
+    output with no plain-data form that isn't marked fails the node
+    with an error that names it.
 
 ### Process isolation: the Isolated mode
 

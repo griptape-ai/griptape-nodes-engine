@@ -28,6 +28,45 @@ All Parameter attributes:
 - **parent_container_name**: str|None — assigns this parameter as a child of a `ParameterContainer` (i.e. a `ParameterList` or `ParameterDictionary`). Used for list-like ownership.
 - **parent_element_name**: str|None — nests this parameter under a `ParameterGroup` (a UI grouping element). Used for visual grouping in the node UI.
 
+## Parameter Values
+
+A value that leaves the engine's process travels as plain data. Today that happens when a node
+runs in its library's own process (see
+[Node Isolation with Workers](node_isolation_with_workers.md)).
+
+These values make the trip and arrive as the same type:
+
+- `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
+- tuples, named tuples, sets, `bytes`, and dicts with keys that aren't text
+- enums, `pathlib` paths, dates and times, `timedelta`, `UUID`, and `Decimal`
+- pydantic models, dataclasses, and attrs classes, rebuilt from the fields their constructor takes
+- griptape objects such as artifacts and rulesets, and any class with a `to_dict()` method and a
+    `from_dict()` classmethod
+
+For any other class, add a `to_state()` method that returns the values above, and a
+`from_state()` classmethod that rebuilds the object from them:
+
+```python
+class Palette:
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+```
+
+A value whose class belongs to a library the receiving process doesn't load arrives there as a dict
+of its plain data, and continues unchanged to the next process that does load it. A class defined
+inside a function can't make the trip at all, because no other process can find it.
+
+A value with no plain-data form fails the node with an error that names the parameter, unless the
+parameter is `serializable=False`: then the engine keeps the value in the process that built it
+(see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md)).
+
 ## Traits
 
 Add functionality via `add_trait()`:
