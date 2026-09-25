@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import traceback
 import types
@@ -18,7 +19,14 @@ from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.serialization.type_names import resolve_type_name, type_name
-from griptape_nodes.serialization.values import DisplayValue, Value, decode_value, encode_for_display, encode_value
+from griptape_nodes.serialization.values import (
+    DisplayValue,
+    Value,
+    ValueEncodeError,
+    decode_value,
+    encode_for_display,
+    encode_value,
+)
 
 if TYPE_CHECKING:
     from cattrs import Converter
@@ -34,10 +42,19 @@ converter = make_converter()
 converter.register_unstructure_hook(Value, encode_value)
 converter.register_unstructure_hook(DisplayValue, encode_for_display)
 
-# SerializableMixin subclasses (BaseArtifact, BaseTool, Structure, etc.)
+
+# Griptape objects (artifacts, rulesets, drivers) are parameter values, so they cross only in fields
+# typed `Value` or `DisplayValue`. Anywhere else cattrs would walk their attrs fields and fail on a
+# type hint griptape imports only for type checking, with an error that names neither the object
+# nor the field.
+def _refuse_griptape_object(obj: SerializableMixin) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value is sent only in a field that carries parameter values."
+    raise ValueEncodeError(msg)
+
+
 converter.register_unstructure_hook_func(
     lambda cls: isinstance(cls, type) and issubclass(cls, SerializableMixin),
-    lambda obj: obj.to_dict(),
+    _refuse_griptape_object,
 )
 
 # Pydantic BaseModel subclasses (WorkflowMetadata, WorkflowShape, etc.)
@@ -245,23 +262,10 @@ converter.register_structure_hook_func(
 
 
 def _make_fallback_unstructure_fn(conv: Converter) -> Any:
-    """Fallback unstructure for dataclasses where get_type_hints() fails."""
+    """Fallback unstructure for dataclasses where get_type_hints() fails: each field by its runtime type."""
 
     def unstructure_fn(obj: Any) -> dict[str, Any]:
-        result = {}
-        for f in dc_fields(obj):
-            value = getattr(obj, f.name)
-            try:
-                result[f.name] = conv.unstructure(value)
-            except Exception:
-                logger.debug(
-                    "Failed to unstructure field '%s' (type=%s), using raw value",
-                    f.name,
-                    type(value).__name__,
-                    exc_info=True,
-                )
-                result[f.name] = value
-        return result
+        return {f.name: conv.unstructure(getattr(obj, f.name)) for f in dc_fields(obj)}
 
     return unstructure_fn
 
@@ -353,17 +357,18 @@ def register_polymorphic_dataclass(cls: type) -> None:
     include_subclasses(cls, converter)
 
 
-def safe_unstructure(obj: Any) -> Any:
-    """Unstructure an arbitrary object into a JSON-serializable form.
+def dump_json(data: Any, **kwargs: Any) -> str:
+    """Write the converter's output as JSON text.
 
-    Wraps the cattrs converter with a fallback for dataclasses that tries
-    each field individually, so a single bad field doesn't lose the entire
-    object. Falls back to str() only as a last resort.
+    Raises:
+        ValueEncodeError: ``data`` holds a value with no JSON form. The converter passes objects it
+            has no hook for through unchanged, so this is where they surface.
     """
-    try:
-        return converter.unstructure(obj)
-    except Exception:
-        logger.debug("Failed to unstructure object (type=%s), using fallback", type(obj).__name__, exc_info=True)
-        if is_dataclass(obj) and not isinstance(obj, type):
-            return _make_fallback_unstructure_fn(converter)(obj)
-        return str(obj)
+    return json.dumps(data, default=_refuse_json_value, **kwargs)
+
+
+# Passed explicitly: griptape swaps `JSONEncoder.default` process-wide for one that sends any object
+# with a `to_dict()` through it, and fails on the rest without naming their type.
+def _refuse_json_value(obj: Any) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value has no plain-data form."
+    raise ValueEncodeError(msg)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -10,11 +9,9 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
-from griptape_nodes.serialization.converter import (
-    converter,
-    register_polymorphic_dataclass,
-    safe_unstructure,
-)
+from griptape_nodes.serialization.converter import converter, dump_json, register_polymorphic_dataclass
+from griptape_nodes.serialization.type_names import TypeNameError
+from griptape_nodes.serialization.values import ValueEncodeError
 
 if TYPE_CHECKING:
     import builtins
@@ -124,6 +121,26 @@ class ResultDetails:
         return cls(*[converter.structure(item, ResultDetail) for item in data["result_details"]])
 
 
+class EventSerializationError(TypeError):
+    """A payload holds a value with no JSON form, so it cannot be sent."""
+
+
+def _unstructure(payload: Any) -> Any:
+    try:
+        return converter.unstructure(payload)
+    except (ValueEncodeError, TypeNameError) as error:
+        msg = f"Attempted to send a '{type(payload).__name__}'. Failed because {error}"
+        raise EventSerializationError(msg) from error
+
+
+def _to_json(data: Any, payload_type: str, **kwargs) -> str:
+    try:
+        return dump_json(data, **kwargs)
+    except (TypeError, ValueError) as error:
+        msg = f"Attempted to send a '{payload_type}'. Failed because {error}"
+        raise EventSerializationError(msg) from error
+
+
 # The Payload class is a marker interface
 class Payload(ABC):  # noqa: B024
     """Base class for all payload types. Customers will derive from this."""
@@ -134,7 +151,7 @@ class Payload(ABC):  # noqa: B024
         Returns:
             JSON string representation of the payload
         """
-        return json.dumps(safe_unstructure(self), default=str, **kwargs)
+        return _to_json(_unstructure(self), type(self).__name__, **kwargs)
 
 
 # Request payload base class with optional request ID
@@ -331,7 +348,7 @@ class BaseEvent(BaseModel, ABC):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization and add event_type."""
-        result = super().dict(*args, **kwargs)
+        result = self.model_dump(*args, **kwargs)
 
         # Add event type based on class name
         result["event_type"] = self.__class__.__name__
@@ -345,16 +362,9 @@ class BaseEvent(BaseModel, ABC):
 
     def json(self, **kwargs) -> str:
         """Serialize to JSON string."""
-
-        def _default(obj: Any) -> str:
-            logger.debug(
-                "json.dumps fallback hit: type=%s, value=%r",
-                type(obj).__name__,
-                obj,
-            )
-            return str(obj)
-
-        return json.dumps(self.dict(), default=_default, **kwargs)
+        data = self.dict()
+        described_as = data.get("result_type") or data.get("payload_type") or data.get("request_type")
+        return _to_json(data, described_as or type(self).__name__, **kwargs)
 
     @abstractmethod
     def get_request(self) -> Payload:
@@ -380,7 +390,7 @@ class EventRequest[P: Payload](BaseEvent):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["request"] = safe_unstructure(self.request)
+        result["request"] = _unstructure(self.request)
         return result
 
     def get_request(self) -> P:
@@ -458,8 +468,8 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["request"] = safe_unstructure(self.request)
-        result_dict = safe_unstructure(self.result)
+        result["request"] = _unstructure(self.request)
+        result_dict = _unstructure(self.result)
         if self.request.fields is not None and self.result.succeeded():
             tree = build_path_tree(self.request.fields)
             filtered = apply_path_tree(result_dict, tree)
@@ -556,7 +566,7 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["payload"] = safe_unstructure(self.payload)
+        result["payload"] = _unstructure(self.payload)
         return result
 
     def get_request(self) -> E:
@@ -590,7 +600,7 @@ class AppEvent[A: AppPayload](BaseEvent):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["payload"] = safe_unstructure(self.payload)
+        result["payload"] = _unstructure(self.payload)
         return result
 
     def get_request(self) -> A:
