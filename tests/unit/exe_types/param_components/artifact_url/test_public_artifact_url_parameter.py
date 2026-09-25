@@ -1,9 +1,8 @@
 """Tests for PublicArtifactUrlParameter.get_public_url_for_parameter input handling.
 
-These cover the artifact shapes that reach the component in practice -- serialized
-artifact dicts (orchestrator <-> worker JSON boundary) and ErrorArtifact propagated
-from an upstream failure -- in addition to the original UrlArtifact / bare-string
-paths. See griptape-ai/griptape-nodes-engine#4688.
+These cover the artifact shapes that reach the component in practice -- artifact-shaped
+dicts the editor sets and ErrorArtifact propagated from an upstream failure -- in addition
+to the original UrlArtifact / bare-string paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
 import re
@@ -64,8 +63,7 @@ class TestGetPublicUrlForParameter:
         assert component.get_public_url_for_parameter() == "https://example.com/img.png"
         driver.upload_file.assert_not_called()
 
-    def test_serialized_url_artifact_dict_is_hydrated(self) -> None:
-        # A value that crossed a JSON boundary arrives as a dict, not an artifact.
+    def test_artifact_shaped_dict_from_the_editor_is_read(self) -> None:
         component, driver = _make_component(ImageUrlArtifact(value="https://example.com/img.png").to_dict())
 
         assert component.get_public_url_for_parameter() == "https://example.com/img.png"

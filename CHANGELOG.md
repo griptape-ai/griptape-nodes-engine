@@ -10,6 +10,22 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Changed
+
+- A node in a library running in its own process fails with an error naming the parameter when an
+  input or output has no plain-data form, instead of receiving or sending it as text. See
+  [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
+  that can cross.
+
+### Fixed
+
+- Outputs of a node in a library running in its own process reach downstream nodes as the same
+  types, instead of as plain dicts. Artifact classes a library defines itself, such as
+  `VideoUrlArtifact`, arrive as that class instead of griptape's class of the same name. A value
+  whose class belongs to a library the receiving process does not load still arrives as a dict, and
+  reaches the next process that does load it unchanged.
+  [#4475](https://github.com/griptape-ai/griptape-nodes-engine/issues/4475)
+
 ## [0.102.0] - 2026-09-24
 
 ### Added

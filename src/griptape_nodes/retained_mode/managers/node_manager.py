@@ -9,7 +9,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
-from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
     StrictModeScopeKind,
@@ -244,6 +243,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.converter import converter, safe_unstructure
+from griptape_nodes.serialization.values import ValueEncodeError, encode_value
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3491,6 +3491,13 @@ class NodeManager(EngineScoped):
         (NodeExecutor.execute) so the write path is identical for local and
         worker routes.
         """
+        unsendable = self._unencodable_value_names(request.parameter_values)
+        if unsendable:
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"its input {', '.join(unsendable)} cannot be sent there."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
         worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
@@ -3654,9 +3661,7 @@ class NodeManager(EngineScoped):
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
         with self.engine.event_manager.node_execution_scope():
-            # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
-            parameter_values = hydrate_parameter_values(request.parameter_values)
-            hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
+            hydration_failure = self._apply_hydrated_values(node, node_name, request.parameter_values)
             if hydration_failure is not None:
                 return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
@@ -3718,12 +3723,28 @@ class NodeManager(EngineScoped):
         # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
         # dict the node just wrote its object into.
         if self.engine.library_manager.is_worker:
-            output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
-        else:
-            output_values = dict(node.parameter_output_values)
+            return self._worker_execution_result(node)
+        return ExecuteNodeResultSuccess(
+            parameter_output_values=dict(node.parameter_output_values),
+            result_details=f"Node '{node_name}' executed successfully.",
+        )
+
+    def _worker_execution_result(self, node: BaseNode) -> ResultPayload:
+        """The result a worker sends back: outputs with cached objects swapped for their keys."""
+        output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
+        unsendable = self._unencodable_value_names(output_values)
+        if unsendable:
+            library_name = node.metadata.get("library", "its library")
+            details = (
+                f"Node '{node.name}' produced {', '.join(unsendable)}, which cannot leave "
+                f"'{library_name}'s isolated process. Either give the value a plain-data form, or "
+                f"declare its parameter serializable=False so the value stays in that process and "
+                f"the next node receives a reference to it."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
-            result_details=f"Node '{node_name}' executed successfully.",
+            result_details=f"Node '{node.name}' executed successfully.",
         )
 
     def _apply_hydrated_values(
@@ -3789,6 +3810,17 @@ class NodeManager(EngineScoped):
                 param_name,
             )
         return None
+
+    @staticmethod
+    def _unencodable_value_names(values: dict[str, Any]) -> list[str]:
+        """Name each value that has no plain-data form, with the reason."""
+        names = []
+        for name, value in values.items():
+            try:
+                encode_value(value)
+            except ValueEncodeError as error:
+                names.append(f"'{name}' ({error})")
+        return names
 
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
