@@ -137,6 +137,11 @@ def value_key(encoded: JsonValue) -> str:
     return hashlib.sha256(_canonical_json(encoded).encode("utf-8")).hexdigest()[:32]
 
 
+def has_plain_data_form(cls: type) -> bool:
+    """Whether instances of ``cls`` encode to plain data that decodes back to ``cls``."""
+    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or cls in _codecs or _adapter_for(cls) is not None
+
+
 class SavesState(Protocol):
     """What ``register_value_codec`` needs from a class it decorates."""
 
@@ -494,6 +499,8 @@ class _Registration:
 
 
 _LIBRARY_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
+
+_PLAIN_TYPES: frozenset[type] = frozenset({type(None), bool, int, str, list, dict})
 
 _BUILTIN_DECODERS: dict[type, Any] = {
     tuple: tuple,

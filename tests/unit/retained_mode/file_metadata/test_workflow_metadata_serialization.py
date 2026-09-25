@@ -8,9 +8,7 @@ module (`test_sidecar_metadata.py`) or `ExtractFlowCommandsFromImageMetadata`
 (`test_flow_manager.py`), which read this module's output from the other side.
 """
 
-import base64
 import json
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from collections.abc import Generator
 
 import pytest
@@ -22,6 +20,7 @@ from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAnd
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
+    SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
@@ -32,6 +31,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
     _serialize_node,
     collect_workflow_metadata,
 )
+from griptape_nodes.serialization.commands import decode_commands
 
 
 @pytest.fixture
@@ -66,11 +66,11 @@ def _add_error_proxy_node(engine: Engine, node_name: str) -> ErrorProxyNode:
 
 
 class TestSerializeFlow:
-    """`_serialize_flow` packs a flow's commands into a pickle+base64 string for image metadata."""
+    """`_serialize_flow` packs a flow's commands into a JSON string for image metadata."""
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_round_trips_through_pickle_and_base64(self, engine: Engine) -> None:
-        """The payload unpickles back into the exact commands a direct request would produce."""
+    def test_round_trips_through_json(self, engine: Engine) -> None:
+        """The payload decodes back into the exact commands a direct request would produce."""
         engine.context_manager.push_workflow(workflow_name="wf_roundtrip")
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_roundtrip", set_as_new_context=True)
@@ -80,13 +80,13 @@ class TestSerializeFlow:
         payload = _serialize_flow(engine, flow_name=created.flow_name)
         assert payload is not None
 
-        unpickled = pickle.loads(base64.b64decode(payload))  # noqa: S301
+        decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
 
         direct_result = engine.handle_request(
             SerializeFlowToCommandsRequest(flow_name=created.flow_name, include_create_flow_command=False)
         )
         assert isinstance(direct_result, SerializeFlowToCommandsResultSuccess)
-        assert unpickled == direct_result.serialized_flow_commands
+        assert decoded == direct_result.serialized_flow_commands
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_no_flow_name_and_no_current_flow_returns_none(self, engine: Engine) -> None:
@@ -116,8 +116,8 @@ class TestSerializeFlow:
         payload = _serialize_flow(engine, flow_name=None)
         assert payload is not None
 
-        unpickled = pickle.loads(base64.b64decode(payload))  # noqa: S301
-        assert unpickled.flow_name is None  # SerializeFlowToCommandsResult doesn't stamp a name for the payload itself
+        decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
+        assert decoded.flow_name is None  # SerializeFlowToCommandsResult doesn't stamp a name for the payload itself
 
 
 class TestSerializeNode:
@@ -184,8 +184,8 @@ class TestCollectWorkflowMetadata:
         metadata = collect_workflow_metadata(engine)
 
         assert FLOW_COMMANDS_KEY in metadata
-        unpickled = pickle.loads(base64.b64decode(metadata[FLOW_COMMANDS_KEY]))  # noqa: S301
-        assert unpickled.serialized_node_commands == []
+        decoded = decode_commands(json.loads(metadata[FLOW_COMMANDS_KEY]), SerializedFlowCommands)
+        assert decoded.serialized_node_commands == []
 
 
 class TestWorkflowMetadataNodeTypesUsedSerialization:

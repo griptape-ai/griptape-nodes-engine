@@ -33,6 +33,8 @@ All Parameter attributes:
 Parameter values are serialized when:
 
 - a workflow is saved
+- nodes are copied
+- a workflow is embedded in an exported image
 - a node runs in its library's own process (see [Node Isolation with Workers](node_isolation_with_workers.md))
 - a loop or subflow group runs with an **Execution Environment** other than **Local Execution**
 

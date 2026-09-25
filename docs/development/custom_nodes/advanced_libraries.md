@@ -373,8 +373,8 @@ registers fine, but the editor has no category to file it under.
 
 Definitions added this way are indistinguishable from hand-written ones, which means they
 inherit the loader's behavior: lazy module loading, one memoized import per file even
-when many classes share it, stable-namespace aliasing so saved workflows can rebuild
-values your classes define, per-node problem reporting, and correct fitness.
+when many classes share it, stable-namespace aliasing so saved workflows, copied nodes, and
+images can rebuild values your classes define, per-node problem reporting, and correct fitness.
 
 ### Where the classes come from
 
