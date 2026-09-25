@@ -12,6 +12,8 @@ import json
 from typing import Any
 
 import httpx
+import httpx2
+import openai
 import pytest
 
 from griptape_nodes.retained_mode.events.event_converter import converter
@@ -304,13 +306,37 @@ class TestTheExceptionChain:
         assert refusal_from_exception(wrapped, cloud_host=CLOUD_HOST) is not None
 
     def test_a_model_http_error_carries_its_own_body(self) -> None:
-        """Pydantic AI's shape: status and body directly on the exception, no URL."""
-        error = _ModelHttpError(403, an_openai_refusal_body(a_refusal_body()))
+        """Pydantic AI's shape: status and body directly on the exception, no URL.
+
+        The body is the OpenAI SDK's, which has already had its ``error`` wrapper taken off.
+        """
+        error = _ModelHttpError(403, an_openai_refusal_body(a_refusal_body())["error"])
 
         refusal = refusal_from_exception(error, cloud_host=CLOUD_HOST)
 
         assert refusal is not None
         assert refusal.budgets[0].budget_name == "tight"
+
+    def test_the_openai_sdk_error_from_a_chat_refusal_is_recognized(self) -> None:
+        """The chat endpoint refuses in the OpenAI envelope, and the SDK unwraps it before raising.
+
+        Driven through the real client so a change in how the SDK hands the body over fails here.
+        The SDK ships its own fork of httpx, so its transport comes from there.
+        """
+        body = an_openai_refusal_body(a_refusal_body())
+        transport = httpx2.MockTransport(lambda _request: httpx2.Response(403, json=body))
+        client = openai.OpenAI(
+            api_key="unused",
+            base_url=f"https://{CLOUD_HOST}/api/v1",
+            max_retries=0,
+            http_client=httpx2.Client(transport=transport),
+        )
+
+        with pytest.raises(openai.PermissionDeniedError) as raised:
+            client.chat.completions.create(model="gpt-4.1", messages=[{"role": "user", "content": "hi"}])
+
+        refusal = refusal_from_exception(raised.value, cloud_host=CLOUD_HOST)
+        assert refusal == refusal_from_body(a_refusal_body())
 
     def test_a_model_http_error_body_may_arrive_as_text(self) -> None:
         error = _ModelHttpError(403, json.dumps(a_refusal_body()))

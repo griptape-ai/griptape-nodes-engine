@@ -40,7 +40,8 @@ BUDGET_EXCEEDED_CODE = "budget_exceeded"
 """The machine-readable code Cloud sets on every budget refusal.
 
 Present on both envelopes: at the top level of the flat body, and as
-``error.code`` in the OpenAI-compatible one. Cloud builds a refusal in exactly
+``error.code`` in the OpenAI-compatible one -- which an OpenAI SDK unwraps to
+a bare ``code``. Cloud builds a refusal in exactly
 one place, so this token is the whole recognition test -- ``blocked_by`` only
 confirms there is something to name.
 """
@@ -172,11 +173,13 @@ def refusal_from_exception(exc: BaseException, *, cloud_host: str | Callable[[],
 def refusal_from_body(body: object) -> BudgetRefusal | None:
     """Return the refusal a 403 body describes, or None if it does not describe one.
 
-    Accepts both envelopes Cloud sends. Six surfaces return the refusal as the
-    whole body; the OpenAI-compatible surface nests the same values under
-    ``error`` so an OpenAI SDK can parse it. Two envelopes because two protocols,
-    but the values are lifted rather than rebuilt, so this returns the same
-    refusal either way.
+    Accepts both envelopes Cloud sends, and the one an OpenAI SDK leaves behind.
+    Six surfaces return the refusal as the whole body; the OpenAI-compatible
+    surface nests the same values under ``error`` so an OpenAI SDK can parse it.
+    That SDK then unwraps ``error`` before raising, so the body on its exception
+    -- and on Pydantic AI's, which passes it along -- is the inner object, with
+    the code under ``code``. The values are lifted rather than rebuilt at every
+    step, so this returns the same refusal whichever shape arrives.
 
     Args:
         body: The parsed response body, or anything at all -- a body that is not
@@ -192,6 +195,9 @@ def refusal_from_body(body: object) -> BudgetRefusal | None:
     if isinstance(error, dict):
         payload: Mapping[str, Any] = error
         code = error.get("code")
+    elif error is None:
+        payload = body
+        code = body.get("code")
     else:
         payload = body
         code = error
