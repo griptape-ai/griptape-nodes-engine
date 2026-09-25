@@ -3939,8 +3939,10 @@ class TestLibraryManagerDuplicateEntryHygiene:
             patch.object(LibraryRegistry, "unregister_library"),
             patch.object(library_manager, "_unregister_all_stable_module_aliases_for_library"),
         ):
-            result = library_manager.unload_library_from_registry_request(
-                UnloadLibraryFromRegistryRequest(library_name="MyLib")
+            result = asyncio.run(
+                library_manager.unload_library_from_registry_request(
+                    UnloadLibraryFromRegistryRequest(library_name="MyLib")
+                )
             )
 
         assert isinstance(result, UnloadLibraryFromRegistryResultSuccess)

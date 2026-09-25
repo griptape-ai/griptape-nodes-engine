@@ -6,7 +6,7 @@ import re
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from pydantic import BaseModel, Field, ValidationError, field_serializer, field_validator
 
@@ -15,6 +15,9 @@ from griptape_nodes.node_library.library_registry import (
     LibraryNameAndVersion,
 )
 from griptape_nodes.utils.metaclasses import SingletonMeta
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -279,6 +282,13 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
         raise WorkflowMetadataSchemaError(msg, section_path=METADATA_TABLE_PATH, error_message=str(err)) from err
 
 
+class RemovedWorkflows(NamedTuple):
+    """What a removal took out of the registry: the keys it held, and the files they pointed at."""
+
+    registry_keys: list[str]
+    file_paths: list[str]
+
+
 class WorkflowRegistry(metaclass=SingletonMeta):
     class _RegistryKey:
         """Private class for workflow construction."""
@@ -298,6 +308,7 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         registry_key: str,
         metadata: WorkflowMetadata,
         file_path: str | None = None,
+        library_name: str | None = None,
     ) -> Workflow:
         """Register a workflow under `registry_key` with the given metadata.
 
@@ -309,6 +320,10 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         `file_path` is optional: provide it for saved workflows (backed by a file on
         disk; existence is verified at construction time); omit it for unsaved in-memory
         entries. Unsaved keys must start with `UNSAVED_KEY_PREFIX`.
+
+        `library_name` names the library contributing the entry, and is what takes it out again
+        when that library unloads. Leave it None for the workspace scan and for anything the user
+        creates.
         """
         instance = cls()
         if registry_key in instance._workflows:
@@ -322,9 +337,19 @@ class WorkflowRegistry(metaclass=SingletonMeta):
             msg = f"Saved registry key '{registry_key}' requires a file_path."
             raise ValueError(msg)
         if file_path is None:
-            workflow = Workflow(registry_key=instance._registry_key, metadata=metadata, file_path=None)
+            workflow = Workflow(
+                registry_key=instance._registry_key,
+                metadata=metadata,
+                file_path=None,
+                library_name=library_name,
+            )
         else:
-            workflow = Workflow.from_disk(registry_key=instance._registry_key, file_path=file_path, metadata=metadata)
+            workflow = Workflow.from_disk(
+                registry_key=instance._registry_key,
+                file_path=file_path,
+                metadata=metadata,
+                library_name=library_name,
+            )
         instance._workflows[registry_key] = workflow
         return workflow
 
@@ -401,18 +426,44 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         return instance._workflows.pop(name)
 
     @classmethod
-    def clear_user_workflows(cls) -> None:
-        """Remove all non-library workflows from the registry.
+    def clear_workspace_workflows(cls) -> None:
+        """Remove every workflow the workspace scan is responsible for.
 
-        Library-provided workflows (is_griptape_provided=True) are preserved.
-        Called before re-registering workflows so that a workspace change takes effect cleanly.
+        Called before re-scanning so that a workspace change takes effect cleanly. Library
+        entries are left alone: they go away when their library unloads, not when the workspace
+        moves.
+        """
+        cls._remove_workflows_where(lambda workflow: workflow.library_name is None)
+
+    @classmethod
+    def remove_workflows_from_library(cls, library_name: str) -> RemovedWorkflows:
+        """Remove every workflow `library_name` contributed and report what went.
+
+        The files come back alongside the keys because a caller holding per-file state, such as
+        `WorkflowManager`'s dependency verdicts, cannot find it once the entries are gone.
         """
         instance = cls()
-        keys_to_remove = [
-            key for key, workflow in instance._workflows.items() if not workflow.metadata.is_griptape_provided
-        ]
+        removed_keys = [key for key, workflow in instance._workflows.items() if workflow.library_name == library_name]
+        removed_file_paths = []
+        for key in removed_keys:
+            file_path = instance._workflows[key].file_path
+            if file_path is not None:
+                removed_file_paths.append(file_path)
+            del instance._workflows[key]
+        return RemovedWorkflows(registry_keys=removed_keys, file_paths=removed_file_paths)
+
+    @classmethod
+    def _clear(cls) -> None:
+        """Empty the registry. For tests, which need the ClassVar reset between cases."""
+        cls()._workflows.clear()
+
+    @classmethod
+    def _remove_workflows_where(cls, predicate: Callable[[Workflow], bool]) -> list[str]:
+        instance = cls()
+        keys_to_remove = [key for key, workflow in instance._workflows.items() if predicate(workflow)]
         for key in keys_to_remove:
             del instance._workflows[key]
+        return keys_to_remove
 
     @classmethod
     def rekey_workflow(cls, old_key: str, new_key: str) -> None:
@@ -444,16 +495,23 @@ class Workflow:
     - **Unsaved**: in-memory only. `file_path is None`. Created via
       `WorkflowRegistry.generate_new_workflow` with `file_path=None`. Transitions to
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
+
+    `library_name` is the library that contributed the entry, or None for the workspace scan and
+    anything the user creates. Recorded on write because the header cannot answer it: its flags
+    survive the file being copied out of the library, so a copy sitting in the workspace would
+    still claim to be the library's.
     """
 
     metadata: WorkflowMetadata
     file_path: str | None
+    library_name: str | None
 
     def __init__(
         self,
         registry_key: WorkflowRegistry._RegistryKey,
         metadata: WorkflowMetadata,
         file_path: str | None,
+        library_name: str | None = None,
     ) -> None:
         if not isinstance(registry_key, WorkflowRegistry._RegistryKey):
             msg = "Workflows can only be created through WorkflowRegistry"
@@ -461,6 +519,7 @@ class Workflow:
 
         self.metadata = metadata
         self.file_path = file_path
+        self.library_name = library_name
 
     @classmethod
     def from_disk(
@@ -468,6 +527,7 @@ class Workflow:
         registry_key: WorkflowRegistry._RegistryKey,
         metadata: WorkflowMetadata,
         file_path: str,
+        library_name: str | None = None,
     ) -> Workflow:
         """Construct a Workflow backed by an existing file on disk.
 
@@ -479,7 +539,7 @@ class Workflow:
         if not Path(complete_path).is_file():
             msg = f"File path '{complete_path}' does not exist."
             raise ValueError(msg)
-        return cls(registry_key=registry_key, metadata=metadata, file_path=file_path)
+        return cls(registry_key=registry_key, metadata=metadata, file_path=file_path, library_name=library_name)
 
     @property
     def is_saved(self) -> bool:
@@ -517,6 +577,9 @@ class Workflow:
         # Customers of this function need that, so let's stuff it in.
         ret_val["file_path"] = self.file_path
         ret_val["is_saved"] = self.is_saved
+        # Not in the schema either: which library contributed the entry is a property of the
+        # registration, not of the file. Clients group templates by it.
+        ret_val["library_name"] = self.library_name
 
         if synced_path is not None and workspace_path is not None and self.file_path is not None:
             # Pre-computed paths supplied by list_workflows() to avoid a ConfigManager
