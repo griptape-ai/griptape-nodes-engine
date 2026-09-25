@@ -4,20 +4,14 @@ These tests describe the observable contract of:
 
 * ``NodeExecutor.get_workflow_handler`` - returns the registered handler for a
   library, or raises ``ValueError`` with the library name in the message.
-* ``NodeExecutor._deserialize_parameter_value`` - resolves UUID-referenced
-  pickled bytes back into Python objects. By the time this function is called,
-  cattrs has already decoded base85-encoded bytes via the typed
-  ``ControlFlowResolvedEvent.unique_parameter_uuid_to_values`` field, so
-  ``stored_value`` is always ``bytes``.
 * ``NodeExecutor._extract_parameter_output_values`` - merges per-node output
-  dicts from a subprocess result, using the deserializer for UUID references
-  and falling back to a pre-mapping flat shape for backward compatibility.
+  dicts from a subprocess result.
 * ``NodeExecutor.execute`` - the remaining ``SubflowNodeGroup`` branches
   (private execution, library-name execution) and the unexpected-result-type
   edge case.
 """
 
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
+import json
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -73,94 +67,17 @@ class TestGetWorkflowHandler:
             executor.get_workflow_handler("missing_lib")
 
 
-class TestDeserializeParameterValue:
-    """_deserialize_parameter_value resolves UUID-referenced pickled bytes.
-
-    By the time this function runs, ``ControlFlowResolvedEvent`` has already been
-    structured by cattrs (preconf.json), which auto-decodes base85-encoded strings
-    back to real ``bytes``. The stored value is therefore always ``bytes``.
-    """
-
-    def test_returns_param_value_unchanged_when_not_a_uuid_reference(self) -> None:
-        executor = _make_executor()
-        sentinel = object()
-
-        result = executor._deserialize_parameter_value(
-            param_name="x",
-            param_value=sentinel,
-            unique_uuid_to_values={"some-uuid": pickle.dumps("irrelevant")},
-        )
-
-        assert result is sentinel
-
-    def test_unpickles_bytes_stored_under_uuid(self) -> None:
-        executor = _make_executor()
-        original = {"answer": 42, "items": [1, 2, 3]}
-
-        result = executor._deserialize_parameter_value(
-            param_name="payload",
-            param_value="uuid-1",
-            unique_uuid_to_values={"uuid-1": pickle.dumps(original)},
-        )
-
-        assert result == original
-
-    def test_unpickles_arbitrary_python_objects(self) -> None:
-        executor = _make_executor()
-        original = complex(3, 7)
-
-        result = executor._deserialize_parameter_value(
-            param_name="point",
-            param_value="uuid-pt",
-            unique_uuid_to_values={"uuid-pt": pickle.dumps(original)},
-        )
-
-        assert result == original
-
-
 class TestExtractParameterOutputValues:
     """_extract_parameter_output_values merges per-node outputs from a subprocess result."""
 
     def test_returns_empty_dict_for_empty_input(self) -> None:
         assert _make_executor()._extract_parameter_output_values({}) == {}
 
-    def test_passes_through_values_when_no_uuid_mapping(self) -> None:
+    def test_merges_outputs_from_multiple_end_nodes(self) -> None:
         executor = _make_executor()
-        subprocess_result: dict[str, Any] = {
-            "node_a": {"parameter_output_values": {"out1": 1, "out2": "two"}},
-        }
-
-        assert executor._extract_parameter_output_values(subprocess_result) == {"out1": 1, "out2": "two"}
-
-    def test_deserializes_uuid_referenced_values(self) -> None:
-        executor = _make_executor()
-        original = [10, 20, 30]
-        subprocess_result: dict[str, Any] = {
-            "node_a": {
-                "parameter_output_values": {"items": "uuid-1"},
-                "unique_parameter_uuid_to_values": {"uuid-1": pickle.dumps(original)},
-            },
-        }
-
-        assert executor._extract_parameter_output_values(subprocess_result) == {"items": original}
-
-    def test_merges_outputs_from_multiple_result_dicts(self) -> None:
-        executor = _make_executor()
-        subprocess_result: dict[str, Any] = {
-            "node_a": {"parameter_output_values": {"a": 1}},
-            "node_b": {"parameter_output_values": {"b": 2}},
-        }
+        subprocess_result: dict[str, Any] = {"node_a": {"a": 1}, "node_b": {"b": 2}}
 
         assert executor._extract_parameter_output_values(subprocess_result) == {"a": 1, "b": 2}
-
-    def test_backward_compatible_with_flat_result_shape(self) -> None:
-        """Old flat structure: result dict directly contains output keys."""
-        executor = _make_executor()
-        subprocess_result: dict[str, Any] = {
-            "node_a": {"out1": "hello", "out2": "world"},
-        }
-
-        assert executor._extract_parameter_output_values(subprocess_result) == {"out1": "hello", "out2": "world"}
 
 
 class TestExecuteSubflowNodeGroupBranches:
@@ -312,47 +229,19 @@ class TestFormatNodeFailureMessage:
         assert "[" not in msg.split("execution failed:")[1].split(":")[0]
 
 
-class TestControlFlowResolvedEventCattrsRoundTrip:
-    """ControlFlowResolvedEvent.unique_parameter_uuid_to_values round-trips through cattrs.
+class TestControlFlowResolvedEventWireForm:
+    """The subprocess sends its flow result as JSON; the parent gets back the same values."""
 
-    cattrs.preconf.json registers symmetric base85 hooks for bytes.  When the
-    subprocess unstructures a ControlFlowResolvedEvent containing bytes values,
-    those values become base85 strings on the wire.  When the parent structures
-    the received payload back into a ControlFlowResolvedEvent, cattrs decodes
-    the base85 strings back into bytes — so _deserialize_parameter_value always
-    sees real bytes.
-    """
-
-    def test_bytes_values_survive_unstructure_structure_round_trip(self) -> None:
+    def test_values_keep_their_types_across_the_wire(self) -> None:
         from griptape_nodes.retained_mode.events.execution_events import ControlFlowResolvedEvent
-        from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
-        from griptape_nodes.serialization.converter import converter, safe_unstructure
+        from griptape_nodes.serialization.converter import converter
 
-        original = {"answer": 42}
-        pickled = pickle.dumps(original)
-        uuid = SerializedNodeCommands.UniqueParameterValueUUID("test-uuid-1")
+        values = {"flag": True, "count": 1, "pair": (1, 2), "blob": b"\x00"}
+        event = ControlFlowResolvedEvent(end_node_name="EndFlow", parameter_output_values=values)
 
-        event = ControlFlowResolvedEvent(
-            end_node_name="EndFlow",
-            parameter_output_values={"result": uuid},
-            unique_parameter_uuid_to_values={uuid: pickled},
-        )
+        wire = json.loads(json.dumps(converter.unstructure(event)))
+        received = converter.structure(wire, ControlFlowResolvedEvent)
 
-        # Simulate what the subprocess does: unstructure → JSON
-        raw = safe_unstructure(event)
-
-        # The bytes value must have been base85-encoded to a string on the wire
-        wire_value = raw["unique_parameter_uuid_to_values"][uuid]
-        assert isinstance(wire_value, str), "cattrs must base85-encode bytes during unstructure"
-
-        # Simulate what the parent does: JSON → structure
-        reconstructed = converter.structure(raw, ControlFlowResolvedEvent)
-
-        # After structuring with the typed field, value must be bytes again
-        assert reconstructed.unique_parameter_uuid_to_values is not None
-        stored = reconstructed.unique_parameter_uuid_to_values[uuid]
-        assert isinstance(stored, bytes), "cattrs must decode base85 back to bytes during structure"
-        assert stored == pickled
-
-        # And pickle.loads on the stored bytes must recover the original object
-        assert pickle.loads(stored) == original  # noqa: S301
+        assert received.parameter_output_values == values
+        assert type(received.parameter_output_values["flag"]) is bool
+        assert type(received.parameter_output_values["count"]) is int

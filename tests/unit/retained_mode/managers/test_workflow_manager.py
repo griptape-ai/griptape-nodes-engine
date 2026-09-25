@@ -3275,7 +3275,6 @@ class TestWorkflowSaveSituationMacro:
             is_template=None,
             branched_from=None,
             workflow_shape=None,
-            pickle_control_flow_result=False,
         )
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowFileFromSerializedFlowResultSuccess,
@@ -3319,7 +3318,6 @@ class TestWorkflowSaveSituationMacro:
             is_template=None,
             branched_from=None,
             workflow_shape=None,
-            pickle_control_flow_result=False,
         )
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowFileFromSerializedFlowResultSuccess,

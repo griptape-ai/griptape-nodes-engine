@@ -33,11 +33,7 @@ def _main() -> None:
 
     local_session_workflow_executor = LocalSessionWorkflowExecutor.from_cli_args(args)
 
-    execute_workflow(
-        input=flow_input,
-        workflow_executor=local_session_workflow_executor,
-        pickle_control_flow_result=args.pickle_control_flow_result,
-    )
+    execute_workflow(input=flow_input, workflow_executor=local_session_workflow_executor)
 
 
 if __name__ == "__main__":

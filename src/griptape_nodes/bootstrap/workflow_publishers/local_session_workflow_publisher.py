@@ -75,7 +75,7 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
         workflow_path: str,
         publisher_name: str,
         published_workflow_file_name: str,
-        **kwargs: Any,
+        **kwargs: Any,  # noqa: ARG002 callers may still pass the deprecated pickle_control_flow_result
     ) -> None:
         """Run the publish operation with WebSocket event emission enabled.
 
@@ -89,7 +89,6 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                 workflow_path=workflow_path,
                 publisher_name=publisher_name,
                 published_workflow_file_name=published_workflow_file_name,
-                **kwargs,
             )
         except Exception as e:
             msg = f"Unexpected error during publish: {e}"
@@ -104,18 +103,15 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
         workflow_path: str,
         publisher_name: str,
         published_workflow_file_name: str,
-        **kwargs: Any,
     ) -> None:
         """Internal async run method with event queue monitoring and websocket integration."""
         # Load the workflow into memory
         await self.aprepare_workflow_for_run(flow_input={}, workflow_path=workflow_path)
 
-        pickle_control_flow_result = kwargs.get("pickle_control_flow_result", False)
         publish_workflow_request = PublishWorkflowRequest(
             workflow_name=workflow_name,
             publisher_name=publisher_name,
             published_workflow_file_name=published_workflow_file_name,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
 
         # Send the publish request async (fire and forget pattern)
