@@ -29,6 +29,11 @@ class RezLibraryStatus:
     has_rez_package: bool = False
     rez_family: str | None = None
     rez_version: str | None = None
+    # The libraries_to_register entry this library came from (e.g. "REZ:<family>-<version>"),
+    # so a client can match config entries to libraries without parsing rez request syntax.
+    registered_path: str | None = None
+    # Why the library did not load (e.g. its rez environment does not resolve here), or None.
+    problem: str | None = None
 
 
 @dataclass

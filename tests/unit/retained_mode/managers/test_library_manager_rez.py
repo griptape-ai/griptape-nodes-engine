@@ -486,6 +486,8 @@ class TestLibraryDependencyFromRezStore:
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            # The library itself is a rez package; only its dependency's lookup is under test.
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
             patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=store_json) as lookup,
             patch.object(
                 mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema, "/mock.json")
@@ -733,3 +735,59 @@ class TestCheckRezLibraryEnvironments:
         ):
             await engine.library_manager._check_rez_library_environments([LIBRARY_JSON])
         check.assert_not_called()
+
+
+class TestRezOnlyLibraries:
+    """With rez on, libraries come only from rez packages; rez and venv libraries are never mixed."""
+
+    def test_library_without_a_rez_package_is_refused(self, engine: Engine) -> None:
+        info = _library_info(library_path="/libs/plain/griptape_nodes_library.json")
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=False),
+        ):
+            failure = engine.library_manager._rez_only_failure(info)
+
+        assert isinstance(failure, RegisterLibraryFromFileResultFailure)
+        assert "rez is active, so libraries come only from rez packages" in str(failure.result_details)
+        assert info.fitness == LibraryManager.LibraryFitness.UNUSABLE
+        assert info.lifecycle_state == LibraryManager.LibraryLifecycleState.FAILURE
+        assert [type(problem).__name__ for problem in info.problems] == ["RezEnvironmentProblem"]
+
+    @pytest.mark.parametrize(
+        ("rez_enabled", "has_package", "path"),
+        [
+            (False, False, LIBRARY_JSON),
+            (True, True, LIBRARY_JSON),
+            (True, False, f"REZ:{FAMILY}"),
+        ],
+    )
+    def test_rez_packages_and_rez_off_are_allowed(
+        self, engine: Engine, *, rez_enabled: bool, has_package: bool, path: str
+    ) -> None:
+        info = _library_info(library_path=path)
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=rez_enabled),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=has_package),
+        ):
+            assert engine.library_manager._rez_only_failure(info) is None
+        assert info.fitness == LibraryManager.LibraryFitness.GOOD
+
+    @pytest.mark.asyncio
+    async def test_dependency_install_never_builds_a_venv_while_rez_is_on(self, engine: Engine) -> None:
+        schema = _schema_with_dependencies(["pillow"], [])
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=False),
+            patch.object(
+                engine.library_manager,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(schema),
+            ),
+        ):
+            result = await engine.library_manager.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path=LIBRARY_JSON)
+            )
+
+        assert isinstance(result, InstallLibraryDependenciesResultFailure)
+        assert "libraries come only from rez packages" in str(result.result_details)

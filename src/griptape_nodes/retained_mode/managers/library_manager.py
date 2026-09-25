@@ -2971,6 +2971,13 @@ class LibraryManager(EngineScoped):
                     # still reports WORKER_DELEGATED and completes through LOADED, so the library is
                     # registered for the editor and for workflow loading.
                     delegated_to_worker = library_info.requires_worker and not self._is_worker
+
+                    # With rez on, libraries come only from rez packages: one without a package
+                    # would need a venv, and rez and venv libraries are never mixed.
+                    rez_only_failure = self._rez_only_failure(library_info)
+                    if rez_only_failure is not None:
+                        return rez_only_failure
+
                     install_result = await self.install_library_dependencies_request(
                         InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
                     )
@@ -3591,6 +3598,22 @@ class LibraryManager(EngineScoped):
         if is_rez_library_path(library_file_path):
             return True
         return is_rez_enabled() and is_library_rez_package_available(Path(library_file_path))
+
+    def _rez_only_failure(
+        self, library_info: LibraryManager.LibraryInfo
+    ) -> RegisterLibraryFromFileResultFailure | None:
+        """Refuse a library that is not a rez package while rez is on, before any venv is built."""
+        if not is_rez_enabled() or self._uses_rez_package(library_info.library_path):
+            return None
+        name = library_info.library_name or library_info.library_path
+        reason = _rez_only_reason(name)
+        library_info.problems.append(RezEnvironmentProblem(error_message=reason))
+        library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+        self._library_file_path_to_info[library_info.library_path] = library_info
+        details = f"Attempted to load Library '{name}'. Failed because {reason}"
+        logger.warning("[Rez] %s", details)
+        return RegisterLibraryFromFileResultFailure(result_details=details)
 
     async def _check_rez_library_environments(self, library_paths: list[str]) -> None:
         """Resolve every rez library's worker environment at once, before libraries load one by one.
@@ -7788,6 +7811,11 @@ class LibraryManager(EngineScoped):
                 result_details=f"Library '{library_name}' dependencies resolved from rez packages",
             )
 
+        if is_rez_enabled():
+            # Rez and venv libraries are never mixed: with rez on, no library venv is built.
+            details = f"Attempted to install dependencies for Library '{library_name}'. Failed because {_rez_only_reason(library_name)}"
+            return InstallLibraryDependenciesResultFailure(result_details=details)
+
         # A declared dependency's execution set belongs to THIS environment, so every decision
         # below reads the combined set. A library that declares no execution dependencies of its
         # own still needs one built when something it depends on does.
@@ -8428,3 +8456,11 @@ class LibraryManager(EngineScoped):
             ref=ref,
             result_details=details,
         )
+
+
+def _rez_only_reason(library_name: str) -> str:
+    """Why a library that is not a rez package cannot load while rez is on (written for artists)."""
+    return (
+        f"rez is active, so libraries come only from rez packages, and '{library_name}' has none. "
+        "Ask your rez administrator to build it (build-library-package) and register it as REZ:<package>."
+    )

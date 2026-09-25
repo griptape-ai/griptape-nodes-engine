@@ -18,6 +18,8 @@ from griptape_nodes.retained_mode.events.rez_events import (
     GetRezStatusResultSuccess,
     RezHealthStatus,
 )
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import RezEnvironmentProblem
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.rez_manager import RezManager
 from griptape_nodes.utils.rez_utils import RezBase, RezHealthResult, RezSetup
 
@@ -30,13 +32,24 @@ DURATION_MS = 120.0
 TIMESTAMP = "2026-09-24T12:00:00+00:00"
 
 
-def _library_info(name: str, path: str, *, has_rez_package: bool, version: str | None) -> SimpleNamespace:
+def _library_info(  # noqa: PLR0913
+    name: str,
+    path: str,
+    *,
+    has_rez_package: bool,
+    version: str | None,
+    fitness: LibraryManager.LibraryFitness = LibraryManager.LibraryFitness.GOOD,
+    problems: list | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         library_name=name,
         library_path=path,
         has_rez_package=has_rez_package,
         rez_family=name.lower().replace(" ", "_"),
         rez_version=version,
+        registered_path=f"REZ:{name.lower().replace(' ', '_')}" if has_rez_package else None,
+        fitness=fitness,
+        problems=problems or [],
     )
 
 
@@ -289,3 +302,26 @@ class TestTorchBuildInStatus:
         assert result.torch_backend == "cu128"
         notification = cast("RezStatusNotification", engine.event_manager.put_event.call_args.args[0].payload)
         assert notification.torch_backend == "cu128"
+
+
+class TestLibraryStatusDetails:
+    def test_reports_registered_path_and_why_a_library_did_not_load(
+        self, manager: RezManager, engine: MagicMock
+    ) -> None:
+        engine.library_manager._library_file_path_to_info["/store/diffusers.json"] = _library_info(
+            "Diffusers",
+            "/store/diffusers.json",
+            has_rez_package=True,
+            version="0.7.0",
+            fitness=LibraryManager.LibraryFitness.UNUSABLE,
+            problems=[RezEnvironmentProblem(error_message="no torch build fits this workstation")],
+        )
+        with patch(f"{REZ_MANAGER_MODULE}.rez_setup", return_value=_setup()):
+            result = manager.handle_get_rez_status(GetRezStatusRequest())
+
+        assert isinstance(result, GetRezStatusResultSuccess)
+        by_name = {status.library_name: status for status in result.library_statuses}
+        assert by_name["Lib A"].registered_path == "REZ:lib_a"
+        assert by_name["Lib A"].problem is None
+        assert by_name["Diffusers"].problem is not None
+        assert "no torch build fits this workstation" in by_name["Diffusers"].problem

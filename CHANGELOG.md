@@ -15,8 +15,9 @@ the engine's request API from working without edits. Migration steps live in
 - The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
   Pointing `GTN_REZ_BIN_PATH` at Rez's tools turns it on: libraries listed as `REZ:<package>` in
   `libraries_to_register` load from the packages Rez can resolve, each library's worker runs in its
-  own `rez env`, and the engine creates no library venvs and downloads no libraries. When Rez is
-  configured but cannot start, the engine says why at startup.
+  own `rez env`, and the engine creates no library venvs and downloads no libraries. A library
+  that is not a Rez package does not load while Rez is on, and says why: Rez and venv libraries
+  are never mixed. When Rez is configured but cannot start, the engine says why at startup.
 - The `build-engine-package`, `build-library-package`, and `write-launch-package` commands (in
   `griptape_nodes.cli.commands.rez`) build the engine, a node library, and the `griptape_launch`
   package as Rez packages. Builds from several platforms into one shared store add each

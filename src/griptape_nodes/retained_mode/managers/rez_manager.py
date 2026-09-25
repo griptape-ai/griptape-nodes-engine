@@ -17,6 +17,7 @@ from griptape_nodes.retained_mode.events.rez_events import (
     RezHealthStatus,
     RezLibraryStatus,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.utils.rez_utils import (
     ENV_CONFIG_FILE,
     check_rez_health_detailed,
@@ -122,6 +123,8 @@ class RezManager(EngineScoped):
                 has_rez_package=library_info.has_rez_package,
                 rez_family=library_info.rez_family,
                 rez_version=library_info.rez_version,
+                registered_path=library_info.registered_path,
+                problem=_load_problem(library_info),
             )
             for library_info in self.engine.library_manager._library_file_path_to_info.values()
             if library_info.library_name and library_info.library_path
@@ -194,3 +197,10 @@ def _path_or_none(path: Path | None) -> str | None:
 def _torch_backend_label() -> str | None:
     """The torch build this workstation uses, for the status: ``cu128``, or None when none applies."""
     return choose_torch_backend().backend
+
+
+def _load_problem(library_info: LibraryManager.LibraryInfo) -> str | None:
+    """Why a library did not load, as its problems describe it, or None when it loaded."""
+    if library_info.fitness != LibraryManager.LibraryFitness.UNUSABLE or not library_info.problems:
+        return None
+    return "; ".join(type(problem).collate_problems_for_display([problem]) for problem in library_info.problems)
