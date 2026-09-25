@@ -9,11 +9,13 @@ import pytest
 from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException, RequestPayload
+from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
 from griptape_nodes.serialization.converter import (
     _is_json_primitive_union,
     converter,
+    dump_json,
 )
 from griptape_nodes.serialization.values import Value, ValueEncodeError
 
@@ -253,6 +255,36 @@ class TestExceptionWireForm:
         assert str(rebuilt) == "legacy stringified error"
         assert rebuilt.original_type is None
         assert rebuilt.original_traceback is None
+
+
+class TestDeprecatedSafeUnstructure:
+    """Node libraries still import ``safe_unstructure`` from the old module path."""
+
+    def test_warns_and_unstructures(self) -> None:
+        with pytest.warns(DeprecationWarning, match="encode_value"):
+            assert safe_unstructure({"a": [1]}) == {"a": [1]}
+
+
+class TestDumpJson:
+    """Converter output with an object the converter passed through unchanged."""
+
+    def test_names_the_type_json_has_no_form_for(self) -> None:
+        with pytest.raises(ValueEncodeError, match="'_Handle' value has no plain-data form"):
+            dump_json({"handle": _Handle()})
+
+    def test_ignores_to_dict(self) -> None:
+        """Griptape's process-wide ``JSONEncoder.default`` would send this through its ``to_dict()``."""
+        with pytest.raises(ValueEncodeError, match="'_HasToDict' value has no plain-data form"):
+            dump_json({"thing": _HasToDict()})
+
+
+class _Handle:
+    pass
+
+
+class _HasToDict:
+    def to_dict(self) -> dict[str, Any]:
+        return {"lossy": True}
 
 
 class TestNamedTupleFields:
