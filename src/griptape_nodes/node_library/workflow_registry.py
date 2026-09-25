@@ -321,9 +321,9 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         disk; existence is verified at construction time); omit it for unsaved in-memory
         entries. Unsaved keys must start with `UNSAVED_KEY_PREFIX`.
 
-        `library_name` names the library contributing the entry, and is what removes it again
-        when that library unloads. Leave it None for the workspace scan and for anything the
-        user creates.
+        `library_name` names the library contributing the entry, and is what takes it out again
+        when that library unloads. Leave it None for the workspace scan and for anything the user
+        creates.
         """
         instance = cls()
         if registry_key in instance._workflows:
@@ -439,9 +439,8 @@ class WorkflowRegistry(metaclass=SingletonMeta):
     def remove_workflows_from_library(cls, library_name: str) -> RemovedWorkflows:
         """Remove every workflow `library_name` contributed and report what went.
 
-        The files come back alongside the keys because a caller holding per-file state about
-        these workflows, such as `WorkflowManager`'s dependency verdicts, has no way to find it
-        once the entries are gone.
+        The files come back alongside the keys because a caller holding per-file state, such as
+        `WorkflowManager`'s dependency verdicts, cannot find it once the entries are gone.
         """
         instance = cls()
         removed_keys = [key for key, workflow in instance._workflows.items() if workflow.library_name == library_name]
@@ -498,9 +497,9 @@ class Workflow:
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
 
     `library_name` is the library that contributed the entry, or None for the workspace scan and
-    anything the user creates. Recorded on write because the header cannot answer it: an author
-    sets those flags and they survive the file being copied out of a library, so a copy sitting in
-    the workspace still claims to be the library's.
+    anything the user creates. Recorded on write because the header cannot answer it: its flags
+    survive the file being copied out of the library, so a copy sitting in the workspace would
+    still claim to be the library's.
     """
 
     metadata: WorkflowMetadata

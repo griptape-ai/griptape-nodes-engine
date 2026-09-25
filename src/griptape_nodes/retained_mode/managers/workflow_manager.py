@@ -714,9 +714,8 @@ class WorkflowManager(EngineScoped):
 
         try:
             # Clear the workflows this scan found last time before re-scanning, so that a
-            # workspace change (e.g. project switch) takes effect cleanly. Entries from any
-            # other source stay put: this scan never claimed them, so it has nothing to say
-            # about when they go away.
+            # workspace change (e.g. project switch) takes effect cleanly. Entries from any other
+            # source stay put: this scan never claimed them.
             WorkflowRegistry.clear_workspace_workflows()
 
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
@@ -2372,10 +2371,8 @@ class WorkflowManager(EngineScoped):
 
         A workflow's dependency verdict is computed once, when its metadata is read, and cached
         until it is read again, so a library arriving or leaving does not on its own change what
-        the workflow list says about it. Install library A whose template references B, then
-        install B, and A's template stays flagged as needing something uninstalled; uninstall B
-        afterwards and it goes back to claiming it has everything. Called whenever a library's
-        presence or version changes, which is exactly when those verdicts stop being true.
+        the workflow list says about it. Called whenever a library's presence or version changes,
+        which is exactly when those verdicts stop being true.
 
         Only the workflows naming that library are re-read, found through the dependencies each
         verdict already records; a library changing does not re-parse every workflow on disk.
@@ -2387,16 +2384,15 @@ class WorkflowManager(EngineScoped):
         ]
         for workflow_path in stale_paths:
             # The keys are already absolute, and on_load_workflow_metadata_request joins its
-            # file_name onto the workspace, which leaves an absolute path alone. So the recompute
+            # file_name onto the workspace, which leaves an absolute path alone, so the recompute
             # lands back on the same key.
             await self.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=workflow_path))
 
     def forget_verdicts_for_workflows(self, workflow_file_paths: list[str]) -> None:
         """Drop the cached verdicts for workflows that are no longer registered.
 
-        Their entries went out of the registry, so nothing can ask about them again, and leaving
-        the rows behind means every later refresh re-reads files belonging to a library that is
-        gone.
+        Nothing can ask about them again, and leaving the rows behind means every later refresh
+        re-reads files belonging to a library that is gone.
         """
         for workflow_file_path in workflow_file_paths:
             self._workflow_file_path_to_info.pop(self._build_workflow_info_key(workflow_file_path), None)
@@ -3058,13 +3054,6 @@ class WorkflowManager(EngineScoped):
             )
 
         # Determine scenario and build target info.
-        #
-        # Saving a template copies it rather than writing back over it, which is what protects
-        # the original from being edited away. A workflow qualifies when its header marks it a
-        # template AND it does not belong to the user: either a library contributed it (the
-        # registry records the owner) or it is Griptape-provided. A workflow the user marked
-        # `is_template` in their own workspace is theirs to overwrite, and saving it behaves
-        # normally.
         destination: ProjectFileDestination | None = None
         file_path: Path | None = None
         if self._is_protected_template(target_workflow) or self._is_protected_template(current_workflow):
@@ -3139,11 +3128,10 @@ class WorkflowManager(EngineScoped):
         """True when saving this workflow has to copy it instead of overwriting it.
 
         A template belonging to someone other than the user: one a library contributed, or one
-        Griptape ships. Using the recorded library is what makes a library's template safe to
-        ship with nothing but `is_template` in its header -- the author does not have to know to
-        also set `is_griptape_provided` to stop the editor writing the user's changes into their
-        library directory. The copy this produces is registered by the workspace scan, so saving
-        it again overwrites it like any other workflow of the user's.
+        Griptape ships. Going by the recorded library is what lets an author ship a template
+        carrying nothing but `is_template`, without also knowing to set `is_griptape_provided` to
+        keep the editor out of their library directory. A workflow the user marked `is_template`
+        themselves is theirs to overwrite, as is the copy this produces.
         """
         if workflow is None:
             return False
@@ -7202,11 +7190,10 @@ class WorkflowManager(EngineScoped):
             workflows_to_register, library_name=library_name
         )
 
-        # A file whose key is already in the registry is dropped here rather than inside the loop
-        # below, so re-running a registration pass neither reports it as a failure nor counts it
-        # towards the progress total. Re-registering a library's workflows is a normal event (a
-        # library sync issues a second whole-set load), and a no-op has no business turning into
-        # a "failed" badge.
+        # Dropped here rather than inside the loop below, so a second pass over the same paths
+        # neither reports them as failures nor counts them towards the progress total.
+        # Re-registering a library's workflows is a normal event: a library sync issues a second
+        # whole-set load.
         already_registered = {
             workflow_file
             for workflow_file in all_workflow_files
@@ -7221,8 +7208,8 @@ class WorkflowManager(EngineScoped):
 
         # The WORKFLOWS phase of EngineInitializationProgress is the boot channel: the editor
         # reads any of it as the engine still initializing, which blanks the workflow picker and
-        # sets it re-polling the registry. A library registering mid-session must not look like
-        # that, and does not need to -- it announces itself with LibraryWorkflowsChanged instead.
+        # sets it re-polling the registry. A library registering mid-session announces itself with
+        # LibraryWorkflowsChanged instead.
         report_progress = library_name is None
 
         # Second pass: process each workflow file with progress events
@@ -7274,14 +7261,11 @@ class WorkflowManager(EngineScoped):
             The workflow files found, deduplicated.
         """
         # Registered-library roots (excluding sandbox) whose bundled workflow files the workspace
-        # scan must skip. Library-declared workflows (listed in griptape_nodes_library.json) only
-        # ever enter the registry through LibraryManager, which registers them under the library's
-        # name so they live and die with it. Letting this scan claim them too would register them a
-        # second time as the workspace's, and that copy would outlive the library. Sandbox libraries
-        # are intentionally left scannable so in-development workflows appear.
-        #
-        # None of that applies when a library is the one registering: its own files are exactly
-        # what it is asking for.
+        # scan must skip. Library-declared workflows enter the registry through LibraryManager,
+        # under the library's name so they live and die with it; a second entry from this scan would
+        # be the workspace's and would outlive the library. Sandbox libraries are intentionally left
+        # scannable so in-development workflows appear. None of it applies when a library is the one
+        # registering: its own files are exactly what it is asking for.
         library_exclusion_roots: list[Path] = []
         if library_name is None:
             for library_info in self.engine.library_manager._library_file_path_to_info.values():

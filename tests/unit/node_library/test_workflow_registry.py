@@ -262,10 +262,9 @@ class TestContributingLibraryIsRecordedOnWrite:
     """Which library contributed a workflow, recorded when it is registered.
 
     The registry holds populations with different lifetimes: what the workspace scan found, which
-    goes away when the workspace changes, and what a library contributed, which goes away when
-    that library unloads. Recording the library on write is what tells them apart -- the metadata
-    header cannot, because an author sets those flags and they survive the file being copied out
-    of the library into the workspace.
+    goes away when the workspace changes, and what a library contributed, which goes away when that
+    library unloads. Recording the library on write is what tells them apart -- the metadata header
+    cannot, because its flags survive the file being copied out of the library into the workspace.
     """
 
     def _register(self, registry_key: str, library_name: str | None = None) -> None:
@@ -306,10 +305,8 @@ class TestContributingLibraryIsRecordedOnWrite:
     def test_clear_workspace_workflows_ignores_the_template_flags(self) -> None:
         """A rescan must not decide ownership from the header.
 
-        A workflow flagged `is_griptape_provided` that no library contributed -- a template the
-        user copied into their workspace, most likely -- is the user's, and a rescan finds it
-        again. The old rule spared it, so the copy accumulated in the registry under a key the
-        rescan then registered a second time.
+        A workflow flagged `is_griptape_provided` that no library contributed -- a template the user
+        copied into their workspace, most likely -- is the user's, and a rescan finds it again.
         """
         griptape_provided_metadata = MagicMock()
         griptape_provided_metadata.is_griptape_provided = True

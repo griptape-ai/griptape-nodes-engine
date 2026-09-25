@@ -1,4 +1,10 @@
-"""Tests for registering and unregistering the workflows a library declares."""
+"""Tests for registering and unregistering the workflows a library declares.
+
+The interlock these tests keep circling: registering a workflow reads its metadata header through
+`WorkflowManager.on_load_workflow_metadata_request`, which waits on the libraries loading gate. So
+nothing may register while a whole-set load holds that gate closed -- it would hang the load that
+has to reopen it -- and the load registers everything in one pass on the way out instead.
+"""
 
 from __future__ import annotations
 
@@ -114,9 +120,9 @@ def _stub_library_lifecycle(
 ) -> Iterator[None]:
     """Patch out everything before the fitness match, so only what follows it is exercised.
 
-    There is no library on disk in these tests, so the lifecycle work cannot run. Pass
-    `register_one` to stand in for `register_workflows_for_library` and assert on whether the call
-    under test reaches it; leave it out to let the real registration run.
+    There is no library on disk in these tests. Pass `register_one` to stand in for
+    `register_workflows_for_library` and assert on whether the call under test reaches it; leave it
+    out to let the real registration run.
     """
     prerequisites = LibraryManager.RegisterLibraryPrerequisites(
         library_info=library_info, file_path=library_info.library_path
@@ -150,9 +156,9 @@ class TestCollectWorkflowFilesForLibrary:
     def test_leaves_sys_path_alone(self, engine: Engine, tmp_path: Path) -> None:
         """Loading the library already put its directory on `sys.path`.
 
-        Adding it again here would mean a second, undocumented owner of the process's import
-        path -- and every test pointing a library at a `tmp_path` pytest later deletes would
-        leave a dead directory behind to shadow module resolution.
+        Adding it again here would mean a second, undocumented owner of the process's import path, and
+        a library pointed at a `tmp_path` pytest later deletes would leave a dead directory shadowing
+        module resolution.
         """
         library_json = tmp_path / "griptape_nodes_library.json"
         sys_path = MagicMock()
@@ -238,10 +244,10 @@ class TestRegisterWorkflowsForLibrary:
     async def test_a_library_arriving_re_reads_the_verdicts_that_named_it(self, engine: Engine, tmp_path: Path) -> None:
         """A "library not installed" verdict is cached, and this arrival may be what was missing.
 
-        Install a library whose template references a second one, then install the second: without
-        this the first library's template stays flagged for the rest of the session. This library
-        declares no workflows of its own, because being the library someone else was waiting for
-        has nothing to do with shipping templates.
+        Install a library whose template references a second one, then install the second: without this
+        the first template stays flagged for the rest of the session. This library declares no workflows
+        of its own, because being the library someone else was waiting for has nothing to do with
+        shipping templates.
         """
         refresh = AsyncMock(return_value=None)
 
@@ -284,10 +290,7 @@ class TestRegisterWorkflowsForLibrary:
     async def test_refuses_while_the_loading_gate_is_closed(self, engine: Engine, tmp_path: Path) -> None:
         """The interlock: nothing may register through a gate a whole-set load is holding closed.
 
-        Registering reads each workflow's metadata header through
-        `WorkflowManager.on_load_workflow_metadata_request`, which waits on that same gate. So a
-        library arriving mid-load and registering here would hang the load that closed it, and the
-        load is what reopens it. The pass afterwards registers whatever arrived.
+        The load is what reopens the gate, and the pass that follows it registers whatever arrived.
         """
         library_manager = engine.library_manager
         library_manager._close_libraries_loading_gate()
@@ -445,9 +448,9 @@ class TestUnregisterWorkflowsForLibrary:
     def test_leaves_alone_a_library_this_engine_never_registered(self, engine: Engine) -> None:
         """The mirror of the guard on the register side, and for the same reason.
 
-        `WorkflowRegistry` is process-global and a library's entries are identified by its name
-        alone, so in a process running more than one Engine an unguarded delete would take the
-        other engine's entries for a library this one has never seen.
+        `WorkflowRegistry` is process-global and a library's entries are identified by its name alone,
+        so in a process running more than one Engine an unguarded delete would take the other engine's
+        entries.
         """
         event_manager = MagicMock()
 
@@ -483,8 +486,8 @@ class TestUnregisterWorkflowsForLibrary:
     def test_forgets_the_verdicts_of_the_workflows_it_took_out(self, engine: Engine) -> None:
         """Their entries are gone, so nothing can ask about them and nothing would clean them up.
 
-        The verdicts are kept per file, and the file paths only reach here through the removal:
-        once the entries are out of the registry there is no way back from a library name to them.
+        The verdicts are kept per file, and the file paths only reach here through the removal: from a
+        library name alone there is no way back to them.
         """
         forget = MagicMock(return_value=None)
 
@@ -518,10 +521,10 @@ class TestUnregisterWorkflowsForLibrary:
 
     @pytest.mark.asyncio
     async def test_unloading_mid_load_leaves_the_verdicts_to_the_pass_after_the_load(self, engine: Engine) -> None:
-        """Re-reading a verdict waits on the libraries gate, and a whole-set load holds it closed.
+        """A whole-set load unloads every library while holding the gate a verdict read waits on.
 
-        A load unloads every library before registering it again, so refreshing here would wait on
-        the load that is doing the unloading. The pass that follows the load settles them instead.
+        So refreshing here would wait on the load that is doing the unloading. The pass that follows it
+        settles them instead.
         """
         library_manager = engine.library_manager
         refresh = AsyncMock(return_value=None)
@@ -546,8 +549,7 @@ class TestRegisteringALibraryRegistersItsWorkflows:
     """Every library that newly arrives goes through one door, and that door registers.
 
     No caller has to know whether it is bringing in one library or one of a set: a library arriving
-    mid-batch finds the loading gate closed and leaves its workflows to the pass that follows the
-    batch. See `TestRegisterWorkflowsForLibrary.test_refuses_while_the_loading_gate_is_closed`.
+    mid-batch finds the loading gate closed and leaves its workflows to the pass that follows.
     """
 
     @pytest.mark.parametrize(
@@ -570,10 +572,10 @@ class TestRegisteringALibraryRegistersItsWorkflows:
     ) -> None:
         """Not just the healthy verdict.
 
-        `FLAWED` means some of the library's nodes failed to load and `NOT_EVALUATED` means node
-        loading is deferred to a worker. Either way the library is registered and its templates
-        belong in the picker: registering one parses the file's TOML header and never imports a
-        node class, so there is nothing to wait for. `UNUSABLE` is the one that gets no further.
+        `FLAWED` means some of the library's nodes failed to load and `NOT_EVALUATED` means node loading
+        is deferred to a worker. Either way the library is registered and its templates belong in the
+        picker: registering one parses the file's TOML header and never imports a node class. `UNUSABLE`
+        is the one that gets no further.
         """
         library_manager = engine.library_manager
         library_info = _library_info(tmp_path / "lib.json")
@@ -628,13 +630,11 @@ class TestRegisteringALibraryRegistersItsWorkflows:
 class TestTheWholeSetRegistersAfterTheLoad:
     """A load of every library registers their workflows in one pass once the set is complete.
 
-    Two reasons it cannot happen per library on the way through. A workflow resolves its
-    `node_libraries_referenced` against `LibraryRegistry` as it stands when it registers, so one
-    naming a sibling still to load would be reported as depending on a library that is not
-    installed when it is merely not installed *yet* -- and nothing recomputes that, because the
-    workspace rescan skips registered-library roots. And registering reads each workflow's
-    metadata header through `WorkflowManager.on_load_workflow_metadata_request`, which waits on
-    the loading gate the load itself holds closed.
+    Two reasons it cannot happen per library on the way through. The interlock above, and that a
+    workflow resolves its `node_libraries_referenced` against `LibraryRegistry` as it stands when it
+    registers -- so one naming a sibling still to load would be recorded as depending on a library
+    that is merely not installed *yet*, and nothing re-reads that until the sibling's presence
+    changes again.
     """
 
     @pytest.mark.asyncio
@@ -675,9 +675,9 @@ class TestTheWholeSetRegistersAfterTheLoad:
     async def test_the_real_pass_does_not_hang_behind_the_gate(self, engine: Engine, tmp_path: Path) -> None:
         """Guards the hazard, not just the ordering the test above reads off.
 
-        Nothing runs the unmocked pass in the tests above, so move it back inside the gate and they
-        keep passing. Here the real `register_workflows_for_all_libraries` runs against a library
-        declaring a real workflow file, so that move shows up as this timing out instead.
+        Nothing runs the unmocked pass in the tests above, so move it back inside the gate and they keep
+        passing. Here the real `register_workflows_for_all_libraries` runs against a library declaring a
+        real workflow file, so that move shows up as this timing out instead.
         """
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
@@ -709,9 +709,9 @@ class TestTheWholeSetRegistersAfterTheLoad:
     async def test_an_early_exit_still_opens_the_gate_and_still_registers(self, engine: Engine) -> None:
         """The load returns early when it finds nothing to load, and must not leave the gate shut.
 
-        A closed gate outlives the load: `on_load_workflow_metadata_request` waits on it, so every
-        later attempt to open a workflow would hang rather than merely find the list short. The
-        pass runs either way; with nothing loaded it has nothing to register.
+        A closed gate outlives the load, so every later attempt to open a workflow would hang rather
+        than merely find the list short. The pass runs either way; with nothing loaded it has nothing to
+        register.
         """
         library_manager = engine.library_manager
         register_all = AsyncMock(return_value=None)
@@ -807,8 +807,7 @@ class TestTheWholeSetRegistersAfterTheLoad:
 
         The loop takes the same door a mid-session arrival does, so the gate it holds closed is the
         whole of what defers registration. Open the gate around the loop and every library would
-        register partway through the load -- against a half-loaded registry, and reading a workflow
-        header would suspend on the gate the load itself has to reopen.
+        register partway through the load, against a half-loaded registry.
         """
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
@@ -849,10 +848,9 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
 
     Every other library is already loaded on these paths, so a workflow's
     `node_libraries_referenced` resolves against the full set and the gate is open. Two handlers
-    bring one library in mid-session and both reach it the same way: they dispatch
-    `RegisterLibraryFromFileRequest`, and registering the templates is what that handler does. So
-    neither registers anything itself. `TestTheConcurrentSyncBatch` below covers the one caller that
-    drives these paths several at a time.
+    bring one library in mid-session and both dispatch `RegisterLibraryFromFileRequest`, so neither
+    registers anything itself. `TestTheConcurrentSyncBatch` below covers the one caller that drives
+    these paths several at a time.
 
     These tests run the real handler behind the mocked dispatch: asserting only that some request
     went out would pass just as happily if it never reached the registration.
@@ -945,14 +943,13 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
     async def test_an_arrival_mid_load_does_not_hang_the_load(self, engine: Engine, tmp_path: Path) -> None:
         """An arrival nothing asked for, run for real against a closed gate.
 
-        A declared library dependency that is missing from disk is downloaded and registered from
-        inside another library's lifecycle, so it reaches this handler even when that lifecycle is
-        running inside a whole-set load. Registering here reads the workflow's metadata header
-        through `on_load_workflow_metadata_request`, which waits on the gate the load is holding
-        closed, so without the interlock this hangs for the life of the process rather than failing.
+        A declared library dependency that is missing from disk is downloaded and registered from inside
+        another library's lifecycle, so it reaches this handler even when that lifecycle is running
+        inside a whole-set load. Without the interlock this hangs for the life of the process rather
+        than failing.
 
-        The real registration path runs, against a real workflow file: a simulated gate wait would
-        keep passing if registering ever stopped going through the gated handler.
+        The real registration path runs, against a real workflow file: a simulated gate wait would keep
+        passing if registering ever stopped going through the gated handler.
         """
         library_manager = engine.library_manager
         library_json = tmp_path / "griptape_nodes_library.json"
@@ -983,20 +980,18 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
 class TestTheConcurrentSyncBatch:
     """Sync is the one batch that leaves the gate open: it drives `UpdateLibraryRequest`.
 
-    Each update reloads one library and registers its workflows itself, which is right for a
-    library arriving alone and wrong for several at once -- so this batch cannot use the gate to
-    hold them back (it would deadlock), and re-reads the verdicts afterwards instead.
+    Each update reloads one library and registers its workflows itself, which is right for a library
+    arriving alone and wrong for several at once -- so this batch cannot hold them back with the
+    gate, and re-reads the verdicts afterwards instead.
     """
 
     @pytest.mark.asyncio
     async def test_sync_leaves_the_gate_open_for_the_updates_it_drives(self, engine: Engine) -> None:
         """Sync drives `UpdateLibraryRequest` per library, and each one registers its own.
 
-        So the gate has to stay open across the whole sync. Close it around the update pass and
-        every update inside would suspend on the event only that pass can set -- registering reads
-        workflow metadata through `on_load_workflow_metadata_request`, which waits on it. The check
-        pass has the same requirement for its own reason: `check_library_update_request` waits on
-        the gate too.
+        So the gate has to stay open across the whole sync: close it around the update pass and every
+        update inside would suspend on the event only that pass can set. The check pass has the same
+        requirement for its own reason -- `check_library_update_request` waits on the gate too.
         """
         library_manager = engine.library_manager
         observed = {}
@@ -1192,10 +1187,9 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
     ) -> None:
         """Through the real `refresh_workflow_registry`, with the real clear at the top of it.
 
-        The workflow's header sets `is_template` but not `is_griptape_provided`, so nothing in
-        the file spares it. It survives purely because the registry knows the library contributed
-        it -- which is the point: a workflow follows the library that ships it rather than
-        depending on a flag its author may have omitted.
+        The workflow's header sets `is_template` but not `is_griptape_provided`, so nothing in the file
+        spares it. It survives because the registry knows the library contributed it: a workflow follows
+        the library that ships it rather than a flag its author may have omitted.
         """
         library_manager = engine.library_manager
         workflow_manager = engine.workflow_manager
@@ -1231,10 +1225,10 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
     ) -> None:
         """Libraries live under the workspace by default, so the scan walks straight into them.
 
-        Claiming an installed library's files would register them a second time as the workspace's,
-        and that copy would outlive the library. Sandbox libraries are the deliberate exception:
-        they are the directory an author is actively editing, so their workflows have to appear
-        from the scan rather than waiting on a library reload to publish them.
+        Claiming an installed library's files would register them a second time as the workspace's, and
+        that copy would outlive the library. Sandbox libraries are the deliberate exception: they are
+        the directory an author is actively editing, so their workflows have to appear without waiting
+        on a library reload.
         """
         workflow_manager = engine.workflow_manager
         config_manager = engine.config_manager
@@ -1272,11 +1266,9 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
     ) -> None:
         """Skipping library roots is the workspace scan's business, not every caller's.
 
-        A library hands over explicit file paths today, and those never reach the directory walk
-        that consults the exclusion roots. Handing over its own directory is the case that would:
-        the library's own root is an exclusion candidate, so without the check on the contributing
-        library it would exclude its own files and registering its workflows would silently do
-        nothing.
+        A library hands over explicit file paths today, and those never reach the directory walk that
+        consults the exclusion roots. Handing over its own directory is the case that would: without the
+        check on the contributing library it would exclude its own files and register nothing.
         """
         workflow_manager = engine.workflow_manager
         config_manager = engine.config_manager

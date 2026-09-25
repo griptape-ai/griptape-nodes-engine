@@ -309,13 +309,12 @@ class LibraryWorkflowsChanged(AppPayload):
     """Notification that a library's workflows entered or left the registry.
 
     Emitted when a library that declares `workflows` in its `griptape_nodes_library.json`
-    registers them (engine start, library install, library reload), and again when it unloads.
-    Gives clients showing the workflow list something to refetch on, rather than only learning
-    about the change the next time they happen to ask.
+    registers them (engine start, library install, library reload), and again when it unloads, so
+    a client showing the workflow list has something to refetch on.
 
-    Enqueued with `put_event`, like `EngineReadyEvent`, so it reaches the application layer
-    and the GUI. In-process Python subscribers registered via `add_listener_to_app_event` do
-    not see it -- those only fire for events passed to `broadcast_app_event`.
+    Enqueued with `put_event`, like `EngineReadyEvent`, so it reaches the application layer and
+    the GUI. In-process subscribers registered via `add_listener_to_app_event` do not see it --
+    those fire only for events passed to `broadcast_app_event`.
 
     Args:
         library_name: The library whose workflows changed.

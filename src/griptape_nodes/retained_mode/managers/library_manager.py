@@ -2433,10 +2433,7 @@ class LibraryManager(EngineScoped):
         Supports loading by library_name OR file_path (mutually exclusive), with optional
         discovery integration. Creates LibraryInfo if not already tracked.
 
-        A library that newly arrived also gets its declared workflow templates registered. That
-        step defers itself while a whole-set load holds the libraries gate closed, so the batch
-        loops need no bookkeeping of their own -- see `register_workflows_for_library` and
-        `_batch_library_load`.
+        A library that newly arrived also gets its declared workflow templates registered.
 
         Args:
             request: RegisterLibraryFromFileRequest containing library_name OR file_path,
@@ -2452,10 +2449,9 @@ class LibraryManager(EngineScoped):
         if isinstance(prereq_result, RegisterLibraryFromFileResultFailure):
             return prereq_result
 
-        # SUCCESS CHECK (library already loaded). Nothing arrived, so there is nothing new to
-        # register. Returning here rather than relying on registration being idempotent: opening
-        # a workflow re-requests every library it references, and each pass would otherwise
-        # re-read the header of every template on disk.
+        # SUCCESS CHECK (library already loaded). Returning here rather than leaning on
+        # registration being idempotent: opening a workflow re-requests every library it
+        # references, and each pass would re-read the header of every template on disk.
         if isinstance(prereq_result, RegisterLibraryFromFileResultSuccess):
             return prereq_result
 
@@ -3604,8 +3600,6 @@ class LibraryManager(EngineScoped):
             self._libraries_reloaded_after_import.add(request.library_name)
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
-        # Take the library's workflows back out of the WorkflowRegistry so an unloaded library
-        # stops offering them.
         self._unregister_workflows_for_library(request.library_name)
 
         # Workflows that stay behind and name this library recorded it as installed, and that
@@ -4272,18 +4266,17 @@ class LibraryManager(EngineScoped):
     async def _batch_library_load(self) -> AsyncIterator[None]:
         """Hold the libraries gate closed for a whole-set load, then register what the set ships.
 
-        Closing the gate is what makes each library's own registration defer: workflow
-        registration reads every template's metadata header through
-        `WorkflowManager.on_load_workflow_metadata_request`, which waits on this gate, so a
-        library registering its templates mid-load would hang the load that closed it. Deferring
-        is also what a whole-set load wants regardless -- a workflow resolves its
+        Closing the gate is what makes each library's own registration defer: registration reads
+        every template's metadata header through `WorkflowManager.on_load_workflow_metadata_request`,
+        which waits on this gate, so registering mid-load would hang the load that closed it.
+        Deferring is also what a whole-set load wants regardless -- a workflow resolves its
         `node_libraries_referenced` against the registry as it stands, so a template naming a
         sibling still to load would be recorded as depending on something uninstalled.
 
-        The pass on exit is therefore the one place a batch's templates land, and pairing it with
-        the gate here is what keeps every batch loop from having to remember to run it. It runs
-        after the gate reopens, because it needs the gated API the body could not use -- as does
-        settling the verdicts of any library the body unloaded and did not bring back.
+        The pass on exit is the one place a batch's templates land, which saves every batch loop
+        from remembering to run it. It runs after the gate reopens because it needs the gated API
+        the body could not use, as does settling the verdicts of any library the body unloaded and
+        did not bring back.
         """
         libraries_before = set(LibraryRegistry.list_libraries())
         self._close_libraries_loading_gate()
@@ -4940,22 +4933,17 @@ class LibraryManager(EngineScoped):
     async def register_workflows_for_all_libraries(self) -> None:
         """Register the workflows declared by every library this engine has loaded.
 
-        The post-library-load pass. Runs once a load of the whole set has finished and reopened
-        the loading gate, so every workflow resolves the libraries it references against the
-        complete set. A library that arrives on its own mid-session is registered by the handler
-        that brought it in, where the rest are already loaded and this pass is not needed.
+        Runs once a load of the whole set has finished and reopened the loading gate, so every
+        workflow resolves the libraries it references against the complete set. A library that
+        arrives on its own mid-session is registered by the handler that brought it in.
 
-        Idempotent: a workflow whose key is already in the registry is skipped, so running this
-        again leaves the same entries rather than a second copy of each.
+        Idempotent: a workflow whose key is already in the registry is skipped.
         """
         for library_name in LibraryRegistry.list_libraries():
             await self.register_workflows_for_registered_library(library_name)
 
     async def register_workflows_for_registered_library(self, library_name: str) -> None:
         """Register one already-registered library's workflows, resolving it by name.
-
-        What `register_library_from_file_request` calls for a library that has just arrived on its
-        own, and what the whole-set pass above calls per library once its set is complete.
 
         Resolved through the shared resolver rather than by scanning the info dict, so a
         duplicately-registered library contributes its workflows once, from whichever on-disk
@@ -4976,9 +4964,8 @@ class LibraryManager(EngineScoped):
         A registry key is workspace-relative while the file sits inside the workspace and
         absolute otherwise, and libraries live under the workspace by default. So when the
         workspace moves, a library's entries keep their old spelling and resolve against the
-        new workspace, pointing at nothing. A library reload rebuilds them as a side effect of
-        unloading and loading each library, but a workspace-only project switch does not reload
-        libraries, which is the case this covers.
+        new workspace, pointing at nothing. A library reload rebuilds them on its way through;
+        a workspace-only project switch does not, which is the case this covers.
 
         Removal first, then registration: registering alone skips a key already in the registry
         and adds the newly-derived one beside it, leaving the workflow registered twice with the
@@ -4997,19 +4984,16 @@ class LibraryManager(EngineScoped):
         entries, and a workspace rescan -- which clears everything it found itself -- leaves
         them alone.
 
-        Workers are skipped: they exist to import node classes on the orchestrator's behalf
-        and never serve workflow lists, so registering workflows there is pure overhead.
+        Workers are skipped: they import node classes for the orchestrator and never serve
+        workflow lists.
         """
         library_name = library_info.library_name
         if library_name is None or self._is_worker:
             return
 
         if not self._libraries_loading_complete.is_set():
-            # A whole-set load is in flight and holding this gate closed. Registering reads each
-            # workflow's metadata header through `WorkflowManager.on_load_workflow_metadata_request`,
-            # which waits on the same gate, so registering now would hang the load that closed it.
-            # `_batch_library_load` runs this pass for every library once the gate reopens, so a
-            # library arriving mid-batch is not lost by returning here.
+            # Registering reads headers from behind this gate, so it would hang the load holding
+            # it closed. `_batch_library_load` runs this pass for every library once it reopens.
             logger.debug(
                 "Libraries are still loading; leaving library '%s' workflows to the pass that follows the load.",
                 library_name,
@@ -5024,9 +5008,8 @@ class LibraryManager(EngineScoped):
             )
             registered_names = registration.succeeded
 
-        # A workflow registered while a library it names was not installed recorded that verdict,
-        # and it stays recorded until the header is read again. This library arriving may be what
-        # it was waiting for -- which holds whether or not this library ships templates itself.
+        # This library arriving may be what a cached "library not installed" verdict was waiting
+        # for, which holds whether or not this library ships templates itself.
         await self.engine.workflow_manager.refresh_verdicts_for_library(library_name)
 
         if not registered_names:
@@ -5068,17 +5051,12 @@ class LibraryManager(EngineScoped):
     def _unregister_workflows_for_library(self, library_name: str) -> None:
         """Take a library's workflows out of the WorkflowRegistry, and announce their removal.
 
-        Nothing else does this: the workspace rescan deliberately spares library-owned
-        entries, so without this an install -> uninstall -> reinstall cycle accumulates stale
-        entries and an unloaded library keeps offering workflows for the life of the process.
+        Nothing else does: the workspace rescan deliberately spares library-owned entries.
 
-        Guarded on this engine knowing the library, the same condition
-        `register_workflows_for_all_libraries` registers under. `WorkflowRegistry` is
-        process-global and a library's entries are identified by its name alone, so in a process
-        running more than one Engine an unguarded delete would take the other engine's entries
-        for a library this one never registered -- the exact case the register side defends
-        against. Called before the unload path drops the library's info, so the lookup still
-        resolves for a library this engine is unloading.
+        Guarded on this engine knowing the library -- see
+        `register_workflows_for_registered_library` -- because an unguarded delete by name would
+        take another engine's entries out of the process-global registry. Called before the unload
+        path drops the library's info, so the lookup still resolves for a library on its way out.
         """
         if self.get_library_info_by_library_name(library_name) is None:
             logger.debug("Library '%s' is not known to this engine; leaving its workflows alone.", library_name)
@@ -5088,8 +5066,8 @@ class LibraryManager(EngineScoped):
         if not removed.registry_keys:
             return
 
-        # Nothing can ask about these workflows now, so their dependency verdicts are dead weight
-        # that every later refresh would still re-read from a library that is gone.
+        # Nothing can ask about these workflows now, and every later refresh would still re-read
+        # them from a library that is gone.
         self.engine.workflow_manager.forget_verdicts_for_workflows(removed.file_paths)
 
         self.engine.event_manager.put_event(
@@ -5105,9 +5083,8 @@ class LibraryManager(EngineScoped):
     async def _refresh_workflow_verdicts_for_library(self, library_name: str) -> None:
         """Re-read the verdicts of workflows naming this library, or leave them to the batch pass.
 
-        Re-reading a verdict waits on the libraries gate, and a whole-set load unloads every
-        library while holding that gate closed, so refreshing there would hang the load that
-        closed it. `_batch_library_load` settles whatever did not come back.
+        A whole-set load unloads every library while holding the gate a verdict read waits on, so
+        refreshing there would hang it. `_batch_library_load` settles whatever did not come back.
         """
         if not self._libraries_loading_complete.is_set():
             logger.debug(
@@ -8252,12 +8229,10 @@ class LibraryManager(EngineScoped):
                 update_result.new_version,
             )
 
-        # The updates above run concurrently, and each one unloads its library and registers it
-        # again. A workflow registering mid-batch resolves its `node_libraries_referenced` against
-        # a registry that is missing whichever siblings sit between their own unload and reload, so
-        # it records a dependency on a library that is merely not installed for another moment, or
-        # on the version it is replacing. Every sibling is settled by now, so re-reading the
-        # verdicts that name one of them settles those too.
+        # The updates above run concurrently, and each unloads its library and registers it again,
+        # so a workflow registering mid-batch can record a dependency on a sibling that is merely
+        # between its own unload and reload, or on the version it is replacing. Every sibling is
+        # settled by now.
         for touched_library_name in update_summary:
             await self.engine.workflow_manager.refresh_verdicts_for_library(touched_library_name)
 

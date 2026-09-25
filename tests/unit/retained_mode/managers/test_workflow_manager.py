@@ -1807,8 +1807,8 @@ class TestWorkflowManager:
     ) -> None:
         """An unloaded library's templates leave the registry, so nothing can ask about them again.
 
-        Their verdicts would otherwise sit in the cache for the life of the process, and every
-        later refresh would re-read files belonging to a library that is gone.
+        Their verdicts would otherwise sit in the cache for the life of the process, and every later
+        refresh would re-read files from a library that is gone.
         """
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
@@ -5686,9 +5686,9 @@ class TestProtectedTemplateOwnership:
     """Which templates saving copies instead of overwriting.
 
     A template that belongs to someone other than the user: one a library contributed, or one
-    Griptape ships. Recording the contributing library is what lets a library ship a template with
-    nothing but ``is_template`` in its header -- before this, an author who did not also know to
-    set ``is_griptape_provided`` got the user's edits written into their library directory.
+    Griptape ships. Recording the contributing library is what lets a library ship a template
+    carrying nothing but ``is_template``, without its author also knowing to set
+    ``is_griptape_provided``.
     """
 
     @staticmethod
@@ -5727,8 +5727,8 @@ class TestProtectedTemplateOwnership:
     def test_the_users_own_template_is_not_protected(self, engine: Engine) -> None:
         """A workflow the user marked ``is_template`` in their own workspace is theirs to overwrite.
 
-        Which is also what the copy a save produces looks like: the workspace scan registers it
-        with no library, so saving it again overwrites it rather than making a third copy.
+        Which is also what the copy a save produces looks like: the workspace scan registers it with no
+        library, so saving it again overwrites it rather than making a third copy.
         """
         workflow = self._workflow(is_template=True)
 
@@ -5737,8 +5737,8 @@ class TestProtectedTemplateOwnership:
     def test_a_library_workflow_that_is_not_a_template_is_not_protected(self, engine: Engine) -> None:
         """Coming from a library does not protect anything -- the header still has to say template.
 
-        A library can declare a workflow that is not a template, and saving that keeps the
-        overwrite-in-place behaviour it had before the contributing library was recorded at all.
+        A library can declare a workflow that is not a template, and saving that overwrites it in place
+        like any other.
         """
         workflow = self._workflow(library_name="MyLib")
 
