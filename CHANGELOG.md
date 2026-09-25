@@ -17,8 +17,21 @@ the engine's request API from working without edits. Migration steps live in
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
   that can cross.
 
+### Deprecated
+
+- `pickle_control_flow_result` on `StartFlowRequest`, `StartFlowFromNodeRequest`,
+  `StartLocalSubflowRequest`, `SaveWorkflowRequest`, `SaveWorkflowFileFromSerializedFlowRequest`,
+  `PublishWorkflowRequest`, and the workflow executors, and the `--pickle-control-flow-result` CLI
+  flag, have no effect. Flow results always travel as plain data. They will be removed in a later
+  release.
+
 ### Fixed
 
+- Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
+  the same types, instead of as plain dicts.
+- A loop or subflow run in a separate process no longer hands back one parameter's value in place
+  of another's when one is `True` and the other is `1`.
+  [#5435](https://github.com/griptape-ai/griptape-nodes-engine/issues/5435)
 - Outputs of a node in a library running in its own process reach downstream nodes as the same
   types, instead of as plain dicts. Artifact classes a library defines itself, such as
   `VideoUrlArtifact`, arrive as that class instead of griptape's class of the same name. A value

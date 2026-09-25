@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class WorkflowExecutor:
-    def __init__(self, *, pickle_control_flow_result: bool = False) -> None:
+    def __init__(self, *, pickle_control_flow_result: bool = False) -> None:  # noqa: ARG002
+        """``pickle_control_flow_result`` is deprecated and ignored; saved workflow files still pass it."""
         self.output: dict | None = None
-        self._pickle_control_flow_result = pickle_control_flow_result
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -59,9 +59,8 @@ class WorkflowExecutor:
         whose constructor cannot accept a particular flag should compose the
         smaller `_add_*_argument` helpers directly instead of calling super.
 
-        `pickle_control_flow_result_default` is forwarded to
-        `_add_pickle_control_flow_result_argument`; it lets generated workflow
-        files seed argparse's default with the save-time choice.
+        `pickle_control_flow_result_default` is deprecated and ignored; workflow files saved by
+        earlier engines still pass it.
         """
         cls._add_storage_backend_argument(parser)
         cls._add_project_file_path_argument(parser)
@@ -86,15 +85,12 @@ class WorkflowExecutor:
 
     @classmethod
     def _add_pickle_control_flow_result_argument(cls, parser: ArgumentParser, *, default: bool = False) -> None:
-        # `default` lets callers (e.g. the generated workflow file's __main__)
-        # override the built-in False default with the save-time pickle setting,
-        # so users running the workflow from the CLI get the same default the
-        # workflow was published with.
+        # Kept so command lines that still pass the flag keep parsing.
         parser.add_argument(
             "--pickle-control-flow-result",
             action="store_true",
             default=default,
-            help="Pickle the control flow result (used by subflow/private-execution callers)",
+            help="Deprecated and ignored. Flow results always travel as plain data.",
         )
 
     @classmethod
@@ -121,5 +117,4 @@ class WorkflowExecutor:
         return {
             "storage_backend": StorageBackend(args.storage_backend),
             "project_file_path": Path(args.project_file_path) if args.project_file_path is not None else None,
-            "pickle_control_flow_result": args.pickle_control_flow_result,
         }

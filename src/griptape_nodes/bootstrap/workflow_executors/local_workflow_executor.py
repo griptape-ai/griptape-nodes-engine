@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
@@ -65,9 +66,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         skip_library_loading: bool = False,
         workflows_to_register: list[str] | None = None,
         save_on_failure_path: str | None = None,
-        pickle_control_flow_result: bool = False,
+        pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
     ):
-        super().__init__(pickle_control_flow_result=pickle_control_flow_result)
+        super().__init__()
         self._set_storage_backend(storage_backend=storage_backend)
         self._project_file_path = project_file_path
         self._skip_library_loading = skip_library_loading
@@ -162,9 +163,11 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                 param_map: dict | None = flow_input.get(node_name)
                 if param_map is not None:
                     for parameter_name, parameter_value in param_map.items():
+                        # Decoded here, not where the input arrives, so classes from the flow's
+                        # libraries resolve: those libraries are registered by now.
                         set_parameter_value_request = SetParameterValueRequest(
                             parameter_name=parameter_name,
-                            value=parameter_value,
+                            value=decode_value(parameter_value),
                             node_name=node_name,
                         )
                         set_parameter_value_result = await GriptapeNodes.ahandle_request(set_parameter_value_request)
@@ -384,7 +387,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         flow_input: Any,
         storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
-        pickle_control_flow_result: bool | None = None,
+        pickle_control_flow_result: bool | None = None,  # noqa: ARG002 deprecated and ignored
         **kwargs: Any,
     ) -> None:
         """Executes a local workflow.
@@ -398,8 +401,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             storage_backend: Accepted for compatibility with the base-class run path,
                 but ignored here: the storage backend is applied once at construction
                 via `_set_storage_backend`. Passing it to the run path has no effect.
-            pickle_control_flow_result: Per-call override for the executor's
-                save-time default. None means "use the instance default".
+            pickle_control_flow_result: Deprecated and ignored.
 
         Returns:
             None
@@ -410,10 +412,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         )
 
         # Now send the run command to actually execute it
-        effective_pickle = (
-            pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
-        )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(flow_name=flow_name)
         start_flow_result = await GriptapeNodes.ahandle_request(start_flow_request)
 
         if start_flow_result.failed():

@@ -260,7 +260,6 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return save_result.file_path
