@@ -29,6 +29,7 @@ from griptape_nodes.common.project_templates.provenance_settings import (
 )
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
+from griptape_nodes.files.os_utils import is_windows
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
@@ -881,6 +882,7 @@ class TestReconstructArtifactPath:
         reconstructed = engine.provenance_manager._reconstruct_artifact_path(Path("C:") / "renders" / "out.png")
         assert reconstructed == Path("C:/renders/out.png")
 
+    @pytest.mark.skipif(is_windows(), reason="the /-rooted branch is POSIX; Windows takes the drive branch above")
     def test_rooted_mirror_reconstructs_when_the_root_location_exists(self, engine: Engine, temp_dir: Path) -> None:
         # A mirror of a real rooted directory: the workspace-relative candidate
         # does not exist, so reconstruction re-roots it at / and finds it there.
@@ -917,7 +919,11 @@ class TestRecordLoadingSkips:
         record_dir = self._saved_record_dir(engine, temp_dir)
         good_record = _load_single_record(record_dir)
         from_the_future = good_record.model_copy(update={"schema_version": "99.0.0"})
-        (record_dir / "99990101T000000000000Z-bbbbbbbb.yaml").write_text(dump_record_yaml(from_the_future))
+        # Records contain non-cp1252 characters (the summary line's arrow), so
+        # write UTF-8 explicitly the way the store itself does.
+        (record_dir / "99990101T000000000000Z-bbbbbbbb.yaml").write_text(
+            dump_record_yaml(from_the_future), encoding="utf-8"
+        )
 
         latest = engine.provenance_manager.find_latest_record_for_path(temp_dir / "hero.txt")
         assert latest is not None
