@@ -344,11 +344,12 @@ class WorkerSettings(BaseModel):
     heartbeat_startup_grace_s: float = Field(
         default=600.0,
         description=(
-            "Grace period in seconds after worker spawn before heartbeat timeouts are enforced. "
-            "Workers need time to install venv deps and import modules before they can respond. "
+            "Seconds a worker may take to load its library before the orchestrator marks the "
+            "library as FAILURE. Also bounds how long running a node waits for its library's worker "
+            "to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes; this also bounds how long the orchestrator waits for worker libraries "
-            "to load before marking them as FAILURE."
+            "two minutes. Heartbeats are enforced from the moment a worker registers regardless of "
+            "this value, because a loading worker keeps answering them."
         ),
     )
 

@@ -10,6 +10,13 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Fixed
+
+- The process a library runs isolated in shuts down within about 20 seconds of losing the engine
+  that started it. Before, if that engine exited in the process's first 10 minutes, the process
+  stayed up until those 10 minutes had passed. `worker.heartbeat_startup_grace_s` no longer delays
+  that check; it still bounds how long the engine waits for the process to load its library.
+
 ## [0.102.0] - 2026-09-24
 
 ### Added

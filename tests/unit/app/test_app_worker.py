@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -114,6 +115,21 @@ def _managed_proc_mock() -> MagicMock:
     proc = MagicMock()
     proc.wait = AsyncMock()
     return proc
+
+
+async def _sweep_until_evicted(worker_manager: WorkerManager) -> None:
+    """Run the orchestrator's sweep until it evicts ``_ENGINE``, giving up after 5s.
+
+    Waits for the eviction rather than a fixed window: the sweep ticks in real time, and a garbage
+    collection pause or a loaded test runner can hold off the tick that evicts past a short window.
+    """
+    evicted = asyncio.Event()
+    worker_manager.register_worker_evicted_callback(lambda _wid, _lib: evicted.set())
+    task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(evicted.wait(), timeout=5.0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 class TestHandleRegisterWorkerRequest:
@@ -399,11 +415,38 @@ class TestWorkerHeartbeatMonitor:
         """Monitor raises RuntimeError when no heartbeat arrives within the timeout."""
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_startup_grace_s", 0.0)
         worker_manager._worker_heartbeat_last_received_at = 0.0
 
         with pytest.raises(RuntimeError, match="Orchestrator heartbeat lost"):
             await worker_manager.worker_heartbeat_monitor()
+
+    @pytest.mark.asyncio
+    async def test_raises_without_waiting_out_the_startup_grace(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker whose orchestrator is gone shuts down within the timeout, not after the load deadline."""
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.05)
+        monkeypatch.setattr(worker_manager, "heartbeat_startup_grace_s", 600.0)
+        worker_manager._worker_heartbeat_last_received_at = 0.0
+
+        with pytest.raises(RuntimeError, match="Orchestrator heartbeat lost"):
+            await asyncio.wait_for(worker_manager.worker_heartbeat_monitor(), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_before_the_first_heartbeat_is_due(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Silence is counted from when the monitor started, not from a heartbeat that never came."""
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 1.0)
+        worker_manager._worker_heartbeat_last_received_at = 0.0
+
+        task = asyncio.create_task(worker_manager.worker_heartbeat_monitor())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     @pytest.mark.asyncio
     async def test_does_not_raise_while_heartbeats_arrive(
@@ -412,7 +455,6 @@ class TestWorkerHeartbeatMonitor:
         """Monitor does not raise when the timestamp is kept current."""
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_startup_grace_s", 0.0)
         worker_manager._worker_heartbeat_last_received_at = time.monotonic()
 
         task = asyncio.create_task(worker_manager.worker_heartbeat_monitor())
@@ -507,10 +549,7 @@ class TestEvictionCountsUnansweredChallenges:
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.01)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
 
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _sweep_until_evicted(worker_manager)
 
         assert _ENGINE not in worker_manager._workers
 
@@ -1643,10 +1682,7 @@ class TestOrchestratorHeartbeatLoop:
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
 
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _sweep_until_evicted(worker_manager)
 
         assert _ENGINE not in worker_manager._workers
 

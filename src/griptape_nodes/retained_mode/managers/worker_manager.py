@@ -95,10 +95,10 @@ class WorkerManager(EngineScoped):
     # is the sleep in both heartbeat loops, so a non-positive value is a ZeroDivisionError on one
     # path and a hot loop on the other. Low enough that any interval meant seriously survives it.
     MINIMUM_HEARTBEAT_INTERVAL_S: float = 0.1
-    # How long after spawn to wait before enforcing heartbeat timeout.
-    # Workers install venv deps and import modules before receiving heartbeats;
-    # this matches the _await_pending_workers() ceiling so a worker never kills
-    # itself before the orchestrator gives up waiting for it.
+    # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
+    # on the boot wait for worker libraries, on `wait_until_executable`, and on each worker's reply to
+    # a project-switch fan-out. It does not delay heartbeat enforcement on either side, because a
+    # worker keeps answering challenges while it loads; see `worker_heartbeat_monitor`.
     DEFAULT_HEARTBEAT_STARTUP_GRACE_S: float = 600.0
     # How long to wait for a worker to exit after SIGTERM before escalating to
     # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
@@ -386,16 +386,20 @@ class WorkerManager(EngineScoped):
     async def worker_heartbeat_monitor(self) -> None:
         """Shut down the worker if orchestrator heartbeats stop arriving.
 
-        Waits out a startup grace period before enforcing the timeout, so
-        library loading (venv creation, pip install, module import) cannot kill
-        the worker before the orchestrator has a chance to start sending
-        challenges. Does not mutate `_worker_heartbeat_last_received_at`; that
-        attribute is owned by `handle_worker_heartbeat_request`.
+        Enforced from the start, as the orchestrator's side is: it challenges a worker from the
+        moment the worker registers, with no grace period. A worker loading its library keeps
+        answering, because the host answers heartbeats on a different event loop from the one that
+        loads libraries. Silence is measured from the later of the last heartbeat and this monitor
+        starting, so a first challenge still in flight is not counted as silence.
+
+        Does not mutate `_worker_heartbeat_last_received_at`; that attribute is owned by
+        `handle_worker_heartbeat_request`.
         """
-        await asyncio.sleep(self.heartbeat_startup_grace_s)
+        started_at = time.monotonic()
         while True:
             await asyncio.sleep(self.heartbeat_interval_s)
-            elapsed = time.monotonic() - self._worker_heartbeat_last_received_at
+            last_heard_at = max(self._worker_heartbeat_last_received_at, started_at)
+            elapsed = time.monotonic() - last_heard_at
             if elapsed > self.heartbeat_timeout_s:
                 msg = f"Orchestrator heartbeat lost ({elapsed:.1f}s since last heartbeat); worker is shutting down."
                 logger.warning(msg)
