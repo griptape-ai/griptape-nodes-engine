@@ -242,6 +242,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     PostDispatchHooksWorkerIncompatibleProblem,
     RequestHandlerRegistrationProblem,
     RequestHandlersWorkerIncompatibleProblem,
+    RezEnvironmentProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
     WorkflowNodeLoadProblem,
@@ -291,20 +292,25 @@ from griptape_nodes.utils.library_utils import (
     normalize_library_registrations,
 )
 from griptape_nodes.utils.rez_utils import (
+    ENV_BIN_PATH,
     _library_rez_name,
+    choose_torch_backend,
     get_library_rez_package_version,
     is_in_rez_context,
     is_library_rez_package_available,
     is_rez_enabled,
     is_rez_library_path,
     library_edit_rez_requests,
+    library_environment_failure,
     library_file_path_to_rez_family,
     read_library_manifest,
     resolve_rez_library_json_path,
     resolve_rez_pythonpath,
     rez_library_package_name,
     rez_library_package_version,
+    rez_setup,
     rez_version_from_git_ref,
+    torch_backend_requests,
 )
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 from griptape_nodes.utils.version_utils import (
@@ -580,6 +586,10 @@ class LibraryManager(EngineScoped):
         has_rez_package: bool = False
         rez_family: str | None = None
         rez_version: str | None = None
+        # Set by the startup check of every rez library's worker environment: whether it ran,
+        # and why the environment does not resolve on this workstation (None: it does).
+        rez_environment_checked: bool = False
+        rez_environment_failure: str | None = None
         # True when this library's nodes EXECUTE in a dedicated worker process, for either
         # reason: legacy worker-mode declarations (requires_worker above, which also skips
         # orchestrator-side loading in favor of stubs) or execution dependencies
@@ -3016,6 +3026,12 @@ class LibraryManager(EngineScoped):
                         json_path = Path(file_path)
                         base_dir = json_path.parent.absolute()
 
+                        # A rez library whose worker environment cannot resolve on this
+                        # workstation (e.g. no matching torch build) does not load.
+                        rez_failure = await self._rez_environment_failure(library_info, library_data.name, file_path)
+                        if rez_failure is not None:
+                            return rez_failure
+
                         # Add library directory and venv site-packages to sys.path
                         await self._add_library_paths_to_sys_path(library_data.name, file_path, base_dir)
 
@@ -3570,6 +3586,64 @@ class LibraryManager(EngineScoped):
         # Create venv relative to the xdg data home
         return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
 
+    def _uses_rez_package(self, library_file_path: str) -> bool:
+        """Whether a library comes from a rez package (a REZ: entry, or a checkout that has one)."""
+        if is_rez_library_path(library_file_path):
+            return True
+        return is_rez_enabled() and is_library_rez_package_available(Path(library_file_path))
+
+    async def _check_rez_library_environments(self, library_paths: list[str]) -> None:
+        """Resolve every rez library's worker environment at once, before libraries load one by one.
+
+        Each resolve can take a second or two on a large store; running them together keeps
+        startup close to the slowest one instead of their sum.
+        """
+        if not is_rez_enabled():
+            return
+        rez_paths = [path for path in library_paths if self._uses_rez_package(path)]
+        if not rez_paths:
+            return
+        choice = choose_torch_backend()
+        if choice.backend is not None:
+            logger.info("[Rez] torch build for this workstation: %s (%s)", choice.backend, choice.reason)
+        failures = await asyncio.gather(
+            *(asyncio.to_thread(library_environment_failure, Path(path)) for path in rez_paths)
+        )
+        for path, failure in zip(rez_paths, failures, strict=True):
+            library_info = self._library_file_path_to_info.get(path)
+            if library_info is not None:
+                library_info.rez_environment_checked = True
+                library_info.rez_environment_failure = failure
+
+    async def _rez_environment_failure(
+        self, library_info: LibraryManager.LibraryInfo, library_name: str, file_path: str
+    ) -> RegisterLibraryFromFileResultFailure | None:
+        """Fail a rez library whose worker environment cannot resolve on this workstation.
+
+        Checked when the library loads, so the artist learns it cannot run here from the
+        library list, not from a node that fails mid-workflow. A worker, already running
+        inside the library's rez environment, skips the check.
+        """
+        if not is_rez_enabled() or not self._uses_rez_package(file_path):
+            return None
+        if is_in_rez_context(library_file_path_to_rez_family(Path(file_path))):
+            return None
+
+        if library_info.rez_environment_checked:
+            reason = library_info.rez_environment_failure
+        else:
+            reason = await asyncio.to_thread(library_environment_failure, Path(file_path))
+        if reason is None:
+            return None
+
+        library_info.problems.append(RezEnvironmentProblem(error_message=reason))
+        library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+        self._library_file_path_to_info[library_info.library_path] = library_info
+        details = f"Attempted to load Library '{library_name}'. Failed because {reason}"
+        logger.warning("[Rez] %s", details)
+        return RegisterLibraryFromFileResultFailure(result_details=details)
+
     async def _add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
         """Add a library's directory and dependency paths to sys.path.
 
@@ -3595,9 +3669,7 @@ class LibraryManager(EngineScoped):
         sys.path.insert(0, str(base_dir))
         logger.debug("[path] Added library '%s' base_dir to sys.path: %s", library_name, base_dir)
 
-        if is_rez_library_path(library_file_path) or (
-            is_rez_enabled() and is_library_rez_package_available(Path(library_file_path))
-        ):
+        if self._uses_rez_package(library_file_path):
             rez_family = library_file_path_to_rez_family(Path(library_file_path))
 
             # A worker runs inside `rez env <family>`, which already put the library's full
@@ -3621,11 +3693,13 @@ class LibraryManager(EngineScoped):
                         len(edit_rez_specs),
                         len(exec_deps),
                     )
-                    rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, edit_rez_specs)
+                    rez_paths = await asyncio.to_thread(
+                        resolve_rez_pythonpath, [*edit_rez_specs, *torch_backend_requests()]
+                    )
                 else:
                     rez_paths = []
             else:
-                rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, [rez_family])
+                rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, [rez_family, *torch_backend_requests()])
 
             for rez_path in rez_paths:
                 if rez_path not in sys.path:
@@ -4456,6 +4530,9 @@ class LibraryManager(EngineScoped):
                 logger.info("No libraries found in configuration.")
                 return reconcile_failures
 
+            if target_library_names is None:
+                await self._check_rez_library_environments(libraries_to_load)
+
             # Calculate total libraries for progress tracking
             total_libraries = len(libraries_to_load)
 
@@ -4983,7 +5060,7 @@ class LibraryManager(EngineScoped):
             self._is_initializing = False
 
     async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
-        logger.info("Rez integration: %s", "enabled" if is_rez_enabled() else "disabled")
+        self.engine.rez_manager.log_startup_configuration()
         if is_rez_enabled():
             await asyncio.to_thread(self.engine.rez_manager.run_startup_health_check)
         if payload.skip_library_loading:
@@ -6807,6 +6884,10 @@ class LibraryManager(EngineScoped):
         exist on disk.
         """
         if is_rez_library_path(entry.path):
+            if not is_rez_enabled():
+                reason = rez_setup().disabled_reason or f"rez is not active ({ENV_BIN_PATH} is not set)."
+                logger.warning("[Rez] Library '%s' was not loaded: %s", entry.path, reason)
+                return None
             rez_family = rez_library_package_name(entry.path)
             rez_version = rez_library_package_version(entry.path)
             json_path = resolve_rez_library_json_path(rez_family, version=rez_version)

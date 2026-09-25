@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -13,8 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.rez_utils import (
+    TORCH_BACKEND_UNKNOWN,
+    TorchBackendChoice,
     _anchor_drive_letter,
-    _derive_library_version,
+    _choose_torch_backend_for,
     _detect_rez_store_family,
     _executable_candidate_names,
     _git_describe_version,
@@ -27,9 +30,13 @@ from griptape_nodes.utils.rez_utils import (
     _write_library_meta_package,
     build_direct_requires,
     build_rez_env_prefix,
+    built_torch_backends,
     check_rez_health,
     check_rez_health_detailed,
+    choose_torch_backend,
+    cuda_version_of,
     current_platform_key,
+    derive_library_version,
     find_library_manifest,
     get_library_rez_package_version,
     get_rez_context_string,
@@ -39,7 +46,11 @@ from griptape_nodes.utils.rez_utils import (
     is_rez_enabled,
     is_rez_library_path,
     library_edit_rez_requests,
+    library_environment_failure,
     library_file_path_to_rez_family,
+    library_platform_requires,
+    library_rez_family,
+    nvidia_driver_cuda_version,
     pip_spec_name,
     read_library_dependencies,
     read_library_manifest,
@@ -47,20 +58,25 @@ from griptape_nodes.utils.rez_utils import (
     resolve_and_log_rez_context,
     resolve_rez_library_json_path,
     resolve_rez_pythonpath,
+    rez_base,
     rez_bin_path,
+    rez_config_dropped_paths,
     rez_config_file,
+    rez_implicit_packages,
     rez_library_package_name,
     rez_library_package_version,
     rez_local_packages_path,
+    rez_package_stores,
     rez_path_map,
-    rez_release_packages_path,
-    rez_root,
+    rez_resolve_failure,
     rez_search_paths,
+    rez_setup,
     rez_subprocess_env,
     rez_unsearched_stores,
     rez_version_from_git_ref,
+    torch_backend_requests,
 )
-from griptape_nodes.utils.rez_uv import ResolvedPackage, RezInstallError
+from griptape_nodes.utils.rez_uv import InstallReport, ResolvedPackage, RezInstallError, read_package_file
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -70,23 +86,144 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-class TestRezEnabled:
-    def test_disabled_when_root_unset(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("GTN_REZ_ROOT", None)
-            assert not is_rez_enabled()
+def _rez_tools(folder: Path) -> Path:
+    """Create a folder holding an executable rez-env, like a real rez install's tools folder."""
+    folder.mkdir(parents=True, exist_ok=True)
+    tool = folder / _executable_candidate_names("rez-env")[0]
+    tool.write_text("")
+    tool.chmod(0o755)
+    return folder
 
-    def test_enabled_when_root_set(self) -> None:
-        with patch.dict(os.environ, {"GTN_REZ_ROOT": "/mnt/pipeline"}):
+
+class TestRezEnabled:
+    def test_off_and_silent_when_nothing_is_set(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert setup.disabled_reason == ""
+
+    def test_on_with_absolute_tools_folder(self, tmp_path: Path) -> None:
+        tools = _rez_tools(tmp_path / "rez" / "bin")
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True):
+            assert is_rez_enabled()
+            assert rez_setup().bin_path == tools
+
+    def test_root_is_optional(self, tmp_path: Path) -> None:
+        tools = _rez_tools(tmp_path / "bin")
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True):
+            setup = rez_setup()
+        assert setup.enabled
+        assert setup.base is None
+
+    def test_on_with_relative_tools_folder_and_root(self, tmp_path: Path) -> None:
+        _rez_tools(tmp_path / "rez" / "bin")
+        with patch.dict(os.environ, {"GTN_REZ_ROOT": str(tmp_path), "GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
             assert is_rez_enabled()
 
-    def test_disabled_when_root_empty(self) -> None:
-        with patch.dict(os.environ, {"GTN_REZ_ROOT": ""}):
+    def test_on_with_relative_tools_folder_and_path_map(self, tmp_path: Path) -> None:
+        _rez_tools(tmp_path / "rez" / "bin")
+        path_map = f"{current_platform_key()}={tmp_path};nowhere=/unused"
+        with patch.dict(os.environ, {"GTN_REZ_PATH_MAP": path_map, "GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
+            setup = rez_setup()
+        assert setup.enabled
+        assert setup.base is not None
+        assert setup.base.source == "GTN_REZ_PATH_MAP"
+
+    def test_off_with_absolute_folder_missing_rez_env(self, tmp_path: Path) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tmp_path)}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert "no rez-env was found" in setup.disabled_reason
+        assert str(tmp_path) in setup.disabled_reason
+
+    def test_off_with_relative_folder_missing_rez_env(self, tmp_path: Path) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_ROOT": str(tmp_path), "GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert str(tmp_path / "rez/bin") in setup.disabled_reason
+
+    def test_off_with_relative_folder_and_no_base(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert "relative path 'rez/bin'" in setup.disabled_reason
+        assert "GTN_REZ_ROOT" in setup.disabled_reason
+        assert current_platform_key() in setup.disabled_reason
+
+    def test_path_map_for_another_platform_is_no_base(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_PATH_MAP": "nowhere=/unused", "GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert "relative path" in setup.disabled_reason
+
+    def test_leftover_configuration_explains_why_rez_is_off(self) -> None:
+        env = {"GTN_REZ_ROOT": "/mnt/pipeline", "GTN_REZ_LOCAL_PACKAGES_PATH": "rez/local"}
+        with patch.dict(os.environ, env, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert "GTN_REZ_ROOT, GTN_REZ_LOCAL_PACKAGES_PATH are set" in setup.disabled_reason
+        assert "GTN_REZ_BIN_PATH is not" in setup.disabled_reason
+
+    def test_single_leftover_variable_uses_singular(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_ROOT": "/mnt/pipeline"}, clear=True):
+            assert "GTN_REZ_ROOT is set" in rez_setup().disabled_reason
+
+    def test_whitespace_tools_path_counts_as_unset(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": "   "}, clear=True):
+            setup = rez_setup()
+        assert not setup.enabled
+        assert setup.disabled_reason == ""
+
+    def test_relative_optional_paths_without_base_are_ignored_with_a_warning(self, tmp_path: Path) -> None:
+        tools = _rez_tools(tmp_path / "bin")
+        env = {"GTN_REZ_BIN_PATH": str(tools), "GTN_REZ_LOCAL_PACKAGES_PATH": "local", "GTN_REZ_CONFIG_FILE": "cfg.py"}
+        with patch.dict(os.environ, env, clear=True):
+            setup = rez_setup()
+        assert setup.enabled
+        assert setup.local_packages_path is None
+        assert setup.config_file is None
+        assert len(setup.warnings) == 2  # noqa: PLR2004 -- one per ignored variable
+        assert all("It is ignored" in warning for warning in setup.warnings)
+
+    def test_windows_tools_suffix_is_found(self, tmp_path: Path) -> None:
+        tools = tmp_path / "bin"
+        tools.mkdir()
+        (tools / "rez-env.EXE").write_text("")
+        (tools / "rez-env.EXE").chmod(0o755)
+        # Windows candidates as _executable_candidate_names builds them from PATHEXT.
+        windows_names = ["rez-env.COM", "rez-env.EXE", "rez-env"]
+        with (
+            patch(f"{_RU}._executable_candidate_names", return_value=windows_names),
+            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True),
+        ):
+            assert rez_setup().enabled
+
+    def test_result_follows_a_changed_environment(self, tmp_path: Path) -> None:
+        tools = _rez_tools(tmp_path / "bin")
+        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True):
+            assert is_rez_enabled()
+        with patch.dict(os.environ, {}, clear=True):
             assert not is_rez_enabled()
 
-    def test_disabled_when_root_whitespace(self) -> None:
-        with patch.dict(os.environ, {"GTN_REZ_ROOT": "   "}):
-            assert not is_rez_enabled()
+
+class TestRezBase:
+    def test_root_wins_over_path_map(self, tmp_path: Path) -> None:
+        env = {"GTN_REZ_ROOT": str(tmp_path / "root"), "GTN_REZ_PATH_MAP": f"{current_platform_key()}=/mapped"}
+        with patch.dict(os.environ, env, clear=True):
+            base = rez_base()
+        assert base is not None
+        assert base.path == tmp_path / "root"
+        assert base.source == "GTN_REZ_ROOT"
+
+    def test_none_without_root_or_matching_map_entry(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_PATH_MAP": "nowhere=/x"}, clear=True):
+            assert rez_base() is None
+
+    def test_drive_letter_root_is_anchored(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_ROOT": "P:"}, clear=True):
+            base = rez_base()
+        assert base is not None
+        assert base.path == Path("P:/")
 
 
 # ---------------------------------------------------------------------------
@@ -361,20 +498,8 @@ class TestLibraryFilePathToRezFamily:
 
 
 # ---------------------------------------------------------------------------
-# GTN_REZ_ROOT and GTN_REZ_PATH_MAP
+# GTN_REZ_PATH_MAP
 # ---------------------------------------------------------------------------
-
-
-class TestRezRoot:
-    def test_returns_path_when_set(self) -> None:
-        with patch.dict(os.environ, {"GTN_REZ_ROOT": "/mnt/pipeline"}):
-            result = rez_root()
-            assert result == Path("/mnt/pipeline")
-
-    def test_returns_none_when_unset(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("GTN_REZ_ROOT", None)
-            assert rez_root() is None
 
 
 class TestRezPathMap:
@@ -429,11 +554,9 @@ class TestResolveRezPath:
             result = _resolve_rez_path("GTN_REZ_BIN_PATH")
             assert result == Path("/mnt/pipeline/rez/bin")
 
-    def test_relative_without_root(self) -> None:
+    def test_relative_without_base_is_unresolved(self) -> None:
         with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
-            os.environ.pop("GTN_REZ_ROOT", None)
-            result = _resolve_rez_path("GTN_REZ_BIN_PATH")
-            assert result == Path("rez/bin")
+            assert _resolve_rez_path("GTN_REZ_BIN_PATH") is None
 
     def test_absolute_path_skips_root(self) -> None:
         with patch.dict(
@@ -471,27 +594,8 @@ class TestAnchorDriveLetter:
 
 class TestRezExecutable:
     def test_bare_command_when_no_bin_path(self) -> None:
-        from griptape_nodes.utils.rez_utils import _rez_executable
-
         with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("GTN_REZ_BIN_PATH", None)
-            os.environ.pop("GTN_REZ_ROOT", None)
-            result = _rez_executable("rez-nonexistent-test-cmd")
-            assert result == "rez-nonexistent-test-cmd"
-
-    def test_resolves_via_which_with_bin_path(self, tmp_path: Path) -> None:
-        from griptape_nodes.utils.rez_utils import _rez_executable
-
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        fake_rez = bin_dir / "rez"
-        fake_rez.write_text("#!/bin/sh\necho ok")
-        fake_rez.chmod(0o755)
-
-        with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(bin_dir)}):
-            os.environ.pop("GTN_REZ_ROOT", None)
-            result = _rez_executable("rez")
-            assert "rez" in result
+            assert _rez_executable("rez-nonexistent-test-cmd") == "rez-nonexistent-test-cmd"
 
 
 # ---------------------------------------------------------------------------
@@ -518,17 +622,15 @@ class TestPathAccessors:
             "GTN_REZ_BIN_PATH": "rez/bin",
             "GTN_REZ_CONFIG_FILE": "rez/rezconfig.py",
             "GTN_REZ_LOCAL_PACKAGES_PATH": "rez/packages/local",
-            "GTN_REZ_RELEASE_PACKAGES_PATH": "rez/packages/release",
         }
         with patch.dict(os.environ, env, clear=True):
             assert rez_bin_path() == tmp_path / "rez/bin"
             assert rez_config_file() == tmp_path / "rez/rezconfig.py"
             assert rez_local_packages_path() == tmp_path / "rez/packages/local"
-            assert rez_release_packages_path() == tmp_path / "rez/packages/release"
 
-    def test_relative_path_without_root_returned_as_is(self) -> None:
+    def test_relative_path_without_base_is_none(self) -> None:
         with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": "rez/bin"}, clear=True):
-            assert rez_bin_path() == Path("rez/bin")
+            assert rez_bin_path() is None
 
     def test_absolute_path_ignores_root(self, tmp_path: Path) -> None:
         absolute = tmp_path / "elsewhere" / "local"
@@ -570,17 +672,26 @@ class TestRezExecutableLookup:
         with patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(bin_dir)}, clear=True):
             assert _rez_executable("rez-search") == str(exe)
 
-    def test_falls_back_to_which(self, tmp_path: Path) -> None:
+    def test_never_falls_back_to_path(self, tmp_path: Path) -> None:
+        missing = tmp_path / "missing"
         with (
-            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tmp_path / "missing")}, clear=True),
-            patch(f"{_RU}.shutil.which", return_value="/usr/bin/rez"),
+            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(missing)}, clear=True),
+            patch(f"{_RU}.shutil.which", return_value="/usr/bin/rez") as which,
         ):
-            assert _rez_executable("rez") == "/usr/bin/rez"
+            assert _rez_executable("rez") == str(missing / "rez")
+        which.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
 # Rez store lookups
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _searching(*stores: Path) -> Iterator[None]:
+    """Make rez's package search path the given folders, as rez-config would report it."""
+    with patch(f"{_RU}.rez_package_stores", return_value=list(stores)):
+        yield
 
 
 def _make_rez_version(store_local: Path, family: str, version: str, *, manifest: str | None = None) -> Path:
@@ -596,20 +707,20 @@ def _make_rez_version(store_local: Path, family: str, version: str, *, manifest:
 
 class TestResolveRezLibraryJsonPath:
     def test_no_store_configured(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
+        with _searching():
             assert resolve_rez_library_json_path("anything") is None
 
     def test_missing_family(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         local.mkdir()
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert resolve_rez_library_json_path("nope") is None
 
     def test_latest_version_is_chosen_numerically(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         _make_rez_version(local, "my_lib", "1.9.0", manifest="griptape_nodes_library.json")
         newest = _make_rez_version(local, "my_lib", "1.10.0", manifest="griptape_nodes_library.json")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             result = resolve_rez_library_json_path("my_lib")
         assert result == newest / "python" / "griptape_nodes_library.json"
 
@@ -617,26 +728,26 @@ class TestResolveRezLibraryJsonPath:
         local = tmp_path / "local"
         pinned = _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape-nodes-library.json")
         _make_rez_version(local, "my_lib", "2.0.0", manifest="griptape_nodes_library.json")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             result = resolve_rez_library_json_path("my_lib", version="1.0.0")
         assert result == pinned / "python" / "griptape-nodes-library.json"
 
     def test_pinned_version_missing(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert resolve_rez_library_json_path("my_lib", version="9.9.9") is None
 
     def test_family_without_versions(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         (local / "my_lib" / "junk").mkdir(parents=True)
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert resolve_rez_library_json_path("my_lib") is None
 
     def test_version_without_python_dir(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         _make_rez_version(local, "my_lib", "1.0.0")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert resolve_rez_library_json_path("my_lib") is None
 
     def test_python_dir_without_manifest(self, tmp_path: Path) -> None:
@@ -644,7 +755,7 @@ class TestResolveRezLibraryJsonPath:
         version_dir = _make_rez_version(local, "my_lib", "1.0.0")
         (version_dir / "python").mkdir()
         (version_dir / "python" / "readme.txt").write_text("")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert resolve_rez_library_json_path("my_lib") is None
 
 
@@ -664,7 +775,7 @@ class TestLibraryRezPackageVersion:
 
     def test_no_store(self, tmp_path: Path) -> None:
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {}, clear=True):
+        with _searching():
             assert get_library_rez_package_version(manifest) is None
             assert not is_library_rez_package_available(manifest)
 
@@ -673,7 +784,7 @@ class TestLibraryRezPackageVersion:
         _make_rez_version(local, "my_lib", "0.9.0")
         _make_rez_version(local, "my_lib", "0.10.0")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert get_library_rez_package_version(manifest) == "0.10.0"
             assert is_library_rez_package_available(manifest)
 
@@ -685,7 +796,7 @@ class TestLibraryRezPackageVersion:
         manifest = _library_manifest_in(
             tmp_path / "griptape-nodes-library-diffusers", display_name="Griptape Modular Diffusion Nodes Library"
         )
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert get_library_rez_package_version(manifest) is None
 
             _make_rez_version(local, "griptape_nodes_library_diffusers", "2.0.0")
@@ -695,30 +806,30 @@ class TestLibraryRezPackageVersion:
         local = tmp_path / "store" / "local"
         local.mkdir(parents=True)
         manifest = _library_manifest_in(tmp_path / "nothing-here")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert get_library_rez_package_version(manifest) is None
 
-    def test_explicit_packages_root_overrides_env(self, tmp_path: Path) -> None:
+    def test_explicit_store_overrides_search_path(self, tmp_path: Path) -> None:
         explicit_store = tmp_path / "explicit"
-        _make_rez_version(explicit_store / "local", "my_lib", "2.0.0")
-        env_local = tmp_path / "env" / "local"
-        _make_rez_version(env_local, "my_lib", "1.0.0")
+        _make_rez_version(explicit_store, "my_lib", "2.0.0")
+        searched = tmp_path / "searched"
+        _make_rez_version(searched, "my_lib", "1.0.0")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(env_local)}, clear=True):
-            assert get_library_rez_package_version(manifest, packages_root=explicit_store) == "2.0.0"
+        with _searching(searched):
+            assert get_library_rez_package_version(manifest, store=explicit_store) == "2.0.0"
 
-    def test_explicit_packages_root_without_env(self, tmp_path: Path) -> None:
+    def test_explicit_store_without_search_path(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
-        _make_rez_version(store / "local", "my_lib", "1.5.0")
+        _make_rez_version(store, "my_lib", "1.5.0")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {}, clear=True):
-            assert get_library_rez_package_version(manifest, packages_root=store) == "1.5.0"
+        with _searching():
+            assert get_library_rez_package_version(manifest, store=store) == "1.5.0"
 
     def test_family_without_versions(self, tmp_path: Path) -> None:
         local = tmp_path / "store" / "local"
         (local / "my_lib" / "empty").mkdir(parents=True)
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+        with _searching(local):
             assert get_library_rez_package_version(manifest) is None
 
 
@@ -817,7 +928,7 @@ class TestDeriveLibraryVersion:
         (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.7.1"\n')
         manifest = tmp_path / "pkg" / "griptape_nodes_library.json"
         manifest.parent.mkdir()
-        assert _derive_library_version(manifest) == "0.7.1"
+        assert derive_library_version(manifest) == "0.7.1"
 
     def test_git_describe_fallback(self, tmp_path: Path) -> None:
         manifest = tmp_path / "griptape_nodes_library.json"
@@ -825,7 +936,7 @@ class TestDeriveLibraryVersion:
             patch(f"{_RU}._read_pyproject_version", return_value=None),
             patch(f"{_RU}._git_describe_version", return_value="2.0.0.post1"),
         ):
-            assert _derive_library_version(manifest) == "2.0.0.post1"
+            assert derive_library_version(manifest) == "2.0.0.post1"
 
     def test_default_version(self, tmp_path: Path) -> None:
         manifest = tmp_path / "griptape_nodes_library.json"
@@ -833,7 +944,7 @@ class TestDeriveLibraryVersion:
             patch(f"{_RU}._read_pyproject_version", return_value=None),
             patch(f"{_RU}._git_describe_version", return_value=None),
         ):
-            assert _derive_library_version(manifest) == "1.0.0"
+            assert derive_library_version(manifest) == "1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1143,7 @@ class TestWriteLibraryMetaPackage:
             library_json_name=manifest.name,
         )
 
-        version_dir = store / "local" / "my_library" / "2.3.4"
+        version_dir = store / "my_library" / "2.3.4"
         content = (version_dir / "package.py").read_text()
         assert "name = 'my_library'" in content
         assert "version = '2.3.4'" in content
@@ -1050,7 +1161,7 @@ class TestWriteLibraryMetaPackage:
     def test_skip_installed_keeps_existing(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "lib")
         store = tmp_path / "store"
-        pkg_file = store / "local" / "fam" / "1.0.0" / "package.py"
+        pkg_file = store / "fam" / "1.0.0" / "package.py"
         pkg_file.parent.mkdir(parents=True)
         pkg_file.write_text("original")
         source = {
@@ -1109,7 +1220,7 @@ class TestInstallLibraryAsRezPackage:
             install_library_as_rez_package("Lib", ["requests"], library_file_path=manifest)
         install.assert_not_called()
 
-    def test_explicit_packages_root_used_without_env(self, tmp_path: Path) -> None:
+    def test_explicit_store_used_without_env(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "lib")
         store = tmp_path / "store"
         with (
@@ -1118,11 +1229,11 @@ class TestInstallLibraryAsRezPackage:
             patch(f"{_RU}.rez_uv_install") as install,
             patch(f"{_RU}.get_git_repository_root", return_value=None),
         ):
-            install_library_as_rez_package("Lib", ["requests"], library_file_path=manifest, packages_root=store)
+            install_library_as_rez_package("Lib", ["requests"], library_file_path=manifest, store=store)
             assert "GTN_REZ_LOCAL_PACKAGES_PATH" not in os.environ
 
         assert install.call_args.kwargs["packages_dir"] == store
-        assert (store / "local" / "lib" / "2.3.4" / "package.py").is_file()
+        assert (store / "lib" / "2.3.4" / "package.py").is_file()
 
     def test_installs_edit_and_exec_deps(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "my-library")
@@ -1153,7 +1264,7 @@ class TestInstallLibraryAsRezPackage:
         assert resolve.call_args.kwargs["extra_flags"] == ["--torch-backend=auto"]
         install_kwargs = install.call_args.kwargs
         assert install.call_args.args[0] == ["pillow>=10", "torch==2.7.0"]
-        assert install_kwargs["packages_dir"] == local.parent
+        assert install_kwargs["packages_dir"] == local
         assert install_kwargs["extra_index_url"] == "https://example.invalid/simple"
         assert install_kwargs["python_version"] == "3.12"
         assert install_kwargs["skip_installed"] is False
@@ -1218,7 +1329,7 @@ class TestReadLibraryPackageRequires:
         manifest = checkout / "griptape_nodes_library.json"
         manifest.write_text("{}")
         with (
-            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            _searching(local),
             patch(f"{_RU}.get_git_repository_root", return_value=None),
         ):
             assert read_library_package_requires(manifest) == ["torch-2.7.0"]
@@ -1228,7 +1339,7 @@ class TestReadLibraryPackageRequires:
         manifest.parent.mkdir()
         manifest.write_text("{}")
         with (
-            patch.dict(os.environ, {}, clear=True),
+            _searching(),
             patch(f"{_RU}.get_git_repository_root", return_value=None),
         ):
             assert read_library_package_requires(manifest) == []
@@ -1384,21 +1495,19 @@ class TestRezSearchPaths:
 
 
 class TestRezUnsearchedStores:
-    def test_reports_stores_rez_does_not_search(self, tmp_path: Path) -> None:
-        local = tmp_path / "local"
-        release = tmp_path / "release"
-        environ = {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local), "GTN_REZ_RELEASE_PACKAGES_PATH": str(release)}
-        with (
-            patch.dict(os.environ, environ, clear=True),
-            patch(f"{_RU}.rez_search_paths", return_value=[local, tmp_path / "studio"]),
-        ):
-            assert rez_unsearched_stores() == [release]
-
-    def test_all_stores_searched(self, tmp_path: Path) -> None:
+    def test_reports_local_store_when_rez_does_not_search_it(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         with (
             patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
-            patch(f"{_RU}.rez_search_paths", return_value=[local]),
+            patch(f"{_RU}.rez_search_paths", return_value=[tmp_path / "studio"]),
+        ):
+            assert rez_unsearched_stores() == [local]
+
+    def test_local_store_searched(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=[local, tmp_path / "studio"]),
         ):
             assert rez_unsearched_stores() == []
 
@@ -1412,76 +1521,643 @@ class TestRezUnsearchedStores:
         with patch(f"{_RU}.rez_search_paths", return_value=None):
             assert rez_unsearched_stores([tmp_path / "local"]) == []
 
-    def test_no_stores_does_not_ask_rez(self) -> None:
+    def test_production_has_no_local_store_to_check(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_search_paths") as search:
             assert rez_unsearched_stores() == []
         search.assert_not_called()
 
 
-class TestLocalAndReleaseStoreLookups:
+class TestRezPackageStores:
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self) -> Iterator[None]:
+        from griptape_nodes.utils.rez_utils import _package_stores_for
+
+        _package_stores_for.cache_clear()
+        yield
+        _package_stores_for.cache_clear()
+
+    def test_empty_when_rez_is_off(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_search_paths") as search:
+            assert rez_package_stores() == []
+        search.assert_not_called()
+
+    def test_reads_rez_search_path_once(self, tmp_path: Path) -> None:
+        tools = _rez_tools(tmp_path / "bin")
+        studio = [tmp_path / "local", tmp_path / "release"]
+        with (
+            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=studio) as search,
+        ):
+            assert rez_package_stores() == studio
+            assert rez_package_stores() == studio
+        search.assert_called_once()
+
+    def test_unreadable_search_path_finds_nothing(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        tools = _rez_tools(tmp_path / "bin")
+        with (
+            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=None),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert rez_package_stores() == []
+        assert "no rez packages can be found" in caplog.text
+
+
+class TestRezConfigDroppedPaths:
+    def test_nothing_to_compare_without_our_config(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_search_paths") as search:
+            assert rez_config_dropped_paths() == []
+        search.assert_not_called()
+
+    def test_extending_config_drops_nothing(self, tmp_path: Path) -> None:
+        studio = [tmp_path / "studio"]
+        with (
+            patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(tmp_path / "ours.py")}, clear=True),
+            patch(f"{_RU}.rez_search_paths", side_effect=[studio, [*studio, tmp_path / "local"]]),
+        ):
+            assert rez_config_dropped_paths() == []
+
+    def test_replacing_config_reports_studio_paths_it_removes(self, tmp_path: Path) -> None:
+        studio = [tmp_path / "studio", tmp_path / "shows"]
+        with (
+            patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(tmp_path / "ours.py")}, clear=True),
+            patch(f"{_RU}.rez_search_paths", side_effect=[studio, [tmp_path / "local", tmp_path / "shows"]]) as search,
+        ):
+            assert rez_config_dropped_paths() == [tmp_path / "studio"]
+        studio_env = search.call_args_list[0].kwargs["env"]
+        assert "REZ_CONFIG_FILE" not in studio_env
+
+    def test_unknown_search_path_reports_nothing(self, tmp_path: Path) -> None:
+        with (
+            patch.dict(os.environ, {"GTN_REZ_CONFIG_FILE": str(tmp_path / "ours.py")}, clear=True),
+            patch(f"{_RU}.rez_search_paths", return_value=None),
+        ):
+            assert rez_config_dropped_paths() == []
+
+
+class TestSearchPathLookups:
+    """Lookups read rez's own search path: local store (when searched) and released packages."""
+
     @pytest.fixture(autouse=True)
     def _no_git(self) -> Iterator[None]:
         with patch(f"{_RU}.get_git_repository_root", return_value=None):
             yield
 
-    def _stores(self, tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
-        local = tmp_path / "store" / "local"
-        release = tmp_path / "store" / "release"
-        environ = {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local), "GTN_REZ_RELEASE_PACKAGES_PATH": str(release)}
-        return local, release, environ
+    def _stores(self, tmp_path: Path) -> tuple[Path, Path]:
+        return tmp_path / "store" / "local", tmp_path / "store" / "release"
 
     def test_released_package_is_found(self, tmp_path: Path) -> None:
-        _, release, environ = self._stores(tmp_path)
+        local, release = self._stores(tmp_path)
         _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, environ, clear=True):
+        with _searching(local, release):
             assert get_library_rez_package_version(manifest) == "1.0.0"
             assert resolve_rez_library_json_path("my_lib") == release / "my_lib" / "1.0.0" / "python" / (
                 "griptape_nodes_library.json"
             )
 
     def test_highest_version_across_stores_wins(self, tmp_path: Path) -> None:
-        local, release, environ = self._stores(tmp_path)
+        local, release = self._stores(tmp_path)
         _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
         _make_rez_version(release, "my_lib", "1.2.0", manifest="griptape_nodes_library.json")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, environ, clear=True):
+        with _searching(local, release):
             assert get_library_rez_package_version(manifest) == "1.2.0"
             json_path = resolve_rez_library_json_path("my_lib")
         assert json_path is not None
         assert json_path.is_relative_to(release)
 
-    def test_same_version_in_both_prefers_local(self, tmp_path: Path) -> None:
-        local, release, environ = self._stores(tmp_path)
+    def test_same_version_prefers_earlier_search_path(self, tmp_path: Path) -> None:
+        local, release = self._stores(tmp_path)
         _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
         _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
-        with patch.dict(os.environ, environ, clear=True):
+        with _searching(local, release):
             json_path = resolve_rez_library_json_path("my_lib")
         assert json_path is not None
         assert json_path.is_relative_to(local)
 
     def test_pinned_version_found_in_release(self, tmp_path: Path) -> None:
-        local, release, environ = self._stores(tmp_path)
+        local, release = self._stores(tmp_path)
         _make_rez_version(local, "my_lib", "2.0.0", manifest="griptape_nodes_library.json")
         _make_rez_version(release, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
-        with patch.dict(os.environ, environ, clear=True):
+        with _searching(local, release):
             json_path = resolve_rez_library_json_path("my_lib", version="1.0.0")
             missing = resolve_rez_library_json_path("my_lib", version="3.0.0")
         assert json_path == release / "my_lib" / "1.0.0" / "python" / "griptape_nodes_library.json"
         assert missing is None
 
-    def test_local_store_folder_need_not_be_named_local(self, tmp_path: Path) -> None:
-        store = tmp_path / "studio" / "griptape_builds"
-        _make_rez_version(store, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
-        manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(store)}, clear=True):
-            assert get_library_rez_package_version(manifest) == "1.0.0"
-            assert resolve_rez_library_json_path("my_lib") is not None
+    def test_local_store_rez_does_not_search_is_not_used(self, tmp_path: Path) -> None:
+        # Only what rez can resolve counts: a local store missing from rez's search path is ignored.
+        local, release = self._stores(tmp_path)
+        _make_rez_version(local, "my_lib", "1.0.0", manifest="griptape_nodes_library.json")
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            _searching(release),
+        ):
+            assert resolve_rez_library_json_path("my_lib") is None
 
     def test_pinned_requires_read_from_released_package(self, tmp_path: Path) -> None:
-        _, release, environ = self._stores(tmp_path)
+        local, release = self._stores(tmp_path)
         version_dir = _make_rez_version(release, "my_lib", "1.0.0")
         (version_dir / "package.py").write_text("requires = ['pillow-10.0.0']\n")
         manifest = _library_manifest_in(tmp_path / "my-lib")
-        with patch.dict(os.environ, environ, clear=True):
+        with _searching(local, release):
             assert library_edit_rez_requests(manifest, ["pillow"]) == ["pillow-10.0.0"]
+
+
+class TestLibraryRezFamilySource:
+    def test_folder_source(self, tmp_path: Path) -> None:
+        manifest = _library_manifest_in(tmp_path / "Studio Tools")
+        with patch(f"{_RU}.get_git_repository_root", return_value=None):
+            naming = library_rez_family(manifest)
+        assert naming.family == "studio_tools"
+        assert naming.source == "folder 'Studio Tools'"
+
+    def test_git_remote_source(self, tmp_path: Path) -> None:
+        manifest = _library_manifest_in(tmp_path / "clone")
+        with (
+            patch(f"{_RU}.get_git_repository_root", return_value=tmp_path / "clone"),
+            patch(f"{_RU}._git_remote_repo_name", return_value="griptape-nodes-library-diffusers"),
+        ):
+            naming = library_rez_family(manifest)
+        assert naming.family == "griptape_nodes_library_diffusers"
+        assert naming.source == "git remote repository 'griptape-nodes-library-diffusers'"
+
+    def test_git_root_source(self, tmp_path: Path) -> None:
+        manifest = _library_manifest_in(tmp_path / "repo" / "sub")
+        with (
+            patch(f"{_RU}.get_git_repository_root", return_value=tmp_path / "repo"),
+            patch(f"{_RU}._git_remote_repo_name", return_value=None),
+        ):
+            naming = library_rez_family(manifest)
+        assert naming.source == "git repository folder 'repo'"
+
+    def test_store_source(self, tmp_path: Path) -> None:
+        manifest = _write_library_package(tmp_path / "store", "my_lib", "1.0.0", "name = 'my_lib'\n")
+        naming = library_rez_family(manifest)
+        assert naming.family == "my_lib"
+        assert naming.source == "its rez package folder"
+
+
+# ---------------------------------------------------------------------------
+# Library packages whose dependencies differ by platform, and torch builds
+# ---------------------------------------------------------------------------
+
+
+class TestLibraryPlatformRequires:
+    def test_none_without_platform_markers(self) -> None:
+        assert library_platform_requires(["pillow>=10", 'tomli; python_version < "3.11"'], {"pillow": "10.0.0"}) is None
+
+    def test_pins_this_platform_and_uses_ranges_for_others(self) -> None:
+        with (
+            patch(f"{_RU}.rez_platform_key", return_value="osx-arm64"),
+            patch("griptape_nodes.utils.rez_uv.current_platform_key", return_value="osx-arm64"),
+        ):
+            requires = library_platform_requires(
+                ["torch==2.7.0", "bitsandbytes>=0.46.0; sys_platform == 'win32'", "pyobjc; sys_platform == 'darwin'"],
+                {"torch": "2.7.0", "pyobjc": "10.3"},
+            )
+        assert requires is not None
+        assert requires["*"] == ["torch-2.7.0"]
+        assert requires["osx-arm64"] == ["pyobjc-10.3", "torch-2.7.0"]
+        assert requires["windows-AMD64"] == ["bitsandbytes-0.46.0+", "torch-2.7.0"]
+        assert requires["linux-x86_64"] == ["torch-2.7.0"]
+
+    def test_unresolved_common_dependency_is_left_out(self) -> None:
+        requires = library_platform_requires(["numpy", "colorama; sys_platform == 'win32'"], {})
+        assert requires is not None
+        assert requires["*"] == []
+
+
+class TestLibraryMetaPackagePlatformRequires:
+    def test_writes_platform_requires_and_merges_a_second_platform(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        store = tmp_path / "store"
+        source = {"rez_family": "lib", "library_source_dir": manifest.parent, "library_json_name": manifest.name}
+        mac = {
+            "*": ["torch-2.7.0"],
+            "osx-arm64": ["torch-2.7.0"],
+            "windows-AMD64": ["bitsandbytes-0.46.0+", "torch-2.7.0"],
+        }
+        windows = {"*": ["torch-2.7.0"], "windows-AMD64": ["bitsandbytes-0.48.1", "torch-2.7.0"], "osx-arm64": ["x"]}
+
+        with patch("griptape_nodes.utils.rez_uv.current_platform_key", return_value="osx-arm64"):
+            _write_library_meta_package("Lib", "1.0.0", ["torch-2.7.0"], store, **source, platform_requires=mac)
+        (manifest.parent / "nodes.py").write_text("# changed after the first build\n")
+        with patch("griptape_nodes.utils.rez_uv.current_platform_key", return_value="windows-AMD64"):
+            _write_library_meta_package("Lib", "1.0.0", ["torch-2.7.0"], store, **source, platform_requires=windows)
+
+        package_py = store / "lib" / "1.0.0" / "package.py"
+        content = package_py.read_text()
+        assert "@late()" in content
+        platform_requires = _platform_requires_of(package_py)
+        assert platform_requires["windows-AMD64"] == ["bitsandbytes-0.48.1", "torch-2.7.0"]
+        assert platform_requires["osx-arm64"] == ["torch-2.7.0"]
+        # The existing package's source is kept; only the requires gained Windows' entry.
+        assert (store / "lib" / "1.0.0" / "python" / "nodes.py").read_text() == "# nodes\n"
+
+    def test_edit_time_pins_come_from_this_platforms_entry(self, tmp_path: Path) -> None:
+        manifest = _write_library_package(
+            tmp_path / "store",
+            "lib",
+            "1.0.0",
+            "platform_requires = {'*': ['a-1'], 'osx-arm64': ['a-1', 'pyobjc-10.3']}\n",
+        )
+        with patch(f"{_RU}.rez_platform_key", return_value="osx-arm64"):
+            assert read_library_package_requires(manifest) == ["a-1", "pyobjc-10.3"]
+        with patch(f"{_RU}.rez_platform_key", return_value="linux-aarch64"):
+            assert read_library_package_requires(manifest) == ["a-1"]
+
+
+def _platform_requires_of(package_py: Path) -> dict[str, list[str]]:
+    platform_requires = read_package_file(package_py).platform_requires
+    assert platform_requires is not None
+    return platform_requires
+
+
+class TestInstallLibraryTorchBuilds:
+    @pytest.fixture(autouse=True)
+    def _no_git(self) -> Iterator[None]:
+        with patch(f"{_RU}.get_git_repository_root", return_value=None):
+            yield
+
+    def test_each_torch_build_is_its_own_install_pass(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        store = tmp_path / "store"
+        resolved = [ResolvedPackage(pip_name="torch", version="2.7.0", local_version="cu118")]
+        with (
+            patch(f"{_RU}.resolve_full", return_value=resolved) as resolve,
+            patch(f"{_RU}.rez_uv_install", return_value=InstallReport(new=["torch==2.7.0"])) as install,
+        ):
+            result = install_library_as_rez_package(
+                "Lib",
+                [],
+                pip_dependencies_exec=["torch==2.7.0"],
+                library_file_path=manifest,
+                pip_install_flags=["--extra-index-url", "https://download.pytorch.org/whl/cu128"],
+                store=store,
+                torch_backends=["cu118", "cu128"],
+            )
+
+        assert result is not None
+        assert result.built_torch_backends == ["cu118", "cu128"]
+        assert result.report.new == ["torch==2.7.0", "torch==2.7.0"]
+        flags_used = [call.kwargs["extra_flags"] for call in install.call_args_list]
+        assert "https://download.pytorch.org/whl/cu118" in flags_used[0]
+        assert "https://download.pytorch.org/whl/cu128" in flags_used[1]
+        assert all("https://download.pytorch.org/whl/cu128" not in flags for flags in flags_used[:1])
+        assert resolve.call_count == 2  # noqa: PLR2004 -- one resolve per torch build
+        assert "'torch-2.7.0'" in (store / "lib" / "2.3.4" / "package.py").read_text()
+
+    def test_all_skips_builds_without_the_pinned_version(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+
+        def fake_resolve(_deps: list[str], **kwargs: object) -> list[ResolvedPackage]:
+            if "https://download.pytorch.org/whl/cu128" not in kwargs["extra_flags"]:  # type: ignore[operator]
+                raise subprocess.CalledProcessError(1, "uv")
+            return [ResolvedPackage(pip_name="torch", version="2.7.0", local_version="cu128")]
+
+        with (
+            patch(f"{_RU}.resolve_full", side_effect=fake_resolve),
+            patch(f"{_RU}.rez_uv_install", return_value=InstallReport()),
+        ):
+            result = install_library_as_rez_package(
+                "Lib", ["torch==2.7.0"], library_file_path=manifest, store=tmp_path / "store", torch_backends=["all"]
+            )
+
+        assert result is not None
+        assert result.built_torch_backends == ["cu128"]
+        assert "cu118" in result.skipped_torch_backends
+        assert "cu128" not in result.skipped_torch_backends
+
+    def test_named_build_that_cannot_resolve_fails(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        with (
+            patch(f"{_RU}.resolve_full", side_effect=subprocess.CalledProcessError(1, "uv")),
+            pytest.raises(subprocess.CalledProcessError),
+        ):
+            install_library_as_rez_package(
+                "Lib", ["torch==2.7.0"], library_file_path=manifest, store=tmp_path / "store", torch_backends=["cu118"]
+            )
+
+    def test_all_with_nothing_available_fails_with_reason(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        with (
+            patch(f"{_RU}.resolve_full", side_effect=subprocess.CalledProcessError(1, "uv")),
+            pytest.raises(RuntimeError, match="none of them publish the torch version"),
+        ):
+            install_library_as_rez_package(
+                "Lib", ["torch==2.7.0"], library_file_path=manifest, store=tmp_path / "store", torch_backends=["all"]
+            )
+        assert not (tmp_path / "store" / "lib").exists()
+
+    def test_platform_markers_in_the_manifest_become_platform_requires(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        resolved = [ResolvedPackage(pip_name="torch", version="2.7.0")]
+        with (
+            patch(f"{_RU}.resolve_full", return_value=resolved),
+            patch(f"{_RU}.rez_uv_install", return_value=InstallReport()),
+        ):
+            install_library_as_rez_package(
+                "Lib",
+                [],
+                pip_dependencies_exec=["torch==2.7.0", "bitsandbytes>=0.46.0; sys_platform == 'win32'"],
+                library_file_path=manifest,
+                store=tmp_path / "store",
+            )
+        platform_requires = _platform_requires_of(tmp_path / "store" / "lib" / "2.3.4" / "package.py")
+        assert platform_requires["windows-AMD64"] == ["bitsandbytes-0.46.0+", "torch-2.7.0"]
+        assert platform_requires["*"] == ["torch-2.7.0"]
+
+
+# ---------------------------------------------------------------------------
+# torch builds at load and execution time
+# ---------------------------------------------------------------------------
+
+
+def _torch_package(store: Path, version: str, variants: list[list[str]]) -> None:
+    package = store / "torch" / version / "package.py"
+    package.parent.mkdir(parents=True)
+    package.write_text(f"name = 'torch'\nvariants = {variants!r}\n")
+
+
+WINDOWS_TIERS = [
+    ["platform-windows", "arch-AMD64", "python-3.12", ".torch_backend-cu118"],
+    ["platform-windows", "arch-AMD64", "python-3.12", ".torch_backend-cu128"],
+    ["platform-osx", "arch-arm64", "python-3.12"],
+]
+
+
+class TestBuiltTorchBackends:
+    def test_lists_this_platforms_builds_oldest_first(self, tmp_path: Path) -> None:
+        _torch_package(
+            tmp_path,
+            "2.7.0",
+            [*WINDOWS_TIERS, ["platform-linux", "arch-x86_64", "python-3.12", ".torch_backend-cu126"]],
+        )
+        with patch(f"{_RU}.rez_platform_key", return_value="windows-AMD64"):
+            assert built_torch_backends([tmp_path]) == ["cu118", "cu128"]
+
+    def test_macos_has_none(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path, "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.rez_platform_key", return_value="osx-arm64"):
+            assert built_torch_backends([tmp_path, tmp_path / "missing"]) == []
+
+    def test_cpu_sorts_first(self, tmp_path: Path) -> None:
+        _torch_package(
+            tmp_path,
+            "2.7.0",
+            [
+                ["platform-windows", "arch-AMD64", "python-3.12", ".torch_backend-cu128"],
+                ["platform-windows", "arch-AMD64", "python-3.12", ".torch_backend-cpu"],
+            ],
+        )
+        with patch(f"{_RU}.rez_platform_key", return_value="windows-AMD64"):
+            assert built_torch_backends([tmp_path]) == ["cpu", "cu128"]
+
+
+class TestCudaVersionOf:
+    @pytest.mark.parametrize(
+        ("backend", "expected"),
+        [("cu118", (11, 8)), ("cu128", (12, 8)), ("cu130", (13, 0)), ("cpu", None), ("rocm6.3", None)],
+    )
+    def test_parse(self, backend: str, expected: tuple[int, int] | None) -> None:
+        assert cuda_version_of(backend) == expected
+
+
+class TestNvidiaDriverCudaVersion:
+    def test_no_nvidia_smi(self) -> None:
+        with patch(f"{_RU}.shutil.which", return_value=None):
+            assert nvidia_driver_cuda_version() is None
+
+    def test_reads_cuda_version_from_header(self) -> None:
+        header = "| NVIDIA-SMI 595.95   Driver Version: 595.95   CUDA Version: 13.2     |\n"
+        with (
+            patch(f"{_RU}.shutil.which", return_value="nvidia-smi"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(0, stdout=header)),
+        ):
+            assert nvidia_driver_cuda_version() == (13, 2)
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [_completed(9, stdout="CUDA Version: 12.4"), _completed(0, stdout="No devices were found")],
+    )
+    def test_unusable_output(self, outcome: subprocess.CompletedProcess[str]) -> None:
+        with (
+            patch(f"{_RU}.shutil.which", return_value="nvidia-smi"),
+            patch(f"{_RU}.subprocess.run", return_value=outcome),
+        ):
+            assert nvidia_driver_cuda_version() is None
+
+    def test_nvidia_smi_error(self) -> None:
+        with (
+            patch(f"{_RU}.shutil.which", return_value="nvidia-smi"),
+            patch(f"{_RU}.subprocess.run", side_effect=subprocess.TimeoutExpired("nvidia-smi", 15)),
+        ):
+            assert nvidia_driver_cuda_version() is None
+
+
+class TestChooseTorchBackend:
+    @pytest.fixture(autouse=True)
+    def _rez_on(self, tmp_path: Path) -> Iterator[None]:
+        _choose_torch_backend_for.cache_clear()
+        tools = _rez_tools(tmp_path / "bin")
+        with (
+            patch.dict(os.environ, {"GTN_REZ_BIN_PATH": str(tools)}, clear=True),
+            patch(f"{_RU}.rez_package_stores", return_value=[tmp_path / "store"]),
+            patch(f"{_RU}.rez_implicit_packages", return_value=[]),
+            patch(f"{_RU}.rez_platform_key", return_value="windows-AMD64"),
+        ):
+            yield
+        _choose_torch_backend_for.cache_clear()
+
+    def test_rez_off(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            choice = choose_torch_backend()
+        assert choice.backend is None
+        assert torch_backend_requests() == []
+
+    def test_studio_implicit_wins_and_engine_adds_nothing(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path / "store", "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.rez_implicit_packages", return_value=["~platform==windows", ".torch_backend-cu118"]):
+            choice = choose_torch_backend()
+            requests = torch_backend_requests()
+        assert choice == TorchBackendChoice(
+            backend="cu118", reason="set by your studio's rez configuration (implicit_packages)", studio_managed=True
+        )
+        assert requests == []
+
+    def test_studio_implicit_read_from_the_rez_context(self) -> None:
+        with patch.dict(os.environ, {"REZ_USED_IMPLICIT_PACKAGES": "~platform==windows ~.torch_backend==cu128"}):
+            assert choose_torch_backend().backend == "cu128"
+
+    def test_machine_override(self) -> None:
+        with patch.dict(os.environ, {"GTN_REZ_TORCH_BACKEND": "cu118"}):
+            choice = choose_torch_backend()
+            requests = torch_backend_requests()
+        assert choice.backend == "cu118"
+        assert "GTN_REZ_TORCH_BACKEND" in choice.reason
+        assert requests == [".torch_backend-cu118"]
+
+    def test_no_tiered_builds_needs_no_choice(self) -> None:
+        choice = choose_torch_backend()
+        assert choice.backend is None
+        assert torch_backend_requests() == []
+
+    def test_highest_build_the_driver_supports(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path / "store", "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.nvidia_driver_cuda_version", return_value=(12, 4)):
+            choice = choose_torch_backend()
+        assert choice.backend == "cu118"
+        assert choice.reason == "driver supports CUDA 12.4; built: cu118, cu128"
+
+    def test_newest_build_for_a_new_driver(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path / "store", "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.nvidia_driver_cuda_version", return_value=(13, 2)):
+            assert torch_backend_requests() == [".torch_backend-cu128"]
+
+    def test_driver_older_than_every_build_is_unknown(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path / "store", "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.nvidia_driver_cuda_version", return_value=(11, 4)):
+            choice = choose_torch_backend()
+        assert choice.backend == TORCH_BACKEND_UNKNOWN
+        assert "supports CUDA 11.4, older than every CUDA build" in choice.reason
+        assert torch_backend_requests() == [".torch_backend-unknown"]
+
+    def test_no_gpu_uses_cpu_build(self, tmp_path: Path) -> None:
+        _torch_package(
+            tmp_path / "store",
+            "2.7.0",
+            [["platform-windows", "arch-AMD64", "python-3.12", ".torch_backend-cpu"], *WINDOWS_TIERS],
+        )
+        with patch(f"{_RU}.nvidia_driver_cuda_version", return_value=None):
+            assert choose_torch_backend().backend == "cpu"
+
+    def test_no_gpu_and_no_cpu_build_is_unknown(self, tmp_path: Path) -> None:
+        _torch_package(tmp_path / "store", "2.7.0", WINDOWS_TIERS)
+        with patch(f"{_RU}.nvidia_driver_cuda_version", return_value=None):
+            choice = choose_torch_backend()
+        assert choice.backend == TORCH_BACKEND_UNKNOWN
+        assert "no NVIDIA GPU was found and no CPU build" in choice.reason
+
+
+class TestRezImplicitPackages:
+    def test_reads_json(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(0, stdout='["~platform==osx"]')) as run,
+        ):
+            assert rez_implicit_packages() == ["~platform==osx"]
+        assert run.call_args.args[0] == ["rez-config", "--json", "implicit_packages"]
+
+    @pytest.mark.parametrize(
+        "outcome", [_completed(1), _completed(0, stdout="not json"), _completed(0, stdout='{"a": 1}')]
+    )
+    def test_unreadable_answer(self, outcome: subprocess.CompletedProcess[str]) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", return_value=outcome),
+        ):
+            assert rez_implicit_packages() == []
+
+    def test_rez_missing(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez-config"),
+            patch(f"{_RU}.subprocess.run", side_effect=OSError("x")),
+        ):
+            assert rez_implicit_packages() == []
+
+
+FAILED_RESOLVE = """\
+resolve failed, by artist on Fri, using Rez v3.4.0
+
+requested packages:
+griptape_nodes_library_diffusers
+.torch_backend-unknown  (ephemeral)
+
+The context failed to resolve:
+A package was completely reduced: (torch-2.7.0[1] (dep(.torch_backend-cu128) <--!--> .torch_backend-unknown))
+
+To see a graph of the failed resolution, add --fail-graph in your rez-env or rez-build command.
+"""
+
+
+class TestRezResolveFailure:
+    def test_resolves(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(0)) as run,
+        ):
+            assert rez_resolve_failure(["lib", ".torch_backend-cu128"]) is None
+        cmd = run.call_args.args[0]
+        assert cmd[:4] == ["rez", "env", "lib", ".torch_backend-cu128"]
+        assert cmd[4] == "--output"
+
+    def test_failure_summary(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(1, stderr=FAILED_RESOLVE)),
+        ):
+            failure = rez_resolve_failure(["lib"])
+        assert failure is not None
+        assert failure.startswith("A package was completely reduced")
+
+    def test_failure_without_the_usual_header(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(1, stderr="PackageFamilyNotFoundError: lib\n")),
+        ):
+            assert rez_resolve_failure(["lib"]) == "PackageFamilyNotFoundError: lib"
+
+    def test_silent_failure(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez"),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(1)),
+        ):
+            assert rez_resolve_failure(["lib"]) == "rez could not resolve it"
+
+    def test_rez_cannot_run(self) -> None:
+        with (
+            patch(f"{_RU}._rez_executable", return_value="rez"),
+            patch(f"{_RU}.subprocess.run", side_effect=OSError("gone")),
+        ):
+            assert rez_resolve_failure(["lib"]) == "rez could not be run: gone"
+
+
+class TestLibraryEnvironmentFailure:
+    @pytest.fixture(autouse=True)
+    def _family(self) -> Iterator[None]:
+        with patch(f"{_RU}.library_file_path_to_rez_family", return_value="griptape_nodes_library_diffusers"):
+            yield
+
+    def test_resolves_with_this_workstations_torch_build(self) -> None:
+        with (
+            patch(f"{_RU}.torch_backend_requests", return_value=[".torch_backend-cu128"]),
+            patch(f"{_RU}.rez_resolve_failure", return_value=None) as resolve,
+        ):
+            assert library_environment_failure(Path("lib.json")) is None
+        resolve.assert_called_once_with(["griptape_nodes_library_diffusers", ".torch_backend-cu128"])
+
+    def test_unknown_torch_build_explains_in_artist_terms(self) -> None:
+        choice = TorchBackendChoice(backend=TORCH_BACKEND_UNKNOWN, reason="no NVIDIA GPU was found")
+        with (
+            patch(f"{_RU}.torch_backend_requests", return_value=[".torch_backend-unknown"]),
+            patch(f"{_RU}.rez_resolve_failure", return_value="A package was completely reduced"),
+            patch(f"{_RU}.choose_torch_backend", return_value=choice),
+        ):
+            failure = library_environment_failure(Path("lib.json"))
+        assert failure is not None
+        assert "GPU build of torch could not be determined (no NVIDIA GPU was found)" in failure
+        assert "Ask your rez administrator" in failure
+
+    def test_other_failures_name_the_environment(self) -> None:
+        with (
+            patch(f"{_RU}.torch_backend_requests", return_value=[]),
+            patch(f"{_RU}.rez_resolve_failure", return_value="PackageNotFoundError: numpy-9"),
+            patch(f"{_RU}.choose_torch_backend", return_value=TorchBackendChoice(backend=None, reason="")),
+        ):
+            failure = library_environment_failure(Path("lib.json"))
+        assert failure == (
+            "its rez environment 'griptape_nodes_library_diffusers' does not resolve on this workstation: "
+            "PackageNotFoundError: numpy-9"
+        )

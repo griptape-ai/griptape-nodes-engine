@@ -623,6 +623,9 @@ class RezStatusNotification(AppPayload):
     """Broadcast rez integration status at startup and after state changes."""
 
     enabled: bool = False
+    disabled_reason: str = ""
+    local_packages_path: str | None = None
+    torch_backend: str | None = None
     context_string: str = ""
     health: RezHealthStatus | None = None
     library_statuses: list[RezLibraryStatus] = field(default_factory=list)

@@ -38,6 +38,7 @@ from .pre_dispatch_hook_registration_problem import PreDispatchHookRegistrationP
 from .request_handler_registration_problem import RequestHandlerRegistrationProblem
 from .request_handlers_worker_incompatible_problem import RequestHandlersWorkerIncompatibleProblem
 from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
+from .rez_environment_problem import RezEnvironmentProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
 from .ui_options_field_modified_warning_problem import UiOptionsFieldModifiedWarningProblem
@@ -86,6 +87,7 @@ __all__ = [
     "RequestHandlerRegistrationProblem",
     "RequestHandlersWorkerIncompatibleProblem",
     "RetiredNodeDeclarationProblem",
+    "RezEnvironmentProblem",
     "SandboxDirectoryMissingProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",
     "UiOptionsFieldModifiedWarningProblem",

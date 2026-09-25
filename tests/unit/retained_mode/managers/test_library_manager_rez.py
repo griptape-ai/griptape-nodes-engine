@@ -6,6 +6,7 @@ namespace, so these tests pin down how LibraryManager reacts to what rez reports
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from griptape_nodes.retained_mode.managers.library_manager import DependencyInst
 from griptape_nodes.retained_mode.managers.settings import LibraryRegistration
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
@@ -343,7 +346,10 @@ class TestResolveDiscoveryPathRez:
         manifest = tmp_path / "griptape_nodes_library.json"
         entry = LibraryRegistration(path=f"REZ:{FAMILY}-1.2.0")
 
-        with patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=manifest) as mock_resolve:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=manifest) as mock_resolve,
+        ):
             resolved = LibraryManager._resolve_discovery_path(entry, tmp_path)
 
         mock_resolve.assert_called_once_with(FAMILY, version="1.2.0")
@@ -354,11 +360,41 @@ class TestResolveDiscoveryPathRez:
     def test_missing_rez_package_resolves_to_none(self, tmp_path: Path) -> None:
         entry = LibraryRegistration(path=f"REZ:{FAMILY}")
 
-        with patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=None) as mock_resolve:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=None) as mock_resolve,
+        ):
             resolved = LibraryManager._resolve_discovery_path(entry, tmp_path)
 
         mock_resolve.assert_called_once_with(FAMILY, version=None)
         assert resolved is None
+
+    def test_rez_entry_with_rez_off_says_why(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        entry = LibraryRegistration(path=f"REZ:{FAMILY}")
+        reason = "Rez is not active: GTN_REZ_ROOT is set, but GTN_REZ_BIN_PATH is not."
+        setup = SimpleNamespace(disabled_reason=reason)
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=False),
+            patch(f"{LIBRARY_MANAGER_MODULE}.rez_setup", return_value=setup),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path") as mock_resolve,
+            caplog.at_level(logging.WARNING),
+        ):
+            resolved = LibraryManager._resolve_discovery_path(entry, tmp_path)
+
+        assert resolved is None
+        mock_resolve.assert_not_called()
+        assert f"Library 'REZ:{FAMILY}' was not loaded: {reason}" in caplog.text
+
+    def test_rez_entry_with_rez_not_configured(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        entry = LibraryRegistration(path=f"REZ:{FAMILY}")
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=False),
+            patch(f"{LIBRARY_MANAGER_MODULE}.rez_setup", return_value=SimpleNamespace(disabled_reason="")),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert LibraryManager._resolve_discovery_path(entry, tmp_path) is None
+        assert "GTN_REZ_BIN_PATH is not set" in caplog.text
 
 
 class TestInstallDependenciesRez:
@@ -550,3 +586,150 @@ class TestAppInitializationRezHealthCheck:
             mock_engine.rez_manager.run_startup_health_check.assert_called_once_with()
         else:
             mock_engine.rez_manager.run_startup_health_check.assert_not_called()
+        mock_engine.rez_manager.log_startup_configuration.assert_called_once_with()
+
+
+class TestTorchBuildInEditorResolve:
+    @pytest.mark.asyncio
+    async def test_edit_time_resolve_carries_this_workstations_torch_build(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(sys, "path", ["/existing"])
+        monkeypatch.delenv("REZ_USED_RESOLVE", raising=False)
+        mgr = engine.library_manager
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_file_path_to_rez_family", return_value=FAMILY),
+            patch(f"{LIBRARY_MANAGER_MODULE}.read_library_manifest", return_value=(LIBRARY_NAME, ["torch"], [], [])),
+            patch(f"{LIBRARY_MANAGER_MODULE}.torch_backend_requests", return_value=[".torch_backend-cu128"]),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_pythonpath", return_value=[]) as mock_resolve,
+        ):
+            await mgr._add_library_paths_to_sys_path(LIBRARY_NAME, LIBRARY_JSON, tmp_path)
+
+        mock_resolve.assert_called_once_with([FAMILY, ".torch_backend-cu128"])
+
+
+class TestRezEnvironmentGate:
+    @pytest.fixture
+    def rez_library(self) -> Iterator[None]:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_file_path_to_rez_family", return_value=FAMILY),
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("rez_library")
+    async def test_library_whose_environment_does_not_resolve_is_unusable(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REZ_USED_RESOLVE", raising=False)
+        info = _library_info()
+        reason = "this workstation's GPU build of torch could not be determined (no NVIDIA GPU was found)."
+        with patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure", return_value=reason):
+            failure = await engine.library_manager._rez_environment_failure(info, LIBRARY_NAME, LIBRARY_JSON)
+
+        assert isinstance(failure, RegisterLibraryFromFileResultFailure)
+        assert f"Attempted to load Library '{LIBRARY_NAME}'. Failed because {reason}" in str(failure.result_details)
+        assert info.fitness == LibraryManager.LibraryFitness.UNUSABLE
+        assert info.lifecycle_state == LibraryManager.LibraryLifecycleState.FAILURE
+        assert [type(problem).__name__ for problem in info.problems] == ["RezEnvironmentProblem"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("rez_library")
+    async def test_library_that_resolves_loads(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("REZ_USED_RESOLVE", raising=False)
+        info = _library_info()
+        with patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure", return_value=None):
+            assert await engine.library_manager._rez_environment_failure(info, LIBRARY_NAME, LIBRARY_JSON) is None
+        assert info.fitness == LibraryManager.LibraryFitness.GOOD
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("rez_library")
+    async def test_startup_check_result_is_used_without_resolving_again(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REZ_USED_RESOLVE", raising=False)
+        info = _library_info()
+        info.rez_environment_checked = True
+        info.rez_environment_failure = "checked at startup"
+        with patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure") as check:
+            failure = await engine.library_manager._rez_environment_failure(info, LIBRARY_NAME, LIBRARY_JSON)
+        check.assert_not_called()
+        assert failure is not None
+        assert "checked at startup" in str(failure.result_details)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("rez_library")
+    async def test_worker_inside_the_library_environment_skips_the_check(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REZ_USED_RESOLVE", f"python-3.12.4 {FAMILY}-1.0.0 torch-2.7.0")
+        with patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure") as check:
+            assert (
+                await engine.library_manager._rez_environment_failure(_library_info(), LIBRARY_NAME, LIBRARY_JSON)
+                is None
+            )
+        check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_rez_library_is_not_checked(self, engine: Engine) -> None:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=False),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure") as check,
+        ):
+            assert (
+                await engine.library_manager._rez_environment_failure(_library_info(), LIBRARY_NAME, LIBRARY_JSON)
+                is None
+            )
+        check.assert_not_called()
+
+
+class TestCheckRezLibraryEnvironments:
+    @pytest.mark.asyncio
+    async def test_checks_every_rez_library_and_records_the_results(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        rez_info = _library_info(library_path="/store/lib_a/1.0.0/python/griptape_nodes_library.json")
+        other_info = _library_info(library_path="/libs/plain/griptape_nodes_library.json")
+        mgr._library_file_path_to_info[rez_info.library_path] = rez_info
+        mgr._library_file_path_to_info[other_info.library_path] = other_info
+
+        def uses_rez(path: Path) -> bool:
+            return str(path).startswith("/store")
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", side_effect=uses_rez),
+            patch(
+                f"{LIBRARY_MANAGER_MODULE}.choose_torch_backend",
+                return_value=SimpleNamespace(backend="cu128", reason="r"),
+            ),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure", return_value="no torch build") as check,
+        ):
+            await mgr._check_rez_library_environments([rez_info.library_path, other_info.library_path])
+
+        check.assert_called_once_with(Path(rez_info.library_path))
+        assert rez_info.rez_environment_checked is True
+        assert rez_info.rez_environment_failure == "no torch build"
+        assert other_info.rez_environment_checked is False
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_check_when_rez_is_off(self, engine: Engine) -> None:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=False),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure") as check,
+        ):
+            await engine.library_manager._check_rez_library_environments([LIBRARY_JSON])
+        check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_rez_libraries(self, engine: Engine) -> None:
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=False),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_environment_failure") as check,
+        ):
+            await engine.library_manager._check_rez_library_environments([LIBRARY_JSON])
+        check.assert_not_called()

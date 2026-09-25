@@ -43,9 +43,12 @@ class GetRezStatusResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Current rez integration status."""
 
     enabled: bool = False
+    disabled_reason: str = ""
     context_string: str = ""
     studio_root: str = ""
     path_map: dict[str, str] = field(default_factory=dict)
+    local_packages_path: str | None = None
+    torch_backend: str | None = None
     health: RezHealthStatus = field(default_factory=RezHealthStatus)
     library_statuses: list[RezLibraryStatus] = field(default_factory=list)
     health_green_threshold_ms: float = 500.0

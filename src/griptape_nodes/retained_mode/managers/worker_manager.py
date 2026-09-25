@@ -34,6 +34,7 @@ from griptape_nodes.utils.rez_utils import (
     library_file_path_to_rez_family,
     resolve_and_log_rez_context,
     rez_subprocess_env,
+    torch_backend_requests,
 )
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -900,10 +901,13 @@ class WorkerManager(EngineScoped):
             return base_args
 
         rez_family = library_file_path_to_rez_family(library_file_path)
+        # The same request the library was checked with at load: its package plus this
+        # workstation's torch build.
+        rez_specs = [rez_family, *torch_backend_requests()]
         logger.info("[Rez][execution] wrapping worker for '%s' (family: %s)", library_name, rez_family)
-        resolve_and_log_rez_context([rez_family])
+        resolve_and_log_rez_context(rez_specs)
 
-        rez_prefix = build_rez_env_prefix([rez_family])
+        rez_prefix = build_rez_env_prefix(rez_specs)
         wrapped = [*rez_prefix, *base_args]
         logger.info("[Rez][execution]   wrapped cmd: %s", " ".join(wrapped))
         return wrapped

@@ -76,10 +76,11 @@ class TestBuildRezWorkerArgs:
         library_dir.mkdir()
         manifest = library_dir / "griptape_nodes_library.json"
         manifest.write_text('{"name": "Demo Library"}')
-        version_dir = tmp_path / "store" / "local" / FAMILY / "1.0.0"
+        store = tmp_path / "store"
+        version_dir = store / FAMILY / "1.0.0"
         version_dir.mkdir(parents=True)
         (version_dir / "package.py").write_text(f"name = '{FAMILY}'\n")
-        monkeypatch.setenv("GTN_REZ_LOCAL_PACKAGES_PATH", str(tmp_path / "store" / "local"))
+        monkeypatch.setattr(f"{REZ_UTILS_MODULE}.rez_package_stores", lambda: [store])
         worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = SimpleNamespace(  # type: ignore[union-attr]
             library_path=str(manifest)
         )
@@ -184,3 +185,21 @@ class TestSpawnWorkerRezEnvironment:
 
         assert "REZ_CONFIG_FILE" not in env
         assert "GTN_REZ_ROOT" not in env
+
+
+class TestWorkerTorchBuild:
+    def test_worker_resolve_carries_this_workstations_torch_build(self, worker_manager: WorkerManager) -> None:
+        worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = SimpleNamespace(  # type: ignore[union-attr]
+            library_path="/libs/demo/griptape_nodes_library.json"
+        )
+        with (
+            patch(f"{WORKER_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
+            patch(f"{WORKER_MANAGER_MODULE}.library_file_path_to_rez_family", return_value=FAMILY),
+            patch(f"{WORKER_MANAGER_MODULE}.torch_backend_requests", return_value=[".torch_backend-cu118"]),
+            patch(f"{WORKER_MANAGER_MODULE}.resolve_and_log_rez_context", return_value=[]) as mock_resolve,
+            patch(f"{WORKER_MANAGER_MODULE}.build_rez_env_prefix", return_value=REZ_PREFIX) as mock_prefix,
+        ):
+            worker_manager._build_rez_worker_args(LIBRARY, _base_args())
+
+        mock_resolve.assert_called_once_with([FAMILY, ".torch_backend-cu118"])
+        mock_prefix.assert_called_once_with([FAMILY, ".torch_backend-cu118"])

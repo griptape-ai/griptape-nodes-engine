@@ -10,6 +10,22 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
+  Pointing `GTN_REZ_BIN_PATH` at Rez's tools turns it on: libraries listed as `REZ:<package>` in
+  `libraries_to_register` load from the packages Rez can resolve, each library's worker runs in its
+  own `rez env`, and the engine creates no library venvs and downloads no libraries. When Rez is
+  configured but cannot start, the engine says why at startup.
+- The `build-engine-package`, `build-library-package`, and `write-launch-package` commands (in
+  `griptape_nodes.cli.commands.rez`) build the engine, a node library, and the `griptape_launch`
+  package as Rez packages. Builds from several platforms into one shared store add each
+  platform's variant, and `build-library-package --torch-backend` builds several GPU builds of
+  torch at once.
+- On a Rez workstation, the engine picks the GPU build of torch its NVIDIA driver supports. A
+  library that needs torch does not load when no build fits the workstation, and the library list
+  says why.
+
 ## [0.102.0] - 2026-09-24
 
 ### Added
@@ -17,13 +33,6 @@ the engine's request API from working without edits. Migration steps live in
 - Libraries can list heavy packages under `pip_dependencies_exec` in their manifest. Those install
   into a separate `.venv-exec` and load only in the library's own process, where its nodes run, so
   libraries with clashing heavy pins can be installed side by side.
-- The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
-  Setting `GTN_REZ_ROOT` turns it on: libraries listed as `REZ:<package>` in
-  `libraries_to_register` load from the Rez package store, each library's worker runs in its own
-  `rez env`, and the engine creates no library venvs and downloads no libraries.
-- `gtn rez build-engine-package` and `gtn rez build-library-package` build the engine or a node
-  library, with every pip dependency, as Rez packages. Both stop with a warning when the store is
-  missing the `platform`, `os`, or `python` packages that `rez bind` creates.
 - A node in a library that runs isolated in a worker can hand an unserializable value, such as a
   diffusers pipeline or a latent tensor, to the next node. Mark the producing output
   `serializable=False` and the engine holds the object in the worker, sending an opaque key in its
