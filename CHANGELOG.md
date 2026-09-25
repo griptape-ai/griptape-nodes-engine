@@ -24,6 +24,10 @@ the engine's request API from working without edits. Migration steps live in
   `GetVariablesRequest`, and `ListVariablesRequest`. A value sent in the same form to
   `SetParameterValueRequest` or `SetVariableValueRequest` is set with that exact type. See
   [Parameter values](docs/guides/mcp/external_clients.md#parameter-values).
+- **Breaking:** In `SerializeFlowToCommandsResultSuccess` and
+  `ExtractFlowCommandsFromImageMetadataResultSuccess`, each node's `element_modification_commands`
+  lists `{"request_type": ..., "request": {...}}` entries, the form `EventRequestBatch` takes,
+  instead of each request's fields alone, so each request reads back as its own type.
 - Saved workflow files store parameter values as readable data instead of pickle, and saving an
   unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
   by earlier versions still open. A workflow saved by this version does not open in earlier ones.
@@ -41,6 +45,9 @@ the engine's request API from working without edits. Migration steps live in
   an artifact comes back as the artifact.
 - Parameter values recorded in an image's workflow provenance name their type when JSON has none,
   the same way the request API sends them.
+- A class in a request field typed `type`, such as `RegisterArtifactProviderRequest.provider_class`,
+  is sent as `module:Qualname` instead of `module.Qualname`, the form parameter values name
+  classes by.
 
 ### Deprecated
 
@@ -52,6 +59,9 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- `DeserializeFlowFromCommandsRequest` and `SaveWorkflowFileFromSerializedFlowRequest` sent as JSON
+  read their nested node, connection, and parameter commands back as commands, instead of as plain
+  dicts the request could not use.
 - Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
   the same types, instead of as plain dicts.
 - A loop or subflow run in a separate process no longer hands back one parameter's value in place
@@ -63,6 +73,16 @@ the engine's request API from working without edits. Migration steps live in
   whose class belongs to a library the receiving process does not load still arrives as a dict, and
   reaches the next process that does load it unchanged.
   [#4475](https://github.com/griptape-ai/griptape-nodes-engine/issues/4475)
+- A request with a field typed `type`, such as `RegisterArtifactProviderRequest`, reads back from
+  JSON into the class it names, instead of failing.
+  [#5437](https://github.com/griptape-ai/griptape-nodes-engine/issues/5437)
+- `ScanSequencesResultFailure`, `ListDirectoryResultFailure`, `ListDirectorySequencesResultFailure`,
+  and `DeduceSequencesFromFileListResultFailure` read back from JSON with their `failure_reason`,
+  instead of failing because it may come from either of two enums.
+  [#5438](https://github.com/griptape-ai/griptape-nodes-engine/issues/5438)
+- `UpdateAgentProviderRequest` sent as JSON with only some provider fields set reads back with just
+  those fields, instead of failing validation on the ones left out.
+  [#5439](https://github.com/griptape-ai/griptape-nodes-engine/issues/5439)
 
 ## [0.102.0] - 2026-09-24
 
