@@ -70,12 +70,13 @@ data on a declared parameter is still sent as data**:
 | a `dict` of numbers, a list of strings | the value                    | already data                                                               |
 | an `ImageUrlArtifact`                  | a key; the object stays here | see below                                                                  |
 
-That last row surprises people. An artifact a library defines itself unstructures
-into a dict of its fields and loses its payload on the way, so the engine will not
-gamble on a round trip: if you declared the parameter, your object is held. If you
-want an artifact to travel as data — which is usually what you want for anything
-with a URL in it — **do not declare the parameter**. Undeclared artifacts serialize
-and rehydrate exactly as they always have.
+That last row surprises people. Only a value that is already plain data, such as
+text, numbers, and lists and dicts of them, travels as data on a declared parameter.
+An artifact is an object, so if you declared the parameter, your artifact is held. If
+you want an artifact to travel as data — which is usually what you want for anything
+with a URL in it — **do not declare the parameter**. Undeclared artifacts cross as
+plain data and arrive as the same class, including artifact classes a library defines
+itself (see [Parameter Values](parameters.md#parameter-values)).
 
 ## Reusing an expensive resource across runs
 

@@ -13,7 +13,6 @@ from griptape.artifacts.image_url_artifact import ImageUrlArtifact
 from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
-from griptape_nodes.common.parameter_hydration import hydrate_value
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
@@ -164,9 +163,7 @@ class PublicArtifactUrlParameter:
         # the already-public pass-through below.
         self.gtc_file_path = None
 
-        # Parameter values that crossed a JSON boundary (orchestrator <-> worker, workflow load)
-        # arrive as serialized artifact dicts; rehydrate them back into artifacts first.
-        parameter_value = hydrate_value(self._node.get_parameter_value(self._parameter.name))
+        parameter_value = self._node.get_parameter_value(self._parameter.name)
 
         # An upstream failure propagates as an ErrorArtifact. Surface the original error
         # instead of masking it with an AttributeError further down.
@@ -177,7 +174,12 @@ class PublicArtifactUrlParameter:
             )
             raise RuntimeError(msg)  # noqa: TRY004 the upstream failure is a runtime error, not a type error.
 
-        url = parameter_value.value if isinstance(parameter_value, UrlArtifact) else parameter_value
+        url: Any = parameter_value
+        if isinstance(parameter_value, UrlArtifact):
+            url = parameter_value.value
+        elif isinstance(parameter_value, dict):
+            # The editor sets artifact parameters to artifact-shaped dicts.
+            url = parameter_value.get("value")
 
         # check if the URL is already public
         if url.startswith(("http://", "https://")) and "localhost" not in url:
