@@ -143,6 +143,7 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
 from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 from griptape_nodes.utils.budget_refusal import refusal_from_exception
 
@@ -527,7 +528,14 @@ class AgentManager(EngineScoped):
 
         Either way the bare text is "Forbidden", which reads like a bug rather
         than a decision. Every other error keeps its original text.
+
+        A tool that recognized the refusal itself has already worded and logged
+        it, so its halt is handed back as written rather than logged twice.
         """
+        halt = budget_halt_message(exc)
+        if halt is not None:
+            return halt
+
         if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
             return str(exc)
 

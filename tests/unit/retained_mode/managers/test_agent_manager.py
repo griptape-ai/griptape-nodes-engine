@@ -8,6 +8,7 @@ the real config system.
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -101,6 +102,9 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, refusal_from_body
+from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
@@ -1247,6 +1251,35 @@ class TestExplainAgentRunError:
         message = providers_manager._explain_agent_run_error(exc, "my-ollama")
 
         assert "not entitled" not in message
+
+    def test_budget_refusal_is_explained_as_a_halt(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A chat refusal arrives as a raw 403; the artist should read which budget refused it.
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body=a_refusal_body())
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
+
+        assert message.startswith(BUDGET_HALT_PREFIX)
+        assert "tight" in message
+        assert len(caplog.records) == 1
+
+    def test_a_halt_a_tool_already_worded_is_not_logged_again(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The image tool logs its refusal before raising, and pydantic-ai may wrap what it raised.
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+        wrapped = RuntimeError("tool call failed")
+        wrapped.__cause__ = halt
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(wrapped, "griptape_cloud")
+
+        assert message == str(halt)
+        assert caplog.records == []
 
 
 _CLOUD_HOST = "cloud.griptape.ai"

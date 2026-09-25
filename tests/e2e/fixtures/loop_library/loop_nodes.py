@@ -21,6 +21,9 @@ from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
 class StartFlow(StartNode):
     """The packaged body's entry node."""
 
+    def process(self) -> None:
+        pass
+
 
 class EndFlow(EndNode):
     """The packaged body's exit node."""
@@ -66,9 +69,25 @@ class LoopEndNode(BaseIterativeEndNode):
 
 
 class LoopStartNode(BaseIterativeStartNode):
-    """Iterates a fixed three-item list, so no input wiring is needed to have a total."""
+    """Iterates a fixed three-item list, so no input wiring is needed to have a total.
+
+    Runs its iterations concurrently unless ``run_in_order`` is set, which is the parameter the
+    node executor reads to choose between the two.
+    """
 
     ITEMS = ("first", "second", "third")
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(
+            Parameter(
+                name="run_in_order",
+                tooltip="Run the iterations one at a time instead of all at once",
+                type="bool",
+                default_value=False,
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
 
     @classmethod
     def _get_compatible_end_classes(cls) -> set[type]:
