@@ -94,8 +94,7 @@ across the top of the canvas naming the node that was stopped and the
 budget that stopped it:
 
 > Budget stopped this run. 'Generate Poster' was blocked by the budget
-> "Marketing Q3". Raise its limit, or wait for it to reset at the start of
-> next month.
+> "Marketing Q3". Contact your Griptape administrator.
 
 Click **✕** on the bar to close it. It also closes on its own when you run
 the workflow again.
@@ -110,17 +109,15 @@ A few things worth knowing:
     before each call goes out, so a call that was already running when the
     budget filled up finishes and is billed.
 - **More than one budget can refuse the same call.** When that happens the
-    bar names every one of them, because raising just the first still
-    leaves the run blocked.
+    bar names every one of them, so your administrator can make room in all
+    of them at once.
 
 To see how much a budget has spent and how much room it has left, open its
 page on Griptape Cloud. A budget marked *(frozen)* refuses every call no
-matter how many credits are left, so only an administrator lifting the
-freeze will let the run through.
+matter how many credits are left, until an administrator lifts the freeze.
 
-Budgets are set and raised on Griptape Cloud, not in the editor. If you
-don't administer your organization's budgets, the budget name in the
-message is what to bring to whoever does.
+Budgets are set, raised and unfrozen on Griptape Cloud, not in the editor.
+Bring the budget names from the bar to your Griptape administrator.
 
 ## Reading execution state on the canvas
 

@@ -19,9 +19,11 @@ model so an engine/Cloud disagreement is diagnosable from a log rather than a
 screenshot.
 
 **Names, not figures.** The halt is short enough to read at a glance in the
-editor's Run blocked bar: which node, which budgets, and what to do. The credit
-figures stay on the budget page, where they are current, and in
-:func:`log_line`, where an administrator can recover them later.
+editor's Run blocked bar: which node, which budgets, and who to contact. Budgets
+are raised and unfrozen on Griptape Cloud, usually by someone other than the
+artist, so every halt sends them to their administrator. The credit figures stay
+on the budget page, where they are current, and in :func:`log_line`, where that
+administrator can recover them later.
 """
 
 from __future__ import annotations
@@ -56,24 +58,12 @@ all that survives. Rewording it silently turns a budget halt back into a generic
 error; a round-trip test pins it.
 """
 
-_RESET_PHRASES = {
-    "DAILY": "tomorrow",
-    "WEEKLY": "at the start of next week",
-    "MONTHLY": "at the start of next month",
-    "YEARLY": "at the start of next year",
-}
-"""How to say each reset period to someone who did not configure the budget.
+_REMEDY = "Contact your Griptape administrator."
+"""The closing sentence of every halt.
 
-Cloud sends enum tokens (``MONTHLY``), which would reach the artist as "wait for
-the MONTHLY budget to reset". A period absent from this map -- including one
-Cloud adds later -- degrades to vaguer prose rather than leaking its token.
-
-``LIFETIME`` is deliberately absent: it never resets, and telling someone to wait
-for a reset that will not come sends them to watch an unchanging dashboard. It
-selects a different closing sentence instead.
+Whether a budget is exhausted, frozen, or set to zero, the fix is on Griptape
+Cloud, so the artist's next step is the same person every time.
 """
-
-_LIFETIME_PERIOD = "LIFETIME"
 
 _MISSING = object()
 """Sentinel for "this exception has no body at all", which None does not say.
@@ -233,8 +223,8 @@ def describe(refusal: BudgetRefusal, *, node_name: str | None = None) -> str:
         node_name: The node whose call was refused, when known.
 
     Returns:
-        A short message naming the node, every budget that refused, and what the
-        artist can do about it.
+        A short message naming the node and every budget that refused, and sending
+        the artist to their administrator.
     """
     if node_name:
         subject = f"'{node_name}'"
@@ -242,14 +232,10 @@ def describe(refusal: BudgetRefusal, *, node_name: str | None = None) -> str:
         subject = "The next call"
 
     if len(refusal.budgets) == 1:
-        budget = refusal.budgets[0]
-        return f"{BUDGET_HALT_PREFIX} {subject} was blocked by the budget {_label(budget)}. {_remedy(budget)}"
-
-    names = _joined([_label(budget) for budget in refusal.budgets])
-    return (
-        f"{BUDGET_HALT_PREFIX} {subject} was blocked by the budgets {names}. "
-        "Each one needs room before the run can go through."
-    )
+        blocked_by = f"the budget {_label(refusal.budgets[0])}"
+    else:
+        blocked_by = f"the budgets {_joined([_label(budget) for budget in refusal.budgets])}"
+    return f"{BUDGET_HALT_PREFIX} {subject} was blocked by {blocked_by}. {_REMEDY}"
 
 
 def log_line(refusal: BudgetRefusal) -> str:
@@ -487,22 +473,6 @@ def _label(budget: BlockedBudget) -> str:
     if budget.frozen:
         return f'"{budget.budget_name}" (frozen)'
     return f'"{budget.budget_name}"'
-
-
-def _remedy(budget: BlockedBudget) -> str:
-    """Say what the artist can do about this budget."""
-    if budget.frozen:
-        return "Ask your Griptape administrator to unfreeze it."
-    # A zero limit blocks every call under it by design, so waiting for it to
-    # reset only produces the same refusal on a later day.
-    if budget.limit_credits == 0:
-        return "Raise its limit, or ask your Griptape administrator to."
-    if budget.reset_period == _LIFETIME_PERIOD:
-        return "Raise its limit - it does not reset on its own."
-    reset_phrase = _RESET_PHRASES.get(budget.reset_period or "")
-    if reset_phrase is None:
-        return "Raise its limit, or wait for it to reset."
-    return f"Raise its limit, or wait for it to reset {reset_phrase}."
 
 
 def _joined(names: list[str]) -> str:

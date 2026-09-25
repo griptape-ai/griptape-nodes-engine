@@ -429,7 +429,7 @@ class TestTheMessage:
 
         assert message == (
             f"{BUDGET_HALT_PREFIX} 'Generate Poster' was blocked by the budget \"tight\". "
-            "Raise its limit, or wait for it to reset at the start of next month."
+            "Contact your Griptape administrator."
         )
 
     def test_it_never_shows_dollars(self) -> None:
@@ -453,7 +453,7 @@ class TestTheMessage:
 
         assert message == (
             f"{BUDGET_HALT_PREFIX} 'Generate Poster' was blocked by the budgets "
-            '"tight", "daily cap" and "Star Wars X". Each one needs room before the run can go through.'
+            '"tight", "daily cap" and "Star Wars X". Contact your Griptape administrator.'
         )
 
     def test_two_budgets_join_without_a_comma(self) -> None:
@@ -473,36 +473,32 @@ class TestTheMessage:
 
         assert describe(refusal).startswith(f"{BUDGET_HALT_PREFIX} The next call was blocked by the budget")
 
-    def test_a_frozen_budget_is_not_told_to_wait_or_raise(self) -> None:
-        """Frozen refuses at any headroom, so both ordinary remedies are wrong."""
+    def test_a_frozen_budget_is_marked(self) -> None:
+        """Frozen refuses at any headroom, so the page's credits left would otherwise puzzle."""
         refusal = refusal_from_body(a_refusal_body(a_rejection(frozen=True, remaining_credits=10_000)))
         assert refusal is not None
 
+        assert '"tight" (frozen)' in describe(refusal)
+
+    @pytest.mark.parametrize(
+        "rejection",
+        [
+            a_rejection(),
+            a_rejection(frozen=True, remaining_credits=10_000),
+            a_rejection(limit_credits=0, spent_credits=0, remaining_credits=0),
+            a_rejection(reset_period="LIFETIME"),
+        ],
+        ids=["exhausted", "frozen", "zero-limit", "lifetime"],
+    )
+    def test_every_halt_sends_the_artist_to_their_administrator(self, rejection: dict[str, Any]) -> None:
+        """Budgets are changed on Griptape Cloud, so the next step is always the same person."""
+        refusal = refusal_from_body(a_refusal_body(rejection))
+        assert refusal is not None
+
         message = describe(refusal)
 
-        assert '"tight" (frozen)' in message
-        assert "unfreeze" in message
+        assert message.endswith("Contact your Griptape administrator.")
         assert "Raise" not in message
-        assert "wait for" not in message
-
-    def test_a_zero_limit_budget_is_not_told_to_wait_for_a_reset(self) -> None:
-        """Zero is Cloud's documented block-everything idiom; the reset changes nothing."""
-        refusal = refusal_from_body(a_refusal_body(a_rejection(limit_credits=0, spent_credits=0, remaining_credits=0)))
-        assert refusal is not None
-
-        message = describe(refusal)
-
-        assert "Raise its limit" in message
-        assert "wait for" not in message
-
-    def test_a_lifetime_budget_is_not_waited_out(self) -> None:
-        """A LIFETIME budget never resets; sending someone to watch the dashboard is cruel."""
-        refusal = refusal_from_body(a_refusal_body(a_rejection(reset_period="LIFETIME")))
-        assert refusal is not None
-
-        message = describe(refusal)
-
-        assert "does not reset on its own" in message
         assert "wait for" not in message
 
     @pytest.mark.parametrize("period", [*RESET_PERIODS, "FORTNIGHTLY"])
