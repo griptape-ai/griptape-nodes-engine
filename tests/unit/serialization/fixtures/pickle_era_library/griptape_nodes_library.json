@@ -1,0 +1,35 @@
+{
+  "name": "Pickle Era Fixture Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Nodes and value types for the pickle-era format fixtures",
+    "library_version": "0.1.0",
+    "engine_version": "0.102.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "LegacyValuesNode",
+      "file_path": "legacy_values_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Holds one any-typed parameter per fixture value",
+        "display_name": "Legacy Values"
+      }
+    }
+  ]
+}

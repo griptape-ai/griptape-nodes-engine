@@ -112,6 +112,7 @@ line-length = 120
 extend-exclude = [
   "libraries/**/templates/*.py",
   "tests/e2e/fixtures/**/*_workflow.py",
+  "tests/unit/**/fixtures/**/*_workflow.py",
 ]
 
 
@@ -232,6 +233,7 @@ exclude = [
   # Engine-generated workflow files. The generator emits untyped request/result chains, so these are
   # checked by running them, not by pyright.
   "tests/e2e/fixtures/**/*_workflow.py",
+  "tests/unit/**/fixtures/**/*_workflow.py",
   ".venv",
   "GriptapeNodes",
   "**/node_modules",
