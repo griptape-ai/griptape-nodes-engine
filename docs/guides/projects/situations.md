@@ -83,6 +83,45 @@ sub_dirs="lighting/pass_a", node_name="ImageGen", file_name_base="render", file_
 → outputs/lighting/pass_a/ImageGen_render.exr
 ```
 
+### `save_output_directory`
+
+```
+macro:  {outputs}/{sub_dirs?:/}{dir_name}_v{###}
+policy: create_new, create_dirs: true
+```
+
+Used when a node writes its output into a folder instead of a single file. Each run creates a new numbered folder, so earlier results are never overwritten. The number counts up from the highest version already on disk and fills any gaps.
+
+**Example:**
+
+```
+dir_name="renders"
+→ outputs/renders_v001      (first run)
+→ outputs/renders_v002      (second run)
+```
+
+### `save_file_sequence`
+
+```
+macro:  {outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}
+policy: create_new, create_dirs: true
+```
+
+Used when a node writes a numbered series of files, such as frames extracted from a video. Each run gets its own version folder, and the frames inside it are numbered separately.
+
+The two sets of `#` marks do different jobs. `{###}` inside braces is the version number of the folder. The bare `####` outside braces is where each frame's number goes. Only one `{###}` is allowed in a macro, so use the bare form for frame numbers. See [Sequences](sequences.md) for more on frame numbering.
+
+**Example:**
+
+```
+file_name_base="frames", file_extension="png"
+→ outputs/images/frames_v001/frames.0001.png
+→ outputs/images/frames_v001/frames.0002.png
+→ outputs/images/frames_v002/frames.0001.png   (second run)
+```
+
+Both situations come with the current project template. Projects created from the legacy template don't include them, so nodes use a built-in macro that produces the same layout.
+
 ### `save_preview`
 
 ```

@@ -28,6 +28,19 @@ the engine's request API from working without edits. Migration steps live in
 - A library whose isolated process shuts down before loading it now reports that as soon as the
   process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
   load that never finished.
+- Creating a versioned output folder or file sequence in a project no longer fails with "requires
+  at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
+  `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
+  callers only supply their own variables.
+
+### Added
+
+- Projects have two new situations for versioned output folders. `save_output_directory` creates
+  `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
+  run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
+  use them through `ProjectDirectoryParameter` and `ProjectFileSequenceParameter`. Projects on
+  the legacy template fall back to the same layout. See
+  [Situations](https://docs.griptapenodes.com/en/stable/guides/projects/situations/#save_output_directory).
 
 ## [0.102.0] - 2026-09-24
 
