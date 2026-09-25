@@ -1,5 +1,16 @@
 # Unreleased
 
+## `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
+
+Rename the key in any config file or environment that sets it; the environment variable is
+`GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`. The old name is not read, so a setting left behind
+silently reverts to the 600 second default.
+
+What the value bounds is unchanged: how long a worker may take to load its library, covering the boot
+wait for worker libraries, a node waiting for its library's worker, and a project switch waiting for
+each worker to adopt it. It no longer delays heartbeat enforcement, which is what the old name
+suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
+
 ## `serializable=False` outputs are held in their own process across a worker boundary
 
 `Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it
