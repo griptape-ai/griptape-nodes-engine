@@ -40,8 +40,7 @@ These values make the trip and arrive as the same type:
 - tuples, named tuples, sets, `bytes`, and dicts with keys that aren't text
 - enums, `pathlib` paths, dates and times, `timedelta`, `UUID`, and `Decimal`
 - pydantic models, dataclasses, and attrs classes, rebuilt from the fields their constructor takes
-- griptape objects such as artifacts and rulesets, and any class with a `to_dict()` method and a
-    `from_dict()` classmethod
+- griptape objects such as artifacts and rulesets
 
 For any other class, add a `to_state()` method that returns the values above, and a
 `from_state()` classmethod that rebuilds the object from them:
