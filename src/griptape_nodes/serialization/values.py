@@ -35,6 +35,7 @@ from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 import attrs
+from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.serialization.type_names import TypeNameError, resolve_type_name, type_name
@@ -365,17 +366,17 @@ class _PydanticAdapter:
         return cls.model_validate(state)  # pyright: ignore[reportAttributeAccessIssue]
 
 
-class _DictMethodsAdapter:
-    """Classes with ``to_dict()`` and a ``from_dict(data)`` classmethod, such as griptape's artifacts."""
+class _GriptapeAdapter:
+    """Griptape objects such as artifacts and rulesets."""
 
     def claims(self, cls: type) -> bool:
-        return callable(getattr(cls, "to_dict", None)) and _is_classmethod(cls, "from_dict")
+        return issubclass(cls, SerializableMixin)
 
-    def to_state(self, value: Any) -> Any:
+    def to_state(self, value: SerializableMixin) -> Any:
         return value.to_dict()
 
-    def from_state(self, cls: type, state: Any) -> Any:
-        return cls.from_dict(state)  # pyright: ignore[reportAttributeAccessIssue]
+    def from_state(self, cls: type[SerializableMixin], state: Any) -> Any:
+        return cls.from_dict(state)
 
 
 class _FieldsAdapter:
@@ -412,7 +413,7 @@ _adapters: list[ValueAdapter] = [
     _TextFormAdapter(),
     _NamedTupleAdapter(),
     _PydanticAdapter(),
-    _DictMethodsAdapter(),
+    _GriptapeAdapter(),
     _FieldsAdapter(),
 ]
 
