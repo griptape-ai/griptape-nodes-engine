@@ -38,8 +38,8 @@ bottom-left gives you zoom in/out/fit-view buttons and a **Toggle
 Clean Mode** button that hides the decorative Griptape logo watermark
 — useful when you're taking a screenshot of your own workflow.
 
-Double-clicking empty canvas opens the **Add Node** menu at your
-cursor. See [Working with Nodes](working_with_nodes.md) for everything
+Press `Tab` with your cursor over the canvas to open the **Add Node**
+menu at your cursor. See [Working with Nodes](working_with_nodes.md) for everything
 you can do with a node once it's placed, and
 [Keyboard Shortcuts](keyboard_shortcuts.md) for the full list of
 canvas shortcuts.
@@ -120,8 +120,8 @@ on:
 
 Everything configurable, grouped under a **Settings** submenu (All
 Settings, Agent Settings, Editor Settings, Theme Settings, Engine
-Settings, File System, Libraries, Library Settings, MCP Servers, and
-API Keys & Secrets), plus three actions below it: **Copy Path to
+Settings, File System, Libraries, Library Settings, MCP Servers,
+API Keys & Secrets, and [Beta Features](beta_features.md)), plus three actions below it: **Copy Path to
 Settings** (copies the settings file's path to your clipboard),
 **Show Settings Folder** (opens it in Finder/Explorer/your file
 manager), and **Reset Settings to Default**.

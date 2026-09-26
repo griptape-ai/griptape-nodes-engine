@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
-from griptape_nodes.exe_types.variable_resolver import _aprocess_variable_cache
+from griptape_nodes.exe_types.variable_resolver import VariableResolver, _aprocess_variable_cache
 from griptape_nodes.retained_mode.events.base_events import ProgressEvent
 from griptape_nodes.retained_mode.events.connection_events import (
     IncomingConnection,
@@ -1037,3 +1037,112 @@ class TestOptionalVariableSubstitution:
             value = node.get_parameter_value("text")
 
         assert value == "Hello {name}"
+
+
+class TestResolveValueIdentity:
+    """What `resolve_value` returns when it has nothing to rewrite, and how it handles cycles.
+
+    Output parameter writes run every dict and list through this, so rebuilding one that needs no
+    substitution both loses the container's identity and copies it for nothing.
+    """
+
+    def test_an_unchanged_list_is_returned_unchanged(self) -> None:
+        value = [object(), "no macro here"]
+
+        assert VariableResolver.resolve_value(value, {"VAR": "x"}) is value
+
+    def test_an_unchanged_dict_is_returned_unchanged(self) -> None:
+        value = {"a": object(), "b": "plain"}
+
+        assert VariableResolver.resolve_value(value, {"VAR": "x"}) is value
+
+    def test_a_nested_container_that_needs_nothing_keeps_its_identity(self) -> None:
+        inner = [object()]
+        value = {"inner": inner}
+
+        resolved = VariableResolver.resolve_value(value, {"VAR": "x"})
+
+        assert resolved is value
+        assert resolved["inner"] is inner
+
+    def test_a_list_holding_a_macro_is_still_substituted(self) -> None:
+        value = ["{VAR}", "untouched"]
+
+        resolved = VariableResolver.resolve_value(value, {"VAR": "replaced"})
+
+        assert resolved is not value
+        assert resolved == ["replaced", "untouched"]
+
+    def test_a_dict_holding_a_macro_is_still_substituted(self) -> None:
+        value = {"a": "{VAR}", "b": "untouched"}
+
+        resolved = VariableResolver.resolve_value(value, {"VAR": "replaced"})
+
+        assert resolved is not value
+        assert resolved == {"a": "replaced", "b": "untouched"}
+
+    def test_a_self_referential_list_terminates(self) -> None:
+        """Raised RecursionError before, which reached the artist as a node that failed to run."""
+        value: list = [object()]
+        value.append(value)
+
+        resolved = VariableResolver.resolve_value(value, {"VAR": "x"})
+
+        assert resolved is value
+
+    def test_a_mutually_referential_pair_terminates(self) -> None:
+        left: dict = {}
+        right: dict = {"left": left}
+        left["right"] = right
+
+        assert VariableResolver.resolve_value(left, {"VAR": "x"}) is left
+
+    def test_a_self_referential_container_holding_a_macro_still_substitutes(self) -> None:
+        value: list = ["{VAR}"]
+        value.append(value)
+
+        resolved = VariableResolver.resolve_value(value, {"VAR": "replaced"})
+
+        assert resolved is not value
+        assert resolved[0] == "replaced"
+        # The cycle is handed back as the original container rather than walked again.
+        assert resolved[1] is value
+
+
+class TestPredicateWalksSurviveCycles:
+    """The predicates walk the same shapes `resolve_value` does, so they need the same guard.
+
+    A self-referential value used to die at the output write, so these walks were never reached
+    with one. Now that the write survives it, the value can reach them.
+    """
+
+    def test_contains_variable_macro_terminates_on_a_self_referential_list(self) -> None:
+        value: list = ["plain"]
+        value.append(value)
+
+        assert VariableResolver.contains_variable_macro(value) is False
+
+    def test_contains_variable_macro_still_finds_a_macro_past_a_cycle(self) -> None:
+        value: list = ["{VAR}"]
+        value.append(value)
+
+        assert VariableResolver.contains_variable_macro(value) is True
+
+    def test_contains_variable_macro_terminates_on_a_mutually_referential_pair(self) -> None:
+        left: dict = {}
+        right: dict = {"left": left}
+        left["right"] = right
+
+        assert VariableResolver.contains_variable_macro(left) is False
+
+    def test_would_substitute_terminates_on_a_self_referential_list(self) -> None:
+        value: list = ["plain"]
+        value.append(value)
+
+        assert VariableResolver.would_substitute(value, {"VAR": "x"}) is False
+
+    def test_would_substitute_still_finds_a_rewrite_past_a_cycle(self) -> None:
+        value: list = ["{VAR}"]
+        value.append(value)
+
+        assert VariableResolver.would_substitute(value, {"VAR": "x"}) is True

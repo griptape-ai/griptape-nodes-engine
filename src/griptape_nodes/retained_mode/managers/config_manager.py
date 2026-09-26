@@ -8,8 +8,20 @@ from typing import Any, Literal, NamedTuple
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
 
+from griptape_nodes.common.log_capture import (
+    DEFAULT_BUFFER_LINES,
+    DEFAULT_RETENTION_DAYS,
+    configure_diagnostic_logging,
+    resolve_log_directory,
+)
 from griptape_nodes.files.path_utils import resolve_workspace_path
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
+from griptape_nodes.retained_mode.beta_features import (
+    BetaFeature,
+    get_beta_feature,
+    is_beta_enabled,
+    list_beta_features,
+)
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -37,6 +49,11 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueResultSuccess,
     GetWorkspaceRequest,
     GetWorkspaceResultSuccess,
+    IsBetaFeatureEnabledRequest,
+    IsBetaFeatureEnabledResultFailure,
+    IsBetaFeatureEnabledResultSuccess,
+    ListBetaFeaturesRequest,
+    ListBetaFeaturesResultSuccess,
     ResetConfigRequest,
     ResetConfigResultFailure,
     ResetConfigResultSuccess,
@@ -59,10 +76,16 @@ from griptape_nodes.retained_mode.events.os_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
+    BETA_FEATURES_FROM_ENV_CONTEXT,
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
+    LOG_DIRECTORY_KEY,
+    LOG_RETENTION_DAYS_KEY,
+    LOG_TO_FILE_KEY,
+    SESSION_LOG_BUFFER_LINES_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
+    LogLevel,
     Settings,
 )
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
@@ -244,6 +267,28 @@ class _LayerProbe(NamedTuple):
     path: Path | None
 
 
+class _LoggingSettings(NamedTuple):
+    """Everything the shared logger and its diagnostic sinks are configured from.
+
+    One value so a config reload can tell whether any of it changed; otherwise every reload
+    would re-scan the log directory for files to age out.
+
+    Attributes:
+        log_level: Verbosity of the ``griptape_nodes`` logger, which bounds what any
+            sink can receive.
+        buffer_lines: Lines of this session held in memory. Zero disables the buffer.
+        log_to_file: Whether a rotating log file is written.
+        log_directory: Resolved directory that file holds.
+        retention_days: How long log files are kept. Zero keeps them forever.
+    """
+
+    log_level: str
+    buffer_lines: int
+    log_to_file: bool
+    log_directory: Path
+    retention_days: int
+
+
 class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
 
@@ -302,6 +347,8 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
+        # (file, key) pairs already reported as dotted. Files are re-read on every load_configs().
+        self._reported_dotted_keys: set[tuple[Path, str]] = set()
         # The GTN_CONFIG_ variable each env-layer key came from, recorded by load_configs as the
         # names are parsed and keyed by key segments. A name cannot be rebuilt from a config key:
         # segments are separated by ENV_VAR_PATH_SEPARATOR, so a rebuilt name is wrong for every
@@ -317,13 +364,13 @@ class ConfigManager(EngineScoped):
         # compute_*_provisioning_config previews, which read some other project's config and
         # would otherwise clobber the live layer's error.
         self._layer_parse_errors: dict[ConfigLayerName, str | None] = {}
+        # Set before the first load, because loading is what applies these.
+        self._applied_logging_settings: _LoggingSettings | None = None
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
         # this cannot live in load_configs().
         self._publish_default_libraries_root()
-
-        self._set_log_level(self.merged_config.get("log_level", logging.INFO))
 
         # Store event manager reference for broadcasting config change events
         self._event_manager = event_manager
@@ -347,6 +394,12 @@ class ConfigManager(EngineScoped):
                 GetConfigSchemaRequest, self.on_handle_get_config_schema_request
             )
             event_manager.assign_manager_to_request_type(ResetConfigRequest, self.on_handle_reset_config_request)
+            event_manager.assign_manager_to_request_type(
+                ListBetaFeaturesRequest, self.on_handle_list_beta_features_request
+            )
+            event_manager.assign_manager_to_request_type(
+                IsBetaFeatureEnabledRequest, self.on_handle_is_beta_feature_enabled_request
+            )
 
     @property
     def workspace_path(self) -> Path:
@@ -365,6 +418,21 @@ class ConfigManager(EngineScoped):
             path: The path to set as the base file path.
         """
         self._workspace_path = str(Path(path).expanduser().resolve())
+
+    @property
+    def log_directory(self) -> Path:
+        """Directory the engine's log files are written to.
+
+        Resolved from ``logging.log_directory``, empty meaning the default. A property so a
+        report of where logs go and the sink that puts them there cannot disagree.
+
+        Read with secret expansion off: this runs while the ``ConfigManager`` is being built,
+        before there is a secrets manager to ask, so a directory written as ``$LOG_DIR`` would
+        take the engine down at startup with no log to say why. A leading ``$`` is part of the name.
+        """
+        return resolve_log_directory(
+            self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str, should_load_env_var_if_detected=False)
+        )
 
     def set_workspace_override(self, path: Path | None, *, supplied_by_config: bool = False) -> None:
         """Set a runtime workspace directory override.
@@ -964,7 +1032,7 @@ class ConfigManager(EngineScoped):
         candidate = set_dot_value({}, config_key, raw_value)
 
         try:
-            validated = Settings.model_validate(candidate)
+            validated = Settings.model_validate(candidate, context={BETA_FEATURES_FROM_ENV_CONTEXT: True})
         except ValidationError:
             return _REJECTED_BAD_VALUE
 
@@ -1012,7 +1080,33 @@ class ConfigManager(EngineScoped):
             logger.error("Error parsing %s config file: %s", label, error)
             return LoadedConfigFile(contents={}, parse_error=error)
 
+        self._report_dotted_keys(loaded, path)
         return LoadedConfigFile(contents=loaded, parse_error=None)
+
+    def _report_dotted_keys(self, contents: dict, path: Path) -> None:
+        """Warn about top-level keys written in dotted form, once per file and key.
+
+        A flat `"worker.heartbeat_timeout_s"` key merges in beside the real `worker` object and is
+        never read, since `get_dot_value` descends by segment. `Settings` allows extra keys, so
+        validation can't catch it. Only top-level keys are checked: deeper mapping keys, such as
+        `project_workspaces` paths, may legitimately contain dots.
+        """
+        for key in contents:
+            if "." not in key:
+                continue
+            report_key = (path, key)
+            if report_key in self._reported_dotted_keys:
+                continue
+
+            self._reported_dotted_keys.add(report_key)
+            nested_form = json.dumps(set_dot_value({}, key, "..."))
+            logger.warning(
+                "Ignoring setting '%s' in %s: a config file must nest each part of the name, as %s. "
+                "The setting keeps its current value.",
+                key,
+                path,
+                nested_form,
+            )
 
     def _load_file_layer(self, layer: ConfigLayerName, path: Path | None, label: str) -> dict:
         """Load one file-backed config layer and record its parse error under `layer`.
@@ -1090,6 +1184,11 @@ class ConfigManager(EngineScoped):
             logger.error("Error validating config file: %s", e)
             self.merged_config = self.default_config
             self._merged_config_rejection = _MergedConfigRejection(paths=_offending_paths(e, merged_config))
+
+        # Last, from whatever config survived above: any config file can carry a logging setting,
+        # so applying these only on a user-config write would leave the engine logging somewhere
+        # other than it reports. Settings nested under `logging.` do not reach the flat env layer.
+        self._apply_logging_settings()
 
     def load_project_config(self, project_dir: Path) -> None:
         """Load the project-adjacent config from the given project directory and remerge all configs.
@@ -1383,9 +1482,7 @@ class ConfigManager(EngineScoped):
         old_value = self.get_config_value(key, should_load_env_var_if_detected=False)
 
         delta = set_dot_value({}, key, value)
-        if key == "log_level":
-            self._set_log_level(value)
-        elif key == "workspace_directory":
+        if key == "workspace_directory":
             self.workspace_path = value
         self.user_config = merge_dicts(self.merged_config, delta)
         write_succeeded = self._write_user_config_delta(delta)
@@ -1396,6 +1493,8 @@ class ConfigManager(EngineScoped):
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/437
+        # Reapplies the log level and sinks from the reloaded merged config rather than from
+        # `value`: logging is configured from several related settings at once.
         self.load_configs()
         logger.debug("Config value '%s' set to '%s'", key, value)
 
@@ -1456,6 +1555,10 @@ class ConfigManager(EngineScoped):
                     "file could not be written; see prior logs for the underlying I/O error."
                 )
                 return SetConfigCategoryResultFailure(result_details=result_details)
+
+            # Reloaded so the merged config, the workspace path, and the log sinks describe what was
+            # just written, instead of readers of `merged_config` reporting a config the engine is not on.
+            self.load_configs()
 
             result_details = "Successfully assigned the entire config dictionary."
 
@@ -1525,6 +1628,51 @@ class ConfigManager(EngineScoped):
         result_details = "Successfully returned the absolute workspace path."
         return GetWorkspaceResultSuccess(workspace_path=str(self.workspace_path), result_details=result_details)
 
+    def on_handle_list_beta_features_request(self, request: ListBetaFeaturesRequest) -> ResultPayload:  # noqa: ARG002
+        all_features = list(list_beta_features())
+        for library_name in LibraryRegistry.list_libraries():
+            all_features.extend(LibraryRegistry.get_library(library_name).get_beta_features().values())
+
+        features = [feature.model_dump(mode="json") for feature in all_features if not feature.is_expired()]
+        result_details = f"Successfully listed {len(features)} beta feature(s)."
+        return ListBetaFeaturesResultSuccess(features=features, result_details=result_details)
+
+    def on_handle_is_beta_feature_enabled_request(self, request: IsBetaFeatureEnabledRequest) -> ResultPayload:
+        feature: BetaFeature | None = None
+        if request.library_name is None:
+            feature = get_beta_feature(request.feature_id)
+            if feature is None:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}'. "
+                    "Failed because the engine has no beta feature with that id."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+        else:
+            try:
+                library = LibraryRegistry.get_library(request.library_name)
+            except LibraryRegistryError:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}' of library '{request.library_name}'. "
+                    "Failed because that library isn't loaded."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+
+            feature = library.get_beta_features().get(request.feature_id)
+            if feature is None:
+                details = (
+                    f"Attempted to check beta feature '{request.feature_id}' of library '{request.library_name}'. "
+                    "Failed because the library doesn't declare a valid beta feature with that id. "
+                    "Check the beta_features list in its library JSON."
+                )
+                return IsBetaFeatureEnabledResultFailure(result_details=details)
+
+        enabled = is_beta_enabled(feature, self)
+        state = "off"
+        if enabled:
+            state = "on"
+        result_details = f"Beta feature '{request.feature_id}' is {state}."
+        return IsBetaFeatureEnabledResultSuccess(enabled=enabled, result_details=result_details)
+
     def on_handle_get_config_schema_request(self, request: GetConfigSchemaRequest) -> ResultPayload:  # noqa: ARG002
         """Handle request to get the configuration schema with current values and library settings.
 
@@ -1572,8 +1720,8 @@ class ConfigManager(EngineScoped):
 
     def on_handle_reset_config_request(self, request: ResetConfigRequest) -> ResultPayload:  # noqa: ARG002
         try:
+            # Reloads, which reapplies the log level and sinks from the reset config.
             self.reset_user_config()
-            self._set_log_level(str(self.merged_config["log_level"]))
 
             result_details = "Successfully reset user configuration."
             # Reset is a full replacement; emit the same shape of ConfigChanged
@@ -2160,3 +2308,63 @@ class ConfigManager(EngineScoped):
         except (ValueError, AttributeError):
             logger.error("Invalid log level %s. Defaulting to INFO.", level)
             logger.setLevel(logging.INFO)
+
+    def _apply_logging_settings(self) -> None:
+        """Point the shared logger and its diagnostic sinks at what the config now says.
+
+        The one place logging is configured from, called at the end of every config load. Like
+        ``_set_log_level`` it reaches the process-wide logger, so the last engine to load a
+        config wins -- one logger, one answer to where its output goes.
+
+        Does nothing when nothing relevant changed, because every config write reloads and
+        re-applying would re-scan the log directory each time.
+        """
+        settings = self._resolve_logging_settings()
+        if settings == self._applied_logging_settings:
+            return
+
+        self._set_log_level(settings.log_level)
+        installed = configure_diagnostic_logging(
+            buffer_lines=settings.buffer_lines,
+            log_to_file=settings.log_to_file,
+            log_directory=settings.log_directory,
+            retention_days=settings.retention_days,
+        )
+
+        # Only recorded when the sinks actually installed. A failed log-file open is usually
+        # temporary (unmounted volume, fixable permissions), and marking the attempt done would
+        # stop the engine ever retrying.
+        if installed:
+            self._applied_logging_settings = settings
+
+    def _resolve_logging_settings(self) -> _LoggingSettings:
+        """Read the settings the logger and its sinks are built from.
+
+        Every one with secret expansion off, for the reason the ``log_directory`` property
+        gives: this runs inside ``ConfigManager.__init__``, before ``Engine.__init__`` has a
+        ``SecretsManager``, so expansion would raise ``AttributeError`` out of a constructor.
+        None of them is a credential -- a line count, a day count, a flag, and a directory.
+
+        Each is also coerced to the type this returns. ``load_configs`` validates against
+        ``Settings`` but keeps values as written, so ``"log_to_file": "false"`` would leave a
+        truthy *string* in the config and file logging on for a user who turned it off.
+        """
+        return _LoggingSettings(
+            log_level=str(self.merged_config.get("log_level", LogLevel.INFO.value)),
+            buffer_lines=self.get_config_value(
+                SESSION_LOG_BUFFER_LINES_KEY,
+                default=DEFAULT_BUFFER_LINES,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
+            log_to_file=self.get_config_value(
+                LOG_TO_FILE_KEY, default=True, cast_type=bool, should_load_env_var_if_detected=False
+            ),
+            log_directory=self.log_directory,
+            retention_days=self.get_config_value(
+                LOG_RETENTION_DAYS_KEY,
+                default=DEFAULT_RETENTION_DAYS,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
+        )

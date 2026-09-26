@@ -141,8 +141,14 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
             omitted.append(param.name)
             continue
 
-        value = node.get_parameter_value(param.name)
+        value = node._get_raw_parameter_value(param.name)
         if value is None:
+            continue
+        # A key into one process's memory is dead on reload, and this feeds image sidecar and PNG
+        # provenance, so it must not carry one. Reported alongside the deliberately excluded ones because
+        # the effect on the reader is the same: the value is not here.
+        if node.local_objects.contains_a_parked_object(value):
+            omitted.append(param.name)
             continue
 
         try:

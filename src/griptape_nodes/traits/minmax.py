@@ -18,12 +18,14 @@ class MinMax(Trait):
         self.min = min_val
         self.max = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["min", "max", "minmax", "min_max"]
+    def to_state(self) -> dict[str, Any]:
+        return {"min_val": self.min, "max_val": self.max}
 
-    def ui_options_for_trait(self) -> dict:
-        return {"multiline": True}
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "min_val" in state:
+            self.min = state["min_val"]
+        if "max_val" in state:
+            self.max = state["max_val"]
 
     def display_options_for_trait(self) -> dict:
         return {}

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+    from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -171,6 +172,7 @@ class Engine:
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
     _budget_manager: BudgetManager
+    _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
 
     def __init__(self) -> None:  # noqa: PLR0915
@@ -183,6 +185,7 @@ class Engine:
         from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
         from griptape_nodes.retained_mode.managers.event_manager import EventManager
         from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -217,7 +220,7 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
-        self._resource_manager = ResourceManager(self._event_manager)
+        self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
@@ -249,6 +252,7 @@ class Engine:
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
+        self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
         self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
@@ -367,6 +371,10 @@ class Engine:
         return self._budget_manager
 
     @property
+    def diagnostics_manager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
+
+    @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
 
@@ -458,6 +466,9 @@ class Engine:
 
     def BudgetManager(self) -> BudgetManager:
         return self._budget_manager
+
+    def DiagnosticsManager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
 
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager
@@ -573,6 +584,17 @@ class Engine:
                 context_manager.pop_node()
             context_manager.pop_flow()
         context_manager.pop_workflow()
+
+        # Every key referring to a held object lived on a node just deleted, so each entry would hold
+        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
+        #
+        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
+        # teardown shares: deleting the open workflow reaches this without going through that handler.
+        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
+        # workers about theirs.
+        dropped = self._resource_manager.drop_all_local_objects()
+        if dropped:
+            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:

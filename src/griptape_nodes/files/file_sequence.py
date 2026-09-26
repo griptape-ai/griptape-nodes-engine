@@ -15,9 +15,11 @@ import pathlib
 import typing
 
 from fileseq import constants as fileseq_constants
+from fileseq import exceptions as fileseq_exceptions
 from fileseq import filesequence as fileseq_filesequence
 
 from griptape_nodes.common import macro_parser, sequences
+from griptape_nodes.common.sequences import scan as sequences_scan
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file
@@ -34,6 +36,44 @@ class FileSequenceError(Exception):
     def __init__(self, result_details: str) -> None:
         self.result_details = result_details
         super().__init__(result_details)
+
+
+def strip_sequence_token(stem: str) -> str:
+    """Return stem with its embedded fileseq token removed, if any.
+
+    Used so a situation's own frame-number token isn't duplicated when the
+    artist's filename already carries one (e.g. ``"render_####"``) -- fileseq
+    and ``ScanSequencesRequest`` reject templates with more than one token.
+
+    Args:
+        stem: Filename stem (no extension) to inspect.
+
+    Returns:
+        stem unchanged if it has no sequence token; otherwise the basename fileseq
+        parsed out of it, minus the separator that sat before the token, since the
+        situation macro supplies its own (``"render_####"`` becomes ``"render"``).
+
+    Raises:
+        FileSequenceError: If stem contains more than one sequence token, or nothing
+            but a sequence token.
+    """
+    token_count = sequences_scan.count_sequence_tokens(stem)
+    if token_count == 0:
+        return stem
+    if token_count > 1:
+        msg = (
+            f"Attempted to build a file sequence name from '{stem}'. "
+            f"Failed because it contains {token_count} sequence tokens; only one is supported."
+        )
+        raise FileSequenceError(msg)
+    base = fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename().rstrip("._-")
+    if not base:
+        msg = (
+            f"Attempted to build a file sequence name from '{stem}'. "
+            "Failed because the name has no text besides the frame number. Add a name such as 'render_####'."
+        )
+        raise FileSequenceError(msg)
+    return base
 
 
 def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:
@@ -295,10 +335,17 @@ class FileSequenceDestination:
             if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
                 msg = f"Attempted to prepare sequence for writing. Failed to resolve macro path: {resolve_result.result_details}"
                 raise FileSequenceError(msg)
-            self._fseq = fileseq_filesequence.FileSequence(
-                str(resolve_result.absolute_path),
-                pad_style=fileseq_constants.PAD_STYLE_HASH1,
-            )
+            try:
+                self._fseq = fileseq_filesequence.FileSequence(
+                    str(resolve_result.absolute_path),
+                    pad_style=fileseq_constants.PAD_STYLE_HASH1,
+                )
+            except fileseq_exceptions.ParseException as exc:
+                msg = (
+                    f"Attempted to prepare sequence for writing. "
+                    f"Failed because '{resolve_result.absolute_path}' is not a valid sequence pattern: {exc}"
+                )
+                raise FileSequenceError(msg) from exc
         return self._fseq
 
     def _on_entry_written(self, written_file: file_mod.File) -> None:  # noqa: ARG002
@@ -325,13 +372,25 @@ def build_versioned_sequence_destination(
         create_parents: Whether to create parent directories. Defaults to True.
 
     Returns:
-        FileSequenceDestination with a locked _index version.
+        FileSequenceDestination with a locked _index version. When the template has no
+        ``{_index}`` slot, such as a project situation that writes to a fixed folder, the
+        destination is returned unversioned.
 
     Raises:
         FileSequenceError: If the engine cannot determine the next available version index.
     """
     dir_template = str(pathlib.PurePosixPath(macro_path.parsed_macro.template).parent)
     dir_macro = project_events.MacroPath(macro_parser.ParsedMacro(dir_template), macro_path.variables)
+
+    has_version_slot = any(
+        variable.name == macro_parser.SEQUENCE_VARIABLE_NAME for variable in dir_macro.parsed_macro.get_variables()
+    )
+    if not has_version_slot:
+        return FileSequenceDestination(
+            macro_path,
+            existing_file_policy=existing_file_policy,
+            create_parents=create_parents,
+        )
 
     index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
         os_events.GetNextVersionIndexRequest(macro_path=dir_macro)
@@ -350,3 +409,12 @@ def build_versioned_sequence_destination(
         existing_file_policy=existing_file_policy,
         create_parents=create_parents,
     )
+
+
+@typing.runtime_checkable
+class FileSequenceDestinationProvider(typing.Protocol):
+    """Protocol for nodes that provide a FileSequenceDestination without serializing it over the wire."""
+
+    @property
+    def file_sequence_destination(self) -> FileSequenceDestination | None:
+        """The destination downstream nodes should write to, or None if the node has not configured one."""

@@ -4,6 +4,7 @@ from .advanced_library_load_failure_problem import AdvancedLibraryLoadFailurePro
 from .after_library_callback_problem import AfterLibraryCallbackProblem
 from .app_event_listener_registration_problem import AppEventListenerRegistrationProblem
 from .before_library_callback_problem import BeforeLibraryCallbackProblem
+from .beta_feature_settings_collision_problem import BetaFeatureSettingsCollisionProblem
 from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
 from .deprecated_node_warning_problem import DeprecatedNodeWarningProblem
@@ -14,6 +15,7 @@ from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationPr
 from .engine_version_error_problem import EngineVersionErrorProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
+from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
 from .library_dependency_problem import LibraryDependencyProblem
 from .library_json_decode_problem import LibraryJsonDecodeProblem
@@ -50,6 +52,7 @@ __all__ = [
     "AfterLibraryCallbackProblem",
     "AppEventListenerRegistrationProblem",
     "BeforeLibraryCallbackProblem",
+    "BetaFeatureSettingsCollisionProblem",
     "CreateConfigCategoryProblem",
     "DependencyInstallationFailedProblem",
     "DeprecatedNodeWarningProblem",
@@ -60,6 +63,7 @@ __all__ = [
     "EngineVersionErrorProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
+    "InvalidBetaFeatureProblem",
     "InvalidVersionStringProblem",
     "LibraryDependencyProblem",
     "LibraryJsonDecodeProblem",

@@ -6,6 +6,7 @@ Supports I/O-free path inspection and deferred write via DirectoryDestination.
 from __future__ import annotations
 
 import pathlib
+import typing
 
 from griptape_nodes.common import macro_parser
 from griptape_nodes.files import project_file
@@ -270,3 +271,12 @@ def _map_to_macro_directory(absolute_path: pathlib.Path, fallback_path: str | pr
     if isinstance(fallback_path, project_events.MacroPath):
         return Directory(fallback_path)
     return Directory(str(absolute_path))
+
+
+@typing.runtime_checkable
+class DirectoryDestinationProvider(typing.Protocol):
+    """Protocol for nodes that provide a DirectoryDestination without serializing it over the wire."""
+
+    @property
+    def directory_destination(self) -> DirectoryDestination | None:
+        """The destination downstream nodes should create, or None if the node has not configured one."""

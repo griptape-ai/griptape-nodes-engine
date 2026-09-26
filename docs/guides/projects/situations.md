@@ -83,6 +83,45 @@ sub_dirs="lighting/pass_a", node_name="ImageGen", file_name_base="render", file_
 → outputs/lighting/pass_a/ImageGen_render.exr
 ```
 
+### `save_output_directory`
+
+```
+macro:  {outputs}/{sub_dirs?:/}{dir_name}_v{###}
+policy: create_new, create_dirs: true
+```
+
+Used when a node writes its output into a folder instead of a single file. Each run creates a new numbered folder, so earlier results are never overwritten. The number counts up from the highest version already on disk and fills any gaps.
+
+**Example:**
+
+```
+dir_name="renders"
+→ outputs/renders_v001      (first run)
+→ outputs/renders_v002      (second run)
+```
+
+### `save_file_sequence`
+
+```
+macro:  {outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}
+policy: create_new, create_dirs: true
+```
+
+Used when a node writes a numbered series of files, such as frames extracted from a video. Each run gets its own version folder, and the frames inside it are numbered separately.
+
+The two sets of `#` marks do different jobs. `{###}` inside braces is the version number of the folder. The bare `####` outside braces is where each frame's number goes. Only one `{###}` is allowed in a macro, so use the bare form for frame numbers. See [Sequences](sequences.md) for more on frame numbering.
+
+**Example:**
+
+```
+file_name_base="frames", file_extension="png"
+→ outputs/images/frames_v001/frames.0001.png
+→ outputs/images/frames_v001/frames.0002.png
+→ outputs/images/frames_v002/frames.0001.png   (second run)
+```
+
+Both situations come with the current project template. Projects created from the legacy template don't include them, so nodes use a built-in macro that produces the same layout.
+
 ### `save_preview`
 
 ```
@@ -169,6 +208,17 @@ A node's situation is chosen by whoever wrote the node, not by you. Nodes that s
 The filename parameter *is* the `ProjectFileParameter`. Whatever you type there becomes the `file_name_base` and `file_extension` variables, and the situation's macro decides where the file actually lands. So typing `render.png` into a node using `save_node_output` produces `outputs/MyNode_render.png`, not `render.png` in the project root. The node supplies the filename pieces; the project system supplies everything else (directory paths, built-in variables).
 
 Nearly every generation and save node uses `save_node_output`. The other situations are used by the parts of the system they name: dragging a file in uses `copy_external_file`, a URL download uses `download_url`, thumbnails use `save_preview`, and saving a workflow uses `save_workflow`.
+
+### Sending one node's output somewhere else entirely
+
+Typing a plain name like `render.png` lets the situation decide the destination, which is what you want nearly always. Two other things you can type override that for the one node:
+
+- **A relative folder path** — `lighting/pass_a/render.png` nests the file inside the situation's directory, so `save_node_output` puts it in `outputs/lighting/pass_a/`. The situation still decides the starting point.
+- **An absolute path** — `/mnt/studio/renders/render.png`, `C:\renders\render.png`, or the `file:///mnt/studio/renders/render.png` spelling of either. Here you are naming the exact location on disk, so the situation no longer builds the path and the file lands where you said: no `outputs` directory, no node-name prefix, no version number added to the name. The situation still decides what happens when a file is already at that location — under `save_node_output` you get `render_1.png` rather than losing the earlier render — and it still creates any folders in the path that don't exist yet.
+
+A web address is not a destination. A node cannot save to `https://example.com/render.png`, and typing one gives you an error rather than a file in an unexpected place.
+
+Because an absolute path skips the project system, it also skips what the project system gives you: the path is specific to your machine, so a workflow carrying one will not find that location on someone else's computer. A path naming a drive the machine doesn't have — a `C:` path opened on macOS or Linux — gives you an error rather than a folder called `C:` somewhere unexpected. When you want *every* node to write somewhere new, edit the situation in your project file instead.
 
 ### Finding out which situation a node uses
 
