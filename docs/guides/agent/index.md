@@ -41,6 +41,20 @@ For example, you can ask it to:
 
     Griptape Nodes runs a built-in **MCP server** alongside the engine. MCP (Model Context Protocol) is an open standard that lets AI models call tools — in this case, tools for reading your canvas, creating nodes, running workflows, and more. The agent connects to this server automatically; there's nothing to configure.
 
+## When a budget stops a reply
+
+If your organization has set a spending budget on Griptape Cloud and a reply
+would go over it, the agent stops and says so in the thread, in place of its
+answer:
+
+> Budget stopped this reply. It was blocked by the budget "Marketing Q3".
+> Contact your Griptape administrator.
+
+The message names every budget that blocked the reply. Bring those names to
+your Griptape administrator, who can raise or unfreeze the budget on Griptape
+Cloud. A budget that stops a workflow run is shown differently — see
+[When a budget stops a run](../editor/running_workflows.md#when-a-budget-stops-a-run).
+
 ## What's next
 
 - [Threads](./threads.md) — how conversations are saved and where to find them

@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -342,11 +343,17 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
-class TestStartFlowCancelsOnWaitTimeout:
-    """Tests for the wait_for_completion cancel-on-timeout cleanup in on_start_flow_request."""
+class TestStartFlowTellsTheEditorAWaitEndedBadly:
+    """A wait that ends badly has to stop the run and say so, however it ended badly.
+
+    The editor learns a run is over from ``ControlFlowCancelledEvent``; the caller's
+    ``StartFlowResultFailure`` never reaches it. So both ways out of the wait -- a timeout with
+    the flow still churning, and an error that already stopped it -- go through the same
+    abandonment, which cancels what is still live and publishes the reason either way.
+    """
 
     @pytest.mark.asyncio
-    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, engine: Engine) -> None:
+    async def test_a_timed_out_run_is_stopped_and_the_editor_is_told(self, engine: Engine) -> None:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -366,10 +373,10 @@ class TestStartFlowCancelsOnWaitTimeout:
         )
         cancel_mock = AsyncMock()
 
-        # check_for_existing_running_flow is consulted twice along the wait path:
-        # once before kicking off (must be False), and once after the timeout to decide
-        # whether to cancel (must be True since the flow is still churning).
-        running_flow_states = iter([False, True])
+        # check_for_existing_running_flow is consulted three times along the wait path:
+        # once before kicking off (must be False), then after the failed wait and again inside
+        # the abandonment to decide whether there is a run to stop (True: it is still churning).
+        running_flow_states = iter([False, True, True])
 
         with (
             patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
@@ -401,7 +408,13 @@ class TestStartFlowCancelsOnWaitTimeout:
         cancel_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_does_not_cancel_when_flow_already_finished_with_error(self, engine: Engine) -> None:
+    async def test_a_run_that_already_errored_still_tells_the_editor_it_is_over(self, engine: Engine) -> None:
+        """Nothing is left to cancel, and the editor still has to hear that the run ended.
+
+        A budget halt lands here: the refused node ends the run before the wait returns, so there
+        is nothing to cancel. The editor is told, and the machine is left alone: resetting it would
+        clear the upstream nodes that finished, and whose results the artist may have paid for.
+        """
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -420,9 +433,11 @@ class TestStartFlowCancelsOnWaitTimeout:
             validation_succeeded=True, exceptions=[], result_details="validated"
         )
         cancel_mock = AsyncMock()
+        abandon_spy = AsyncMock()
+        announce_spy = MagicMock()
 
-        # First call (kickoff gate) returns False; second call (post-wait cancel gate) also
-        # returns False because the flow already finished with an error.
+        # Always False: the flow already finished with an error, so it is not live at the
+        # kickoff gate and not live when the wait fails.
         with (
             patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
             patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
@@ -439,13 +454,76 @@ class TestStartFlowCancelsOnWaitTimeout:
                 AsyncMock(return_value="boom"),
             ),
             patch.object(flow_manager, "cancel_flow_run", cancel_mock),
+            patch.object(flow_manager, "_abandon_running_flow", abandon_spy),
+            patch.object(flow_manager, "_announce_failed_run", announce_spy),
         ):
             result = await flow_manager.on_start_flow_request(
                 StartFlowRequest(flow_name="errored_flow", wait_for_completion=True)
             )
 
         assert isinstance(result, StartFlowResultFailure)
+        announce_spy.assert_called_once()
+        abandon_spy.assert_not_called()
         cancel_mock.assert_not_called()
+
+
+class TestStartFlowTellsTheEditorAShortRunFailed:
+    """A run short enough to finish inside start_flow never reaches the wait at all.
+
+    One node that fails immediately -- the budget-halt shape -- errors before ``start_flow``
+    returns, so the handler leaves by the ``is_errored`` branch above the wait. That branch owes
+    the editor the same cancellation every other failed exit sends, carrying the reason, and
+    must not reset the machine that holds the finished nodes' results.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_errored_before_the_wait_tells_the_editor_why(self, engine: Engine) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from griptape_nodes.retained_mode.events.execution_events import (
+            StartFlowRequest,
+            StartFlowResultFailure,
+        )
+        from griptape_nodes.retained_mode.events.validation_events import (
+            ValidateFlowDependenciesResultSuccess,
+        )
+
+        flow_manager = engine.flow_manager
+
+        fake_flow = MagicMock()
+        fake_flow.name = "short_flow"
+        validate_success = ValidateFlowDependenciesResultSuccess(
+            validation_succeeded=True, exceptions=[], result_details="validated"
+        )
+        halt = f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call from 'Refused'."
+        machine = MagicMock()
+        machine.resolution_machine.is_errored.return_value = True
+        machine.resolution_machine.get_error_message.return_value = halt
+        abandon_spy = AsyncMock()
+        announce_spy = MagicMock()
+
+        with (
+            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
+            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
+            patch.object(
+                flow_manager,
+                "on_validate_flow_dependencies_request",
+                AsyncMock(return_value=validate_success),
+            ),
+            patch.object(flow_manager, "start_flow", AsyncMock()),
+            patch.object(flow_manager, "_global_control_flow_machine", machine),
+            patch.object(flow_manager, "_abandon_running_flow", abandon_spy),
+            patch.object(flow_manager, "_announce_failed_run", announce_spy),
+        ):
+            result = await flow_manager.on_start_flow_request(
+                StartFlowRequest(flow_name="short_flow", wait_for_completion=True)
+            )
+
+        assert isinstance(result, StartFlowResultFailure)
+        assert halt in str(result.result_details)
+        announce_spy.assert_called_once_with(halt)
+        abandon_spy.assert_not_called()
+        machine.reset_machine.assert_not_called()
 
 
 class TestListNodesInFlowRequest:

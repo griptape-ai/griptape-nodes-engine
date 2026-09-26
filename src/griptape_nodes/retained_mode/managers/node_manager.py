@@ -18,7 +18,7 @@ from griptape_nodes.common.strict_mode import (
 from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
@@ -245,6 +246,9 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.traits.trait_resolver import resolve_trait
+from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefusal, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
@@ -3696,19 +3700,7 @@ class NodeManager(EngineScoped):
                 with aprocess_scope(request.variables):
                     await node.aprocess()
             except Exception as e:
-                # Pass the live exception through ``exception=`` so the
-                # converter can capture worker-side frames into a
-                # ForwardedException on the orchestrator. Without this
-                # the orchestrator only sees the type and message --
-                # PR06's whole reason for the dict wire-format -- and
-                # NodeExecutor._format_node_failure_message would have
-                # nothing to surface. ``__traceback__`` is populated
-                # because ``e`` was actually raised, so the strict-mode
-                # tripwire stays quiet for raise-in-process.
-                return ExecuteNodeResultFailure(
-                    result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
-                    exception=e,
-                )
+                return self._execution_failure(e, node_name)
             finally:
                 # The scratch marker only means anything while the run is in flight. A parameter
                 # the node still holds here was never torn down, so serialization must treat it
@@ -3725,6 +3717,98 @@ class NodeManager(EngineScoped):
             parameter_output_values=output_values,
             result_details=f"Node '{node_name}' executed successfully.",
         )
+
+    def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
+        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
+        budget_halt = self._budget_halt_for(exc, node_name)
+        if budget_halt is not None:
+            return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
+        # Pass the live exception through ``exception=`` so the
+        # converter can capture worker-side frames into a
+        # ForwardedException on the orchestrator. Without this
+        # the orchestrator only sees the type and message --
+        # PR06's whole reason for the dict wire-format -- and
+        # NodeExecutor._format_node_failure_message would have
+        # nothing to surface. ``__traceback__`` is populated
+        # because ``exc`` was actually raised, so the strict-mode
+        # tripwire stays quiet for raise-in-process.
+        return ExecuteNodeResultFailure(
+            result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
+            exception=exc,
+        )
+
+    def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
+        """Return the halt for a node whose call Griptape Cloud refused over budget, or None.
+
+        Every node failure crosses this one point, whichever HTTP client made the
+        call and whether the node runs in-process or in a worker. Recognizing the
+        refusal here means a node spending through a Griptape Cloud driver -- the
+        prompt driver behind every agent node, the image-generation driver --
+        halts with the budgets named, without each of the ~50 node types having
+        to catch it for itself.
+
+        A halt raised further down is re-worded here when it does not yet name a
+        node. A driver recognizes the refusal inside a request it made on some
+        node's behalf and cannot know whose; this is where that is known, and
+        "the call from 'Describe Image'" is the difference between a message the
+        artist can act on and one that sends them hunting. A halt that already
+        names its node -- the proxy nodes word their own and set their own status
+        -- is left exactly as it was.
+        """
+        already_worded = self._named_budget_halt(exc)
+        if already_worded is not None:
+            return already_worded
+
+        refusal = self._refusal_carried_by(exc)
+        if refusal is None:
+            return None
+
+        logger.error("%s: %s", node_name, budget_log_line(refusal))
+        return BudgetExceededError(describe_budget_refusal(refusal, node_name=node_name), refusal, node_name=node_name)
+
+    def _named_budget_halt(self, exc: Exception) -> BudgetExceededError | None:
+        """Return the halt on this chain that already names its node, if there is one."""
+        for halt in self._budget_halts_on(exc):
+            if halt.node_name is not None:
+                return halt
+        return None
+
+    def _refusal_carried_by(self, exc: Exception) -> BudgetRefusal | None:
+        """Return the refusal behind this failure, from a halt already raised or from the HTTP error.
+
+        A driver that recognized the refusal itself carries the parsed result,
+        which is both cheaper and more faithful than re-reading a response the
+        SDK may have already closed -- a streaming chat refusal, for one, keeps
+        its status but not its body once the request context exits.
+
+        The host resolver is passed rather than called. Every node failure
+        reaches here, the overwhelming majority of them carrying no HTTP
+        response at all, and resolving the host reads a secret; it is looked up
+        only once there is a response whose host decides the answer.
+        """
+        for halt in self._budget_halts_on(exc):
+            return halt.refusal
+        return refusal_from_exception(exc, cloud_host=self._cloud_host)
+
+    def _cloud_host(self) -> str:
+        """Hostname of the Griptape Cloud deployment this engine is pointed at."""
+        return resolve_cloud_host(self.engine.secrets_manager)
+
+    def _budget_halts_on(self, exc: Exception) -> Iterator[BudgetExceededError]:
+        """Walk the cause chain, yielding each budget halt on it, outermost first.
+
+        In-process only. A halt forwarded from a worker arrives flattened to type
+        and message, which :func:`is_budget_halt` recognizes and this cannot; that
+        is the right split, because a flattened halt has already been worded by
+        the worker-side pass through this same method.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, BudgetExceededError):
+                yield current
+            current = current.__cause__
 
     def _apply_hydrated_values(
         self, node: BaseNode, node_name: str, parameter_values: dict[str, Any]

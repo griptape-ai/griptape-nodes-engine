@@ -14,6 +14,8 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     ImageGenerationToolset,
     ImageGenerationToolsetConfig,
 )
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
+from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
@@ -183,6 +185,19 @@ class TestGenerateImage:
         # A Cloud failure becomes a ModelRetry so the agent turn survives.
         with pytest.raises(ModelRetry):
             await toolset.generate_image("a cat")
+        assert static_files.saved == []
+
+    async def test_a_budget_refusal_stops_the_run_instead_of_retrying(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        # Retrying a budget refusal only spends the turn being refused again.
+        patch_transport.responses.append(httpx.Response(403, json=a_refusal_body()))
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        with pytest.raises(BudgetExceededError) as raised:
+            await toolset.generate_image("a cat")
+        assert str(raised.value).startswith(BUDGET_REPLY_HALT_PREFIX)
+        assert "tight" in str(raised.value)
         assert static_files.saved == []
 
     async def test_raises_on_malformed_response(

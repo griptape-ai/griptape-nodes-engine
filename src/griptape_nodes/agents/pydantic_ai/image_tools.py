@@ -20,9 +20,14 @@ import logging
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic_ai.exceptions import ModelRetry
+
+from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent
@@ -133,6 +138,14 @@ class ImageGenerationToolset:
             image_bytes = base64.b64decode(artifact["value"])
             image_format = artifact.get("format", "png")
         except httpx.HTTPError as exc:
+            # A budget refusal is not recoverable by trying again: every retry is
+            # another refused call, and the agent burns its turn rediscovering the
+            # same wall. Raise it so the run stops and the user is told which
+            # budget to act on.
+            refusal = refusal_from_exception(exc, cloud_host=urlsplit(self._base_url).hostname or "")
+            if refusal is not None:
+                logger.error(budget_log_line(refusal))
+                raise BudgetExceededError(describe_budget_refusal(refusal), refusal) from exc
             msg = f"Image generation request to Griptape Cloud failed: {exc}"
             raise ModelRetry(msg) from exc
         except (KeyError, ValueError, TypeError) as exc:

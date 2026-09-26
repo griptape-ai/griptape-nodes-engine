@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
+from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
@@ -822,14 +823,25 @@ class ExecuteDagState(State):
                     dag_node.node_state = NodeState.ERRORED
 
                     logger.error("Error processing node '%s'", node_name, exc_info=exc)
-                    msg = f"Node '{node_name}' encountered a problem: {exc}"
+                    # A budget halt already names the node and says what to do, and it is
+                    # what the artist reads. By the time it arrives here the node executor
+                    # has wrapped it in a RuntimeError, so recover the original wording:
+                    # framing it a third time would bury the sentence and displace the
+                    # opening words the halt is recognized by downstream.
+                    halt = budget_halt_message(exc, str(exc))
+                    if halt is not None:
+                        msg = halt
+                        node_error = halt
+                    else:
+                        msg = f"Node '{node_name}' encountered a problem: {exc}"
+                        node_error = str(exc)
 
                     await context.engine.event_manager.aput_event(
                         ExecutionGriptapeNodeEvent(
                             wrapped_event=ExecutionEvent(
                                 payload=NodeErrorEvent(
                                     node_name=node_name,
-                                    error_message=str(exc),
+                                    error_message=node_error,
                                 )
                             )
                         )

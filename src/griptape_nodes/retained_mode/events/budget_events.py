@@ -1,8 +1,10 @@
 """Events for budget attribution.
 
 The engine is the only party that knows which project a credit-consuming call belongs to. These
-events hand a caller one ready-to-send header value. No network call, no credential, no
-enforcement.
+events hand a caller one ready-to-send header value. They make no network call and read no
+credential; they label a call, they do not decide whether the call is allowed. Cloud decides
+that, and `griptape_nodes.utils.budget_refusal` turns its refusal into something an artist can
+act on.
 """
 
 from dataclasses import dataclass, field
@@ -28,9 +30,9 @@ class GetAttributionContextRequest(RequestPayload):
     of the project name, replaceable with any string, and a filesystem path on a project created
     before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
 
-    Best-effort: nothing here raises, because the caller is about to spend money and an
-    unattributed call beats a blocked one. A chain that cannot be read yields a Failure rather
-    than an empty chain, which would assert that no project is open.
+    Best-effort: nothing here raises. Not knowing which project to bill is not a reason to refuse
+    work -- the spend is legitimate, it just lands unattributed. A chain that cannot be read
+    yields a Failure rather than an empty chain, which would assert that no project is open.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.

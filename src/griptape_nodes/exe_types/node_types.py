@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
     ControlParameterInput,
@@ -61,6 +62,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
+from griptape_nodes.utils.budget_refusal import is_budget_halt, refusal_from_exception
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
@@ -2515,9 +2517,27 @@ class SuccessFailureNode(BaseNode):
         to allow graceful failure handling. If no connections exist, raises the exception
         to crash the flow and provide immediate feedback.
 
+        A budget refusal is the exception, and always stops the run. The Failed
+        output means "this operation failed, here is the recovery path", but a
+        budget block is not this operation failing: it is the organization's
+        authority to spend being withdrawn, and it applies just as much to every
+        node the recovery path leads to. Routing down Failed would run a branch
+        that spends credits, be refused in turn, and turn one clear halt into a
+        confusing one per node.
+
+        That holds whether or not the node recognized the refusal itself. A node
+        that hands over the raw Cloud 403, or its own error raised from it, is
+        refused just the same, so the HTTP error is read here too; the node
+        executor words the halt on its way out.
+
         Args:
             exception: The exception that caused the failure
         """
+        if is_budget_halt(exception):
+            raise exception
+        if refusal_from_exception(exception, cloud_host=self._cloud_host) is not None:
+            raise exception
+
         if self._has_outgoing_connections(self.failure_output):
             # User has connected something to Failed output, they want to handle errors gracefully
             logger.error(
@@ -2538,6 +2558,14 @@ class SuccessFailureNode(BaseNode):
         """Clear result details before node runs to avoid confusion from previous sessions."""
         self._set_status_results(was_successful=False, result_details="<Results will appear when the node executes>")
         return super().validate_before_node_run()
+
+    def _cloud_host(self) -> str:
+        """Hostname of the Griptape Cloud deployment this engine is pointed at.
+
+        Passed to ``refusal_from_exception`` uncalled, so the secret behind it is
+        read only for a failure that carries an HTTP response.
+        """
+        return resolve_cloud_host(self.engine.secrets_manager)
 
 
 class StartNode(BaseNode):

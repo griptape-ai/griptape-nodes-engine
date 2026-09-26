@@ -1,7 +1,9 @@
 """BudgetManager - Describes which project an outbound call should be attributed to.
 
 Holds no state: the project chain is read from the project manager per request, so a project
-switch between two calls shows up on the second. No network call, no credential, no enforcement.
+switch between two calls shows up on the second. This module makes no network call and reads no
+credential; it labels a call, it does not decide whether the call is allowed. Cloud decides that,
+and `griptape_nodes.utils.budget_refusal` turns its refusal into something an artist can act on.
 
 Project ids travel exactly as stored -- unstripped, uncut, never repaired.
 
@@ -88,8 +90,10 @@ class BudgetManager(EngineScoped):
         """Describe the current project as an encoded attribution header.
 
         Both failures send no header rather than a bare `{"v": 1}`, so the caller gets a Failure
-        it can act on instead of a Success carrying an empty chain. Neither blocks the call: it is
-        about to spend money, and an unattributed call beats a blocked one.
+        it can act on instead of a Success carrying an empty chain. Neither blocks the call. Not
+        knowing which project to bill is not a reason to refuse work: the spend is legitimate, it
+        just lands unattributed. A budget refusal is the opposite case -- Cloud has already
+        declined the call -- and that one always halts the run.
 
         Both log at WARNING rather than the ERROR a bare `result_details` string would default to.
         Neither condition clears on its own, so an ERROR would repeat once per metered call for
