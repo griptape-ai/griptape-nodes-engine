@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(eq=False)
-class Trait(ABC, BaseNodeElement):
+class Trait(BaseNodeElement):
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
         return hash(self.element_id)
@@ -35,10 +34,29 @@ class Trait(ABC, BaseNodeElement):
         updated["trait_display_options"] = self.display_options_for_trait()
         return updated
 
+    def to_state(self) -> dict[str, Any]:
+        """Return state that must survive a workflow save."""
+        return {}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Apply state from a saved workflow."""
+        if state:
+            msg = f"Trait '{type(self).__name__}' does not accept saved state."
+            raise ValueError(msg)
+
     @classmethod
-    @abstractmethod
-    def get_trait_keys(cls) -> list[str]:
-        """This will return keys that trigger this trait."""
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Build a trait from saved state when the node did not build one.
+
+        Passes the state to the constructor. Override when ``to_state`` keys are not
+        constructor arguments.
+        """
+        return cls(**state)
+
+    @classmethod
+    def state_from_ui_options(cls, _ui_options: dict[str, Any]) -> dict[str, Any]:
+        """Return trait state represented by an inbound UI option write."""
+        return {}
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""

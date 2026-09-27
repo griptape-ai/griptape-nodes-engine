@@ -198,11 +198,10 @@ Griptape Nodes uses a variety of environment variables for influencing its low-l
 
 - **`GRIPTAPE_NODES_API_BASE_URL`**: The base URL for the Griptape Nodes API (default `https://api.nodes.griptape.ai`). This is used to connect the engine to the Workflow Editor.
 - **`GT_CLOUD_API_KEY`**: The API key for authenticating with the Griptape Cloud API. This is required for the engine to function properly.
-- **`STATIC_SERVER_HOST`**: The host for the static server (default `localhost`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_PORT`**: The port for the static server (default `8124`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_URL`**: The URL path the workspace is served under (default `/workspace`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the static server (default `error`). This is used to control the verbosity of the static server logs.
-- **`STATIC_SERVER_ENABLED`**: Whether the static server is enabled (default `true`). This is used to control whether the static server is started or not.
+- **`STATIC_SERVER_HOST`**: The host for the static file server (default `localhost`). The app's server binds here, and the engine assumes it when no server URL is reported.
+- **`STATIC_SERVER_PORT`**: The port for the static file server (default `8124`). The app's server binds here, and the engine assumes it when no server URL is reported.
+- **`STATIC_SERVER_URL`**: The URL path the workspace is served under (default `/workspace`).
+- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the app's static file server (default `error`).
 
 ## Contributing to Documentation
 
@@ -240,13 +239,87 @@ This will start a local webserver (usually at `http://127.0.0.1:8000/`). The sit
 - We use **Pyright** for static type checking. Run `make check` to ensure there are no type errors.
 - Run tests using `make test/unit` or `uv run pytest`.
 
+## Gating Work Behind a Beta Feature
+
+If you're building something user-visible or behavior-changing that isn't ready to be on for everyone, you can put it behind a beta feature. Users turn beta features on and off from the Beta page in the editor's Settings. Every feature you register in the engine appears there automatically, with no editor change needed.
+
+This section covers engine features. Node libraries, including the standard library, declare their own in the `beta_features` list of their library JSON and check them from nodes with `self.is_beta_feature_enabled("<id>")`. See [Beta Features in Authoring Libraries](docs/development/custom_nodes/authoring_libraries.md#beta-features).
+
+1. **Register the feature** in `src/griptape_nodes/retained_mode/beta_features.py`. All engine features live in that one module. The `name` and `description` are shown to users on the Beta page, so describe what changes and where, in plain terms:
+
+    ```python
+    PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
+        BetaFeature(
+            id="parallel_branch_resolution",
+            name="Parallel branch resolution",
+            description="Runs independent branches of a flow at the same time instead of one after another.",
+            owner="@your-github-handle",
+            remove_by=date(2027, 1, 31),
+        )
+    )
+    ```
+
+1. **Check it** at the point where the old and new behavior split:
+
+    ```python
+    if is_beta_enabled(PARALLEL_BRANCH_RESOLUTION, self.engine.config_manager):
+        ...
+    ```
+
+1. **Turn it on locally** by adding it to the `beta_features` section of your `griptape_nodes_config.json`:
+
+    ```json
+    {
+      "beta_features": {
+        "parallel_branch_resolution": true
+      }
+    }
+    ```
+
+    You can also set it for a single run with an environment variable:
+
+    ```shell
+    GTN_CONFIG_BETA_FEATURES__PARALLEL_BRANCH_RESOLUTION=true make run
+    ```
+
+**Rules:**
+
+- A beta feature must never change saved data or the protocol. Workflows have to open the same way whether the feature is on or off.
+- Every feature needs a `remove_by` date, at most 180 days out. By that date, make the feature standard or delete it.
+- Ids are lowercase snake_case and must be unique across the engine and the editor, so check the editor's features before picking one.
+
+**When `tests/unit/retained_mode/test_beta_features.py` fails:** once a feature passes its `remove_by` date, this test fails on every PR, including ones that don't touch the feature. The failure names the feature and its owner. To fix it, make the feature standard, delete it, or extend `remove_by` (still at most 180 days out) and explain why in the PR.
+
+**Removing a feature:** delete its registration and every `is_beta_enabled` check. If the feature is becoming standard, keep the new code path. Users' leftover `beta_features` entries do nothing and don't need cleaning up.
+
 ## Submitting Changes
 
 1. Create a new branch for your feature or bug fix: `git checkout -b my-feature-branch`.
 1. Make your changes, commit them with clear messages, and ensure all checks (`make check`) and tests (`make test/unit`) pass.
+1. If the change is user-facing, add an entry to `CHANGELOG.md`. See [Changelog](#changelog).
 1. Push your branch to your fork: `git push origin my-feature-branch`.
 1. Open a Pull Request (PR) against the `main` branch of the `griptape-ai/griptape-nodes-engine` repository.
 1. Clearly describe your changes in the PR description.
+
+## Changelog
+
+[`CHANGELOG.md`](CHANGELOG.md) follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). Each version's section is its GitHub release notes.
+
+A PR with a user-facing change adds a bullet under `## [Unreleased]`, grouped under one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`:
+
+```markdown
+## [Unreleased]
+
+### Fixed
+
+- Model dropdowns no longer mark every model "Not permitted by your license" when two installed
+  libraries provide a node with the same name.
+  [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
+```
+
+Write for the person upgrading, not the reviewer: what they will notice, where, and why. Link the GitHub issue on the entry's last line when there is one. Start breaking changes with `**Breaking:**` and link the upgrade steps in `MIGRATION.md`. Refactors, tests, CI, and docs-only changes get no entry. The full style guide is in [CLAUDE.md](CLAUDE.md#changelog).
+
+`make check/changelog`, part of `make check` and CI, validates the file's structure. It never requires a PR to add an entry. That call stays with people.
 
 ## Making a Release (Maintainers)
 
@@ -270,28 +343,36 @@ Use this process for minor and major version bumps that include new features or 
 
 1. Check the version:
 
-    There should be an existing `chore: bump v0.66.0` commit elevating the minor version on `main` 1 higher than what is currently `stable`. If not, perform step 4 an additional time right now so the version on `main` is greater than the current `stable` version.
+    There should be an existing `chore: bump v0.66.0` commit elevating the minor version on `main` 1 higher than what is currently `stable`. If not, run `make version/minor` and merge that PR first so the version on `main` is greater than the current `stable` version.
 
 1. Publish the release:
+
+    Read `## [Unreleased]` in `CHANGELOG.md` first. Those entries become the release notes.
 
     ```shell
     make version/publish
     ```
 
-    This creates and pushes:
+    This rolls `CHANGELOG.md`, renaming `[Unreleased]` to the release (e.g., `## [0.66.0] - 2026-09-22`), and commits it as `chore: release v0.66.0` on a detached HEAD, so your local `main` still matches `origin/main`. It then creates and pushes:
 
-    - A version tag (e.g., `v0.66.0`)
+    - A version tag (e.g., `v0.66.0`) on that commit
     - An updated `stable` tag
     - A release branch (e.g., `release/v0.66`) for future patch releases
 
+    It refuses to release an empty `[Unreleased]`. If nothing notable shipped, run `make version/publish allow_empty=1`.
+
 1. Update the version on `main`
 
+    The `Bump Main to Next Version` workflow opens a PR that advances `main` to the next minor version and applies the same changelog roll. Merge it. Other PRs cannot merge until it lands.
+
+    If the workflow did not run, do both by hand and PR the result. Use the date from the tag's changelog heading:
+
     ```shell
-    # For minor releases (e.g., 0.65.0 → 0.66.0)
+    # After releasing v0.66.0
+    uv run python scripts/changelog.py roll 0.66.0 --date YYYY-MM-DD
+    git commit -m "chore: roll changelog for v0.66.0" CHANGELOG.md
     make version/minor
     ```
-
-    PR and merge that change to `main`.
 
 ### Patch Releases (from release branches)
 
@@ -332,7 +413,7 @@ Use this process to release bug fixes for a specific version without including n
     git cherry-pick def456
     ```
 
-    If you encounter conflicts, resolve them and continue:
+    If you encounter conflicts, resolve them and continue. A conflict in `CHANGELOG.md` usually means keeping the fix's entry under `## [Unreleased]`.
 
     ```shell
     # After resolving conflicts in your editor
@@ -354,9 +435,9 @@ Use this process to release bug fixes for a specific version without including n
     make version/publish
     ```
 
-    This creates and pushes the version tag (e.g., `v0.65.3`) and updates the `stable` tag.
+    This rolls the release branch's `[Unreleased]` entries into `## [0.65.3]`, then creates and pushes the version tag (e.g., `v0.65.3`) and updates the `stable` tag.
 
-1. **No synchronization back to `main`** - A patch release does not touch `main`, and does not need to: `main` already carries the next minor version. The `Bump Main to Next Version` workflow skips any released tag that does not end in `.0`.
+1. **No synchronization back to `main`** - A patch release does not touch `main`, and does not need to: `main` already carries the next minor version. The fix's changelog entry stays under `[Unreleased]` on `main`, so the next minor release lists it too. The `Bump Main to Next Version` workflow skips any released tag that does not end in `.0`.
 
 ### Important Notes
 
@@ -365,6 +446,7 @@ Use this process to release bug fixes for a specific version without including n
 - Release branches follow the pattern `release/v{major.minor}` (e.g., `release/v0.65`)
 - Version tags follow the format `v{major}.{minor}.{patch}` (e.g., `v0.65.3`)
 - The `stable` tag always points to the latest stable release across all versions
-- The `version-bump-next-on-release.yml` GitHub Actions workflow opens a PR advancing `main` to the next minor version, and only for minor and major releases
+- The `version-bump-next-on-release.yml` GitHub Actions workflow opens a PR advancing `main` to the next minor version and rolling its changelog, and only for minor and major releases
+- The `stable-release.yml` workflow uses that version's `CHANGELOG.md` section as the GitHub release notes
 
 Thank you for contributing!

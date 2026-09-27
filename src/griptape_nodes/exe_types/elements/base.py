@@ -131,7 +131,6 @@ class BaseNodeElement:
         # Imported here to avoid circular dependencies: the event modules reach the element tree.
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         event_data = {
             "element_id": self.element_id,
@@ -149,7 +148,8 @@ class BaseNodeElement:
         event = ExecutionGriptapeNodeEvent(
             wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
         )
-        GriptapeNodes.EventManager().put_event(event)
+        # This is an element, not a node, so the engine comes from the node it belongs to.
+        self._node_context.engine.event_manager.put_event(event)
         self._changes.clear()
 
     def to_dict(self) -> dict[str, Any]:

@@ -48,6 +48,9 @@ def _make_node(
     node.parameter_values = parameter_values if parameter_values is not None else {}
     node.parameter_output_values = {}
     node.metadata = metadata if metadata is not None else {}
+    # None of these values are held, so the egress pass must not treat them as parkable. A MagicMock
+    # parameter answers truthy to is_process_local, which would swap every value for a mock key.
+    node.get_parameter_by_name.return_value = None
     return node
 
 

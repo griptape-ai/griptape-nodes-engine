@@ -84,7 +84,7 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
         markdown: bool | None = None,
         hide: bool | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         **kwargs,
     ):
         # Remove markdown and hide from kwargs to prevent passing them to parent class

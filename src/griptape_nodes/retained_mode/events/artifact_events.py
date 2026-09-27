@@ -176,7 +176,16 @@ class GetPreviewForArtifactResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @dataclass
 @PayloadRegistry.register
 class GetPreviewForArtifactResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Failed to get preview for artifact."""
+    """Failed to get preview for artifact.
+
+    Attributes:
+        source_file_missing: True when the failure is that the source artifact
+            itself does not exist on disk. Callers use this to pick a log level:
+            a vanished source is routine (outputs cleaned up between runs) and
+            not actionable, unlike a provider or write failure.
+    """
+
+    source_file_missing: bool = False
 
 
 @dataclass

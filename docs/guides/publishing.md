@@ -234,6 +234,36 @@ that need to bundle the common ingredients can reuse the engine's
 `WorkflowPackager` (as the Folder and Nuke publishers do) rather than
 reimplementing that logic.
 
+**Finding the workflow inside the bundle.** `package_to_folder` returns a
+`PackagedBundle` telling you where it put things. Every path on it is relative to
+the folder you packaged into. Use `entrypoint_workflow_path` — the workflow your
+publisher launches — whenever you need to point at the workflow file (an
+entrypoint script, a copy into a version folder, a README). Do not rebuild that
+location from the workflow's file name; the packager owns the bundle's layout and
+may change it:
+
+```python
+packaged = self._packager.package_to_folder(destination, workflow)
+workflow_in_bundle = destination / packaged.entrypoint_workflow_path
+```
+
+`packaged.library_paths` holds the path to each copied library's definition
+file.
+
+**Reserving your publisher's own file names.** If your publisher writes files
+into the bundle itself, tell the packager about them so they get the same
+collision protection as the engine's own — otherwise a bundled workflow or static
+file can land on one of your files and silently replace it (or be replaced by
+it). Pass them as bundle-relative paths to `package_to_folder`:
+
+```python
+self._packager.package_to_folder(
+    destination,
+    workflow,
+    additional_reserved_paths=[Path("run.py"), Path("README.md")],
+)
+```
+
 **Declaring node dependencies.** The permanent fix for the static-files gap above
 is for each node to declare the files it uses, which benefits *every* publisher.
 Override `get_node_dependencies()` and add the file to

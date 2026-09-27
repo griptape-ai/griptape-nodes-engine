@@ -3,7 +3,8 @@ name: Bump Main to Next Version
 # When a minor or major release publishes (a tag ending in .0), open a PR that
 # advances main's version to the next minor (X.Y.0 -> X.(Y+1).0). This keeps main
 # ahead of the last release so ongoing development reflects the upcoming version
-# instead of the shipped one.
+# instead of the shipped one. The same PR rolls CHANGELOG.md's [Unreleased] section into the
+# released version, matching the roll `make version/publish` committed on the tag.
 #
 # Patch releases (X.Y.Z where Z > 0) are skipped: those ship maintenance fixes
 # from a release/** branch and main is already ahead of them.
@@ -95,6 +96,20 @@ jobs:
         if: steps.compute.outputs.skip == 'false'
         run: uv lock
 
+      # Dated from the tag's own changelog so main and the tag agree. version-check blocks other
+      # merges until this PR lands, so nothing new reaches [Unreleased] first.
+      - name: Roll the changelog
+        if: steps.compute.outputs.skip == 'false'
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          RELEASED="${TAG#v}"
+          if grep -q "^## \[${RELEASED}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md already has a section for ${RELEASED}."
+            exit 0
+          fi
+          DATE=$(git show "${TAG}:CHANGELOG.md" 2>/dev/null | sed -n "s/^## \[${RELEASED}\] - \([0-9-]*\).*/\1/p")
+          uv run --no-project scripts/changelog.py roll "$RELEASED" --date "${DATE:-$(date -u +%F)}" --allow-empty
+
       - name: Create bump branch and commit
         if: steps.compute.outputs.skip == 'false'
         id: branch
@@ -102,7 +117,7 @@ jobs:
           NEXT="${{ steps.compute.outputs.next }}"
           BRANCH="chore/bump-next-v${NEXT}"
           git checkout -b "$BRANCH"
-          git add pyproject.toml uv.lock
+          git add pyproject.toml uv.lock CHANGELOG.md
           git commit -m "chore: bump v${NEXT}"
           git push origin "$BRANCH" --force
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
@@ -126,7 +141,7 @@ jobs:
             --base main \
             --head "${{ steps.branch.outputs.branch }}" \
             --title "chore: bump v${NEXT}" \
-            --body "Advances \`main\` to the next version (\`${NEXT}\`) following the \`${TAG}\` release.
+            --body "Advances \`main\` to the next version (\`${NEXT}\`) following the \`${TAG}\` release, and rolls \`CHANGELOG.md\` into \`${TAG}\`.
 
           Generated automatically by the \`Bump Main to Next Version\` workflow."
         env:

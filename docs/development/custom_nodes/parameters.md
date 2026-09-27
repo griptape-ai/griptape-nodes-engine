@@ -21,7 +21,7 @@ All Parameter attributes:
 - **hide/hide_label/hide_property**: common UI flags (also available via `ui_options`; `ui_options` wins on conflict)
 - **allow_input/allow_property/allow_output**: convenience flags for configuring modes (ignored if `allowed_modes` is explicitly set)
 - **settable**: bool (default True) - False for computed/output parameters
-- **serializable**: bool (default True) - set False for non-serializable values (drivers, file handles, etc.)
+- **serializable**: bool (default True) - set False for non-serializable values (drivers, file handles, etc.). On an output, this also holds the value in the process that produced it and sends a key across a worker process boundary - see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md)
 - **user_defined**: bool (default False)
 - **private**: bool (default False) - hide from general user editing (library/internal use)
 - **exclude_from_metadata**: bool (default False) - exclude this parameter's value from plaintext metadata outputs (sidecar JSON and embedded PNG text chunks). The parameter name is still recorded in `parameters_omitted` so the omission is auditable. Use this for parameters that hold sensitive values such as passwords or user-supplied credentials.
@@ -33,12 +33,17 @@ All Parameter attributes:
 Add functionality via `add_trait()`:
 
 - **Options**: `Options(choices=list[str] | list[tuple[str, Any]], show_search: bool = True, search_filter: str = "", allow_custom: bool = False)`
-- **Slider**: `Slider(min_val: float, max_val: float)`
+- **Slider**: `Slider(min_val: float, max_val: float, soft_limits: bool = False)` — `soft_limits=True` makes the range a
+    soft limit: it sizes the slider track, but values typed outside it are accepted rather than rejected.
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
+
+**Saving trait state**: A trait opts into state persistence with `to_state()` and `apply_state()`. Return constructor-shaped state containing text, numbers, booleans, and lists or dictionaries of those values. Unsupported values are omitted with a warning. Traits using the default methods have no saved state.
+
+**Accepting UI option writes**: Implement `state_from_ui_options()` to map a `ui_options` write, from node code, the editor, or a saved file, to the same state accepted by `apply_state()`. The default ignores writes, which suits rendered keys with no mutable state. A write that would have changed what the trait renders is logged if the trait does not accept it.
 
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
@@ -90,6 +95,9 @@ They exist to make common parameter patterns **simple, consistent, and runtime-m
     - `Slider(min_val, max_val)` if `slider=True`
     - `MinMax(min_val, max_val)` if `validate_min_max=True`
     - `Clamp(min_val, max_val)` if `min_val` and `max_val` are provided
+- `soft_limits`: only valid alongside `slider=True`. Makes the slider's range a soft limit — the track still spans
+    `min_val`–`max_val`, but a value typed outside it is accepted instead of raising. Also readable/settable at runtime
+    via the `soft_limits` property.
 
 #### `ParameterJson`
 
@@ -591,7 +599,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
 
 ### Dynamic Options Updates
 
-Update parameter choices at runtime:
+Update parameter choices at runtime. They are saved as trait state:
 
 ```python
 from griptape_nodes.traits.options import Options

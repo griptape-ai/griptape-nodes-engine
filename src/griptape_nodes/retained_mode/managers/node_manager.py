@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import logging
 import pickle
@@ -16,6 +15,7 @@ from griptape_nodes.common.strict_mode import (
     StrictModeScopeKind,
     StrictModeSeverity,
 )
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -43,6 +43,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
@@ -58,6 +59,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
@@ -235,6 +237,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultFailure,
     ValidateNodeDependenciesResultSuccess,
 )
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -242,7 +245,9 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
@@ -1419,6 +1424,10 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
+        # What this node owns, collected before the connections come down so a mid-teardown state cannot
+        # affect it.
+        releasable_handle_keys = self._cached_objects_owned_by(node)
+
         with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
@@ -1489,15 +1498,15 @@ class NodeManager(EngineScoped):
                         )
                         return DeleteNodeResultFailure(result_details=details)
 
-        # Check if it's in a node group
-        if isinstance(node.parent_group, SubflowNodeGroup):
-            try:
-                node.parent_group.delete_nodes_from_group([node])
-            except ValueError as e:
-                details = f"Attempted to delete a Node '{node_name}'. Failed to remove it from the node group: {e}"
-                return DeleteNodeResultFailure(result_details=details)
+        # Every kind of group has to give up a node being deleted, not just a SubflowNodeGroup:
+        # a group that keeps naming a deleted child reports it as involved in the next run.
+        if isinstance(node.parent_group, BaseNodeGroup):
+            node.parent_group.delete_nodes_from_group([node])
 
         parent_flow.remove_node(node.name)
+
+        for key in releasable_handle_keys:
+            node.local_objects.release_parked(key)
 
         # Now remove the record keeping
         self.engine.object_manager.del_obj_by_name(node_name)
@@ -2126,6 +2135,10 @@ class NodeManager(EngineScoped):
                 settable=request.settable,
                 allow_variable_substitution=request.allow_variable_substitution,
             )
+        # Hand saved state to the traits so their converters, validators, and rendered
+        # options match what was saved.
+        if request.traits:
+            NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -2459,7 +2472,7 @@ class NodeManager(EngineScoped):
                 value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
-                value = node.get_parameter_value(parameter.name)
+                value = node._get_raw_parameter_value(parameter.name)
             if value is not None:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
@@ -2493,6 +2506,8 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.traits is not None:
+                NodeManager._apply_trait_states(parameter, request.traits)
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -3024,12 +3039,12 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node.get_parameter_value(request.parameter_name)
+        old_value = node._get_raw_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
         )
         # Get the "converted" value here.
-        finalized_value = node.get_parameter_value(request.parameter_name)
+        finalized_value = node._get_raw_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
@@ -3230,6 +3245,35 @@ class NodeManager(EngineScoped):
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
 
+    def _cached_objects_owned_by(self, node: BaseNode) -> list[str]:
+        """The cache references for objects this node owns, which are the ones it produced.
+
+        A cached object belongs to the output parameter that produced it. A consumer holds a reference and
+        borrows the object; it never owns it and is never responsible for its life. So deleting a node
+        releases what that node made and nothing else, and a consumer left holding a reference to it finds
+        it stale and is told to re-run the producer -- which is the same answer it already gets when the
+        producer re-runs and displaces what it made.
+        """
+        owned: set[str] = set()
+        # Its own outputs, and of those only the references it produced itself -- not a reference a
+        # pass-through merely copied into its own outputs, which EndNode and the subflow boundary nodes do
+        # for every parameter they carry.
+        #
+        # Read from the values rather than from this process's store, because the object is cached in the
+        # worker that ran the node while deletion happens on the orchestrator -- so the orchestrator holds
+        # no entry for it and has only the reference to go on. Snapshot: node bodies write outputs from
+        # worker threads.
+        for value in list(node.parameter_output_values.values()):
+            owned |= node.local_objects.keys_this_node_produced(value)
+        # Plus anything this process does hold for the node, which covers an in-process library and an entry
+        # whose parameter was renamed or removed after it was cached.
+        owned.update(
+            self.engine.resource_manager.parked_keys_for(
+                owner=node.local_objects.owner, source=node.local_object_source
+            )
+        )
+        return sorted(owned)
+
     def get_node_by_name(self, name: str) -> BaseNode:
         obj_mgr = self.engine.object_manager
 
@@ -3372,7 +3416,19 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
-            worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            # "This library cannot run right now" is expected and recoverable -- an evicted worker,
+            # or one that never started -- and get_worker_for_library reports it by raising. Caught
+            # here so it reads as the node failure it is, rather than an unhandled engine error that
+            # buries a message written for an artist.
+            #
+            # The wait comes first: a worker is routable the moment it registers but loads its
+            # library after, and forwarding into that window fails node creation over there.
+            try:
+                if library_name:
+                    await self.engine.worker_manager.wait_until_executable(library_name)
+                worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            except RuntimeError as err:
+                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
@@ -3439,16 +3495,71 @@ class NodeManager(EngineScoped):
                 ),
             )
         try:
-            return LibraryRegistry.create_node(
+            transient = LibraryRegistry.create_node(
                 node_type=node_type,
                 name=node_name,
                 metadata=dict(request.node_metadata),
                 specific_library_name=library_name,
             )
         except Exception as e:
-            return ExecuteNodeResultFailure(
-                result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}",
+            # In a worker, this almost always means the process could not load the one library
+            # it exists to run -- most often because an execution dependency would not install.
+            # The orchestrator holds that library perfectly well and is drawing its nodes on the
+            # canvas, so "Library not found" sends whoever reads it hunting for a missing library
+            # that is right in front of them. When this process knows better, say that instead.
+            reason = self._local_library_load_failure(library_name)
+            if reason is None:
+                return ExecuteNodeResultFailure(
+                    result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}"
+                )
+
+            # The library's own account of why -- resolver output, environment paths, version
+            # solving -- is for whoever maintains the library, and an artist cannot act on any of
+            # it. It goes to the log, the way a model-policy failure's diagnostic does, while the
+            # surfaced message stays about what happened and what still works.
+            logger.error(
+                "The worker for library '%s' could not load it, so node '%s' (%s) cannot run: %s (%s)",
+                library_name,
+                node_name,
+                node_type,
+                reason,
+                e,
             )
+            return ExecuteNodeResultFailure(
+                result_details=(
+                    f"Attempted to run '{node_name}' ({node_type}). Failed because the separate process "
+                    f"that runs '{library_name}' could not start it up. Editing the node still works and "
+                    f"your workflow keeps it. Ask whoever maintains '{library_name}' to check its "
+                    f"installation; the details are in the engine log."
+                )
+            )
+
+        if request.local_object_source is not None:
+            # Adopt the orchestrator's identity. A fresh node is built for every execution, so without this
+            # each run would cache under a new identity and nothing would ever displace anything.
+            transient.local_object_source = request.local_object_source
+        return transient
+
+    def _local_library_load_failure(self, library_name: str | None) -> str | None:
+        """What THIS process recorded about failing to load ``library_name``, if anything.
+
+        Worker-only: on the orchestrator a library that failed to load has no nodes to execute
+        in the first place, so there is nothing to explain here.
+        """
+        library_manager = self.engine.library_manager
+        if not library_name or not library_manager.is_worker:
+            return None
+        library_info = library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return None
+        # Whether the library LOADED, not whether it has any problem. A library can be LOADED and
+        # FLAWED -- one node module of twenty failed to import, a duplicate node name -- and be
+        # running everything else perfectly well. Treating that as "the process could not start"
+        # would misattribute a single broken node type to the whole library. Note the state after
+        # a failed dependency install is EVALUATED, not FAILURE, so this cannot test for FAILURE.
+        if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
+            return None
+        return library_manager.get_collated_problems_for_library(library_name)
 
     async def _execute_node_via_worker(
         self,
@@ -3487,6 +3598,17 @@ class NodeManager(EngineScoped):
                 worker_engine_id,
                 worker_request_topic,
             )
+        except WorkerGoneError as err:
+            # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
+            # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
+            # UNRESOLVED with nothing anywhere saying why. The reason comes from whoever retired the
+            # worker, and rides on `exception` so it reaches the node-failure formatting.
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"{err} Editing the node still works and your workflow keeps it."
+            )
+            logger.error(details)
+            return ExecuteNodeResultFailure(result_details=details, exception=err)
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation
             # so a subsequent execute on the same node doesn't see a stale record.
@@ -3552,15 +3674,15 @@ class NodeManager(EngineScoped):
     async def _hydrate_and_run_node(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         """Hydrate a node's input parameters and execute it.
 
-        On a worker, hydration and node.aprocess() both run inside
-        worker_node_execution_scope so that any nested handle_request calls
-        originated from node code forward to the orchestrator. Hydration calls
+        Hydration and node.aprocess() both run inside node_execution_scope. On a
+        worker that is what makes any nested handle_request calls originated from
+        node code forward to the orchestrator: hydration calls
         set_parameter_value, which cascades into ListConnectionsForNodeRequest
-        and similar cross-node lookups; those must forward because the worker
+        and similar cross-node lookups, and those must forward because the worker
         only owns its single node copy and cannot resolve parent-flow or peer-
-        node state locally. On the orchestrator we skip the scope entirely --
-        there is no RemoteHandler to read the flag, so opening it there would
-        only bump a refcount nothing observes.
+        node state locally. Everywhere it also marks the window in which a held
+        object must not be freed, which is why it is opened on the orchestrator
+        too.
         """
         # Register this aprocess task under its request_id so
         # CancelExecuteNodeRequest can locate it. Only populated when the caller
@@ -3572,42 +3694,56 @@ class NodeManager(EngineScoped):
         if tracked_request_id and current_task is not None:
             self._worker_inflight_aprocesses[tracked_request_id] = (current_task, node)
         try:
+            # Adopt the orchestrator's workflow context before anything resolves a path. Hydration
+            # resolves paths too, so this precedes it, and it cannot ride aprocess_scope, which
+            # stays narrow so its mutation detector fires only inside aprocess. Worker-only: on the
+            # orchestrator route this process already owns the context it just sent.
+            if self.engine.library_manager.is_worker:
+                self.engine.context_manager.mirror_workflow_context(
+                    request.workflow_name,
+                    request.workflow_file_path,
+                    request.workflow_working_directory,
+                )
             return await self._hydrate_and_run_node_inner(node, request)
         finally:
             if tracked_request_id:
                 self._worker_inflight_aprocesses.pop(tracked_request_id, None)
+            # Release hooks held back while nodes ran. A no-op while any node is still executing, which
+            # parallel resolution makes routine -- the drain enforces that itself.
+            dropped = self.engine.resource_manager.drain_deferred_releases()
+            if dropped:
+                logger.debug("Released %d held object(s) deferred while nodes were running.", dropped)
+
+    @staticmethod
+    def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
+        """Swap each reference in the node's input values for the object it stands for, where held here.
+
+        So a node body reading `self.parameter_values[name]` directly gets what `get_parameter_value` would
+        give it. Authors do read that dict -- hydration already materialises defaults into it for the same
+        reason -- and a reference sitting there hands them something that is not their object.
+
+        Written straight into the dict rather than through `set_parameter_value`: nothing changed as far as
+        the graph is concerned, and the setter would emit a lifecycle event carrying the live object where
+        the reference is what the editor should see.
+
+        Worker-side only. In-process a node's dict already holds the object it was handed, so there is
+        nothing to swap -- except a reference a library made itself through `reference_for`, and replacing
+        that one would blind the save and metadata guards, which look for a reference and would find an
+        object they cannot write out.
+        """
+        for param_name, stored in list(node.parameter_values.items()):
+            resolved = node.local_objects.resolve_what_is_here(stored)
+            if resolved is not stored:
+                node.parameter_values[param_name] = resolved
 
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
-        # The node-execution scope only has meaning on a worker: it is what
-        # RemoteHandler consults to decide whether to forward a request to the
-        # orchestrator. On the orchestrator itself there is no RemoteHandler
-        # installed (register_remote_handlers is worker-only), so opening the
-        # scope there would just bump a refcount that nothing reads. Skip it
-        # to keep the depth counter accurate to its name.
-        is_worker = self.engine.library_manager._is_worker
-        scope_cm = self.engine.event_manager.worker_node_execution_scope() if is_worker else contextlib.nullcontext()
-        with scope_cm:
+        with self.engine.event_manager.node_execution_scope():
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
-            for param_name, value in parameter_values.items():
-                # Skip when the node already holds this value. The local path
-                # calls ExecuteNodeRequest with dict(node.parameter_values) on
-                # the same in-memory instance, so every iteration would be a
-                # no-op mutation that still ran before/after_value_set hooks
-                # and emitted a lifecycle event -- observably breaking nodes
-                # like LoadImage. On the worker the node is fresh, so current
-                # is _PARAM_MISSING and the normal set path runs.
-                current = node.parameter_values.get(param_name, _PARAM_MISSING)
-                if current is value or current == value:
-                    continue
-                try:
-                    node.set_parameter_value(param_name, value)
-                except Exception as e:
-                    return ExecuteNodeResultFailure(
-                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
-                        exception=e,
-                    )
+            hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
+            if hydration_failure is not None:
+                return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
             # process() code reading self.parameter_values[name] directly (rather
             # than via get_parameter_value) sees the default. Newly-dropped nodes
@@ -3620,6 +3756,27 @@ class NodeManager(EngineScoped):
                 if param.default_value is None:
                     continue
                 node.parameter_values[param.name] = param.default_value
+            if self.engine.library_manager.is_worker:
+                self._resolve_cached_inputs_in_place(node)
+
+            # After hydration and after cached inputs have become objects again, so a check here reads
+            # what `aprocess` will read. Before `aprocess`, so a node that cannot run does not half-run.
+            try:
+                validation_exceptions = node.validate_in_execution_environment()
+            except Exception as e:
+                # The check is a library's own code, and it runs where the execution dependencies are, so
+                # an ImportError out of it says the same thing as a returned exception: this node cannot
+                # run here. Letting it escape would report a node that declined as an engine crash.
+                validation_exceptions = [e]
+            if validation_exceptions:
+                return ExecuteNodeResultFailure(
+                    result_details=(
+                        f"Attempted to execute node '{node_name}'. It declined to run: "
+                        f"{'; '.join(str(exception) for exception in validation_exceptions)}"
+                    ),
+                    validation_exceptions=validation_exceptions,
+                )
+
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()
@@ -3637,10 +3794,86 @@ class NodeManager(EngineScoped):
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
                 )
+            finally:
+                # The scratch marker only means anything while the run is in flight. A parameter
+                # the node still holds here was never torn down, so serialization must treat it
+                # as structure rather than dropping it from every later save.
+                node.forget_parameters_added_during_execution()
+        # Only a worker's result leaves the process. In-process this is handed straight back to
+        # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
+        # dict the node just wrote its object into.
+        if self.engine.library_manager.is_worker:
+            output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
+        else:
+            output_values = dict(node.parameter_output_values)
         return ExecuteNodeResultSuccess(
-            parameter_output_values=dict(node.parameter_output_values),
+            parameter_output_values=output_values,
             result_details=f"Node '{node_name}' executed successfully.",
         )
+
+    def _apply_hydrated_values(
+        self, node: BaseNode, node_name: str, parameter_values: dict[str, Any]
+    ) -> ExecuteNodeResultFailure | None:
+        """Apply hydrated parameter values to an executing node. Returns a failure or None.
+
+        Applied in passes until a fixpoint, because parameter STRUCTURE derives from values
+        (the authoring contract): setting a value fires the node's value hooks, and hooks are
+        where a node like the diffusers VAE decoder creates the parameters its other values
+        belong to. A fresh worker-side node starts with only its __init__ shape, so a value
+        for a derived parameter can arrive before the value that derives it -- hydration
+        order is dict order, which promises nothing. Each pass sets every value whose
+        parameter exists (running the derivations) and defers the rest; deferred values are
+        retried as long as a pass made progress, so a derivation CHAIN (provider creates
+        model, model creates options) hydrates fully no matter how the values were ordered.
+        Termination is guaranteed: a productive pass strictly shrinks the deferred set, and
+        an unproductive one ends the loop.
+
+        A value still unclaimed after both passes belongs to a parameter nothing on this copy
+        derives -- most often one added to the authoritative node by request (a user-added
+        parameter in the editor, or a node that added one mid-execution and expected it to
+        persist). Skipped rather than failed: the authoritative value is untouched on the
+        orchestrator, and failing here made any user-added parameter fatal to a worker-routed
+        node. The warning names the contract so the author of a node that MEANT this
+        parameter to exist knows what to change.
+        """
+        pending = parameter_values
+        deferred: dict[str, Any] = {}
+        made_progress = True
+        while pending and made_progress:
+            deferred = {}
+            made_progress = False
+            for param_name, value in pending.items():
+                if node.get_parameter_by_name(param_name) is None:
+                    deferred[param_name] = value
+                    continue
+                made_progress = True
+                # Skip when the node already holds this value. The local path passes
+                # dict(node.parameter_values) for the same in-memory instance, so setting it again
+                # would fire before/after_value_set and emit a lifecycle event for no change --
+                # observably breaking nodes like LoadImage. On a worker the node is fresh, so
+                # current is _PARAM_MISSING and the normal set path runs.
+                current = node.parameter_values.get(param_name, _PARAM_MISSING)
+                if current is value or current == value:
+                    continue
+                try:
+                    node.set_parameter_value(param_name, value)
+                except Exception as e:
+                    return ExecuteNodeResultFailure(
+                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
+                        exception=e,
+                    )
+            pending = deferred
+        for param_name in deferred:
+            logger.warning(
+                "Node '%s' received a value for parameter '%s', which does not exist on the "
+                "executing copy and was not created by its value hooks. The value was left "
+                "unapplied for this run. Parameter structure must derive from parameter "
+                "values (created in __init__ or by a value hook); a parameter added only by "
+                "request does not carry over to execution.",
+                node_name,
+                param_name,
+            )
+        return None
 
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
@@ -3873,11 +4106,13 @@ class NodeManager(EngineScoped):
                     serialized_library_name = library_details.library_name
 
                 # Get the creation details for regular nodes
+                metadata_copy = copy.deepcopy(node.metadata)
+                # Per live node, never per serialized form -- see the group branch above.
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
-                    metadata=copy.deepcopy(node.metadata),
+                    metadata=metadata_copy,
                     # If it is actively resolving, mark as unresolved.
                     resolution=node.state.value,
                     initial_setup=True,
@@ -3908,6 +4143,9 @@ class NodeManager(EngineScoped):
             # Now creation or alteration of all of the elements.
             element_modification_commands = []
 
+            # Parameters left out of the commands below, so their values must be left out too.
+            omitted_parameter_names: set[str] = set()
+
             # Serialize only user-defined ParameterGroups (like parameters)
             all_groups = node.root_ui_element.find_elements_by_type(ParameterGroup)
             for group in all_groups:
@@ -3927,9 +4165,9 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    param_dict = parameter.save_dict()
+                    param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3945,6 +4183,31 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
+                    param_dict = parameter.save_dict()
+                    param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
+                    element_modification_commands.append(add_param_request)
+                elif (
+                    parameter.name in node.parameters_added_during_execution
+                    and reference_node.get_parameter_by_name(parameter.name) is None
+                ):
+                    # Scratch state the run owns and tears down, so the copy should not have it at
+                    # all. An alter would find no element on the recreated node and fail the whole
+                    # deserialize, and an add would leave the artist a phantom property.
+                    omitted_parameter_names.add(parameter.name)
+                elif (
+                    parameter.name in node.parameters_added_after_construction
+                    and reference_node.get_parameter_by_name(parameter.name) is None
+                ):
+                    # Added outside ``__init__`` but meant to last — typically built from a value
+                    # hook as an input arrived. The recreated node has no such parameter when the
+                    # element commands replay, and the value replay will not rebuild it either
+                    # because ``initial_setup`` suppresses the hooks, so recreate it outright.
+                    #
+                    # Reference absence cannot pick these out on its own: the reference's metadata is
+                    # narrowed to library and node_type, so it also lacks parameters ``__init__``
+                    # derives from any other metadata key, and adding those would collide with the
+                    # copy's own and land as ``<name>_1``.
                     param_dict = parameter.to_dict()
                     param_dict["initial_setup"] = True
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
@@ -3960,6 +4223,8 @@ class NodeManager(EngineScoped):
                     if relevant:
                         diff["parameter_name"] = parameter.name
                         diff["initial_setup"] = True
+                        if "traits" in diff:
+                            diff["traits"] = self._stabilize_trait_modules(diff["traits"])
                         alter_param_request = AlterParameterDetailsRequest.create(**diff)
                         element_modification_commands.append(alter_param_request)
 
@@ -3977,6 +4242,8 @@ class NodeManager(EngineScoped):
                     if relevant:
                         diff["group_name"] = group.name
                         diff["initial_setup"] = True
+                        if "traits" in diff:
+                            diff["traits"] = self._stabilize_trait_modules(diff["traits"])
                         alter_group_request = AlterParameterGroupDetailsRequest(**diff)
                         element_modification_commands.append(alter_group_request)
 
@@ -3987,6 +4254,9 @@ class NodeManager(EngineScoped):
             # Only AlterParameterDetailsRequest commands are recorded and replayed
             # Normal node - use current parameter values
             for parameter in node.parameters:
+                # No parameter to receive the value: it was left out of the commands above.
+                if parameter.name in omitted_parameter_names:
+                    continue
                 # SetParameterValueRequest event
                 set_param_value_requests = NodeManager.handle_parameter_value_saving(
                     parameter=parameter,
@@ -4540,6 +4810,111 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
 
+    def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        library_manager = self.engine.library_manager
+        for entry in trait_states:
+            trait_module = entry.get("trait_module")
+            if trait_module is None:
+                continue
+            if not library_manager.is_dynamic_module(trait_module):
+                continue
+            stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
+            if stable_namespace is None:
+                entry["trait_module"] = None
+                logger.warning(
+                    "Attempted to save the '%s' control, but the library providing it has no stable name to "
+                    "record. Its state can only be restored when the node rebuilds that control.",
+                    entry.get("trait_name"),
+                )
+                continue
+            entry["trait_module"] = stable_namespace
+        return trait_states
+
+    @staticmethod
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+        """Update attached traits in place to preserve constructor wiring such as callbacks."""
+        unmatched = parameter.find_elements_by_type(Trait)
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            trait_class = None
+            if entry.trait_module is not None:
+                trait_class = resolve_trait(entry.trait_name, entry.trait_module)
+            existing = NodeManager._take_attached_trait(unmatched, entry, trait_class)
+            if existing is None:
+                NodeManager._build_saved_trait(parameter, entry, trait_class)
+                continue
+            # Library code can raise anything, and a bad trait must not fail the load.
+            try:
+                existing.apply_state(entry.trait_state)
+            except Exception as error:
+                logger.warning(
+                    "Parameter '%s' was saved with state for its '%s' control, but the control did not "
+                    "accept it (%s). The parameter keeps the state its node supplied.",
+                    parameter.name,
+                    entry.trait_name,
+                    error,
+                )
+
+    @staticmethod
+    def _take_attached_trait(
+        unmatched: list[Trait], entry: TraitStateEntry, trait_class: type[Trait] | None
+    ) -> Trait | None:
+        """Take the first match by resolved class, or by name when the class cannot be resolved.
+
+        Consumed so two entries cannot share one trait. The name fallback covers a library moving
+        a trait to another module while the node still builds it. Save-side pairing in
+        ``changed_trait_states`` compares module strings instead, since both its sides are live.
+        """
+        for candidate in unmatched:
+            if trait_class is None:
+                matched = type(candidate).__name__ == entry.trait_name
+            else:
+                matched = type(candidate) is trait_class
+            if matched:
+                unmatched.remove(candidate)
+                return candidate
+        return None
+
+    @staticmethod
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry, trait_class: type[Trait] | None) -> None:
+        if entry.trait_module is None:
+            logger.warning(
+                "Parameter '%s' was saved with a '%s' control, but no module was recorded and the node did "
+                "not rebuild it. The parameter loads without that control.",
+                parameter.name,
+                entry.trait_name,
+            )
+            return
+        if trait_class is None:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
+                "The parameter will load without it. Check that the library providing it is installed.",
+                parameter.name,
+                entry.trait_name,
+                entry.trait_module,
+            )
+            return
+        # Library code can raise anything, and a bad trait must not drop the parameter.
+        try:
+            trait = trait_class.from_state(entry.trait_state)
+        except Exception as error:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait, but its saved state could not build that "
+                "control (%s). The parameter loads without it. Check that the library providing it is up to date.",
+                parameter.name,
+                entry.trait_name,
+                error,
+            )
+            return
+        parameter.add_trait(trait)
+
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
         base_param = base_node_obj.get_parameter_by_name(parameter.name)
@@ -4687,7 +5062,7 @@ class NodeManager(EngineScoped):
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
-        effective_value = node.get_parameter_value(parameter.name)
+        effective_value = node._get_raw_parameter_value(parameter.name)
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
@@ -4759,6 +5134,14 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # A key into this process's memory means nothing in another, and a workflow that saved one would
+        # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
+        # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
+        # serializable parameter is still skipped.
+        if node.local_objects.contains_a_parked_object(value):
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -4824,7 +5207,7 @@ class NodeManager(EngineScoped):
             if param.name in node.parameter_output_values:
                 param_values[param.name] = node.parameter_output_values[param.name]
             else:
-                param_values[param.name] = node.get_parameter_value(param.name)
+                param_values[param.name] = node._get_raw_parameter_value(param.name)
         simple_values = safe_unstructure(param_values)
         return SerializedParameterValues(simple_values, None)
 
@@ -4877,7 +5260,7 @@ class NodeManager(EngineScoped):
         """
         if param_name in node.parameter_output_values:
             return node.parameter_output_values[param_name]
-        return node.get_parameter_value(param_name)
+        return node._get_raw_parameter_value(param_name)
 
     @staticmethod
     def _process_parameter_for_pickling(  # noqa: PLR0913
