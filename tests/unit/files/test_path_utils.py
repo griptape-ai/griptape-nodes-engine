@@ -723,6 +723,30 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "/path/to/file.txt"
 
+    def test_parse_localhost_percent_encoded(self) -> None:
+        """A percent-encoded localhost must decode before the comparison, not after.
+
+        Regression guard: decoding netloc only inside the (former) UNC branch meant
+        this literal-compared as "local%68ost" and missed the localhost collapse.
+        """
+        uri = "file://local%68ost/path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "/path/to/file.txt"
+
+    def test_parse_file_scheme_case_insensitive(self) -> None:
+        """The file:// scheme match is case-insensitive, consistent with is_url() and RFC 3986."""
+        uri = "FILE:///path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "/path/to/file.txt"
+
+    def test_bare_file_uri_with_no_path_returns_none(self) -> None:
+        """file:// alone names no file; returning "" would let a caller treat it as real."""
+        assert parse_file_uri("file://") is None
+
+    def test_bare_localhost_uri_with_no_path_returns_none(self) -> None:
+        """file://localhost alone names no file either."""
+        assert parse_file_uri("file://localhost") is None
+
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
     def test_parse_windows_absolute_path(self) -> None:
         """Test parsing Windows absolute path file URI."""
@@ -749,11 +773,120 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "/path/to/file!@#.txt"
 
-    def test_rejects_remote_host(self) -> None:
-        """Test that file URIs with non-localhost hosts are rejected."""
-        uri = "file://remote-server/path/to/file.txt"
+    def test_drive_letter_netloc_is_treated_as_local(self) -> None:
+        """A bare drive letter in the netloc slot (file://C:/...) names a local path, not a host.
+
+        Platform-independent: this is pure URI-spelling reinterpretation, not real UNC
+        resolution, so it doesn't need is_windows() patched.
+        """
+        uri = "file://C:/Users/test/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "C:/Users/test/file.txt"
+
+    def test_legacy_pipe_drive_letter_netloc_is_treated_as_local(self) -> None:
+        """The legacy file://c|/... spelling is the same drive-letter case, piped instead of colon."""
+        uri = "file://c|/Users/test/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "c:/Users/test/file.txt"
+
+    def test_parses_unc_share_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A UNC network share resolves on Windows, where UNC paths are meaningful."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/render.exr"
+
+    def test_rejects_unc_share_off_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reject UNC shares off Windows.
+
+        POSIX has no UNC concept: Path("//server/share/f").resolve() silently returns a
+        real-looking but bogus local path, so a non-Windows host must reject this outright
+        rather than resolve it.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        uri = "file://server/share/render.exr"
         result = parse_file_uri(uri)
         assert result is None
+
+    def test_parses_unc_share_with_percent_encoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test parsing a UNC network share file URI with percent-encoded characters."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/file%20with%20spaces.txt"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/file with spaces.txt"
+
+    def test_rejects_unc_host_with_no_share(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bare UNC host (no share) is not a path PureWindowsPath treats as absolute -- reject it."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server") is None
+
+    def test_rejects_unc_host_with_trailing_slash_and_no_share(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same as above: a trailing slash alone doesn't supply a share."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server/") is None
+
+    def test_parses_unc_host_preserves_case(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """UNC host and path casing is preserved, unlike the localhost check."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://Server/Share/File.txt"
+        result = parse_file_uri(uri)
+        assert result == "//Server/Share/File.txt"
+
+    def test_unc_result_is_not_classified_as_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A parsed UNC path must not be re-classified as a URL by is_url()."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result is not None
+        assert is_url(result) is False
+
+    def test_rejects_path_traversal_as_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """file://../../etc/passwd parses a netloc of ".." -- not a real host name."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://../../etc/passwd") is None
+
+    def test_rejects_userinfo_and_port_in_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A UNC host is a bare NetBIOS/DNS name -- userinfo and a port aren't part of that."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://user:pass@host:445/share/f") is None
+
+    def test_rejects_ipv6_literal_as_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows needs the [::1].ipv6-literal.net form; the bracket spelling can never open."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://[::1]/share/f") is None
+
+    def test_malformed_ipv6_does_not_raise(self) -> None:
+        """An unterminated "[" makes urlparse raise ValueError; this must return None, not propagate."""
+        assert parse_file_uri("file://[oops/path") is None
+
+    def test_rejects_unc_host_with_leading_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://.server/share/f") is None
+
+    def test_rejects_unc_host_with_trailing_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must end on an alphanumeric character, so a trailing dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server./share/f") is None
+
+    def test_rejects_unc_host_with_leading_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading hyphen is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://-server/share/f") is None
+
+    def test_parses_unc_host_as_ip_literal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bare (unbracketed) IPv4 address is a valid UNC host, unlike a bracketed IPv6 literal."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://192.168.1.5/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//192.168.1.5/share/f.txt"
+
+    def test_parses_unc_host_with_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hyphenated hostname (not at the start/end) is a valid UNC host."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://my-server/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//my-server/share/f.txt"
 
     def test_rejects_non_file_scheme(self) -> None:
         """Test that non-file:// URIs are rejected."""

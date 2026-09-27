@@ -18,6 +18,7 @@ from griptape_nodes.node_library.library_declarations import (
     find_model_catalog,
     resolve_node_models,
 )
+from griptape_nodes.retained_mode.beta_features import BetaFeature, parse_library_beta_features
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
     DuplicateNodeRegistrationProblem,
 )
@@ -62,9 +63,29 @@ class LibraryNameAndVersion(NamedTuple):
 
 
 class Dependencies(BaseModel):
-    """Pip packages that need to be installed for this library."""
+    """Pip packages that need to be installed for this library.
+
+    Dependencies are declared in two sets, because a library needs far less installed to be
+    *edited* than to be *run*:
+
+    - ``pip_dependencies`` (edit-time): everything needed to import the library's node modules
+      and instantiate its nodes. The orchestrator installs these, so they are what the editor,
+      workflow loading, and parameter/trait behavior depend on. Keep this set light.
+    - ``pip_dependencies_exec`` (execution-time): the heavy packages only ``process`` needs
+      (torch, diffusers, and friends). These are installed into a separate environment and are
+      only on ``sys.path`` where nodes actually execute, so they never enter the orchestrator's
+      import path and cannot collide with another library's pins there.
+
+    A library that declares no execution dependencies is entirely edit-time, and it runs in
+    the orchestrator.
+
+    ``pip_install_flags`` applies to both installs, since flags in practice configure where
+    packages come from (index URLs, ``--find-links``, backend selection) rather than which set
+    is being installed.
+    """
 
     pip_dependencies: list[str] | None = None
+    pip_dependencies_exec: list[str] | None = None
     pip_install_flags: list[str] | None = None
 
 
@@ -73,6 +94,9 @@ class ResourceRequirements(BaseModel):
 
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
+
+    ``required`` is the only tier: without it the library cannot run. Execution refuses with the
+    reason and editing is unaffected, so a cuda-only library stays fully editable on a laptop.
     """
 
     required: Requirements | None = None
@@ -253,7 +277,10 @@ class LibrarySchema(BaseModel):
     library itself.
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.11.0"
+    # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
+    # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
+    # optional beta_features list, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.14.0"
 
     name: str
     library_schema_version: str
@@ -268,6 +295,10 @@ class LibrarySchema(BaseModel):
     is_default_library: bool | None = None
     advanced_library_path: str | None = None
     widgets: list[WidgetDefinition] | None = None
+    # Beta features this library defines. Kept as raw entries so one bad entry cannot fail the
+    # whole manifest. parse_library_beta_features checks each one, and the load reports the
+    # dropped ones as library problems.
+    beta_features: list[Any] | None = None
 
 
 class LibraryRegistry:
@@ -585,6 +616,9 @@ class Library:
     # the class on demand -- see NodeTypeEntry) and to its metadata.
     _node_types: dict[str, NodeTypeEntry]
     _node_metadata: dict[str, NodeMetadata]
+    # Valid beta features from the manifest, parsed on first use and kept because the manifest
+    # can't change while loaded.
+    _beta_features: dict[str, BetaFeature] | None
     _advanced_library: AdvancedNodeLibrary | None
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
@@ -610,11 +644,20 @@ class Library:
 
         self._node_types = {}
         self._node_metadata = {}
+        self._beta_features = None
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
+
+    def get_beta_features(self) -> dict[str, BetaFeature]:
+        """The valid beta features this library declares, keyed by id, including expired ones."""
+        if self._beta_features is None:
+            self._beta_features = parse_library_beta_features(
+                self._library_data.name, self._library_data.beta_features or []
+            ).features
+        return dict(self._beta_features)
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)

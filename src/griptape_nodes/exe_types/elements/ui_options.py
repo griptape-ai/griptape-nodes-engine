@@ -49,17 +49,29 @@ class UIOptionsMixin:
             )
             logger.warning(msg)
 
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Return stored options without values derived by subclasses."""
+        return dict(self._ui_options)  # type: ignore[attr-defined]
+
     def update_ui_options_key(self, key: str, value: Any) -> None:
         """Update a single UI option key."""
-        ui_options = self.ui_options
-        ui_options[key] = value
-        self.ui_options = ui_options
+        self.update_ui_options({key: value})
 
     def update_ui_options(self, updates: dict[str, Any]) -> None:
-        """Update multiple UI options at once."""
-        ui_options = self.ui_options
-        ui_options.update(updates)
-        self.ui_options = ui_options
+        """Update stored options without copying derived options into them."""
+        authored = self.authored_ui_options()
+        authored.update(updates)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Remove a stored option without copying derived options into storage."""
+        authored = self.authored_ui_options()
+        authored.pop(key, None)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def report_ui_options_change(self) -> None:
+        """Report derived UI options without storing them."""
+        self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
 
 
 def seed_ui_options(element: UIOptionsMixin, ui_options: dict, values: dict[str, Any]) -> None:

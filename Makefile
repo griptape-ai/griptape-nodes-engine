@@ -1,3 +1,7 @@
+# mdformat sorts and lowercases link definitions, which breaks the Keep a Changelog layout.
+# scripts/changelog.py checks CHANGELOG.md instead.
+MARKDOWN_ROOT_FILES := $(filter-out CHANGELOG.md,$(wildcard *.md))
+
 .PHONY: version/get
 version/get: ## Get version.
 	@uv version | awk '{print $$2}'
@@ -28,13 +32,19 @@ version/commit: ## Commit version.
 	@git add pyproject.toml uv.lock
 	@git commit -m "chore: bump v$$(make version/get)"
 
+# Commits the roll on a detached HEAD so the local branch still matches its remote. On main, the
+# bump-next PR repeats the roll.
 .PHONY: version/publish
-version/publish: ## Create and push git tags.
+version/publish: ## Roll the changelog, then create and push git tags. Pass allow_empty=1 to release with no entries.
 	@git fetch --tags --force
+	@uv run python scripts/changelog.py roll $$(make version/get) $(if $(allow_empty),--allow-empty)
+	@git checkout --quiet --detach
+	@git commit --quiet -m "chore: release v$$(make version/get)" CHANGELOG.md
 	@git tag v$$(make version/get)
 	@git tag stable -f
 	@git push -f --tags
 	@git push origin HEAD:refs/heads/release/v$$(make version/get | awk -F. '{print $$1 "." $$2}')
+	@git checkout --quiet -
 	
 .PHONY: install
 install: ## Install all dependencies.
@@ -71,7 +81,7 @@ lint: ## Lint project.
 .PHONY: format
 format: ## Format project.
 	@uv run ruff format
-	@uv run mdformat .github docs src tests *.md
+	@uv run mdformat .github docs src tests $(MARKDOWN_ROOT_FILES)
 
 .PHONY: fix
 fix: ## Fix project.
@@ -79,12 +89,12 @@ fix: ## Fix project.
 	@uv run ruff check --fix --unsafe-fixes
 
 .PHONY: check
-check: check/format check/lint check/types check/spell ## Run all checks.
+check: check/format check/lint check/types check/spell check/changelog ## Run all checks.
 
 .PHONY: check/format
 check/format:
 	@uv run ruff format --check
-	@uv run mdformat --check .github docs src tests *.md
+	@uv run mdformat --check .github docs src tests $(MARKDOWN_ROOT_FILES)
 
 .PHONY: check/lint
 check/lint:
@@ -97,6 +107,10 @@ check/types:
 .PHONY: check/spell
 check/spell:
 	@uv run typos 
+
+.PHONY: check/changelog
+check/changelog: ## Check CHANGELOG.md follows Keep a Changelog.
+	@uv run python scripts/changelog.py check
 
 .PHONY: test  ## Run all tests.
 test: test/unit test/integration test/e2e

@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 async def call_function(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Call a function, handling both sync and async cases.
 
+    Awaits on what the call RETURNS rather than asking whether ``func`` is a coroutine
+    function. The two differ for a callable object: ``inspect.iscoroutinefunction`` inspects
+    the object, not its ``__call__``, so an instance with an ``async def __call__`` looks
+    synchronous and its coroutine comes back unawaited -- as a value, silently, to be handed
+    on as though it were the result. Every caller here dispatches to registered callbacks,
+    and a callback is as likely to be an instance as a function.
+
     Args:
         func: The function to call (sync or async)
         *args: Positional arguments to pass to the function
@@ -26,9 +33,10 @@ async def call_function(func: Callable[..., Any], *args: Any, **kwargs: Any) -> 
     Returns:
         The result of the function call
     """
-    if inspect.iscoroutinefunction(func):
-        return await func(*args, **kwargs)
-    return func(*args, **kwargs)
+    result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 async def to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

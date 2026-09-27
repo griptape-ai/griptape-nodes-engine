@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 from abc import abstractmethod
 from enum import StrEnum
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import (
     ControlParameterInput,
@@ -16,66 +18,57 @@ from griptape_nodes.exe_types.core_types import (
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.progress_bar_component import ProgressBarComponent
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    DeleteConnectionRequest,
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
-def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
+def _outgoing_connection_exists(engine: Engine, source_node: str, source_param: str) -> bool:
     """Check if a source node/parameter has any outgoing connections.
 
     Args:
+        engine: Engine to ask about the workflow
         source_node: Name of the node that would be sending the connection
         source_param: Name of the parameter on that node
 
     Returns:
         True if the parameter has at least one outgoing connection, False otherwise
 
-    Logic: Look in connections.outgoing_index[source_node][source_param]
+    Asked as a request rather than read from a local connection index: connections are
+    workflow state, and the orchestrator is the only place that holds all of it.
     """
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-    connections = GriptapeNodes.FlowManager().get_connections()
-
-    # Check if source_node has any outgoing connections at all
-    source_connections = connections.outgoing_index.get(source_node)
-    if source_connections is None:
+    result = engine.handle_request(ListConnectionsForNodeRequest(node_name=source_node, broadcast_result=False))
+    if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
-    # Check if source_param has any outgoing connections
-    param_connections = source_connections.get(source_param)
-    if param_connections is None:
-        return False
-
-    # Return True if connections list is populated
-    return bool(param_connections)
+    return any(connection.source_parameter_name == source_param for connection in result.outgoing_connections)
 
 
-def _incoming_connection_exists(target_node: str, target_param: str) -> bool:
+def _incoming_connection_exists(engine: Engine, target_node: str, target_param: str) -> bool:
     """Check if a target node/parameter has any incoming connections.
 
     Args:
+        engine: Engine to ask about the workflow
         target_node: Name of the node that would be receiving the connection
         target_param: Name of the parameter on that node
 
     Returns:
         True if the parameter has at least one incoming connection, False otherwise
 
-    Logic: Look in connections.incoming_index[target_node][target_param]
+    Asked as a request rather than read from a local connection index: connections are
+    workflow state, and the orchestrator is the only place that holds all of it.
     """
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-    connections = GriptapeNodes.FlowManager().get_connections()
-
-    # Check if target_node has any incoming connections at all
-    target_connections = connections.incoming_index.get(target_node)
-    if target_connections is None:
+    result = engine.handle_request(ListConnectionsForNodeRequest(node_name=target_node, broadcast_result=False))
+    if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
-    # Check if target_param has any incoming connections
-    param_connections = target_connections.get(target_param)
-    if param_connections is None:
-        return False
-
-    # Return True if connections list is populated
-    return bool(param_connections)
+    return any(connection.target_parameter_name == target_param for connection in result.incoming_connections)
 
 
 class IterativeNodeParam(StrEnum):
@@ -122,7 +115,7 @@ class BaseIterativeStartNode(BaseNode):
     state tracking, and validation logic used by iterative loop start nodes.
     """
 
-    end_node: "BaseIterativeEndNode | None" = None
+    end_node: BaseIterativeEndNode | None = None
     exec_out: ControlParameterOutput
     _current_iteration_count: int
     _total_iterations: int
@@ -329,8 +322,6 @@ class BaseIterativeStartNode(BaseNode):
 
     def _validate_start_node(self) -> list[Exception] | None:
         """Common validation logic for both workflow and node run validation."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         exceptions = []
 
         # Validate end node connection
@@ -344,8 +335,8 @@ class BaseIterativeStartNode(BaseNode):
             exceptions.extend(validation_errors)
 
         try:
-            flow = GriptapeNodes.ObjectManager().get_object_by_name(
-                GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
+            flow = self.engine.object_manager.get_object_by_name(
+                self.engine.node_manager.get_node_parent_flow_by_name(self.name)
             )
             if isinstance(flow, ControlFlow):
                 self._flow = flow
@@ -481,10 +472,13 @@ class BaseIterativeStartNode(BaseNode):
             self._complete_loop()
             return
 
-        # Continue with current item - unresolve future nodes for fresh evaluation
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        # Continue with current item - unresolve future nodes for fresh evaluation.
+        # NOTE: this walks the LOCAL connection map, which is correct on the orchestrator and
+        # near-empty in a worker, where it would no-op in silence. UnresolveNodeRequest is not
+        # a substitute: it unresolves the node itself and refuses while the node is RESOLVING,
+        # which is exactly this node's state here. An iterative node in a worker-routed library
+        # therefore needs a downstream-only unresolve request that does not exist yet.
+        connections = self.engine.flow_manager.get_connections()
         connections.unresolve_future_nodes(self)
 
         # Always set the index output in base class
@@ -512,7 +506,7 @@ class BaseIterativeStartNode(BaseNode):
         node_type = self._get_base_node_type_name()
 
         # Check if exec_out has outgoing connections
-        if not _outgoing_connection_exists(self.name, self.exec_out.name):
+        if not _outgoing_connection_exists(self.engine, self.name, self.exec_out.name):
             exec_out_display_name = self._get_exec_out_display_name()
             errors.append(
                 Exception(
@@ -535,7 +529,7 @@ class BaseIterativeStartNode(BaseNode):
         # Check if all hidden signal connections exist (only if end_node is connected)
         if self.end_node:
             # Check trigger_next_iteration_signal connection
-            if not _incoming_connection_exists(self.name, self.trigger_next_iteration_signal.name):
+            if not _incoming_connection_exists(self.engine, self.name, self.trigger_next_iteration_signal.name):
                 errors.append(
                     Exception(
                         f"{self.name}: Missing hidden signal connection. "
@@ -545,7 +539,7 @@ class BaseIterativeStartNode(BaseNode):
                 )
 
             # Check break_loop_signal connection
-            if not _incoming_connection_exists(self.name, self.break_loop_signal.name):
+            if not _incoming_connection_exists(self.engine, self.name, self.break_loop_signal.name):
                 errors.append(
                     Exception(
                         f"{self.name}: Missing hidden signal connection. "
@@ -604,7 +598,7 @@ class BaseIterativeEndNode(BaseNode):
     conditional evaluation, and result accumulation logic used by iterative loop end nodes.
     """
 
-    start_node: "BaseIterativeStartNode | None" = None
+    start_node: BaseIterativeStartNode | None = None
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
@@ -887,7 +881,9 @@ class BaseIterativeEndNode(BaseNode):
             )
 
         # Check if all hidden signal connections exist (only if start_node is connected)
-        if self.start_node and not _incoming_connection_exists(self.name, "loop_end_condition_met_signal_input"):
+        if self.start_node and not _incoming_connection_exists(
+            self.engine, self.name, "loop_end_condition_met_signal_input"
+        ):
             errors.append(
                 Exception(
                     f"{self.name}: Missing hidden signal connection. "
@@ -905,7 +901,7 @@ class BaseIterativeEndNode(BaseNode):
         connected_controls = []
 
         for control_name in control_names:
-            if _incoming_connection_exists(self.name, control_name):
+            if _incoming_connection_exists(self.engine, self.name, control_name):
                 connected_controls.append(control_name)  # noqa: PERF401
 
         if not connected_controls:
@@ -988,13 +984,10 @@ class BaseIterativeEndNode(BaseNode):
 
     def _create_hidden_signal_connections(self, start_node: BaseNode) -> None:
         """Automatically create all hidden signal connections between Start and End nodes."""
-        from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Create the hidden signal connections and default control flow:
 
         # 1. Start → End: loop_end_condition_met_signal → loop_end_condition_met_signal_input
-        GriptapeNodes.handle_request(
+        self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=start_node.name,
                 source_parameter_name=IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL.value,
@@ -1004,7 +997,7 @@ class BaseIterativeEndNode(BaseNode):
         )
 
         # 2. End → Start: trigger_next_iteration_signal_output → trigger_next_iteration_signal
-        GriptapeNodes.handle_request(
+        self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=self.name,
                 source_parameter_name=IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL_OUTPUT.value,
@@ -1014,7 +1007,7 @@ class BaseIterativeEndNode(BaseNode):
         )
 
         # 3. End → Start: break_loop_signal_output → break_loop_signal
-        GriptapeNodes.handle_request(
+        self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=self.name,
                 source_parameter_name=IterativeNodeParam.BREAK_LOOP_SIGNAL_OUTPUT.value,
@@ -1025,8 +1018,8 @@ class BaseIterativeEndNode(BaseNode):
 
         # 4. Default control flow: Start → End: exec_out → add_item (default "happy path")
         # Only create this connection if the exec_out parameter doesn't already have a connection
-        if not _outgoing_connection_exists(start_node.name, IterativeNodeParam.EXEC_OUT.value):
-            GriptapeNodes.handle_request(
+        if not _outgoing_connection_exists(self.engine, start_node.name, IterativeNodeParam.EXEC_OUT.value):
+            self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=start_node.name,
                     source_parameter_name=IterativeNodeParam.EXEC_OUT.value,
@@ -1037,15 +1030,8 @@ class BaseIterativeEndNode(BaseNode):
 
     def _remove_hidden_signal_connections(self, start_node: BaseNode) -> None:
         """Remove all hidden signal connections when the main tethering connection is removed."""
-        from griptape_nodes.retained_mode.events.connection_events import (
-            DeleteConnectionRequest,
-            ListConnectionsForNodeRequest,
-            ListConnectionsForNodeResultSuccess,
-        )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Get current connections for start node to check what still exists
-        list_connections_result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=start_node.name))
+        list_connections_result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=start_node.name))
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             return  # Cannot determine what connections exist, exit gracefully
 
@@ -1080,7 +1066,7 @@ class BaseIterativeEndNode(BaseNode):
             self.name,
             IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL_INPUT.value,
         ):
-            GriptapeNodes.handle_request(
+            self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=start_node.name,
                     source_parameter_name=IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL.value,
@@ -1096,7 +1082,7 @@ class BaseIterativeEndNode(BaseNode):
             start_node.name,
             IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL.value,
         ):
-            GriptapeNodes.handle_request(
+            self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=self.name,
                     source_parameter_name=IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL_OUTPUT.value,
@@ -1112,7 +1098,7 @@ class BaseIterativeEndNode(BaseNode):
             start_node.name,
             IterativeNodeParam.BREAK_LOOP_SIGNAL.value,
         ):
-            GriptapeNodes.handle_request(
+            self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=self.name,
                     source_parameter_name=IterativeNodeParam.BREAK_LOOP_SIGNAL_OUTPUT.value,

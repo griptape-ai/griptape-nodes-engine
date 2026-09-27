@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 import warnings
 from abc import ABC
 from collections.abc import Callable, Generator, Iterable, Iterator
@@ -27,6 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
+from griptape_nodes.exe_types.local_objects import LocalObjectScope
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
@@ -35,11 +37,26 @@ from griptape_nodes.retained_mode.events.base_events import (
     ProgressEvent,
     RequestPayload,
 )
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
+    GetConfigValueResultSuccess,
+    IsBetaFeatureEnabledRequest,
+    IsBetaFeatureEnabledResultSuccess,
+    SetConfigValueRequest,
+)
+from griptape_nodes.retained_mode.events.connection_events import (
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     RemoveElementEvent,
     RemoveParameterFromNodeRequest,
+)
+from griptape_nodes.retained_mode.events.resource_events import (
+    GetExecutionDeviceRequest,
+    GetExecutionDeviceResultSuccess,
 )
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
@@ -48,6 +65,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.variable_types import VariableScope
 
 logger = logging.getLogger("griptape_nodes")
@@ -284,13 +302,15 @@ class NodeResolutionState(StrEnum):
     RESOLVED = auto()
 
 
-def get_library_names_with_publish_handlers() -> list[str]:
-    """Get names of all registered libraries that have PublishWorkflowRequest handlers."""
-    from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+def get_library_names_with_publish_handlers(engine: Engine) -> list[str]:
+    """Get names of all registered libraries that have PublishWorkflowRequest handlers.
 
-    library_manager = GriptapeNodes.LibraryManager()
-    event_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
+    Takes the engine rather than reaching for the facade: a free function has no ``self`` to
+    resolve it from, so its caller (a node, which has one) supplies it.
+    """
+    from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
+
+    event_handlers = engine.library_manager.get_registered_event_handlers(PublishWorkflowRequest)
 
     # Always include "local" and "private" as the first options
     library_names = [LOCAL_EXECUTION, PRIVATE_EXECUTION]
@@ -310,6 +330,7 @@ class BaseNode(ABC):
     current_spotlight_parameter: Parameter | None = None
     parameter_values: dict[str, Any]
     parameter_output_values: TrackedParameterOutputValues
+    _local_objects: LocalObjectScope | None
     stop_flow: bool = False
     root_ui_element: BaseNodeElement
     _state: NodeResolutionState
@@ -321,10 +342,36 @@ class BaseNode(ABC):
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
+    _parameters_added_after_construction: set[str]
+    _parameters_added_during_execution: set[str]
+    _engine: Engine | None
 
     @property
     def parameters(self) -> list[Parameter]:
         return self.root_ui_element.find_elements_by_type(Parameter)
+
+    @property
+    def parameters_added_after_construction(self) -> set[str]:
+        """Names of parameters the node grew outside its declarative ``__init__``.
+
+        A parameter declared in ``__init__`` reappears whenever the node is recreated from its
+        create command, even one built from the node's own metadata rather than hardcoded. One
+        added later does not, so serialization has to recreate it by hand.
+        """
+        return self._parameters_added_after_construction
+
+    @property
+    def parameters_added_during_execution(self) -> set[str]:
+        """Names of parameters the node is growing while it runs, a subset of the set above.
+
+        These are scratch state rather than node shape: a node adds one to feed a helper and drops
+        it when the run ends, so serialization leaves it out entirely. Only ever populated while a
+        run is in flight -- the framework empties it when the run ends, so a parameter that outlived
+        its run is durable structure from then on. Parameters a node builds from its value hooks are
+        excluded too, because those arrive during input hydration and are meant to last, which is
+        why this is narrower than ``parameters_added_after_construction``.
+        """
+        return self._parameters_added_during_execution
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -334,15 +381,44 @@ class BaseNode(ABC):
         name: str,
         metadata: dict[Any, Any] | None = None,
         state: NodeResolutionState = NodeResolutionState.UNRESOLVED,
+        *,
+        engine: Engine | None = None,
     ) -> None:
+        """Initialize the node.
+
+        Args:
+            name: Node name, unique within its flow.
+            metadata: Node metadata (node_type and library, plus optional extras).
+            state: Initial resolution state.
+            engine: The engine this node belongs to. Keyword-only and optional so a library's
+                ``super().__init__(name, metadata=metadata)`` keeps working untouched.
+
+                Nothing in the engine passes it today: ``LibraryRegistry.create_node`` builds
+                nodes as ``node_class(name=name, metadata=metadata)``, and it cannot start
+                passing an engine without breaking every library node and several engine-internal
+                subclasses, all of which fix their signature at two arguments. So in practice a
+                node resolves the ambient engine via ``current_engine()``. The parameter exists
+                for embedders and tests that DO hold a reference, and so the fallback has
+                somewhere to be overridden from -- which is what the unit tests use it for.
+        """
+        self._engine = engine
         self.name = name
         self._state = state
         if metadata is None:
             self.metadata = {}
         else:
             self.metadata = metadata
+        # The identity cached objects are held under. Display names are recycled -- delete Producer_1 and
+        # the next node created gets Producer_1 back -- so caching under the name would let a new node
+        # displace and free a dead node's object while a consumer still holds its key. An attribute rather
+        # than a metadata entry, because metadata is client-writable and a replayed copy would give two
+        # live nodes one identity. A worker's transient node adopts the orchestrator's through
+        # ExecuteNodeRequest.local_object_source; it survives rename, so a renamed node keeps displacing
+        # its own prior objects.
+        self.local_object_source = f"{name}@{uuid.uuid4().hex[:8]}"
         self.parameter_values = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)
+        self._local_objects = None
         self.root_ui_element = BaseNodeElement()
         # Set the node context for the root element
         self.root_ui_element._node_context = self
@@ -351,8 +427,33 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._inputs_to_reset_after_execution = set()
         self._deferred_inputs_were_reset = False
+        self._parameters_added_after_construction = set()
+        self._parameters_added_during_execution = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
+
+    @property
+    def engine(self) -> Engine:
+        """The engine this node belongs to.
+
+        Node machinery reaches managers and dispatches requests through here rather than the
+        process-wide ``GriptapeNodes`` facade. The facade remains what it is documented to be:
+        the surface for separately-versioned library code and saved workflow files.
+
+        For a node built without an explicit engine -- which is every node the engine itself
+        creates -- this resolves the ambient one, so the lookup is the same process-wide
+        resolution the facade would have done. What the migration buys is not per-node isolation
+        but the classification it forced: questions about workflow state now travel as requests,
+        which is what makes them answerable from inside a worker.
+        """
+        if self._engine is None:
+            # Deferred import: griptape_nodes.retained_mode.engine pulls in the manager graph,
+            # which pulls in the event payloads, which import this module for
+            # NodeDependencies/NodeResolutionState. Importing it at module scope is a cycle.
+            from griptape_nodes.retained_mode.engine import current_engine
+
+            return current_engine()
+        return self._engine
 
     @property
     def state(self) -> NodeResolutionState:
@@ -397,15 +498,13 @@ class BaseNode(ABC):
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
     # https://github.com/griptape-ai/griptape-nodes/issues/994
     def make_node_unresolved(self, current_states_to_trigger_change_event: set[NodeResolutionState] | None) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # See if the current state is in the set of states to trigger a change event.
         if current_states_to_trigger_change_event is not None and self.state in current_states_to_trigger_change_event:
             # Trigger the change event.
             # Send an event to the GUI so it knows this node has changed resolution state.
             from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
 
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=NodeUnresolvedEvent(node_name=self.name))
                 )
@@ -736,6 +835,7 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
@@ -745,6 +845,8 @@ class BaseNode(ABC):
 
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
+        self._parameters_added_after_construction.discard(param.name)
+        self._parameters_added_during_execution.discard(param.name)
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -783,7 +885,7 @@ class BaseNode(ABC):
         for name in names:
             parameter = self.get_parameter_by_name(name)
             if parameter is not None:
-                parameter.ui_options = {**parameter.ui_options, "hide": not visible}
+                parameter.update_ui_options({"hide": not visible})
 
     def get_message_by_name_or_element_id(self, element: str) -> ParameterMessage | None:
         element_items = self.root_ui_element.find_elements_by_type(ParameterMessage)
@@ -805,7 +907,7 @@ class BaseNode(ABC):
         for name in names:
             message = self.get_message_by_name_or_element_id(name)
             if message is not None:
-                message.ui_options = {**message.ui_options, "hide": not visible}
+                message.update_ui_options({"hide": not visible})
 
     def hide_message_by_name(self, names: str | list[str]) -> None:
         self._set_message_visibility(names, visible=False)
@@ -840,9 +942,6 @@ class BaseNode(ABC):
             if traits:
                 trait = traits[0]  # Take the first Options trait
                 trait.choices = choices
-                # Update the manually set UI options to include the new simple_dropdown
-                if hasattr(parameter, "_ui_options") and parameter._ui_options:
-                    parameter._ui_options["simple_dropdown"] = choices
 
                 if default in choices:
                     parameter.default_value = default
@@ -1070,12 +1169,39 @@ class BaseNode(ABC):
             self.metadata["size"] = {"width": width, "height": height}
 
     def kill_parameter_children(self, parameter: Parameter) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         for child in parameter.find_elements_by_type(Parameter):
-            GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
+            self.engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
 
     def get_parameter_value(self, param_name: str) -> Any:
+        """The value a node reads, with a held object substituted for the key standing in for it.
+
+        A `serializable=False` parameter's value is held in the process that produced it and travels as a
+        key, so this is where the key becomes the object again -- the node reads its parameter normally.
+        Engine code that moves values between nodes, saves them, or sends them to the editor wants the key
+        and calls `_get_raw_parameter_value`, which is also the one to override for a computed value.
+
+        The reading parameter's own declaration is not consulted. Only the producer declares the flag, and
+        its key travels down connections to consumers that declare nothing -- gating translation on the
+        reader would hand those consumers the key string instead of the object.
+
+        Raises:
+            RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
+        """
+        value = self._get_raw_parameter_value(param_name)
+        return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
+
+    def _get_raw_parameter_value(self, param_name: str) -> Any:
+        """The value as stored, with no cached-object substitution. Engine-internal.
+
+        What is in a parameter is a reference when the object is cached, and a reference is what has to
+        travel to a worker, into a saved workflow, or to the editor. Node authors want
+        `get_parameter_value` and have no use for this one, which is why it is private: two public readers
+        would only raise the question of which to pick.
+
+        Saving, dispatch, events and metadata all read through here, so an engine subclass computing a
+        value rather than storing it overrides this rather than the public wrapper -- an override there
+        would be bypassed by every one of them.
+        """
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
@@ -1136,7 +1262,10 @@ class BaseNode(ABC):
             # special handling if it's in a container.
             if parameter.parent_container_name and parameter.parent_container_name in self.parameter_values:
                 del self.parameter_values[parameter.parent_container_name]
-                new_val = self.get_parameter_value(parameter.parent_container_name)
+                # Raw: this copies the remaining rows along rather than reading them for use. Resolving
+                # here would raise on a key whose object sits in a worker, out of a connection delete and
+                # out of the run's finally, and would write live objects back into parameter_values.
+                new_val = self._get_raw_parameter_value(parameter.parent_container_name)
                 if new_val is not None:
                     # Don't set the container to None (that would make it empty)
                     self.set_parameter_value(parameter.parent_container_name, new_val)
@@ -1228,7 +1357,7 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
-        if VariableResolver.is_substitution_enabled():
+        if VariableResolver.is_substitution_enabled(self.engine):
             for param in self.parameters:
                 if not param.allow_variable_substitution:
                     continue
@@ -1244,7 +1373,37 @@ class BaseNode(ABC):
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:
-        """Runs before this node is run."""
+        """Runs on the ORCHESTRATOR, immediately before this node is dispatched.
+
+        Structural checks only: what a parameter declares, whether a value is present, what the graph
+        looks like. This process may be nothing like the one that runs the node -- a library whose nodes
+        execute in a worker is installed here with its edit-time dependencies only, and a value produced
+        by a worker is held there and cannot be read from here.
+
+        For anything that needs the real thing -- a loaded model, a tensor an upstream node produced --
+        use `validate_in_execution_environment`, which runs where the node runs.
+        """
+        return None
+
+    def validate_in_execution_environment(self) -> list[Exception] | None:
+        """Runs in the process that executes this node, immediately before `aprocess()`.
+
+        The counterpart to `validate_before_node_run`: same purpose, different place. Here the node's
+        execution dependencies are importable and its input values are the objects themselves, so this
+        is where a check that needs a built model or a real tensor belongs.
+
+        Called on both paths, so a library behaves the same whether or not its nodes run in a worker.
+        Returning exceptions fails the node without running it, and the orchestrator reports that as a
+        validation failure rather than as a crash.
+
+        Inspection only: read a tensor's shape, confirm a model is already loaded. Building the thing
+        being checked is what this hook exists to stop. It runs synchronously on the executing process's
+        event loop, so a slow check on a worker leaves the orchestrator's heartbeat challenges
+        unanswered and the worker is evicted mid-run.
+
+        Not a substitute for the other two hooks. This one cannot run before the flow starts, and it
+        sees a transient node with no connections, so a question about the graph has no answer here.
+        """
         return None
 
     def can_queue_for_execution(self) -> bool:
@@ -1285,30 +1444,123 @@ class BaseNode(ABC):
             return ValueError(msg)
         return None
 
-    def get_config_value(self, service: str, value: str) -> str:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    @property
+    def execution_device(self) -> str:
+        """The compute device this node should run on: "cuda", "mps" or "cpu".
 
+        Answered by the engine, which detects the machine's backends without importing a
+        framework. Every model-wrapping library currently imports torch purely to call
+        `torch.cuda.is_available()`, which pulls an execution-time dependency into whichever
+        process asks -- including one that only edits, where the import fails outright.
+
+            def process(self) -> None:
+                model = model.to(self.execution_device)
+
+        Falls back to "cpu" if the engine cannot determine the backends, because a node that
+        cannot pick a device is worse than one running slowly.
+        """
+        result = self.engine.handle_request(GetExecutionDeviceRequest())
+        if isinstance(result, GetExecutionDeviceResultSuccess):
+            return result.device
+        logger.warning(
+            "Node %s could not determine an execution device (%s); using cpu.",
+            self.name,
+            result.result_details,
+        )
+        return "cpu"
+
+    @property
+    def available_compute(self) -> list[str]:
+        """Every compute backend this machine has, in detection order.
+
+        Cpu first, then any accelerator found. NOT ranked: `available_compute[0]` is "cpu" even on
+        a machine with a GPU. Use
+        `execution_device` to get the device to actually run on; this list answers "what
+        exists here", which is a different question.
+
+        For a node that wants to decide for itself rather than take `execution_device`.
+        """
+        result = self.engine.handle_request(GetExecutionDeviceRequest())
+        if isinstance(result, GetExecutionDeviceResultSuccess):
+            return result.available
+        # A GPU-less machine still takes the success path above, so reaching here means detection
+        # itself failed. Logged because a node branching on this list would otherwise take its CPU
+        # path on an accelerated machine with nothing to show why.
+        logger.warning("Could not detect compute backends; reporting cpu only. %s", result.result_details)
+        return ["cpu"]
+
+    def is_beta_feature_enabled(self, feature_id: str) -> bool:
+        """Whether a beta feature declared by this node's library is on.
+
+        The feature must be listed in the `beta_features` section of the library JSON. Returns the
+        user's choice from the Beta Features settings page, or the feature's default when they
+        haven't made one. Logs a warning and returns False when the library doesn't declare a
+        valid feature with this id.
+
+        Always create the parameters a feature uses, and only hide or show them based on this, so
+        workflows saved with the feature on still open with it off.
+        """
+        library_name = self.metadata.get("library")
+        if library_name is None:
+            logger.warning(
+                "Attempted to check beta feature '%s' for node '%s'. Failed because the node doesn't belong to a library.",
+                feature_id,
+                self.name,
+            )
+            return False
+
+        # A failure here is an author mistake this method reports itself, so keep the dispatcher
+        # from also logging it as an error on every node created and every run.
+        result = self.engine.handle_request(
+            IsBetaFeatureEnabledRequest(
+                feature_id=feature_id, library_name=library_name, failure_log_level=logging.DEBUG
+            )
+        )
+        if not isinstance(result, IsBetaFeatureEnabledResultSuccess):
+            logger.warning("%s The feature is treated as off for node '%s'.", result.result_details, self.name)
+            return False
+
+        return result.enabled
+
+    def get_config_value(self, service: str, value: str) -> str:
         warnings.warn(
-            "get_config_value() is deprecated. Use GriptapeNodes.SecretsManager().get_secret() for secrets/API keys "
-            "or GriptapeNodes.ConfigManager().get_config_value() for other config values.",
+            "get_config_value() is deprecated. Use GetSecretValueRequest for secrets/API keys or "
+            "GetConfigValueRequest for other config values. Both are answered by the main engine "
+            "even when your node runs in an isolated process, where the manager accessors are "
+            "refused.",
             UserWarning,
             stacklevel=2,
         )
 
-        config_value = GriptapeNodes.ConfigManager().get_config_value(f"nodes.{service}.{value}")
+        result = self.engine.handle_request(GetConfigValueRequest(category_and_key=f"nodes.{service}.{value}"))
+        # Typed loosely on purpose: config values are `Any`, and an absent key has always
+        # come back as None here despite the declared return type.
+        config_value: Any = result.value if isinstance(result, GetConfigValueResultSuccess) else None
         return config_value
 
     def set_config_value(self, service: str, value: str, new_value: str) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         warnings.warn(
-            "set_config_value() is deprecated. Use GriptapeNodes.SecretsManager().set_secret() for secrets/API keys "
-            "or GriptapeNodes.ConfigManager().set_config_value() for other config values.",
+            "set_config_value() is deprecated. Use SetSecretValueRequest for secrets/API keys or "
+            "SetConfigValueRequest for other config values. Both are answered by the main engine "
+            "even when your node runs in an isolated process, where the manager accessors are "
+            "refused.",
             UserWarning,
             stacklevel=2,
         )
 
-        GriptapeNodes.ConfigManager().set_config_value(f"nodes.{service}.{value}", new_value)
+        self.engine.handle_request(SetConfigValueRequest(category_and_key=f"nodes.{service}.{value}", value=new_value))
+
+    @property
+    def local_objects(self) -> LocalObjectScope:
+        """This node's view of the process-local object store, for a resource it reuses across runs.
+
+        A value passed between nodes does not need this: mark the output parameter `serializable=False` and
+        assign the object to it. The engine holds it, sends the key on, and releases it when the value is
+        replaced or this node goes away.
+        """
+        if self._local_objects is None:
+            self._local_objects = LocalObjectScope(node=self, library=self.metadata.get("library"))
+        return self._local_objects
 
     def clear_node(self) -> None:
         # set state to unresolved
@@ -1397,8 +1649,6 @@ class BaseNode(ABC):
         return None
 
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
             try:
@@ -1434,13 +1684,12 @@ class BaseNode(ABC):
             return
 
         # Publish the event up!
-        GriptapeNodes.EventManager().put_event(
+        self.engine.event_manager.put_event(
             ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
         )
 
     def publish_update_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter:
@@ -1456,7 +1705,7 @@ class BaseNode(ABC):
                 value=safe_unstructure(self.get_display_value_for_output(parameter_name, value)),
             )
 
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
             )
         else:
@@ -1571,14 +1820,17 @@ class BaseNode(ABC):
         self.reorder_elements(list(new_order))
 
     def _param_has_incoming_connection(self, param_name: str) -> bool:
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        """Whether ``param_name`` is fed by a connection.
 
-        connections = GriptapeNodes.FlowManager().get_connections()
-        node_connections = connections.incoming_index.get(self.name)
-        if node_connections is None:
+        Asked as a request rather than read from a local manager: this is a question about
+        the workflow, and the workflow's single source of truth is the orchestrator. A node
+        executing in an isolated process holds only a transient copy of itself, so reading
+        its own process's connection index would answer from almost nothing.
+        """
+        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
-        return param_name in node_connections
+        return any(connection.target_parameter_name == param_name for connection in result.incoming_connections)
 
     def _has_connected_whole_list_value(self, parameter_list: ParameterList) -> bool:
         """Whether a ParameterList was handed an entire list through a connection to the list itself.
@@ -1593,11 +1845,15 @@ class BaseNode(ABC):
         param_name = parameter_list.name
         if param_name not in self.parameter_values:
             return False
-        if not self._param_has_incoming_connection(param_name):
-            return False
 
+        # Both cheap local checks run before the connection question, which costs a request
+        # dispatch -- and a cross-process round trip in a worker -- on a path that
+        # get_parameter_value reaches for every read of a populated list.
         value = self.parameter_values[param_name]
         if not isinstance(value, list):
+            return False
+
+        if not self._param_has_incoming_connection(param_name):
             return False
 
         child_count = len(parameter_list.find_elements_by_type(Parameter, find_recursively=False))
@@ -1624,13 +1880,13 @@ class BaseNode(ABC):
 
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
-        variables = VariableResolver.get_variables_if_enabled(self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
         if variables is None:
             return value
         return VariableResolver.resolve_value(value, variables, self.name)
 
     def _resolve_variables_in_string(self, text: str) -> str:
-        variables = VariableResolver.get_variables_if_enabled(self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
         if variables is None:
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
@@ -1669,7 +1925,7 @@ class BaseNode(ABC):
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token
         # and would leave a stale variable dict on the surrounding context.
-        variables = VariableResolver.get_variables_without_memoizing(self.name)
+        variables = VariableResolver.get_variables_without_memoizing(self.engine, self.name)
         if variables is None:
             return True
         return VariableResolver.would_substitute(raw_value, variables)
@@ -1688,7 +1944,7 @@ class BaseNode(ABC):
         connection never gets substituted, so its output is genuine and its
         stored value must stay writable.
         """
-        if not VariableResolver.is_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(self.engine):
             return None
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
@@ -1696,8 +1952,8 @@ class BaseNode(ABC):
         raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
         # One short-circuiting chain rather than a ladder of early returns, so the
         # cheap checks stay ordered ahead of the expensive ones. The connection
-        # lookup is last: it reaches through the GriptapeNodes singleton to the
-        # FlowManager, and the checks before it already rule out the common case.
+        # lookup is last: it costs a request round trip to the FlowManager, and the
+        # checks before it already rule out the common case.
         substitution_would_have_applied = (
             ParameterMode.PROPERTY in parameter.allowed_modes
             and parameter.allow_variable_substitution
@@ -1790,11 +2046,36 @@ class BaseNode(ABC):
             ),
         )
 
+    def _record_parameter_add_scope(self, parameter_name: str) -> None:
+        """Populate the two parameter-origin sets from the scope this add arrived in.
+
+        Reads the same flags as the detector above, but not the same way: a sanctioned
+        mutation is exempt from the execution set only, because ``AddParameterToNodeRequest``
+        syncs the parameter back to the orchestrator and so builds durable structure even
+        mid-run, while it is still structure the node did not declare in ``__init__``.
+        """
+        # Lazy import: library_registry imports BaseNode from this module,
+        # so importing at module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if LibraryRegistry.is_constructing_node():
+            return
+        self._parameters_added_after_construction.add(parameter_name)
+        if _in_aprocess.get() and not _sanctioned_mutation.get():
+            self._parameters_added_during_execution.add(parameter_name)
+
+    def forget_parameters_added_during_execution(self) -> None:
+        """Drop the scratch marker from every parameter still carrying it. Called when a run ends.
+
+        Scratch parameters are torn down by the run that made them, so one that outlives the
+        run was structure after all. Keeping the marker would drop it from every later save.
+        """
+        self._parameters_added_during_execution.clear()
+
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         # Create event data using the parameter's to_event method
         if remove:
@@ -1806,9 +2087,9 @@ class BaseNode(ABC):
             event_data = parameter.to_event(self)
             # Display-preservation guard. Gated on _in_aprocess here, unlike
             # TrackedParameterOutputValues._emit_parameter_change_event, because this
-            # value comes from Parameter.to_event -> node.get_parameter_value(), which
-            # only substitutes inside aprocess. Outside it the value is already the
-            # template, so the guard would be a no-op.
+            # value comes from Parameter.to_event -> node._get_raw_parameter_value(),
+            # and substitution only happens inside aprocess. Outside it the value is
+            # already the template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
@@ -1816,7 +2097,7 @@ class BaseNode(ABC):
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
             )
 
-        GriptapeNodes.EventManager().put_event(event)
+        self.engine.event_manager.put_event(event)
 
     def _get_element_name(self, element: str | int, element_names: list[str]) -> str:
         """Convert an element identifier (name or index) to its name.
@@ -1951,6 +2232,23 @@ class BaseNode(ABC):
         return element_names.index(element_name)
 
 
+def _values_differ(old_value: Any, new_value: Any) -> bool:
+    """Whether a parameter's value changed, for values that may not support `!=` as a bool.
+
+    A node can hold an array-like whose `__ne__` returns another array rather than a bool, so
+    `old != new` raises instead of answering ("The truth value of an array with more than one
+    element is ambiguous"). Identity is checked first because it answers the common re-assignment
+    without touching `__ne__` at all, and an uncomparable pair is reported as changed: emitting an
+    event the editor ignores costs a message, while swallowing one leaves it showing a stale value.
+    """
+    if old_value is new_value:
+        return False
+    try:
+        return bool(old_value != new_value)
+    except (ValueError, TypeError):
+        return True
+
+
 class TrackedParameterOutputValues(dict[str, Any]):
     """A dictionary that tracks modifications and emits AlterElementEvent when parameter output values change."""
 
@@ -1966,8 +2264,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get():
-            param = self._node.get_parameter_by_name(key)
-            if param is None or param.allow_variable_substitution:
+            parameter = self._node.get_parameter_by_name(key)
+            if parameter is None or parameter.allow_variable_substitution:
                 value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
@@ -1976,7 +2274,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # None -- self.get(key) returns None for both, so without the had_key
         # check an unset -> None transition would be silently dropped and the UI
         # would keep showing the stale prior value.
-        if not had_key or old_value != value:
+        if not had_key or _values_differ(old_value, value):
             self._emit_parameter_change_event(key, value)
 
     def __delitem__(self, key: str) -> None:
@@ -1991,7 +2289,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
             for key in keys_to_clear:
                 # Some nodes still have values set, even if their output values are cleared
                 # Here, we are emitting an event with those set values, to not misrepresent the values of the parameters in the UI.
-                value = self._node.get_parameter_value(key)
+                # Raw: this goes to the editor, which shows the stored value. Translating here would put
+                # a held object into an event payload and json-serialize it on the way out.
+                value = self._node._get_raw_parameter_value(key)
                 self._emit_parameter_change_event(key, value, deleted=True)
 
     def silent_clear(self) -> None:
@@ -2018,7 +2318,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         if parameter is not None:
             from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
             from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
@@ -2051,7 +2350,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
             )
 
-            GriptapeNodes.EventManager().put_event(event)
+            # This is a plain dict subclass, not a node, so the engine comes from the node it
+            # belongs to.
+            self._node.engine.event_manager.put_event(event)
 
 
 class ControlNode(BaseNode):
@@ -2149,18 +2450,10 @@ class SuccessFailureNode(BaseNode):
 
     def _has_outgoing_connections(self, parameter: Parameter) -> bool:
         """Check if a specific parameter has outgoing connections."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
-
-        # Check if node has any outgoing connections
-        node_connections = connections.outgoing_index.get(self.name)
-        if node_connections is None:
+        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
-
-        # Check if this specific parameter has any outgoing connections
-        param_connections = node_connections.get(parameter.name, [])
-        return len(param_connections) > 0
+        return any(connection.source_parameter_name == parameter.name for connection in result.outgoing_connections)
 
     def _create_status_parameters(
         self,
@@ -2309,7 +2602,9 @@ class EndNode(BaseNode):
         # Update all values to use the output value
         for param in self.parameters:
             if param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                value = self.get_parameter_value(param.name)
+                # Raw: this copies a value along rather than reading it for use, so a held value
+                # stays the key it already is instead of being resolved and parked a second time.
+                value = self._get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
@@ -2421,8 +2716,6 @@ class ErrorProxyNode(BaseNode):
 
         if existing_param is None:
             # Create new universal parameter with all modes enabled
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             request = AddParameterToNodeRequest(
                 node_name=self.name,
                 parameter_name=param_name,
@@ -2436,7 +2729,7 @@ class ErrorProxyNode(BaseNode):
                 is_user_defined=False,  # Don't serialize this parameter
                 initial_setup=True,  # Allows setting non-settable parameters and prevents resolution cascades during workflow loading
             )
-            result = GriptapeNodes.handle_request(request)
+            result = self.engine.handle_request(request)
 
             # Check if parameter creation was successful
             from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
@@ -2608,7 +2901,11 @@ def handle_container_parameter(current_node: BaseNode, parameter: Parameter) -> 
             build_parameter_value = {}
         build_parameter_value = []
         for child in children:
-            value = current_node.get_parameter_value(child.name)
+            # Raw, because what this builds is cached into the container's own entry in
+            # `parameter_values`, and that dict is the payload of an ExecuteNodeRequest. Translating here
+            # would put a live object in it and send it to a worker as JSON. The node still sees objects:
+            # its read resolves the whole list on the way out.
+            value = current_node._get_raw_parameter_value(child.name)
             if value is not None:
                 build_parameter_value.append(value)
         return build_parameter_value

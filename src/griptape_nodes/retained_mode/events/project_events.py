@@ -20,11 +20,18 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
-    from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+# The opaque id a project is keyed by. Lives here rather than in ProjectManager because payloads
+# annotate with it and pydantic resolves those annotations at runtime, so a TYPE_CHECKING-only
+# import leaves them unresolvable. Events are the leaf of the import graph, so ProjectManager
+# importing it from here cannot cycle.
+ProjectID = str
 
 
 class MacroPath(NamedTuple):
@@ -39,6 +46,23 @@ class MacroPath(NamedTuple):
 
     parsed_macro: ParsedMacro
     variables: MacroVariables
+
+
+# Registered here rather than in event_converter because that module cannot import this one:
+# project_events -> base_events -> event_converter. A NamedTuple has no hook in the JSON preset, so
+# without this cattrs hands the instance back untouched and the ParsedMacro inside it is never
+# reached, leaving the failure to surface from json.dumps.
+converter.register_unstructure_hook(
+    MacroPath,
+    lambda path: {"parsed_macro": converter.unstructure(path.parsed_macro), "variables": path.variables},
+)
+converter.register_structure_hook(
+    MacroPath,
+    lambda data, _: MacroPath(
+        parsed_macro=converter.structure(data["parsed_macro"], ParsedMacro),
+        variables=data["variables"],
+    ),
+)
 
 
 class PathResolutionFailureReason(StrEnum):

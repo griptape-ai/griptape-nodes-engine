@@ -36,7 +36,7 @@ class ParameterContainer(Parameter, ABC):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -97,7 +97,7 @@ class ParameterContainer(Parameter, ABC):
 
 
 class ParameterList(ParameterContainer):
-    _original_traits: set[Trait.__class__ | Trait]
+    _original_traits: set[type[Trait] | Trait]
 
     def __init__(  # noqa: PLR0913, PLR0917
         self,
@@ -112,7 +112,7 @@ class ParameterList(ParameterContainer):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -212,11 +212,23 @@ class ParameterList(ParameterContainer):
     @property
     def ui_options(self) -> dict:
         """Override ui_options to merge convenience parameters in real-time."""
-        # Get base ui_options from parent
-        base_ui_options = super().ui_options
+        return {
+            **super().ui_options,
+            **self._convenience_ui_options(),
+        }
 
-        # Build convenience options from instance parameters
-        convenience_options = {}
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Include layout fields stored outside ``_ui_options``.
+
+        The setter treats a missing ``display`` as disabling grid layout.
+        """
+        return {
+            **super().authored_ui_options(),
+            **self._convenience_ui_options(),
+        }
+
+    def _convenience_ui_options(self) -> dict[str, Any]:
+        convenience_options: dict[str, Any] = {}
 
         if self._collapsed is not None:
             convenience_options["collapsed"] = self._collapsed
@@ -224,17 +236,12 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
-        if self._grid is not None and self._grid:
+        if self._grid:
             convenience_options["display"] = "grid"
+            if self._grid_columns is not None:
+                convenience_options["columns"] = self._grid_columns
 
-        if self._grid_columns is not None and self._grid:
-            convenience_options["columns"] = self._grid_columns
-
-        # Merge convenience options with base ui_options
-        return {
-            **base_ui_options,
-            **convenience_options,
-        }
+        return convenience_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
@@ -489,20 +496,20 @@ class ParameterKeyValuePair(Parameter):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         # Key and Value specific options
         key_default_value: Any = None,
         key_tooltip: str | list[dict] | None = None,
         key_ui_options: dict | None = None,
-        key_traits: set[Trait.__class__ | Trait] | None = None,
+        key_traits: set[type[Trait] | Trait] | None = None,
         key_converters: list[Callable[[Any], Any]] | None = None,
         key_validators: list[Callable[[Parameter, Any], None]] | None = None,
         value_default_value: Any = None,
         value_tooltip: str | list[dict] | None = None,
         value_ui_options: dict | None = None,
-        value_traits: set[Trait.__class__ | Trait] | None = None,
+        value_traits: set[type[Trait] | Trait] | None = None,
         value_converters: list[Callable[[Any], Any]] | None = None,
         value_validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,
@@ -615,7 +622,7 @@ class ParameterKeyValuePair(Parameter):
 
 class ParameterDictionary(ParameterContainer):
     _kvp_type: ParameterType.KeyValueTypePair
-    _original_traits: set[Trait.__class__ | Trait]
+    _original_traits: set[type[Trait] | Trait]
 
     def __init__(  # noqa: PLR0913, PLR0917
         self,
@@ -628,7 +635,7 @@ class ParameterDictionary(ParameterContainer):
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
         ui_options: dict | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,
+        traits: set[type[Trait] | Trait] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         *,

@@ -44,6 +44,7 @@ _OPENAI_ARGS = {"stream": True}
 MODEL_CHOICES_ARGS = [
     # Anthropic
     {"name": "claude-sonnet-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
+    {"name": "claude-opus-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-opus-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-haiku-4-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": False},
     # Google
@@ -57,6 +58,8 @@ MODEL_CHOICES_ARGS = [
     {"name": "gemini-2.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     {"name": "gemini-2.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     # OpenAI
+    {"name": "gpt-6-sol", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
+    {"name": "gpt-6-luna", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.6-sol", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.6-terra", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.6-luna", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
@@ -134,7 +137,7 @@ one case. A ``None`` in a preset means "don't send this field" — today only
 filtered out too. (The o-series also rejects ``top_p``, but its preset simply
 never sets it; see :data:`O_SERIES_MODELS`.)
 
-Resolves to the three Claude models today, since they are the only entries whose
+Resolves to the Claude models today, since they are the only entries whose
 presets carry a ``ModelSettings`` key. Every other catalog model has no preset
 setting to apply and keeps the provider default.
 """

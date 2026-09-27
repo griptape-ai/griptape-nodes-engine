@@ -118,6 +118,25 @@ class BaseNodeGroup(BaseNode):
 
         return nodes_removed
 
+    def delete_nodes_from_group(self, nodes: list[BaseNode]) -> None:
+        """Stop claiming nodes that are being deleted outright.
+
+        Unlike `remove_nodes_from_group`, the nodes are going away rather than moving back out to a
+        flow, so there is nothing to reparent. Membership still has to be given up: anything that
+        reads a group's contents — the editor's involved-node list, saved metadata — would otherwise
+        keep naming a node that no longer exists.
+
+        Nodes that are not members are skipped rather than raising, matching
+        `remove_nodes_from_group`, so callers can hand over a best-effort list.
+
+        Args:
+            nodes: List of nodes being deleted
+        """
+        for node in nodes:
+            self.nodes.pop(node.name, None)
+
+        self.metadata["node_names_in_group"] = list(self.nodes.keys())
+
     def _remove_nodes_from_existing_parents(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Detach nodes from whichever group currently owns them before reparenting them here.
 

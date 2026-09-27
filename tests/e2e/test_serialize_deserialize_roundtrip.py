@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
+from griptape_nodes.exe_types.node_groups.subflow_node_group import LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -164,6 +165,40 @@ class TestPlainSubflowRoundTrip:
 
 
 class TestNodeGroupRoundTrip:
+    def test_restores_the_port_side_a_proxy_parameter_sits_on(self, engine: Engine, library_name: str) -> None:
+        """A restored group has to keep naming its proxy parameters as left/right ports.
+
+        The edges themselves come back, but the editor lays a group's ports out from the
+        left_parameters / right_parameters metadata. A proxy missing from those lists has nowhere to
+        draw its wire, so the connection reads as broken even though the engine still holds it.
+        """
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ProxyPortRoundTrip", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            group = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            leaf = _create_node(engine, "EchoNode", "Leaf", library_name, parent_group_name=group)
+            source = _create_node(engine, "EchoNode", "Source", library_name)
+            sink = _create_node(engine, "EchoNode", "Sink", library_name)
+            # One edge in each direction, so the group carries a proxy on both sides.
+            _connect(engine, source, leaf)
+            _connect(engine, leaf, sink)
+
+        saved_group = _get_group(engine, group)
+        saved_left = list(saved_group.metadata[LEFT_PARAMETERS_KEY])
+        saved_right = list(saved_group.metadata[RIGHT_PARAMETERS_KEY])
+
+        commands = _serialize(engine, flow.flow_name)
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        result = _deserialize_into_fresh_context(engine, commands)
+
+        restored_group = _get_group(engine, result.node_name_mappings["Group"])
+        assert restored_group.metadata[LEFT_PARAMETERS_KEY] == saved_left
+        assert restored_group.metadata[RIGHT_PARAMETERS_KEY] == saved_right
+
     def test_restores_a_single_level_group(self, engine: Engine, library_name: str) -> None:
         """A group's wall connections cross its boundary, so this failed for every group."""
         flow = engine.handle_request(

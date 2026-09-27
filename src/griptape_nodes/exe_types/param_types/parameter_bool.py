@@ -203,9 +203,7 @@ class ParameterBool(Parameter):
             value: The on label to use, or None to remove it
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("on_label", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("on_label")
         else:
             self.update_ui_options_key("on_label", value)
 
@@ -226,8 +224,6 @@ class ParameterBool(Parameter):
             value: The off label to use, or None to remove it
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("off_label", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("off_label")
         else:
             self.update_ui_options_key("off_label", value)
