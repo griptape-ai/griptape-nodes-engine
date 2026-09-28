@@ -121,31 +121,24 @@ Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP
 
 ## Parameter values
 
-Tool results carry parameter values as JSON. A value of a type JSON doesn't have, such as a tuple,
-an enum, or an artifact, names its Python type under `$type`. When the value's own data is a JSON
-object, its fields sit beside `$type`. Anything else sits under `$value`:
+Parameter and flow variable values use JSON everywhere they appear: in request results, in
+events, and in the requests that set them. Values of types JSON lacks, such as tuples, enums, and
+artifacts, carry their Python type under `$type`. Artifacts and other objects keep their fields
+beside `$type`:
+
+```json
+{"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
+```
+
+Other values, such as tuples and enums, sit under `$value`:
 
 ```json
 {"$type": "builtins:tuple", "$value": [1, "b"]}
 {"$type": "my_library.colors:Color", "$value": "red"}
-{"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
 ```
 
-Send a value in the same form to `SetParameterValueRequest` or `SetVariableValueRequest` to set it
-with that exact type. A plain JSON value is set as it is. A value that has no JSON form, such as an
-open file, comes back as its text, or as `null` in `ControlFlowResolvedEvent`.
-
-Values carry their type this way in:
-
-- the results of `GetParameterValueRequest`, `SetParameterValueRequest`,
-    `GetParameterDetailsRequest`, `GetNodeElementDetailsRequest`, `GetAllNodeInfoRequest`,
-    `SerializeFlowToCommandsRequest`, and `RunArbitraryPythonStringRequest` (its
-    `found_variable_values`)
-- flow variable values, in `CreateVariableRequest`, `SetVariableValueRequest`, and the results of
-    `GetVariableRequest`, `GetVariableValueRequest`, `GetVariablesRequest`, and
-    `ListVariablesRequest`
-- the events the engine sends to the editor: `ParameterValueUpdateEvent`, `NodeResolvedEvent`,
-    `AlterElementEvent`, and `ControlFlowResolvedEvent`
+A value that can't be written as JSON, such as an open file, is sent as its Python `str()`, for
+example `"<_io.TextIOWrapper name='notes.txt' mode='r' encoding='UTF-8'>"`.
 
 ## Install the workflow-construction skill
 
