@@ -52,7 +52,7 @@ def build_griptape_cloud_model(
             :func:`resolve_cloud_credential`. Sent as ``Authorization: Bearer <key>``.
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
             the ``GT_CLOUD_BASE_URL`` environment variable, then to
-            :data:`~griptape_nodes.drivers.cloud_credentials.DEFAULT_CLOUD_BASE_URL`.
+            :data:`DEFAULT_CLOUD_BASE_URL`.
         settings: Default :class:`ModelSettings` for the returned model. ``None``
             falls back to the catalog preset for ``model_name`` via
             :func:`model_settings_for`; pass a dict to override it. Without
