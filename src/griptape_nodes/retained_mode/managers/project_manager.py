@@ -154,7 +154,7 @@ from griptape_nodes.utils.version_utils import engine_version, engine_version_fa
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from griptape_nodes.common.macro_parser.segments import ParsedSegment, VariableInfo
+    from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
@@ -190,10 +190,11 @@ BUILTIN_WORKFLOW_NAME = "workflow_name"
 BUILTIN_WORKFLOW_DIR = "workflow_dir"
 BUILTIN_STATIC_FILES_DIR = "static_files_dir"
 
-# Stands in for the filename when resolving a save situation purely to learn its folder. Never
+# Stands in for the filename when resolving `save_workflow` purely to learn its folder. Never
 # reaches disk: only the parent of the resolved path is read. Carries no path separator, so it
 # cannot add a level the real filename would not have.
 _SAVE_DIR_PROBE_STEM = "workflow"
+_SAVE_DIR_PROBE_EXTENSION = "py"
 
 
 @dataclass(frozen=True)
@@ -274,19 +275,10 @@ class _ProjectVariableResolver:
     template: ProjectTemplate
     get_builtin: Callable[[str], str]
     secrets_manager: SecretsManager
-    extra_variables: MacroVariables = field(default_factory=dict)
     builtins_cache: dict[str, str] = field(default_factory=dict)
     env_resolved: dict[str, str] = field(default_factory=dict)
     directories_resolved: dict[str, str] = field(default_factory=dict)
     in_progress: set[str] = field(default_factory=set)
-
-    def resolve_situation(self, name: str, macro: str) -> str:
-        """Resolve a situation's macro, with `extra_variables` supplying its per-file names.
-
-        Not cached: a situation macro's value depends on the caller's `extra_variables`,
-        unlike a directory or environment value, which depends only on the template.
-        """
-        return self._resolve_macro_string("situation", name, macro)
 
     def resolve_directory(self, name: str) -> str:
         if name in self.directories_resolved:
@@ -347,81 +339,71 @@ class _ProjectVariableResolver:
             parsed = ParsedMacro(raw_value)
             bag: MacroVariables = {}
             for var_info in parsed.get_variables():
-                self._claim_reference(bag, var_info, owner_kind, owner_name)
+                ref = var_info.name
+                if ref in BUILTIN_VARIABLES:
+                    try:
+                        bag[ref] = self._get_builtin(ref)
+                    except (RuntimeError, NotImplementedError) as e:
+                        # An optional reference (e.g. `{workflow_dir?:/}`) degrades cleanly:
+                        # leave it out of the bag so parsed.resolve() drops it, mirroring the
+                        # situation-macro path in on_get_path_for_macro_request. A required
+                        # builtin that can't resolve is a genuine error.
+                        if not var_info.is_required:
+                            # Logged because the degraded result is a PLAUSIBLE path, not an
+                            # obviously broken one: dropping `{workflow_dir}` from
+                            # `{workflow_dir?:/}outputs` silently relocates writes and reads
+                            # from the workflow's folder to the workspace root. Without this
+                            # line the only symptom is media that resolves to a file which was
+                            # never written there.
+                            logger.warning(
+                                "Optional builtin '%s' could not be resolved while resolving %s '%s'; "
+                                "dropping it from the path (%s)",
+                                ref,
+                                owner_kind,
+                                owner_name,
+                                e,
+                            )
+                            continue
+                        msg = (
+                            f"Cannot resolve {owner_kind} '{owner_name}': "
+                            f"builtin '{ref}' unavailable in current context ({e})"
+                        )
+                        raise MacroResolutionError(
+                            msg,
+                            failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                            variable_name=ref,
+                        ) from e
+                elif ref in self.template.directories:
+                    bag[ref] = self.resolve_directory(ref)
+                elif ref in self.template.environment:
+                    bag[ref] = self.resolve_env(ref)
+                else:
+                    shell_value = os.environ.get(ref)
+                    if shell_value is not None:
+                        bag[ref] = shell_value
+                    elif ref in DERIVED_VARIABLE_NAMES and var_info.is_required:
+                        # Derived variables are only computed in the situation-macro path
+                        # (apply_derivation_rules runs there, not here). A required derived
+                        # token in a directory/env macro can never resolve, so raise an
+                        # explanatory error instead of a bare MISSING_REQUIRED_VARIABLES.
+                        # The optional form (e.g. `{file_extension_directory?:/}`) is left
+                        # unresolved and degrades cleanly via parsed.resolve().
+                        msg = (
+                            f"Cannot resolve {owner_kind} '{owner_name}': '{ref}' is a derived macro "
+                            f"variable that is only available in situation macros (resolved per-file at "
+                            f"write time), not in directory or environment path_macros. Move it to a "
+                            f"situation's filename macro, e.g. `{{{ref}?:/}}`."
+                        )
+                        raise MacroResolutionError(
+                            msg,
+                            failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                            variable_name=ref,
+                        )
+                    # else: leave unresolved; parsed.resolve() will raise MISSING_REQUIRED_VARIABLES
             resolved = parsed.resolve(bag, self.secrets_manager)
         finally:
             self.in_progress.discard(token)
         return resolved
-
-    def _claim_reference(self, bag: MacroVariables, var_info: VariableInfo, owner_kind: str, owner_name: str) -> None:
-        """Fill one referenced name into `bag`, in source-precedence order.
-
-        High to low: builtins, directories, caller-supplied `extra_variables`, project
-        environment, shell environment. A name no source claims is left out of the bag, so
-        `parsed.resolve()` raises MISSING_REQUIRED_VARIABLES when it was required and drops it
-        when it was optional.
-        """
-        ref = var_info.name
-        if ref in BUILTIN_VARIABLES:
-            try:
-                bag[ref] = self._get_builtin(ref)
-            except (RuntimeError, NotImplementedError) as e:
-                # An optional reference (e.g. `{workflow_dir?:/}`) degrades cleanly:
-                # leave it out of the bag so parsed.resolve() drops it, mirroring the
-                # situation-macro path in on_get_path_for_macro_request. A required
-                # builtin that can't resolve is a genuine error.
-                if not var_info.is_required:
-                    # Logged because the degraded result is a PLAUSIBLE path, not an
-                    # obviously broken one: dropping `{workflow_dir}` from
-                    # `{workflow_dir?:/}outputs` silently relocates writes and reads
-                    # from the workflow's folder to the workspace root. Without this
-                    # line the only symptom is media that resolves to a file which was
-                    # never written there.
-                    logger.warning(
-                        "Optional builtin '%s' could not be resolved while resolving %s '%s'; "
-                        "dropping it from the path (%s)",
-                        ref,
-                        owner_kind,
-                        owner_name,
-                        e,
-                    )
-                    return
-                msg = (
-                    f"Cannot resolve {owner_kind} '{owner_name}': builtin '{ref}' unavailable in current context ({e})"
-                )
-                raise MacroResolutionError(
-                    msg,
-                    failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
-                    variable_name=ref,
-                ) from e
-        elif ref in self.template.directories:
-            bag[ref] = self.resolve_directory(ref)
-        elif ref in self.extra_variables:
-            bag[ref] = self.extra_variables[ref]
-        elif ref in self.template.environment:
-            bag[ref] = self.resolve_env(ref)
-        else:
-            shell_value = os.environ.get(ref)
-            if shell_value is not None:
-                bag[ref] = shell_value
-            elif ref in DERIVED_VARIABLE_NAMES and var_info.is_required:
-                # Derived variables are only computed in the situation-macro path
-                # (apply_derivation_rules runs there, not here). A required derived
-                # token in a directory/env macro can never resolve, so raise an
-                # explanatory error instead of a bare MISSING_REQUIRED_VARIABLES.
-                # The optional form (e.g. `{file_extension_directory?:/}`) is left
-                # unresolved and degrades cleanly via parsed.resolve().
-                msg = (
-                    f"Cannot resolve {owner_kind} '{owner_name}': '{ref}' is a derived macro "
-                    f"variable that is only available in situation macros (resolved per-file at "
-                    f"write time), not in directory or environment path_macros. Move it to a "
-                    f"situation's filename macro, e.g. `{{{ref}?:/}}`."
-                )
-                raise MacroResolutionError(
-                    msg,
-                    failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
-                    variable_name=ref,
-                )
 
 
 @dataclass
@@ -740,6 +722,11 @@ class ProjectManager(EngineScoped):
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
+        # Set while `_resolve_default_workflow_save_dir` is resolving `save_workflow` to learn
+        # where an unsaved workflow would be saved. That resolution can reach `workflow_dir`
+        # again, directly or through a directory such as `{outputs}`, and each re-entry builds
+        # its own resolver, so the resolver's own cycle guard never sees the loop.
+        self._resolving_default_workflow_save_dir: bool = False
 
         # Track validation status for ALL load attempts (including MISSING/UNUSABLE)
         # This allows UI to query why a project failed to load
@@ -1972,21 +1959,13 @@ class ProjectManager(EngineScoped):
         return dict(resolver.env_resolved)
 
     def _build_variable_resolver(
-        self,
-        template: ProjectTemplate,
-        project_info: ProjectInfo,
-        extra_variables: MacroVariables | None = None,
+        self, template: ProjectTemplate, project_info: ProjectInfo
     ) -> _ProjectVariableResolver:
-        """Build a resolver that recursively resolves directories and env vars for this project.
-
-        `extra_variables` supplies caller-owned names a macro needs but the template cannot
-        provide, such as a situation's per-file `file_name_base`.
-        """
+        """Build a resolver that recursively resolves directories and env vars for this project."""
         return _ProjectVariableResolver(
             template=template,
             get_builtin=lambda name: self._get_builtin_variable_value(name, project_info),
             secrets_manager=self._secrets_manager,
-            extra_variables=dict(extra_variables) if extra_variables else {},
         )
 
     async def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
@@ -5028,10 +5007,10 @@ class ProjectManager(EngineScoped):
            location always beats the folder it was created in -- the two differ as soon as the
            user saves somewhere else.
         4. The folder the workflow WOULD be saved into, for a never-saved workflow whose creator
-           named no folder, read from the `save_workflow` situation so a template that anchors
-           saves outside the workspace root is answered with its folder rather than the root.
-           Where the user later chooses to save is a choice at save time, not a misprediction
-           by this rung. See `_resolve_default_workflow_save_dir`.
+           named no folder, read from the `save_workflow` situation with no sub-directories so a
+           template that anchors saves outside the workspace root is answered with its folder
+           rather than the root. Where the user later chooses to save is a choice at save time,
+           not a misprediction by this rung. See `_resolve_default_workflow_save_dir`.
 
         Raises:
             RuntimeError: If no workflow is in context, or the context's workflow is not
@@ -5073,48 +5052,54 @@ class ProjectManager(EngineScoped):
     def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo) -> str:
         """The folder `save_workflow` would put a workflow in when the save names no sub-directory.
 
-        Rung 4 of `_resolve_workflow_dir`. Resolves the situation's own macro with `sub_dirs`
-        omitted, so the answer tracks a template that anchors workflow saves somewhere other
-        than the workspace root. `file_name_base` and `file_extension` are required by the macro
-        but cannot affect which folder it names, so they are filled with placeholders and only
-        the parent is kept.
+        Rung 4 of `_resolve_workflow_dir`. Resolves the situation through
+        `on_get_path_for_macro_request`, the same handler the real save goes through, so the
+        answer accounts for derivation rules and stored project variables rather than tracking
+        only what this manager's resolver knows. `sub_dirs` is left out so the folder is the one
+        a save with no hierarchy lands in; `file_name_base` and `file_extension` are required by
+        the macro but cannot change which folder it names, so they get placeholders and only the
+        parent is kept.
 
-        Falls back to the workspace root when the situation is absent, failed to parse, or
-        cannot resolve, since answering with the root is what dropping an optional
-        `{workflow_dir}` already did -- a never-saved workflow keeps a usable folder either way.
+        Falls back to the workspace root when the situation is absent, failed to parse, or cannot
+        resolve, since answering with the root is what dropping an optional `{workflow_dir}`
+        already did -- a never-saved workflow keeps a usable folder either way.
         """
+        # Resolving the situation can reach `workflow_dir` again and land back here, so answer the
+        # root for the duration. The macro may name the builtin outright, or reach it through a
+        # directory: every v1 default directory is `{workflow_dir?:/}<name>`, and that form appends
+        # its own name once per pass, so an unguarded loop yields `outputs/outputs/outputs/...`.
+        if self._resolving_default_workflow_save_dir:
+            return self._resolve_builtin_workspace_dir()
+
         parsed_macro = project_info.parsed_situation_schemas.get(BuiltInSituation.SAVE_WORKFLOW)
         if parsed_macro is None:
             return self._resolve_builtin_workspace_dir()
 
-        # A `save_workflow` macro naming `{workflow_dir}` re-enters this method through the builtin,
-        # and the resolver's cycle guard covers directories and environment values, not builtins.
-        # The loop ends only by exhausting the stack: `RecursionError` is a `RuntimeError`, which the
-        # builtin handler reads as an unresolvable reference, so it degrades to this same answer the
-        # expensive way.
-        if any(variable.name == BUILTIN_WORKFLOW_DIR for variable in parsed_macro.get_variables()):
-            return self._resolve_builtin_workspace_dir()
-
-        resolver = self._build_variable_resolver(
-            project_info.template,
-            project_info,
-            extra_variables={"file_name_base": _SAVE_DIR_PROBE_STEM, "file_extension": "py"},
-        )
+        self._resolving_default_workflow_save_dir = True
         try:
-            resolved = resolver.resolve_situation(BuiltInSituation.SAVE_WORKFLOW, parsed_macro.template)
-        except MacroResolutionError as e:
+            result = self.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=parsed_macro,
+                    variables={
+                        "file_name_base": _SAVE_DIR_PROBE_STEM,
+                        "file_extension": _SAVE_DIR_PROBE_EXTENSION,
+                    },
+                    project_id=project_info.project_id,
+                )
+            )
+        finally:
+            self._resolving_default_workflow_save_dir = False
+
+        if not isinstance(result, GetPathForMacroResultSuccess):
             logger.debug(
-                "Could not resolve the '%s' situation to predict an unsaved workflow's folder; "
-                "using the workspace root (%s)",
+                "Could not resolve the '%s' situation to find where an unsaved workflow would be "
+                "saved; using the workspace root (%s)",
                 BuiltInSituation.SAVE_WORKFLOW,
-                e,
+                result.result_details,
             )
             return self._resolve_builtin_workspace_dir()
 
-        save_dir = Path(resolved).parent
-        if not save_dir.is_absolute():
-            save_dir = Path(self._resolve_builtin_workspace_dir()) / save_dir
-        return str(save_dir)
+        return str(result.absolute_path.parent)
 
     def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.

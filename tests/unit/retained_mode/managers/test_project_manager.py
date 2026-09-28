@@ -13190,7 +13190,9 @@ class TestUnsavedWorkflowDirFromSaveSituation:
     workflow created from the header menu is in before its first save.
     """
 
-    def _project_manager(self, save_workflow_macro: str | None) -> ProjectManager:
+    def _project_manager(
+        self, save_workflow_macro: str | None, stored_project_variables: dict[str, str | int] | None = None
+    ) -> ProjectManager:
         """A ProjectManager whose `save_workflow` macro is `save_workflow_macro` (None removes it)."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.situation import BuiltInSituation
@@ -13229,14 +13231,32 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         mock_context_manager.get_current_workflow_working_directory.return_value = None
         pm._engine = MagicMock()
         pm._engine.context_manager = mock_context_manager
+        # The probe resolves through on_get_path_for_macro_request, which consults stored project
+        # variables. A MagicMock's return value is not a mapping it can walk.
+        pm._engine.variables_manager.stored_project_variable_values.return_value = stored_project_variables or {}
 
         return pm
 
-    def _resolve_workflow_dir(self, pm: ProjectManager) -> str:
-        """Resolve `{workflow_dir}` through the registered-but-unsaved registry entry."""
+    def _resolve_workflow_dir(self, pm: ProjectManager, workflow_dir_requests: list[str] | None = None) -> str:
+        """Resolve `{workflow_dir}` through the registered-but-unsaved registry entry.
+
+        Every request for the `workflow_dir` builtin made during the resolution is appended to
+        `workflow_dir_requests`, so a test can bound how far the situation probe re-enters.
+        """
+        recorded = workflow_dir_requests if workflow_dir_requests is not None else []
+        real_get_builtin = ProjectManager._get_builtin_variable_value
+
+        def counting_get_builtin(pm_self: ProjectManager, var_name: str, project_info: ProjectInfo) -> str:
+            if var_name == "workflow_dir":
+                recorded.append(var_name)
+            return real_get_builtin(pm_self, var_name, project_info)
+
         registered_unsaved = Mock()
         registered_unsaved.file_path = None
-        with patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_workflow_registry:
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_workflow_registry,
+            patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin),
+        ):
             mock_workflow_registry.get_workflow_by_name.return_value = registered_unsaved
             project_info = pm._successfully_loaded_project_templates[cast("str", pm._current_project_id)]
             return pm._resolve_workflow_dir(project_info)
@@ -13268,28 +13288,49 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         assert "sub_dirs" not in self._resolve_workflow_dir(pm)
 
     def test_macro_naming_workflow_dir_does_not_recurse(self) -> None:
-        """A `save_workflow` macro referencing `{workflow_dir}` must not re-enter this resolution.
+        """A `save_workflow` macro naming `{workflow_dir}` resolves it once, not repeatedly.
 
-        The resolver's cycle guard covers directories and environment values, not builtins, so
-        without the up-front check the macro is resolved over and over until the stack runs out.
-        Asserting on the returned folder alone would not catch that: the degradation path answers
-        with the workspace root either way. The claim under test is that the macro is never
-        resolved, so the builtin is never asked for again.
+        Asserting on the returned folder alone would not catch a loop: the resolution degrades to
+        the workspace root either way, just after exhausting the stack. Bounding the number of
+        requests is what pins the reentrancy guard down.
         """
         pm = self._project_manager("{workflow_dir}/{file_name_base}.{file_extension}")
-        workflow_dir_requests = []
-        real_get_builtin = ProjectManager._get_builtin_variable_value
+        workflow_dir_requests: list[str] = []
 
-        def counting_get_builtin(pm_self: ProjectManager, var_name: str, project_info: ProjectInfo) -> str:
-            if var_name == "workflow_dir":
-                workflow_dir_requests.append(var_name)
-            return real_get_builtin(pm_self, var_name, project_info)
-
-        with patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin):
-            resolved = self._resolve_workflow_dir(pm)
+        resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
 
         assert resolved == str(Path("/workspace"))
-        assert workflow_dir_requests == []
+        assert len(workflow_dir_requests) == 1
+
+    def test_macro_reaching_workflow_dir_through_a_directory_does_not_recurse(self) -> None:
+        """The loop can also run through a directory, which is the shape every v1 default has.
+
+        `{outputs}` is `{workflow_dir?:/}outputs`, so a `save_workflow` macro that names no builtin
+        at all still reaches `workflow_dir`. Scanning the situation macro's own variables would
+        miss this, which is why the guard is a flag held across the whole probe. Unguarded, this
+        case does not degrade: each pass appends another `outputs`, so the folder is corrupt.
+        """
+        pm = self._project_manager("{outputs}/{file_name_base}.{file_extension}")
+        workflow_dir_requests: list[str] = []
+
+        resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
+
+        assert resolved == str(Path("/workspace/outputs"))
+        assert len(workflow_dir_requests) == 1
+
+    def test_stored_project_variable_resolves_the_same_way_the_save_would(self) -> None:
+        """A macro naming a stored project variable gets the folder the real save writes to.
+
+        The save resolves through `on_get_path_for_macro_request`, which fills stored project
+        variables. Resolving the macro with only this manager's own resolver could not see them,
+        so it answered the workspace root while the save wrote somewhere else entirely.
+        """
+        pm = self._project_manager(
+            "{workspace_dir}/{team_folder}/{file_name_base}.{file_extension}",
+            stored_project_variables={"team_folder": "lighting"},
+        )
+
+        assert self._resolve_workflow_dir(pm) == str(Path("/workspace/lighting"))
 
     def test_missing_situation_answers_the_workspace_root(self) -> None:
         """A template with no `save_workflow` situation still gets a usable folder."""
