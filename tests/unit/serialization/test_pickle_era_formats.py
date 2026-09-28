@@ -30,15 +30,13 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeserializeSelectedNodesFromCommandsRequest,
     DeserializeSelectedNodesFromCommandsResultSuccess,
 )
-from tests.unit.serialization.conftest import FIXTURES
+from tests.unit.serialization.fixture_paths import FIXTURES
 
 if TYPE_CHECKING:
     from types import ModuleType
 
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.engine import Engine
-
-_FIXTURES = FIXTURES
 
 
 def _expected_values(library_module: ModuleType) -> dict[str, Any]:
@@ -96,7 +94,7 @@ def _assert_holder_restored(node: BaseNode, *, skip: frozenset[str] = frozenset(
 
 def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
     result = engine.handle_request(
-        ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(_FIXTURES / file_name), deserialize=True)
+        ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(FIXTURES / file_name), deserialize=True)
     )
     assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess), result
     return engine.node_manager.get_node_by_name(result.node_name_mappings["Holder"])
@@ -105,7 +103,7 @@ def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
 class TestPickleEraFormats:
     @pytest.mark.usefixtures("library_name")
     def test_saved_workflow_restores_every_value(self, engine: Engine) -> None:
-        workflow_path = _FIXTURES / "pickle_era_workflow.py"
+        workflow_path = FIXTURES / "pickle_era_workflow.py"
         exec_globals: dict[str, object] = {"__file__": str(workflow_path)}
         exec(compile(workflow_path.read_text(), str(workflow_path), "exec"), exec_globals)  # noqa: S102
         asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]
@@ -135,7 +133,7 @@ class TestPickleEraFormats:
 
     @pytest.mark.usefixtures("flow_name")
     def test_clipboard_paste_restores_every_value(self, engine: Engine) -> None:
-        clipboard = json.loads((_FIXTURES / "pickle_era_clipboard.json").read_text())
+        clipboard = json.loads((FIXTURES / "pickle_era_clipboard.json").read_text())
         result = engine.handle_request(
             DeserializeSelectedNodesFromCommandsRequest(
                 deserialize_commands=clipboard["serialized_selected_node_commands"],
