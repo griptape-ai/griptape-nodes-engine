@@ -91,7 +91,7 @@ A workflow that has never been saved has no file, so there is no directory to de
 
 Once the workflow is saved, `workflow_dir` switches to the directory of the saved file — which may be somewhere else, if you saved it to a different folder. The files themselves stay where they were written, but any stored references built on `{workflow_dir}` now resolve into the new folder, so outputs generated before the save may appear missing from the node even though the bytes are on disk.
 
-If the editor did not supply a folder, `workflow_dir` answers with the folder your first save would default to, which is the workspace directory. Files you generate before saving land there, in the same place they would have landed when `workflow_dir` was unavailable and `{workflow_dir?:/}` was omitted.
+If the editor did not supply a folder, `workflow_dir` answers with the folder your first save would default to. That is the folder named by your project's `save_workflow` situation, which is the workspace directory unless your project points workflow saves somewhere else. Files you generate before saving land there.
 
 ## Variable priority
 

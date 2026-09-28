@@ -30,7 +30,8 @@ the engine's request API from working without edits. Migration steps live in
   load that never finished.
 - Saving a file from a workflow you have not saved yet no longer logs a stream of "Optional builtin
   'workflow_dir' could not be resolved" warnings. `workflow_dir` now answers with the folder your
-  first save would default to, so the paths files are written to are unchanged.
+  first save would default to, read from the project's `save_workflow` situation, so a project that
+  points workflow saves outside the workspace root writes those files there rather than at the root.
   [#5669](https://github.com/griptape-ai/griptape-nodes-engine/issues/5669)
 - Creating a versioned output folder or file sequence in a project no longer fails with "requires
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
