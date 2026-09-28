@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
+    ControlFlowResolvedEvent,
     GriptapeEvent,
     StartFlowRequest,
     StartFlowResultFailure,
@@ -213,11 +214,13 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                     task.add_done_callback(_handle_task_done)
                 elif isinstance(event, ExecutionGriptapeNodeEvent):
                     # Emit execution event via WebSocket
-                    self._send_event("execution_event", event.wrapped_event)
+                    result_send_failure = self._send_execution_event(event)
                     task = asyncio.create_task(self._process_execution_event_async(event))
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
                     is_flow_finished, error = await self._handle_execution_event(event, flow_name)
+                    if result_send_failure is not None:
+                        error = result_send_failure
                 elif isinstance(event, ProgressEvent):
                     # Convert ProgressEvent to GriptapeEvent and emit via WebSocket
                     payload = GriptapeEvent(
@@ -245,6 +248,17 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         if error is not None:
             raise error
+
+    def _send_execution_event(self, event: ExecutionGriptapeNodeEvent) -> LocalExecutorError | None:
+        """Send an execution event, and fail the run if it carries the run's result and could not be sent.
+
+        Any other event is skipped on failure. Skipping ControlFlowResolvedEvent would leave the parent
+        reporting success with no output.
+        """
+        send_error = self._send_event("execution_event", event.wrapped_event)
+        if send_error is None or not isinstance(event.wrapped_event.payload, ControlFlowResolvedEvent):
+            return None
+        return LocalExecutorError(f"Attempted to send the workflow's result. Failed because: {send_error}")
 
     @classmethod
     def add_cli_arguments(
