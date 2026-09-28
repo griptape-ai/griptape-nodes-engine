@@ -19,7 +19,7 @@ from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriv
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
@@ -1335,16 +1335,20 @@ class WorkerManager(EngineScoped):
         act on locally (e.g. reload config, refresh secrets). The request is
         sent to each worker's dedicated request topic; no response is awaited.
 
-        Safe to call with zero registered workers -- it is a no-op.
+        Safe to call with zero registered workers -- it is a no-op. An event that cannot be
+        serialized is logged and sent to no worker.
         """
         if not self._workers:
             return
-        for wid, registration in list(self._workers.items()):
-            await self.forward_event_to_worker(
-                event,
-                worker_engine_id=wid,
-                worker_request_topic=registration.request_topic,
-            )
+        try:
+            for wid, registration in list(self._workers.items()):
+                await self.forward_event_to_worker(
+                    event,
+                    worker_engine_id=wid,
+                    worker_request_topic=registration.request_topic,
+                )
+        except EventSerializationError:
+            logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
 
     async def relay_worker_result(self, payload: dict) -> None:
         """Relay an unmatched worker result to the GUI session response topic.
