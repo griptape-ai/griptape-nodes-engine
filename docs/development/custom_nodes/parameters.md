@@ -30,18 +30,16 @@ All Parameter attributes:
 
 ## Parameter Values
 
-A value that leaves the engine's process travels as plain data. That happens when a node runs in
-its library's own process (see [Node Isolation with Workers](node_isolation_with_workers.md)).
-
-These values make the trip and arrive as the same type:
+Parameter values are serialized when a node runs in its library's own process (see
+[Node Isolation with Workers](node_isolation_with_workers.md)). These types serialize as-is:
 
 - `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
-- tuples, named tuples, sets, `bytes`, and dicts with keys that aren't text
+- tuples, named tuples, sets, `bytes`, and dicts with non-string keys
 - enums, `pathlib` paths, dates and times, `timedelta`, `UUID`, and `Decimal`
-- pydantic models, dataclasses, and attrs classes, rebuilt from the fields their constructor takes
+- pydantic models, dataclasses, and attrs classes
 - griptape objects such as artifacts and rulesets
 
-For any other class, add a `to_state()` method that returns the values above, and a
+To serialize any other class, add a `to_state()` method that returns the types above, and a
 `from_state()` classmethod that rebuilds the object from them:
 
 ```python
@@ -56,17 +54,6 @@ class Palette:
     def from_state(cls, state: dict) -> "Palette":
         return cls(state["colors"])
 ```
-
-A value whose class belongs to a library the receiving process doesn't load arrives there as a dict
-of its plain data, and continues unchanged to the next process that does load it. A class defined
-inside a function can't make the trip at all, because no other process can find it.
-
-An output with no plain-data form fails the node with an error that names the parameter, unless
-the node is in a library running in its own process and the parameter is `serializable=False`:
-then the engine keeps the value in that process (see [Passing Values That Cannot Be
-Serialized](passing_unserializable_values.md)). `serializable=False` only holds an output in
-place; an input sent to a node in an isolated library still needs a plain-data form, even one
-wired from a `serializable=False` output upstream.
 
 ## Traits
 
