@@ -28,11 +28,12 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.rez_utils import (
-    build_rez_env_prefix,
+    RezContextEnvironment,
     is_library_rez_package_available,
     is_rez_enabled,
-    library_file_path_to_rez_family,
-    resolve_and_log_rez_context,
+    layer_rez_environment,
+    library_rez_request,
+    rez_context_environment,
     rez_subprocess_env,
     torch_backend_requests,
 )
@@ -450,11 +451,15 @@ class WorkerManager(EngineScoped):
                 return wid, registration.request_topic
         return None
 
-    async def spawn_worker(self, args: list[str], worker_key: str) -> None:
+    async def spawn_worker(
+        self, args: list[str], worker_key: str, *, rez_environ: dict[str, str] | None = None
+    ) -> None:
         """Spawn a worker subprocess using the given command args.
 
         worker_key is an opaque identifier used to track the process and prevent
         duplicate spawns. Callers are responsible for constructing the args list.
+        rez_environ is the environment of the library's rez context (see
+        ``rez_context_environment``), applied as ``rez env`` would apply it.
         """
         if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
@@ -495,6 +500,10 @@ class WorkerManager(EngineScoped):
                 worker_environ.update(rez_vars)
                 if rez_vars:
                     logger.debug("[Rez] forwarding %d rez env vars to worker: %s", len(rez_vars), list(rez_vars.keys()))
+
+            # The library's rez environment, with this engine's PYTHONPATH behind it.
+            if rez_environ is not None:
+                worker_environ = layer_rez_environment(worker_environ, rez_environ)
 
             # PYTHONPATH precedes site-packages, making this library-first with the engine's own
             # environment as the fallback. It must be the environment rather than a later sys.path
@@ -902,43 +911,56 @@ class WorkerManager(EngineScoped):
             library_name,
         ]
 
+        rez_environ: dict[str, str] | None = None
         if is_rez_enabled():
-            args = self._build_rez_worker_args(library_name, base_args)
-        else:
-            args = base_args
+            context = await asyncio.to_thread(self._rez_worker_context, library_name)
+            if context is not None and context.environment is None:
+                reason = f"its rez environment could not be set up: {context.failure}."
+                logger.error(
+                    "[Rez][execution] Attempted to start the worker for library '%s'. Failed because %s",
+                    library_name,
+                    reason,
+                )
+                self.note_worker_unavailable(library_name, reason)
+                return
+            if context is not None:
+                rez_environ = context.environment
 
-        await self.spawn_worker(args, library_name)
+        await self.spawn_worker(base_args, library_name, rez_environ=rez_environ)
 
-    def _build_rez_worker_args(self, library_name: str, base_args: list[str]) -> list[str]:
-        """Wrap base_args with a rez-env prefix when the library has a rez package.
+    def _rez_worker_context(self, library_name: str) -> RezContextEnvironment | None:
+        """The environment of a library's rez context for its worker, or None without a rez package.
 
-        The package lookup and the wrap both derive the rez family from the library's
+        The package lookup and the request both derive the rez family from the library's
         path, so they always agree on the repo/folder-named package.
         """
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None or not library_info.library_path:
             logger.warning(
-                "[Rez][execution] Cannot find library path for '%s' -- skipping rez wrap",
+                "[Rez][execution] Cannot find library path for '%s' -- starting its worker without rez",
                 library_name,
             )
-            return base_args
+            return None
 
         library_file_path = Path(library_info.library_path)
         if not is_library_rez_package_available(library_file_path):
-            logger.debug("[Rez][execution] no rez package for '%s' -- spawning without rez wrap", library_name)
-            return base_args
+            logger.debug("[Rez][execution] no rez package for '%s' -- starting its worker without rez", library_name)
+            return None
 
-        rez_family = library_file_path_to_rez_family(library_file_path)
+        # The package version the orchestrator loaded, not whatever is newest in the store.
+        rez_request = library_rez_request(library_file_path)
         # The same request the library was checked with at load: its package plus this
         # workstation's torch build.
-        rez_specs = [rez_family, *torch_backend_requests()]
-        logger.info("[Rez][execution] wrapping worker for '%s' (family: %s)", library_name, rez_family)
-        resolve_and_log_rez_context(rez_specs)
-
-        rez_prefix = build_rez_env_prefix(rez_specs)
-        wrapped = [*rez_prefix, *base_args]
-        logger.info("[Rez][execution]   wrapped cmd: %s", " ".join(wrapped))
-        return wrapped
+        rez_specs = [rez_request, *torch_backend_requests()]
+        context = rez_context_environment(rez_specs)
+        if context.environment is not None:
+            logger.info(
+                "[Rez][execution] worker for '%s' uses %s: %s",
+                library_name,
+                " ".join(rez_specs),
+                context.environment.get("REZ_USED_RESOLVE", ""),
+            )
+        return context
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
         """Record a spawn that raised before producing a worker.

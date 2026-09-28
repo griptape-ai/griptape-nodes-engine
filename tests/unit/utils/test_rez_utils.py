@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ import pytest
 
 from griptape_nodes.utils.rez_utils import (
     TORCH_BACKEND_UNKNOWN,
+    RezContextEnvironment,
     TorchBackendChoice,
     _anchor_drive_letter,
     _choose_torch_backend_for,
@@ -29,7 +31,6 @@ from griptape_nodes.utils.rez_utils import (
     _rez_executable,
     _write_library_meta_package,
     build_direct_requires,
-    build_rez_env_prefix,
     built_torch_backends,
     check_rez_health,
     check_rez_health_detailed,
@@ -45,23 +46,25 @@ from griptape_nodes.utils.rez_utils import (
     is_library_rez_package_available,
     is_rez_enabled,
     is_rez_library_path,
+    layer_rez_environment,
     library_edit_rez_requests,
     library_environment_failure,
     library_file_path_to_rez_family,
     library_platform_requires,
     library_rez_family,
+    library_rez_request,
     nvidia_driver_cuda_version,
     pip_spec_name,
     read_library_dependencies,
     read_library_manifest,
     read_library_package_requires,
-    resolve_and_log_rez_context,
     resolve_rez_library_json_path,
     resolve_rez_pythonpath,
     rez_base,
     rez_bin_path,
     rez_config_dropped_paths,
     rez_config_file,
+    rez_context_environment,
     rez_implicit_packages,
     rez_library_package_name,
     rez_library_package_version,
@@ -76,7 +79,7 @@ from griptape_nodes.utils.rez_utils import (
     rez_version_from_git_ref,
     torch_backend_requests,
 )
-from griptape_nodes.utils.rez_uv import InstallReport, ResolvedPackage, RezInstallError, read_package_file
+from griptape_nodes.utils.rez_uv import InstallReport, ResolvedPackage, RezInstallError, read_package_file, rez_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -530,19 +533,16 @@ class TestRezPathMap:
 
 class TestCurrentPlatformKey:
     def test_linux(self) -> None:
-        import sys
 
         with patch.object(sys, "platform", "linux"):
             assert current_platform_key() == "linux"
 
     def test_darwin(self) -> None:
-        import sys
 
         with patch.object(sys, "platform", "darwin"):
             assert current_platform_key() == "osx"
 
     def test_windows(self) -> None:
-        import sys
 
         with patch.object(sys, "platform", "win32"):
             assert current_platform_key() == "windows"
@@ -966,77 +966,120 @@ class TestBuildDirectRequires:
             result = build_direct_requires(["pillow>=10", "ruamel-yaml"])
         assert result == ["pillow-10.0.0", "ruamel_yaml-0.18.0"]
 
+    def test_requested_extras_are_pinned_too(self, tmp_path: Path) -> None:
+        # The engine's `pydantic-ai-slim[mcp,openai]`: rez has no extras, so the engine
+        # package itself must require what the `mcp` extra adds.
+        _installed_wheel(
+            tmp_path,
+            "pydantic-ai-slim",
+            "2.51.0",
+            ['fastmcp-slim>=4; extra == "mcp"', 'openai>=1; extra == "openai"', 'anthropic; extra == "anthropic"'],
+        )
+        resolved = [
+            ResolvedPackage(pip_name="anthropic", version="0.70.0"),
+            ResolvedPackage(pip_name="fastmcp-slim", version="4.0.10"),
+            ResolvedPackage(pip_name="openai", version="2.1.0"),
+            ResolvedPackage(pip_name="pydantic-ai-slim", version="2.51.0"),
+        ]
+        with patch(f"{_RU}.resolve_full", return_value=resolved):
+            result = build_direct_requires(["pydantic-ai-slim[mcp,openai]>=2.29.0"], store=tmp_path)
+        assert result == ["fastmcp_slim-4.0.10", "openai-2.1.0", "pydantic_ai_slim-2.51.0"]
+
+    def test_without_a_store_extras_are_not_expanded(self) -> None:
+        resolved = [
+            ResolvedPackage(pip_name="fastmcp-slim", version="4.0.10"),
+            ResolvedPackage(pip_name="pydantic-ai-slim", version="2.51.0"),
+        ]
+        with patch(f"{_RU}.resolve_full", return_value=resolved):
+            assert build_direct_requires(["pydantic-ai-slim[mcp]"]) == ["pydantic_ai_slim-2.51.0"]
+
+
+def _installed_wheel(store: Path, pip_name: str, version: str, requires_dist: list[str]) -> None:
+    """A pure-Python package installed in *store* the way rez_uv lays it out, with its metadata."""
+    version_dir = store / rez_name(pip_name) / version
+    dist_info = version_dir / "python-3.12" / "python" / f"{rez_name(pip_name)}-{version}.dist-info"
+    dist_info.mkdir(parents=True)
+    (version_dir / "package.py").write_text("variants = [['python-3.12']]\n", encoding="utf-8")
+    metadata = [f"Name: {pip_name}", f"Version: {version}", *[f"Requires-Dist: {r}" for r in requires_dist]]
+    (dist_info / "METADATA").write_text("\n".join(metadata) + "\n", encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
 # Rez runtime probes
 # ---------------------------------------------------------------------------
 
 
-class TestBuildRezEnvPrefix:
-    def test_prefix(self) -> None:
-        with patch(f"{_RU}._rez_executable", return_value="/opt/rez/bin/rez"):
-            assert build_rez_env_prefix(["lib_a", "lib_b-1.0"]) == [
-                "/opt/rez/bin/rez",
-                "env",
-                "lib_a",
-                "lib_b-1.0",
-                "--",
-            ]
-
-
-class TestResolveAndLogRezContext:
-    def test_success(self) -> None:
+class TestRezContextEnvironment:
+    def test_resolves_then_reads_the_environment_from_rez(self) -> None:
+        environ = {"PYTHONPATH": "/store/a/python", "REZ_USED_RESOLVE": "lib_a-1.0"}
         with (
             patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", return_value=_completed(stdout="lib_a-1.0\n\npython-3.12\n")) as run,
+            patch(f"{_RU}.subprocess.run", side_effect=[_completed(), _completed(stdout=json.dumps(environ))]) as run,
         ):
-            assert resolve_and_log_rez_context(["lib_a"]) == ["lib_a-1.0", "python-3.12"]
-        cmd = run.call_args.args[0]
-        assert cmd[:4] == ["rez", "env", "lib_a", "--"]
+            context = rez_context_environment(["lib_a==1.0", ".torch_backend-cu128"])
 
-    def test_non_zero_exit(self) -> None:
+        assert context == RezContextEnvironment(environment=environ, failure=None)
+        resolve_cmd, interpret_cmd = (call.args[0] for call in run.call_args_list)
+        assert resolve_cmd[:5] == ["rez", "env", "lib_a==1.0", ".torch_backend-cu128", "--output"]
+        # Nothing runs inside the environment: rez interprets the context file itself.
+        assert interpret_cmd == ["rez", "context", resolve_cmd[5], "--interpret", "--format", "json"]
+
+    def test_failed_resolve_says_why(self) -> None:
+        stderr = "The context failed to resolve:\nThe following package conflicts occurred: (a-1 <--!--> a-2)\n"
         with (
             patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", return_value=_completed(returncode=1, stderr="resolve failed")),
+            patch(f"{_RU}.subprocess.run", return_value=_completed(returncode=1, stderr=stderr)) as run,
         ):
-            assert resolve_and_log_rez_context(["lib_a"]) == []
+            context = rez_context_environment(["lib_a"])
 
-    def test_os_error(self) -> None:
+        assert context.environment is None
+        assert context.failure == "The following package conflicts occurred: (a-1 <--!--> a-2)"
+        assert run.call_count == 1
+
+    def test_rez_that_cannot_run(self) -> None:
         with (
             patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", side_effect=OSError("not found")),
+            patch(f"{_RU}.subprocess.run", side_effect=OSError("gone")),
         ):
-            assert resolve_and_log_rez_context(["lib_a"]) == []
+            assert rez_context_environment(["lib_a"]).failure == "rez could not be run: gone"
 
-    def test_logs_path_map_when_set(self) -> None:
+    @pytest.mark.parametrize("stdout", ["not json", "[1, 2]"])
+    def test_unreadable_environment(self, stdout: str) -> None:
         with (
-            patch.dict(os.environ, {"GTN_REZ_PATH_MAP": "linux=/mnt/p;windows=P:"}, clear=True),
             patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", return_value=_completed(stdout="")),
+            patch(f"{_RU}.subprocess.run", side_effect=[_completed(), _completed(stdout=stdout)]),
         ):
-            assert resolve_and_log_rez_context(["lib_a"]) == []
+            assert rez_context_environment(["lib_a"]).failure == "rez printed an environment that could not be read"
+
+
+class TestLayerRezEnvironment:
+    def test_library_paths_first_then_the_engines(self) -> None:
+        environ = {"PYTHONPATH": "/store/engine/python", "HOME": "/home/artist", "PATH": "/usr/bin"}
+        rez_environ = {"PYTHONPATH": "/store/torch/python", "PATH": "/rez/bin", "REZ_USED_RESOLVE": "lib-1.0"}
+
+        layered = layer_rez_environment(environ, rez_environ)
+
+        assert layered["PYTHONPATH"] == os.pathsep.join(["/store/torch/python", "/store/engine/python"])
+        assert layered["PATH"] == "/rez/bin"  # as rez env sets it
+        assert layered["REZ_USED_RESOLVE"] == "lib-1.0"
+        assert layered["HOME"] == "/home/artist"
+
+    def test_engine_outside_rez_keeps_only_the_library_paths(self) -> None:
+        layered = layer_rez_environment({}, {"PYTHONPATH": "/store/torch/python"})
+        assert layered["PYTHONPATH"] == "/store/torch/python"
 
 
 class TestResolveRezPythonpath:
-    def test_success(self) -> None:
-        stdout = "/store/a/python\n/store/b/python\n"
-        with (
-            patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", return_value=_completed(stdout=stdout)),
+    def test_reads_pythonpath_from_the_context_environment(self) -> None:
+        environ = {"PYTHONPATH": os.pathsep.join(["/store/a/python", "", "/store/b/python"])}
+        with patch(
+            f"{_RU}.rez_context_environment", return_value=RezContextEnvironment(environment=environ, failure=None)
         ):
             assert resolve_rez_pythonpath(["lib_a"]) == ["/store/a/python", "/store/b/python"]
 
-    def test_non_zero_exit(self) -> None:
-        with (
-            patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", return_value=_completed(returncode=3, stderr="boom")),
-        ):
-            assert resolve_rez_pythonpath(["lib_a"]) == []
-
-    def test_timeout(self) -> None:
-        with (
-            patch(f"{_RU}._rez_executable", return_value="rez"),
-            patch(f"{_RU}.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="rez", timeout=30)),
+    def test_failure_returns_empty(self) -> None:
+        with patch(
+            f"{_RU}.rez_context_environment", return_value=RezContextEnvironment(environment=None, failure="boom")
         ):
             assert resolve_rez_pythonpath(["lib_a"]) == []
 
@@ -1363,6 +1406,39 @@ class TestReadLibraryPackageRequires:
         manifest = _write_library_package(tmp_path / "local", "my_lib", "1.0.0", body)
         assert read_library_package_requires(manifest) == ["torch-2.7.0"]
         assert not marker.exists()
+
+
+class TestLibraryRezRequest:
+    def test_pinned_store_registration_requests_that_exact_version(self, tmp_path: Path) -> None:
+        # REZ:my_lib-1.0.0 registers the 1.0.0 folder; a newer 1.1.0 in the store must not win.
+        local = tmp_path / "local"
+        manifest = _write_library_package(local, "my_lib", "1.0.0", "requires = []\n")
+        _write_library_package(local, "my_lib", "1.1.0", "requires = []\n")
+        assert library_rez_request(manifest) == "my_lib==1.0.0"
+
+    def test_local_checkout_requests_latest_store_package(self, tmp_path: Path) -> None:
+        local = tmp_path / "store" / "local"
+        _write_library_package(local, "my_lib", "1.0.0", "requires = []\n")
+        _write_library_package(local, "my_lib", "1.1.0", "requires = []\n")
+        checkout = tmp_path / "my-lib"
+        checkout.mkdir()
+        manifest = checkout / "griptape_nodes_library.json"
+        manifest.write_text("{}")
+        with (
+            _searching(local),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+        ):
+            assert library_rez_request(manifest) == "my_lib==1.1.0"
+
+    def test_no_package_falls_back_to_family(self, tmp_path: Path) -> None:
+        manifest = tmp_path / "loose" / "griptape_nodes_library.json"
+        manifest.parent.mkdir()
+        manifest.write_text("{}")
+        with (
+            _searching(),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+        ):
+            assert library_rez_request(manifest) == "loose"
 
 
 class TestLibraryEditRezRequests:
@@ -2127,7 +2203,7 @@ class TestRezResolveFailure:
 class TestLibraryEnvironmentFailure:
     @pytest.fixture(autouse=True)
     def _family(self) -> Iterator[None]:
-        with patch(f"{_RU}.library_file_path_to_rez_family", return_value="griptape_nodes_library_diffusers"):
+        with patch(f"{_RU}.library_rez_request", return_value="griptape_nodes_library_diffusers"):
             yield
 
     def test_resolves_with_this_workstations_torch_build(self) -> None:

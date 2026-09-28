@@ -25,8 +25,9 @@ from griptape_nodes.utils.rez_uv import (
     TORCH_BACKENDS,
     InstallReport,
     ParsedRequirement,
+    ResolvedPackage,
+    expand_extras,
     flags_for_torch_backend,
-    marker_applies,
     merge_platform_requires,
     parse_requirement,
     pip_normalize,
@@ -35,6 +36,7 @@ from griptape_nodes.utils.rez_uv import (
     resolve_full,
     rez_name,
     rez_range,
+    store_requires_dist_reader,
     torch_backend_request,
 )
 from griptape_nodes.utils.rez_uv import current_platform_key as rez_uv_platform_key
@@ -455,19 +457,6 @@ def rez_config_dropped_paths() -> list[Path]:
     return [path for path in studio_paths if canonicalize_for_identity(path) not in kept]
 
 
-def _log_rez_env_context() -> None:
-    """Emit debug lines describing the current Rez configuration."""
-    setup = rez_setup()
-    logger.debug("[Rez] enabled=%s", setup.enabled)
-    if setup.disabled_reason:
-        logger.debug("[Rez] %s", setup.disabled_reason)
-    if setup.base is not None:
-        logger.debug("[Rez] base=%s (from %s)", setup.base.path, setup.base.source)
-    logger.debug("[Rez] bin_path=%s (raw=%s)", setup.bin_path or "(unset)", _env_value(ENV_BIN_PATH) or "(unset)")
-    logger.debug("[Rez] config_file=%s", setup.config_file or "(none)")
-    logger.debug("[Rez] local_packages_path=%s", setup.local_packages_path or "(none: production)")
-
-
 # ---------------------------------------------------------------------------
 # Library installation helpers
 # ---------------------------------------------------------------------------
@@ -591,21 +580,50 @@ def read_library_dependencies(library_json: Path) -> list[dict[str, str | bool]]
     ]
 
 
-def build_direct_requires(pip_dependencies: list[str]) -> list[str]:
+def build_direct_requires(pip_dependencies: list[str], *, store: Path | None = None) -> list[str]:
     """Resolve pip dependencies and return pinned rez requires for direct deps only.
 
     Resolves the full transitive dependency tree with uv, then filters to
     only the packages that were directly requested (by name). Each is pinned
-    to its resolved version in rez naming format.
+    to its resolved version in rez naming format. With *store*, where the
+    dependencies are installed, what requested extras add is included too
+    (see ``pinned_direct_requires``).
     """
     if not pip_dependencies:
         return []
 
     resolved = resolve_full(pip_dependencies)
+    return pinned_direct_requires(pip_dependencies, resolved, store)
+
+
+def pinned_direct_requires(
+    pip_dependencies: list[str], resolved: list[ResolvedPackage], store: Path | None
+) -> list[str]:
+    """Pin the directly requested packages, and what their requested extras add, to *resolved*.
+
+    Rez has no extras, so ``pydantic-ai-slim[mcp]`` needs the package itself to require the
+    ``mcp`` extra's dependencies (see ``expand_extras``). Their metadata is read from *store*,
+    so the dependencies must be installed there first; without a store extras are ignored.
+    """
     direct_names = {pip_spec_name(spec) for spec in pip_dependencies}
+    if store is not None:
+        resolved_versions = {pip_normalize(pkg.pip_name): pkg.version for pkg in resolved}
+        direct_names |= {
+            pip_spec_name(requirement.pip_name)
+            for requirement in _requirements_with_extras(pip_dependencies, store, resolved_versions)
+            if requirement.applies()
+        }
     return [
         f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
     ]
+
+
+def _requirements_with_extras(
+    pip_dependencies: list[str], store: Path, resolved_versions: dict[str, str]
+) -> list[ParsedRequirement]:
+    """Parsed *pip_dependencies* plus what their requested extras add, read from *store*."""
+    parsed = [requirement for spec in pip_dependencies if (requirement := parse_requirement(spec)) is not None]
+    return expand_extras(parsed, store_requires_dist_reader(store, resolved_versions))
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +909,21 @@ def _library_package_dir(library_file_path: Path) -> Path | None:
     return _find_package_version_dir(rez_family, None, rez_package_stores())
 
 
+def library_rez_request(library_file_path: Path) -> str:
+    """Return the rez request for a library's package: ``<family>==<version>``.
+
+    The version is the package ``_library_package_dir`` finds, the one the orchestrator
+    reads its edit-time pins from. A library registered as ``REZ:<family>-0.8.0`` therefore
+    runs its worker on 0.8.0 even when the store also holds a newer version, which a bare
+    ``<family>`` request would pick. Falls back to the bare family when no package is found.
+    """
+    rez_family = library_file_path_to_rez_family(library_file_path)
+    package_dir = _library_package_dir(library_file_path)
+    if package_dir is None:
+        return rez_family
+    return f"{rez_family}=={package_dir.name}"
+
+
 def read_library_package_requires(library_file_path: Path) -> list[str]:
     """Return the ``requires`` list of the rez package that provides a library.
 
@@ -974,113 +1007,101 @@ def is_in_rez_context(rez_family: str) -> bool:
     return False
 
 
-def build_rez_env_prefix(package_specs: list[str]) -> list[str]:
-    """Build the ``rez env <specs> --`` command prefix for subprocess wrapping.
+@dataclass(frozen=True)
+class RezContextEnvironment:
+    """The environment a rez context gives a command, or why it could not be worked out."""
 
-    Args:
-        package_specs: Rez package request strings (e.g. ``["griptape_nodes_library_diffusers"]``).
+    environment: dict[str, str] | None
+    failure: str | None
 
-    Returns:
-        Command prefix list that can be prepended to any subprocess args list.
-        Example: ``["/opt/rez/bin/rez", "env", "griptape_nodes_library_diffusers", "--"]``
+
+def rez_context_environment(package_specs: list[str]) -> RezContextEnvironment:
+    """Return the environment ``rez env <specs>`` would give a command, without running one in it.
+
+    Resolves the request to a context file, then has rez interpret it
+    (``rez context --interpret --format json``): PATH, PYTHONPATH, and every REZ_* variable
+    the context sets, exactly as ``rez env`` applies them. Nothing runs inside the
+    environment. A failure is written for artists, as the load-time check reports it.
     """
     rez_bin = _rez_executable("rez")
-    prefix = [rez_bin, "env", *package_specs, "--"]
-    logger.info("[Rez][execution] built rez-env prefix: %s", " ".join(prefix))
-    return prefix
+    env = rez_subprocess_env()
+    logger.debug("[Rez] reading the environment of %s", package_specs)
+    with tempfile.TemporaryDirectory() as tmp:
+        context_file = str(Path(tmp) / "context.rxt")
+        resolved = _run_rez_step([rez_bin, "env", *package_specs, "--output", context_file], env)
+        if resolved.failure is not None:
+            return RezContextEnvironment(environment=None, failure=resolved.failure)
+        interpreted = _run_rez_step([rez_bin, "context", context_file, "--interpret", "--format", "json"], env)
+    if interpreted.failure is not None:
+        return RezContextEnvironment(environment=None, failure=interpreted.failure)
+    environment = _parse_interpreted_environment(interpreted.output)
+    if environment is None:
+        return RezContextEnvironment(environment=None, failure="rez printed an environment that could not be read")
+    return RezContextEnvironment(environment=environment, failure=None)
 
 
-def resolve_and_log_rez_context(package_specs: list[str]) -> list[str]:
-    """Probe a rez context via the binary and log each resolved package.
+@dataclass(frozen=True)
+class _RezStep:
+    output: str
+    failure: str | None
 
-    Uses ``rez env <specs> -- python -c "..."`` to read ``REZ_USED_RESOLVE``
-    from inside the resolved environment.  Binary-only — does not import the
-    rez Python API so it works regardless of whether rez is installed as a
-    Python package.
 
-    Args:
-        package_specs: Rez package request strings.
-
-    Returns:
-        List of resolved ``"name-version"`` strings, or empty list on failure.
-    """
-    _log_rez_env_context()
-    logger.info("[Rez][execution] resolving context for specs: %s", package_specs)
-    rez_bin = _rez_executable("rez")
-    probe_cmd = [
-        rez_bin,
-        "env",
-        *package_specs,
-        "--",
-        "python",
-        "-c",
-        "import os; [print(p) for p in os.environ.get('REZ_USED_RESOLVE', '').split()]",
-    ]
-    logger.debug("[Rez][execution] probe cmd: %s", " ".join(probe_cmd))
+def _run_rez_step(cmd: list[str], env: dict[str, str]) -> _RezStep:
+    """Run one rez command; its stdout, or an artist-readable reason it failed."""
     try:
-        result = subprocess.run(  # noqa: S603
-            probe_cmd,
-            capture_output=True,
-            text=True,
-            env=rez_subprocess_env(),
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            logger.warning("[Rez][execution] rez probe failed (rc=%d): %s", result.returncode, result.stderr.strip())
-            return []
-        resolved = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        for pkg in resolved:
-            logger.info("[Rez][execution]   resolved: %s", pkg)
-        logger.info("[Rez][execution] total resolved packages: %d", len(resolved))
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=120)  # noqa: S603
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("[Rez][execution] rez probe error: %s", exc)
-        return []
-    else:
-        return resolved
+        return _RezStep(output="", failure=f"rez could not be run: {exc}")
+    if result.returncode != 0:
+        return _RezStep(output="", failure=_resolve_failure_summary(result.stderr or result.stdout))
+    return _RezStep(output=result.stdout, failure=None)
+
+
+def _parse_interpreted_environment(output: str) -> dict[str, str] | None:
+    """The environ dict ``rez context --interpret --format json`` printed, or None if unreadable."""
+    try:
+        environment = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(environment, dict):
+        return None
+    return {str(key): str(value) for key, value in environment.items()}
+
+
+def layer_rez_environment(environ: dict[str, str], rez_environ: dict[str, str]) -> dict[str, str]:
+    """Apply a library's rez environment over *environ*, keeping *environ*'s PYTHONPATH behind it.
+
+    Two rez resolves, layered: the library's context first, then the running engine's own
+    PYTHONPATH (the engine and its dependencies from griptape_launch). The engine and a
+    library cannot share one resolve (their pins can conflict, huggingface_hub for one), so
+    this is the layering a venv worker gets with .venv-exec ahead of the engine: the
+    library's packages win, and the worker still runs this orchestrator's engine.
+    """
+    layered = {**environ, **rez_environ}
+    layered["PYTHONPATH"] = os.pathsep.join(
+        path for path in (rez_environ.get("PYTHONPATH"), environ.get("PYTHONPATH")) if path
+    )
+    return layered
 
 
 def resolve_rez_pythonpath(package_specs: list[str]) -> list[str]:
     """Resolve a rez environment and return the PYTHONPATH entries it provides.
 
-    Runs ``rez env <specs> -- python -c "..."`` to read the ``PYTHONPATH``
-    from inside the resolved environment. Used by the orchestrator to add
-    rez-provided dependency paths to ``sys.path`` for in-process library loading.
+    Read from rez's own account of the environment (see ``rez_context_environment``).
+    Used by the orchestrator to add rez-provided dependency paths to ``sys.path`` for
+    in-process library loading.
 
     Returns a list of directory paths, or empty list on failure.
     """
-    rez_bin = _rez_executable("rez")
-    probe_cmd = [
-        rez_bin,
-        "env",
-        *package_specs,
-        "--",
-        "python",
-        "-c",
-        "import os; [print(p) for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p]",
-    ]
-    logger.debug("[Rez] resolving PYTHONPATH for specs: %s", package_specs)
-    try:
-        result = subprocess.run(  # noqa: S603
-            probe_cmd,
-            capture_output=True,
-            text=True,
-            env=rez_subprocess_env(),
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            logger.warning("[Rez] PYTHONPATH resolve failed (rc=%d): %s", result.returncode, result.stderr.strip())
-            return []
-        paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        for p in paths:
-            logger.debug("[Rez]   PYTHONPATH entry: %s", p)
-        logger.info("[Rez] resolved %d PYTHONPATH entries for %s", len(paths), package_specs)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("[Rez] PYTHONPATH resolve error: %s", exc)
+    context = rez_context_environment(package_specs)
+    if context.environment is None:
+        logger.warning("[Rez] PYTHONPATH resolve failed for %s: %s", package_specs, context.failure)
         return []
-    else:
-        return paths
+    paths = [p for p in context.environment.get("PYTHONPATH", "").split(os.pathsep) if p]
+    for p in paths:
+        logger.debug("[Rez]   PYTHONPATH entry: %s", p)
+    logger.info("[Rez] resolved %d PYTHONPATH entries for %s", len(paths), package_specs)
+    return paths
 
 
 def _library_rez_name(library_name: str) -> str:
@@ -1195,15 +1216,19 @@ _LIBRARY_COPY_EXCLUDES = shutil.ignore_patterns(*REZ_PACKAGE_COPY_EXCLUDE_PATTER
 
 
 def library_platform_requires(
-    pip_dependencies: list[str], resolved_versions: dict[str, str]
+    pip_dependencies: list[str], resolved_versions: dict[str, str], *, store: Path | None = None
 ) -> dict[str, list[str]] | None:
     """A library package's requires per platform, or None when no dependency depends on the platform.
 
     Dependencies are pinned to the versions this build resolved. One marked for other
     platforms only (``bitsandbytes; sys_platform == 'win32'`` built on macOS) was not
     resolved here, so its manifest range is used until that platform builds the library.
+    With *store*, what requested extras add is included too (see ``pinned_direct_requires``).
     """
-    parsed = [requirement for spec in pip_dependencies if (requirement := parse_requirement(spec)) is not None]
+    if store is None:
+        parsed = [requirement for spec in pip_dependencies if (requirement := parse_requirement(spec)) is not None]
+    else:
+        parsed = _requirements_with_extras(pip_dependencies, store, resolved_versions)
     if not any(requirement.depends_on_platform for requirement in parsed):
         return None
 
@@ -1222,7 +1247,7 @@ def library_platform_requires(
     for key, environment in platform_environments().items():
         extras: list[str] = []
         for requirement in platform_specific:
-            if not marker_applies(requirement.marker, environment):
+            if not requirement.applies(environment):
                 continue
             pinned = _pinned_library_request(requirement, resolved_versions) if key == this_key else None
             extras.append(pinned or rez_range(requirement))
@@ -1456,7 +1481,6 @@ def install_library_as_rez_package(  # noqa: C901, PLR0912, PLR0913
             len(pip_dependencies_exec or []),
         )
 
-        direct_names = {pip_spec_name(spec) for spec in all_pip_dependencies}
         for backend, flags in passes:
             try:
                 resolved = resolve_full(
@@ -1472,16 +1496,6 @@ def install_library_as_rez_package(  # noqa: C901, PLR0912, PLR0913
                 result.skipped_torch_backends.append(backend)
                 continue
 
-            if not resolved_requires:
-                # The library's pins are the same for every torch build (plain versions).
-                resolved_requires = [
-                    f"{rez_name(pkg.pip_name)}-{pkg.version}"
-                    for pkg in resolved
-                    if pip_spec_name(pkg.pip_name) in direct_names
-                ]
-                resolved_versions = {pip_normalize(pkg.pip_name): pkg.version for pkg in resolved}
-                platform_requires = library_platform_requires(all_pip_dependencies, resolved_versions)
-
             report = rez_uv_install(
                 all_pip_dependencies,
                 packages_dir=store,
@@ -1491,6 +1505,13 @@ def install_library_as_rez_package(  # noqa: C901, PLR0912, PLR0913
                 skip_installed=skip_installed,
             )
             result.report.merge(report)
+
+            if not resolved_requires:
+                # The library's pins are the same for every torch build (plain versions).
+                # Worked out after installing: extras are read from the installed metadata.
+                resolved_requires = pinned_direct_requires(all_pip_dependencies, resolved, store)
+                resolved_versions = {pip_normalize(pkg.pip_name): pkg.version for pkg in resolved}
+                platform_requires = library_platform_requires(all_pip_dependencies, resolved_versions, store=store)
             if backend is not None:
                 result.built_torch_backends.append(backend)
 
@@ -1732,10 +1753,10 @@ def _resolve_failure_summary(output: str) -> str:
 def library_environment_failure(library_file_path: Path) -> str | None:
     """Why a library's worker environment cannot resolve on this workstation, or None if it can.
 
-    Resolves ``rez env <family>`` with this workstation's torch build, the same request its
-    worker makes. The reason is written for artists.
+    Resolves the library's package (see ``library_rez_request``) with this workstation's
+    torch build, the same request its worker makes. The reason is written for artists.
     """
-    family = library_file_path_to_rez_family(library_file_path)
+    family = library_rez_request(library_file_path)
     requests = torch_backend_requests()
     failure = rez_resolve_failure([family, *requests])
     if failure is None:

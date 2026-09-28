@@ -459,7 +459,7 @@ def _write_engine_package(
     _copy_engine_source(src_dir, python_dest)
     _copy_dist_info(python_dest, version)
 
-    requires = build_direct_requires(dependencies)
+    requires = build_direct_requires(dependencies, store=store)
 
     timestamp = datetime.now(UTC).isoformat()
     req_entries = "".join(f"    '{r}',\n" for r in sorted(requires))

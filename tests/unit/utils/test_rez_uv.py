@@ -40,6 +40,8 @@ from griptape_nodes.utils.rez_uv import (
     _write_package_py,
     build_variant,
     current_platform_key,
+    dependencies_first,
+    expand_extras,
     flags_for_torch_backend,
     install,
     install_state,
@@ -52,6 +54,7 @@ from griptape_nodes.utils.rez_uv import (
     read_wheel_info,
     resolve_full,
     rez_name,
+    store_requires_dist_reader,
     torch_backend_from_local_version,
     torch_backend_request,
     wheel_requires,
@@ -475,6 +478,118 @@ class TestParseRequirement:
 
     def test_unparsable(self) -> None:
         assert parse_requirement("!!!") is None
+
+    def test_keeps_requested_extras(self) -> None:
+        parsed = parse_requirement("pydantic-ai-slim[openai, MCP]>=2.29.0")
+        assert parsed == ParsedRequirement("pydantic-ai-slim", ">=2.29.0", None, extras=("mcp", "openai"))
+
+
+PYDANTIC_AI_REQUIRES = [
+    "pydantic>=2.12",
+    'fastmcp-slim[client]>=4.0; extra == "mcp"',
+    'mcp>=1.18; extra == "mcp"',
+    'pywin32>=300; extra == "mcp" and sys_platform == "win32"',
+    'openai>=1.107; extra == "openai"',
+    'anthropic>=0.70; extra == "anthropic"',
+]
+FASTMCP_REQUIRES = ["httpx>=0.28", 'websockets>=15; extra == "client"']
+
+
+def _requires_dist_of(pip_name: str) -> list[str] | None:
+    return {"pydantic-ai-slim": PYDANTIC_AI_REQUIRES, "fastmcp-slim": FASTMCP_REQUIRES}.get(pip_name)
+
+
+class TestExpandExtras:
+    @staticmethod
+    def _names(requirements: list[ParsedRequirement]) -> list[str]:
+        return [requirement.pip_name for requirement in requirements]
+
+    def test_adds_what_each_requested_extra_brings(self) -> None:
+        requested = [parse_requirement("pydantic-ai-slim[mcp]>=2.29")]
+        expanded = expand_extras([r for r in requested if r is not None], _requires_dist_of)
+        # Not openai or anthropic (other extras), not pydantic (its own dependency), and
+        # fastmcp-slim's own "client" extra is followed.
+        assert self._names(expanded) == ["pydantic-ai-slim", "fastmcp-slim", "mcp", "pywin32", "websockets"]
+        assert [r.applies() for r in expanded[1:3]] == [True, True]
+
+    def test_platform_marker_inside_an_extra_is_per_platform(self) -> None:
+        requested = parse_requirement("pydantic-ai-slim[mcp]")
+        assert requested is not None
+        pywin32 = next(r for r in expand_extras([requested], _requires_dist_of) if r.pip_name == "pywin32")
+        assert pywin32.depends_on_platform
+        assert pywin32.applies({"sys_platform": "win32"})
+        assert not pywin32.applies({"sys_platform": "darwin"})
+
+    def test_asking_requirements_marker_limits_what_its_extra_adds(self) -> None:
+        requested = parse_requirement("pydantic-ai-slim[openai]; sys_platform == 'win32'")
+        assert requested is not None
+        openai = expand_extras([requested], _requires_dist_of)[1]
+        assert openai.pip_name == "openai"
+        assert openai.depends_on_platform
+        assert openai.applies({"sys_platform": "win32"})
+        assert not openai.applies({"sys_platform": "linux"})
+
+    def test_listed_requirement_wins(self) -> None:
+        requested = [parse_requirement("pydantic-ai-slim[openai]"), parse_requirement("openai==2.0.0")]
+        expanded = expand_extras([r for r in requested if r is not None], _requires_dist_of)
+        assert [(r.pip_name, r.specifier) for r in expanded] == [("pydantic-ai-slim", ""), ("openai", "==2.0.0")]
+
+    def test_extras_on_a_requirement_that_never_applies_are_not_followed(self, mock_logger: MagicMock) -> None:
+        # A package's own optional line: only installed if someone asks for its "testing" extra.
+        requested = parse_requirement('validate-pyproject[all]; extra == "testing"')
+        assert requested is not None
+        reader = MagicMock(return_value=None)
+        assert expand_extras([requested], reader) == [requested]
+        reader.assert_not_called()
+        mock_logger.warning.assert_not_called()
+
+    def test_unreadable_metadata_is_reported(self, mock_logger: MagicMock) -> None:
+        requested = parse_requirement("unknown-pkg[extra]")
+        assert requested is not None
+        assert expand_extras([requested], _requires_dist_of) == [requested]
+        mock_logger.warning.assert_called_once()
+
+    def test_wheel_requires_includes_extras(self) -> None:
+        requires = wheel_requires(["pydantic-ai-slim[mcp]>=2.29"], _requires_dist_of)
+        assert "fastmcp_slim-4.0+" in requires.common
+        assert "mcp-1.18+" in requires.common
+        assert [r.pip_name for r in requires.platform["windows-AMD64"]] == ["pywin32"]
+        assert requires.platform["osx-arm64"] == []
+
+    def test_without_a_reader_extras_are_ignored(self) -> None:
+        assert wheel_requires(["pydantic-ai-slim[mcp]>=2.29"]).common == ["pydantic_ai_slim-2.29+"]
+
+
+class TestStoreRequiresDistReader:
+    def test_reads_metadata_from_the_installed_variant(self, tmp_path: Path) -> None:
+        version_dir = tmp_path / "pydantic_ai_slim" / "2.51.0"
+        version_dir.mkdir(parents=True)
+        (version_dir / "package.py").write_text("variants = [['python-3.12']]\n", encoding="utf-8")
+        _write_fake_wheel(
+            version_dir / "python-3.12" / "python", "pydantic-ai-slim", "2.51.0", requires=("mcp; extra == 'mcp'",)
+        )
+
+        reader = store_requires_dist_reader(tmp_path, {"pydantic-ai-slim": "2.51.0"})
+
+        assert reader("pydantic_ai_slim") == ["mcp; extra == 'mcp'"]
+        assert reader("not-resolved") is None
+
+    def test_not_installed_returns_none(self, tmp_path: Path) -> None:
+        assert store_requires_dist_reader(tmp_path, {"six": "1.16.0"})("six") is None
+
+
+class TestDependenciesFirst:
+    def test_dependencies_come_before_their_dependents(self) -> None:
+        resolved = [
+            ResolvedPackage("agent-lib", "1.0", direct_deps={"pydantic-ai-slim"}),
+            ResolvedPackage("fastmcp-slim", "4.0.10"),
+            ResolvedPackage("pydantic-ai-slim", "2.51.0", direct_deps={"fastmcp-slim"}),
+        ]
+        assert [p.pip_name for p in dependencies_first(resolved)] == ["fastmcp-slim", "pydantic-ai-slim", "agent-lib"]
+
+    def test_cycle_keeps_every_package(self) -> None:
+        resolved = [ResolvedPackage("a", "1", direct_deps={"b"}), ResolvedPackage("b", "1", direct_deps={"a"})]
+        assert sorted(p.pip_name for p in dependencies_first(resolved)) == ["a", "b"]
 
 
 class TestMarkerEnvironment:
@@ -1060,6 +1175,32 @@ class TestInstallOne:
 
 
 class TestInstall:
+    @pytest.mark.usefixtures("mock_logger")
+    def test_package_requesting_extras_requires_what_they_add(self, tmp_path: Path, linux_platform: None) -> None:  # noqa: ARG002
+        # Compile output is alphabetical: agent-lib is met before the package whose metadata it needs.
+        compile_output = (
+            "agent-lib==1.0\n    # via -r -\n"
+            "fastmcp-slim==4.0.10\n    # via pydantic-ai-slim\n"
+            "pydantic-ai-slim==2.51.0\n    # via agent-lib\n"
+        )
+        wheels = {
+            "agent-lib": {"requires": ("pydantic-ai-slim[mcp]>=2.29",)},
+            "fastmcp-slim": {},
+            "pydantic-ai-slim": {"requires": ('fastmcp-slim>=4.0; extra == "mcp"',)},
+        }
+        fake = FakeUv(wheels, compile_output=compile_output)
+
+        with patch.object(rez_uv.subprocess, "run", side_effect=fake):
+            install("agent-lib", packages_dir=tmp_path, python_version="3.12", uv_cmd="uv")
+
+        installed_specs = [c[c.index("--target") + 2] for c in fake.calls if "install" in c]
+        assert installed_specs == ["fastmcp-slim==4.0.10", "pydantic-ai-slim==2.51.0", "agent-lib==1.0"]
+        agent_package = (tmp_path / "agent_lib" / "1.0" / "package.py").read_text(encoding="utf-8")
+        assert "'fastmcp_slim-4.0+'" in agent_package
+        # The extra is the requester's choice: pydantic-ai-slim's own package does not require it.
+        pydantic_package = (tmp_path / "pydantic_ai_slim" / "2.51.0" / "package.py").read_text(encoding="utf-8")
+        assert "fastmcp" not in pydantic_package
+
     def test_installs_skips_and_reports_failures(
         self,
         tmp_path: Path,

@@ -27,13 +27,17 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email.parser import HeaderParser
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from packaging.markers import InvalidMarker, Marker
 
 from griptape_nodes.utils.uv_utils import find_uv_bin
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +389,7 @@ PLATFORM_ENVIRONMENTS: dict[str, dict[str, str]] = {
 FALLBACK_PLATFORM_KEY = "*"
 
 _PLATFORM_MARKER = re.compile(r"\b(sys_platform|platform_system|os_name|platform_machine)\b")
+_EXTRA_MARKER = re.compile(r"\bextra\b")
 
 
 # ---------------------------------------------------------------------------
@@ -459,30 +464,142 @@ class ParsedRequirement:
     pip_name: str
     specifier: str
     marker: str | None
+    # Extras requested on the name, normalised: ``pydantic-ai-slim[mcp,openai]`` → ("mcp", "openai").
+    extras: tuple[str, ...] = ()
+    # Set on a dependency an extra brings in (see ``expand_extras``): the extra of the package
+    # that lists it, and the requirement that asked for that extra. Its marker is evaluated with
+    # that extra active, and only where the asking requirement applies too.
+    activated_extra: str | None = None
+    required_by: ParsedRequirement | None = None
 
     @property
     def depends_on_platform(self) -> bool:
-        return self.marker is not None and _PLATFORM_MARKER.search(self.marker) is not None
+        if self.marker is not None and _PLATFORM_MARKER.search(self.marker) is not None:
+            return True
+        return self.required_by is not None and self.required_by.depends_on_platform
+
+    def applies(self, environment: dict[str, str] | None = None) -> bool:
+        """Whether this requirement applies on this machine, or in *environment*."""
+        if self.required_by is not None and not self.required_by.applies(environment):
+            return False
+        if self.activated_extra is None:
+            return marker_applies(self.marker, environment)
+        return marker_applies(self.marker, {**(environment or {}), "extra": self.activated_extra})
 
 
 def parse_requirement(req_str: str) -> ParsedRequirement | None:
-    """Parse a requirement string without evaluating its marker. Extras are stripped."""
+    """Parse a requirement string without evaluating its marker."""
     req = req_str.strip()
     marker: str | None = None
     if ";" in req:
         spec_part, _, marker_str = req.partition(";")
         marker = marker_str.strip() or None
         req = spec_part.strip()
-    req = re.sub(r"\[.*?\]", "", req)  # strip extras
+    extras: tuple[str, ...] = ()
+    extras_match = re.search(r"\[(.*?)\]", req)
+    if extras_match is not None:
+        extras = tuple(sorted({pip_normalize(e.strip()) for e in extras_match.group(1).split(",") if e.strip()}))
+        req = req[: extras_match.start()] + req[extras_match.end() :]
     # "name (>=1.0,<2)" form
     m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*\(([^)]*)\)\s*$", req)
     if m:
-        return ParsedRequirement(pip_name=m.group(1).strip(), specifier=m.group(2).strip(), marker=marker)
+        return ParsedRequirement(
+            pip_name=m.group(1).strip(), specifier=m.group(2).strip(), marker=marker, extras=extras
+        )
     # "name>=1.0,<2" or bare "name" form
     m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)\s*$", req)
     if m:
-        return ParsedRequirement(pip_name=m.group(1).strip(), specifier=m.group(2).strip(), marker=marker)
+        return ParsedRequirement(
+            pip_name=m.group(1).strip(), specifier=m.group(2).strip(), marker=marker, extras=extras
+        )
     return None
+
+
+def expand_extras(
+    requirements: list[ParsedRequirement], requires_dist_of: Callable[[str], list[str] | None]
+) -> list[ParsedRequirement]:
+    """Add the dependencies each requested extra brings to *requirements*.
+
+    Rez has no extras. A package asking for ``pydantic-ai-slim[mcp]`` must itself require
+    what the ``mcp`` extra adds (``fastmcp-slim``, from pydantic-ai-slim's own
+    ``extra == "mcp"`` dependencies), or no rez resolve ever contains it. *requires_dist_of*
+    returns a dependency's Requires-Dist, or None when its metadata cannot be read. Extras of
+    those dependencies are followed too. A requirement already listed wins over one an extra
+    adds.
+    """
+    result = list(requirements)
+    listed = {pip_normalize(requirement.pip_name) for requirement in requirements}
+    followed: set[tuple[str, str]] = set()
+    # Only requirements that apply somewhere: `validate-pyproject[all]; extra == "testing"` in a
+    # package's own metadata is never installed unless someone asks for that package's extra.
+    pending = [
+        requirement
+        for requirement in requirements
+        if requirement.extras and any(requirement.applies(env) for env in platform_environments().values())
+    ]
+    while pending:
+        requirement = pending.pop(0)
+        for extra in requirement.extras:
+            key = (pip_normalize(requirement.pip_name), extra)
+            if key in followed:
+                continue
+            followed.add(key)
+            requires_dist = requires_dist_of(requirement.pip_name)
+            if requires_dist is None:
+                logger.warning(
+                    "[Rez][uv] could not read %s's metadata -- what its '%s' extra adds is not required",
+                    requirement.pip_name,
+                    extra,
+                )
+                continue
+            for spec in requires_dist:
+                dependency = parse_requirement(spec)
+                if dependency is None or dependency.marker is None or not _EXTRA_MARKER.search(dependency.marker):
+                    continue  # the package's own dependencies, which its rez package requires itself
+                dependency = replace(dependency, activated_extra=extra, required_by=requirement)
+                if not any(dependency.applies(environment) for environment in platform_environments().values()):
+                    continue  # belongs to another extra
+                if dependency.extras:
+                    pending.append(dependency)
+                name = pip_normalize(dependency.pip_name)
+                if name in listed:
+                    continue
+                listed.add(name)
+                result.append(dependency)
+    return result
+
+
+def store_requires_dist_reader(
+    packages_dir: Path, resolved_versions: dict[str, str]
+) -> Callable[[str], list[str] | None]:
+    """Read a resolved package's Requires-Dist from its ``.dist-info`` in the store.
+
+    For ``expand_extras``: the package must already be installed, as ``install`` ensures by
+    writing dependencies before the packages that require them.
+    """
+
+    def requires_dist_of(pip_name: str) -> list[str] | None:
+        version = resolved_versions.get(pip_normalize(pip_name))
+        if version is None:
+            return None
+        version_dir = packages_dir / rez_name(pip_name) / version
+        variants = read_package_file(version_dir / "package.py").variants or [[]]
+        for variant in variants:
+            python_dir = version_dir / _variant_subpath(variant) / "python"
+            if not python_dir.is_dir():
+                continue
+            for dist_info in python_dir.glob("*.dist-info"):
+                dist_name = dist_info.name.removesuffix(".dist-info").rsplit("-", 1)[0]
+                if pip_normalize(dist_name) != pip_normalize(pip_name):
+                    continue
+                meta_file = dist_info / "METADATA"
+                if not meta_file.is_file():
+                    continue
+                meta_text = meta_file.read_text(encoding="utf-8", errors="replace")
+                return HeaderParser().parsestr(meta_text).get_all("Requires-Dist") or []
+        return None
+
+    return requires_dist_of
 
 
 def marker_applies(marker_str: str | None, environment: dict[str, str] | None = None) -> bool:
@@ -510,7 +627,7 @@ def _parse_requires_dist(req_str: str) -> tuple[str, str] | None:
     Extras in the package name (e.g. ``requests[security]``) are stripped.
     """
     parsed = parse_requirement(req_str)
-    if parsed is None or not marker_applies(parsed.marker):
+    if parsed is None or not parsed.applies():
         return None
     return parsed.pip_name, parsed.specifier
 
@@ -607,27 +724,32 @@ class WheelRequires:
     platform: dict[str, list[ParsedRequirement]]
 
 
-def wheel_requires(requires_dist: list[str]) -> WheelRequires:
+def wheel_requires(
+    requires_dist: list[str], requires_dist_of: Callable[[str], list[str] | None] | None = None
+) -> WheelRequires:
     """Split a wheel's Requires-Dist into dependencies for every platform and per-platform ones.
 
     Markers on anything but the platform (Python version, extras) are evaluated for this
     machine. Platform markers are evaluated for every platform in ``PLATFORM_ENVIRONMENTS``.
+    With *requires_dist_of*, a dependency requested with extras also brings what those extras
+    add (see ``expand_extras``).
     """
+    parsed_requirements = [parsed for req_str in requires_dist if (parsed := parse_requirement(req_str)) is not None]
+    if requires_dist_of is not None:
+        parsed_requirements = expand_extras(parsed_requirements, requires_dist_of)
+
     common: list[str] = []
     platform_specific: list[ParsedRequirement] = []
-    for req_str in requires_dist:
-        parsed = parse_requirement(req_str)
-        if parsed is None:
-            continue
+    for parsed in parsed_requirements:
         if parsed.depends_on_platform:
             platform_specific.append(parsed)
-        elif marker_applies(parsed.marker):
+        elif parsed.applies():
             common.append(rez_range(parsed))
 
     per_platform: dict[str, list[ParsedRequirement]] = {}
     if platform_specific:
         for key, environment in platform_environments().items():
-            per_platform[key] = [r for r in platform_specific if marker_applies(r.marker, environment)]
+            per_platform[key] = [r for r in platform_specific if r.applies(environment)]
     return WheelRequires(common=sorted(common), platform=per_platform)
 
 
@@ -964,7 +1086,9 @@ def write_rez_package(  # noqa: PLR0913
     info.version = clean_version
     version_dir = packages_dir / family_name / clean_version
 
-    requires_info = wheel_requires(info.requires_dist)
+    requires_info = wheel_requires(
+        info.requires_dist, store_requires_dist_reader(packages_dir, resolved_versions or {})
+    )
     this_key = current_platform_key()
     existing = read_package_file(version_dir / "package.py")
     if info.is_pure_python:
@@ -1109,6 +1233,29 @@ def _pure_platform_requires(
 # ---------------------------------------------------------------------------
 
 
+def dependencies_first(resolved: list[ResolvedPackage]) -> list[ResolvedPackage]:
+    """Order *resolved* so each package comes after the packages it depends on.
+
+    Uses uv's dependency graph; a dependency cycle keeps the order it was met in.
+    """
+    by_name = {pip_normalize(pkg.pip_name): pkg for pkg in resolved}
+    ordered: list[ResolvedPackage] = []
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited or name not in by_name:
+            return
+        visited.add(name)
+        pkg = by_name[name]
+        for dependency in sorted(pkg.direct_deps):
+            visit(dependency)
+        ordered.append(pkg)
+
+    for pkg in resolved:
+        visit(pip_normalize(pkg.pip_name))
+    return ordered
+
+
 @dataclass
 class InstallReport:
     """What an install added to the package store."""
@@ -1194,7 +1341,9 @@ def install(  # noqa: PLR0913
     report = InstallReport()
     failed: list[str] = []
 
-    for pkg in resolved:
+    # Dependencies first: a package requesting another's extras reads that package's metadata
+    # from the store when its own package.py is written (see ``expand_extras``).
+    for pkg in dependencies_first(resolved):
         label = f"{pkg.pip_name}=={pkg.version}"
         state = install_state(
             pkg.pip_name, pkg.version, packages_dir, python_version=python_version, backend=pkg.torch_backend
