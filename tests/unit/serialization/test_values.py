@@ -20,6 +20,7 @@ from griptape.artifacts import ImageUrlArtifact, TextArtifact
 from griptape.rules import Rule, Ruleset
 from pydantic import BaseModel
 
+import griptape_nodes
 from griptape_nodes.serialization import values as values_module
 from griptape_nodes.serialization.type_names import forget_stable_module_name, register_stable_module_name
 from griptape_nodes.serialization.values import (
@@ -334,7 +335,7 @@ class TestUndecodedValues:
     @pytest.mark.parametrize(
         ("data", "reason"),
         [
-            ({TYPE_KEY: "no_such_module_xyz:Thing", "a": 1}, "failed to import"),
+            ({TYPE_KEY: "no_such_module_xyz:Thing", "a": 1}, "has not loaded"),
             ({TYPE_KEY: "builtins:NoSuchThing"}, "has no"),
             ({TYPE_KEY: "os:getcwd"}, "does not name a class"),
             ({TYPE_KEY: "builtins:object"}, "no plain-data form"),
@@ -366,6 +367,43 @@ class TestUndecodedValues:
 
         assert decode_value(live) is live
         assert decode_value([live])[0] is live
+
+
+class TestImportRestriction:
+    """Decoding only imports a $type's module if it is under griptape or griptape_nodes."""
+
+    def test_module_outside_allowed_packages_is_not_imported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = tmp_path / "marker.txt"
+        module_path = tmp_path / "untrusted_module.py"
+        module_path.write_text(f"open({marker!r}, 'w').write('ran')\nclass Thing:\n    pass\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        sys.modules.pop("untrusted_module", None)
+
+        decoded = decode_value({TYPE_KEY: "untrusted_module:Thing"})
+
+        assert type(decoded) is UndecodedValue
+        assert "untrusted_module" not in sys.modules
+        assert not marker.exists()
+
+    def test_unloaded_griptape_nodes_module_still_imports(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module_name = "griptape_nodes._test_import_probe"
+        module_path = tmp_path / "_test_import_probe.py"
+        module_path.write_text("import dataclasses\n\n\n@dataclasses.dataclass\nclass Thing:\n    x: int = 0\n")
+        monkeypatch.setattr(griptape_nodes, "__path__", [*griptape_nodes.__path__, str(tmp_path)])
+        sys.modules.pop(module_name, None)
+
+        try:
+            decoded = decode_value({TYPE_KEY: f"{module_name}:Thing", "x": 5})
+
+            assert type(decoded).__name__ == "Thing"
+            assert decoded.x == 5  # noqa: PLR2004 arbitrary probe value, not a meaningful constant
+            assert module_name in sys.modules
+        finally:
+            sys.modules.pop(module_name, None)
 
 
 class TestLibraryModules:

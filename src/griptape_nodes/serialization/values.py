@@ -11,10 +11,12 @@ A class's state comes from the first adapter that claims it. A class can supply 
 defining ``to_state()`` and a ``from_state(state)`` classmethod; other types can be covered with
 ``register_value_adapter``.
 
-Decoding imports the module a ``$type`` names, and builds only classes an adapter claims. A value
-this process cannot build, such as one whose class lives in a library another process loads,
-decodes to an ``UndecodedValue`` that encodes back to exactly the data it came from, so it passes
-through to a process that can build it.
+Decoding imports a ``$type``'s module only if it is already loaded, or its top-level package is
+``griptape`` or ``griptape_nodes`` (this covers node library files, loaded lazily under
+``griptape_nodes.node_libraries.*``). It builds only classes an adapter claims. A value this
+process cannot build or is not allowed to import, such as one whose class lives in a library
+another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
+came from, so it passes through to a process that can build it.
 """
 
 from __future__ import annotations

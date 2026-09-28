@@ -16,11 +16,23 @@ import sys
 
 DYNAMIC_MODULE_PREFIX = "gtn_dynamic_module_"
 
+# Top-level packages decoding may import to resolve a $type. Anything else could be untrusted
+# data (PNG metadata, clipboard) naming an arbitrary module to run its top-level code.
+IMPORTABLE_TOP_LEVEL_PACKAGES = frozenset({"griptape", "griptape_nodes"})
+
 _stable_module_names: dict[str, str] = {}
 
 
 class TypeNameError(Exception):
     """A class cannot be named, or a name cannot be resolved to a class."""
+
+
+class ModuleUnavailableError(TypeNameError):
+    """A name's module is not loaded and this process may not, or cannot, load it.
+
+    Expected wherever a library's classes live in another process, so callers that only need to
+    know a value could not be rebuilt should stay quiet rather than warn.
+    """
 
 
 def register_stable_module_name(dynamic_module_name: str, stable_module_name: str) -> None:
@@ -36,6 +48,16 @@ def forget_stable_module_name(dynamic_module_name: str) -> None:
 def is_dynamic_module_name(module_name: str) -> bool:
     """True for the per-process module names node library files load under."""
     return module_name.startswith(DYNAMIC_MODULE_PREFIX)
+
+
+def may_import_for_decoding(module_name: str) -> bool:
+    """True if decoding may import ``module_name`` to resolve a ``$type``.
+
+    A module already in ``sys.modules`` is always safe to read from; this only gates importing
+    one that is not loaded yet, which would run its top-level code.
+    """
+    top_level_package, _, _ = module_name.partition(".")
+    return top_level_package in IMPORTABLE_TOP_LEVEL_PACKAGES
 
 
 def stable_module_name(module_name: str) -> str | None:
@@ -59,15 +81,28 @@ def type_name(cls: type) -> str:
 
 
 def resolve_type_name(name: str) -> type:
-    """Import the class ``name`` refers to."""
+    """Import the class ``name`` refers to.
+
+    Raises:
+        ModuleUnavailableError: the module is not loaded and this process may not, or cannot,
+            load it. Expected wherever a library's classes live in another process.
+        TypeNameError: ``name`` is malformed, its module failed to import for another reason,
+            or it does not resolve to a class.
+    """
     module_name, separator, qualname = name.partition(":")
     if not separator or not module_name or not qualname:
         msg = f"'{name}' is not a type name."
         raise TypeNameError(msg)
     module = sys.modules.get(module_name)
     if module is None:
+        if not may_import_for_decoding(module_name):
+            msg = f"'{qualname}' needs module '{module_name}', which this process has not loaded."
+            raise ModuleUnavailableError(msg)
         try:
             module = importlib.import_module(module_name)
+        except ModuleNotFoundError as error:
+            msg = f"'{qualname}' needs module '{module_name}', which does not exist here: {error}"
+            raise ModuleUnavailableError(msg) from error
         except Exception as error:
             msg = f"'{qualname}' needs module '{module_name}', which failed to import: {error}"
             raise TypeNameError(msg) from error
