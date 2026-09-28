@@ -11,6 +11,23 @@ from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import Bas
 _COMPRESS_TEXT_LONGER_THAN = 1024
 
 
+def _should_compress_text(text: str) -> bool:
+    """Decide whether a text chunk can be compressed and still be read back.
+
+    Pillow rejects a zTXt/iTXt chunk whose decompressed size exceeds
+    PngImagePlugin.MAX_TEXT_CHUNK, raising ValueError from Image.open. Mirror the
+    encoding add_text falls back to (latin-1, then utf-8) to check the size Pillow
+    will actually decompress.
+    """
+    if len(text) <= _COMPRESS_TEXT_LONGER_THAN:
+        return False
+    try:
+        encoded_length = len(text.encode("latin-1"))
+    except UnicodeEncodeError:
+        encoded_length = len(text.encode("utf-8"))
+    return encoded_length <= PngImagePlugin.MAX_TEXT_CHUNK
+
+
 class PngMetadataDriver(BaseImageMetadataDriver):
     """Bidirectional driver for PNG metadata using text chunks.
 
@@ -51,12 +68,12 @@ class PngMetadataDriver(BaseImageMetadataDriver):
             # Only preserve string key-value pairs (text chunks), skip binary data
             # Don't preserve keys that will be overwritten by new metadata
             if isinstance(key, str) and isinstance(value, str) and key not in metadata:
-                png_info.add_text(key, value, zip=len(value) > _COMPRESS_TEXT_LONGER_THAN)
+                png_info.add_text(key, value, zip=_should_compress_text(value))
 
         # Add new metadata
         for key, value in metadata.items():
             text = str(value)
-            png_info.add_text(key, text, zip=len(text) > _COMPRESS_TEXT_LONGER_THAN)
+            png_info.add_text(key, text, zip=_should_compress_text(text))
 
         # Save with metadata
         output_buffer = BytesIO()
