@@ -4925,7 +4925,7 @@ class ProjectManager(EngineScoped):
                 raise NotImplementedError(msg)
 
             case "workspace_dir":
-                return str(self._config_manager.workspace_path)
+                return self._resolve_builtin_workspace_dir()
 
             case "workflow_name":
                 context_manager = self.engine.context_manager
@@ -4969,10 +4969,19 @@ class ProjectManager(EngineScoped):
             working_directory=context_manager.get_current_workflow_working_directory(),
         )
 
+    def _resolve_builtin_workspace_dir(self) -> str:
+        """Resolve the `workspace_dir` builtin: the root every relative project path anchors to.
+
+        Also the last rung of `_resolve_workflow_dir`, which is why it is a method rather than
+        an inline expression -- the two must answer identically or a never-saved workflow's
+        files land somewhere `{workspace_dir}` does not describe.
+        """
+        return str(self._config_manager.workspace_path)
+
     def _resolve_workflow_dir(self) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
 
-        Three sources, in descending order of authority:
+        Four sources, in descending order of authority:
 
         1. The file path retained on the context. The registry key is derived against the
            workspace that was active at push time, so a project switch -- which re-registers
@@ -4982,13 +4991,19 @@ class ProjectManager(EngineScoped):
            to a workspace-relative path, so saved media resolves somewhere it was never written.
         2. The registry entry for the context's name.
         3. The folder the workflow was created in, for a workflow that has never been saved and
-           so has no file to answer from. Last because a saved workflow's own location always
-           beats the folder it was created in -- the two differ as soon as the user saves
-           somewhere else.
+           so has no file to answer from. Below the two above because a saved workflow's own
+           location always beats the folder it was created in -- the two differ as soon as the
+           user saves somewhere else.
+        4. The folder the workflow WOULD be saved into, for a never-saved workflow whose creator
+           named no folder. A prediction rather than a fact: it reads the workspace root, which
+           is where the `save_workflow` situation puts a workflow with no sub-directories. A
+           template that anchors that situation somewhere else makes this rung wrong rather than
+           absent, which is the trade for never handing out an unresolvable `workflow_dir` to a
+           workflow that demonstrably exists.
 
         Raises:
-            RuntimeError: If no workflow is in context, or the workflow has neither a file nor
-                a folder to answer with.
+            RuntimeError: If no workflow is in context, or the context's workflow is not
+                registered on this engine.
         """
         context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
@@ -5018,8 +5033,10 @@ class ProjectManager(EngineScoped):
         if workflow.file_path is None:
             if working_directory is not None:
                 return working_directory
-            msg = f"Workflow '{workflow_name}' has not been saved yet"
-            raise RuntimeError(msg)
+            # Where this workflow would be saved, which is also where dropping an optional
+            # `{workflow_dir}` already sent its files -- so answering keeps every path exactly
+            # where it was while removing the only degradation a normal unsaved workflow hits.
+            return self._resolve_builtin_workspace_dir()
 
         workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
         return str(workflow_file_path.parent)
