@@ -1,12 +1,44 @@
-"""Unit tests for LocalSessionWorkflowExecutor's CLI surface (issue #4599)."""
+"""Unit tests for LocalSessionWorkflowExecutor's CLI surface (issue #4599) and its event sends."""
 
+import dataclasses
+import json
 from argparse import ArgumentParser
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 
 from griptape_nodes.bootstrap.workflow_executors.local_session_workflow_executor import (
     LocalSessionWorkflowExecutor,
 )
 from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.retained_mode.events.base_events import (
+    EventRequest,
+    EventResultSuccess,
+    ExecutionEvent,
+    ExecutionPayload,
+    RequestPayload,
+    ResultPayloadSuccess,
+)
+from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest
+
+
+class _NoJsonForm:
+    """A value neither the converter nor JSON knows how to write."""
+
+
+@dataclasses.dataclass
+class _UnsendableRequest(RequestPayload):
+    anything: Any = None
+
+
+@dataclasses.dataclass
+class _UnsendableExecutionPayload(ExecutionPayload):
+    anything: Any = None
+
+
+@dataclasses.dataclass
+class _UnsendableResultSuccess(ResultPayloadSuccess):
+    anything: Any = None
 
 
 class TestLocalSessionWorkflowExecutorCli:
@@ -78,3 +110,76 @@ class TestLocalSessionWorkflowExecutorCli:
         kwargs = LocalSessionWorkflowExecutor._cli_constructor_kwargs(args)
 
         assert kwargs["storage_backend"] == StorageBackend.GTC
+
+
+class TestSendEvent:
+    """Tests for LocalSessionWorkflowExecutor._send_event."""
+
+    def test_sends_a_serializable_execution_event(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything="a plain string"))
+
+        executor._send_event("execution_event", event)
+
+        executor.send_event.assert_called_once()
+        sent_type, sent_payload = executor.send_event.call_args.args
+        assert sent_type == "execution_event"
+        assert json.loads(sent_payload)["payload"]["anything"] == "a plain string"
+
+    def test_skips_an_unsendable_execution_event_without_raising(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything=_NoJsonForm()))
+
+        executor._send_event("execution_event", event)
+
+        executor.send_event.assert_not_called()
+
+    def test_skips_an_unsendable_event_request_without_raising(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        event = EventRequest(request=_UnsendableRequest(anything=_NoJsonForm()))
+
+        executor._send_event("event_request", event)
+
+        executor.send_event.assert_not_called()
+
+
+class TestSendResult:
+    """Tests for LocalSessionWorkflowExecutor._send_result."""
+
+    def test_sends_a_serializable_result(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        request = StartFlowRequest(flow_name="wf")
+        event = EventResultSuccess(request=request, result=_UnsendableResultSuccess(result_details="ok"))
+
+        executor._send_result("success_result", event)
+
+        executor.send_event.assert_called_once()
+        sent_type, _ = executor.send_event.call_args.args
+        assert sent_type == "success_result"
+
+    def test_answers_an_unsendable_result_with_a_generic_result_failure(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        request = StartFlowRequest(flow_name="wf", request_id="req-1")
+        event = EventResultSuccess(
+            request=request,
+            result=_UnsendableResultSuccess(result_details="ok", anything=_NoJsonForm()),
+            request_id="req-1",
+            response_topic="sessions/abc/response",
+        )
+
+        executor._send_result("success_result", event)
+
+        executor.send_event.assert_called_once()
+        sent_type, sent_payload = executor.send_event.call_args.args
+        assert sent_type == "failure_result"
+        data = json.loads(sent_payload)
+        assert data["result_type"] == "GenericResultFailure"
+        assert data["request_id"] == "req-1"
+        assert data["response_topic"] == "sessions/abc/response"
+        assert data["request_type"] == "StartFlowRequest"
+        assert "_UnsendableResultSuccess" in data["result"]["result_details"]["result_details"][0]["message"]
