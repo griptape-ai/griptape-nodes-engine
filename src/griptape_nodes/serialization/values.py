@@ -40,7 +40,12 @@ import attrs
 from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
-from griptape_nodes.serialization.type_names import TypeNameError, resolve_type_name, type_name
+from griptape_nodes.serialization.type_names import (
+    ModuleUnavailableError,
+    TypeNameError,
+    resolve_type_name,
+    type_name,
+)
 
 TYPE_KEY = "$type"
 VALUE_KEY = "$value"
@@ -211,9 +216,11 @@ def _decode_tagged(data: dict[str, Any]) -> Any:
         return UndecodedValue(data, f"its type name is {name!r}, not text")
     try:
         cls = resolve_type_name(name)
-    except TypeNameError as error:
+    except ModuleUnavailableError as error:
         # Expected wherever a library's classes live in another process, so no warning.
         return UndecodedValue(data, str(error))
+    except TypeNameError as error:
+        return _undecodable(data, str(error))
     if VALUE_KEY not in data:
         state = decode_value({key: item for key, item in data.items() if key != TYPE_KEY})
     elif cls is dict and isinstance(data[VALUE_KEY], dict):
@@ -227,6 +234,10 @@ def _decode_tagged(data: dict[str, Any]) -> Any:
     adapter = _adapter_for(cls)
     if adapter is None:
         return UndecodedValue(data, f"'{name}' has no plain-data form in this process")
+    return _decode_with_adapter(adapter, cls, state, data)
+
+
+def _decode_with_adapter(adapter: ValueAdapter, cls: type, state: Any, data: dict[str, Any]) -> Any:
     try:
         return adapter.from_state(cls, state)
     except Exception as error:

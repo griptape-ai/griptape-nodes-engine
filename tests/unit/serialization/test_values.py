@@ -7,6 +7,7 @@ import datetime
 import decimal
 import enum
 import json
+import logging
 import math
 import sys
 import types
@@ -351,6 +352,23 @@ class TestUndecodedValues:
         assert type(decoded) is UndecodedValue
         assert decoded == data
         assert reason in decoded.reason
+
+    def test_module_unavailable_in_this_process_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Expected wherever a library's classes live in another process."""
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            decoded = decode_value({TYPE_KEY: "no_such_module_xyz:Thing"})
+
+        assert type(decoded) is UndecodedValue
+        assert caplog.records == []
+
+    def test_loaded_module_missing_the_name_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A renamed or removed class is unexpected, unlike a class this process never loaded."""
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            decoded = decode_value({TYPE_KEY: "builtins:NoSuchThing"})
+
+        assert type(decoded) is UndecodedValue
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelno == logging.WARNING
 
     def test_kept_value_encodes_back_to_the_same_data(self) -> None:
         data = {TYPE_KEY: "other_process_library:Artifact", "value": "https://example.com/a.png", "meta": {}}
