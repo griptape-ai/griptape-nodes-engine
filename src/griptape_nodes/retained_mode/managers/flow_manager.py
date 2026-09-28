@@ -4733,14 +4733,8 @@ class FlowManager(EngineScoped):
     def _announce_failed_run(self, failure_details: str | None) -> None:
         """Tell the editor a run that has already stopped on an error is over, and why.
 
-        The editor listens for the cancellation event, so a run that ends without
-        one leaves the canvas showing a run still in progress, and only the caller
-        ever learns it failed.
-
-        Deliberately not a cancel. The run is no longer live, and cancelling
-        resets the machine, which clears every node it was holding -- including
-        the upstream nodes that finished, and whose results the artist may have
-        paid for.
+        Sends the cancellation event without cancelling, because cancelling
+        resets the machine and clears the results of nodes that already finished.
         """
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
@@ -4754,16 +4748,9 @@ class FlowManager(EngineScoped):
     async def cancel_flow_run(self, failure_details: str | None = None) -> None:
         """Stop the running flow and tell the editor the run is over.
 
-        Serves both the artist pressing Cancel and the engine giving up on a run
-        that has already failed, so the reason is a parameter rather than
-        something read off the machine here: a clean cancel carries no failure,
-        and labelling one as an error would report a problem the artist caused
-        on purpose.
-
         Args:
-            failure_details: Why the run is ending, when it is ending badly.
-                Rides on the cancellation event so a listener can say what
-                happened instead of only that the run stopped.
+            failure_details: Why the run is ending, when it failed. None for an
+                artist's Cancel. Sent on the cancellation event.
         """
         if not self.check_for_existing_running_flow():
             errormsg = "Flow has not yet been started. Cannot cancel flow that hasn't begun."
@@ -4803,9 +4790,7 @@ class FlowManager(EngineScoped):
         permanently, so the reset happens either way -- and the cancellation's own error is logged
         rather than raised, because the error worth reporting is the one that ended the run.
 
-        The reason is read first because every way out of here resets the machine that holds it, and
-        a cancellation event saying only "the run stopped" leaves the editor with nothing to show for
-        a run that failed.
+        The failure reason is read first, because every path below resets the machine that holds it.
         """
         failure_details = self._current_flow_error_message()
 

@@ -3740,20 +3740,9 @@ class NodeManager(EngineScoped):
     def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
         """Return the halt for a node whose call Griptape Cloud refused over budget, or None.
 
-        Every node failure crosses this one point, whichever HTTP client made the
-        call and whether the node runs in-process or in a worker. Recognizing the
-        refusal here means a node spending through a Griptape Cloud driver -- the
-        prompt driver behind every agent node, the image-generation driver --
-        halts with the budgets named, without each of the ~50 node types having
-        to catch it for itself.
-
-        A halt raised further down is re-worded here when it does not yet name a
-        node. A driver recognizes the refusal inside a request it made on some
-        node's behalf and cannot know whose; this is where that is known, and
-        "the call from 'Describe Image'" is the difference between a message the
-        artist can act on and one that sends them hunting. A halt that already
-        names its node -- the proxy nodes word their own and set their own status
-        -- is left exactly as it was.
+        Every node failure passes through here, so no node type has to catch the
+        refusal itself. A halt that does not yet name a node (one a Cloud driver
+        raised) is re-worded to name this one; a halt that already does is kept.
         """
         already_worded = self._named_budget_halt(exc)
         if already_worded is not None:
@@ -3776,15 +3765,9 @@ class NodeManager(EngineScoped):
     def _refusal_carried_by(self, exc: Exception) -> BudgetRefusal | None:
         """Return the refusal behind this failure, from a halt already raised or from the HTTP error.
 
-        A driver that recognized the refusal itself carries the parsed result,
-        which is both cheaper and more faithful than re-reading a response the
-        SDK may have already closed -- a streaming chat refusal, for one, keeps
-        its status but not its body once the request context exits.
-
-        The host resolver is passed rather than called. Every node failure
-        reaches here, the overwhelming majority of them carrying no HTTP
-        response at all, and resolving the host reads a secret; it is looked up
-        only once there is a response whose host decides the answer.
+        A raised halt's parsed refusal is preferred, since the SDK may have closed
+        the response. The host resolver is passed uncalled so the secret is read
+        only for a failure that carries a response.
         """
         for halt in self._budget_halts_on(exc):
             return halt.refusal
@@ -3797,10 +3780,7 @@ class NodeManager(EngineScoped):
     def _budget_halts_on(self, exc: Exception) -> Iterator[BudgetExceededError]:
         """Walk the cause chain, yielding each budget halt on it, outermost first.
 
-        In-process only. A halt forwarded from a worker arrives flattened to type
-        and message, which :func:`is_budget_halt` recognizes and this cannot; that
-        is the right split, because a flattened halt has already been worded by
-        the worker-side pass through this same method.
+        In-process only; a halt forwarded from a worker was already worded there.
         """
         seen: set[int] = set()
         current: BaseException | None = exc

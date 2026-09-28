@@ -421,12 +421,9 @@ class NodeExecutor(EngineScoped):
 
     @staticmethod
     def _raise_if_budget_halt(failure_details: object) -> None:
-        """Stop the loop when an iteration was refused by a budget, rather than running the next one.
+        """Stop the loop when a budget refused an iteration, since every later one would be refused too.
 
-        Every later iteration would ask Griptape Cloud again and be refused again, and any paid node
-        ahead of the refused one in the body would spend again on the way. The halt is raised in its
-        own words so the scheduler recognizes it and the artist reads which budget to act on, not a
-        tally of lost iterations with the reason buried inside.
+        Raised in the halt's own words so the scheduler recognizes it.
         """
         halt = budget_halt_message(message=str(failure_details))
         if halt is None:
@@ -3345,8 +3342,7 @@ class NodeExecutor(EngineScoped):
                 for iteration_index, flow_name, node_name_mappings in deserialized_flows
             ]
             try:
-                # Wait as iterations finish rather than for all of them, so a budget refusal in one
-                # stops the others where they are instead of letting each spend into the same wall.
+                # Wait for each iteration as it finishes, so a budget refusal cancels the rest.
                 pending_iterations = set(iteration_tasks)
                 while pending_iterations:
                     finished_iterations, pending_iterations = await asyncio.wait(

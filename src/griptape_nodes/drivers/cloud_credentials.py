@@ -128,18 +128,13 @@ def resolve_cloud_credential(
 def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:
     """Return the hostname of the Griptape Cloud deployment in use.
 
-    Used to decide whether an HTTP failure is Griptape's to explain. A workflow
-    also calls remote MCP servers and third-party APIs that raise the same
-    errors, so a Cloud-specific message must be scoped to Cloud's own host.
+    Used to tell Cloud's HTTP failures apart from those of MCP servers and
+    third-party APIs.
 
     Args:
-        secrets_manager: Used to read the override so that workspace and global
-            ``.env`` files are searched, not just the environment. Pass it
-            whenever there is one to hand: pointing the engine at a dev control
-            plane through the workspace ``.env`` is the documented way to do it,
-            and an environment-only read would resolve to production and then
-            decline to explain a genuine failure from the deployment actually in
-            use. Omit it only where no engine reference is available.
+        secrets_manager: Reads the override from the workspace and global
+            ``.env`` files as well as the environment. Pass it whenever one is
+            available; without it a workspace ``.env`` override is missed.
 
     Returns:
         The hostname, or an empty string if the configured URL has none.

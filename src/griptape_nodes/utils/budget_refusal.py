@@ -1,29 +1,13 @@
-"""Recognition, wording, and re-recognition for a Griptape Cloud budget refusal.
+"""Recognize, word, and re-recognize a Griptape Cloud budget refusal.
 
-When a HARD budget has no room, Griptape Cloud refuses the invocation with HTTP
-403 and a body naming every budget that refused and the figures it refused on.
-Without this module that body reaches the artist as ``budget_exceeded`` at best
--- the machine-readable code, mistaken for a message -- and the run either stops
-with a generic error or, worse, carries on as though the call had succeeded.
+When a HARD budget has no room, Cloud refuses the call with HTTP 403 and a body
+naming every budget that refused. :func:`refusal_from_body` reads that body,
+:func:`describe` and :func:`describe_reply` word it for the artist, and
+:func:`is_budget_halt` recognizes the halt again after it crosses a worker boundary.
 
-The four jobs live together because they are one contract seen from four sides:
-:func:`refusal_from_body` reads Cloud's wire format, :class:`BudgetRefusal`
-models it, :func:`describe` and :func:`describe_reply` word it for the artist, and :func:`is_budget_halt`
-recognizes the verdict again on the far side of a worker boundary. Splitting
-them lets the wording drift from the shape that produced it.
-
-**The engine words the message; Cloud's prose goes to the log.** Cloud sends a
-``message`` too, but it is one line serving every refusing surface, so it cannot
-name the node or tell a frozen budget from an exhausted one. It is kept on the
-model so an engine/Cloud disagreement is diagnosable from a log rather than a
-screenshot.
-
-**Names, not figures.** The halt is short enough to read at a glance in the
-editor's Run blocked bar: which node, which budgets, and who to contact. Budgets
-are raised and unfrozen on Griptape Cloud, usually by someone other than the
-artist, so every halt sends them to their administrator. The credit figures stay
-on the budget page, where they are current, and in :func:`log_line`, where that
-administrator can recover them later.
+The halt names the node and the budgets and sends the artist to their
+administrator, short enough for the editor's Run blocked bar. Cloud's own
+``message`` and the credit figures go to :func:`log_line` only.
 """
 
 from __future__ import annotations
@@ -40,60 +24,31 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 BUDGET_EXCEEDED_CODE = "budget_exceeded"
-"""The machine-readable code Cloud sets on every budget refusal.
-
-Present on both envelopes: at the top level of the flat body, and as
-``error.code`` in the OpenAI-compatible one -- which an OpenAI SDK unwraps to
-a bare ``code``. Cloud builds a refusal in exactly
-one place, so this token is the whole recognition test -- ``blocked_by`` only
-confirms there is something to name.
-"""
+"""The code Cloud sets on every budget refusal, and the whole recognition test."""
 
 BUDGET_HALT_PREFIX = "Budget stopped this run."
-"""Opening words of every halt message, and the last-resort way to recognize one.
+"""Opening words of every halt message.
 
-A worker flattens an exception to type, message, and traceback, and one library
-call site loses the exception object entirely, so in those cases the prefix is
-all that survives. Rewording it silently turns a budget halt back into a generic
-error; a round-trip test pins it.
+Where only the message survives (a worker boundary, or a library call site that
+drops the exception), these words are how a halt is recognized. A test pins them.
 """
 
 BUDGET_REPLY_HALT_PREFIX = "Budget stopped this reply."
-"""Opening words of a halt in the sidebar chat, where there is no run to stop.
-
-The chat shows the halt in the thread, beside the question it stopped, so it
-needs no bar. The editor still recognizes it by these words, so it does not
-raise a toast repeating what the thread already says.
-"""
+"""Opening words of a halt in the sidebar chat, which the editor uses to skip its error toast."""
 
 _REMEDY = "Contact your Griptape administrator."
-"""The closing sentence of every halt.
-
-Whether a budget is exhausted, frozen, or set to zero, the fix is on Griptape
-Cloud, so the artist's next step is the same person every time.
-"""
+"""The closing sentence of every halt: the fix is on Griptape Cloud, whatever the cause."""
 
 _MISSING = object()
-"""Sentinel for "this exception has no body at all", which None does not say.
-
-A carrier can legitimately report a body of None -- a 403 with an empty
-response -- and that is still an HTTP failure worth reading a status off.
-"""
+"""Sentinel for "this exception has no body attribute", since a body of None is valid."""
 
 
 @dataclass(frozen=True)
 class BlockedBudget:
     """One budget that refused the call, and the figures it refused on.
 
-    Only ``budget_name`` is required. Cloud sends every other field today, but a
-    refusal that reaches an older engine should still name the budget rather than
-    fail to parse, and the artist can act on a name alone.
-
-    ``spent_by_cost_basis``, ``includes_byok``, and ``includes_reported`` are
-    deliberately not modelled. They answer "which spend counted toward this
-    limit", which belongs to whoever can retune the budget -- reachable through
-    the receipt this refusal's ``spend_id`` points at -- not to the artist whose
-    run just stopped.
+    Only ``budget_name`` is required, so a refusal with fields this engine does
+    not expect still names the budget.
     """
 
     budget_name: str
@@ -121,15 +76,10 @@ class BudgetRefusal:
 class BudgetExceededError(Exception):
     """A budget refused this call, so the run stops.
 
-    Carries the parsed refusal for a same-process caller. The attribute does not
-    survive a worker boundary -- see :func:`is_budget_halt` -- so the message is
-    built before raising rather than derived by whoever catches it.
-
-    ``node_name`` records whether the message already names the node whose call
-    was refused. A Griptape Cloud driver recognizes a refusal deep inside a
-    request it made on some node's behalf and has no idea which node that is, so
-    it raises without a name; the node executor knows, and re-words rather than
-    letting the artist read a halt that does not say where to look.
+    ``refusal`` does not survive a worker boundary, so the message is worded
+    before raising. ``node_name`` is None when the raiser (a Cloud driver, say)
+    did not know which node it was calling for; the node manager then re-words
+    the halt to name it.
     """
 
     def __init__(self, message: str, refusal: BudgetRefusal, *, node_name: str | None = None) -> None:
@@ -150,13 +100,10 @@ def refusal_from_exception(exc: BaseException, *, cloud_host: str | Callable[[],
 
     Args:
         exc: The exception to inspect, including anything it was raised from.
-        cloud_host: Hostname of the Griptape Cloud deployment in use, from
-            ``resolve_cloud_host``. An HTTP error from any other host is not ours
-            to interpret. Pass the function itself rather than its result where
-            this is asked about failures indiscriminately: resolving the host
-            reads a secret, and most failures are answered without ever needing
-            one. It is called at most once per exception, and not at all for a
-            failure carrying no response.
+        cloud_host: Hostname of the Griptape Cloud deployment in use, or a
+            function returning it. HTTP errors from other hosts are ignored. Pass
+            the function to defer reading the secret behind it until a failure
+            actually carries a response; it is called at most once.
 
     Returns:
         The refusal, or None when this is not a budget refusal from Cloud.
@@ -172,17 +119,11 @@ def refusal_from_exception(exc: BaseException, *, cloud_host: str | Callable[[],
 def refusal_from_body(body: object) -> BudgetRefusal | None:
     """Return the refusal a 403 body describes, or None if it does not describe one.
 
-    Accepts both envelopes Cloud sends, and the one an OpenAI SDK leaves behind.
-    Six surfaces return the refusal as the whole body; the OpenAI-compatible
-    surface nests the same values under ``error`` so an OpenAI SDK can parse it.
-    That SDK then unwraps ``error`` before raising, so the body on its exception
-    -- and on Pydantic AI's, which passes it along -- is the inner object, with
-    the code under ``code``. The values are lifted rather than rebuilt at every
-    step, so this returns the same refusal whichever shape arrives.
+    Accepts the flat body, the OpenAI-compatible body nested under ``error``, and
+    the inner object an OpenAI SDK leaves after unwrapping ``error``.
 
     Args:
-        body: The parsed response body, or anything at all -- a body that is not
-            a budget refusal is answered with None rather than an exception.
+        body: The parsed response body, of any type.
 
     Returns:
         The refusal, or None when the body is not a budget refusal.
@@ -210,9 +151,7 @@ def refusal_from_body(body: object) -> BudgetRefusal | None:
 
     budgets = tuple(budget for budget in (_budget_from_entry(entry) for entry in entries) if budget is not None)
     if not budgets:
-        # The code says a budget refused, but nothing survived that names one. A
-        # message reading "no budgets" is worse than the generic error, so leave
-        # it to the generic path.
+        # Nothing names a budget, so fall back to the generic error.
         return None
 
     return BudgetRefusal(
@@ -255,12 +194,9 @@ def describe_reply(refusal: BudgetRefusal) -> str:
 
 
 def log_line(refusal: BudgetRefusal) -> str:
-    """Summarize a refusal for the engine log, including what the artist is not shown.
+    """Summarize a refusal for the engine log, including the figures the artist is not shown.
 
-    The halt message answers "what do I do now"; this answers "what exactly
-    happened", which is the question an administrator asks later. ``spend_id`` is
-    the durable handle: Cloud writes a BLOCKED receipt row for every refusal, and
-    that row outlives the message once it has scrolled away.
+    ``spend_id`` points at the BLOCKED receipt Cloud writes for every refusal.
     """
     budgets = "; ".join(
         f"{budget.budget_name} (id={budget.budget_id}, scope={budget.scope_type}, "
@@ -280,23 +216,10 @@ def log_line(refusal: BudgetRefusal) -> str:
 def halt_message(exception: BaseException | None = None, message: str | None = None) -> str | None:
     """Return a budget halt's own wording from wherever it has ended up, or None.
 
-    A halt is worded once, at the node that was refused, and then re-raised and
-    re-wrapped on its way out: the node executor raises
-    ``RuntimeError("Node 'X' execution failed: ...") from exc``, and a worker
-    flattens the original to a ``ForwardedException`` first. By the time the
-    scheduler reaps it, the sentence an artist can act on is two layers of
-    framing deep and no longer at the front of the string.
-
-    So the search is down the ``__cause__`` chain rather than at the top, and
-    what it returns is the halt as it was written rather than the wrapper's
-    retelling of it.
-
-    Three tests, because the verdict arrives in three conditions. In the same
-    process the original exception is intact. Forwarded from a worker it is a
-    ``ForwardedException`` naming the original type, since crossing that
-    boundary keeps type, message, and traceback and nothing else. And one
-    library call site discards the exception entirely, leaving the message as
-    the only evidence.
+    The halt gets wrapped on its way out, so this walks the ``__cause__`` chain
+    and returns the halt's own wording. It matches a ``BudgetExceededError``, a
+    ``ForwardedException`` whose original type is one (from a worker), or, when
+    there is no exception, a message starting with :data:`BUDGET_HALT_PREFIX`.
 
     Args:
         exception: The exception that ended the node, including anything it was
@@ -354,31 +277,16 @@ def _host_resolver(cloud_host: str | Callable[[], str]) -> Callable[[], str]:
 def _cloud_http_failure(exc: BaseException, resolve_host: Callable[[], str]) -> CloudHttpFailure | None:
     """Find the Griptape Cloud HTTP failure on an exception chain.
 
-    Three unrelated shapes reach this code, one per HTTP client that spends
-    credits, and they agree on nothing -- not the attribute holding the status,
-    not whether the body arrives parsed, not whether the URL survives at all.
+    Three shapes, one per HTTP client that spends credits:
 
-    ``httpx.HTTPStatusError`` keeps the status on ``response`` and knows the URL
-    it called, so it can be host-scoped: a workflow also talks to remote MCP
-    servers and third-party APIs that raise the same error, and attributing
-    their 403 to a Griptape budget would send the artist hunting for a budget
-    that is not the problem.
-
-    ``requests.exceptions.HTTPError`` is what the Griptape SDK's Cloud drivers
-    raise -- the prompt driver behind every agent node, and the image-generation
-    driver. It also carries a response and a URL, but under a different shape:
-    the status is on the response rather than the exception, and the body is a
-    method rather than an attribute. Duck-typed rather than imported because
-    ``requests`` is not an engine dependency; it arrives through the SDK.
-
-    The third carries ``status_code`` and ``body`` directly and knows no URL --
-    Pydantic AI's ``ModelHTTPError``, from the sidebar's chat model. It is
-    duck-typed too, so that ``pydantic_ai`` stays out of the import graph of a
-    module that node libraries bind to. Unable to check the host, it relies on
-    the ``budget_exceeded`` code, which no third party sends.
-
-    Callers wrap and re-raise -- the image toolset raises ``ModelRetry`` from the
-    original -- so follow the cause chain rather than only inspecting the top.
+    - ``httpx.HTTPStatusError``: host-scoped, so a 403 from an MCP server or a
+      third-party API is not read as a budget refusal.
+    - ``requests.exceptions.HTTPError``, from the Griptape SDK's Cloud drivers:
+      host-scoped too, and duck-typed because ``requests`` is not an engine
+      dependency.
+    - Pydantic AI's ``ModelHTTPError``, from the sidebar chat: ``status_code`` and
+      ``body`` with no URL, so it relies on the ``budget_exceeded`` code alone.
+      Duck-typed to keep ``pydantic_ai`` out of this module's imports.
     """
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -400,14 +308,7 @@ def _cloud_http_failure(exc: BaseException, resolve_host: Callable[[], str]) -> 
 
 
 def _response_failure(response: object, resolve_host: Callable[[], str]) -> CloudHttpFailure | None:
-    """Read a ``requests``-style response off an exception, host-scoped.
-
-    Structural checks rather than an ``isinstance``, since the type is not
-    importable here. Anything failing them is not a response this code can read,
-    and is left to the rest of the chain rather than guessed at. The host is
-    resolved last, after those checks have established there is a response worth
-    scoping.
-    """
+    """Read a ``requests``-style response off an exception, host-scoped, or return None."""
     status = getattr(response, "status_code", None)
     if not isinstance(status, int):
         return None
@@ -424,12 +325,7 @@ def _response_failure(response: object, resolve_host: Callable[[], str]) -> Clou
 
 
 def _parsed_body(parse: Callable[[], object]) -> object | None:
-    """Call a response's JSON parser, tolerating a body that is not JSON.
-
-    ``requests`` raises its own decode error, which subclasses ``ValueError``;
-    an empty body raises the same way. Either means there is nothing here to
-    read a refusal out of, which is an answer rather than a failure.
-    """
+    """Call a response's JSON parser, returning None for an empty or non-JSON body."""
     try:
         return parse()
     except ValueError:
@@ -437,12 +333,7 @@ def _parsed_body(parse: Callable[[], object]) -> object | None:
 
 
 def _body_of(response: httpx.Response) -> object | None:
-    """Parse a response body, tolerating one that is not JSON or was never read.
-
-    A streamed response raises ``ResponseNotRead`` when ``raise_for_status`` runs
-    inside the ``stream`` block, before anything read the body. Its status is
-    still an answer; its body is simply not there to read a refusal out of.
-    """
+    """Parse a response body, returning None when it is not JSON or a stream never read it."""
     try:
         return response.json()
     except (ValueError, httpx.ResponseNotRead):
@@ -488,11 +379,7 @@ def _blocked_by(refusal: BudgetRefusal) -> str:
 
 
 def _label(budget: BlockedBudget) -> str:
-    """Name a budget the way the budget page does, marking one that is frozen.
-
-    Frozen refuses at any headroom, so without the mark an artist would find
-    credits left on the page and wonder why the run stopped.
-    """
+    """Name a budget the way the budget page does, marking a frozen one, which refuses at any headroom."""
     if budget.frozen:
         return f'"{budget.budget_name}" (frozen)'
     return f'"{budget.budget_name}"'

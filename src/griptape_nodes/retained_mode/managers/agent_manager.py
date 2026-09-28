@@ -512,8 +512,7 @@ class AgentManager(EngineScoped):
             return await self._run_agent(request)
         except Exception as e:
             message = self._explain_agent_run_error(e, request.provider_name)
-            # A budget halt is complete as worded, and the editor recognizes it by
-            # its opening words so the chat thread is the only place it appears.
+            # Keep a budget halt's opening words, which the editor recognizes.
             if message.startswith(BUDGET_REPLY_HALT_PREFIX):
                 err_msg = message
             else:
@@ -524,17 +523,10 @@ class AgentManager(EngineScoped):
     def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
         """Return the user-facing text for a failed agent run.
 
-        Two different Griptape Cloud decisions arrive as the same HTTP 403, and
-        they mean different things. A budget refusal names budgets that have no
-        room; an entitlement refusal means the license is not permitted the
-        action at all. A budget refusal says so in its body, so ask for one
-        before falling back to entitlement.
-
-        Either way the bare text is "Forbidden", which reads like a bug rather
-        than a decision. Every other error keeps its original text.
-
-        A tool that recognized the refusal itself has already worded and logged
-        it, so its halt is handed back as written rather than logged twice.
+        A Cloud 403 is either a budget refusal, recognized from its body, or an
+        entitlement refusal. Both get a readable message instead of "Forbidden";
+        every other error keeps its text. A halt a tool already worded is
+        returned as is.
         """
         halt = budget_halt_message(exc)
         if halt is not None:

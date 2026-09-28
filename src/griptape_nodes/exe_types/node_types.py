@@ -2517,18 +2517,9 @@ class SuccessFailureNode(BaseNode):
         to allow graceful failure handling. If no connections exist, raises the exception
         to crash the flow and provide immediate feedback.
 
-        A budget refusal is the exception, and always stops the run. The Failed
-        output means "this operation failed, here is the recovery path", but a
-        budget block is not this operation failing: it is the organization's
-        authority to spend being withdrawn, and it applies just as much to every
-        node the recovery path leads to. Routing down Failed would run a branch
-        that spends credits, be refused in turn, and turn one clear halt into a
-        confusing one per node.
-
-        That holds whether or not the node recognized the refusal itself. A node
-        that hands over the raw Cloud 403, or its own error raised from it, is
-        refused just the same, so the HTTP error is read here too; the node
-        executor words the halt on its way out.
+        A budget refusal is the exception, and always stops the run: the Failed
+        branch would spend credits too and be refused in turn. This includes a
+        raw Cloud 403, or a node's own error raised from one.
 
         Args:
             exception: The exception that caused the failure
@@ -2560,11 +2551,7 @@ class SuccessFailureNode(BaseNode):
         return super().validate_before_node_run()
 
     def _cloud_host(self) -> str:
-        """Hostname of the Griptape Cloud deployment this engine is pointed at.
-
-        Passed to ``refusal_from_exception`` uncalled, so the secret behind it is
-        read only for a failure that carries an HTTP response.
-        """
+        """Hostname of the Griptape Cloud deployment this engine is pointed at."""
         return resolve_cloud_host(self.engine.secrets_manager)
 
 

@@ -823,11 +823,8 @@ class ExecuteDagState(State):
                     dag_node.node_state = NodeState.ERRORED
 
                     logger.error("Error processing node '%s'", node_name, exc_info=exc)
-                    # A budget halt already names the node and says what to do, and it is
-                    # what the artist reads. By the time it arrives here the node executor
-                    # has wrapped it in a RuntimeError, so recover the original wording:
-                    # framing it a third time would bury the sentence and displace the
-                    # opening words the halt is recognized by downstream.
+                    # Unwrap a budget halt to its own wording; it already names the node,
+                    # and downstream recognizes it by its opening words.
                     halt = budget_halt_message(exc, str(exc))
                     if halt is not None:
                         msg = halt

@@ -138,10 +138,7 @@ class ImageGenerationToolset:
             image_bytes = base64.b64decode(artifact["value"])
             image_format = artifact.get("format", "png")
         except httpx.HTTPError as exc:
-            # A budget refusal is not recoverable by trying again: every retry is
-            # another refused call, and the agent burns its turn rediscovering the
-            # same wall. Raise it so the run stops and the user is told which
-            # budget to act on.
+            # Retrying a budget refusal is just refused again, so stop instead.
             refusal = refusal_from_exception(exc, cloud_host=urlsplit(self._base_url).hostname or "")
             if refusal is not None:
                 logger.error(budget_log_line(refusal))
