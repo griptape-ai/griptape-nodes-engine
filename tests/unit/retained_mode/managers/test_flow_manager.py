@@ -525,6 +525,93 @@ class TestStartFlowTellsTheEditorAShortRunFailed:
         abandon_spy.assert_not_called()
         machine.reset_machine.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_run_from_a_node_that_errored_tells_the_editor_why(self, engine: Engine) -> None:
+        """Running from a selected node leaves by its own ``is_errored`` branch, which owes the same."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from griptape_nodes.retained_mode.events.execution_events import (
+            StartFlowFromNodeRequest,
+            StartFlowFromNodeResultFailure,
+        )
+        from griptape_nodes.retained_mode.events.validation_events import (
+            ValidateFlowDependenciesResultSuccess,
+        )
+
+        flow_manager = engine.flow_manager
+
+        start_node = MagicMock(spec=BaseNode)
+        start_node.name = "Refused"
+        validate_success = ValidateFlowDependenciesResultSuccess(
+            validation_succeeded=True, exceptions=[], result_details="validated"
+        )
+        halt = f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call from 'Refused'."
+        machine = MagicMock()
+        machine.resolution_machine.is_errored.return_value = True
+        machine.resolution_machine.get_error_message.return_value = halt
+        announce_spy = MagicMock()
+
+        with (
+            patch.object(engine.object_manager, "attempt_get_object_by_name_as_type", return_value=start_node),
+            patch.object(flow_manager, "get_flow_by_name", return_value=MagicMock()),
+            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
+            patch.object(
+                flow_manager,
+                "on_validate_flow_dependencies_request",
+                AsyncMock(return_value=validate_success),
+            ),
+            patch.object(flow_manager, "start_flow", AsyncMock()),
+            patch.object(flow_manager, "_global_control_flow_machine", machine),
+            patch.object(flow_manager, "_announce_failed_run", announce_spy),
+        ):
+            result = await flow_manager.on_start_flow_from_node_request(
+                StartFlowFromNodeRequest(node_name="Refused", flow_name="short_flow")
+            )
+
+        assert isinstance(result, StartFlowFromNodeResultFailure)
+        assert halt in str(result.result_details)
+        announce_spy.assert_called_once_with(halt)
+        machine.reset_machine.assert_not_called()
+
+
+class TestAnnouncingAFailedRun:
+    """The editor learns a run is over from ``ControlFlowCancelledEvent``, which carries the reason."""
+
+    def test_the_editor_is_told_the_run_is_over_and_why(self, engine: Engine) -> None:
+        from unittest.mock import patch
+
+        from griptape_nodes.retained_mode.events.execution_events import (
+            ControlFlowCancelledEvent,
+            InvolvedNodesEvent,
+        )
+
+        flow_manager = engine.flow_manager
+        halt = f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call from 'Refused'."
+
+        with patch.object(engine.event_manager, "put_event") as put_event:
+            flow_manager._announce_failed_run(halt)
+
+        payloads = [call.args[0].wrapped_event.payload for call in put_event.call_args_list]
+        assert isinstance(payloads[0], InvolvedNodesEvent)
+        assert payloads[0].involved_nodes == []
+        assert isinstance(payloads[1], ControlFlowCancelledEvent)
+        assert payloads[1].result_details == halt
+
+    def test_there_is_no_error_to_report_without_a_run(self, engine: Engine) -> None:
+        from unittest.mock import patch
+
+        with patch.object(engine.flow_manager, "_global_control_flow_machine", None):
+            assert engine.flow_manager._current_flow_error_message() is None
+
+    def test_there_is_no_error_to_report_from_a_run_that_did_not_error(self, engine: Engine) -> None:
+        from unittest.mock import MagicMock, patch
+
+        machine = MagicMock()
+        machine.resolution_machine.is_errored.return_value = False
+
+        with patch.object(engine.flow_manager, "_global_control_flow_machine", machine):
+            assert engine.flow_manager._current_flow_error_message() is None
+
 
 class TestListNodesInFlowRequest:
     """Tests for FlowManager.on_list_nodes_in_flow_request node_types filter."""

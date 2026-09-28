@@ -1303,6 +1303,22 @@ class TestExplainAgentRunError:
         assert isinstance(result.result_details, ResultDetails)
         assert result.result_details.result_details[0].message == str(halt)
 
+    @pytest.mark.asyncio
+    async def test_any_other_failure_is_framed_as_an_agent_error(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(_request: RunAgentRequest) -> None:
+            msg = "the provider hung up"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(providers_manager, "_run_agent", broken)
+
+        result = await providers_manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert result.result_details.result_details[0].message.startswith("Error running agent: ")
+
 
 _CLOUD_HOST = "cloud.griptape.ai"
 

@@ -402,6 +402,15 @@ class TestBudgetHaltsIgnoreTheFailureBranch:
 
         node._handle_failure_exception(ValueError("the API returned garbage"))
 
+    def test_the_cloud_host_comes_from_the_engine_settings(self) -> None:
+        """Only a 403 from the Cloud deployment this engine uses is read as a budget refusal."""
+        node = SuccessFailureNode(name="refused_call")
+        engine = Mock()
+        engine.secrets_manager.get_secret.return_value = "https://cloud.example.test/api"
+
+        with patch.object(SuccessFailureNode, "engine", engine):
+            assert node._cloud_host() == "cloud.example.test"
+
     def test_an_ordinary_error_still_raises_with_nothing_connected(self) -> None:
         node = SuccessFailureNode(name="unconnected")
         node._has_outgoing_connections = Mock(return_value=False)  # type: ignore[method-assign]

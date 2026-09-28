@@ -310,6 +310,25 @@ class TestRecognizingARefusal:
         assert refusal.budgets[0].budget_name == "tight"
         assert refusal.budgets[0].remaining_credits is None
 
+    def test_a_blocked_by_that_is_not_a_list_is_not_a_refusal(self) -> None:
+        assert refusal_from_body({"error": BUDGET_EXCEEDED_CODE, "blocked_by": {"budget_name": "tight"}}) is None
+
+    def test_entries_that_name_no_budget_are_skipped(self) -> None:
+        """A malformed entry is dropped rather than shown as a budget with no name."""
+        body = a_refusal_body(blocked_by=["tight", {"budget_name": ""}, a_rejection(budget_name="shared")])
+
+        refusal = refusal_from_body(body)
+
+        assert refusal is not None
+        assert [budget.budget_name for budget in refusal.budgets] == ["shared"]
+
+    def test_a_boolean_credit_count_is_not_read_as_a_number(self) -> None:
+        """JSON `true` is an `int` to Python; showing an artist "1 credit left" from it would be wrong."""
+        refusal = refusal_from_body(a_refusal_body(a_rejection(remaining_credits=True)))
+
+        assert refusal is not None
+        assert refusal.budgets[0].remaining_credits is None
+
 
 class TestTheExceptionChain:
     """Callers wrap and re-raise, so the refusal is rarely on the exception handed to us."""
@@ -389,6 +408,19 @@ class TestTheExceptionChain:
         exc = _RequestsHttpError(_RequestsResponse(403, "not json"))
 
         assert refusal_from_exception(exc, cloud_host=CLOUD_HOST) is None
+
+    def test_a_requests_style_response_with_no_url_is_not_a_refusal(self) -> None:
+        """Without a URL the host cannot be checked, so the 403 is not assumed to be Cloud's."""
+        response = _RequestsResponse(403, a_refusal_body())
+        response.url = None  # type: ignore[assignment]
+
+        assert refusal_from_exception(_RequestsHttpError(response), cloud_host=CLOUD_HOST) is None
+
+    def test_a_requests_style_response_with_no_json_method_is_not_a_refusal(self) -> None:
+        response = _RequestsResponse(403, a_refusal_body())
+        response.json = a_refusal_body()  # type: ignore[method-assign,assignment]
+
+        assert refusal_from_exception(_RequestsHttpError(response), cloud_host=CLOUD_HOST) is None
 
     def test_an_ordinary_exception_is_not_a_refusal(self) -> None:
         assert refusal_from_exception(ValueError("something else"), cloud_host=CLOUD_HOST) is None
