@@ -1,16 +1,20 @@
 """Tests for the serialized-artifact-dict branch of `normalize_artifact_input`.
 
 The dict branch reuses `_normalize_string_input`, so these only cover inputs it can
-resolve without a configured engine: HTTP URLs, and paths it fails to resolve. Workspace
-path resolution and static-storage upload need a configured engine and are not covered.
+resolve without a configured engine: HTTP URLs, and paths it fails to resolve. Static-storage
+upload needs a configured engine and is not covered; the data URI tests stub only the workspace.
 """
 
+import base64
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from griptape.artifacts import AudioUrlArtifact, ImageArtifact, ImageUrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+from griptape_nodes.utils import artifact_normalization
 from griptape_nodes.utils.artifact_normalization import normalize_artifact_input, normalize_artifact_list
 
 # The shape the editor sends for a stored video: an artifact dict plus the display
@@ -23,6 +27,18 @@ EDITOR_VIDEO_DICT = {
     "height": 1080,
     "duration": 12,
 }
+
+# Long enough that, read as a path under the workspace, it exceeds the OS file name limit.
+LARGE_PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(bytes(5000)).decode()
+
+
+@pytest.fixture
+def workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Give path resolution a workspace, so relative values are looked up on disk."""
+    engine = MagicMock()
+    engine.config_manager.workspace_path = tmp_path
+    monkeypatch.setattr(artifact_normalization, "current_engine", lambda: engine)
+    return tmp_path
 
 
 @pytest.mark.parametrize(
@@ -70,6 +86,28 @@ def test_unresolvable_path_still_becomes_an_artifact() -> None:
 
     assert isinstance(result, VideoUrlArtifact)
     assert result.value == "{inputs}/clip.mp4"
+
+
+@pytest.mark.usefixtures("workspace")
+def test_data_uri_dict_becomes_the_artifact() -> None:
+    """A data URI is not a path, but it is a value the declared type can hold.
+
+    It is looked up on disk as a workspace-relative path first, and a real image's worth of
+    base64 is longer than the OS allows a file name to be. That lookup must answer "not a
+    file" rather than raise, so the value is wrapped like any other unresolvable one.
+    """
+    data_uri_dict = {"type": "ImageUrlArtifact", "value": LARGE_PNG_DATA_URI, "width": 64}
+
+    result = normalize_artifact_input(dict(data_uri_dict), ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value == LARGE_PNG_DATA_URI
+
+
+@pytest.mark.usefixtures("workspace")
+def test_data_uri_string_passes_through() -> None:
+    """The string branch hands back what it cannot resolve, a data URI included."""
+    assert normalize_artifact_input(LARGE_PNG_DATA_URI, ImageUrlArtifact) == LARGE_PNG_DATA_URI
 
 
 def test_dict_for_another_artifact_type_passes_through() -> None:

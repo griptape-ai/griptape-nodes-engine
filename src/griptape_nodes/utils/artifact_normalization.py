@@ -111,7 +111,15 @@ def _upload_file_to_static_storage(file_path: Path, artifact_type: type[Any]) ->
     Returns:
         Artifact object with localhost URL, or None if upload fails
     """
-    if not file_path.exists() or not file_path.is_file():
+    # A value that is not a path at all, such as a data URI, can be too long for the OS to
+    # look up. That is still an answer to "is this a file?", so treat it as "no".
+    try:
+        is_file = file_path.is_file()
+    except OSError as e:
+        logger.debug("Failed to check if '%s' is a file: %s", file_path, e)
+        return None
+
+    if not is_file:
         return None
 
     try:
@@ -207,7 +215,9 @@ def normalize_artifact_input(
     # rather than rebuilding the artifact from the dict: it resolves and uploads the path,
     # and builds the type this parameter declared. The declared type is what tells a path
     # apart from a payload -- a raw ``ImageArtifact`` dict holds base64 bytes in ``value``,
-    # which is not a path and must be left alone.
+    # which is not a path and must be left alone. The check trusts the declared type, so a
+    # data URI in a *Url* dict is knowingly let through; it fails to resolve as a path and
+    # is wrapped as-is below, and the node libraries accept data URIs in URL artifacts.
     if isinstance(artifact_input, dict) and artifact_input.get("type") == artifact_type.__name__:
         inner = artifact_input.get("value")
         if isinstance(inner, str) and inner:
