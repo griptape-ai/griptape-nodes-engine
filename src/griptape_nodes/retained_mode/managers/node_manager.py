@@ -3909,7 +3909,7 @@ class NodeManager(EngineScoped):
 
         Args:
             group_node: The group node to serialize
-            unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
+            unique_uuid_to_values: Shared dictionary of encoded parameter values
             serialized_parameter_value_tracker: Tracker for parameter value hashes
             serialize_all_parameter_values: If True, capture every parameter value on the group and
                 on each child, not just the ones the ordinary save condition would record
@@ -5003,9 +5003,7 @@ class NodeManager(EngineScoped):
 
         Notes:
             - Parameter output values take precedence over regular parameter values
-            - For values that can be hashed, the value itself is used as the key in values_created
-            - For unhashable values, the object's id is used as the key
-            - The function will reuse already created values to avoid duplication
+            - Each object is encoded once, tracked by its id, and pooled under a hash of its encoded content
         """
         output_value = None
         internal_value = None
