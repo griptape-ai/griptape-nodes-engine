@@ -61,9 +61,12 @@ A value whose class belongs to a library the receiving process doesn't load arri
 of its plain data, and continues unchanged to the next process that does load it. A class defined
 inside a function can't make the trip at all, because no other process can find it.
 
-A value with no plain-data form fails the node with an error that names the parameter, unless the
-parameter is `serializable=False`: then the engine keeps the value in the process that built it
-(see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md)).
+An output with no plain-data form fails the node with an error that names the parameter, unless
+the node is in a library running in its own process and the parameter is `serializable=False`:
+then the engine keeps the value in that process (see [Passing Values That Cannot Be
+Serialized](passing_unserializable_values.md)). `serializable=False` only holds an output in
+place; an input sent to a node in an isolated library still needs a plain-data form, even one
+wired from a `serializable=False` output upstream.
 
 ## Traits
 
