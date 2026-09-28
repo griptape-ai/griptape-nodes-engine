@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.node_types import BaseNode, DataNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
@@ -32,7 +33,7 @@ def _make_mock_node(name: str = "test_node") -> MagicMock:
     return node
 
 
-def _make_mock_obj_mgr(existing_node: MagicMock | None = None) -> MagicMock:
+def _make_mock_obj_mgr(existing_node: MagicMock | BaseNode | None = None) -> MagicMock:
     mock_obj_mgr = MagicMock()
     mock_obj_mgr.attempt_get_object_by_name_as_type.return_value = existing_node
     return mock_obj_mgr
@@ -267,6 +268,69 @@ class TestExecuteNodeOrchestratorPath:
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_called_once_with("param_a", 999)
+
+    @pytest.mark.asyncio
+    async def test_untagged_artifact_dict_becomes_an_artifact(self) -> None:
+        """An editor-set or older-saved-workflow dict shaped like an artifact hydrates before being applied."""
+        mock_node = _make_mock_node()
+        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+
+        request = ExecuteNodeRequest(
+            node_name="test_node",
+            parameter_values={"image": {"type": "ImageUrlArtifact", "value": "https://example.com/a.png"}},
+        )
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        set_name, set_value = mock_node.set_parameter_value.call_args[0]
+        assert set_name == "image"
+        assert isinstance(set_value, ImageUrlArtifact)
+        assert set_value.value == "https://example.com/a.png"
+
+
+class _ImageInputDataNode(DataNode):
+    """DataNode with one image-typed input, recording what process() actually saw."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(
+            Parameter(
+                name="image",
+                type="ImageUrlArtifact",
+                default_value=None,
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.seen_image: object = None
+
+    def process(self) -> None:
+        self.seen_image = self.parameter_values.get("image")
+
+
+class TestExecuteNodeLocalRouteHydratesUntaggedDicts:
+    """Local-route regression: an untagged artifact dict from the editor reaches process() as the artifact."""
+
+    @pytest.mark.asyncio
+    async def test_data_node_sees_hydrated_artifact_not_dict(self) -> None:
+        node = _ImageInputDataNode(
+            "image_node", metadata={"node_type": "ImageInputDataNode", "library": "some_library"}
+        )
+        mock_obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+
+        request = ExecuteNodeRequest(
+            node_name="image_node",
+            parameter_values={"image": {"type": "ImageUrlArtifact", "value": "https://example.com/a.png"}},
+        )
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert isinstance(node.seen_image, ImageUrlArtifact)
+        assert node.seen_image.value == "https://example.com/a.png"
 
 
 class TestExecuteNodeWorkerPathStateless:
