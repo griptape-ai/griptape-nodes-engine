@@ -28,6 +28,11 @@ the engine's request API from working without edits. Migration steps live in
 - A library whose isolated process shuts down before loading it now reports that as soon as the
   process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
   load that never finished.
+- Creating or switching to a project whose workspace differs now closes the open workflow, returning
+  you to the workflow picker. Before, the engine kept a workflow it no longer had a record of, so the
+  next workflow you opened sat on "Checking workflow" and the log filled with "is not registered on
+  this engine" warnings until you restarted the engine. You are still offered a save first.
+  [#5692](https://github.com/griptape-ai/griptape-nodes-engine/issues/5692)
 - Creating a versioned output folder or file sequence in a project no longer fails with "requires
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
   `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so

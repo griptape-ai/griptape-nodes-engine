@@ -5807,6 +5807,7 @@ class TestProjectManagerProjectWorkspaces:
         from unittest.mock import AsyncMock, patch
 
         from griptape_nodes.retained_mode.events.library_events import (
+            ReloadAllLibrariesRequest,
             ReloadAllLibrariesResultSuccess,
         )
 
@@ -5835,7 +5836,10 @@ class TestProjectManagerProjectWorkspaces:
 
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
 
-        mock_engine.ahandle_request.assert_called_once()
+        # Only the reload. A library-only switch leaves the workflow open: its registry
+        # entry is still keyed against the same workspace.
+        dispatched = [type(call.args[0]) for call in mock_engine.ahandle_request.call_args_list]
+        assert dispatched == [ReloadAllLibrariesRequest]
         mock_workflow_manager.refresh_workflow_registry.assert_not_called()
         assert not result.altered_workflow_state
 
@@ -5846,8 +5850,10 @@ class TestProjectManagerProjectWorkspaces:
         from unittest.mock import AsyncMock, patch
 
         from griptape_nodes.retained_mode.events.library_events import (
+            ReloadAllLibrariesRequest,
             ReloadAllLibrariesResultSuccess,
         )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         project_file = tmp_path / "project.yml"
         project_file.touch()
@@ -5885,9 +5891,160 @@ class TestProjectManagerProjectWorkspaces:
 
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
 
-        mock_engine.ahandle_request.assert_called_once()
+        # The workflow is closed before the reload; the reload's own clear then finds an
+        # empty stack, so the teardown happens exactly once.
+        dispatched = [type(call.args[0]) for call in mock_engine.ahandle_request.call_args_list]
+        assert dispatched == [ClearAllObjectStateRequest, ReloadAllLibrariesRequest]
         mock_workflow_manager.refresh_workflow_registry.assert_called_once()
         assert result.altered_workflow_state
+
+    @pytest.mark.asyncio
+    async def test_workspace_change_closes_the_workflow_without_a_library_reload(self, tmp_path: Path) -> None:
+        """A workspace change closes the open workflow even when library config is unchanged.
+
+        The reported case: a child project inherits its parent's `libraries_dir`, so
+        `library_config_changed` is False and the reload -- which is what used to clear
+        the context, incidentally -- never runs.
+        """
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from griptape_nodes.retained_mode.events.object_events import (
+            ClearAllObjectStateRequest,
+            ClearAllObjectStateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        new_workspace = Path(tempfile.mkdtemp())
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        # Library config is deliberately left stable, so only the workspace changes.
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+        mock_config.workspace_path = str(tmp_path / "old_workspace")
+
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+        pm._initialization_complete = True
+
+        mock_workflow_manager = Mock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=ClearAllObjectStateResultSuccess(result_details="ok"))
+            mock_engine.workflow_manager = mock_workflow_manager
+
+            def side_effect_set_workspace_override(_: object, **_kwargs: object) -> None:
+                mock_config.workspace_path = str(new_workspace)
+
+            mock_config.set_workspace_override.side_effect = side_effect_set_workspace_override
+            mock_workflow_manager.refresh_workflow_registry = AsyncMock(return_value=None)
+
+            result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
+
+        dispatched = [type(call.args[0]) for call in mock_engine.ahandle_request.call_args_list]
+        assert dispatched == [ClearAllObjectStateRequest]
+        mock_workflow_manager.refresh_workflow_registry.assert_called_once()
+        assert result.altered_workflow_state
+
+    @pytest.mark.asyncio
+    async def test_workflow_is_closed_before_the_registry_is_re_registered(self, tmp_path: Path) -> None:
+        """The teardown runs while its registry entry still exists, so paths still resolve."""
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        new_workspace = Path(tempfile.mkdtemp())
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+        mock_config.workspace_path = str(tmp_path / "old_workspace")
+
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+        pm._initialization_complete = True
+
+        order: list[str] = []
+
+        mock_workflow_manager = Mock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+
+            async def record_request(_request: object) -> object:
+                order.append("clear")
+                return ClearAllObjectStateResultSuccess(result_details="ok")
+
+            async def record_refresh() -> None:
+                order.append("refresh")
+
+            mock_engine.ahandle_request = AsyncMock(side_effect=record_request)
+            mock_engine.workflow_manager = mock_workflow_manager
+
+            def side_effect_set_workspace_override(_: object, **_kwargs: object) -> None:
+                mock_config.workspace_path = str(new_workspace)
+
+            mock_config.set_workspace_override.side_effect = side_effect_set_workspace_override
+            mock_workflow_manager.refresh_workflow_registry = AsyncMock(side_effect=record_refresh)
+
+            await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
+
+        assert order == ["clear", "refresh"]
+
+    @pytest.mark.asyncio
+    async def test_failure_to_close_the_workflow_returns_failure(self, tmp_path: Path) -> None:
+        """When the workflow cannot be closed, the registry is left alone and the switch fails."""
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        new_workspace = Path(tempfile.mkdtemp())
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+        mock_config.workspace_path = str(tmp_path / "old_workspace")
+
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+        pm._initialization_complete = True
+
+        mock_workflow_manager = Mock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
+                return_value=ClearAllObjectStateResultFailure(result_details="a node refused to release")
+            )
+            mock_engine.workflow_manager = mock_workflow_manager
+
+            def side_effect_set_workspace_override(_: object, **_kwargs: object) -> None:
+                mock_config.workspace_path = str(new_workspace)
+
+            mock_config.set_workspace_override.side_effect = side_effect_set_workspace_override
+            mock_workflow_manager.refresh_workflow_registry = AsyncMock(return_value=None)
+
+            result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        mock_workflow_manager.refresh_workflow_registry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_library_reload_failure_returns_failure(self, tmp_path: Path) -> None:
