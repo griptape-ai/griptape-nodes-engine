@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import SerializedSelectedNodesCommands
 from griptape_nodes.serialization.commands import CommandsFormatError, check_element_modification_commands
-from griptape_nodes.serialization.type_names import DYNAMIC_MODULE_PREFIX, is_dynamic_module_name
+from griptape_nodes.serialization.type_names import (
+    DYNAMIC_MODULE_PREFIX,
+    is_dynamic_module_name,
+    may_import_for_decoding,
+)
 from griptape_nodes.serialization.values import JsonValue, ValueEncodeError, encode_value, has_plain_data_form
 
 if TYPE_CHECKING:
@@ -30,8 +34,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# Packages whose modules a payload may cause to be imported. Anything else must already be loaded.
-_IMPORTABLE_PACKAGES = frozenset({"griptape", "griptape_nodes"})
 
 # Classes pickle needs to rebuild values the codec encodes by other means.
 _PICKLE_BUILDING_BLOCKS: frozenset[type] = frozenset({datetime.timezone})
@@ -123,7 +125,7 @@ class _RestrictedUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str) -> Any:
         if is_dynamic_module_name(module) and module not in sys.modules:
             module = self._library_module_for(module, name)
-        if module not in sys.modules and module.partition(".")[0] not in _IMPORTABLE_PACKAGES:
+        if module not in sys.modules and not may_import_for_decoding(module):
             msg = f"the data refers to '{module}.{name}', whose module is not loaded"
             raise LegacyPickleError(msg)
         resolved = super().find_class(module, name)
