@@ -37,7 +37,7 @@ from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapt
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
+from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     MCPToolsetCache,
@@ -53,6 +53,8 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolResult,
 )
 from griptape_nodes.drivers.cloud_credentials import (
+    BASE_URL_SETTING_NAME,
+    DEFAULT_CLOUD_BASE_URL,
     MISSING_CREDENTIAL_MESSAGE,
     POLICY_DENIED_HINT,
     is_license_credential,
@@ -954,7 +956,7 @@ class AgentManager(EngineScoped):
             # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
             # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
             # malformed endpoint, so the chat and image paths agree.
-            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
+            cloud_base_url = os.environ.get(BASE_URL_SETTING_NAME) or DEFAULT_CLOUD_BASE_URL
             model_base_url: str | None = cloud_base_url
             image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url

@@ -37,12 +37,12 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Added
 
-- Once Griptape Cloud spending budgets are available, a run stops at the node whose call a budget
-  refuses, and the editor's "Run blocked" bar names the node and every budget that refused, for
+- With Griptape Cloud spending budgets, a node whose call a budget refuses fails with a message
+  naming the node and every budget that refused, and the editor's "Run blocked" bar shows it, for
   example: "Budget stopped this run. 'Generate Poster' was blocked by the budget "Marketing Q3".
-  Contact your Griptape administrator." A budget refusal does not take a node's Failure output, and
-  a loop stops at the first refused iteration. In the sidebar chat the same refusal ends the reply
-  instead. See
+  Contact your Griptape administrator." A node with its Failure output wired takes that branch, as
+  it does for any other error, and a loop stops at the first refused iteration. In the sidebar
+  chat the same refusal ends the reply instead. See
   [When a budget stops a run](https://docs.griptapenodes.com/en/stable/guides/editor/running_workflows/#when-a-budget-stops-a-run).
   [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
 - Projects have two new situations for versioned output folders. `save_output_directory` creates

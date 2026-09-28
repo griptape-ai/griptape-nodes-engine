@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic_ai.exceptions import ModelRetry
 
+from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
@@ -37,9 +38,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-
-GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
-"""Default Griptape Cloud root. The ``/api/images`` prefix is added here."""
 
 DEFAULT_IMAGE_MODEL = "gpt-image-1-mini"
 DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 120.0
@@ -69,7 +67,7 @@ class ImageGenerationToolsetConfig:
 
     api_key: str
     model: str = DEFAULT_IMAGE_MODEL
-    base_url: str = GRIPTAPE_CLOUD_BASE_URL
+    base_url: str = DEFAULT_CLOUD_BASE_URL
     image_size: str | None = None
     quality: str | None = None
     background: str | None = None

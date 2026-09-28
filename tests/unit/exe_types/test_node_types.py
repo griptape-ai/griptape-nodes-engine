@@ -1,14 +1,11 @@
 from unittest.mock import Mock, patch
 
-import httpx
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.traits.slider import Slider
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, BudgetRefusal
-from tests.unit.utils.test_budget_refusal import CLOUD_HOST, a_refusal_body
 
 from .mocks import MockNode
 
@@ -338,22 +335,12 @@ class TestParameterVisibilityKeepsTraitStateLive:
         assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}
 
 
-class TestBudgetHaltsIgnoreTheFailureBranch:
-    """A budget block stops the run even when the node has a Failed path wired up.
+class TestBudgetHaltsTakeTheFailureBranch:
+    """A budget refusal is one node's failure, routed like any other.
 
-    The Failed output means "this operation failed, here is the recovery path". A budget
-    block is not this operation failing: it is the authority to spend being withdrawn, and
-    it applies just as much to every node the recovery path leads to. Routing down Failed
-    would spend on a branch that is refused in turn, turning one clear halt into one
-    confusing error per node.
+    A Failed branch may lead somewhere the budget does not reach, such as a local model, so
+    the node's wiring decides what happens next.
     """
-
-    @staticmethod
-    def _node_with_failure_connected() -> SuccessFailureNode:
-        """A node whose Failed output is wired, which is the graceful-handling case."""
-        node = SuccessFailureNode(name="refused_call")
-        node._has_outgoing_connections = Mock(return_value=True)  # type: ignore[method-assign]
-        return node
 
     @staticmethod
     def _a_budget_error() -> BudgetExceededError:
@@ -362,58 +349,15 @@ class TestBudgetHaltsIgnoreTheFailureBranch:
             BudgetRefusal(),
         )
 
-    def test_a_budget_error_raises_despite_the_failure_branch(self) -> None:
-        node = self._node_with_failure_connected()
+    def test_a_budget_error_takes_a_connected_failure_branch(self) -> None:
+        node = SuccessFailureNode(name="refused_call")
+        node._has_outgoing_connections = Mock(return_value=True)  # type: ignore[method-assign]
+
+        node._handle_failure_exception(self._a_budget_error())
+
+    def test_a_budget_error_raises_with_nothing_connected(self) -> None:
+        node = SuccessFailureNode(name="refused_call")
+        node._has_outgoing_connections = Mock(return_value=False)  # type: ignore[method-assign]
 
         with pytest.raises(BudgetExceededError):
             node._handle_failure_exception(self._a_budget_error())
-
-    def test_a_forwarded_budget_error_raises_too(self) -> None:
-        """The node may have run in a worker, where `isinstance` no longer answers."""
-        node = self._node_with_failure_connected()
-        forwarded = converter.structure(converter.unstructure(self._a_budget_error()), Exception)
-
-        with pytest.raises(Exception, match=BUDGET_HALT_PREFIX) as caught:
-            node._handle_failure_exception(forwarded)  # type: ignore[arg-type]
-
-        assert caught.value is forwarded
-
-    def test_a_raw_cloud_refusal_raises_despite_the_failure_branch(self) -> None:
-        """A node that wraps the Cloud 403 in its own error has not recognized the refusal.
-
-        It is refused just the same, and the recovery path would be too.
-        """
-        node = self._node_with_failure_connected()
-        node._cloud_host = Mock(return_value=CLOUD_HOST)  # type: ignore[method-assign]
-        request = httpx.Request("POST", f"https://{CLOUD_HOST}/api/assets")
-        response = httpx.Response(403, json=a_refusal_body(), request=request)
-        http_error = httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
-        wrapped = RuntimeError("Attempted to register the asset. Failed due to a 403.")
-        wrapped.__cause__ = http_error
-
-        with pytest.raises(RuntimeError) as caught:
-            node._handle_failure_exception(wrapped)
-
-        assert caught.value is wrapped
-
-    def test_every_other_error_still_takes_the_graceful_path(self) -> None:
-        """The contract tripwire: only budget refusals override a connected Failed output."""
-        node = self._node_with_failure_connected()
-
-        node._handle_failure_exception(ValueError("the API returned garbage"))
-
-    def test_the_cloud_host_comes_from_the_engine_settings(self) -> None:
-        """Only a 403 from the Cloud deployment this engine uses is read as a budget refusal."""
-        node = SuccessFailureNode(name="refused_call")
-        engine = Mock()
-        engine.secrets_manager.get_secret.return_value = "https://cloud.example.test/api"
-
-        with patch.object(SuccessFailureNode, "engine", engine):
-            assert node._cloud_host() == "cloud.example.test"
-
-    def test_an_ordinary_error_still_raises_with_nothing_connected(self) -> None:
-        node = SuccessFailureNode(name="unconnected")
-        node._has_outgoing_connections = Mock(return_value=False)  # type: ignore[method-assign]
-
-        with pytest.raises(ValueError, match="the API returned garbage"):
-            node._handle_failure_exception(ValueError("the API returned garbage"))

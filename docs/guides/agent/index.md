@@ -43,11 +43,6 @@ For example, you can ask it to:
 
 ## When a budget stops a reply
 
-!!! note
-
-    Spending budgets are not yet available on Griptape Cloud. This section
-    describes how replies behave once they are.
-
 If your organization has set a spending budget on Griptape Cloud and a reply
 would go over it, the agent stops and says so in the thread, in place of its
 answer:

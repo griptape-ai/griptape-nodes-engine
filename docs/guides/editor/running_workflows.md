@@ -88,15 +88,10 @@ Running** dialog (see [Saving](#saving) below) — that dialog offers a
 
 ### When a budget stops a run
 
-!!! note
-
-    Spending budgets are not yet available on Griptape Cloud. This section
-    describes how runs behave once they are.
-
-If your organization has set a spending budget on Griptape Cloud, a run
-that would go over it stops on its own. A **Run blocked** bar appears
-across the top of the canvas naming the node that was stopped and the
-budget that stopped it:
+If your organization has set a spending budget on Griptape Cloud, a node
+whose call would go over it fails, and the run stops there. A **Run
+blocked** bar appears across the top of the canvas naming the node that was
+stopped and the budget that stopped it:
 
 > Budget stopped this run. 'Generate Poster' was blocked by the budget
 > "Marketing Q3". Contact your Griptape administrator.
@@ -106,10 +101,13 @@ the workflow again.
 
 A few things worth knowing:
 
-- **The run stops where it is.** A budget block is not a node error you
-    can route around — if the node has a **Failure** output wired up, the
-    run still stops rather than taking that branch. Retrying spends
-    nothing new, because the call never reached the model.
+- **A Failure output still works.** If the node's **Failure** output is
+    wired up, the run takes that branch instead of stopping, just as it
+    would for any other error. Use it to fall back to a local model when a
+    budget runs out. Retrying spends nothing new, because the refused call
+    never reached the model.
+- **A loop stops at the first refused pass.** Every later pass would ask
+    the same budget and be refused too.
 - **Work already in flight still costs credits.** Budgets are checked
     before each call goes out, so a call that was already running when the
     budget filled up finishes and is billed.

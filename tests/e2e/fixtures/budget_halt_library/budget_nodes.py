@@ -7,12 +7,12 @@ and hands whatever it raises to the same two functions a real credit-spending no
 ``refusal_from_exception`` to decide whether Griptape Cloud refused it over budget, and
 ``_handle_failure_exception`` to route the result. Pointed at a stub that answers 403 with a
 recorded refusal body, it exercises the whole path -- ``httpx`` raising, the chain being walked,
-the body being parsed, the halt being worded, and the Failed branch being overridden -- with no
+the body being parsed, the halt being worded, and the result routed down Failed -- with no
 network and no Cloud account.
 
-Two instances of the one node type make the test: the first is refused, the second hangs off its
-Failed output and writes a file if it ever runs. That file is how a run that routed down Failed
-past a budget block becomes visible.
+Two instances of the one node type make the Failed-branch test: the first is refused, the second
+hangs off its Failed output and writes a file when it runs. That file is how the test sees the
+branch was taken.
 
 ``UnhandledCloudCallNode`` and ``DriverHaltNode`` cover the nodes that do *not* do that work
 themselves, which is most of them. The first lets the raw HTTP error out, the way any node

@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, cast
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    BASE_URL_SETTING_NAME,
+    DEFAULT_CLOUD_BASE_URL,
+    MISSING_CREDENTIAL_MESSAGE,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.cloud_models import (
     LM_STUDIO_DEFAULT_BASE_URL,
     OLLAMA_DEFAULT_BASE_URL,
@@ -28,9 +33,6 @@ from griptape_nodes.drivers.cloud_models import (
 
 if TYPE_CHECKING:
     from pydantic_ai.settings import ModelSettings
-
-GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
-"""Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
 
 
 def build_griptape_cloud_model(
@@ -50,7 +52,7 @@ def build_griptape_cloud_model(
             :func:`resolve_cloud_credential`. Sent as ``Authorization: Bearer <key>``.
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
             the ``GT_CLOUD_BASE_URL`` environment variable, then to
-            :data:`GRIPTAPE_CLOUD_BASE_URL`.
+            :data:`~griptape_nodes.drivers.cloud_credentials.DEFAULT_CLOUD_BASE_URL`.
         settings: Default :class:`ModelSettings` for the returned model. ``None``
             falls back to the catalog preset for ``model_name`` via
             :func:`model_settings_for`; pass a dict to override it. Without
@@ -74,7 +76,7 @@ def build_griptape_cloud_model(
         # ModelSettings fields there and asserted in the catalog's tests, so this
         # is the boundary where that guarantee becomes the static type.
         resolved_settings = cast("ModelSettings", preset) if preset is not None else None
-    cloud_root = (base_url or os.environ.get("GT_CLOUD_BASE_URL", GRIPTAPE_CLOUD_BASE_URL)).rstrip("/")
+    cloud_root = (base_url or os.environ.get(BASE_URL_SETTING_NAME, DEFAULT_CLOUD_BASE_URL)).rstrip("/")
     return OpenAIChatModel(
         model_name,
         provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),

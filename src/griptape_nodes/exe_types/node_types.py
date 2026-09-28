@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
-from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
     ControlParameterInput,
@@ -62,7 +61,6 @@ from griptape_nodes.retained_mode.events.resource_events import (
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
-from griptape_nodes.utils.budget_refusal import is_budget_halt, refusal_from_exception
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
@@ -2517,18 +2515,9 @@ class SuccessFailureNode(BaseNode):
         to allow graceful failure handling. If no connections exist, raises the exception
         to crash the flow and provide immediate feedback.
 
-        A budget refusal is the exception, and always stops the run: the Failed
-        branch would spend credits too and be refused in turn. This includes a
-        raw Cloud 403, or a node's own error raised from one.
-
         Args:
             exception: The exception that caused the failure
         """
-        if is_budget_halt(exception):
-            raise exception
-        if refusal_from_exception(exception, cloud_host=self._cloud_host) is not None:
-            raise exception
-
         if self._has_outgoing_connections(self.failure_output):
             # User has connected something to Failed output, they want to handle errors gracefully
             logger.error(
@@ -2549,10 +2538,6 @@ class SuccessFailureNode(BaseNode):
         """Clear result details before node runs to avoid confusion from previous sessions."""
         self._set_status_results(was_successful=False, result_details="<Results will appear when the node executes>")
         return super().validate_before_node_run()
-
-    def _cloud_host(self) -> str:
-        """Hostname of the Griptape Cloud deployment this engine is pointed at."""
-        return resolve_cloud_host(self.engine.secrets_manager)
 
 
 class StartNode(BaseNode):
