@@ -272,6 +272,16 @@ class TestSelectedNodesCommandsJson:
         (connection,) = restored.serialized_connection_commands
         assert type(connection) is SerializedSelectedNodesCommands.IndirectConnectionSerialization
 
+    def test_disallowed_element_command_fails_to_read(self, selection: SerializedSelectedNodesCommands) -> None:
+        encoded = json.loads(json.dumps(encode_commands(selection)))
+        node_commands = encoded["commands"]["serialized_node_commands"][0]
+        node_commands["element_modification_commands"].append(
+            {"request_type": "RunArbitraryPythonStringRequest", "request": {"python_string": "import os"}}
+        )
+
+        with pytest.raises(CommandsFormatError, match="RunArbitraryPythonStringRequest"):
+            decode_commands(encoded, SerializedSelectedNodesCommands)
+
 
 class TestLayout:
     def test_commands_name_no_engine_classes(self, flow_commands: SerializedFlowCommands) -> None:
@@ -304,6 +314,28 @@ class TestLayout:
                 command["request_type"] = "NoSuchRequest"
 
         with pytest.raises(CommandsFormatError, match="incomplete or damaged"):
+            decode_commands(encoded, SerializedFlowCommands)
+
+    def test_disallowed_element_command_fails_to_read(self, flow_commands: SerializedFlowCommands) -> None:
+        encoded = json.loads(json.dumps(encode_commands(flow_commands)))
+        node_commands = encoded["commands"]["serialized_node_commands"][0]
+        node_commands["element_modification_commands"].append(
+            {"request_type": "RunArbitraryPythonStringRequest", "request": {"python_string": "import os"}}
+        )
+
+        with pytest.raises(CommandsFormatError, match="RunArbitraryPythonStringRequest"):
+            decode_commands(encoded, SerializedFlowCommands)
+
+    def test_disallowed_element_command_in_a_sub_flow_fails_to_read(
+        self, flow_commands: SerializedFlowCommands
+    ) -> None:
+        encoded = json.loads(json.dumps(encode_commands(flow_commands)))
+        (sub_flow,) = encoded["commands"]["sub_flows_commands"]
+        sub_flow["serialized_node_commands"][0]["element_modification_commands"].append(
+            {"request_type": "RunArbitraryPythonStringRequest", "request": {"python_string": "import os"}}
+        )
+
+        with pytest.raises(CommandsFormatError, match="RunArbitraryPythonStringRequest"):
             decode_commands(encoded, SerializedFlowCommands)
 
     def test_data_from_a_later_version_fails_to_read(self, flow_commands: SerializedFlowCommands) -> None:

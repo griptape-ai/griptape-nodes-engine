@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import pickle
 import sys
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
@@ -10,6 +11,14 @@ from typing import TYPE_CHECKING
 import pytest
 from PIL import Image
 
+from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.retained_mode.events.arbitrary_python_events import RunArbitraryPythonStringRequest
+from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    SerializedNodeCommands,
+    SerializedSelectedNodesCommands,
+)
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.serialization.legacy_pickle import (
     LegacyPickleError,
@@ -98,4 +107,46 @@ class TestLegacyPayloads:
         text = _call("pathlib", "PurePosixPath", "a").decode("latin-1")
 
         with pytest.raises(LegacyPickleError, match="not copied nodes"):
+            read_legacy_clipboard_commands(text, ())
+
+
+def _node_commands_running_arbitrary_python() -> SerializedNodeCommands:
+    """A node's commands holding an element command serialization never writes."""
+    return SerializedNodeCommands(
+        create_node_command=CreateNodeRequest(node_type="Holder"),
+        element_modification_commands=[RunArbitraryPythonStringRequest(python_string="import os")],
+        node_dependencies=NodeDependencies(),
+    )
+
+
+class TestElementCommandAllowlist:
+    """An element command naming a request serialization never writes is refused, not run."""
+
+    def test_image_payload_with_disallowed_element_command_is_refused(self) -> None:
+        commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[_node_commands_running_arbitrary_python()],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=NodeDependencies(),
+            node_types_used=set(),
+        )
+        text = base64.b64encode(pickle.dumps(commands)).decode("ascii")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
+            read_legacy_image_flow_commands(text, ())
+
+    def test_clipboard_payload_with_disallowed_element_command_is_refused(self) -> None:
+        commands = SerializedSelectedNodesCommands(
+            serialized_node_commands=[_node_commands_running_arbitrary_python()],
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            serialized_connection_commands=[],
+        )
+        text = pickle.dumps(commands).decode("latin-1")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
             read_legacy_clipboard_commands(text, ())

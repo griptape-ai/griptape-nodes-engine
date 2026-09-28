@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import SerializedSelectedNodesCommands
+from griptape_nodes.serialization.commands import CommandsFormatError, check_element_modification_commands
 from griptape_nodes.serialization.type_names import DYNAMIC_MODULE_PREFIX, is_dynamic_module_name
 from griptape_nodes.serialization.values import JsonValue, ValueEncodeError, encode_value, has_plain_data_form
 
@@ -76,6 +77,7 @@ def read_legacy_image_flow_commands(text: str, library_modules: Collection[str])
     if not isinstance(commands, SerializedFlowCommands):
         msg = f"the data holds a '{type(commands).__qualname__}', not flow commands"
         raise LegacyPickleError(msg)
+    _check_element_modification_commands(commands)
     _encode_value_pools(commands)
     logger.warning(
         "Loaded a workflow from an image saved by an earlier version of Griptape Nodes. A later release "
@@ -94,6 +96,7 @@ def read_legacy_clipboard_commands(text: str, library_modules: Collection[str]) 
     if not isinstance(commands, SerializedSelectedNodesCommands):
         msg = f"the data holds a '{type(commands).__qualname__}', not copied nodes"
         raise LegacyPickleError(msg)
+    _check_element_modification_commands(commands)
     logger.warning(
         "Pasted nodes copied by an earlier version of Griptape Nodes. A later release will stop reading "
         "nodes copied that way. Copy them again to paste them in later releases."
@@ -152,6 +155,18 @@ class _RestrictedUnpickler(pickle.Unpickler):
             )
             raise LegacyPickleError(msg)
         return matches[0]
+
+
+def _check_element_modification_commands(commands: SerializedFlowCommands | SerializedSelectedNodesCommands) -> None:
+    """Refuse pickle-era commands naming an element command type serialization never writes.
+
+    Raises:
+        LegacyPickleError: A node's element_modification_commands holds such a type.
+    """
+    try:
+        check_element_modification_commands(commands)
+    except CommandsFormatError as error:
+        raise LegacyPickleError(str(error)) from error
 
 
 def _encode_value_pools(commands: SerializedFlowCommands) -> None:
