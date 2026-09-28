@@ -3037,12 +3037,18 @@ class ProjectManager(EngineScoped):
         # Ahead of refresh_workflow_registry, which deletes the entry this teardown resolves
         # paths through, and ahead of the reload below, whose own clear then finds an empty
         # stack and no-ops.
+        #
+        # Both failures below report altered_workflow_state: the teardown pops the context
+        # before the checks that can fail it, so the workflow is gone either way. A failure
+        # that claimed otherwise would leave the client showing a workflow the engine has
+        # dropped, which is the state this teardown exists to prevent.
         if workspace_changed:
             clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
             if not clear_result.succeeded():
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but the open workflow could not be closed: {clear_result.result_details}",
+                    altered_workflow_state=True,
                 )
         if library_config_changed:
             reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
@@ -3050,6 +3056,7 @@ class ProjectManager(EngineScoped):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but library reload failed: {reload_result.result_details}",
+                    altered_workflow_state=True,
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
