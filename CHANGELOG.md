@@ -12,6 +12,12 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Added
 
+- Projects have two new situations for versioned output folders. `save_output_directory` creates
+  `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
+  run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
+  use them through `ProjectDirectoryParameter` and `ProjectFileSequenceParameter`. Projects on
+  the legacy template fall back to the same layout. See
+  [Situations](https://docs.griptapenodes.com/en/stable/guides/projects/situations/#save_output_directory).
 - The engine can run inside a [Rez](https://github.com/AcademySoftwareFoundation/rez) environment.
   Pointing `GTN_REZ_BIN_PATH` at Rez's tools turns it on: libraries listed as `REZ:<package>` in
   `libraries_to_register` load from the packages Rez can resolve, each library's worker runs in its
@@ -26,6 +32,29 @@ the engine's request API from working without edits. Migration steps live in
 - On a Rez workstation, the engine picks the GPU build of torch its NVIDIA driver supports. A
   library that needs torch does not load when no build fits the workstation, and the library list
   says why.
+
+### Changed
+
+- **Breaking:** The setting `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
+  (env `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`). With its heartbeat role removed, what it bounds
+  is how long a worker may take to load its library, which the new name states. A config file still
+  setting the old name silently falls back to the 600 second default.
+
+### Fixed
+
+- The process a library runs isolated in shuts down within about 35 seconds of losing the engine
+  that started it. Before, if that engine exited in the process's first 10 minutes, the process
+  stayed up until those 10 minutes had passed. `worker.library_load_timeout_s` no longer delays
+  that check; it still bounds how long the engine waits for the process to load its library.
+  Setting `worker.heartbeat_timeout_s` below 30 seconds does not shorten this, on purpose: a busy
+  engine can be slow to challenge, and a library's process must not read that as an engine that died.
+- A library whose isolated process shuts down before loading it now reports that as soon as the
+  process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
+  load that never finished.
+- Creating a versioned output folder or file sequence in a project no longer fails with "requires
+  at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
+  `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
+  callers only supply their own variables.
 
 ## [0.102.0] - 2026-09-24
 
