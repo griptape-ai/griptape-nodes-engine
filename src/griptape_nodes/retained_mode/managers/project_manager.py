@@ -4770,7 +4770,7 @@ class ProjectManager(EngineScoped):
 
         Raises ValueError when the project isn't loaded or the name isn't a computed name;
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
-        {workflow_dir} before the workflow is saved).
+        {workflow_dir} with no workflow in context).
         """
         effective = self.resolve_project_id(project_id)
         if effective is None:
@@ -5064,16 +5064,20 @@ class ProjectManager(EngineScoped):
         resolve, since answering with the root is what dropping an optional `{workflow_dir}`
         already did -- a never-saved workflow keeps a usable folder either way.
         """
+        # Anchored so every answer here has one shape: the resolved path is fully absolute, and on
+        # Windows a bare `/workspace` carries no drive letter until it is anchored against the CWD.
+        workspace_root = str(resolve_path_safely(Path(self._resolve_builtin_workspace_dir())))
+
         # Resolving the situation can reach `workflow_dir` again and land back here, so answer the
         # root for the duration. The macro may name the builtin outright, or reach it through a
         # directory: every v1 default directory is `{workflow_dir?:/}<name>`, and that form appends
         # its own name once per pass, so an unguarded loop yields `outputs/outputs/outputs/...`.
         if self._resolving_default_workflow_save_dir:
-            return self._resolve_builtin_workspace_dir()
+            return workspace_root
 
         parsed_macro = project_info.parsed_situation_schemas.get(BuiltInSituation.SAVE_WORKFLOW)
         if parsed_macro is None:
-            return self._resolve_builtin_workspace_dir()
+            return workspace_root
 
         self._resolving_default_workflow_save_dir = True
         try:
@@ -5097,7 +5101,7 @@ class ProjectManager(EngineScoped):
                 BuiltInSituation.SAVE_WORKFLOW,
                 result.result_details,
             )
-            return self._resolve_builtin_workspace_dir()
+            return workspace_root
 
         return str(result.absolute_path.parent)
 

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
-from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -13237,6 +13237,14 @@ class TestUnsavedWorkflowDirFromSaveSituation:
 
         return pm
 
+    def _expected_dir(self, *parts: str) -> str:
+        """A workspace-anchored folder, anchored the way the resolution anchors it.
+
+        The resolved path is fully absolute, which on Windows means a drive letter that a bare
+        `Path("/workspace")` does not carry, so the expectation has to go through the same call.
+        """
+        return str(resolve_path_safely(Path("/workspace", *parts)))
+
     def _resolve_workflow_dir(self, pm: ProjectManager, workflow_dir_requests: list[str] | None = None) -> str:
         """Resolve `{workflow_dir}` through the registered-but-unsaved registry entry.
 
@@ -13265,7 +13273,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         """The shipped `{workspace_dir}/{sub_dirs?:/}...` macro puts a workflow at the root."""
         pm = self._project_manager("{workspace_dir}/{sub_dirs?:/}{file_name_base}.{file_extension}")
 
-        assert self._resolve_workflow_dir(pm) == str(Path("/workspace"))
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
 
     def test_relocated_macro_answers_its_own_folder(self) -> None:
         """The point of reading the situation: a template that saves elsewhere is answered with it.
@@ -13275,7 +13283,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         """
         pm = self._project_manager("{workspace_dir}/workflows/{sub_dirs?:/}{file_name_base}.{file_extension}")
 
-        assert self._resolve_workflow_dir(pm) == str(Path("/workspace/workflows"))
+        assert self._resolve_workflow_dir(pm) == self._expected_dir("workflows")
 
     def test_sub_dirs_is_omitted_rather_than_guessed(self) -> None:
         """`sub_dirs` is a per-save choice, so the prediction leaves it out instead of inventing one.
@@ -13299,7 +13307,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
 
         resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
 
-        assert resolved == str(Path("/workspace"))
+        assert resolved == self._expected_dir()
         assert len(workflow_dir_requests) == 1
 
     def test_macro_reaching_workflow_dir_through_a_directory_does_not_recurse(self) -> None:
@@ -13315,7 +13323,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
 
         resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
 
-        assert resolved == str(Path("/workspace/outputs"))
+        assert resolved == self._expected_dir("outputs")
         assert len(workflow_dir_requests) == 1
 
     def test_stored_project_variable_resolves_the_same_way_the_save_would(self) -> None:
@@ -13330,16 +13338,16 @@ class TestUnsavedWorkflowDirFromSaveSituation:
             stored_project_variables={"team_folder": "lighting"},
         )
 
-        assert self._resolve_workflow_dir(pm) == str(Path("/workspace/lighting"))
+        assert self._resolve_workflow_dir(pm) == self._expected_dir("lighting")
 
     def test_missing_situation_answers_the_workspace_root(self) -> None:
         """A template with no `save_workflow` situation still gets a usable folder."""
         pm = self._project_manager(None)
 
-        assert self._resolve_workflow_dir(pm) == str(Path("/workspace"))
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
 
     def test_unresolvable_macro_answers_the_workspace_root(self) -> None:
         """An undefined required variable falls back instead of failing the whole resolution."""
         pm = self._project_manager("{no_such_directory}/{file_name_base}.{file_extension}")
 
-        assert self._resolve_workflow_dir(pm) == str(Path("/workspace"))
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
