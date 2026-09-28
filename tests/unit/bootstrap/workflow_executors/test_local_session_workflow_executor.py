@@ -10,16 +10,18 @@ from unittest.mock import MagicMock
 from griptape_nodes.bootstrap.workflow_executors.local_session_workflow_executor import (
     LocalSessionWorkflowExecutor,
 )
+from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalExecutorError
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     EventResultSuccess,
     ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     RequestPayload,
     ResultPayloadSuccess,
 )
-from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest
+from griptape_nodes.retained_mode.events.execution_events import ControlFlowResolvedEvent, StartFlowRequest
 
 
 class _NoJsonForm:
@@ -183,3 +185,27 @@ class TestSendResult:
         assert data["response_topic"] == "sessions/abc/response"
         assert data["request_type"] == "StartFlowRequest"
         assert "_UnsendableResultSuccess" in data["result"]["result_details"]["result_details"][0]["message"]
+
+
+class TestSendExecutionEvent:
+    """A run whose result cannot be sent fails instead of reporting success with no output."""
+
+    def test_unsendable_resolved_event_fails_the_run(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        resolved = ControlFlowResolvedEvent(end_node_name="End", parameter_output_values={"out": _NoJsonForm()})
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=resolved))
+
+        error = executor._send_execution_event(event)
+
+        assert isinstance(error, LocalExecutorError)
+        assert "workflow's result" in str(error)
+        executor.send_event.assert_not_called()
+
+    def test_unsendable_progress_event_is_skipped(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        payload = _UnsendableExecutionPayload(anything=_NoJsonForm())
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+
+        assert executor._send_execution_event(event) is None

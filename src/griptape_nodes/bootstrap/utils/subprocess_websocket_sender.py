@@ -102,14 +102,19 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
         except asyncio.QueueFull:
             logger.error("WebSocket queue full, event dropped: %s", event_type)
 
-    def _send_event(self, event_type: str, event: BaseEvent) -> None:
-        """Send an event, logging and skipping it if it holds a value with no JSON form."""
+    def _send_event(self, event_type: str, event: BaseEvent) -> EventSerializationError | None:
+        """Send an event, logging and skipping it if it holds a value with no JSON form.
+
+        Returns:
+            The error when the event was skipped, for callers that cannot let it go.
+        """
         try:
             payload = event.json()
         except EventSerializationError as error:
             logger.error("Could not send %s: %s", event_type, error)
-            return
+            return error
         self.send_event(event_type, payload)
+        return None
 
     def _send_result(self, event_type: str, event: EventResultSuccess | EventResultFailure) -> None:
         """Send a result, or a GenericResultFailure naming why it could not be sent, so the requester hears back."""
