@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from griptape.artifacts import ImageUrlArtifact
@@ -16,6 +16,13 @@ from griptape_nodes.serialization.converter import (
     converter,
 )
 from griptape_nodes.serialization.values import Value, ValueEncodeError
+
+
+class _UnresolvableHints(NamedTuple):
+    """Like a NamedTuple naming a type imported only under TYPE_CHECKING."""
+
+    message: str
+    problem: "_NotImported | None"  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
 
 
 @dataclass
@@ -265,6 +272,14 @@ class TestNamedTupleFields:
 
         assert restored == library
         assert type(restored.path) is type(library.path)
+
+    def test_unresolvable_hints_fall_back_to_runtime_values(self) -> None:
+        issue = _UnresolvableHints("m", None)
+
+        data = converter.unstructure(issue)
+
+        assert data == ("m", None)
+        assert converter.structure(list(data), _UnresolvableHints) == issue
 
 
 class TestRequestFields:
