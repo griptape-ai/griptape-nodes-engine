@@ -130,6 +130,13 @@ def _parse_annotation_graph(stdout: str) -> tuple[list[ResolvedEntry], dict[str,
             current_norm = pip_normalize(name)
             in_via = False
 
+        elif stripped and not line.startswith(" ") and not stripped.startswith("#"):
+            # Not a `name==version` pin: a local requirement (`name @ file:///...`), which the
+            # caller provides itself. It ends the previous entry, so its `# via` lines are not
+            # credited to that entry.
+            current_norm = None
+            in_via = False
+
         elif current_norm and stripped.startswith("# via"):
             tail = stripped[len("# via") :].strip()
             in_via = True
@@ -234,10 +241,17 @@ class WheelInfo:
     is_pure_python: bool
     platform_tag: str  # e.g. "macosx_11_0_arm64" or "any"
     requires_dist: list[str]  # raw Requires-Dist strings from METADATA
+    # Console script name -> entry point target ("package.module:function").
+    console_script_targets: dict[str, str] = field(default_factory=dict)
 
 
 def _parse_entry_points(text: str) -> list[str]:
-    tools: list[str] = []
+    return list(_parse_console_script_targets(text))
+
+
+def _parse_console_script_targets(text: str) -> dict[str, str]:
+    """Console script names and their entry point targets from an entry_points.txt."""
+    targets: dict[str, str] = {}
     in_console = False
     for line in text.splitlines():
         s = line.strip()
@@ -246,8 +260,9 @@ def _parse_entry_points(text: str) -> list[str]:
         elif s.startswith("["):
             in_console = False
         elif in_console and "=" in s:
-            tools.append(s.split("=")[0].strip())
-    return tools
+            name, _, target = s.partition("=")
+            targets[name.strip()] = target.strip()
+    return targets
 
 
 def _detect_wheel_tag(dist_info: Path) -> tuple[bool, str]:
@@ -297,9 +312,10 @@ def read_wheel_info(install_dir: Path, pip_name: str, version: str) -> WheelInfo
         requires_python = requires_python.strip()
 
     ep_file = dist_info / "entry_points.txt"
-    console_scripts = (
-        _parse_entry_points(ep_file.read_text(encoding="utf-8", errors="replace")) if ep_file.exists() else []
-    )
+    console_script_targets: dict[str, str] = {}
+    if ep_file.exists():
+        console_script_targets = _parse_console_script_targets(ep_file.read_text(encoding="utf-8", errors="replace"))
+    console_scripts = list(console_script_targets)
 
     is_pure, platform_tag = _detect_wheel_tag(dist_info)
     requires_dist = msg.get_all("Requires-Dist") or []
@@ -323,6 +339,7 @@ def read_wheel_info(install_dir: Path, pip_name: str, version: str) -> WheelInfo
         is_pure_python=is_pure,
         platform_tag=platform_tag,
         requires_dist=requires_dist,
+        console_script_targets=console_script_targets,
     )
 
 
@@ -931,8 +948,9 @@ def requires():
 
     commands_lines = ["    env.PYTHONPATH.append('{root}/python')"]
     if info.console_scripts:
-        commands_lines.append("    env.PATH.append('{root}/bin')")
-        commands_lines.append("    env.PATH.append('{root}/Scripts')")
+        # Prepended: rez's system paths come from the login shell, and a tool installed there
+        # (a workstation's own gtn) must not shadow the package's.
+        commands_lines.append("    env.PATH.prepend('{root}/bin')")
     commands_body = "\n".join(commands_lines)
 
     desc = info.description.replace("'", "\\'")[:200] if info.description else ""
@@ -1036,11 +1054,11 @@ def _other_platforms(pip_name: str, version: str, packages_dir: Path) -> set[str
     return found
 
 
-def _copy_payload(install_dir: Path, payload_root: Path, console_scripts: list[str]) -> None:
+def _copy_payload(install_dir: Path, payload_root: Path, console_script_targets: dict[str, str]) -> None:
     """Copy wheel files from *install_dir* into the rez payload layout.
 
     Python modules → ``payload_root/python/``
-    Console scripts → ``payload_root/bin/``
+    Console scripts → ``payload_root/bin/``, as launchers (see ``_write_console_script``)
     """
     python_dir = payload_root / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
@@ -1057,14 +1075,37 @@ def _copy_payload(install_dir: Path, payload_root: Path, console_scripts: list[s
         else:
             shutil.copy2(src, dst)
 
-    bin_candidates = [install_dir / "bin", install_dir / "Scripts"]
-    for bin_src in bin_candidates:
-        if bin_src.exists() and console_scripts:
-            bin_dst = payload_root / "bin"
-            bin_dst.mkdir(exist_ok=True)
-            for script_name in console_scripts:
-                for candidate in bin_src.glob(f"{script_name}*"):
-                    shutil.copy2(candidate, bin_dst / candidate.name)
+    if not console_script_targets:
+        return
+    bin_dst = payload_root / "bin"
+    bin_dst.mkdir(exist_ok=True)
+    for name, target in console_script_targets.items():
+        _write_console_script(bin_dst, name, target)
+
+
+def _write_console_script(bin_dir: Path, name: str, target: str) -> None:
+    """Write launchers for a console script that run it with the rez environment's ``python``.
+
+    The scripts uv installs name the interpreter that ran the build (``#!/build/.venv/bin/python``),
+    which does not exist on other machines and would load that venv's packages. These run the
+    entry point (``package.module:function``) with whichever python the rez context provides:
+    ``<name>`` for macOS and Linux, ``<name>.cmd`` for Windows. Both are written, because a
+    pure-Python package has one variant for every platform.
+    """
+    module, _, attribute = target.partition(":")
+    attribute = attribute.split("[", 1)[0].strip()
+    imported = attribute.split(".", 1)[0]
+    call = f"import sys; from {module.strip()} import {imported}; sys.exit({attribute}())"
+
+    posix_script = bin_dir / name
+    posix_script.write_text(f"#!/usr/bin/env python\n{call.replace('; ', chr(10))}\n", encoding="utf-8")
+    posix_script.chmod(0o755)
+    (bin_dir / f"{name}.cmd").write_text(f'@python -c "{call}" %*\r\n', encoding="utf-8", newline="")
+
+
+def _names_provided(spec: str, provided: frozenset[str]) -> bool:
+    parsed = parse_requirement(spec)
+    return parsed is not None and pip_normalize(parsed.pip_name) in provided
 
 
 def write_rez_package(  # noqa: PLR0913
@@ -1075,20 +1116,21 @@ def write_rez_package(  # noqa: PLR0913
     python_version: str,
     backend: str | None = None,
     resolved_versions: dict[str, str] | None = None,
+    provided: frozenset[str] = frozenset(),
 ) -> Path:
     """Turn one installed wheel (``uv pip install --target``) into this machine's variant of a rez package.
 
     The package gets this machine's variant; variants other machines added are kept.
-    Returns the package's version folder.
+    Requirements on *provided* packages (pip-normalised names the caller builds itself) are
+    left out. Returns the package's version folder.
     """
     family_name = rez_name(info.pip_name)
     clean_version = re.sub(r"\+.*$", "", info.version)
     info.version = clean_version
     version_dir = packages_dir / family_name / clean_version
 
-    requires_info = wheel_requires(
-        info.requires_dist, store_requires_dist_reader(packages_dir, resolved_versions or {})
-    )
+    requires_dist = [spec for spec in info.requires_dist if not _names_provided(spec, provided)]
+    requires_info = wheel_requires(requires_dist, store_requires_dist_reader(packages_dir, resolved_versions or {}))
     this_key = current_platform_key()
     existing = read_package_file(version_dir / "package.py")
     if info.is_pure_python:
@@ -1118,7 +1160,7 @@ def write_rez_package(  # noqa: PLR0913
         variant=variant,
         platform_requires=platform_requires,
     )
-    _copy_payload(install_dir, version_dir / _variant_subpath(variant), info.console_scripts)
+    _copy_payload(install_dir, version_dir / _variant_subpath(variant), info.console_script_targets)
     return version_dir
 
 
@@ -1131,6 +1173,7 @@ def _install_one(  # noqa: PLR0913
     extra_flags: list[str] | None,
     python_version: str,
     resolved_versions: dict[str, str] | None = None,
+    provided: frozenset[str] = frozenset(),
 ) -> str | None:
     """Download and install a single resolved package as a rez package.
 
@@ -1193,6 +1236,7 @@ def _install_one(  # noqa: PLR0913
                 python_version=python_version,
                 backend=pkg.torch_backend,
                 resolved_versions=resolved_versions,
+                provided=provided,
             )
             logger.info("[Rez][uv] installed %s==%s → %s", pkg.pip_name, pkg.version, version_dir)
         except OSError as exc:
@@ -1283,6 +1327,7 @@ def install(  # noqa: PLR0913
     python_version: str | None = None,
     skip_installed: bool = True,
     uv_cmd: str | None = None,
+    provided: frozenset[str] = frozenset(),
 ) -> InstallReport:
     """Resolve and install *packages* and all transitive deps as rez packages.
 
@@ -1313,6 +1358,10 @@ def install(  # noqa: PLR0913
         uses. When False, reinstall this machine's variant of every package.
     uv_cmd:
         Override the uv binary path.  Defaults to ``find_uv_bin()``.
+    provided:
+        Pip names (any spelling) of packages the caller builds as rez packages itself, such as
+        the engine given to the resolve as ``griptape-nodes-engine @ file:///...``. They are
+        never installed, and other packages' requirements on them are left out.
 
     Returns:
     -------
@@ -1341,9 +1390,13 @@ def install(  # noqa: PLR0913
     report = InstallReport()
     failed: list[str] = []
 
+    provided = frozenset(pip_normalize(name) for name in provided)
+
     # Dependencies first: a package requesting another's extras reads that package's metadata
     # from the store when its own package.py is written (see ``expand_extras``).
     for pkg in dependencies_first(resolved):
+        if pip_normalize(pkg.pip_name) in provided:
+            continue
         label = f"{pkg.pip_name}=={pkg.version}"
         state = install_state(
             pkg.pip_name, pkg.version, packages_dir, python_version=python_version, backend=pkg.torch_backend
@@ -1362,6 +1415,7 @@ def install(  # noqa: PLR0913
             extra_flags=extra_flags,
             python_version=python_version,
             resolved_versions=resolved_versions,
+            provided=provided,
         )
         if failure is not None:
             failed.append(f"{label} ({failure})")

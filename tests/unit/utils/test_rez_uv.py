@@ -221,6 +221,23 @@ class TestNames:
 
 
 class TestParseAnnotationGraph:
+    def test_local_path_requirement_is_skipped_and_ends_the_previous_entry(self) -> None:
+        output = (
+            "anyio==4.7.0\n"
+            "    # via griptape-nodes\n"
+            "griptape-nodes==0.99.0\n"
+            "    # via -r -\n"
+            "griptape-nodes-engine @ file:///src/griptape-nodes-engine\n"
+            "    # via\n"
+            "    #   -r -\n"
+            "    #   griptape-nodes\n"
+        )
+        pkg_list, requirers_of = _parse_annotation_graph(output)
+
+        assert [entry.pip_name for entry in pkg_list] == ["anyio", "griptape-nodes"]
+        # The engine's `# via` lines are not credited to griptape-nodes.
+        assert "griptape-nodes" not in requirers_of
+
     def test_parses_packages_and_requirers(self) -> None:
         pkg_list, requirers_of = _parse_annotation_graph(COMPILE_OUTPUT)
 
@@ -834,8 +851,9 @@ class TestWritePackagePy:
 
         content = (tmp_path / "package.py").read_text(encoding="utf-8")
         assert "tools = ['demo', 'demo-admin']" in content
-        assert "env.PATH.append('{root}/bin')" in content
-        assert "env.PATH.append('{root}/Scripts')" in content
+        # Prepended, so a tool of the same name installed on the workstation cannot shadow it.
+        assert "env.PATH.prepend('{root}/bin')" in content
+        assert "Scripts" not in content
         assert "variants = [['platform-linux', 'arch-x86_64', 'python-3.12']]" in content
         assert "description" not in content
         assert "authors" not in content
@@ -949,7 +967,7 @@ class TestCopyPayload:
         (scripts_dir / "unrelated.exe").write_bytes(b"")
         payload = tmp_path / "payload"
 
-        _copy_payload(install_dir, payload, ["demo"])
+        _copy_payload(install_dir, payload, {"demo": "demo.cli:main"})
 
         python_dir = payload / "python"
         assert (python_dir / "demo" / "__init__.py").exists()
@@ -958,7 +976,44 @@ class TestCopyPayload:
         assert (python_dir / "top_level.py").exists()
         assert not (python_dir / "demo-1.0.data").exists()
         assert not (python_dir / "bin").exists()
-        assert sorted(p.name for p in (payload / "bin").iterdir()) == ["demo", "demo.exe"]
+        # Launchers are written, not the build's own scripts (demo.exe names the build's python).
+        assert sorted(p.name for p in (payload / "bin").iterdir()) == ["demo", "demo.cmd"]
+
+    def test_launchers_run_the_entry_point_with_the_environments_python(self, tmp_path: Path) -> None:
+        install_dir = tmp_path / "install"
+        _write_fake_wheel(install_dir, "demo", "1.0")
+        payload = tmp_path / "payload"
+
+        _copy_payload(install_dir, payload, {"demo": "demo.cli:app.main [extra]"})
+
+        posix = (payload / "bin" / "demo").read_text(encoding="utf-8")
+        assert posix == "#!/usr/bin/env python\nimport sys\nfrom demo.cli import app\nsys.exit(app.main())\n"
+        assert os.access(payload / "bin" / "demo", os.X_OK) or sys.platform == "win32"
+        windows = (payload / "bin" / "demo.cmd").read_bytes()
+        assert windows == b'@python -c "import sys; from demo.cli import app; sys.exit(app.main())" %*\r\n'
+
+    def test_posix_launcher_runs(self, tmp_path: Path) -> None:
+        if sys.platform == "win32":
+            pytest.skip("POSIX launcher")
+        module_dir = tmp_path / "python"
+        (module_dir / "demo_tool").mkdir(parents=True)
+        (module_dir / "demo_tool" / "__init__.py").write_text(
+            "import sys\ndef main():\n    print('ran', sys.argv[1:])\n    return 3\n", encoding="utf-8"
+        )
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        rez_uv._write_console_script(bin_dir, "demo-tool", "demo_tool:main")
+        python_dir = Path(sys.executable).parent
+        env = {"PATH": os.pathsep.join([str(bin_dir), str(python_dir)]), "PYTHONPATH": str(module_dir)}
+        if not (python_dir / "python").exists():
+            pytest.skip("no `python` next to this interpreter")
+
+        result = subprocess.run(  # noqa: S603
+            [str(bin_dir / "demo-tool"), "a", "b"], env=env, capture_output=True, text=True, check=False
+        )
+
+        assert result.returncode == 3  # noqa: PLR2004 - the entry point's return value is the exit code
+        assert result.stdout.strip() == "ran ['a', 'b']"
 
     def test_replaces_existing_payload(self, tmp_path: Path) -> None:
         install_dir = tmp_path / "install"
@@ -969,7 +1024,7 @@ class TestCopyPayload:
         (python_dir / "demo" / "stale.py").write_text("", encoding="utf-8")
         (python_dir / "single.py").write_text("old = True\n", encoding="utf-8")
 
-        _copy_payload(install_dir, tmp_path / "payload", [])
+        _copy_payload(install_dir, tmp_path / "payload", {})
 
         assert not (python_dir / "demo" / "stale.py").exists()
         assert (python_dir / "single.py").read_text(encoding="utf-8") == "new = True\n"
@@ -1175,6 +1230,32 @@ class TestInstallOne:
 
 
 class TestInstall:
+    @pytest.mark.usefixtures("mock_logger")
+    def test_provided_package_is_neither_installed_nor_required(self, tmp_path: Path, linux_platform: None) -> None:  # noqa: ARG002
+        # The engine builds its own package; the app's requirement on it must not pull a pip copy.
+        compile_output = (
+            "griptape-nodes==0.99.0\n    # via -r -\n"
+            "griptape-nodes-engine==0.103.0\n    # via griptape-nodes\n"
+            "six==1.16.0\n    # via griptape-nodes\n"
+        )
+        wheels = {"griptape-nodes": {"requires": ("griptape-nodes-engine>=0.101.0", "six")}, "six": {}}
+        fake = FakeUv(wheels, compile_output=compile_output)
+
+        with patch.object(rez_uv.subprocess, "run", side_effect=fake):
+            install(
+                "griptape-nodes",
+                packages_dir=tmp_path,
+                python_version="3.12",
+                uv_cmd="uv",
+                provided=frozenset({"griptape_nodes_engine"}),
+            )
+
+        installed_specs = [c[c.index("--target") + 2] for c in fake.calls if "install" in c]
+        assert installed_specs == ["six==1.16.0", "griptape-nodes==0.99.0"]
+        app_package = (tmp_path / "griptape_nodes" / "0.99.0" / "package.py").read_text(encoding="utf-8")
+        assert "griptape_nodes_engine" not in app_package
+        assert "'six'" in app_package
+
     @pytest.mark.usefixtures("mock_logger")
     def test_package_requesting_extras_requires_what_they_add(self, tmp_path: Path, linux_platform: None) -> None:  # noqa: ARG002
         # Compile output is alphabetical: agent-lib is met before the package whose metadata it needs.

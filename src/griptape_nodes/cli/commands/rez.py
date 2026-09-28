@@ -46,6 +46,7 @@ from griptape_nodes.utils.rez_utils import (
     read_library_dependencies,
     read_library_manifest,
     rez_config_dropped_paths,
+    rez_context_environment,
     rez_package_stores,
     rez_setup,
     rez_subprocess_env,
@@ -58,6 +59,13 @@ from griptape_nodes.utils.rez_uv import install as rez_uv_install
 app = typer.Typer(help="Rez package management.")
 
 ENGINE_FAMILY = "griptape_nodes_engine"
+ENGINE_PIP_NAME = "griptape-nodes-engine"
+# The Griptape Nodes app: the `gtn` command that starts the engine and its workers. Built with
+# the engine so `rez env griptape_nodes_engine` provides `gtn` on a workstation with nothing
+# else installed.
+APP_PIP_NAME = "griptape-nodes"
+# The app's extra that adds griptape-nodes-editor-dist, the prebuilt editor `gtn` serves locally.
+APP_EDITOR_EXTRA = "editor"
 LAUNCH_FAMILY = "griptape_launch"
 REZ_PLATFORMS = ("linux", "osx", "windows")
 RELEASING_GUIDE = "docs/releasing-packages.md in the griptape-rez-demo repository"
@@ -77,7 +85,7 @@ class BuildTarget:
 
 
 @app.command("build-engine-package")
-def build_engine_package(
+def build_engine_package(  # noqa: PLR0913, PLR0917
     engine_repo: str = typer.Option(
         None,
         "--engine-repo",
@@ -99,11 +107,22 @@ def build_engine_package(
         "-y",
         help="Never prompt (for scripted/CI use). Stops with the reason when something is missing.",
     ),
+    editor: bool = typer.Option(  # noqa: FBT001
+        True,
+        "--editor/--no-editor",
+        help="Include the prebuilt editor (griptape-nodes-editor-dist), which gtn serves locally. On by default.",
+    ),
+    app_version: str = typer.Option(
+        None,
+        "--app-version",
+        help=f"Version of {APP_PIP_NAME} (the gtn app) to include. Defaults to the newest that supports this engine.",
+    ),
 ) -> None:
-    """Build the griptape-nodes-engine and every pip dependency as rez packages.
+    """Build the griptape-nodes-engine, the gtn app, and every pip dependency as rez packages.
 
-    Needs only rez's tools (GTN_REZ_BIN_PATH) and a package store to build into.
-    Works without the engine running.
+    The engine package requires the app (and, by default, the editor), so
+    `rez env griptape_nodes_engine` provides `gtn`. Needs only rez's tools
+    (GTN_REZ_BIN_PATH) and a package store to build into. Works without the engine running.
     """
     interactive = _can_prompt(yes=yes)
     console.print(Panel("[bold cyan]Rez Engine Package Builder[/bold cyan]", expand=False))
@@ -111,12 +130,21 @@ def build_engine_package(
 
     repo_path, pyproject_path = _resolve_and_validate_repo(engine_repo, interactive=interactive)
     version, dependencies = _read_project_metadata(pyproject_path)
+    app_request = _app_request(app_version, editor=editor)
+    # The engine joins the resolve as this checkout, so the app's requirement on
+    # griptape-nodes-engine is met by the engine being built, never by a PyPI release.
+    build_requests = [*dependencies, app_request, f"{ENGINE_PIP_NAME} @ {repo_path.as_uri()}"]
 
     console.print()
     console.print("[bold]Summary:[/bold]")
     console.print(f"  Engine:       [cyan]{repo_path}[/cyan]")
     console.print(f"  Version:      [green]{version}[/green]")
     console.print(f"  Dependencies: [green]{len(dependencies)}[/green] direct")
+    console.print(f"  gtn app:      [green]{app_request}[/green]")
+    if editor:
+        console.print("  Editor:       [green]included[/green] (gtn serves it locally; --no-editor leaves it out)")
+    else:
+        console.print("  Editor:       [yellow]not included[/yellow] (--no-editor)")
     console.print(f"  Build into:   [cyan]{target.store}[/cyan]")
     if (target.store / ENGINE_FAMILY / version).exists():
         console.print(f"  [yellow]Existing package {ENGINE_FAMILY}-{version} will be replaced.[/yellow]")
@@ -126,10 +154,35 @@ def build_engine_package(
         raise typer.Abort
 
     target.store.mkdir(parents=True, exist_ok=True)
-    _install_deps(dependencies, target.store, skip_installed=not rebuild)
-    _write_engine_package(repo_path, target.store, version, dependencies)
+    _install_deps(build_requests, target.store, skip_installed=not rebuild, provided=frozenset({ENGINE_PIP_NAME}))
+    _write_engine_package(repo_path, target.store, version, build_requests)
     _validate_rez_package(ENGINE_FAMILY, version)
+    _validate_gtn(version)
     _print_engine_next_steps(version)
+
+
+def _app_request(app_version: str | None, *, editor: bool) -> str:
+    """The pip request for the gtn app: ``griptape-nodes[editor]``, pinned when a version is given."""
+    request = APP_PIP_NAME
+    if editor:
+        request += f"[{APP_EDITOR_EXTRA}]"
+    if app_version:
+        request += f"=={app_version}"
+    return request
+
+
+def _validate_gtn(version: str) -> None:
+    """Check that the engine package provides `gtn` from the store, not from another install."""
+    spec = f"{ENGINE_FAMILY}-{version}"
+    context = rez_context_environment([spec])
+    if context.environment is None:
+        console.print(f"  [yellow]rez-env {spec}: could not check gtn: {context.failure}[/yellow]")
+        return
+    found = shutil.which("gtn", path=context.environment.get("PATH"))
+    if found is None:
+        console.print(f"  [red]rez-env {spec}: gtn is not on its PATH[/red]")
+        raise typer.Exit(1)
+    console.print(f"  [green]rez-env {spec}: gtn is {found}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +421,10 @@ def _read_project_metadata(pyproject_path: Path) -> tuple[str, list[str]]:
     return version, dependencies
 
 
-def _install_deps(dependencies: list[str], store: Path, *, skip_installed: bool) -> None:
-    """Install pip dependencies as individual rez packages."""
+def _install_deps(
+    dependencies: list[str], store: Path, *, skip_installed: bool, provided: frozenset[str] = frozenset()
+) -> None:
+    """Install pip dependencies as individual rez packages; *provided* ones are built elsewhere."""
     if not dependencies:
         console.print("[yellow]No pip dependencies found — skipping dependency install.[/yellow]")
         return
@@ -380,6 +435,7 @@ def _install_deps(dependencies: list[str], store: Path, *, skip_installed: bool)
             dependencies,
             packages_dir=store,
             skip_installed=skip_installed,
+            provided=provided,
         )
     except subprocess.CalledProcessError as exc:
         console.print("[red]Attempted to install the engine's dependencies as rez packages. Failed due to:[/red]")
@@ -507,7 +563,7 @@ def _print_engine_next_steps(version: str) -> None:
     table.add_column(style="bold")
     table.add_column()
     table.add_row("Verify:", f"rez-search {ENGINE_FAMILY}")
-    table.add_row("Test:", f'rez-env {ENGINE_FAMILY}-{version} -- python -c "import griptape_nodes"')
+    table.add_row("Test:", f"rez-env {ENGINE_FAMILY}-{version} -- gtn --help")
     table.add_row("Launch:", f"write-launch-package, then rez-env {LAUNCH_FAMILY} -- gtn")
     table.add_row("Release:", f"see {RELEASING_GUIDE}")
     console.print(table)

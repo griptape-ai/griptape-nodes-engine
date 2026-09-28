@@ -40,13 +40,14 @@ from griptape_nodes.cli.commands.rez import (
     _resolve_and_validate_repo,
     _resolve_build_target,
     _resolve_engine_repo,
+    _validate_gtn,
     _validate_rez_package,
     _warn_if_config_replaces_search_path,
     _warn_if_rez_does_not_search,
     _write_engine_package,
     app,
 )
-from griptape_nodes.utils.rez_utils import LibraryInstallResult, RezBase, RezSetup
+from griptape_nodes.utils.rez_utils import LibraryInstallResult, RezBase, RezContextEnvironment, RezSetup
 from griptape_nodes.utils.rez_uv import InstallReport, RezInstallError
 
 if TYPE_CHECKING:
@@ -479,7 +480,7 @@ class TestInstallDeps:
     def test_installs_into_store(self, tmp_path: Path) -> None:
         with patch(f"{MODULE}.rez_uv_install") as install:
             _install_deps(["requests"], tmp_path, skip_installed=False)
-        install.assert_called_once_with(["requests"], packages_dir=tmp_path, skip_installed=False)
+        install.assert_called_once_with(["requests"], packages_dir=tmp_path, skip_installed=False, provided=frozenset())
 
     def test_resolve_failure_shows_uv_error_and_exits(self, tmp_path: Path, output: io.StringIO) -> None:
         error = subprocess.CalledProcessError(1, "uv", stderr="No solution found when resolving requests")
@@ -1038,6 +1039,30 @@ class TestBuildLibraryPackageCommand:
         build.assert_not_called()
 
 
+class TestValidateGtn:
+    @pytest.mark.usefixtures("output")
+    def test_gtn_found_on_the_engine_packages_path(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "griptape_nodes" / "bin"
+        bin_dir.mkdir(parents=True)
+        gtn = bin_dir / "gtn"
+        gtn.write_text("#!/usr/bin/env python\n", encoding="utf-8")
+        gtn.chmod(0o755)
+        (bin_dir / "gtn.cmd").write_text("@python -c pass %*\r\n", encoding="utf-8")
+        context = RezContextEnvironment(environment={"PATH": str(bin_dir)}, failure=None)
+        with patch(f"{MODULE}.rez_context_environment", return_value=context) as read:
+            _validate_gtn("1.2.3")
+        read.assert_called_once_with(["griptape_nodes_engine-1.2.3"])
+
+    def test_missing_gtn_stops_the_build(self, tmp_path: Path, output: io.StringIO) -> None:
+        context = RezContextEnvironment(environment={"PATH": str(tmp_path)}, failure=None)
+        with (
+            patch(f"{MODULE}.rez_context_environment", return_value=context),
+            pytest.raises(typer.Exit),
+        ):
+            _validate_gtn("1.2.3")
+        assert "gtn is not on its PATH" in output.getvalue()
+
+
 class TestBuildEnginePackageCommand:
     @pytest.mark.usefixtures("output", "rez_on")
     def test_builds_without_prompting(self, tmp_path: Path) -> None:
@@ -1047,8 +1072,9 @@ class TestBuildEnginePackageCommand:
             patch(f"{MODULE}._check_rez_bindings") as check,
             patch(f"{MODULE}.typer.confirm") as confirm,
             patch(f"{MODULE}.rez_uv_install") as install,
-            patch(f"{MODULE}.build_direct_requires", return_value=["requests-2.32.3"]),
+            patch(f"{MODULE}.build_direct_requires", return_value=["requests-2.32.3"]) as direct,
             patch(f"{MODULE}._validate_rez_package") as validate,
+            patch(f"{MODULE}._validate_gtn") as validate_gtn,
         ):
             result = runner.invoke(
                 app,
@@ -1057,9 +1083,45 @@ class TestBuildEnginePackageCommand:
         assert result.exit_code == 0, result.output
         check.assert_called_once_with(interactive=False)
         confirm.assert_not_called()
-        install.assert_called_once_with(["requests>=2"], packages_dir=store, skip_installed=True)
+        # The gtn app (with the editor by default) is built with the engine; the engine joins the
+        # resolve as this checkout and is provided by the engine package, never installed from pip.
+        requests = ["requests>=2", "griptape-nodes[editor]", f"griptape-nodes-engine @ {repo.resolve().as_uri()}"]
+        install.assert_called_once_with(
+            requests, packages_dir=store, skip_installed=True, provided=frozenset({"griptape-nodes-engine"})
+        )
+        assert direct.call_args.args[0] == requests
         validate.assert_called_once_with("griptape_nodes_engine", "1.2.3")
+        validate_gtn.assert_called_once_with("1.2.3")
         assert (store / "griptape_nodes_engine" / "1.2.3" / "package.py").exists()
+
+    @pytest.mark.usefixtures("rez_on")
+    def test_no_editor_and_a_pinned_app_version(self, tmp_path: Path, output: io.StringIO) -> None:
+        repo = _make_engine_repo(tmp_path, deps=["requests>=2"])
+        store = tmp_path / "store"
+        with (
+            patch(f"{MODULE}._check_rez_bindings"),
+            patch(f"{MODULE}.rez_uv_install") as install,
+            patch(f"{MODULE}.build_direct_requires", return_value=[]),
+            patch(f"{MODULE}._validate_rez_package"),
+            patch(f"{MODULE}._validate_gtn"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "build-engine-package",
+                    "--engine-repo",
+                    str(repo),
+                    "--local-packages-path",
+                    str(store),
+                    "--yes",
+                    "--no-editor",
+                    "--app-version",
+                    "0.99.0",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "griptape-nodes==0.99.0" in install.call_args.args[0]
+        assert "not included" in output.getvalue()
 
     @pytest.mark.usefixtures("output", "rez_on")
     def test_rebuild_reinstalls_dependencies(self, tmp_path: Path) -> None:
@@ -1070,6 +1132,7 @@ class TestBuildEnginePackageCommand:
             patch(f"{MODULE}.rez_uv_install") as install,
             patch(f"{MODULE}.build_direct_requires", return_value=[]),
             patch(f"{MODULE}._validate_rez_package"),
+            patch(f"{MODULE}._validate_gtn"),
         ):
             result = runner.invoke(
                 app,

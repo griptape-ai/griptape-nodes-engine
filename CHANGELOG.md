@@ -26,9 +26,10 @@ the engine's request API from working without edits. Migration steps live in
   are never mixed. When Rez is configured but cannot start, the engine says why at startup.
 - The `build-engine-package`, `build-library-package`, and `write-launch-package` commands (in
   `griptape_nodes.cli.commands.rez`) build the engine, a node library, and the `griptape_launch`
-  package as Rez packages. Builds from several platforms into one shared store add each
-  platform's variant, and `build-library-package --torch-backend` builds several GPU builds of
-  torch at once.
+  package as Rez packages. `build-engine-package` also builds the `gtn` app and the prebuilt
+  editor it serves (`--no-editor` leaves the editor out), so a Rez workstation needs nothing else
+  installed. Builds from several platforms into one shared store add each platform's variant, and
+  `build-library-package --torch-backend` builds several GPU builds of torch at once.
 - On a Rez workstation, the engine picks the GPU build of torch its NVIDIA driver supports. A
   library that needs torch does not load when no build fits the workstation, and the library list
   says why.
