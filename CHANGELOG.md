@@ -35,6 +35,7 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Added
 
+- `claude-sonnet-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar.
 - Projects have two new situations for versioned output folders. `save_output_directory` creates
   `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
   run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
