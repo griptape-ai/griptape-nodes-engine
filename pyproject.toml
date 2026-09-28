@@ -164,6 +164,8 @@ ignore = [
 "tests/unit/retained_mode/test_engine.py" = ["TID251"]
 "tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
 "tests/unit/node_library/test_workflow_registry.py" = ["TID251"]
+# Asserts the pickle-era reader's own behavior, so it has to build pickles to feed it.
+"tests/unit/serialization/test_legacy_pickle.py" = ["TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
 # Example libraries shipped with the Advanced Libraries doc. Authors copy these files
