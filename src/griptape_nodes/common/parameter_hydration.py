@@ -1,11 +1,7 @@
-"""Turn untagged artifact-shaped dicts back into artifacts.
+"""Turn untagged artifact dicts, as the editor and older saved workflows send them, into artifacts.
 
-Tagged values already arrive decoded through the plain-data wire format (see
-``griptape_nodes.serialization.values``). This module covers what that format
-doesn't: dicts the editor sends straight from its own artifact-shaped JSON, and
-values in older saved workflows saved before that format existed. Only a plain
-``dict`` (not an ``UndecodedValue``, which is a dict subclass callers rely on
-staying a dict) with a ``"type"`` key is treated this way.
+Tagged values arrive decoded, and ``UndecodedValue`` (a dict subclass) is left alone. Tracked to move
+to set time in https://github.com/griptape-ai/griptape-nodes-engine/issues/5695.
 """
 
 from __future__ import annotations
