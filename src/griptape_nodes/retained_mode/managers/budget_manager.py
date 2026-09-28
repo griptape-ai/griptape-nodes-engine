@@ -93,7 +93,7 @@ class BudgetManager(EngineScoped):
         it can act on instead of a Success carrying an empty chain. Neither blocks the call. Not
         knowing which project to bill is not a reason to refuse work: the spend is legitimate, it
         just lands unattributed. A budget refusal is the opposite case -- Cloud has already
-        declined the call -- and that one always halts the run.
+        declined the call -- and that one fails the node.
 
         Both log at WARNING rather than the ERROR a bare `result_details` string would default to.
         Neither condition clears on its own, so an ERROR would repeat once per metered call for
