@@ -314,13 +314,20 @@ def _is_namedtuple(cls: Any) -> bool:
     return isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_fields")
 
 
+# Like the dataclass factories, a NamedTuple whose hints cannot resolve falls back to its runtime values.
 def _make_namedtuple_unstructure_fn(cls: type, conv: Converter) -> Any:
-    field_types = tuple(get_type_hints(cls).values())
+    try:
+        field_types = tuple(get_type_hints(cls).values())
+    except NameError:
+        return lambda obj: tuple(conv.unstructure(item) for item in obj)
     return make_hetero_tuple_unstructure_fn(cls, conv, unstructure_to=tuple, type_args=field_types)
 
 
 def _make_namedtuple_structure_fn(cls: type, conv: Converter) -> Any:
-    fields_tuple = tuple[tuple(get_type_hints(cls).values())]
+    try:
+        fields_tuple = tuple[tuple(get_type_hints(cls).values())]
+    except NameError:
+        return lambda data, _: cls(*data)
     structure_fields = conv.get_structure_hook(fields_tuple)
     return lambda data, _: cls(*structure_fields(data, fields_tuple))
 
