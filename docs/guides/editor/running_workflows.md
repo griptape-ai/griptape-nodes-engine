@@ -88,6 +88,11 @@ Running** dialog (see [Saving](#saving) below) — that dialog offers a
 
 ### When a budget stops a run
 
+!!! note
+
+    Spending budgets are not yet available on Griptape Cloud. This section
+    describes how runs behave once they are.
+
 If your organization has set a spending budget on Griptape Cloud, a run
 that would go over it stops on its own. A **Run blocked** bar appears
 across the top of the canvas naming the node that was stopped and the
