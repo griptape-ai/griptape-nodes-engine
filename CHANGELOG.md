@@ -31,7 +31,7 @@ the engine's request API from working without edits. Migration steps live in
 - Creating or switching to a project whose workspace differs now closes the open workflow, returning
   you to the workflow picker. Before, the engine kept a workflow it no longer had a record of, so the
   next workflow you opened sat on "Checking workflow" and the log filled with "is not registered on
-  this engine" warnings until you restarted the engine. You are still offered a save first.
+  this engine" warnings until you restarted the engine.
   [#5692](https://github.com/griptape-ai/griptape-nodes-engine/issues/5692)
 - Creating a versioned output folder or file sequence in a project no longer fails with "requires
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
