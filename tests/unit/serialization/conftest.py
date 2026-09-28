@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,13 +14,13 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from tests.unit.serialization.fixture_paths import FIXTURES
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
     from griptape_nodes.retained_mode.engine import Engine
 
-FIXTURES = Path(__file__).parent / "fixtures"
 _LIBRARY_JSON = FIXTURES / "pickle_era_library" / "griptape_nodes_library.json"
 _LIBRARY_MODULE_PREFIXES = (
     "griptape_nodes.node_libraries.pickle_era_fixture_library",
