@@ -2280,7 +2280,11 @@ class TrackedParameterOutputValues(dict[str, Any]):
     def __delitem__(self, key: str) -> None:
         if key in self:
             super().__delitem__(key)
-            self._emit_parameter_change_event(key, None, deleted=True)
+            # Emit the set value, as clear() does. Consumers display whatever the event carries,
+            # so None would blank a parameter that still has a value. Raw, also as clear() does: the
+            # public reader resolves a held object, which raises for one held in another process.
+            value = self._node._get_raw_parameter_value(key)
+            self._emit_parameter_change_event(key, value, deleted=True)
 
     def clear(self) -> None:
         if self:  # Only emit events if there were values to clear
