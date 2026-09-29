@@ -20,8 +20,9 @@ the engine's request API from working without edits. Migration steps live in
 ### Fixed
 
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
-  in a library's isolated process, instead of leaving the output empty. Parameters that only allow
-  OUTPUT are stored as produced values, which is what travels back from an isolated process.
+  in a library's isolated process, instead of leaving the output empty. A parameter that only allows
+  OUTPUT, set while the node is running, records a result rather than a typed-in value, and results
+  are what travel back from an isolated process.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
 - The process a library runs isolated in shuts down within about 35 seconds of losing the engine
   that started it. Before, if that engine exited in the process's first 10 minutes, the process

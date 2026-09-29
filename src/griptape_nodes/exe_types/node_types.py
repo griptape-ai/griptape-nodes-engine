@@ -1079,10 +1079,10 @@ class BaseNode(ABC):
     ) -> None:
         """Attempt to set a Parameter's value.
 
-        Where the value is stored follows the Parameter's declaration. A Parameter allowing OUTPUT and
-        nothing else is stored as a produced value, the same as writing `parameter_output_values`
-        directly, because there is no authored value such a Parameter could be holding. Every other
-        Parameter stores an authored value.
+        A Parameter allowing OUTPUT and nothing else, set while this node's own body is running, stores
+        a produced value, the same as writing `parameter_output_values` directly, because a run is the
+        only thing that could have given such a Parameter a value. Every other set stores an authored
+        value, including one made at edit time or while loading a workflow.
 
         The Node may choose to store a different value (or type) than what was passed in.
         Conversion callbacks on the Parameter may raise Exceptions, which will cancel
@@ -1166,23 +1166,34 @@ class BaseNode(ABC):
                     )
 
     def _value_store_for(self, parameter: Parameter) -> dict[str, Any]:
-        """Which of the node's two value stores holds this Parameter's value.
+        """Which of the node's two value stores a set on this Parameter writes to.
 
-        A Parameter that allows OUTPUT and nothing else has no authored value to hold: the editor
-        cannot type into it and no incoming connection delivers into it. So its value belongs in
-        `parameter_output_values`, and that is also the only one of the two that survives egress from
-        a worker, which ships produced values back and leaves the node's `parameter_values` behind.
+        An OUTPUT-only Parameter set while the node's own body is running is storing what this run
+        produced, so it goes to `parameter_output_values`. That is also the only one of the two stores
+        that survives egress from a worker, which ships produced values back and leaves the node's
+        `parameter_values` behind.
 
-        Adding INPUT or PROPERTY makes the distinction real again, and those Parameters keep their
-        value in `parameter_values`.
+        Outside that window every Parameter writes `parameter_values`, and the distinction matters:
+        `parameter_output_values` is transient, cleared before each run and by `clear_node`. A value
+        set at edit time, in a constructor or from `after_value_set` has to outlive both, and the
+        engine's own writes are compared against `parameter_values` to decide whether a change needs
+        to invalidate anything downstream.
         """
-        modes = parameter.allowed_modes
-        produces_only = (
-            ParameterMode.OUTPUT in modes and ParameterMode.INPUT not in modes and ParameterMode.PROPERTY not in modes
-        )
-        if produces_only:
+        if _in_aprocess.get() and self._is_output_only(parameter):
             return self.parameter_output_values
         return self.parameter_values
+
+    def _is_output_only(self, parameter: Parameter) -> bool:
+        """Whether this Parameter's value could only ever be one the node produced.
+
+        A Parameter allowing OUTPUT and nothing else has no authored value to hold: the editor cannot
+        type into it and no incoming connection delivers into it. Adding INPUT or PROPERTY makes the
+        distinction real again.
+        """
+        modes = parameter.allowed_modes
+        return (
+            ParameterMode.OUTPUT in modes and ParameterMode.INPUT not in modes and ParameterMode.PROPERTY not in modes
+        )
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
@@ -1219,23 +1230,22 @@ class BaseNode(ABC):
         return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
 
     def _get_stored_parameter_value(self, param_name: str) -> Any:
-        """The value from whichever of the two stores holds this Parameter's, so a set can be read back.
+        """The value an OUTPUT-only Parameter produced, else the one stored against its name.
+
+        Unlike the write in `_value_store_for`, this is not limited to the window where the node's body
+        runs: a produced value is still what the Parameter holds once the run is over, and preferring it
+        is the precedence `GetParameterValueRequest` and `LocalWorkflowExecutor` already apply. Falling
+        through covers an OUTPUT-only Parameter whose value was set at edit time or replayed from a save,
+        which lands in `parameter_values`, and survives the pre-run clear there.
 
         Only the node author's read comes through here. `_get_raw_parameter_value` deliberately does not
         consult `parameter_output_values`: a `serializable=False` producer puts the live object there and
         the key standing in for it in `parameter_values`, and the engine's own readers save values,
         dispatch them to workers and send them to the editor, so they need the key.
-
-        An OUTPUT-only Parameter with no produced value falls through to `_get_raw_parameter_value`,
-        which still finds an authored value saved by a workflow written before the setter and the store
-        agreed on where it goes.
         """
         parameter = self.get_parameter_by_name(param_name)
-        if parameter is None:
-            return self._get_raw_parameter_value(param_name)
-        value_store = self._value_store_for(parameter)
-        if value_store is self.parameter_output_values and param_name in value_store:
-            return value_store[param_name]
+        if parameter is not None and self._is_output_only(parameter) and param_name in self.parameter_output_values:
+            return self.parameter_output_values[param_name]
         return self._get_raw_parameter_value(param_name)
 
     def _get_raw_parameter_value(self, param_name: str) -> Any:

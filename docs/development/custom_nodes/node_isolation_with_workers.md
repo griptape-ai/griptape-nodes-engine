@@ -211,9 +211,10 @@ The supported patterns for moving values:
 - **Outputs** go in `self.parameter_output_values`. The framework
     ships these back to the orchestrator after `process` returns. Set
     `self.parameter_output_values["my_param"] = value` inside
-    `process`. `self.set_parameter_value("my_param", value)` reaches
-    the same place when the parameter allows OUTPUT and nothing else,
-    so an output-only parameter is safe to set either way.
+    `process`. Called from inside `process`,
+    `self.set_parameter_value("my_param", value)` reaches the same
+    place when the parameter allows OUTPUT and nothing else, so an
+    output-only parameter is safe to set either way.
 - **Cross-call state that must persist** belongs in the
     orchestrator. Issue a `SetParameterValueRequest` from inside
     `process` to update an authoritative value; on the next execute

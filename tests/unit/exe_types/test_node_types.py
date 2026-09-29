@@ -3,7 +3,12 @@ from unittest.mock import Mock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
+from griptape_nodes.exe_types.node_types import (
+    AsyncResult,
+    SuccessFailureNode,
+    TrackedParameterOutputValues,
+    aprocess_scope,
+)
 from griptape_nodes.traits.slider import Slider
 
 from .mocks import MockNode
@@ -182,12 +187,16 @@ class TestTrackedParameterOutputValuesSetItem:
 
 
 class TestSetParameterValueStore:
-    """`set_parameter_value` stores a value where the Parameter's declaration says it lives.
+    """Where `set_parameter_value` stores a value, and why the window matters.
 
-    A Parameter allowing OUTPUT and nothing else has no authored value the editor could have typed or
-    a connection could have delivered, so what it is set to is a produced value. That is also the only
-    one of the two stores that travels back from a library's isolated process, so a node reporting its
-    result this way keeps that result when it runs there.
+    A Parameter allowing OUTPUT and nothing else has no authored value the editor could have typed or a
+    connection could have delivered, so a set made while the node's own body runs is recording what that
+    run produced. `parameter_output_values` is where that belongs, and it is the only one of the two
+    stores that travels back from a library's isolated process.
+
+    Outside that window the same set stores an authored value, because `parameter_output_values` is
+    cleared before every run and by `clear_node`, and a value set at edit time or replayed from a save
+    has to outlive both.
     """
 
     def _node_with(self, param_name: str, modes: set[ParameterMode]) -> MockNode:
@@ -195,26 +204,50 @@ class TestSetParameterValueStore:
         node.add_parameter(Parameter(name=param_name, type="str", tooltip="", allowed_modes=modes))
         return node
 
-    def test_output_only_is_stored_as_produced(self) -> None:
+    def test_output_only_is_produced_while_the_node_runs(self) -> None:
         node = self._node_with("out", {ParameterMode.OUTPUT})
 
-        node.set_parameter_value("out", "done")
+        with aprocess_scope():
+            node.set_parameter_value("out", "done")
 
         assert node.parameter_output_values["out"] == "done"
         assert "out" not in node.parameter_values
 
-    def test_output_only_reads_back(self) -> None:
+    def test_output_only_reads_back_after_the_run(self) -> None:
+        """The read is not confined to the window: the value is still what the Parameter holds."""
         node = self._node_with("out", {ParameterMode.OUTPUT})
 
-        node.set_parameter_value("out", "done")
+        with aprocess_scope():
+            node.set_parameter_value("out", "done")
 
         assert node.get_parameter_value("out") == "done"
+
+    def test_output_only_set_at_edit_time_is_authored(self) -> None:
+        """The pre-run clear would wipe a produced value, so an edit-time set must not go there."""
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+
+        node.set_parameter_value("out", "set before any run")
+
+        assert node.parameter_values["out"] == "set before any run"
+        assert "out" not in node.parameter_output_values
+        node.parameter_output_values.silent_clear()
+        assert node.get_parameter_value("out") == "set before any run"
+
+    def test_a_produced_value_wins_over_an_authored_one(self) -> None:
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+        node.set_parameter_value("out", "set before any run")
+
+        with aprocess_scope():
+            node.set_parameter_value("out", "produced by the run")
+
+        assert node.get_parameter_value("out") == "produced by the run"
 
     def test_property_and_output_stays_authored(self) -> None:
         """Adding PROPERTY makes the distinction real again: the user can type here."""
         node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
 
-        node.set_parameter_value("both", "typed")
+        with aprocess_scope():
+            node.set_parameter_value("both", "typed")
 
         assert node.parameter_values["both"] == "typed"
         assert "both" not in node.parameter_output_values
@@ -222,17 +255,11 @@ class TestSetParameterValueStore:
     def test_input_only_stays_authored(self) -> None:
         node = self._node_with("incoming", {ParameterMode.INPUT})
 
-        node.set_parameter_value("incoming", "delivered")
+        with aprocess_scope():
+            node.set_parameter_value("incoming", "delivered")
 
         assert node.parameter_values["incoming"] == "delivered"
         assert "incoming" not in node.parameter_output_values
-
-    def test_output_only_falls_back_to_an_authored_value(self) -> None:
-        """What a workflow saved before the setter and the store agreed replays on load."""
-        node = self._node_with("out", {ParameterMode.OUTPUT})
-        node.parameter_values["out"] = "from an older save"
-
-        assert node.get_parameter_value("out") == "from an older save"
 
 
 class TestErrorProxyNode:
