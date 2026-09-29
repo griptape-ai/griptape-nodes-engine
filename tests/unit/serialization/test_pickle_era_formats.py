@@ -22,9 +22,12 @@ from griptape.artifacts import ImageUrlArtifact
 from griptape.mixins.serializable_mixin import SerializableMixin
 from griptape.rules import Rule, Ruleset
 
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
     DeserializeSelectedNodesFromCommandsRequest,
@@ -100,13 +103,40 @@ def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
     return engine.node_manager.get_node_by_name(result.node_name_mappings["Holder"])
 
 
+def _run_workflow_source(source: str, file_name: str) -> None:
+    exec_globals: dict[str, object] = {"__file__": file_name}
+    exec(compile(source, file_name, "exec"), exec_globals)  # noqa: S102
+    asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]
+
+
 class TestPickleEraFormats:
     @pytest.mark.usefixtures("library_name")
     def test_saved_workflow_restores_every_value(self, engine: Engine) -> None:
         workflow_path = FIXTURES / "pickle_era_workflow.py"
-        exec_globals: dict[str, object] = {"__file__": str(workflow_path)}
-        exec(compile(workflow_path.read_text(), str(workflow_path), "exec"), exec_globals)  # noqa: S102
-        asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]
+        _run_workflow_source(workflow_path.read_text(), str(workflow_path))
+
+        _assert_holder_restored(engine.node_manager.get_node_by_name("Holder"))
+
+    @pytest.mark.usefixtures("library_name")
+    def test_saved_workflow_keeps_every_value_after_saving_again(self, engine: Engine) -> None:
+        """The first save after upgrading rewrites the file in plain data, so nothing may drop there."""
+        workflow_path = FIXTURES / "pickle_era_workflow.py"
+        _run_workflow_source(workflow_path.read_text(), str(workflow_path))
+        serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name="ControlFlow_1"))
+        assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
+        resaved_source = engine.workflow_manager._generate_workflow_file_content(
+            serialized_flow_commands=serialized.serialized_flow_commands,
+            workflow_metadata=WorkflowMetadata(
+                name="resaved",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="0.0.0",
+                node_libraries_referenced=[],
+            ),
+        )
+        assert "pickle.loads" not in resaved_source
+        engine.clear_current_workflow_data()
+
+        _run_workflow_source(resaved_source, "resaved_workflow.py")
 
         _assert_holder_restored(engine.node_manager.get_node_by_name("Holder"))
 
