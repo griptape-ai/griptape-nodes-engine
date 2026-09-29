@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import sys
 from typing import TYPE_CHECKING
 
@@ -43,3 +44,24 @@ class TestLibraryValueNames:
 
         assert type(restored) is library_module.FixtureUrlArtifact
         assert restored.to_dict() == artifact.to_dict()
+
+    def test_failed_reload_keeps_the_stable_module_name(
+        self, engine: Engine, library_name: str, library_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A library file saved with a syntax error must not strand values of its live classes."""
+
+        def fail(_loader: object, _module: object) -> None:
+            msg = "invalid syntax"
+            raise SyntaxError(msg)
+
+        file_path = library_module.__file__
+        assert file_path is not None
+        monkeypatch.setattr(importlib.machinery.SourceFileLoader, "exec_module", fail)
+
+        with pytest.raises(ImportError):
+            engine.library_manager._load_module_from_file(file_path, library_name)
+
+        assert encode_value(library_module.FixtureMode.SLOW) == {
+            TYPE_KEY: f"{_STABLE_MODULE}:FixtureMode",
+            VALUE_KEY: "slow",
+        }
