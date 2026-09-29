@@ -27,6 +27,8 @@ from tests.unit.exe_types.mocks import MockNode
 if TYPE_CHECKING:
     import pytest
 
+    from griptape_nodes.serialization.dropped_values import DroppedValue
+
 
 def _make_param(name: str, *, serializable: bool = True) -> Parameter:
     return Parameter(
@@ -95,7 +97,7 @@ class TestSerializedParameterValueTracker:
 
     def test_not_serializable_hash_reports_not_serializable(self) -> None:
         tracker = SerializedParameterValueTracker()
-        tracker.add_as_not_serializable("bad_value")
+        tracker.add_as_not_serializable("bad_value", "no plain-data form")
 
         assert tracker.get_tracker_state("bad_value") == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
 
@@ -103,18 +105,19 @@ class TestSerializedParameterValueTracker:
         tracker = SerializedParameterValueTracker()
         tracker.add_as_serializable("a", SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4())))
         tracker.add_as_serializable("b", SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4())))
-        tracker.add_as_not_serializable("c")
+        tracker.add_as_not_serializable("c", "no plain-data form")
 
         assert tracker.get_serializable_count() == 2
 
 
-def _pool_value(
+def _pool_value(  # noqa: PLR0913
     value: Any,
     tracker: SerializedParameterValueTracker,
     pool: dict[Any, Any],
     *,
     parameter: Parameter | None = None,
     is_output: bool = False,
+    dropped_values: list[DroppedValue] | None = None,
 ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
     return NodeManager._handle_value_hashing(
         value=value,
@@ -123,6 +126,7 @@ def _pool_value(
         parameter=parameter or _make_param("p"),
         parameter_name="p",
         node_name="n",
+        dropped_values=[] if dropped_values is None else dropped_values,
         is_output=is_output,
     )
 
@@ -178,16 +182,43 @@ class TestHandleValueHashing:
         assert first.unique_value_uuid == second.unique_value_uuid
         assert _CountsEncodes.encode_count == 1
 
-    def test_non_serializable_parameter_skips_and_marks_tracker(self) -> None:
+    def test_opted_out_parameter_is_skipped_and_not_reported(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
+        dropped: list[DroppedValue] = []
         value = "opted out"
 
-        command = _pool_value(value, tracker, pool, parameter=_make_param("p", serializable=False))
+        command = _pool_value(
+            value, tracker, pool, parameter=_make_param("p", serializable=False), dropped_values=dropped
+        )
 
         assert command is None
         assert pool == {}
-        assert tracker.get_tracker_state(id(value)) == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
+        assert dropped == []
+
+    def test_opted_out_parameter_does_not_hide_the_value_from_a_parameter_that_saves(self) -> None:
+        tracker = SerializedParameterValueTracker()
+        pool: dict[Any, Any] = {}
+        value = "shared"
+
+        _pool_value(value, tracker, pool, parameter=_make_param("p", serializable=False))
+        command = _pool_value(value, tracker, pool)
+
+        assert command is not None
+        assert list(pool.values()) == ["shared"]
+
+    def test_value_with_no_plain_data_form_is_reported_each_time_with_its_reason(self) -> None:
+        tracker = SerializedParameterValueTracker()
+        dropped: list[DroppedValue] = []
+        value = _FailsToEncode()
+
+        _pool_value(value, tracker, {}, dropped_values=dropped)
+        _pool_value(value, tracker, {}, dropped_values=dropped)
+
+        assert [(entry.node_name, entry.parameter_name, entry.is_default) for entry in dropped] == [
+            ("n", "p", False)
+        ] * 2
+        assert "refuses to be encoded" in dropped[0].reason
 
     def test_value_with_no_plain_data_form_is_skipped_and_not_retried(self) -> None:
         tracker = SerializedParameterValueTracker()
@@ -232,6 +263,7 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
+            dropped_values=[],
         )
 
         assert result is None
@@ -264,6 +296,7 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
+            dropped_values=[],
         )
 
         assert result is None
@@ -295,6 +328,7 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
+            dropped_values=[],
         )
 
         assert result is None
@@ -324,6 +358,7 @@ class TestSerializeOneParameterValueForSave:
             unique_parameter_uuid_to_values=pool,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_request,
+            dropped_values=[],
         )
 
         assert result is not None

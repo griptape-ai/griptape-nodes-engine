@@ -16,6 +16,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
+from griptape_nodes.serialization.dropped_values import DroppedValue
 
 # Flow-metadata flag marking a flow as a runtime-only artifact the engine must never serialize.
 # A flow tagged with ``metadata[TRANSIENT_KEY] = True`` is skipped by the flow serializer, so it is
@@ -410,7 +411,10 @@ class SerializeFlowToCommandsRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class SerializeFlowToCommandsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Flow serialized. ``dropped_values`` lists the values left out because they have no plain-data form."""
+
     serialized_flow_commands: SerializedFlowCommands
+    dropped_values: list[DroppedValue] = field(default_factory=list)
 
 
 @dataclass
@@ -684,12 +688,14 @@ class PackageNodesAsSerializedFlowResultSuccess(WorkflowNotAlteredMixin, ResultP
         parameter_name_mappings: List of parameter mappings for packaged nodes.
             Index 0 = Start node mappings, Index 1 = End node mappings.
             Each entry contains the node name and its parameter mappings.
+        dropped_values: Values left out of the package because they have no plain-data form
     """
 
     serialized_flow_commands: SerializedFlowCommands
     workflow_shape: WorkflowShape
     packaged_node_names: list[str]
     parameter_name_mappings: list[PackagedNodeParameterMapping]
+    dropped_values: list[DroppedValue] = field(default_factory=list)
 
 
 @dataclass

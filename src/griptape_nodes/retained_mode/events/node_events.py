@@ -24,6 +24,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.converter import ElementDocument
+from griptape_nodes.serialization.dropped_values import DroppedValue
 from griptape_nodes.serialization.values import DisplayValue
 
 
@@ -517,8 +518,8 @@ class SerializedParameterValueTracker:
     Attributes:
         _value_hash_to_unique_value_uuid (dict[Any, SerializedNodeCommands.UniqueParameterValueUUID]):
             A dictionary mapping value hashes to their unique UUIDs when they are serializable.
-        _non_serializable_value_hashes (set[Any]):
-            A set of value hashes that are not serializable.
+        _unencodable_reasons (dict[Any, str]):
+            For each value hash with no plain-data form, why it has none.
     """
 
     class TrackerState(Enum):
@@ -531,10 +532,10 @@ class SerializedParameterValueTracker:
     _value_hash_to_unique_value_uuid: dict[Any, SerializedNodeCommands.UniqueParameterValueUUID] = field(
         default_factory=dict
     )
-    _non_serializable_value_hashes: set[Any] = field(default_factory=set)
+    _unencodable_reasons: dict[Any, str] = field(default_factory=dict)
 
     def get_tracker_state(self, value_hash: Any) -> TrackerState:
-        if value_hash in self._non_serializable_value_hashes:
+        if value_hash in self._unencodable_reasons:
             return SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
         if value_hash in self._value_hash_to_unique_value_uuid:
             return SerializedParameterValueTracker.TrackerState.SERIALIZABLE
@@ -545,8 +546,11 @@ class SerializedParameterValueTracker:
     ) -> None:
         self._value_hash_to_unique_value_uuid[value_hash] = unique_value_uuid
 
-    def add_as_not_serializable(self, value_hash: Any) -> None:
-        self._non_serializable_value_hashes.add(value_hash)
+    def add_as_not_serializable(self, value_hash: Any, reason: str) -> None:
+        self._unencodable_reasons[value_hash] = reason
+
+    def get_unencodable_reason(self, value_hash: Any) -> str:
+        return self._unencodable_reasons[value_hash]
 
     def get_uuid_for_value_hash(self, value_hash: Any) -> SerializedNodeCommands.UniqueParameterValueUUID:
         return self._value_hash_to_unique_value_uuid[value_hash]
@@ -595,10 +599,12 @@ class SerializeNodeToCommandsResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
         serialized_node_commands (SerializedNodeCommands): The serialized commands representing the node.
         set_parameter_value_commands (list[SerializedNodeCommands.IndirectSetParameterValueCommand]): A list of
             commands to set parameter values, keyed into the unique values dictionary.
+        dropped_values (list[DroppedValue]): Values left out of the commands because they have no plain-data form.
     """
 
     serialized_node_commands: SerializedNodeCommands
     set_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand]
+    dropped_values: list[DroppedValue] = field(default_factory=list)
 
 
 @dataclass
@@ -664,6 +670,7 @@ class SerializeSelectedNodesToCommandsResultSuccess(WorkflowNotAlteredMixin, Res
 
     Args:
         serialized_selected_node_commands: Complete serialized representation
+        dropped_values: Values left out of the copy because they have no plain-data form
     """
 
     # They will be passed with node_name, timestamp
@@ -671,6 +678,7 @@ class SerializeSelectedNodesToCommandsResultSuccess(WorkflowNotAlteredMixin, Res
     serialized_selected_node_commands: str
     pickled_values: dict[str, str]
     node_names_serialized: list[str]
+    dropped_values: list[DroppedValue] = field(default_factory=list)
 
 
 @dataclass
@@ -709,10 +717,12 @@ class DeserializeSelectedNodesFromCommandsResultSuccess(WorkflowAlteredMixin, Re
     Args:
         node_names: List of all node names created (including children)
         non_children_names: List of node names that are not children, which should have connections remapped in a duplicate operation.
+        dropped_values: Values the pasted nodes did not get because the copy could not be read
     """
 
     node_names: list[str]
     non_children_names: list[str] = field(default_factory=list)
+    dropped_values: list[DroppedValue] = field(default_factory=list)
 
 
 @dataclass

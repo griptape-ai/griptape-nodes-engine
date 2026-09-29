@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
@@ -245,6 +246,12 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
 from griptape_nodes.serialization.converter import converter, dump_json
+from griptape_nodes.serialization.dropped_values import (
+    DroppedValue,
+    keep_encodable_default,
+    success_details,
+    unique_dropped_values,
+)
 from griptape_nodes.serialization.legacy_pickle import (
     LegacyPickleError,
     read_legacy_clipboard_commands,
@@ -317,6 +324,7 @@ class SerializedGroupResult:
         child_commands: List of serialized child node commands (excluding already-selected ones)
         child_parameter_commands: Dict mapping child UUIDs to their parameter value commands
         child_uuids: List of child node UUIDs for UUID-to-name remapping during deserialization
+        dropped_values: Values left out of the group and its children because they have no plain-data form
     """
 
     group_command: SerializedNodeCommands | None
@@ -326,6 +334,14 @@ class SerializedGroupResult:
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
     child_uuids: list[SerializedNodeCommands.NodeUUID]
+    dropped_values: list[DroppedValue]
+
+
+class CopiedValues(NamedTuple):
+    """The values read from a copy, and why each one that could not be read was not."""
+
+    values: dict[str, JsonValue]
+    unreadable_reasons: dict[str, str]
 
 
 class CopiedNodesError(Exception):
@@ -3848,6 +3864,7 @@ class NodeManager(EngineScoped):
         child_commands = []
         child_parameter_commands = {}
         child_uuids = []
+        dropped_values: list[DroppedValue] = []
 
         # Serialize the group node first so its UUID is known before children are serialized
         group_result = self.on_serialize_node_to_commands(
@@ -3866,6 +3883,7 @@ class NodeManager(EngineScoped):
 
         group_command = group_result.serialized_node_commands
         group_uuid = group_command.node_uuid
+        dropped_values.extend(group_result.dropped_values)
 
         # Clear node_names_to_add from the group's create command — children are assigned
         # to the group via _parent_group_uuid/parent_group_name during deserialization.
@@ -3891,6 +3909,7 @@ class NodeManager(EngineScoped):
                 raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
             child_cmd = child_result.serialized_node_commands
+            dropped_values.extend(child_result.dropped_values)
 
             # Embed parent group UUID in child metadata for deserialization remapping
             if child_cmd.create_node_command.metadata is None:
@@ -3907,6 +3926,7 @@ class NodeManager(EngineScoped):
             child_commands=child_commands,
             child_parameter_commands=child_parameter_commands,
             child_uuids=child_uuids,
+            dropped_values=dropped_values,
         )
 
     @handles(SerializeNodeToCommandsRequest)
@@ -4161,6 +4181,12 @@ class NodeManager(EngineScoped):
                         alter_group_request = AlterParameterGroupDetailsRequest(**diff)
                         element_modification_commands.append(alter_group_request)
 
+            dropped_values: list[DroppedValue] = []
+            element_modification_commands = [
+                NodeManager._with_encodable_default(command, node_name, dropped_values)
+                for command in element_modification_commands
+            ]
+
             # Now assignment of values to all of the parameters.
             set_value_commands = []
 
@@ -4178,6 +4204,7 @@ class NodeManager(EngineScoped):
                     unique_parameter_uuid_to_values=request.unique_parameter_uuid_to_values,
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
+                    dropped_values=dropped_values,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
                 )
                 if set_param_value_requests is not None:
@@ -4215,6 +4242,7 @@ class NodeManager(EngineScoped):
         result = SerializeNodeToCommandsResultSuccess(
             serialized_node_commands=serialized_node_commands,  # How to serialize this node
             set_parameter_value_commands=set_value_commands,  # The commands to serialize it with
+            dropped_values=dropped_values,
             result_details=details,
         )
         return result
@@ -4405,6 +4433,7 @@ class NodeManager(EngineScoped):
         all_selected_for_connections = set(selected_node_names)
         # Separate lists for ordering: children must come before parents
         child_node_commands_list = []
+        dropped_values: list[DroppedValue] = []
 
         for node_name, _ in nodes_to_serialize:
             # Check if this is a group node that needs special handling
@@ -4424,6 +4453,7 @@ class NodeManager(EngineScoped):
                 if group_result.group_command is None:
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize group '{node_name}'."
                     return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
+                dropped_values.extend(group_result.dropped_values)
 
                 # Process the group node command
                 node_commands[node_name] = group_result.group_command
@@ -4471,6 +4501,7 @@ class NodeManager(EngineScoped):
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize {node_name}."
                     return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
+                dropped_values.extend(result.dropped_values)
                 node_commands[node_name] = result.serialized_node_commands
                 node_name_to_uuid[node_name] = result.serialized_node_commands.node_uuid
                 parameter_commands[result.serialized_node_commands.node_uuid] = result.set_parameter_value_commands
@@ -4539,11 +4570,18 @@ class NodeManager(EngineScoped):
             return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
         # The pool already holds encoded values, so each one only needs to become text.
         serialized_values = {uuid: json.dumps(value) for uuid, value in unique_uuid_to_values.items()}
+        dropped_values = unique_dropped_values(dropped_values)
+        details = success_details(
+            f"Successfully serialized {len(request.nodes_to_serialize)} selected nodes to commands.",
+            dropped_values,
+            action=f"copy {len(request.nodes_to_serialize)} nodes",
+        )
         return SerializeSelectedNodesToCommandsResultSuccess(
             serialized_selected_node_commands=commands_text,
             pickled_values=serialized_values,
             node_names_serialized=node_names_in_order,
-            result_details=f"Successfully serialized {len(request.nodes_to_serialize)} selected nodes to commands.",
+            dropped_values=dropped_values,
+            result_details=details,
         )
 
     @handles(DeserializeSelectedNodesFromCommandsRequest)
@@ -4557,6 +4595,7 @@ class NodeManager(EngineScoped):
             details = f"Attempted to paste nodes. Failed because {error}."
             return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
         copied_values = self._read_copied_values(request.pickled_values)
+        dropped_values: list[DroppedValue] = []
         connections = commands.serialized_connection_commands
         node_uuid_to_name = {}
         created_node_names: list[str] = []
@@ -4628,13 +4667,25 @@ class NodeManager(EngineScoped):
                     param_request = parameter_command.set_parameter_value_command
                     # Set the Node name
                     param_request.node_name = result.node_name
-                    if parameter_command.unique_value_uuid in copied_values:
+                    if parameter_command.unique_value_uuid in copied_values.values:
                         # Decoding builds a fresh object each time, so repeated pastes share nothing.
-                        param_request.value = decode_value(copied_values[parameter_command.unique_value_uuid])
+                        param_request.value = decode_value(copied_values.values[parameter_command.unique_value_uuid])
                         set_parameter_result = self.engine.handle_request(parameter_command.set_parameter_value_command)
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
                             logger.warning(details)
+                    else:
+                        reason = copied_values.unreadable_reasons.get(
+                            parameter_command.unique_value_uuid, "the copy holds no value for it"
+                        )
+                        logger.warning(
+                            "Attempted to paste the value of parameter '%s' on node '%s'. Failed because %s. "
+                            "The parameter keeps its default.",
+                            param_request.parameter_name,
+                            result.node_name,
+                            reason,
+                        )
+                        dropped_values.append(DroppedValue(result.node_name, param_request.parameter_name, reason))
                 lock_command = commands.set_lock_commands_per_node[node_command.node_uuid]
                 if lock_command is not None:
                     lock_node_result = self.engine.handle_request(lock_command)
@@ -4660,7 +4711,12 @@ class NodeManager(EngineScoped):
         return DeserializeSelectedNodesFromCommandsResultSuccess(
             node_names=all_node_names,
             non_children_names=explicit_node_names,
-            result_details=f"Successfully deserialized {len(node_uuid_to_name)} nodes from commands.",
+            dropped_values=dropped_values,
+            result_details=success_details(
+                f"Successfully deserialized {len(node_uuid_to_name)} nodes from commands.",
+                dropped_values,
+                action=f"paste {len(node_uuid_to_name)} nodes",
+            ),
         )
 
     def _read_copied_commands(self, text: str) -> SerializedSelectedNodesCommands:
@@ -4681,12 +4737,13 @@ class NodeManager(EngineScoped):
         except CommandsFormatError as error:
             raise CopiedNodesError(str(error)) from error
 
-    def _read_copied_values(self, texts: dict[str, str]) -> dict[str, JsonValue]:
+    def _read_copied_values(self, texts: dict[str, str]) -> CopiedValues:
         """Read copied parameter values, keeping them encoded until each use decodes its own copy.
 
         A value that cannot be read is left out, so its parameter pastes with its default.
         """
         values: dict[str, JsonValue] = {}
+        unreadable_reasons: dict[str, str] = {}
         library_modules = self.engine.library_manager.stable_module_names()
         for uuid, text in texts.items():
             try:
@@ -4695,8 +4752,8 @@ class NodeManager(EngineScoped):
                 try:
                     values[uuid] = read_legacy_clipboard_value(text, library_modules)
                 except LegacyPickleError as error:
-                    logger.warning("Attempted to paste a copied parameter value. Failed because %s.", error)
-        return values
+                    unreadable_reasons[uuid] = str(error)
+        return CopiedValues(values, unreadable_reasons)
 
     @handles(DuplicateSelectedNodesRequest)
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
@@ -4724,7 +4781,11 @@ class NodeManager(EngineScoped):
         )
         return DuplicateSelectedNodesResultSuccess(
             result.node_names,
-            result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
+            result_details=success_details(
+                f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
+                serialize_result.dropped_values,
+                action=f"duplicate {len(serialize_result.node_names_serialized)} nodes",
+            ),
         )
 
     def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4860,6 +4921,22 @@ class NodeManager(EngineScoped):
         return diff
 
     @staticmethod
+    def _with_encodable_default(command: Any, node_name: str, dropped_values: list[DroppedValue]) -> Any:
+        """Return ``command``, with a default value that has no plain-data form replaced by None.
+
+        The default is added to ``dropped_values``. Any command other than one that sets a
+        parameter's default is returned as it is.
+        """
+        if not isinstance(command, AddParameterToNodeRequest | AlterParameterDetailsRequest):
+            return command
+        default_value = keep_encodable_default(
+            command.default_value, node_name, command.parameter_name or "", dropped_values
+        )
+        if default_value is command.default_value:
+            return command
+        return dataclasses.replace(command, default_value=default_value)
+
+    @staticmethod
     def _handle_value_hashing(  # noqa: PLR0913, PLR0917
         value: Any,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
@@ -4867,31 +4944,33 @@ class NodeManager(EngineScoped):
         parameter: Parameter,
         parameter_name: str,
         node_name: str,
+        dropped_values: list[DroppedValue],
         *,
         is_output: bool,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         """Pool ``value``'s encoded form under a hash of its content and return the command that restores it.
 
         Returns None when the value is not to be saved: the parameter opted out, or the value has no
-        plain-data form. The tracker remembers each object's outcome, so a value shared by several
-        parameters is encoded once.
+        plain-data form, which is added to ``dropped_values``. The tracker remembers each object's
+        outcome, so a value shared by several parameters is encoded once.
         """
+        # Author opt-out, e.g. drivers and file handles. Not a drop, so never reported.
+        if not parameter.serializable:
+            return None
         value_id = id(value)
         tracker_status = serialized_parameter_value_tracker.get_tracker_state(value_id)
         match tracker_status:
             case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
                 unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value_hash(value_id)
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
+                reason = serialized_parameter_value_tracker.get_unencodable_reason(value_id)
+                dropped_values.append(DroppedValue(node_name, parameter_name, reason))
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                # Author opt-out, e.g. drivers and file handles.
-                if not parameter.serializable:
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
-                    return None
                 encoded = try_encode(value)
                 if isinstance(encoded, Unencodable):
-                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
+                    serialized_parameter_value_tracker.add_as_not_serializable(value_id, encoded.reason)
+                    dropped_values.append(DroppedValue(node_name, parameter_name, encoded.reason))
                     return None
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
                 unique_parameter_uuid_to_values[unique_uuid] = encoded
@@ -4918,6 +4997,7 @@ class NodeManager(EngineScoped):
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
         *,
+        dropped_values: list[DroppedValue],
         serialize_all_parameter_values: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
@@ -4936,6 +5016,7 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
+            dropped_values (list[DroppedValue]): Receives each value left out because it has no plain-data form
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
 
         Returns:
@@ -4974,6 +5055,7 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
+            dropped_values=dropped_values,
         )
         if internal_command is not None:
             commands.append(internal_command)
@@ -4986,6 +5068,7 @@ class NodeManager(EngineScoped):
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
+            dropped_values=dropped_values,
         )
         if output_command is not None:
             commands.append(output_command)
@@ -5002,6 +5085,7 @@ class NodeManager(EngineScoped):
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
+        dropped_values: list[DroppedValue],
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         """Serialize one of a parameter's values (internal-set or output) for workflow save.
 
@@ -5033,6 +5117,7 @@ class NodeManager(EngineScoped):
             is_output=is_output,
             parameter_name=parameter.name,
             node_name=node.name,
+            dropped_values=dropped_values,
         )
         if command is not None:
             return command

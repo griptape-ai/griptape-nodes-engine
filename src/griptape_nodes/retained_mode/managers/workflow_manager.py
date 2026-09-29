@@ -223,6 +223,7 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.serialization.dropped_values import success_details
 from griptape_nodes.serialization.values import is_plain_data
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -2759,7 +2760,12 @@ class WorkflowManager(EngineScoped):
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_name=registry_key,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=success_details(
+                details,
+                serialized_flow_result.dropped_values,
+                action=f"save workflow '{relative_file_path}'",
+                level=logging.INFO,
+            ),
         )
 
     class _ExistingMetadata(NamedTuple):
@@ -3401,7 +3407,12 @@ class WorkflowManager(EngineScoped):
         return SaveSubflowToWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_metadata=workflow_metadata,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=success_details(
+                details,
+                serialized_flow_result.dropped_values,
+                action=f"save subflow '{request.flow_name}'",
+                level=logging.INFO,
+            ),
         )
 
     def _generate_workflow_metadata_from_commands(  # noqa: PLR0913
