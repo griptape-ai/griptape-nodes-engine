@@ -1210,7 +1210,8 @@ class BaseNode(ABC):
 
         It has to be this node running, not any node: a running node can set a value on another node,
         which is how a value reaches a connected input and how a node driving a subflow feeds it. On
-        the receiving node that value is an ordinary authored one.
+        the receiving node that value is an ordinary authored one. `authored_value_scope` covers the
+        other direction, a node authoring a value on itself by asking the engine to set it.
 
         Requiring OUTPUT keeps values with nowhere to go out of the produced store: a Parameter with
         no OUTPUT has no port to publish on and nothing downstream reads it. Such a value set during a
