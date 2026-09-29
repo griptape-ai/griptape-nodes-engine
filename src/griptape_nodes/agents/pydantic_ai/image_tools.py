@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 from pydantic_ai.exceptions import ModelRetry
 
 if TYPE_CHECKING:
@@ -126,13 +126,13 @@ class ImageGenerationToolset:
         # state already mutated by earlier tool calls); the model can retry or
         # explain the failure instead.
         try:
-            async with httpx.AsyncClient(timeout=self._config.timeout_seconds) as client:
+            async with httpx2.AsyncClient(timeout=self._config.timeout_seconds) as client:
                 response = await client.post(url, headers=self._headers, json=payload)
             response.raise_for_status()
             artifact = response.json()["artifact"]
             image_bytes = base64.b64decode(artifact["value"])
             image_format = artifact.get("format", "png")
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             msg = f"Image generation request to Griptape Cloud failed: {exc}"
             raise ModelRetry(msg) from exc
         except (KeyError, ValueError, TypeError) as exc:

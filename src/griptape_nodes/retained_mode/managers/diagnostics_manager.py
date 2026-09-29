@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlparse
 
-import httpx
+import httpx2
 from dotenv import dotenv_values
 
 from griptape_nodes.common.diagnostics.bundle import DiagnosticsBundle, DiagnosticsBundleManifest
@@ -375,9 +375,9 @@ class DiagnosticsManager(EngineScoped):
                 ExistingFilePolicy.CREATE_NEW,
                 skip_metadata_injection=True,
             )
-        # `httpx.HTTPError` because the cloud storage driver uploads the bundle and then asks for a
+        # `httpx2.HTTPError` because the cloud storage driver uploads the bundle and then asks for a
         # download URL over HTTP; a refused connection on either call is this request's to report.
-        except (OSError, RuntimeError, httpx.HTTPError) as err:
+        except (OSError, RuntimeError, httpx2.HTTPError) as err:
             details = (
                 f"Attempted to save the diagnostics bundle as '{file_name}'. "
                 f"Failed because it could not be written: {err}"
