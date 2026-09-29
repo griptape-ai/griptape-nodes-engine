@@ -1530,8 +1530,26 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
         assert shadowed == [ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0")]
 
     @pytest.mark.asyncio
+    async def test_the_execution_environment_alone_is_enough_to_report(self, engine: Engine, tmp_path: Path) -> None:
+        """The execution venv is the half a worker imports, and the half with no workaround."""
+        mgr = engine.library_manager
+        library_json = tmp_path / "lib" / "library.json"
+        library_json.parent.mkdir(parents=True)
+        library_json.write_text("{}")
+        venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=True)
+        site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+        dist_info = site_packages / "griptape-1.9.4.dist-info"
+        dist_info.mkdir(parents=True)
+        (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: griptape\nVersion: 1.9.4\n")
+
+        with patch("griptape_nodes.utils.version_utils.engine_package_versions", return_value={"griptape": "1.13.0"}):
+            shadowed = await mgr._shadowed_engine_packages("test_lib", str(library_json))
+
+        assert shadowed == [ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0")]
+
+    @pytest.mark.asyncio
     async def test_a_reload_replaces_the_problem_rather_than_stacking_one(self, engine: Engine) -> None:
-        """The LibraryInfo survives a reload, and the display reads the oldest instance."""
+        """The LibraryInfo survives a reload, so a second load must replace rather than append."""
         mgr = engine.library_manager
         lib_info = _make_lib_info()
         stale = ShadowedPackage(name="numpy", library_version="1.26.4", engine_version="2.3.4")

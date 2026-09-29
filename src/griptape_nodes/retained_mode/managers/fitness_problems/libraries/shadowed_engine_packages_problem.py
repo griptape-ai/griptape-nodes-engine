@@ -36,7 +36,8 @@ class ShadowedEnginePackagesProblem(LibraryProblem):
 
         described = ", ".join(
             f"{package.name} {package.library_version} instead of {package.engine_version}"
-            for package in instances[0].packages
+            for instance in instances
+            for package in instance.packages
         )
         return (
             f"Installs components older than the ones Griptape Nodes runs on: {described}. This "

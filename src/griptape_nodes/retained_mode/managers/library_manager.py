@@ -7883,6 +7883,10 @@ class LibraryManager(EngineScoped):
         what `_install_deps_with_recovery` depends on: it reads a failure here as a corrupt
         environment and deletes the venv, and a version conflict is not that.
 
+        Known limitation: a floor uv satisfies by backtracking the library's own requirements to an
+        older release exits 0, so it takes neither path and nothing reports it. Catching that costs a
+        second unconstrained resolve on every install, which this trades away.
+
         Raises:
             subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
         """
@@ -7891,9 +7895,9 @@ class LibraryManager(EngineScoped):
                 await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
             except subprocess.CalledProcessError as constrained_error:
                 logger.warning(
-                    "Attempted to install dependencies into %s under the versions this engine runs on. Failed due "
-                    "to: the installer exited with code %s. Installing without them; the result may hold components "
-                    "older than the engine's own.",
+                    "Attempted to install dependencies into the environment at %s under the versions this engine runs "
+                    "on. Failed due to: the installer exited with code %s. Installing without them; the result may "
+                    "hold components older than the engine's own.",
                     library_venv_python_path,
                     constrained_error.returncode,
                 )
