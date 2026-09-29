@@ -219,7 +219,8 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
                     is_flow_finished, error = await self._handle_execution_event(event, flow_name)
-                    if result_send_failure is not None:
+                    # The flow's own error, if any, is the cause worth reporting.
+                    if result_send_failure is not None and error is None:
                         error = result_send_failure
                 elif isinstance(event, ProgressEvent):
                     # Convert ProgressEvent to GriptapeEvent and emit via WebSocket
