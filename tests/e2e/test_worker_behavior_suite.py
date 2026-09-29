@@ -328,6 +328,42 @@ class TestMultiHopChain:
         assert end.parameter_output_values["final"] == "start->middle->end"
 
 
+class TestResultsReportedWithTheSetter:
+    """`set_parameter_value` on an output is how plenty of libraries report a result.
+
+    Only produced values travel back from a worker, so a result the setter stored as an authored value
+    was left behind and the output read empty on the orchestrator.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_a_result_the_setter_stored(self) -> None:
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterReporter")
+
+        assert result.parameter_output_values["status"] == "reported"
+
+    @pytest.mark.asyncio
+    async def test_a_parameter_the_editor_can_type_into_is_not_a_result(self) -> None:
+        """Allowing PROPERTY means the setter is storing an authored value, which does not travel."""
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterNoteReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterNoteReporter")
+
+        assert "note" not in result.parameter_output_values
+
+    @pytest.mark.asyncio
+    async def test_the_same_node_reports_the_same_way_on_the_orchestrator(self) -> None:
+        current_engine().library_manager._is_worker = False
+        _make("ReportsWithSetterNode", "LocalSetterReporter")
+
+        result = await _execute("ReportsWithSetterNode", "LocalSetterReporter")
+
+        assert result.parameter_output_values["status"] == "reported"
+
+
 class TestEditorTimeBehaviorOnRealNodes:
     """These are exactly what a schema stub would have dropped."""
 

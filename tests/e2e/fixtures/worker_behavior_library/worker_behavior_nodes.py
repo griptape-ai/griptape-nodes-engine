@@ -201,6 +201,40 @@ class ChainEndNode(DataNode):
         self.parameter_output_values["final"] = f"{self.get_parameter_value('in_value')}->end"
 
 
+class ReportsWithSetterNode(DataNode):
+    """Reports its results through `set_parameter_value` rather than `parameter_output_values`.
+
+    Both spellings are common in libraries. `status` allows OUTPUT and nothing else, so the setter has
+    no authored value to store and the result belongs with the produced ones that travel back from a
+    worker. `note` also allows PROPERTY, so the same call stores an authored value the worker discards.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="status",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="note",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+            )
+        )
+
+    def process(self) -> None:
+        self.set_parameter_value("status", "reported")
+        self.set_parameter_value("note", "authored")
+
+
 def _shout(value: Any) -> Any:
     """Converter: proves converters run where the node object is real."""
     if isinstance(value, str):
