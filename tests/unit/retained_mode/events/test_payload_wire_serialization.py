@@ -40,6 +40,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultDetail,
     ResultDetails,
+    ResultPayloadSuccess,
     StrictModeViolationDetail,
 )
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
@@ -546,6 +547,52 @@ class TestValuesWithNoJsonForm:
     def test_value_field_names_the_class_that_has_no_plain_data_form(self) -> None:
         with pytest.raises(EventSerializationError, match="'_NoJsonForm' value has no plain-data form"):
             _PayloadHoldingAValue(value=_NoJsonForm()).to_json()
+
+
+@dataclasses.dataclass
+class _ResultHoldingAnything(ResultPayloadSuccess):
+    anything: Any = None
+
+
+class TestUnsendableResults:
+    """A result that cannot be sent is answered with a failure naming why, so the requester hears back."""
+
+    def test_json_sends_a_failure_naming_the_value(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(request_id="req-1"),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+            request_id="req-1",
+        )
+
+        data = json.loads(event.json())
+
+        assert data["event_type"] == "EventResultFailure"
+        assert data["result_type"] == "GenericResultFailure"
+        assert data["request_id"] == "req-1"
+        assert (
+            "'_NoJsonForm' value has no plain-data form"
+            in data["result"]["result_details"]["result_details"][0]["message"]
+        )
+
+    def test_failure_reads_back_as_a_failure_for_its_request(self) -> None:
+        event = EventResultSuccess(
+            request=GetConfigValueRequest(category_and_key="workspace_directory"),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+        )
+
+        restored = EventResultFailure.from_dict(json.loads(event.json()))
+
+        assert type(restored.request) is GetConfigValueRequest
+        assert not restored.result.succeeded()
+
+    def test_strict_json_raises(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+        )
+
+        with pytest.raises(EventSerializationError, match="_ResultHoldingAnything"):
+            event.strict_json()
 
 
 _FAILURE_REASON: Any = SequenceScanFailureReason | FileIOFailureReason

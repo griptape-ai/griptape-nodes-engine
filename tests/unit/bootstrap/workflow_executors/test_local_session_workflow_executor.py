@@ -186,6 +186,23 @@ class TestSendResult:
         assert data["request_type"] == "StartFlowRequest"
         assert "_UnsendableResultSuccess" in data["result"]["result_details"]["result_details"][0]["message"]
 
+    def test_answers_a_result_whose_request_cannot_be_sent(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        request = _UnsendableRequest(anything=_NoJsonForm(), request_id="req-1")
+        event = EventResultSuccess(
+            request=request, result=_UnsendableResultSuccess(result_details="ok"), request_id="req-1"
+        )
+
+        executor._send_result("success_result", event)
+
+        sent_type, sent_payload = executor.send_event.call_args.args
+        assert sent_type == "failure_result"
+        data = json.loads(sent_payload)
+        assert data["request"] == {"request_id": "req-1"}
+        assert data["request_type"] == "_UnsendableRequest"
+        assert "_NoJsonForm" in data["result"]["result_details"]["result_details"][0]["message"]
+
 
 class TestSendExecutionEvent:
     """A run whose result cannot be sent fails instead of reporting success with no output."""
