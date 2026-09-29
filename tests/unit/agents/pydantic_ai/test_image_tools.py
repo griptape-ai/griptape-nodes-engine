@@ -9,17 +9,22 @@ from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from griptape_nodes.agents.pydantic_ai.image_tools import (
     ImageGenerationToolset,
     ImageGenerationToolsetConfig,
+    register_image_tools,
 )
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
 from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 if TYPE_CHECKING:
     from pydantic_ai import RunContext
+    from pydantic_ai.messages import ModelMessage
 
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -107,6 +112,28 @@ class TestConfig:
     def test_accepts_allowed_image_size(self) -> None:
         config = ImageGenerationToolsetConfig(api_key="k", image_size="1024x1024")
         assert config.image_size == "1024x1024"
+
+
+@pytest.mark.asyncio
+class TestRegistration:
+    async def test_offers_generate_image_to_the_model_without_its_run_context(
+        self, static_files: _FakeStaticFilesManager
+    ) -> None:
+        offered: list[AgentInfo] = []
+
+        def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            offered.append(info)
+            return ModelResponse(parts=[TextPart("done")])
+
+        agent: Agent[None, str] = Agent(FunctionModel(respond))
+        register_image_tools(
+            agent, ImageGenerationToolsetConfig(api_key="k"), cast("StaticFilesManager", static_files)
+        )
+        await agent.run("draw a bird")
+
+        (tool,) = offered[0].function_tools
+        assert tool.name == "generate_image"
+        assert set(tool.parameters_json_schema["properties"]) == {"prompt", "negative_prompt"}
 
 
 @pytest.mark.asyncio
