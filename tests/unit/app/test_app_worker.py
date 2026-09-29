@@ -84,8 +84,11 @@ def worker_manager() -> WorkerManager:
     gtn.get_session_id.return_value = _SESSION
     gtn.get_engine_id.return_value = _ENGINE
     # WorkerManager reads several float config values at construction; hand back
-    # the declared default so asyncio.wait_for / time arithmetic gets a real number.
-    gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+    # the declared default so asyncio.wait_for / time arithmetic gets a real number. A spawn reads
+    # worker.command_prefix and library.dependency_source too, uncast, and gets their defaults.
+    gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=None: (
+        default if cast_type is None else cast_type(default)
+    )
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
