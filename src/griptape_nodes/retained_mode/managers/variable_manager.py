@@ -290,7 +290,7 @@ class VariablesManager(EngineScoped):
 
         ``project_id=None`` means the current project. Computed values (builtins/directories)
         are resolved fresh via ProjectManager; a computed value whose context isn't ready
-        (e.g. {workflow_dir} before the workflow is saved) yields None, matching the
+        (e.g. {workflow_dir} with no workflow in context) yields None, matching the
         silent-skip contract — the name exists, so the stored layer is NOT consulted as a
         fallback. Stored hits return a snapshot copy so callers can't mutate stored state through a
         response payload.
@@ -308,8 +308,8 @@ class VariablesManager(EngineScoped):
             try:
                 return project_manager.resolve_project_variable(name, project_id=effective)
             except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
-                # Computed name exists but its context isn't ready (e.g. {workflow_dir} before
-                # the workflow is saved, or a directory macro that can't resolve). Silent-skip,
+                # Computed name exists but its context isn't ready (e.g. {workflow_dir} with no
+                # workflow in context, or a directory macro that can't resolve). Silent-skip,
                 # no stored-layer fallback — the name is defined, just unavailable right now.
                 logger.debug("Computed project variable %r unavailable: %s", name, e)
                 return None
@@ -402,7 +402,7 @@ class VariablesManager(EngineScoped):
 
         Mutates `seen` to include each collected name so downstream layers can shadow correctly.
         Silent-skip for bulk enumeration: computed values whose context isn't ready (e.g.
-        workflow_dir before the workflow is saved) are omitted rather than raising. Each entry
+        workflow_dir with no workflow in context) are omitted rather than raising. Each entry
         carries VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
         """
         collected: list[ResolvedVariable] = []

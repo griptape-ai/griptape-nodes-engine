@@ -19,10 +19,11 @@ if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath, ResolvedProjectPath
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
-from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -13297,3 +13298,175 @@ class TestCurrentProjectChangedReachesClients:
         finally:
             engine.handle_request(SetCurrentProjectRequest(project_id=None))
             engine.config_manager.workspace_path = original_workspace
+
+
+class TestUnsavedWorkflowDirFromSaveSituation:
+    """Rung 4 of `_resolve_workflow_dir`: the folder a never-saved workflow would be saved into.
+
+    Read from the `save_workflow` situation rather than assumed to be the workspace root, so a
+    template that anchors workflow saves elsewhere gets its own folder. Every test here drives a
+    workflow that is registered but has no file and no working directory, which is the state a
+    workflow created from the header menu is in before its first save.
+    """
+
+    def _project_manager(
+        self, save_workflow_macro: str | None, stored_project_variables: dict[str, str | int] | None = None
+    ) -> ProjectManager:
+        """A ProjectManager whose `save_workflow` macro is `save_workflow_macro` (None removes it)."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(deep=True)
+        if save_workflow_macro is None:
+            del template.situations[BuiltInSituation.SAVE_WORKFLOW]
+        else:
+            template.situations[BuiltInSituation.SAVE_WORKFLOW].macro = save_workflow_macro
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_config.get_config_value.return_value = "staticfiles"
+        pm = ProjectManager(Mock(), mock_config, Mock())
+
+        project_path = Path("/test/project.yml")
+        project_id = str(project_path)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        project_info = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_path,
+            project_base_dir=project_path.parent,
+            template=template,
+            validation=validation,
+            parsed_situation_schemas=pm._parse_situation_macros(template.situations, validation),
+            parsed_directory_schemas=pm._parse_directory_macros(template.directories, validation),
+        )
+        pm._successfully_loaded_project_templates[project_id] = project_info
+        pm._current_project_id = project_id
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_name.return_value = "unsaved:abc"
+        mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
+        pm._engine = MagicMock()
+        pm._engine.context_manager = mock_context_manager
+        # The probe resolves through on_get_path_for_macro_request, which consults stored project
+        # variables. A MagicMock's return value is not a mapping it can walk.
+        pm._engine.variables_manager.stored_project_variable_values.return_value = stored_project_variables or {}
+
+        return pm
+
+    def _expected_dir(self, *parts: str) -> str:
+        """A workspace-anchored folder, anchored the way the resolution anchors it.
+
+        The resolved path is fully absolute, which on Windows means a drive letter that a bare
+        `Path("/workspace")` does not carry, so the expectation has to go through the same call.
+        """
+        return str(resolve_path_safely(Path("/workspace", *parts)))
+
+    def _resolve_workflow_dir(self, pm: ProjectManager, workflow_dir_requests: list[str] | None = None) -> str:
+        """Resolve `{workflow_dir}` through the registered-but-unsaved registry entry.
+
+        Every request for the `workflow_dir` builtin made during the resolution is appended to
+        `workflow_dir_requests`, so a test can bound how far the situation probe re-enters.
+        """
+        recorded = workflow_dir_requests if workflow_dir_requests is not None else []
+        real_get_builtin = ProjectManager._get_builtin_variable_value
+
+        def counting_get_builtin(pm_self: ProjectManager, var_name: str, project_info: ProjectInfo) -> str:
+            if var_name == "workflow_dir":
+                recorded.append(var_name)
+            return real_get_builtin(pm_self, var_name, project_info)
+
+        registered_unsaved = Mock()
+        registered_unsaved.file_path = None
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_workflow_registry,
+            patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin),
+        ):
+            mock_workflow_registry.get_workflow_by_name.return_value = registered_unsaved
+            project_info = pm._successfully_loaded_project_templates[cast("str", pm._current_project_id)]
+            return pm._resolve_workflow_dir(project_info)
+
+    def test_default_macro_answers_the_workspace_root(self) -> None:
+        """The shipped `{workspace_dir}/{sub_dirs?:/}...` macro puts a workflow at the root."""
+        pm = self._project_manager("{workspace_dir}/{sub_dirs?:/}{file_name_base}.{file_extension}")
+
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
+
+    def test_relocated_macro_answers_its_own_folder(self) -> None:
+        """The point of reading the situation: a template that saves elsewhere is answered with it.
+
+        Before, this returned the workspace root while the first save wrote to `workflows/`, so
+        every `{workflow_dir}`-anchored path pointed somewhere the workflow was never going to be.
+        """
+        pm = self._project_manager("{workspace_dir}/workflows/{sub_dirs?:/}{file_name_base}.{file_extension}")
+
+        assert self._resolve_workflow_dir(pm) == self._expected_dir("workflows")
+
+    def test_sub_dirs_is_omitted_rather_than_guessed(self) -> None:
+        """`sub_dirs` is a per-save choice, so the prediction leaves it out instead of inventing one.
+
+        The optional block drops cleanly, which is what makes the folder -- not the filename --
+        the only thing this rung reads out of the macro.
+        """
+        pm = self._project_manager("{workspace_dir}/{sub_dirs?:/}{file_name_base}.{file_extension}")
+
+        assert "sub_dirs" not in self._resolve_workflow_dir(pm)
+
+    def test_macro_naming_workflow_dir_does_not_recurse(self) -> None:
+        """A `save_workflow` macro naming `{workflow_dir}` resolves it once, not repeatedly.
+
+        Asserting on the returned folder alone would not catch a loop: the resolution degrades to
+        the workspace root either way, just after exhausting the stack. Bounding the number of
+        requests is what pins the reentrancy guard down.
+        """
+        pm = self._project_manager("{workflow_dir}/{file_name_base}.{file_extension}")
+        workflow_dir_requests: list[str] = []
+
+        resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
+
+        assert resolved == self._expected_dir()
+        assert len(workflow_dir_requests) == 1
+
+    def test_macro_reaching_workflow_dir_through_a_directory_does_not_recurse(self) -> None:
+        """The loop can also run through a directory, which is the shape every v1 default has.
+
+        `{outputs}` is `{workflow_dir?:/}outputs`, so a `save_workflow` macro that names no builtin
+        at all still reaches `workflow_dir`. Scanning the situation macro's own variables would
+        miss this, which is why the guard is a flag held across the whole probe. Unguarded, this
+        case does not degrade: each pass appends another `outputs`, so the folder is corrupt.
+        """
+        pm = self._project_manager("{outputs}/{file_name_base}.{file_extension}")
+        workflow_dir_requests: list[str] = []
+
+        resolved = self._resolve_workflow_dir(pm, workflow_dir_requests)
+
+        assert resolved == self._expected_dir("outputs")
+        assert len(workflow_dir_requests) == 1
+
+    def test_stored_project_variable_resolves_the_same_way_the_save_would(self) -> None:
+        """A macro naming a stored project variable gets the folder the real save writes to.
+
+        The save resolves through `on_get_path_for_macro_request`, which fills stored project
+        variables. Resolving the macro with only this manager's own resolver could not see them,
+        so it answered the workspace root while the save wrote somewhere else entirely.
+        """
+        pm = self._project_manager(
+            "{workspace_dir}/{team_folder}/{file_name_base}.{file_extension}",
+            stored_project_variables={"team_folder": "lighting"},
+        )
+
+        assert self._resolve_workflow_dir(pm) == self._expected_dir("lighting")
+
+    def test_missing_situation_answers_the_workspace_root(self) -> None:
+        """A template with no `save_workflow` situation still gets a usable folder."""
+        pm = self._project_manager(None)
+
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
+
+    def test_unresolvable_macro_answers_the_workspace_root(self) -> None:
+        """An undefined required variable falls back instead of failing the whole resolution."""
+        pm = self._project_manager("{no_such_directory}/{file_name_base}.{file_extension}")
+
+        assert self._resolve_workflow_dir(pm) == self._expected_dir()
