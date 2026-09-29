@@ -223,6 +223,27 @@ def aprocess_scope(
         VariableResolver.reset_cache(cache_token)
 
 
+@contextmanager
+def authored_value_scope() -> Iterator[None]:
+    """Mark the enclosed block as authoring values rather than producing them.
+
+    `SetParameterValueRequest` is the authored way to set a value, and the handler wraps itself in
+    this so that stays true of a request a node sends on itself from inside its own body. Without it
+    the value would be stored as something that run produced, and so cleared before the next one,
+    which is the opposite of the reason to send the request: the documented way for a node to carry
+    state across runs. It also keeps the two execution paths agreed, since a request from a worker is
+    handled on the orchestrator, where no node is running and the value is authored either way.
+
+    This leaves `_in_aprocess` alone. A node is still running, so the parameter-mutation detector and
+    variable substitution behave as they do anywhere else inside the body.
+    """
+    token = _running_node.set(None)
+    try:
+        yield
+    finally:
+        _running_node.reset(token)
+
+
 class ImportDependency(NamedTuple):
     """Import dependency specification for a node.
 
