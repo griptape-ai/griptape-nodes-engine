@@ -103,13 +103,13 @@ a sandbox library.
 
 ### `worker.command_prefix`
 
-Libraries that run in their own worker process are started with a command like
-`python -m griptape_nodes_app engine --library-name "Foo Library" ...`. `worker.command_prefix`
-is a list of words placed in front of that command, so your tool can prepare the environment first
-and then run the worker inside it:
+Libraries that run in their own worker process are started with the engine's own Python
+interpreter, by its full path: `/path/to/python -m griptape_nodes_app engine --library-name "Foo Library" ...`.
+`worker.command_prefix` is a list of words placed in front of that command, so your tool can
+prepare the environment first and then run the worker inside it:
 
 ```bash
-export GTN_CONFIG_WORKER__COMMAND_PREFIX='["env-tool", "run", "engine=={engine_version}", "{library_request}", "--"]'
+export GTN_CONFIG_WORKER__COMMAND_PREFIX='["env-tool", "run", "engine=={engine_version}", "python-{python_version}", "{library_request}", "--"]'
 ```
 
 These placeholders are filled for each worker:
@@ -119,9 +119,16 @@ These placeholders are filled for each worker:
 | `{library_request}` | The library's entry in `GTN_LIBRARY_WORKER_REQUESTS` (see below). |
 | `{library_name}`    | The library's name, as written in its manifest.                   |
 | `{engine_version}`  | The running engine's version, such as `0.103.0`.                  |
+| `{python_version}`  | The Python the engine runs on, as major.minor, such as `3.12`.    |
 
 A word that is exactly `{library_request}` becomes one word per space-separated part of the entry,
 so one entry can name several packages. Inside a longer word it's replaced as text.
+
+The prefix can't change which Python runs the worker: it is always the engine's own interpreter.
+Prepare each worker's environment for that Python, for example by asking your tool for
+`python-{python_version}`. Otherwise packages with compiled parts may be built for a different
+Python and fail to import. Start the engine itself from the prepared environment rather than from
+a virtual environment, so the worker doesn't pick up packages from that virtual environment.
 
 `GTN_LIBRARY_WORKER_REQUESTS` says what each library's worker needs. Entries are
 `<library name>=<request>`, separated like `PATH` entries, where the library name is the `name` in

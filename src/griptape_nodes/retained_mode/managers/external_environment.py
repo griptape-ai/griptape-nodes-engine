@@ -41,6 +41,7 @@ LIBRARY_WORKER_REQUESTS_ENV_VAR = "GTN_LIBRARY_WORKER_REQUESTS"
 LIBRARY_REQUEST_PLACEHOLDER = "{library_request}"
 LIBRARY_NAME_PLACEHOLDER = "{library_name}"
 ENGINE_VERSION_PLACEHOLDER = "{engine_version}"
+PYTHON_VERSION_PLACEHOLDER = "{python_version}"
 
 # Separates a library's name from its request inside one GTN_LIBRARY_WORKER_REQUESTS entry. The
 # first one splits, so a request may itself contain it (`lib_foo==1.4.2`).
@@ -171,6 +172,7 @@ def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact abou
     library_name: str,
     worker_requests: Mapping[str, str],
     engine_version: str,
+    python_version: str,
     environment_mode: bool,
 ) -> WorkerCommand | WorkerCommandRefusal:
     """Put the configured prefix in front of a worker's command, with its placeholders filled.
@@ -185,12 +187,17 @@ def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact abou
     library against whatever packages happen to be there. In venv mode the library runs without the
     prefix, as it would with no prefix configured.
 
+    The worker's command starts with the engine's own interpreter (an absolute path), so the
+    prefix cannot swap in another Python. `{python_version}` lets the tool resolve the worker's
+    environment for that same Python, so its compiled packages match the interpreter that runs.
+
     Args:
         command: The worker command the prefix goes in front of.
         prefix: The configured `worker.command_prefix`.
         library_name: The library the worker serves (its manifest `name`).
         worker_requests: Worker requests by library name, from `GTN_LIBRARY_WORKER_REQUESTS`.
         engine_version: This engine's version, for `{engine_version}`.
+        python_version: The engine's Python as `major.minor`, for `{python_version}`.
         environment_mode: Whether `library.dependency_source` is 'environment'.
     """
     if not prefix:
@@ -226,6 +233,7 @@ def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact abou
         # The request goes in last, so text inside it is never mistaken for a placeholder.
         filled = word.replace(LIBRARY_NAME_PLACEHOLDER, library_name)
         filled = filled.replace(ENGINE_VERSION_PLACEHOLDER, engine_version)
+        filled = filled.replace(PYTHON_VERSION_PLACEHOLDER, python_version)
         filled = filled.replace(LIBRARY_REQUEST_PLACEHOLDER, request_text)
         expanded.append(filled)
     return WorkerCommand(args=[*expanded, *command])

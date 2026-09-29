@@ -77,10 +77,24 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
         assert result == WorkerCommand(args=_COMMAND)
+
+    def test_python_version_is_filled(self) -> None:
+        result = resolve_worker_command(
+            command=_COMMAND,
+            prefix=["tool", "env", "python-{python_version}", "{library_request}", "--"],
+            library_name="Foo Library",
+            worker_requests={"Foo Library": "lib_foo==1.4.2"},
+            engine_version="0.103.0",
+            python_version="3.13",
+            environment_mode=True,
+        )
+
+        assert result == WorkerCommand(args=["tool", "env", "python-3.13", "lib_foo==1.4.2", "--", *_COMMAND])
 
     def test_placeholders_are_filled_and_the_prefix_goes_first(self) -> None:
         result = resolve_worker_command(
@@ -89,6 +103,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={"Foo Library": "lib_foo==1.4.2"},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
@@ -103,6 +118,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={"Foo Library": "lib_foo==1.4.2  extra_pkg"},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
@@ -115,6 +131,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={"Foo Library": "a b"},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
@@ -127,6 +144,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={"Foo Library": "{library_name}"},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
@@ -140,6 +158,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={"Other Library": "lib_other"},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 
@@ -154,6 +173,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=False,
         )
 
@@ -166,6 +186,7 @@ class TestResolveWorkerCommand:
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
+            python_version="3.12",
             environment_mode=True,
         )
 

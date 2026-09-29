@@ -900,6 +900,7 @@ class WorkerManager(EngineScoped):
             library_name=library_name,
             worker_requests=worker_requests_from_environment(os.environ),
             engine_version=engine_version,
+            python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
             environment_mode=uses_environment_dependencies(self.engine.config_manager),
         )
         if isinstance(resolved, WorkerCommandRefusal):
