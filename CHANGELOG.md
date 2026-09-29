@@ -19,6 +19,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- A `Workflow Node` now starts each parameter it exposes from a workflow's `Start Flow` node with
+  the value set on that `Start Flow` node, instead of leaving it empty. The value is saved with the
+  workflow, so a workflow saved before this release needs saving again to carry it. Values such as
+  images keep the parameter's own default.
+  [#5698](https://github.com/griptape-ai/griptape-nodes-engine/issues/5698)
 - The process a library runs isolated in shuts down within about 35 seconds of losing the engine
   that started it. Before, if that engine exited in the process's first 10 minutes, the process
   stayed up until those 10 minutes had passed. `worker.library_load_timeout_s` no longer delays

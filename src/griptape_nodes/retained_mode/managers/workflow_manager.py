@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextvars
+import json
 import logging
 import pickle
 import re
@@ -5961,11 +5962,31 @@ class WorkflowManager(EngineScoped):
                 # Expose only the parameters that are relevant for workflow input and output.
                 param_info = self.extract_parameter_shape_info(param, include_control_params=True)
                 if param_info is not None:
+                    if workflow_shape_type == "input":
+                        self._apply_set_value_as_default(node, param, param_info)
                     if node.name in workflow_shape[workflow_shape_type]:
                         cast("dict", workflow_shape[workflow_shape_type][node.name])[param.name] = param_info
                     else:
                         workflow_shape[workflow_shape_type][node.name] = {param.name: param_info}
         return workflow_shape
+
+    @staticmethod
+    def _apply_set_value_as_default(node: BaseNode, param: Parameter, param_info: ParameterShapeInfo) -> None:
+        """Record the value set on a Start Flow parameter as its default in the shape.
+
+        A Start Flow parameter's declared default is usually empty; the value the workflow's author
+        typed in is stored on the node. Nodes that run the workflow read their defaults from the
+        shape, so without this they start out empty. A value the shape's JSON header cannot hold
+        (an artifact, say) keeps the declared default.
+        """
+        if param.name not in node.parameter_values:
+            return
+        value = node._get_raw_parameter_value(param.name)
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            return
+        param_info["default_value"] = value
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow.
