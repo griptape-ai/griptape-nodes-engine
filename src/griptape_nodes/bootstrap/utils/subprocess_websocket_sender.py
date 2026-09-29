@@ -17,7 +17,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     EventSerializationError,
 )
-from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 
 logger = logging.getLogger(__name__)
 
@@ -119,16 +118,10 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
     def _send_result(self, event_type: str, event: EventResultSuccess | EventResultFailure) -> None:
         """Send a result, or a GenericResultFailure naming why it could not be sent, so the requester hears back."""
         try:
-            payload = event.json()
+            payload = event.strict_json()
         except EventSerializationError as error:
             logger.error("Could not send %s for %s: %s", event_type, type(event.request).__name__, error)
-            failure_event = EventResultFailure(
-                request=event.request,
-                result=GenericResultFailure(result_details=str(error)),
-                request_id=event.request_id,
-                response_topic=event.response_topic,
-            )
-            self.send_event("failure_result", failure_event.json())
+            self.send_event("failure_result", event.failure_json(error))
             return
         self.send_event(event_type, payload)
 
