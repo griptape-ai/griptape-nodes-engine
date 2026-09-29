@@ -25,9 +25,15 @@ from griptape_nodes.node_library.library_registry import (
     NodeDefinition,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
+    GetConfigValueResultSuccess,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     DownloadLibraryRequest,
     DownloadLibraryResultFailure,
+    LoadMetadataForAllLibrariesRequest,
+    LoadMetadataForAllLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     SyncLibrariesRequest,
@@ -382,3 +388,41 @@ class TestLibraryDependencies:
         assert [problem.dependency_name for problem in dependency_problems] == [DEPENDENCY_URL]
         assert "does not provide it" in dependency_problems[0].error_message
         assert main_info.fitness == LibraryManager.LibraryFitness.FLAWED
+
+
+class TestWhatTheEditorReads:
+    """The editor shows environment libraries from the metadata listing and reads the mode as a setting."""
+
+    @pytest.mark.asyncio
+    async def test_environment_libraries_are_listed_under_their_environment_entry(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        configured = _write_library(tmp_path / "config" / "a_lib", "A Library")
+        from_environment = _write_library(tmp_path / "env" / "b_lib", "B Library")
+        configure(environment_paths=[from_environment], registered=[configured], environment_mode=True)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+
+        result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+
+        assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+        by_name = {entry.library_schema.name: entry for entry in result.successful_libraries}
+        assert by_name["B Library"].registered_path == str(from_environment)
+        assert by_name["B Library"].file_path == str(from_environment)
+        assert by_name["B Library"].is_registered is True
+        # A configured library is still listed, under its own config entry, and reads as not loaded.
+        assert by_name["A Library"].registered_path == str(configured)
+        assert by_name["A Library"].is_registered is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("environment_mode", "expected"), [(True, "environment"), (False, "venv")])
+    async def test_the_dependency_source_reads_as_plain_text(
+        self, engine: Engine, configure: Configure, *, environment_mode: bool, expected: str
+    ) -> None:
+        configure(environment_paths=[], environment_mode=environment_mode)
+
+        result = await engine.ahandle_request(GetConfigValueRequest(category_and_key="library.dependency_source"))
+
+        assert isinstance(result, GetConfigValueResultSuccess)
+        assert result.value == expected
+        assert json.loads(json.dumps(result.value)) == expected
