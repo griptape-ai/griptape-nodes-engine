@@ -36,6 +36,15 @@ the engine's request API from working without edits. Migration steps live in
 - A library whose isolated process shuts down before loading it now reports that as soon as the
   process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
   load that never finished.
+- Installing a library's dependencies no longer gives the engine an older copy of a package the
+  engine itself imports. A library's environment comes ahead of the engine's own on the import path,
+  so a library that resolved, for instance, an older `griptape` handed that copy to the engine too.
+  Library installs now carry the engine's own versions as minimum versions, so such a package
+  resolves no older than the engine's. A library that genuinely needs an older one is still
+  installed and still works; it is now listed in that library's problems, naming what it supplies
+  and what the engine expected, where before nothing connected the two.
+  [#5681](https://github.com/griptape-ai/griptape-nodes-engine/issues/5681)
+  [#5682](https://github.com/griptape-ai/griptape-nodes-engine/issues/5682)
 - Creating or switching to a project whose workspace differs now closes the open workflow, returning
   you to the workflow picker. Before, the engine kept a workflow it no longer had a record of, so the
   next workflow you opened sat on "Checking workflow" and the log filled with "is not registered on
@@ -50,9 +59,16 @@ the engine's request API from working without edits. Migration steps live in
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
   `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
   callers only supply their own variables.
+- A parameter that a node both shows and passes on, such as the text on a text node, keeps an edit
+  made after the node has run. Before, reopening the workflow or refreshing the page showed the
+  value from the last run instead of the edit.
+- Renaming a parameter that holds an output value now reports that the old name no longer has one,
+  alongside the new name's value. Before, only the new name was reported, so anything tracking
+  output values by parameter name kept the old name's value.
 
 ### Added
 
+- `claude-sonnet-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar.
 - Projects have two new situations for versioned output folders. `save_output_directory` creates
   `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
   run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
@@ -120,6 +136,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Connecting a video, image, or audio file uploaded through the editor to a node that requires that
+  media type no longer fails with a message saying the parameter must be an artifact.
+- Image, video, audio, and 3D parameters no longer fail when given an inline `data:` URI longer than
+  the operating system's file name limit, which any real image exceeds. The URI is kept as the
+  parameter's value.
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)

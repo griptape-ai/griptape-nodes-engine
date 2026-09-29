@@ -111,7 +111,15 @@ def _upload_file_to_static_storage(file_path: Path, artifact_type: type[Any]) ->
     Returns:
         Artifact object with localhost URL, or None if upload fails
     """
-    if not file_path.exists() or not file_path.is_file():
+    # A value that is not a path at all, such as a data URI, can be too long for the OS to
+    # look up. That is still an answer to "is this a file?", so treat it as "no".
+    try:
+        is_file = file_path.is_file()
+    except OSError as e:
+        logger.debug("Failed to check if '%s' is a file: %s", file_path, e)
+        return None
+
+    if not is_file:
         return None
 
     try:
@@ -187,7 +195,8 @@ def normalize_artifact_input(
             For example, for images, both ImageUrlArtifact and ImageArtifact are valid.
 
     Returns:
-        Artifact of the specified type if input was a string path, otherwise returns input unchanged
+        Artifact of the specified type if the input was a string path, or a serialized dict
+        naming that same type, otherwise returns the input unchanged
     """
     # Return unchanged if already the correct artifact type
     if isinstance(artifact_input, artifact_type):
@@ -200,6 +209,26 @@ def normalize_artifact_input(
     # Process string paths
     if isinstance(artifact_input, str) and artifact_input:
         return _normalize_string_input(artifact_input, artifact_type)
+
+    # A serialized *Url* artifact dict carries the path or URL in its ``value``; the rest is
+    # display metadata the editor tracks alongside it. Hand that string to the branch above
+    # rather than rebuilding the artifact from the dict: it resolves and uploads the path,
+    # and builds the type this parameter declared. The declared type is what tells a path
+    # apart from a payload -- a raw ``ImageArtifact`` dict holds base64 bytes in ``value``,
+    # which is not a path and must be left alone. The check trusts the declared type, so a
+    # data URI in a *Url* dict is knowingly let through; it fails to resolve as a path and
+    # is wrapped as-is below, and the node libraries accept data URIs in URL artifacts.
+    if isinstance(artifact_input, dict) and artifact_input.get("type") == artifact_type.__name__:
+        inner = artifact_input.get("value")
+        if isinstance(inner, str) and inner:
+            normalized = _normalize_string_input(inner, artifact_type)
+            # That branch hands back its own input when a path cannot be resolved or
+            # uploaded -- a macro path, or a file outside the workspace. The dict already
+            # declared the artifact type, so build it from the value instead of letting a
+            # dict degrade into a bare string.
+            if isinstance(normalized, str):
+                return artifact_type(normalized)
+            return normalized
 
     return artifact_input
 
