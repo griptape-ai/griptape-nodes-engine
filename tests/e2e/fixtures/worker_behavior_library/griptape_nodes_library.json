@@ -62,6 +62,15 @@
       }
     },
     {
+      "class_name": "GrowsAnOutputListNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Grows an output-only ParameterList while running",
+        "display_name": "GrowsAnOutputListNode"
+      }
+    },
+    {
       "class_name": "ReportsWithSetterNode",
       "file_path": "worker_behavior_nodes.py",
       "metadata": {

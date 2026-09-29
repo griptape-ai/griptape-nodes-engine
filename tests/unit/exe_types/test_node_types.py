@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import (
     AsyncResult,
     SuccessFailureNode,
@@ -241,6 +241,24 @@ class TestSetParameterValueStore:
             node.set_parameter_value("out", "produced by the run")
 
         assert node.get_parameter_value("out") == "produced by the run"
+
+    def test_a_container_child_keeps_the_container_whole(self) -> None:
+        """The container is rebuilt from its children read raw, so a child must stay authored.
+
+        Split Video in the standard library grows an output-only `ParameterList` this way, adding a
+        child per clip and setting it while the node runs.
+        """
+        node = MockNode(name="node")
+        images = ParameterList(name="images", type="str", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        node.add_parameter(images)
+        child = images.add_child_parameter()
+
+        with aprocess_scope():
+            node.set_parameter_value(child.name, "img0")
+
+        assert node.get_parameter_value("images") == ["img0"]
+        # The rebuilt container is what a worker ships back, so it is the produced value.
+        assert node.parameter_output_values["images"] == ["img0"]
 
     def test_property_and_output_stays_authored(self) -> None:
         """Adding PROPERTY makes the distinction real again: the user can type here."""

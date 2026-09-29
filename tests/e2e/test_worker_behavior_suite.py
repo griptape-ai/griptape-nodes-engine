@@ -364,6 +364,32 @@ class TestResultsReportedWithTheSetter:
         assert result.parameter_output_values["status"] == "reported"
 
 
+class TestAnOutputListGrownWhileRunning:
+    """Split Video's shape: an output-only `ParameterList` whose children are set as the node runs.
+
+    The children are rebuilt into the list by `handle_container_parameter`, which reads them raw, so
+    they stay authored and only the rebuilt list is a result.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_the_whole_list(self) -> None:
+        current_engine().library_manager._is_worker = True
+        _make("GrowsAnOutputListNode", "ListGrower")
+
+        result = await _execute("GrowsAnOutputListNode", "ListGrower")
+
+        assert result.parameter_output_values["clips"] == ["clip0", "clip1"]
+
+    @pytest.mark.asyncio
+    async def test_the_same_node_on_the_orchestrator(self) -> None:
+        current_engine().library_manager._is_worker = False
+        node = _make("GrowsAnOutputListNode", "LocalListGrower")
+
+        await _execute("GrowsAnOutputListNode", "LocalListGrower")
+
+        assert node.get_parameter_value("clips") == ["clip0", "clip1"]
+
+
 class TestEditorTimeBehaviorOnRealNodes:
     """These are exactly what a schema stub would have dropped."""
 

@@ -1178,8 +1178,14 @@ class BaseNode(ABC):
         set at edit time, in a constructor or from `after_value_set` has to outlive both, and the
         engine's own writes are compared against `parameter_values` to decide whether a change needs
         to invalidate anything downstream.
+
+        A container's child is the exception, and writes `parameter_values` wherever it is set.
+        Setting one rebuilds the whole container through `handle_container_parameter`, which reads its
+        children raw so that a held child cannot leak a live object into the container's value. The
+        container itself is not a child, so it still records what the run produced, and that is the
+        value downstream reads and the one that travels back from a worker.
         """
-        if _in_aprocess.get() and self._is_output_only(parameter):
+        if _in_aprocess.get() and parameter.parent_container_name is None and self._is_output_only(parameter):
             return self.parameter_output_values
         return self.parameter_values
 

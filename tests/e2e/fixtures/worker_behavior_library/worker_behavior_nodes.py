@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any
 
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import AsyncResult, DataNode
 from griptape_nodes.files.file import File
 from griptape_nodes.files.project_file import ProjectFileDestination
@@ -233,6 +233,29 @@ class ReportsWithSetterNode(DataNode):
     def process(self) -> None:
         self.set_parameter_value("status", "reported")
         self.set_parameter_value("note", "authored")
+
+
+class GrowsAnOutputListNode(DataNode):
+    """Grows an output-only `ParameterList` while running, as Split Video does.
+
+    The children are set through `set_parameter_value`; the list itself is rebuilt from them. Only the
+    rebuilt list is a result, so only it travels back from a worker.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.clips = ParameterList(
+            name="clips",
+            type="str",
+            tooltip="",
+            allowed_modes={ParameterMode.OUTPUT},
+        )
+        self.add_parameter(self.clips)
+
+    def process(self) -> None:
+        for item in ("clip0", "clip1"):
+            child = self.clips.add_child_parameter()
+            self.set_parameter_value(child.name, item)
 
 
 def _shout(value: Any) -> Any:
