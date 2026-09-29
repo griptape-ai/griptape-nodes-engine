@@ -6,6 +6,7 @@ import os
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.external_environment import (
@@ -22,11 +23,17 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     worker_requests_from_environment,
 )
 from griptape_nodes.retained_mode.managers.settings import (
+    BETA_FEATURES_FROM_ENV_CONTEXT,
     LIBRARY_DEPENDENCY_SOURCE_KEY,
     LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY,
     WORKER_COMMAND_PREFIX_KEY,
     LibraryDependencySource,
+    LibrarySettings,
+    WorkerSettings,
 )
+
+# The context the env loader validates GTN_CONFIG_* overrides under.
+_FROM_ENV = {BETA_FEATURES_FROM_ENV_CONTEXT: True}
 
 _COMMAND = ["/engine/python", "-m", "griptape_nodes_app", "engine", "--library-name", "Foo Library"]
 
@@ -207,6 +214,17 @@ class TestReadingTheSettings:
 
         assert read_dependency_source(config) is LibraryDependencySource.VENV
 
+    @pytest.mark.parametrize(("raw", "expected"), [(" TRUE ", True), ("no", False), (1, False), (None, False)])
+    def test_only_true_or_the_text_true_allows_the_sandbox(self, raw: object, *, expected: bool) -> None:
+        config = _config_returning({LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY: raw})
+
+        assert environment_allows_sandbox(config) is expected
+
+    def test_a_prefix_that_is_not_a_list_is_not_used(self) -> None:
+        config = _config_returning({WORKER_COMMAND_PREFIX_KEY: "tool env --"})
+
+        assert read_worker_command_prefix(config) == []
+
     def test_a_prefix_with_a_non_text_entry_is_not_used(self) -> None:
         config = _config_returning({WORKER_COMMAND_PREFIX_KEY: ["tool", 3]})
 
@@ -250,6 +268,43 @@ class TestEnvironmentOverrides:
 
         assert read_dependency_source(manager) is LibraryDependencySource.VENV
         assert "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE" in caplog.text
+
+
+class TestSettingsValidation:
+    """The validators, run the way the env loader (with the env context) and a config file run them."""
+
+    def test_a_blank_command_prefix_variable_means_no_prefix(self) -> None:
+        settings = WorkerSettings.model_validate({"command_prefix": "  "}, context=_FROM_ENV)
+
+        assert settings.command_prefix == []
+
+    def test_a_dependency_source_that_is_already_typed_is_kept(self) -> None:
+        settings = LibrarySettings.model_validate({"dependency_source": LibraryDependencySource.ENVIRONMENT})
+
+        assert settings.dependency_source is LibraryDependencySource.ENVIRONMENT
+
+    def test_an_unknown_dependency_source_in_a_config_file_falls_back_to_venv(self) -> None:
+        settings = LibrarySettings.model_validate({"dependency_source": "somewhere"})
+
+        assert settings.dependency_source is LibraryDependencySource.VENV
+
+    def test_an_unknown_dependency_source_from_the_environment_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be one of"):
+            LibrarySettings.model_validate({"dependency_source": "somewhere"}, context=_FROM_ENV)
+
+    def test_a_typed_sandbox_setting_is_kept(self) -> None:
+        settings = LibrarySettings.model_validate({"environment_allows_sandbox": True})
+
+        assert settings.environment_allows_sandbox is True
+
+    def test_a_bad_sandbox_setting_in_a_config_file_keeps_the_sandbox_refused(self) -> None:
+        settings = LibrarySettings.model_validate({"environment_allows_sandbox": "maybe"})
+
+        assert settings.environment_allows_sandbox is False
+
+    def test_a_bad_sandbox_setting_from_the_environment_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be true or false"):
+            LibrarySettings.model_validate({"environment_allows_sandbox": "maybe"}, context=_FROM_ENV)
 
 
 class TestEnvironmentAllowsSandbox:
