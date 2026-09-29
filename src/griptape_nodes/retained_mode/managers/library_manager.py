@@ -4025,8 +4025,9 @@ class LibraryManager(EngineScoped):
                 details = f"Hot reloaded module: {module_name} from {file_path}"
                 logger.debug(details)
             except Exception as e:
-                # Restore the old module in case of failure
+                # Restore the old module and its alias, so its live classes keep their type names
                 sys.modules[module_name] = old_module
+                self._register_stable_module_alias(module_name, stable_namespace, old_module, library_name)
                 msg = f"Error reloading module {module_name} from {file_path}: {e}"
                 raise ImportError(msg) from e
 
