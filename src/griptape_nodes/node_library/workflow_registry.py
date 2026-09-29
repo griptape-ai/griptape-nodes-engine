@@ -285,7 +285,7 @@ class _WorkflowRegistry:
     """Workflows known to one engine, keyed by registry key.
 
     Owned by `Engine` and reached through `engine.workflow_registry`. Node libraries, which have
-    no engine reference, use `GriptapeNodes.WorkflowRegistry()`.
+    no engine reference, use the `WorkflowRegistry` classmethods.
     """
 
     # Prefix used for synthetic registry keys for unsaved (in-memory) workflows.
@@ -422,8 +422,7 @@ class WorkflowRegistry:
     """The current engine's workflow registry, for node libraries.
 
     Kept for node libraries that call these classmethods. Each one forwards to
-    `current_engine().workflow_registry`. Library code should use `GriptapeNodes.WorkflowRegistry()`,
-    and engine-internal code `engine.workflow_registry`.
+    `current_engine().workflow_registry`. Engine-internal code uses `engine.workflow_registry`.
     """
 
     UNSAVED_KEY_PREFIX: ClassVar[str] = _WorkflowRegistry.UNSAVED_KEY_PREFIX
@@ -497,7 +496,7 @@ class Workflow:
     - **Saved**: backed by a file on disk. `file_path` is a string (relative or absolute).
       Created via `Workflow.from_disk`.
     - **Unsaved**: in-memory only. `file_path is None`. Created via
-      `generate_new_workflow` with `file_path=None`. Transitions to
+      `_WorkflowRegistry.generate_new_workflow` with `file_path=None`. Transitions to
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
     """
 

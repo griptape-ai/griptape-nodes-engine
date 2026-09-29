@@ -22,7 +22,6 @@ from griptape_nodes.retained_mode.engine import (
     has_current_engine,
     reset_root_engine,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 class TestDeriveRegistryKey:
@@ -262,11 +261,6 @@ class TestWorkflowRegistryOperations:
 
         assert engine.workflow_registry.has_workflow_with_name("unsaved:mine")
         assert not other.workflow_registry.has_workflow_with_name("unsaved:mine")
-
-
-class TestFacadeAccessor:
-    def test_returns_the_current_engine_registry(self, engine: Engine) -> None:
-        assert GriptapeNodes.WorkflowRegistry() is engine.workflow_registry
 
 
 class TestWorkflowRegistryShim:

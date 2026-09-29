@@ -6142,7 +6142,7 @@ class WorkflowManager(EngineScoped):
             if isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
                 workflow_registry_key = derive_registry_key(workflow_file.name)
                 try:
-                    _workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_registry_key)
+                    self.engine.workflow_registry.get_workflow_by_name(workflow_registry_key)
                     # This workflow was registered previously, but now it's been updated (potentially including the metadata), so let's re-register
                     self.engine.workflow_registry.delete_workflow_by_name(workflow_registry_key)
                 except KeyError:
