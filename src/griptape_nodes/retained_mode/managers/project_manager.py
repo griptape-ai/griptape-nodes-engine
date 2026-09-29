@@ -62,6 +62,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
@@ -3026,7 +3027,13 @@ class ProjectManager(EngineScoped):
     async def _reload_after_project_switch(
         self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
-        """Reload libraries and optionally re-register workflows after a project switch.
+        """Close the open workflow, reload libraries, and re-register workflows after a switch.
+
+        A workspace change closes the open workflow, because re-registering the
+        workflows re-keys them against the new workspace: a context that outlives
+        its registry entry names a key nothing can look up again, and every
+        `workflow_dir` resolution against it warns for the life of the process.
+        Clients are expected to return the user to the workflow picker.
 
         Only reloads libraries when the project's library-affecting config
         actually changed: the reload triggers LibraryManager's reconcile, which
@@ -3035,15 +3042,33 @@ class ProjectManager(EngineScoped):
         default workspace) skips the deep reset. Workflows are re-registered only
         when the workspace directory changed.
 
-        Returns a failure result if the library reload (reconcile/engine_version
-        gate included) fails, otherwise None.
+        Returns a failure result if the workflow could not be closed, or if the
+        library reload (reconcile/engine_version gate included) fails, otherwise
+        None.
         """
+        # Ahead of refresh_workflow_registry, which deletes the entry this teardown resolves
+        # paths through, and ahead of the reload below, whose own clear then finds an empty
+        # stack and no-ops.
+        #
+        # Both failures below report altered_workflow_state: the teardown pops the context
+        # before the checks that can fail it, so the workflow is gone either way. A failure
+        # that claimed otherwise would leave the client showing a workflow the engine has
+        # dropped, which is the state this teardown exists to prevent.
+        if workspace_changed:
+            clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if not clear_result.succeeded():
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set project '{project_id}'. "
+                    f"Config updated but the open workflow could not be closed: {clear_result.result_details}",
+                    altered_workflow_state=True,
+                )
         if library_config_changed:
             reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
             if isinstance(reload_result, ReloadAllLibrariesResultFailure):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but library reload failed: {reload_result.result_details}",
+                    altered_workflow_state=True,
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
