@@ -18,9 +18,8 @@ the engine's request API from working without edits. Migration steps live in
   (env `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`). With its heartbeat role removed, what it bounds
   is how long a worker may take to load its library, which the new name states. A config file still
   setting the old name silently falls back to the 600 second default.
-- File URL and local path support for HTTP requests now covers `httpx2` as well as `httpx` and
-  `requests`, so node libraries using `httpx2` can fetch `file://` URLs, local paths, and
-  Griptape Cloud asset URLs.
+- Workflows run in a subprocess now verify TLS certificates against the operating system's trust
+  store, matching the app.
 
 ### Fixed
 
