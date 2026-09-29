@@ -53,6 +53,10 @@ With `environment`:
 - `libraries_to_download` is ignored, and nothing is downloaded, updated, or synced. Requests to
     download, update, switch, or sync a library fail with a message saying the environment manages
     libraries.
+- Checking a library for updates reports no update and says updates come from the environment,
+    without contacting its git remote.
+- The Sandbox Library is neither scanned nor loaded, and adding a sandbox node from a file fails
+    with a message saying the environment manages libraries.
 - No `.venv` or `.venv-exec` folder is created, and none left from an earlier run is used.
 - A library that declares another library as a dependency is satisfied only by a library in
     `GTN_LIBRARY_PATHS`. If the environment doesn't provide it, the library reports the missing

@@ -1831,8 +1831,11 @@ class LibraryManager(EngineScoped):
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
 
-        # Generate sandbox library metadata if configured
-        sandbox_library_dir = self._get_sandbox_directory()
+        # Generate sandbox library metadata if configured. Not when the environment provides the
+        # libraries: the sandbox never loads then, and scanning it writes its manifest.
+        sandbox_library_dir = None
+        if not self._uses_environment_dependencies():
+            sandbox_library_dir = self._get_sandbox_directory()
         if sandbox_library_dir:
             # Try to load existing JSON first - only scan if load fails
             sandbox_json_path = sandbox_library_dir / LibraryManager.LIBRARY_CONFIG_FILENAME
@@ -2229,6 +2232,14 @@ class LibraryManager(EngineScoped):
         discovers files that exist on disk but are absent from the manifest, and the loader
         resolves their class names and writes the manifest back for us.
         """
+        # The environment decides every node type that exists, so none is added from a loose file.
+        if self._uses_environment_dependencies():
+            return RegisterSandboxNodeFromSourceResultFailure(
+                result_details=self._environment_provides_libraries_message(
+                    f"add the sandbox node in '{request.file_path}'"
+                )
+            )
+
         # Resolve and validate the sandbox directory. Agents cannot register nodes on a
         # system that has not opted in to a sandbox.
         sandbox_dir = self._get_sandbox_directory()
@@ -6953,6 +6964,24 @@ class LibraryManager(EngineScoped):
         except KeyError:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no Library with that name was registered."
             return CheckLibraryUpdateResultFailure(result_details=details)
+
+        # The environment chose this version, and a newer one arrives only through it, so there is
+        # nothing to ask git about. Answered as a success: nothing is wrong with the library.
+        if self._uses_environment_dependencies():
+            current_version = library.get_metadata().library_version
+            return CheckLibraryUpdateResultSuccess(
+                has_update=False,
+                current_version=current_version,
+                latest_version=current_version,
+                git_remote=None,
+                git_ref=None,
+                local_commit=None,
+                remote_commit=None,
+                result_details=(
+                    f"Library '{library_name}' is provided by the environment this engine runs in. "
+                    f"Updates come from whoever set up that environment."
+                ),
+            )
 
         # Find the library file path. Route through the shared resolver so the update path
         # (_validate_and_prepare_library_for_git_operation) and this check path can never

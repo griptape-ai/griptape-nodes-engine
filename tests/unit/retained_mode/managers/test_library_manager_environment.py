@@ -30,12 +30,16 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.library_events import (
+    CheckLibraryUpdateRequest,
+    CheckLibraryUpdateResultSuccess,
     DownloadLibraryRequest,
     DownloadLibraryResultFailure,
     LoadMetadataForAllLibrariesRequest,
     LoadMetadataForAllLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
+    RegisterSandboxNodeFromSourceRequest,
+    RegisterSandboxNodeFromSourceResultFailure,
     SyncLibrariesRequest,
     SyncLibrariesResultFailure,
 )
@@ -426,3 +430,63 @@ class TestWhatTheEditorReads:
         assert isinstance(result, GetConfigValueResultSuccess)
         assert result.value == expected
         assert json.loads(json.dumps(result.value)) == expected
+
+
+class TestNothingOutsideTheEnvironmentMixesIn:
+    """Environment mode never adds a node type, a sandbox manifest, or an update the environment did not provide."""
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_node_cannot_be_added(self, engine: Engine, configure: Configure, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        source = sandbox / "my_node.py"
+        source.write_text(_NODE_SOURCE.format(class_name="LooseNode"), encoding="utf-8")
+        configure(environment_paths=[], environment_mode=True)
+
+        result = await engine.ahandle_request(RegisterSandboxNodeFromSourceRequest(file_path=str(source)))
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
+        assert "environment" in str(result.result_details)
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+
+    @pytest.mark.asyncio
+    async def test_the_metadata_listing_does_not_scan_the_sandbox(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "my_node.py").write_text(_NODE_SOURCE.format(class_name="LooseNode"), encoding="utf-8")
+        configure(environment_paths=[], environment_mode=True)
+
+        result = await engine.library_manager.load_metadata_for_all_libraries_request(
+            LoadMetadataForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+        assert not (sandbox / LibraryManager.LIBRARY_CONFIG_FILENAME).exists()
+        listed = [entry.library_schema.name for entry in result.successful_libraries]
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in listed
+        assert result.failed_libraries == []
+
+    @pytest.mark.asyncio
+    async def test_an_update_check_answers_without_git(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = _write_library(tmp_path / "env" / "b_lib", "B Library")
+        configure(environment_paths=[manifest], environment_mode=True)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+
+        def no_git(*_: object, **__: object) -> None:
+            msg = "the update check must not touch git in environment mode"
+            raise AssertionError(msg)
+
+        for name in ("is_monorepo", "get_git_remote", "get_git_info", "get_local_commit_sha"):
+            monkeypatch.setattr(f"griptape_nodes.retained_mode.managers.library_manager.{name}", no_git)
+
+        result = await library_manager.check_library_update_request(CheckLibraryUpdateRequest(library_name="B Library"))
+
+        assert isinstance(result, CheckLibraryUpdateResultSuccess)
+        assert result.has_update is False
+        assert result.current_version == result.latest_version == "1.0.0"
+        assert "environment" in str(result.result_details)
