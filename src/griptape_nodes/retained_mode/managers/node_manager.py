@@ -337,7 +337,8 @@ class SerializedGroupResult:
     dropped_values: list[DroppedValue]
 
 
-class CopiedValues(NamedTuple):
+@dataclass(frozen=True)
+class CopiedValues:
     """The values read from a copy, and why each one that could not be read was not."""
 
     values: dict[str, JsonValue]
@@ -4753,7 +4754,7 @@ class NodeManager(EngineScoped):
                     values[uuid] = read_legacy_clipboard_value(text, library_modules)
                 except LegacyPickleError as error:
                     unreadable_reasons[uuid] = str(error)
-        return CopiedValues(values, unreadable_reasons)
+        return CopiedValues(values=values, unreadable_reasons=unreadable_reasons)
 
     @handles(DuplicateSelectedNodesRequest)
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
