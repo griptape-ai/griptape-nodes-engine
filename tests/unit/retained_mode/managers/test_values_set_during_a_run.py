@@ -1,9 +1,8 @@
-"""A value that arrives through `SetParameterValueRequest` is authored, wherever it comes from.
+"""A value set while a node's body runs is still there on the next run, whichever way it was set.
 
-A node can send the request on itself from inside its own body, which is how it carries state to its
-next run. Storing that as something the run produced would lose it, because the produced store is
-cleared before each run. A direct `set_parameter_value` call in the same place means the other thing:
-that is the node reporting a result.
+A node can set a value on itself from inside its own body, by calling the setter or by sending
+`SetParameterValueRequest`, and both are used to carry state to its next run. The produced store is
+cleared before each run, so what makes that work is the authored copy the setter always writes.
 """
 
 from __future__ import annotations
@@ -32,9 +31,9 @@ def _node_running_its_body(engine: Engine, tmp_path: Path, workflow_name: str) -
     return node
 
 
-def test_a_request_a_node_sends_on_itself_authors_the_value(engine: Engine, tmp_path: Path) -> None:
-    """The documented way to carry state across runs, so it has to outlive the run that set it."""
-    node = _node_running_its_body(engine, tmp_path, "authored_request")
+def test_a_request_a_node_sends_on_itself_outlives_the_run(engine: Engine, tmp_path: Path) -> None:
+    """The documented way for a node to carry state to its next run."""
+    node = _node_running_its_body(engine, tmp_path, "request_state")
 
     with aprocess_scope(None, node):
         _set_value(engine, node.name, "value", "state for the next run")
@@ -44,12 +43,13 @@ def test_a_request_a_node_sends_on_itself_authors_the_value(engine: Engine, tmp_
     assert node.get_parameter_value("value") == "state for the next run"
 
 
-def test_a_direct_set_in_the_body_records_a_result(engine: Engine, tmp_path: Path) -> None:
-    """The contrast, on the same parameter: this one is the node reporting what it computed."""
-    node = _node_running_its_body(engine, tmp_path, "produced_direct")
+def test_a_direct_set_in_the_body_also_reports_the_result(engine: Engine, tmp_path: Path) -> None:
+    """The same set has to do both: outlive the run, and travel back from a worker as a result."""
+    node = _node_running_its_body(engine, tmp_path, "direct_state")
 
     with aprocess_scope(None, node):
         node.set_parameter_value("value", "what this run produced")
 
     assert node.parameter_output_values["value"] == "what this run produced"
-    assert "value" not in node.parameter_values
+    node.parameter_output_values.silent_clear()
+    assert node.get_parameter_value("value") == "what this run produced"

@@ -55,7 +55,6 @@ from griptape_nodes.exe_types.node_types import (
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
-    authored_value_scope,
     sanctioned_parameter_mutation,
 )
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
@@ -2714,17 +2713,7 @@ class NodeManager(EngineScoped):
         modified: bool
 
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
-    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
-        """Set a value the way the editor, a script, or a node asking for one does.
-
-        The whole handler authors, including the `before_value_set` hook and any value it passes on to
-        a connected node. A node can send this request on itself from inside its own body, and that is
-        the documented way to carry state to its next run, so the value has to outlive this one.
-        """
-        with authored_value_scope():
-            return self._handle_set_parameter_value_request(request)
-
-    def _handle_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
 
@@ -2994,9 +2983,6 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        # Raw, because this path authors: the set below writes parameter_values, so that is the store
-        # to compare before against after. Reading what the parameter holds would compare against a
-        # result the last run left behind and report no change, skipping the invalidation below.
         old_value = node._get_raw_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True

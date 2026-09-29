@@ -426,9 +426,8 @@ class TestAParameterWithAnInputAndAnOutputValue:
 
         assert node.local_objects.get(out_key["key"]) is outgoing
         # The input value is still the object the node was handed; nothing minted a key for it.
+        assert node.get_parameter_value("pipeline") is incoming
         assert node.parameter_values["pipeline"] is incoming
-        # Holding both, an output-only parameter reads back the produced value, the fresher of the two.
-        assert node.get_parameter_value("pipeline") is outgoing
 
 
 class TestAConsumerThatDeclaresNothing:

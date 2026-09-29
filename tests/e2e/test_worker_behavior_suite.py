@@ -331,9 +331,10 @@ class TestMultiHopChain:
 class TestResultsReportedWithTheSetter:
     """`set_parameter_value` on an output is how plenty of libraries report a result.
 
-    Only produced values travel back from a worker, so a result the setter stored as an authored value
-    was left behind and the output read empty on the orchestrator. What decides is whether the
-    parameter has an OUTPUT to publish on, not whether OUTPUT is the only mode it allows.
+    Only produced values travel back from a worker, so a result the setter recorded nowhere else was
+    left behind and the output read empty on the orchestrator. What decides whether the setter also
+    records one is whether the parameter has an OUTPUT to publish on, not whether OUTPUT is the only
+    mode it allows.
     """
 
     @pytest.mark.asyncio

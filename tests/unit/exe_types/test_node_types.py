@@ -186,17 +186,16 @@ class TestTrackedParameterOutputValuesSetItem:
         mock_emit.assert_not_called()
 
 
-class TestSetParameterValueStore:
-    """Where `set_parameter_value` stores a value, and why the window is what decides.
+class TestASetDuringARunAlsoRecordsAResult:
+    """`set_parameter_value` always writes `parameter_values`, and sometimes also records a result.
 
-    While a node's own body runs it is computing rather than being authored, so a value it sets on a
-    Parameter that has an OUTPUT is what the run produced. `parameter_output_values` is where that
-    belongs, and it is the only one of the two stores that travels back from a library's isolated
-    process. A Parameter with no OUTPUT has no port to publish on, so a run's write to it is scratch.
+    A value a node sets on itself while its own body is running is what that run computed, and of the
+    node's two stores only `parameter_output_values` travels back from a library's isolated process. So
+    a set in that window writes both: the result reaches the rest of the graph, and the authored copy is
+    still there for the value to be read on the next run, after the produced store has been cleared.
 
-    Outside that window the same set stores an authored value, whatever the modes, because
-    `parameter_output_values` is cleared before every run and by `clear_node`, and a value set at edit
-    time or replayed from a save has to outlive both.
+    Nothing outside that window records a result, and neither does a Parameter with no OUTPUT to
+    publish on, nor a container's child, which never travels on its own account.
     """
 
     def _node_with(self, param_name: str, modes: set[ParameterMode]) -> MockNode:
@@ -204,46 +203,84 @@ class TestSetParameterValueStore:
         node.add_parameter(Parameter(name=param_name, type="str", tooltip="", allowed_modes=modes))
         return node
 
-    def test_output_only_is_produced_while_the_node_runs(self) -> None:
+    def test_an_output_records_a_result_while_the_node_runs(self) -> None:
         node = self._node_with("out", {ParameterMode.OUTPUT})
 
         with aprocess_scope(node=node):
             node.set_parameter_value("out", "done")
 
         assert node.parameter_output_values["out"] == "done"
-        assert "out" not in node.parameter_values
+        assert node.parameter_values["out"] == "done"
 
-    def test_output_only_reads_back_after_the_run(self) -> None:
-        """The read is not confined to the window: the value is still what the Parameter holds."""
-        node = self._node_with("out", {ParameterMode.OUTPUT})
+    def test_the_value_survives_the_clear_before_the_next_run(self) -> None:
+        """`SeedParameter` rolls a seed mid-run, and turning randomizing off has to keep that seed."""
+        node = self._node_with("seed", {ParameterMode.PROPERTY, ParameterMode.INPUT, ParameterMode.OUTPUT})
 
         with aprocess_scope(node=node):
-            node.set_parameter_value("out", "done")
+            node.set_parameter_value("seed", "1234")
 
-        assert node.get_parameter_value("out") == "done"
+        node.parameter_output_values.silent_clear()
+        assert node.get_parameter_value("seed") == "1234"
 
-    def test_output_only_set_at_edit_time_is_authored(self) -> None:
-        """The pre-run clear would wipe a produced value, so an edit-time set must not go there."""
+    def test_a_property_and_output_records_a_result(self) -> None:
+        """A Parameter kept on display still publishes, so what a run puts there is a result too."""
+        node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("both", "computed")
+
+        assert node.parameter_output_values["both"] == "computed"
+
+    def test_the_default_modes_record_a_result(self) -> None:
+        """Declaring no modes at all allows OUTPUT, and that is most of the parameters in a library."""
+        node = MockNode(name="node")
+        node.add_parameter(Parameter(name="out", type="str", tooltip=""))
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("out", "computed")
+
+        assert node.parameter_output_values["out"] == "computed"
+
+    def test_a_set_at_edit_time_records_nothing(self) -> None:
+        """No run produced this, and a stale result would shadow it for every reader that prefers one."""
         node = self._node_with("out", {ParameterMode.OUTPUT})
 
         node.set_parameter_value("out", "set before any run")
 
         assert node.parameter_values["out"] == "set before any run"
         assert "out" not in node.parameter_output_values
-        node.parameter_output_values.silent_clear()
-        assert node.get_parameter_value("out") == "set before any run"
 
-    def test_a_produced_value_wins_over_an_authored_one(self) -> None:
+    def test_a_set_on_another_node_records_nothing_there(self) -> None:
+        """A running node sets values on other nodes, and that is not the other node's result.
+
+        This is how a value reaches a connected input, and how a node driving a subflow feeds it. The
+        recipient is not running, and a result filed against it would be wiped by its own pre-run clear
+        before it ever ran.
+        """
         node = self._node_with("out", {ParameterMode.OUTPUT})
-        node.set_parameter_value("out", "set before any run")
+        downstream = self._node_with("out", {ParameterMode.OUTPUT})
 
         with aprocess_scope(node=node):
-            node.set_parameter_value("out", "produced by the run")
+            downstream.set_parameter_value("out", "handed over")
 
-        assert node.get_parameter_value("out") == "produced by the run"
+        assert downstream.parameter_values["out"] == "handed over"
+        assert "out" not in downstream.parameter_output_values
 
-    def test_a_container_child_keeps_the_container_whole(self) -> None:
-        """The container is rebuilt from its children read raw, so a child must stay authored.
+    def test_a_parameter_with_no_output_records_nothing(self) -> None:
+        """With no OUTPUT there is no port to publish on, so a run's write to it is scratch."""
+        node = self._node_with("incoming", {ParameterMode.INPUT})
+        node.add_parameter(Parameter(name="knob", type="str", tooltip="", allowed_modes={ParameterMode.PROPERTY}))
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("incoming", "delivered")
+            node.set_parameter_value("knob", "scratch")
+
+        assert node.parameter_values["incoming"] == "delivered"
+        assert node.parameter_values["knob"] == "scratch"
+        assert node.parameter_output_values == {}
+
+    def test_a_container_child_records_nothing_but_its_container_does(self) -> None:
+        """Setting a child rebuilds the container, and it is the container that publishes.
 
         Split Video in the standard library grows an output-only `ParameterList` this way, adding a
         child per clip and setting it while the node runs.
@@ -256,66 +293,9 @@ class TestSetParameterValueStore:
         with aprocess_scope(node=node):
             node.set_parameter_value(child.name, "img0")
 
-        assert node.get_parameter_value("images") == ["img0"]
-        # The rebuilt container is what a worker ships back, so it is the produced value.
+        assert child.name not in node.parameter_output_values
         assert node.parameter_output_values["images"] == ["img0"]
-
-    def test_property_and_output_is_produced_while_the_node_runs(self) -> None:
-        """A Parameter kept on display still publishes, so what a run puts there is a result."""
-        node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
-
-        with aprocess_scope(node=node):
-            node.set_parameter_value("both", "computed")
-
-        assert node.parameter_output_values["both"] == "computed"
-        assert "both" not in node.parameter_values
-
-    def test_the_default_modes_are_produced_while_the_node_runs(self) -> None:
-        """Declaring no modes at all allows OUTPUT, and that is most of the parameters in a library."""
-        node = MockNode(name="node")
-        node.add_parameter(Parameter(name="out", type="str", tooltip=""))
-
-        with aprocess_scope(node=node):
-            node.set_parameter_value("out", "computed")
-
-        assert node.parameter_output_values["out"] == "computed"
-
-    def test_property_and_output_set_at_edit_time_is_still_authored(self) -> None:
-        """The window is what decides, so the editor's own write is unaffected by the above."""
-        node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
-
-        node.set_parameter_value("both", "typed")
-
-        assert node.parameter_values["both"] == "typed"
-        assert "both" not in node.parameter_output_values
-
-    def test_a_set_on_another_node_is_authored_there(self) -> None:
-        """A running node sets values on other nodes, and on those it is an ordinary authored set.
-
-        This is how a value reaches a connected input, and how a node driving a subflow feeds it. The
-        receiving node is not running, so the value has to survive the clear before it does run.
-        """
-        node = self._node_with("out", {ParameterMode.OUTPUT})
-        downstream = self._node_with("out", {ParameterMode.OUTPUT})
-
-        with aprocess_scope(node=node):
-            downstream.set_parameter_value("out", "handed over")
-
-        assert downstream.parameter_values["out"] == "handed over"
-        assert "out" not in downstream.parameter_output_values
-
-    def test_a_parameter_with_no_output_stays_authored(self) -> None:
-        """With no OUTPUT there is no port to publish on, so a run's write is scratch."""
-        node = self._node_with("incoming", {ParameterMode.INPUT})
-        node.add_parameter(Parameter(name="knob", type="str", tooltip="", allowed_modes={ParameterMode.PROPERTY}))
-
-        with aprocess_scope(node=node):
-            node.set_parameter_value("incoming", "delivered")
-            node.set_parameter_value("knob", "scratch")
-
-        assert node.parameter_values["incoming"] == "delivered"
-        assert node.parameter_values["knob"] == "scratch"
-        assert node.parameter_output_values == {}
+        assert node.get_parameter_value("images") == ["img0"]
 
 
 class TestErrorProxyNode:
