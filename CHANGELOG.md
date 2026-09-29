@@ -132,9 +132,11 @@ the engine's request API from working without edits. Migration steps live in
 - Image, video, audio, and 3D parameters no longer fail when given an inline `data:` URI longer than
   the operating system's file name limit, which any real image exceeds. The URI is kept as the
   parameter's value.
-- Image, video, audio, and 3D inputs given a file path or a `localhost` static server URL use the
-  file where it already is, instead of copying it into `staticfiles/`. The copy could overwrite a
-  different file with the same name.
+- Image, video, audio, and 3D inputs given a file path use the file where it already is, instead of
+  copying it into `staticfiles/`. The copy could overwrite a different file with the same name. A
+  saved workflow now depends on its input files staying put: moving, renaming, or deleting one
+  breaks the workflow, and an input outside the workspace is referenced by its absolute path, so the
+  project is no longer portable across machines for those inputs.
   [#5647](https://github.com/griptape-ai/griptape-nodes-engine/issues/5647)
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.

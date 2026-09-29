@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.engine import current_engine
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,27 @@ def _resolve_file_path(file_path: str) -> Path | None:  # noqa: PLR0911
     return None
 
 
+def _resolve_static_server_url(url: str) -> Path | None:
+    """Map a localhost static server URL back to the workspace file it serves.
+
+    Args:
+        url: URL string that may be a localhost static server URL
+
+    Returns:
+        Path of the served file, or None if the URL is not a localhost static server URL
+    """
+    if not url.startswith(("http://localhost:", "https://localhost:")):
+        return None
+
+    try:
+        workspace_path = current_engine().config_manager.workspace_path
+    except (AttributeError, RuntimeError, KeyError) as e:
+        logger.debug("Failed to get workspace path: %s", e)
+        return None
+
+    return parse_static_server_url(url, workspace_path)
+
+
 def _wrap_file_in_place(file_path: Path, artifact_type: type[Any]) -> Any | None:
     """Wrap a file in an artifact that serves it from where it is.
 
@@ -113,8 +135,15 @@ def _normalize_string_input(artifact_input: str, artifact_type: type[Any]) -> An
     Returns:
         Artifact object or original input if normalization fails
     """
-    # URLs are already servable, including localhost static server URLs, so wrap them as-is
     if artifact_input.startswith(("http://", "https://")):
+        # A static server URL minted in an earlier session can carry a port or base URL that
+        # no longer serves, and a `?v=` that no longer matches the file. Re-mint it for the
+        # file it names so it keeps resolving.
+        file_path = _resolve_static_server_url(artifact_input)
+        if file_path:
+            artifact = _wrap_file_in_place(file_path, artifact_type)
+            if artifact:
+                return artifact
         return artifact_type(artifact_input)
 
     # The static server serves workspace files and external absolute paths directly, so no copy is needed
