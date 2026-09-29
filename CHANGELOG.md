@@ -59,6 +59,11 @@ the engine's request API from working without edits. Migration steps live in
 - Renaming a parameter that holds an output value now reports that the old name no longer has one,
   alongside the new name's value. Before, only the new name was reported, so anything tracking
   output values by parameter name kept the old name's value.
+- Saving HEIC, AVIF, or ICO bytes no longer rewrites the destination's extension to match the
+  detected format, and no longer fails when `coerce_extension_to_match_bytes` is off. The engine
+  does not recognize these formats, so the file is written at the extension you asked for and a
+  warning is logged.
+  [#5614](https://github.com/griptape-ai/griptape-nodes-engine/issues/5614)
 
 ### Added
 
