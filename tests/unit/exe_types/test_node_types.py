@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
 from griptape_nodes.traits.slider import Slider
 
@@ -179,6 +179,60 @@ class TestTrackedParameterOutputValuesSetItem:
             tracked["out"] = None
 
         mock_emit.assert_not_called()
+
+
+class TestSetParameterValueStore:
+    """`set_parameter_value` stores a value where the Parameter's declaration says it lives.
+
+    A Parameter allowing OUTPUT and nothing else has no authored value the editor could have typed or
+    a connection could have delivered, so what it is set to is a produced value. That is also the only
+    one of the two stores that travels back from a library's isolated process, so a node reporting its
+    result this way keeps that result when it runs there.
+    """
+
+    def _node_with(self, param_name: str, modes: set[ParameterMode]) -> MockNode:
+        node = MockNode(name="node")
+        node.add_parameter(Parameter(name=param_name, type="str", tooltip="", allowed_modes=modes))
+        return node
+
+    def test_output_only_is_stored_as_produced(self) -> None:
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+
+        node.set_parameter_value("out", "done")
+
+        assert node.parameter_output_values["out"] == "done"
+        assert "out" not in node.parameter_values
+
+    def test_output_only_reads_back(self) -> None:
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+
+        node.set_parameter_value("out", "done")
+
+        assert node.get_parameter_value("out") == "done"
+
+    def test_property_and_output_stays_authored(self) -> None:
+        """Adding PROPERTY makes the distinction real again: the user can type here."""
+        node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
+
+        node.set_parameter_value("both", "typed")
+
+        assert node.parameter_values["both"] == "typed"
+        assert "both" not in node.parameter_output_values
+
+    def test_input_only_stays_authored(self) -> None:
+        node = self._node_with("incoming", {ParameterMode.INPUT})
+
+        node.set_parameter_value("incoming", "delivered")
+
+        assert node.parameter_values["incoming"] == "delivered"
+        assert "incoming" not in node.parameter_output_values
+
+    def test_output_only_falls_back_to_an_authored_value(self) -> None:
+        """What a workflow saved before the setter and the store agreed replays on load."""
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+        node.parameter_values["out"] = "from an older save"
+
+        assert node.get_parameter_value("out") == "from an older save"
 
 
 class TestErrorProxyNode:

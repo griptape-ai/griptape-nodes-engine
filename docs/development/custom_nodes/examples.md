@@ -675,13 +675,17 @@ def _poll_for_completion(self, task_id: str, api_key: str) -> dict[str, Any]:
 
         # Update status parameter with progress
         status_msg = f"Generating... ({attempt + 1}/{self.MAX_POLLING_ATTEMPTS})"
-        self.set_parameter_value("status", status_msg)
+        self.publish_update_to_parameter("status", status_msg)
 
         response = requests.get(query_url, headers=headers, params={"ids": task_id})
         # ... check completion ...
 ```
 
 **Best Practice**: Always provide progress feedback for operations longer than 10 seconds.
+
+Use `publish_update_to_parameter` rather than `set_parameter_value` to report progress. It records the
+value as something the node produced and pushes it to the editor as it happens, which is what makes the
+status visible mid-run and what carries it back when the node runs in a worker.
 
 ## Flexible Artifact Processing
 

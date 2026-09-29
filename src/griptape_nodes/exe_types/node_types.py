@@ -1079,6 +1079,11 @@ class BaseNode(ABC):
     ) -> None:
         """Attempt to set a Parameter's value.
 
+        Where the value is stored follows the Parameter's declaration. A Parameter allowing OUTPUT and
+        nothing else is stored as a produced value, the same as writing `parameter_output_values`
+        directly, because there is no authored value such a Parameter could be holding. Every other
+        Parameter stores an authored value.
+
         The Node may choose to store a different value (or type) than what was passed in.
         Conversion callbacks on the Parameter may raise Exceptions, which will cancel
         the value assignment. Similarly, validator callbacks may reject the value and
@@ -1122,6 +1127,8 @@ class BaseNode(ABC):
         for validator in parameter.validators:
             validator(parameter, candidate_value)
 
+        destination = self._value_store_for(parameter)
+
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.
         # Record any parameters modified for cascading.
         if not initial_setup:
@@ -1130,15 +1137,17 @@ class BaseNode(ABC):
             else:
                 final_value = self.before_value_set(parameter=parameter, value=candidate_value)
             # ACTUALLY SET THE NEW VALUE
-            self.parameter_values[param_name] = final_value
+            destination[param_name] = final_value
 
             # If a parameter value has been set at the top level of a container, wipe all children.
             # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
             self.after_value_set(parameter=parameter, value=final_value)
-            if emit_change:
+            # `parameter_output_values` emits its own AlterElementEvent on assignment, so emitting
+            # here too would send the editor two events for one write.
+            if emit_change and destination is self.parameter_values:
                 self._emit_parameter_lifecycle_event(parameter)
         else:
-            self.parameter_values[param_name] = candidate_value
+            destination[param_name] = candidate_value
         # handle with container parameters
         if parameter.parent_container_name is not None:
             # Does it have a parent container
@@ -1155,6 +1164,25 @@ class BaseNode(ABC):
                         initial_setup=initial_setup,
                         emit_change=False,
                     )
+
+    def _value_store_for(self, parameter: Parameter) -> dict[str, Any]:
+        """Which of the node's two value stores holds this Parameter's value.
+
+        A Parameter that allows OUTPUT and nothing else has no authored value to hold: the editor
+        cannot type into it and no incoming connection delivers into it. So its value belongs in
+        `parameter_output_values`, and that is also the only one of the two that survives egress from
+        a worker, which ships produced values back and leaves the node's `parameter_values` behind.
+
+        Adding INPUT or PROPERTY makes the distinction real again, and those Parameters keep their
+        value in `parameter_values`.
+        """
+        modes = parameter.allowed_modes
+        produces_only = (
+            ParameterMode.OUTPUT in modes and ParameterMode.INPUT not in modes and ParameterMode.PROPERTY not in modes
+        )
+        if produces_only:
+            return self.parameter_output_values
+        return self.parameter_values
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
@@ -1187,8 +1215,28 @@ class BaseNode(ABC):
         Raises:
             RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
         """
-        value = self._get_raw_parameter_value(param_name)
+        value = self._get_stored_parameter_value(param_name)
         return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
+
+    def _get_stored_parameter_value(self, param_name: str) -> Any:
+        """The value from whichever of the two stores holds this Parameter's, so a set can be read back.
+
+        Only the node author's read comes through here. `_get_raw_parameter_value` deliberately does not
+        consult `parameter_output_values`: a `serializable=False` producer puts the live object there and
+        the key standing in for it in `parameter_values`, and the engine's own readers save values,
+        dispatch them to workers and send them to the editor, so they need the key.
+
+        An OUTPUT-only Parameter with no produced value falls through to `_get_raw_parameter_value`,
+        which still finds an authored value saved by a workflow written before the setter and the store
+        agreed on where it goes.
+        """
+        parameter = self.get_parameter_by_name(param_name)
+        if parameter is None:
+            return self._get_raw_parameter_value(param_name)
+        value_store = self._value_store_for(parameter)
+        if value_store is self.parameter_output_values and param_name in value_store:
+            return value_store[param_name]
+        return self._get_raw_parameter_value(param_name)
 
     def _get_raw_parameter_value(self, param_name: str) -> Any:
         """The value as stored, with no cached-object substitution. Engine-internal.

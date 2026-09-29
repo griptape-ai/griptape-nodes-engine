@@ -417,7 +417,19 @@ class TestAParameterWithAnInputAndAnOutputValue:
         assert node.local_objects.get(key["key"]) is published
 
     def test_only_the_output_side_is_held(self) -> None:
-        node = _producer()
+        # INPUT as well as OUTPUT, so the one name really does carry both an authored value and a
+        # produced one. A Parameter allowing only OUTPUT stores what it is set to as a produced value.
+        node = _LibraryNode(name="LoadPipeline")
+        node.add_parameter(
+            Parameter(
+                name="pipeline",
+                input_types=["Pipeline"],
+                output_type="Pipeline",
+                tooltip="",
+                serializable=False,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.OUTPUT},
+            )
+        )
         incoming, outgoing = Pipeline("incoming"), Pipeline("outgoing")
 
         node.set_parameter_value("pipeline", incoming)
