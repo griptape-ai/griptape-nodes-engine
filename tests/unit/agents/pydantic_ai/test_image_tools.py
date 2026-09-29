@@ -126,9 +126,7 @@ class TestRegistration:
             return ModelResponse(parts=[TextPart("done")])
 
         agent: Agent[None, str] = Agent(FunctionModel(respond))
-        register_image_tools(
-            agent, ImageGenerationToolsetConfig(api_key="k"), cast("StaticFilesManager", static_files)
-        )
+        register_image_tools(agent, ImageGenerationToolsetConfig(api_key="k"), cast("StaticFilesManager", static_files))
         await agent.run("draw a bird")
 
         (tool,) = offered[0].function_tools
