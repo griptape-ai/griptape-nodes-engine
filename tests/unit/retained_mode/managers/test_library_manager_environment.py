@@ -119,7 +119,8 @@ class Configure(Protocol):
         environment_mode: bool,
         downloads: list[str] | None = None,
         allow_sandbox: bool = False,
-    ) -> None: ...
+    ) -> None:
+        """Configure the engine's libraries and dependency source for one test."""
 
 
 @pytest.fixture(autouse=True)
