@@ -41,6 +41,13 @@ the engine's request API from working without edits. Migration steps live in
   use them through `ProjectDirectoryParameter` and `ProjectFileSequenceParameter`. Projects on
   the legacy template fall back to the same layout. See
   [Situations](https://docs.griptapenodes.com/en/stable/guides/projects/situations/#save_output_directory).
+- Studios can run the engine inside an environment their own tools prepare. Libraries listed in the
+  `GTN_LIBRARY_PATHS` environment variable load before `libraries_to_register`. Setting
+  `library.dependency_source` to `environment` makes those the only libraries that load and stops
+  the engine from downloading libraries or building virtual environments. `worker.command_prefix`
+  starts each library's worker inside that library's own environment, filled in from
+  `GTN_LIBRARY_WORKER_REQUESTS`. See
+  [Running in a Managed Environment](https://docs.griptapenodes.com/en/stable/guides/managed_environment/).
 
 ## [0.102.0] - 2026-09-24
 
