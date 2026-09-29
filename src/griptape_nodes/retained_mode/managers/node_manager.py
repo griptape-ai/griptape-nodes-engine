@@ -246,7 +246,7 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.converter import converter, safe_unstructure
-from griptape_nodes.serialization.values import ValueEncodeError, encode_value
+from griptape_nodes.serialization.values import UndecodedValue, ValueEncodeError, encode_value
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3765,6 +3765,15 @@ class NodeManager(EngineScoped):
                 current = node.parameter_values.get(param_name, _PARAM_MISSING)
                 if current is value or current == value:
                     continue
+                if type(value) is UndecodedValue:
+                    # Still set: nodes that read artifact-shaped dicts can use it.
+                    logger.warning(
+                        "Node '%s' received a value for parameter '%s' that this process cannot "
+                        "rebuild, so it arrives as plain data instead of its type. %s",
+                        node_name,
+                        param_name,
+                        value.reason,
+                    )
                 try:
                     node.set_parameter_value(param_name, value)
                 except Exception as e:
