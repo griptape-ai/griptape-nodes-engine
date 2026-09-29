@@ -17,6 +17,12 @@ the engine's request API from working without edits. Migration steps live in
   is how long a worker may take to load its library, which the new name states. A config file still
   setting the old name silently falls back to the 600 second default.
 
+### Removed
+
+- **Breaking:** The engine no longer patches `httpx` and `requests` to read `file://` URLs, local
+  paths, and cloud asset URLs in workflows run or published in a subprocess. Nodes that fetched
+  those through `httpx` or `requests` must read the file directly instead.
+
 ### Fixed
 
 - The process a library runs isolated in shuts down within about 35 seconds of losing the engine

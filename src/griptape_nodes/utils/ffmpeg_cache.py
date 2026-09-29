@@ -41,7 +41,7 @@ _redirect_installed = False
 def install_ffmpeg_cache_redirect(configured_directory: str) -> None:
     """Redirect `static_ffmpeg`'s cache to the configured (or default) directory, once per process.
 
-    Mirrors `install_file_url_support`: the redirect mutates process-wide state, so it is
+    The redirect mutates process-wide state, so it is
     installed once and subsequent calls are no-ops. The first caller's configuration wins;
     building further engines in the same process must not move the cache out from under
     callers that already resolved ffmpeg.
