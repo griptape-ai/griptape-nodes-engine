@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -484,6 +485,46 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         if self.retained_mode:
             result["retained_mode"] = self.retained_mode
         return result
+
+    def json(self, **kwargs) -> str:
+        """Serialize to send. A result that cannot be sent becomes a failure naming why, so the requester hears back."""
+        try:
+            return self.strict_json(**kwargs)
+        except EventSerializationError as error:
+            logger.error("%s", error)
+            return self.failure_json(error, **kwargs)
+
+    def strict_json(self, **kwargs) -> str:
+        """Serialize to send, raising if the result holds a value with no JSON form.
+
+        Raises:
+            EventSerializationError: The request or result holds a value with no JSON form.
+        """
+        return super().json(**kwargs)
+
+    def failure_json(self, error: EventSerializationError, **kwargs) -> str:
+        """The failure ``json()`` sends in place of this result when ``error`` stops it being sent."""
+        # Lazy: generic_events imports this module for its base classes.
+        from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+
+        try:
+            # Through JSON: unstructuring alone passes some values through for dump_json to reject.
+            request = json.loads(_to_json(_unstructure(self.request), type(self.request).__name__))
+        except EventSerializationError:
+            # The request itself holds the value; send what identifies it.
+            request = {"request_id": self.request.request_id}
+        failure: dict[str, Any] = {
+            "event_type": EventResultFailure.__name__,
+            "request_type": type(self.request).__name__,
+            "request": request,
+            "result_type": GenericResultFailure.__name__,
+            "result": _unstructure(GenericResultFailure(result_details=str(error))),
+            "request_id": self.request_id,
+            "response_topic": self.response_topic,
+        }
+        if self.retained_mode:
+            failure["retained_mode"] = self.retained_mode
+        return _to_json(failure, GenericResultFailure.__name__, **kwargs)
 
     def get_request(self) -> P:
         """Get the request payload for this event.
