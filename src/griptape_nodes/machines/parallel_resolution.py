@@ -492,7 +492,7 @@ class ExecuteDagState(State):
                 if upstream_parameter.name in upstream_node.parameter_output_values:
                     output_value = upstream_node.parameter_output_values[upstream_parameter.name]
                 else:
-                    output_value = upstream_node.get_parameter_value(upstream_parameter.name)
+                    output_value = upstream_node._get_raw_parameter_value(upstream_parameter.name)
 
                 # Pass the value through using the same mechanism as normal resolution
                 result = await engine.ahandle_request(

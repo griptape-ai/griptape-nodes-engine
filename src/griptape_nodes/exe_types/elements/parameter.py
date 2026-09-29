@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -24,12 +25,15 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
+from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.exe_types.elements.badge import BadgeData
     from griptape_nodes.exe_types.node_types import BaseNode
+
+logger = logging.getLogger("griptape_nodes")
 
 
 class ParameterBase(BaseNodeElement, ABC):
@@ -96,8 +100,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     # During save/load, this value IS still serialized to save its proper state.
     _settable: bool = True
 
-    # "serializable" controls whether parameter values should be serialized during save/load operations.
-    # Set to False for parameters containing non-serializable types (ImageDrivers, PromptDrivers, file handles, etc.)
+    # "serializable" controls whether values are written into a saved workflow, AND whether the engine
+    # holds them in the process that produced them rather than sending them across a worker boundary.
+    # One flag: a value that cannot be written to a file is a value that cannot cross a process, and both
+    # follow from the same fact about the object.
     serializable: bool = True
 
     user_defined: bool = False
@@ -111,6 +117,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             ParameterMode.PROPERTY,
         }
     )
+    # A handle parameter's release hook: what to run when the engine releases the object this parameter
+    # referred to. Underscored like the other callables so it stays out of to_dict, which a saved
+    # workflow reads -- a function there would be written out as a repr.
+    _on_local_object_drop: Callable[[Any], None] | None = None
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -121,7 +131,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     parent_container_name: str | None = None
     parent_element_name: str | None = None
 
-    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0917
+    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
         self,
         name: str,
         tooltip: str | list[dict] | None = None,
@@ -135,9 +145,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         allowed_modes: set[ParameterMode] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
-        traits: set[Trait.__class__ | Trait] | None = None,  # We are going to make these children.
+        traits: set[type[Trait] | Trait] | None = None,  # We are going to make these children.
         ui_options: dict | None = None,
         *,
+        on_local_object_drop: Callable[[Any], None] | None = None,
         hide: bool | None = None,
         hide_label: bool | None = None,
         hide_property: bool | None = None,
@@ -212,6 +223,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     stacklevel=2,
                 )
 
+        self._on_local_object_drop = on_local_object_drop
         if converters is None:
             self._converters = []
         else:
@@ -290,6 +302,41 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         return our_dict
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return save-only trait identity and plain-data state.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            trait_state: dict[str, Any] = {}
+            for key, value in trait.to_state().items():
+                saved = as_saved_state_value(value)
+                if saved.unsupported_type is not None:
+                    logger.warning(
+                        "Trait '%s' holds a %s in '%s', which cannot be written to a saved workflow. "
+                        "The parameter will load without this value.",
+                        type(trait).__name__,
+                        saved.unsupported_type,
+                        key,
+                    )
+                    continue
+                trait_state[key] = saved.value
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait_state,
+            )
+            states.append(entry.to_dict())
+        return states
+
+    def save_dict(self) -> dict[str, Any]:
+        """Return the view shared by diffing and persistence."""
+        our_dict = self.to_dict()
+        our_dict["ui_options"] = self.authored_ui_options()
+        our_dict["traits"] = self.trait_states()
+        return our_dict
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -299,7 +346,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         event_dict["parameter_name"] = name
         # Update with value
         if node is not None:
-            event_dict["value"] = node.get_parameter_value(self.name)
+            # Raw: this dict goes to the editor and is json-serialized. A process-local value is a key
+            # there, never the object it stands for.
+            event_dict["value"] = node._get_raw_parameter_value(self.name)
         return event_dict
 
     @property
@@ -409,17 +458,85 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     @property
     def ui_options(self) -> dict:
-        ui_options = {}
-        traits = self.find_elements_by_type(Trait)
-        for trait in traits:
+        """Overlay trait-rendered options on stored options.
+
+        Trait state wins over stale stored copies. Only authored options are persisted.
+        """
+        ui_options = self.authored_ui_options()
+        for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
-        ui_options = ui_options | self._ui_options
         return ui_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
+        """Route trait-owned keys to traits while retaining the write for later detachment."""
+        self._adopt_trait_options(value)
         self._ui_options = value
+
+    def _adopt_trait_options(self, value: dict) -> None:
+        for trait in self.find_elements_by_type(Trait):
+            adopted = trait.state_from_ui_options(value)
+            if not adopted:
+                self._report_unadopted_trait_options(trait, value)
+                continue
+            try:
+                trait.apply_state(adopted)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Attempted to update the %s control on parameter '%s' from a UI option change, "
+                    "but it would not accept those values, so the control is unchanged.",
+                    type(trait).__name__,
+                    self.name,
+                )
+
+    def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
+        """Ignore echoed values; warn when a differing write is neither applied nor saved."""
+        ignored = sorted(
+            key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
+        )
+        if not ignored:
+            return
+        logger.warning(
+            "Attempted to set %s on parameter '%s', but its %s control renders those keys and does "
+            "not read them back, so the change has no effect and is not saved. Set the control's own "
+            "state instead, or give the control a 'state_from_ui_options' that accepts these keys.",
+            ", ".join(f"'{key}'" for key in ignored),
+            self.name,
+            type(trait).__name__,
+        )
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Warn instead of removing a key rendered by an attached trait."""
+        for trait in self.find_elements_by_type(Trait):
+            if key in trait.ui_options_for_trait():
+                self._report_unremovable_trait_option(trait, key)
+                return
+        super().remove_ui_options_key(key)
+
+    def _report_unremovable_trait_option(self, trait: Trait, key: str) -> None:
+        logger.warning(
+            "Attempted to remove '%s' from parameter '%s', but its %s control renders that key "
+            "regardless, so removing it here has no effect. Change the control's own state "
+            "instead, or detach it.",
+            key,
+            self.name,
+            type(trait).__name__,
+        )
+
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Remove options rendered by attached traits.
+
+        Filtering on read handles keys written before or after trait attachment while
+        preserving stored values if the trait is detached.
+        """
+        return self._without_trait_owned_keys(super().authored_ui_options())
+
+    def _without_trait_owned_keys(self, value: dict) -> dict:
+        trait_owned: set[str] = set()
+        for trait in self.find_elements_by_type(Trait):
+            trait_owned.update(trait.ui_options_for_trait())
+        return {key: option for key, option in value.items() if key not in trait_owned}
 
     @property
     def hide(self) -> bool:
@@ -496,9 +613,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             value: Display name string, or None to use the default (parameter name)
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -613,6 +728,16 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             return
         self._output_type = canonical_type_name(value)
 
+    @property
+    def on_local_object_drop(self) -> Callable[[Any], None] | None:
+        """What to run when the engine releases the object this parameter referred to.
+
+        For anything whose memory is not freed by dropping the reference -- a pipeline holding GPU
+        memory. The engine calls it when this parameter's value is replaced, and when the node is deleted.
+        Only meaningful on a `serializable=False` parameter, whose values the engine holds.
+        """
+        return self._on_local_object_drop
+
     def add_trait(self, trait: type[Trait] | Trait) -> None:
         self.add_child(instantiate_trait(trait))
 
@@ -668,8 +793,8 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
 
     A dict rather than true or false, because callers alter the fields it names.
     """
-    self_dict = parameter.to_dict().copy()
-    other_dict = other.to_dict().copy()
+    self_dict = parameter.save_dict()
+    other_dict = other.save_dict()
     self_dict.pop("next", None)
     self_dict.pop("prev", None)
     self_dict.pop("element_id", None)
@@ -681,8 +806,11 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
     differences = {}
     for key, self_value in self_dict.items():
         other_value = other_dict.get(key, None)
+        if key == "traits":
+            if self_value != other_value:
+                differences[key] = changed_trait_states(self_value, other_dict["traits"])
         # handle children here
-        if isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):
+        elif isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):
             if self_value != other_value:
                 differences[key] = other_value
         elif isinstance(self_value, (list, set)) and isinstance(other_value, (list, set)):

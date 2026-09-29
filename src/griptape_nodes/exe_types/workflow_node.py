@@ -497,7 +497,7 @@ class WorkflowNode(ControlNode):
                 SetParameterValueRequest(
                     parameter_name=route.parameter_name,
                     node_name=route.workflow_node_name,
-                    value=self.get_parameter_value(surface_name),
+                    value=self._get_raw_parameter_value(surface_name),
                 )
             )
             if set_result.failed():
@@ -518,7 +518,7 @@ class WorkflowNode(ControlNode):
             if route.parameter_name in end_node.parameter_output_values:
                 value = end_node.parameter_output_values[route.parameter_name]
             else:
-                value = end_node.get_parameter_value(route.parameter_name)
+                value = end_node._get_raw_parameter_value(route.parameter_name)
             # None is published rather than skipped. These parameters are a fixed part of the node
             # type, so a downstream node is already wired to them and needs to see that this run
             # produced nothing rather than keep reading the previous run's value.

@@ -180,7 +180,7 @@ class TestServiceWhileAwaiting:
     async def test_forward_inside_node_execution_scope(self, forwarding: FakeBrokerClient) -> None:  # noqa: ARG002 (fixture wires forwarding)
         """Forwarding works from inside the scope that marks node execution."""
         event_manager = current_engine().event_manager
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             assert event_manager.in_node_execution()
             result = await event_manager.forward_to_orchestrator(GetEngineVersionRequest(), ResultContext())
         assert isinstance(result, EventResultSuccess)
@@ -227,7 +227,7 @@ class TestContention:
             except Exception as e:
                 errors.append(e)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             threads = [threading.Thread(target=forward_from_thread) for _ in range(8)]
             for t in threads:
                 t.start()

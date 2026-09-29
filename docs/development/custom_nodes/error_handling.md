@@ -55,7 +55,7 @@ A parameter value can end up fully embedded in two places:
 
 Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
 
-`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it.
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it. On an output, the same declaration additionally holds the value in the process that produced it and sends only a key across a worker process boundary - see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md).
 
 !!! warning "Keep parameter values small"
 

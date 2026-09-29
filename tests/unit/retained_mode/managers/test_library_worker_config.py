@@ -10,7 +10,12 @@ import pytest
 
 from griptape_nodes.node_library.library_declarations import LibraryDependencyDeclaration
 from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
-from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
+from griptape_nodes.retained_mode.events.app_events import (
+    LibraryLoadedNotification,
+    ReportLibraryLoadedRequest,
+    ReportLibraryLoadedResultFailure,
+    ReportLibraryLoadedResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     IncompatibleRequirementsProblem,
 )
@@ -127,7 +132,13 @@ class TestGetWorkerForLibrary:
             mgr.get_worker_for_library("my_lib")
 
 
-class TestOnLibraryLoadedNotification:
+class TestOnReportLibraryLoadedRequest:
+    def _make_manager(self) -> LibraryManager:
+        """A manager whose engine is a stand-in, so the notification it raises can be observed."""
+        mgr = _make_library_manager()
+        mgr._engine = MagicMock(abroadcast_app_event=AsyncMock())
+        return mgr
+
     def _make_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
         """A legacy worker-mode library awaiting its worker's verdict.
 
@@ -158,18 +169,19 @@ class TestOnLibraryLoadedNotification:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.asyncio
     async def test_updates_fitness_and_lifecycle_to_loaded(self) -> None:
-        mgr = _make_library_manager()
+        mgr = self._make_manager()
         lib_info = self._make_lib_info("my_lib")
         mgr._library_file_path_to_info["/some/path.json"] = lib_info
 
-        await mgr._on_library_loaded_notification(LibraryLoadedNotification(library_name="my_lib", fitness="GOOD"))
+        result = await mgr.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD")
+        )
 
+        assert isinstance(result, ReportLibraryLoadedResultSuccess)
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.GOOD
 
-    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_a_worker_does_not_overwrite_a_locally_derived_fitness(self) -> None:
         """An exec-deps library's fitness is the orchestrator's own finding, not the worker's.
@@ -179,37 +191,93 @@ class TestOnLibraryLoadedNotification:
         knows whether ITS copy came up. Taking the worker's answer would paint over a broken node
         that is sitting on the canvas, and the reason would not travel with it.
         """
-        mgr = _make_library_manager()
+        mgr = self._make_manager()
         lib_info = self._make_exec_deps_lib_info("exec_deps_lib")
         mgr._library_file_path_to_info["/some/exec-deps.json"] = lib_info
 
-        await mgr._on_library_loaded_notification(
-            LibraryLoadedNotification(library_name="exec_deps_lib", fitness="GOOD")
+        await mgr.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(library_name="exec_deps_lib", fitness="GOOD")
         )
 
         assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
 
     @pytest.mark.asyncio
-    @pytest.mark.asyncio
     async def test_accepts_flawed_fitness(self) -> None:
-        mgr = _make_library_manager()
+        mgr = self._make_manager()
         lib_info = self._make_lib_info("my_lib")
         mgr._library_file_path_to_info["/some/path.json"] = lib_info
 
-        await mgr._on_library_loaded_notification(
-            LibraryLoadedNotification(library_name="my_lib", fitness="FLAWED", problem_details="some issue")
+        await mgr.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(library_name="my_lib", fitness="FLAWED", problem_details="some issue")
         )
 
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
 
     @pytest.mark.asyncio
+    async def test_refuses_a_report_for_an_unknown_library(self) -> None:
+        mgr = self._make_manager()
+
+        result = await mgr.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(library_name="unknown_lib", fitness="GOOD")
+        )
+
+        assert isinstance(result, ReportLibraryLoadedResultFailure)
+
     @pytest.mark.asyncio
-    async def test_does_nothing_for_unknown_library(self) -> None:
+    async def test_accepting_a_report_raises_this_process_s_own_notification(self) -> None:
+        """How the GUI hears about a library it has no other way to learn about.
+
+        The worker's report is a request now, and no listener anywhere sees another process's app
+        event, so without this the sidebar never learns a worker-hosted library came up.
+        """
+        mgr = self._make_manager()
+        mgr._library_file_path_to_info["/some/path.json"] = self._make_lib_info("my_lib")
+
+        await mgr.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD", problem_details="some issue")
+        )
+
+        raised = cast("MagicMock", mgr.engine).abroadcast_app_event.await_args.args[0]
+        assert isinstance(raised, LibraryLoadedNotification)
+        assert raised.library_name == "my_lib"
+        assert raised.problem_details == "some issue"
+
+    @pytest.mark.asyncio
+    async def test_accepting_a_report_releases_execution_routing(self) -> None:
+        mgr = self._make_manager()
+        mgr._library_file_path_to_info["/some/path.json"] = self._make_lib_info("my_lib")
+
+        await mgr.on_report_library_loaded_request(ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD"))
+
+        cast("MagicMock", mgr._worker_manager).note_library_loaded.assert_called_once_with("my_lib")
+
+
+class TestLibraryLoadReporter:
+    @pytest.mark.asyncio
+    async def test_a_registered_reporter_receives_the_report(self) -> None:
+        mgr = _make_library_manager()
+        reporter = AsyncMock()
+        mgr.register_library_load_reporter(reporter)
+        request = ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD")
+
+        await mgr._report_library_loaded(request)
+
+        reporter.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_no_reporter_is_logged_rather_than_raised(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A worker whose load never reaches the orchestrator hangs routing until the grace expires.
+
+        Raising here would take down the library load itself, which is the one part that worked.
+        """
         mgr = _make_library_manager()
 
-        await mgr._on_library_loaded_notification(LibraryLoadedNotification(library_name="unknown_lib", fitness="GOOD"))
+        with caplog.at_level("ERROR"):
+            await mgr._report_library_loaded(ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD"))
+
+        assert "my_lib" in caplog.text
 
 
 class TestRegisterPreReloadCallback:
@@ -299,6 +367,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
             executes_in_worker=True,
         )
         library_manager._library_file_path_to_info["/some/path.json"] = info
+        library_manager._engine = MagicMock(abroadcast_app_event=AsyncMock())
         if spawned:
             worker_manager.expect_worker("Lib")
         if loaded:
@@ -306,7 +375,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         return library_manager, worker_manager
 
     @pytest.mark.asyncio
-    async def test_the_wait_releases_when_the_notification_arrives(self) -> None:
+    async def test_the_wait_releases_when_the_report_arrives(self) -> None:
         library_manager, worker_manager = self._managers(spawned=True)
         order: list[str] = []
 
@@ -316,8 +385,8 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
 
         async def worker_finishes_loading() -> None:
             order.append("loaded")
-            await library_manager._on_library_loaded_notification(
-                LibraryLoadedNotification(library_name="Lib", fitness="GOOD")
+            await library_manager.on_report_library_loaded_request(
+                ReportLibraryLoadedRequest(library_name="Lib", fitness="GOOD")
             )
 
         await asyncio.gather(executes(), worker_finishes_loading())
@@ -339,7 +408,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
     @pytest.mark.asyncio
     async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
         _, worker_manager = self._managers(spawned=True)
-        worker_manager.heartbeat_startup_grace_s = 0.01
+        worker_manager.library_load_timeout_s = 0.01
 
         with pytest.raises(RuntimeError, match="Lib"):
             await worker_manager.wait_until_executable("Lib")

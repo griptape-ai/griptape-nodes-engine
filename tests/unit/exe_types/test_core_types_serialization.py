@@ -322,44 +322,47 @@ class TestTraitToDict:
 
         assert multi_options["choices"] == ["x", "y", "z"]
 
-    def test_explicit_ui_options_win_over_stale_trait_choices(self) -> None:
-        """A saved parameter's own `ui_options` is the source of truth over a trait's default.
+    def test_trait_choices_win_over_a_stored_copy(self) -> None:
+        """A trait owns the keys it renders, over any copy sitting in stored `ui_options`.
 
-        Intended contract per the "SERIALIZATION BUG FIX" note on `Options`: after reload,
-        a node rebuilds its trait with its ORIGINAL constructor choices (there is no
-        mechanism to persist a runtime `trait.choices` mutation back into node source), so
-        `Parameter._ui_options` -- populated from the saved `ui_options` during load -- must
-        win the merge over the trait's now-stale default list.
+        A trait derives its options from its current state, while a stored copy may predate
+        that state: it is what a file saved before trait state was carried holds. The trait
+        wins so a narrowed dropdown or slider cannot be shadowed by a stale copy, which
+        would leave the UI offering values the trait's own validator rejects.
         """
         param = Parameter(
             name="p",
             tooltip="t",
-            traits={Options(choices=["stale default 1", "stale default 2"])},
-            ui_options={"simple_dropdown": ["restored choice 1", "restored choice 2"]},
+            traits={Options(choices=["live choice 1", "live choice 2"])},
+            ui_options={"simple_dropdown": ["stale copy 1", "stale copy 2"]},
         )
 
-        assert param.to_dict()["ui_options"]["simple_dropdown"] == ["restored choice 1", "restored choice 2"]
+        assert param.to_dict()["ui_options"]["simple_dropdown"] == ["live choice 1", "live choice 2"]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DATA-LOSS: Bug: Options.choices setter's 'dual sync' write of "
-            "self._parent.ui_options['simple_dropdown'] = value is a no-op. Parameter.ui_options "
-            "is a computed property that rebuilds a brand-new dict via `|` on every access "
-            "(core_types.py ~:1878), so subscript-assigning into its return value never persists "
-            "to Parameter._ui_options. A dynamic runtime update of trait.choices AFTER the trait "
-            "is attached to a parameter should be reflected in that parameter's persisted "
-            "ui_options (the whole point of the documented 'dual sync' fix), but it is not. "
-            "- see #5440"
-        ),
-    )
-    def test_dynamic_choices_update_after_attachment_persists_to_parameter_ui_options(self) -> None:
+    def test_a_dynamic_choices_update_is_carried_by_trait_state(self) -> None:
+        """A runtime `trait.choices` update reaches a save through trait state.
+
+        It deliberately does not reach `Parameter._ui_options`: options a trait renders are
+        the trait's, and `trait_states()` is what saving records for them.
+        """
         options = Options(choices=["initial 1", "initial 2"])
         param = Parameter(name="p", tooltip="t", traits={options})
 
         options.choices = ["updated 1", "updated 2"]
 
-        assert param._ui_options.get("simple_dropdown") == ["updated 1", "updated 2"]
+        assert param.trait_states() == [
+            {
+                "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
+                "trait_state": {
+                    "choices": ["updated 1", "updated 2"],
+                    "show_search": True,
+                    "search_filter": "",
+                    "allow_custom": False,
+                },
+            }
+        ]
+        assert "simple_dropdown" not in param.authored_ui_options()
 
 
 class TestParamTypeSubclassUiOptions:

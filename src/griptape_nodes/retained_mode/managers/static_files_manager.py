@@ -53,13 +53,11 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
-from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.static import (
     ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV,
     STATIC_SERVER_HOST,
     STATIC_SERVER_PORT,
     STATIC_SERVER_URL,
-    start_static_server,
 )
 from griptape_nodes.utils.url_utils import uri_to_path
 
@@ -126,7 +124,7 @@ class StaticFilesManager(EngineScoped):
 
         # Where the workspace is served, resolved in on_app_initialization_complete. Staying None
         # until then is also what tells that handler it has not settled this yet, so a second
-        # initialization pass in the same process doesn't start a second server.
+        # initialization pass in the same process keeps the first pass's answer.
         self._static_server_base_url: str | None = None
         # Set once on_app_initialization_complete has decided the URL -- including deciding there
         # is none (cloud storage). App-event listeners fan out as unordered concurrent tasks, so a
@@ -135,7 +133,7 @@ class StaticFilesManager(EngineScoped):
         self._base_url_settled = threading.Event()
 
         # Seed the driver with any configured override so URLs built before initialization
-        # completes still point at the tunnel or proxy fronting the server. The handler re-reads
+        # completes still point at the tunnel or proxy fronting the host's server. The handler re-reads
         # it, so an override from a project activated after this manager was constructed counts.
         configured_base_url = self._configured_base_url()
         base_url = f"{configured_base_url}{STATIC_SERVER_URL}" if configured_base_url is not None else None
@@ -194,15 +192,14 @@ class StaticFilesManager(EngineScoped):
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
             )
-            # TODO: Listen for shutdown event (https://github.com/griptape-ai/griptape-nodes/issues/2149) to stop static server
 
     @property
     def static_server_base_url(self) -> str:
         """Base URL of the static server serving this workspace.
 
-        Resolved during ``on_app_initialization_complete``, either from the server the host
-        process provided or from the one this engine started. Reading it before that event
-        fires is a startup-ordering bug.
+        Resolved during ``on_app_initialization_complete`` from the server the host process
+        reports, or where that server listens by default when none is reported. Reading it
+        before that event fires is a startup-ordering bug.
         """
         if self._static_server_base_url is None:
             msg = "static_server_base_url accessed before on_app_initialization_complete resolved it."
@@ -566,8 +563,7 @@ class StaticFilesManager(EngineScoped):
     def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
         # try/finally rather than settling per branch: whatever resolution reached before raising
         # is what there is going to be, so waking waiters immediately beats making them sit out a
-        # full timeout on an initialization that already failed. Usually that means no URL, though a
-        # raise from starting the server thread leaves one already assigned.
+        # full timeout on an initialization that already failed.
         try:
             self._resolve_static_server(payload)
         finally:
@@ -587,9 +583,7 @@ class StaticFilesManager(EngineScoped):
             self._static_server_base_url = adopted
             logger.debug("Adopted the orchestrator's static server at %s", adopted)
         elif payload.static_server_base_url is not None:
-            # The host process serves this workspace and told us where. Pointing at its server
-            # keeps asset URLs valid for as long as the host runs, rather than only as long as
-            # this engine does.
+            # The host process serves this workspace and told us where.
             self._static_server_base_url = payload.static_server_base_url.rstrip("/")
             logger.debug("Using host-provided static server at %s", self._static_server_base_url)
         elif self._static_server_base_url is not None:
@@ -597,38 +591,23 @@ class StaticFilesManager(EngineScoped):
             # broadcasts it for its own run. Where the workspace is served is already settled.
             logger.debug("Static server already settled at %s", self._static_server_base_url)
         else:
-            # No host-provided server, so serve the workspace here.
-            #
-            # This is the path that disappears once every shipped host serves the workspace
-            # itself and sets static_server_base_url on the initialization payload. At that
-            # point this branch and servers/static.py both go away, and a workspace with no
-            # host-provided server simply has no server.
-            #
-            # Pre-bind to port 0 (or the configured port) so the OS assigns a free port before
-            # the server thread starts. This lets us know the actual port immediately with no
-            # race condition between discovering the port and uvicorn binding to it.
-            sock = bind_free_socket(STATIC_SERVER_HOST, STATIC_SERVER_PORT)
-            actual_port = sock.getsockname()[1]
-
-            # An override (e.g. an ngrok tunnel, reverse proxy, or `ssh -L` tunnel on a
-            # different port) fronts the server we just bound, so it is advertised verbatim.
-            # Otherwise the URL follows the bind host and the OS-assigned port.
+            # No host reported a server, e.g. a workflow run outside the app. The engine serves
+            # nothing itself, so point at a configured override or where the app's server listens
+            # by default. URLs then load whenever that server runs.
             configured_base_url = self._configured_base_url()
             if configured_base_url is None:
-                self._static_server_base_url = f"http://{STATIC_SERVER_HOST}:{actual_port}"
+                self._static_server_base_url = f"http://{STATIC_SERVER_HOST}:{STATIC_SERVER_PORT}"
             else:
                 self._static_server_base_url = configured_base_url
-
-            threading.Thread(target=start_static_server, args=(sock,), daemon=True, name="static-server").start()
-            logger.info("Serving workspace static files at %s", self._static_server_base_url)
+            logger.debug("No host reported a static server; assuming %s", self._static_server_base_url)
 
         self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
 
     def _configured_base_url(self) -> str | None:
         """Return the configured static server base URL, normalized, or None when unset.
 
-        A configured value means a tunnel or reverse proxy fronts the server, so it is what
-        gets advertised rather than the address the server binds to.
+        A configured value means a tunnel or reverse proxy fronts the host's server, so it is
+        what gets advertised rather than the address that server binds to.
         """
         configured_base_url = self.config_manager.get_config_value("static_server_base_url")
         if configured_base_url is None:

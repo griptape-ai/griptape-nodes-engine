@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
@@ -26,6 +27,9 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.deprecated_node_warning_problem import (
     DeprecatedNodeWarningProblem,
+)
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries.invalid_beta_feature_problem import (
+    InvalidBetaFeatureProblem,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.deprecated_node_in_workflow_problem import (
     DeprecatedNodeInWorkflowProblem,
@@ -228,6 +232,24 @@ class VersionCompatibilityManager(EngineScoped):
             if node.metadata.deprecation is not None
         ] or []
 
+    def _check_library_for_beta_feature_problems(
+        self, library_data: LibrarySchema
+    ) -> list[LibraryVersionCompatibilityIssue]:
+        """Check the beta features a library declares.
+
+        Entries that can't be parsed, expired features, and features whose remove_by is too far
+        out are warnings. The library still loads, and a problem feature uses its default.
+        """
+        parsed = parse_library_beta_features(library_data.name, library_data.beta_features or [])
+        issues = parsed.issues + find_beta_feature_date_issues(list(parsed.features.values()))
+        return [
+            LibraryVersionCompatibilityIssue(
+                problem=InvalidBetaFeatureProblem(feature_id=issue.feature_id, reason=issue.reason),
+                severity=LibraryManager.LibraryFitness.FLAWED,
+            )
+            for issue in issues
+        ]
+
     def check_library_version_compatibility(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
@@ -241,6 +263,7 @@ class VersionCompatibilityManager(EngineScoped):
                 version_issues.extend(issues)
 
         version_issues.extend(self._check_library_for_deprecated_nodes(library_data))
+        version_issues.extend(self._check_library_for_beta_feature_problems(library_data))
 
         return version_issues
 

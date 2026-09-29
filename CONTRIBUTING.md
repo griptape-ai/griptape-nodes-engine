@@ -198,11 +198,10 @@ Griptape Nodes uses a variety of environment variables for influencing its low-l
 
 - **`GRIPTAPE_NODES_API_BASE_URL`**: The base URL for the Griptape Nodes API (default `https://api.nodes.griptape.ai`). This is used to connect the engine to the Workflow Editor.
 - **`GT_CLOUD_API_KEY`**: The API key for authenticating with the Griptape Cloud API. This is required for the engine to function properly.
-- **`STATIC_SERVER_HOST`**: The host for the static server (default `localhost`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_PORT`**: The port for the static server (default `8124`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_URL`**: The URL path the workspace is served under (default `/workspace`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the static server (default `error`). This is used to control the verbosity of the static server logs.
-- **`STATIC_SERVER_ENABLED`**: Whether the static server is enabled (default `true`). This is used to control whether the static server is started or not.
+- **`STATIC_SERVER_HOST`**: The host for the static file server (default `localhost`). The app's server binds here, and the engine assumes it when no server URL is reported.
+- **`STATIC_SERVER_PORT`**: The port for the static file server (default `8124`). The app's server binds here, and the engine assumes it when no server URL is reported.
+- **`STATIC_SERVER_URL`**: The URL path the workspace is served under (default `/workspace`).
+- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the app's static file server (default `error`).
 
 ## Contributing to Documentation
 
@@ -239,6 +238,59 @@ This will start a local webserver (usually at `http://127.0.0.1:8000/`). The sit
 - We use **Ruff** for linting and formatting. Please ensure your code conforms to the style by running `make format` or `make fix`.
 - We use **Pyright** for static type checking. Run `make check` to ensure there are no type errors.
 - Run tests using `make test/unit` or `uv run pytest`.
+
+## Gating Work Behind a Beta Feature
+
+If you're building something user-visible or behavior-changing that isn't ready to be on for everyone, you can put it behind a beta feature. Users turn beta features on and off from the Beta page in the editor's Settings. Every feature you register in the engine appears there automatically, with no editor change needed.
+
+This section covers engine features. Node libraries, including the standard library, declare their own in the `beta_features` list of their library JSON and check them from nodes with `self.is_beta_feature_enabled("<id>")`. See [Beta Features in Authoring Libraries](docs/development/custom_nodes/authoring_libraries.md#beta-features).
+
+1. **Register the feature** in `src/griptape_nodes/retained_mode/beta_features.py`. All engine features live in that one module. The `name` and `description` are shown to users on the Beta page, so describe what changes and where, in plain terms:
+
+    ```python
+    PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
+        BetaFeature(
+            id="parallel_branch_resolution",
+            name="Parallel branch resolution",
+            description="Runs independent branches of a flow at the same time instead of one after another.",
+            owner="@your-github-handle",
+            remove_by=date(2027, 1, 31),
+        )
+    )
+    ```
+
+1. **Check it** at the point where the old and new behavior split:
+
+    ```python
+    if is_beta_enabled(PARALLEL_BRANCH_RESOLUTION, self.engine.config_manager):
+        ...
+    ```
+
+1. **Turn it on locally** by adding it to the `beta_features` section of your `griptape_nodes_config.json`:
+
+    ```json
+    {
+      "beta_features": {
+        "parallel_branch_resolution": true
+      }
+    }
+    ```
+
+    You can also set it for a single run with an environment variable:
+
+    ```shell
+    GTN_CONFIG_BETA_FEATURES__PARALLEL_BRANCH_RESOLUTION=true make run
+    ```
+
+**Rules:**
+
+- A beta feature must never change saved data or the protocol. Workflows have to open the same way whether the feature is on or off.
+- Every feature needs a `remove_by` date, at most 180 days out. By that date, make the feature standard or delete it.
+- Ids are lowercase snake_case and must be unique across the engine and the editor, so check the editor's features before picking one.
+
+**When `tests/unit/retained_mode/test_beta_features.py` fails:** once a feature passes its `remove_by` date, this test fails on every PR, including ones that don't touch the feature. The failure names the feature and its owner. To fix it, make the feature standard, delete it, or extend `remove_by` (still at most 180 days out) and explain why in the PR.
+
+**Removing a feature:** delete its registration and every `is_beta_enabled` check. If the feature is becoming standard, keep the new code path. Users' leftover `beta_features` entries do nothing and don't need cleaning up.
 
 ## Submitting Changes
 

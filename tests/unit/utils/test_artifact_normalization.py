@@ -1,63 +1,181 @@
-"""Unit tests for artifact_normalization module."""
+"""Tests for the serialized-artifact-dict branch of `normalize_artifact_input`.
 
-from __future__ import annotations
+The dict branch reuses `_normalize_string_input`, so these only cover inputs it can
+resolve without a configured engine: HTTP URLs, and paths it fails to resolve. Static-storage
+upload needs a configured engine and is not covered; the data URI tests stub only the workspace.
+"""
 
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+import base64
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
-from griptape.artifacts import ImageUrlArtifact
+from griptape.artifacts import AudioUrlArtifact, ImageArtifact, ImageUrlArtifact
+from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
-from griptape_nodes.utils.artifact_normalization import normalize_artifact_input
+from griptape_nodes.utils import artifact_normalization
+from griptape_nodes.utils.artifact_normalization import normalize_artifact_input, normalize_artifact_list
 
-if TYPE_CHECKING:
-    from pathlib import Path
+# The shape the editor sends for a stored video: an artifact dict plus the display
+# metadata it tracks alongside it.
+EDITOR_VIDEO_DICT = {
+    "type": "VideoUrlArtifact",
+    "value": "http://example.com/clip.mp4",
+    "name": "clip.mp4",
+    "width": 1920,
+    "height": 1080,
+    "duration": 12,
+}
 
-
-class TestNormalizeArtifactInputUrls:
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "http://localhost:8124/workspace/staticfiles/image.jpg?t=123",
-            "http://localhost:8124/workspace/renders/image.jpg",
-            "https://example.com/image.jpg",
-        ],
-    )
-    def test_url_is_wrapped_without_copying_to_static_storage(self, url: str) -> None:
-        engine = MagicMock()
-        with patch("griptape_nodes.utils.artifact_normalization.current_engine", return_value=engine):
-            result = normalize_artifact_input(url, ImageUrlArtifact)
-
-        assert isinstance(result, ImageUrlArtifact)
-        assert result.value == url
-        engine.static_files_manager.save_static_file.assert_not_called()
+# Long enough that, read as a path under the workspace, it exceeds the OS file name limit.
+LARGE_PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(bytes(5000)).decode()
 
 
-class TestNormalizeArtifactInputPaths:
-    @pytest.mark.parametrize("relative", [True, False])
-    def test_path_is_wrapped_in_place_without_copying(self, tmp_path: Path, relative: bool) -> None:  # noqa: FBT001
-        file_path = tmp_path / "renders" / "image.jpg"
-        file_path.parent.mkdir()
-        file_path.write_bytes(b"data")
-        artifact_input = "renders/image.jpg" if relative else str(file_path)
+@pytest.fixture
+def workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Give path resolution a workspace, so relative values are looked up on disk."""
+    engine = MagicMock()
+    engine.config_manager.workspace_path = tmp_path
+    monkeypatch.setattr(artifact_normalization, "current_engine", lambda: engine)
+    return tmp_path
 
-        engine = MagicMock()
-        engine.config_manager.workspace_path = tmp_path
-        storage_driver = engine.static_files_manager.storage_driver
-        storage_driver.create_signed_download_url.return_value = "http://localhost:8124/workspace/renders/image.jpg?v=1"
-        with patch("griptape_nodes.utils.artifact_normalization.current_engine", return_value=engine):
-            result = normalize_artifact_input(artifact_input, ImageUrlArtifact)
 
-        assert isinstance(result, ImageUrlArtifact)
-        assert result.value == "http://localhost:8124/workspace/renders/image.jpg?v=1"
-        storage_driver.create_signed_download_url.assert_called_once_with(file_path)
-        engine.static_files_manager.save_static_file.assert_not_called()
+@pytest.mark.parametrize(
+    ("artifact_dict", "artifact_type"),
+    [
+        pytest.param(EDITOR_VIDEO_DICT, VideoUrlArtifact, id="video-with-metadata"),
+        pytest.param(
+            {"type": "VideoUrlArtifact", "value": "http://example.com/clip.mp4"}, VideoUrlArtifact, id="video"
+        ),
+        pytest.param(
+            {"type": "ImageUrlArtifact", "value": "http://example.com/frame.png", "width": 64},
+            ImageUrlArtifact,
+            id="image-with-metadata",
+        ),
+        pytest.param(
+            {"type": "AudioUrlArtifact", "value": "http://example.com/take.mp3", "duration": 3},
+            AudioUrlArtifact,
+            id="audio-with-metadata",
+        ),
+    ],
+)
+def test_artifact_dict_becomes_the_artifact(artifact_dict: dict, artifact_type: type) -> None:
+    """A serialized artifact dict becomes the artifact, display metadata and all.
 
-    def test_missing_path_is_returned_unchanged(self, tmp_path: Path) -> None:
-        engine = MagicMock()
-        engine.config_manager.workspace_path = tmp_path
-        with patch("griptape_nodes.utils.artifact_normalization.current_engine", return_value=engine):
-            result = normalize_artifact_input("missing.jpg", ImageUrlArtifact)
+    The extra keys are why this branch exists: the editor sends `width` / `height` /
+    `duration` alongside the value, and only the value is needed to build the artifact.
+    """
+    result = normalize_artifact_input(dict(artifact_dict), artifact_type)
 
-        assert result == "missing.jpg"
-        engine.static_files_manager.storage_driver.create_signed_download_url.assert_not_called()
+    assert isinstance(result, artifact_type)
+    assert result.value == artifact_dict["value"]
+
+
+def test_unresolvable_path_still_becomes_an_artifact() -> None:
+    """A dict must never degrade into a bare string.
+
+    `_normalize_string_input` returns its own input when a path cannot be resolved or
+    uploaded — a project macro path, or a file outside the workspace. The dict already
+    declared its artifact type, so the value is wrapped in that type rather than handed
+    back as a string; callers that received a dict expect an artifact-shaped value.
+    """
+    macro_path_dict = {"type": "VideoUrlArtifact", "value": "{inputs}/clip.mp4", "duration": 6}
+
+    result = normalize_artifact_input(dict(macro_path_dict), VideoUrlArtifact)
+
+    assert isinstance(result, VideoUrlArtifact)
+    assert result.value == "{inputs}/clip.mp4"
+
+
+@pytest.mark.usefixtures("workspace")
+def test_data_uri_dict_becomes_the_artifact() -> None:
+    """A data URI is not a path, but it is a value the declared type can hold.
+
+    It is looked up on disk as a workspace-relative path first, and a real image's worth of
+    base64 is longer than the OS allows a file name to be. That lookup must answer "not a
+    file" rather than raise, so the value is wrapped like any other unresolvable one.
+    """
+    data_uri_dict = {"type": "ImageUrlArtifact", "value": LARGE_PNG_DATA_URI, "width": 64}
+
+    result = normalize_artifact_input(dict(data_uri_dict), ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value == LARGE_PNG_DATA_URI
+
+
+@pytest.mark.usefixtures("workspace")
+def test_data_uri_string_passes_through() -> None:
+    """The string branch hands back what it cannot resolve, a data URI included."""
+    assert normalize_artifact_input(LARGE_PNG_DATA_URI, ImageUrlArtifact) == LARGE_PNG_DATA_URI
+
+
+def test_dict_for_another_artifact_type_passes_through() -> None:
+    """An image dict on a video parameter is left alone.
+
+    The declared type is what distinguishes a path from a payload, so a dict naming a
+    different type is not safe to unwrap. Handing back the input keeps the node's own
+    validation responsible for reporting the mismatch.
+    """
+    image_dict = {"type": "ImageUrlArtifact", "value": "http://example.com/frame.png"}
+
+    result = normalize_artifact_input(dict(image_dict), VideoUrlArtifact)
+
+    assert result == image_dict
+
+
+def test_raw_artifact_dict_passes_through() -> None:
+    """Documents a gap rather than asserting a desirable outcome.
+
+    A raw `ImageArtifact` holds base64 bytes in `value`, not a path, so it cannot go
+    through the string branch — unwrapping it would produce an artifact whose "URL" is a
+    base64 payload. Such dicts are left untouched, exactly as before this branch existed.
+    Supporting them means reconstructing the artifact from its schema, which is a
+    different job from normalizing a path.
+    """
+    raw_dict = ImageArtifact(b"\x89PNG", format="png", width=64, height=64).to_dict()
+
+    result = normalize_artifact_input(dict(raw_dict), ImageUrlArtifact, accepted_types=(ImageArtifact,))
+
+    assert result == raw_dict
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param({}, id="empty"),
+        pytest.param({"foo": "bar"}, id="no-type-key"),
+        pytest.param({"type": "NotARealArtifactType", "value": "whatever"}, id="unknown-type"),
+        pytest.param({"type": "video/mp4", "value": "AAAA"}, id="mime-type-not-a-class"),
+        pytest.param({"type": "VideoUrlArtifact"}, id="no-value"),
+        pytest.param({"type": "VideoUrlArtifact", "value": ""}, id="empty-value"),
+    ],
+)
+def test_dict_that_is_not_a_usable_artifact_dict_passes_through(value: dict) -> None:
+    """A parameter accepting any input type can be handed a dict that is not an artifact at all."""
+    result = normalize_artifact_input(dict(value), VideoUrlArtifact)
+
+    assert result == value
+
+
+def test_existing_artifact_is_returned_unchanged() -> None:
+    """An artifact of the requested type is handed back as the same object."""
+    artifact = VideoUrlArtifact("http://example.com/clip.mp4")
+
+    assert normalize_artifact_input(artifact, VideoUrlArtifact) is artifact
+
+
+@pytest.mark.parametrize("value", [None, 3, True], ids=["none", "int", "bool"])
+def test_non_dict_non_string_values_pass_through(value: Any) -> None:
+    """There is nothing to normalize in a scalar, so it survives untouched."""
+    assert normalize_artifact_input(value, VideoUrlArtifact) is value
+
+
+def test_list_of_artifact_dicts_is_normalized_element_wise() -> None:
+    """List parameters get the same treatment per element, mixed contents included."""
+    incoming = [dict(EDITOR_VIDEO_DICT), {"foo": "bar"}]
+
+    result = normalize_artifact_list(incoming, VideoUrlArtifact)
+
+    assert isinstance(result[0], VideoUrlArtifact)
+    assert result[1] == {"foo": "bar"}

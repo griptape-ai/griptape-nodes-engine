@@ -333,6 +333,28 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
+        BuiltInSituation.SAVE_OUTPUT_DIRECTORY: SituationTemplate(
+            name=BuiltInSituation.SAVE_OUTPUT_DIRECTORY,
+            description="Node creates and outputs a new versioned directory",
+            macro="{outputs}/{sub_dirs?:/}{dir_name}_v{###}",  # renders_v001/, renders_v002/, ...
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
+                create_dirs=True,
+            ),
+            fallback=None,
+        ),
+        # `{###}` versions the directory. The bare `####` is not a macro variable: it passes
+        # through resolution as literal text and fileseq fills it with each entry's number.
+        BuiltInSituation.SAVE_FILE_SEQUENCE: SituationTemplate(
+            name=BuiltInSituation.SAVE_FILE_SEQUENCE,
+            description="Node writes a numbered file sequence into a new versioned directory",
+            macro="{outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}",  # frames_v001/frames.0001.png, ...
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
+                create_dirs=True,
+            ),
+            fallback=None,
+        ),
         BuiltInSituation.COPY_EXTERNAL_FILE: SituationTemplate(
             name=BuiltInSituation.COPY_EXTERNAL_FILE,
             description="User copies external file to project",
