@@ -37,9 +37,10 @@ the engine's request API from working without edits. Migration steps live in
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
-- Saved workflow files store parameter values as readable data instead of pickle, and saving an
-  unchanged workflow writes the same file each time, so saved workflows diff cleanly. Workflows saved
-  by earlier versions still open. A workflow saved by this version does not open in earlier ones.
+- Workflows saved by this version do not open in earlier versions. Saved workflow files store
+  parameter values as readable data instead of pickle, and saving an unchanged workflow writes the
+  same file each time, so saved workflows diff cleanly. Workflows saved by earlier versions still
+  open.
   [#5441](https://github.com/griptape-ai/griptape-nodes-engine/issues/5441)
 - A parameter value with no plain-data form is no longer written to saved workflow files, so its
   node runs again when the workflow reopens. It is also left out of copied nodes, and out of the
