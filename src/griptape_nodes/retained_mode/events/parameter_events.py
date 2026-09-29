@@ -15,7 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.converter import ElementDocument
-from griptape_nodes.serialization.values import DisplayValue
+from griptape_nodes.serialization.values import DisplayValue, Value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,7 +57,7 @@ class AddParameterToNodeRequest(RequestPayload):
     # If node name is None, use the Current Context
     node_name: str | None = None
     parameter_name: str | None = None
-    default_value: DisplayValue = None
+    default_value: Value = None
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
     tooltip_as_property: str | list[dict] | None = None
@@ -390,7 +390,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     type: str | None = None
     input_types: list[str] | None = None
     output_type: str | None = None
-    default_value: DisplayValue = None
+    default_value: Value = None
     clear_default_value: bool = False
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
