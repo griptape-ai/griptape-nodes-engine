@@ -19,10 +19,11 @@ import base64
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
+from pydantic_ai import RunContext  # noqa: TC002 - pydantic-ai reads the annotation at runtime to find `ctx`
 from pydantic_ai.exceptions import ModelRetry
 
 from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL
@@ -98,12 +99,14 @@ class ImageGenerationToolset:
 
     def register_on(self, agent: Agent) -> None:
         """Register the image-generation tool on the given Pydantic AI agent."""
-        agent.tool_plain(self.generate_image)
+        agent.tool(self.generate_image)
 
-    async def generate_image(self, prompt: str, negative_prompt: str = "") -> str:
+    async def generate_image(self, ctx: RunContext[Any], prompt: str, negative_prompt: str = "") -> str:
         """Generate an image from a text prompt and return its workspace URL.
 
         Args:
+            ctx: The agent run. Its ``extra_headers`` go on the Cloud request, so
+                the image is billed to the same project as the reply around it.
             prompt: Text description of the image to generate.
             negative_prompt: Optional description of what to avoid. Sent to the
                 model when non-empty.
@@ -130,7 +133,7 @@ class ImageGenerationToolset:
         # explain the failure instead.
         try:
             async with httpx.AsyncClient(timeout=self._config.timeout_seconds) as client:
-                response = await client.post(url, headers=self._headers, json=payload)
+                response = await client.post(url, headers={**_run_headers(ctx), **self._headers}, json=payload)
             response.raise_for_status()
             artifact = response.json()["artifact"]
             image_bytes = base64.b64decode(artifact["value"])
@@ -167,6 +170,12 @@ class ImageGenerationToolset:
             "output_format": self._config.output_format,
         }
         return {key: value for key, value in config.items() if value is not None}
+
+
+def _run_headers(ctx: RunContext[Any]) -> dict[str, str]:
+    """Return the extra headers the agent run carries, or ``{}``."""
+    settings = ctx.model_settings or {}
+    return dict(settings.get("extra_headers") or {})
 
 
 def register_image_tools(

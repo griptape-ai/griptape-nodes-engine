@@ -80,6 +80,10 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateProviderPayload,
 )
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextResultFailure,
+    GetAttributionContextResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultFailure,
@@ -1378,6 +1382,49 @@ async def _stub_compose_prompt(text: str, _url_artifacts: list[RunAgentRequestAr
     return ComposedPrompt(live=text, persist=text)
 
 
+async def _no_attribution(_request: object) -> GetAttributionContextResultFailure:
+    """Answer the attribution lookup as when no project is open."""
+    return GetAttributionContextResultFailure(result_details="no project")
+
+
+class TestAttributionHeaders:
+    """A Griptape Cloud chat turn carries the budget attribution header; others don't."""
+
+    @staticmethod
+    def _manager(provider_type: str, answer: object) -> tuple[AgentManager, list[object]]:
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_provider_name = "p"
+        manager._providers = [ProviderConfig(name="p", type=provider_type, model="m")]
+        asked: list[object] = []
+
+        async def ahandle_request(request: object) -> object:
+            asked.append(request)
+            return answer
+
+        manager._engine = SimpleNamespace(ahandle_request=ahandle_request)  # type: ignore[assignment]
+        return manager, asked
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_sends_the_header(self) -> None:
+        answer = GetAttributionContextResultSuccess(header_value="abc", project_chain=["p1"], result_details="ok")
+        manager, _asked = self._manager("griptape_cloud", answer)
+
+        assert await manager._attribution_headers(None) == {"X-Griptape-Attribution": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_sends_nothing(self) -> None:
+        manager, _asked = self._manager("griptape_cloud", await _no_attribution(None))
+
+        assert await manager._attribution_headers(None) == {}
+
+    @pytest.mark.asyncio
+    async def test_other_providers_are_not_asked(self) -> None:
+        manager, asked = self._manager("openai", None)
+
+        assert await manager._attribution_headers(None) == {}
+        assert asked == []
+
+
 class TestRunAgentResultPayloadContract:
     """`_run_agent`'s three success branches must agree on the payload's keys.
 
@@ -1421,6 +1468,7 @@ class TestRunAgentResultPayloadContract:
             # `_run_agent` reads the enabled MCP servers on every run; these
             # tests are about the result payload, so report none configured.
             handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+            ahandle_request=_no_attribution,
         )
         return manager
 

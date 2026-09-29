@@ -136,6 +136,10 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
+    GetAttributionContextResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
@@ -559,6 +563,7 @@ class AgentManager(EngineScoped):
             model_name=request.model_name,
         )
         composed = await _compose_prompt(request.input, request.url_artifacts)
+        attribution_headers = await self._attribution_headers(request.provider_name)
 
         event_manager = self.engine.event_manager
 
@@ -588,6 +593,7 @@ class AgentManager(EngineScoped):
                     history_rehydrator=_rehydrate_history,
                     extra_toolsets=mcp.lease.toolsets,
                     extra_instructions=mcp.instructions,
+                    extra_headers=attribution_headers,
                 )
         finally:
             # Only drop our own entry; a newer run for the same thread may have
@@ -929,6 +935,22 @@ class AgentManager(EngineScoped):
             details = f"Error getting conversation memory: {e}"
             logger.exception(details)
             return GetConversationMemoryResultFailure(result_details=details)
+
+    async def _attribution_headers(self, provider_name: str | None) -> dict[str, str]:
+        """Return the budget attribution header for a Griptape Cloud run, or ``{}``.
+
+        Cloud checks project budgets against this header, so without it a chat reply is
+        never charged to the open project. Only Griptape Cloud reads it; other providers get
+        nothing. A failure sends no header rather than failing the turn: not knowing which
+        project to bill is not a reason to refuse the reply, and the handler has already
+        logged why.
+        """
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return {}
+        result = await self.engine.ahandle_request(GetAttributionContextRequest())
+        if not isinstance(result, GetAttributionContextResultSuccess):
+            return {}
+        return {result.header_name: result.header_value}
 
     def _build_runner(
         self,

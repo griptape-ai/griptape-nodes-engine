@@ -50,6 +50,9 @@ answer:
 > Budget stopped this reply. It was blocked by the budget "Marketing Q3".
 > Contact your Griptape administrator.
 
+Replies, and images the agent generates, count against the budgets of the
+project you have open, as well as any budget for your whole organization.
+
 The message names every budget that blocked the reply. Bring those names to
 your Griptape administrator, who can raise or unfreeze the budget on Griptape
 Cloud. A budget that stops a workflow run is shown differently — see
