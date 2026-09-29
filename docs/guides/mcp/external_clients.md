@@ -138,8 +138,10 @@ Other values, such as tuples and enums, sit under `$value`:
 {"$type": "my_library.colors:Color", "$value": "red"}
 ```
 
-A value that can't be written as JSON, such as an open file, is sent as its Python `str()`, for
-example `"<_io.TextIOWrapper name='notes.txt' mode='r' encoding='UTF-8'>"`.
+A value that can't be written as JSON, such as an open file, is sent as its Python `str()` in
+fields that only show it, such as element trees, for example
+`"<_io.TextIOWrapper name='notes.txt' mode='r' encoding='UTF-8'>"`. Anywhere else the result
+can't be sent, and the request gets a failure whose message names the value instead.
 
 ## Install the workflow-construction skill
 

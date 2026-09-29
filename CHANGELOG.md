@@ -40,6 +40,7 @@ the engine's request API from working without edits. Migration steps live in
   Annotate a field that carries parameter values `Value` to send them tagged with their type, as
   described in
   [`get_request_handlers`](docs/development/custom_nodes/advanced_libraries.md#get_request_handlers).
+  See [MIGRATION.md](MIGRATION.md#parameter-values-carry-their-type).
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
