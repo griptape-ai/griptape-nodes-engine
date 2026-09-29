@@ -53,8 +53,8 @@ def is_dynamic_module_name(module_name: str) -> bool:
 def may_import_for_decoding(module_name: str) -> bool:
     """True if decoding may import ``module_name`` to resolve a ``$type``.
 
-    A module already in ``sys.modules`` is always safe to read from; this only gates importing
-    one that is not loaded yet, which would run its top-level code.
+    Only gates importing, which would run a module's top-level code. Classes from modules already
+    loaded still decode, and their constructors run on the data.
     """
     top_level_package, _, _ = module_name.partition(".")
     return top_level_package in IMPORTABLE_TOP_LEVEL_PACKAGES
