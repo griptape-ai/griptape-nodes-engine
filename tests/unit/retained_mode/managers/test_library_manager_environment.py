@@ -561,7 +561,12 @@ class TestSandboxAllowedByTheEnvironment:
         result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
         assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
         by_name = {entry.library_schema.name: entry for entry in result.successful_libraries}
-        assert by_name[LibraryManager.SANDBOX_LIBRARY_NAME].is_registered is True
+        sandbox_entry = by_name[LibraryManager.SANDBOX_LIBRARY_NAME]
+        assert sandbox_entry.is_registered is True
+        # No registered_path: the sandbox comes from sandbox_library_directory, not from the
+        # environment or libraries_to_register, which is how the editor keeps it out of either list.
+        assert sandbox_entry.registered_path is None
+        assert sandbox_entry.file_path == str(sandbox / LibraryManager.LIBRARY_CONFIG_FILENAME)
         assert by_name["A Library"].is_registered is False
 
     @pytest.mark.asyncio
