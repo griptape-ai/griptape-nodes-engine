@@ -8,12 +8,12 @@ beside ``$type``; any other state sits under ``$value``:
     {"$type": "builtins:tuple", "$value": [1, "b"]}
 
 A class's state comes from the first adapter that claims it. A class can supply its own by
-defining ``to_state()`` and a ``from_state(state)`` classmethod; other types can be covered with
-``register_value_adapter``.
+implementing ``SavesState``. A class you cannot edit can be covered with ``register_value_codec``.
 
 Decoding imports a ``$type``'s module only if it is already loaded, or its top-level package is
 ``griptape`` or ``griptape_nodes`` (this covers node library files, loaded lazily under
-``griptape_nodes.node_libraries.*``). It builds only classes an adapter claims. A value this
+``griptape_nodes.node_libraries.*``). It builds only classes an adapter claims, and building one
+runs its constructor on the data, so a class from any loaded module can be built. A value this
 process cannot build or is not allowed to import, such as one whose class lives in a library
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
 came from, so it passes through to a process that can build it.
@@ -34,7 +34,7 @@ import math
 import uuid
 import weakref
 from pathlib import Path, PurePath
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, Self
 
 import attrs
 from griptape.mixins.serializable_mixin import SerializableMixin
@@ -46,6 +46,9 @@ from griptape_nodes.serialization.type_names import (
     resolve_type_name,
     type_name,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 TYPE_KEY = "$type"
 VALUE_KEY = "$value"
@@ -109,10 +112,45 @@ def decode_value(data: Any) -> Any:
     return _decode_tagged(data)
 
 
-def register_value_adapter(adapter: ValueAdapter) -> None:
-    """Consult ``adapter`` before every adapter registered earlier and every built-in one."""
-    _adapters.insert(0, adapter)
-    _adapter_cache.clear()
+class SavesState(Protocol):
+    """A value that saves as the state ``to_state()`` returns and reopens through ``from_state()``.
+
+    Any class with these two methods saves this way. Inheriting from this only lets a type checker
+    check their signatures.
+    """
+
+    def to_state(self) -> Any: ...
+
+    @classmethod
+    def from_state(cls, state: Any) -> Self: ...
+
+
+def register_value_codec[T](
+    cls: type[T],
+    *,
+    to_state: Callable[[T], Any],
+    from_state: Callable[[Any], T],
+) -> None:
+    """Save and reopen values of exactly ``cls``, not its subclasses, with these functions.
+
+    For classes you cannot give ``to_state()`` and ``from_state()``. Checked after plain data,
+    containers, and ``Path``, and before every built-in adapter. Registering again from the module
+    that registered ``cls``, as when a library reloads, replaces the earlier functions.
+
+    Raises:
+        ValueError: ``cls`` is a type the codec encodes itself, or another module registered it.
+    """
+    if cls in _UNREGISTRABLE or issubclass(cls, Path):
+        msg = f"Attempted to register a codec for '{cls.__qualname__}'. Failed because values of that type are always saved as themselves."
+        raise ValueError(msg)
+    existing = _codecs.get(cls)
+    if existing is not None and existing.module != to_state.__module__:
+        msg = (
+            f"Attempted to register a codec for '{cls.__qualname__}' from '{to_state.__module__}'. "
+            f"Failed because '{existing.module}' already registered one."
+        )
+        raise ValueError(msg)
+    _codecs[cls] = _Codec(to_state=to_state, from_state=from_state, module=to_state.__module__)
 
 
 def _encode(value: Any, active: set[int]) -> JsonValue:
@@ -151,6 +189,9 @@ def _encode_compound(value: Any, cls: type, active: set[int]) -> JsonValue:  # n
     if isinstance(value, Path):
         # Named as Path, not PosixPath or WindowsPath, so a file saved on one OS opens on another.
         return _tagged(Path, str(value))
+    codec = _codecs.get(cls)
+    if codec is not None:
+        return _tagged(cls, _encode(_codec_state(codec, value), active))
     adapter = _adapter_for(cls)
     if adapter is not None:
         return _tagged(cls, _encode(_adapter_state(adapter, value), active))
@@ -228,12 +269,20 @@ def _decode_tagged(data: dict[str, Any]) -> Any:
         state = {key: decode_value(item) for key, item in data[VALUE_KEY].items()}
     else:
         state = decode_value(data[VALUE_KEY])
+    return _build(cls, state, data)
+
+
+def _build(cls: type, state: Any, data: dict[str, Any]) -> Any:
+    """Build ``cls`` from its decoded ``state``, in the order encoding chose its form."""
     builtin_decoder = _BUILTIN_DECODERS.get(cls)
     if builtin_decoder is not None:
-        return _decode_builtin(builtin_decoder, data, state)
+        return _decode_builtin(builtin_decoder, cls, state, data)
+    codec = _codecs.get(cls)
+    if codec is not None:
+        return _decode_with_codec(codec, cls, state, data)
     adapter = _adapter_for(cls)
     if adapter is None:
-        return UndecodedValue(data, f"'{name}' has no plain-data form in this process")
+        return UndecodedValue(data, f"'{data[TYPE_KEY]}' has no plain-data form in this process")
     return _decode_with_adapter(adapter, cls, state, data)
 
 
@@ -245,11 +294,34 @@ def _decode_with_adapter(adapter: ValueAdapter, cls: type, state: Any, data: dic
         return _undecodable(data, f"a saved '{cls.__qualname__}' value could not be rebuilt: {error}")
 
 
-def _decode_builtin(decoder: Any, data: dict[str, Any], state: Any) -> Any:
+def _decode_with_codec(codec: _Codec, cls: type, state: Any, data: dict[str, Any]) -> Any:
+    try:
+        return codec.from_state(state)
+    except Exception as error:
+        # Codecs run library code, which can raise anything.
+        return _undecodable(data, f"a saved '{cls.__qualname__}' value could not be rebuilt: {error}")
+
+
+def _decode_builtin(decoder: Any, cls: type, state: Any, data: dict[str, Any]) -> Any:
+    if _holds_undecoded_key(cls, state):
+        # A set member or dict key this process cannot build is a dict, which cannot be hashed.
+        # Keep the whole value as data, quietly, as for any value whose class is elsewhere.
+        return UndecodedValue(data, f"a saved '{data[TYPE_KEY]}' value holds values this process cannot build")
     try:
         return decoder(state)
     except (TypeError, ValueError, binascii.Error) as error:
         return _undecodable(data, f"a saved '{data[TYPE_KEY]}' value is malformed: {error}")
+
+
+def _holds_undecoded_key(cls: type, state: Any) -> bool:
+    """True if ``state`` is set members or dict pairs with an ``UndecodedValue`` where a key goes."""
+    if not isinstance(state, list):
+        return False
+    if cls in (set, frozenset):
+        return any(type(item) is UndecodedValue for item in state)
+    if cls is dict:
+        return any(isinstance(pair, list) and pair and type(pair[0]) is UndecodedValue for pair in state)
+    return False
 
 
 def _undecodable(data: dict[str, Any], reason: str) -> UndecodedValue:
@@ -280,12 +352,30 @@ def _adapter_for(cls: type) -> ValueAdapter | None:
     return found
 
 
+def _codec_state(codec: _Codec, value: Any) -> Any:
+    try:
+        return codec.to_state(value)
+    except ValueEncodeError:
+        raise
+    except Exception as error:
+        # Codecs run library code, which can raise anything.
+        msg = f"A '{type(value).__qualname__}' value failed to produce its plain-data form: {error}"
+        raise ValueEncodeError(msg) from error
+
+
+@dataclasses.dataclass(frozen=True)
+class _Codec:
+    to_state: Callable[[Any], Any]
+    from_state: Callable[[Any], Any]
+    module: str
+
+
 def _is_classmethod(cls: type, name: str) -> bool:
     return isinstance(inspect.getattr_static(cls, name, None), classmethod)
 
 
 class _StateMethodsAdapter:
-    """Classes that define ``to_state()`` and a ``from_state(state)`` classmethod."""
+    """Classes that implement ``SavesState``."""
 
     def claims(self, cls: type) -> bool:
         return callable(getattr(cls, "to_state", None)) and _is_classmethod(cls, "from_state")
@@ -415,7 +505,16 @@ _BUILTIN_DECODERS: dict[type, Any] = {
     bytearray: _decode_bytearray,
     dict: _decode_dict,
     float: float,
+    Path: Path,
 }
+
+# Types encoding handles before consulting codecs, so a codec for one would never run.
+_UNREGISTRABLE = frozenset(
+    {type(None), bool, int, float, str, bytes, bytearray, list, dict, tuple, set, frozenset, UndecodedValue}
+)
+
+# Weak, so classes from a reloaded library file are not kept alive.
+_codecs: weakref.WeakKeyDictionary[type, _Codec] = weakref.WeakKeyDictionary()
 
 _adapters: list[ValueAdapter] = [
     _StateMethodsAdapter(),
