@@ -5,3 +5,4 @@
   Annotate a field that carries parameter values `Value` to send them tagged with their type, as
   described in
   [`get_request_handlers`](docs/development/custom_nodes/advanced_libraries.md#get_request_handlers).
+  See [MIGRATION.md](MIGRATION.md#parameter-values-carry-their-type).
