@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+
+import pytest
 
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.external_environment import (
@@ -12,20 +13,20 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     LIBRARY_WORKER_REQUESTS_ENV_VAR,
     WorkerCommand,
     WorkerCommandRefusal,
+    environment_allows_sandbox,
     library_paths_from_environment,
     read_dependency_source,
     read_worker_command_prefix,
     resolve_worker_command,
+    sandbox_refused_by_environment,
     worker_requests_from_environment,
 )
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_DEPENDENCY_SOURCE_KEY,
+    LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY,
     WORKER_COMMAND_PREFIX_KEY,
     LibraryDependencySource,
 )
-
-if TYPE_CHECKING:
-    import pytest
 
 _COMMAND = ["/engine/python", "-m", "griptape_nodes_app", "engine", "--library-name", "Foo Library"]
 
@@ -230,6 +231,35 @@ class TestEnvironmentOverrides:
         assert "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE" in caplog.text
 
 
+class TestEnvironmentAllowsSandbox:
+    @pytest.mark.parametrize(("raw", "expected"), [("TRUE", True), ("true", True), ("False", False)])
+    def test_true_or_false_in_any_letter_case(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, *, expected: bool
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX", raw)
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert environment_allows_sandbox(manager) is expected
+
+    def test_a_bad_value_is_reported_and_keeps_the_sandbox_refused(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX", "maybe")
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE", "environment")
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert environment_allows_sandbox(manager) is False
+        assert sandbox_refused_by_environment(manager) is True
+        assert "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX" in caplog.text
+
+    def test_it_matters_only_in_environment_mode(self) -> None:
+        config = _config_returning({LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY: False})
+
+        assert sandbox_refused_by_environment(config) is False
+
+
 class TestSuiteIsolation:
     def test_the_environment_the_suite_runs_in_is_not_read(self) -> None:
         """The unit-test conftest clears every variable these hooks read before each test.
@@ -242,5 +272,6 @@ class TestSuiteIsolation:
             LIBRARY_WORKER_REQUESTS_ENV_VAR,
             "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE",
             "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+            "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX",
         ):
             assert name not in os.environ

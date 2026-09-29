@@ -114,6 +114,7 @@ def isolate_external_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         LIBRARY_WORKER_REQUESTS_ENV_VAR,
         "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE",
         "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+        "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX",
     ):
         monkeypatch.delenv(name, raising=False)
 
