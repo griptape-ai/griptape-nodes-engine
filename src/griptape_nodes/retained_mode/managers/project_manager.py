@@ -45,6 +45,7 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileWriteError
@@ -61,6 +62,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
@@ -188,6 +190,12 @@ BUILTIN_WORKSPACE_DIR = "workspace_dir"
 BUILTIN_WORKFLOW_NAME = "workflow_name"
 BUILTIN_WORKFLOW_DIR = "workflow_dir"
 BUILTIN_STATIC_FILES_DIR = "static_files_dir"
+
+# Stands in for the filename when resolving `save_workflow` purely to learn its folder. Never
+# reaches disk: only the parent of the resolved path is read. Carries no path separator, so it
+# cannot add a level the real filename would not have.
+_SAVE_DIR_PROBE_STEM = "workflow"
+_SAVE_DIR_PROBE_EXTENSION = "py"
 
 
 @dataclass(frozen=True)
@@ -715,6 +723,11 @@ class ProjectManager(EngineScoped):
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
+        # Set while `_resolve_default_workflow_save_dir` is resolving `save_workflow` to learn
+        # where an unsaved workflow would be saved. That resolution can reach `workflow_dir`
+        # again, directly or through a directory such as `{outputs}`, and each re-entry builds
+        # its own resolver, so the resolver's own cycle guard never sees the loop.
+        self._resolving_default_workflow_save_dir: bool = False
 
         # Track validation status for ALL load attempts (including MISSING/UNUSABLE)
         # This allows UI to query why a project failed to load
@@ -3014,7 +3027,13 @@ class ProjectManager(EngineScoped):
     async def _reload_after_project_switch(
         self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
-        """Reload libraries and optionally re-register workflows after a project switch.
+        """Close the open workflow, reload libraries, and re-register workflows after a switch.
+
+        A workspace change closes the open workflow, because re-registering the
+        workflows re-keys them against the new workspace: a context that outlives
+        its registry entry names a key nothing can look up again, and every
+        `workflow_dir` resolution against it warns for the life of the process.
+        Clients are expected to return the user to the workflow picker.
 
         Only reloads libraries when the project's library-affecting config
         actually changed: the reload triggers LibraryManager's reconcile, which
@@ -3023,15 +3042,33 @@ class ProjectManager(EngineScoped):
         default workspace) skips the deep reset. Workflows are re-registered only
         when the workspace directory changed.
 
-        Returns a failure result if the library reload (reconcile/engine_version
-        gate included) fails, otherwise None.
+        Returns a failure result if the workflow could not be closed, or if the
+        library reload (reconcile/engine_version gate included) fails, otherwise
+        None.
         """
+        # Ahead of refresh_workflow_registry, which deletes the entry this teardown resolves
+        # paths through, and ahead of the reload below, whose own clear then finds an empty
+        # stack and no-ops.
+        #
+        # Both failures below report altered_workflow_state: the teardown pops the context
+        # before the checks that can fail it, so the workflow is gone either way. A failure
+        # that claimed otherwise would leave the client showing a workflow the engine has
+        # dropped, which is the state this teardown exists to prevent.
+        if workspace_changed:
+            clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if not clear_result.succeeded():
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set project '{project_id}'. "
+                    f"Config updated but the open workflow could not be closed: {clear_result.result_details}",
+                    altered_workflow_state=True,
+                )
         if library_config_changed:
             reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
             if isinstance(reload_result, ReloadAllLibrariesResultFailure):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but library reload failed: {reload_result.result_details}",
+                    altered_workflow_state=True,
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
@@ -4758,7 +4795,7 @@ class ProjectManager(EngineScoped):
 
         Raises ValueError when the project isn't loaded or the name isn't a computed name;
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
-        {workflow_dir} before the workflow is saved).
+        {workflow_dir} with no workflow in context).
         """
         effective = self.resolve_project_id(project_id)
         if effective is None:
@@ -4925,7 +4962,7 @@ class ProjectManager(EngineScoped):
                 raise NotImplementedError(msg)
 
             case "workspace_dir":
-                return str(self._config_manager.workspace_path)
+                return self._resolve_builtin_workspace_dir()
 
             case "workflow_name":
                 context_manager = self.engine.context_manager
@@ -4935,7 +4972,7 @@ class ProjectManager(EngineScoped):
                 return context_manager.get_current_workflow_name()
 
             case "workflow_dir":
-                return self._resolve_workflow_dir()
+                return self._resolve_workflow_dir(project_info)
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -4969,10 +5006,19 @@ class ProjectManager(EngineScoped):
             working_directory=context_manager.get_current_workflow_working_directory(),
         )
 
-    def _resolve_workflow_dir(self) -> str:
+    def _resolve_builtin_workspace_dir(self) -> str:
+        """Resolve the `workspace_dir` builtin: the root every relative project path anchors to.
+
+        Also the last rung of `_resolve_workflow_dir`, which is why it is a method rather than
+        an inline expression -- the two must answer identically or a never-saved workflow's
+        files land somewhere `{workspace_dir}` does not describe.
+        """
+        return str(self._config_manager.workspace_path)
+
+    def _resolve_workflow_dir(self, project_info: ProjectInfo) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
 
-        Three sources, in descending order of authority:
+        Four sources, in descending order of authority:
 
         1. The file path retained on the context. The registry key is derived against the
            workspace that was active at push time, so a project switch -- which re-registers
@@ -4982,13 +5028,18 @@ class ProjectManager(EngineScoped):
            to a workspace-relative path, so saved media resolves somewhere it was never written.
         2. The registry entry for the context's name.
         3. The folder the workflow was created in, for a workflow that has never been saved and
-           so has no file to answer from. Last because a saved workflow's own location always
-           beats the folder it was created in -- the two differ as soon as the user saves
-           somewhere else.
+           so has no file to answer from. Below the two above because a saved workflow's own
+           location always beats the folder it was created in -- the two differ as soon as the
+           user saves somewhere else.
+        4. The folder the workflow WOULD be saved into, for a never-saved workflow whose creator
+           named no folder, read from the `save_workflow` situation with no sub-directories so a
+           template that anchors saves outside the workspace root is answered with its folder
+           rather than the root. Where the user later chooses to save is a choice at save time,
+           not a misprediction by this rung. See `_resolve_default_workflow_save_dir`.
 
         Raises:
-            RuntimeError: If no workflow is in context, or the workflow has neither a file nor
-                a folder to answer with.
+            RuntimeError: If no workflow is in context, or the context's workflow is not
+                registered on this engine.
         """
         context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
@@ -5018,11 +5069,66 @@ class ProjectManager(EngineScoped):
         if workflow.file_path is None:
             if working_directory is not None:
                 return working_directory
-            msg = f"Workflow '{workflow_name}' has not been saved yet"
-            raise RuntimeError(msg)
+            return self._resolve_default_workflow_save_dir(project_info)
 
         workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
         return str(workflow_file_path.parent)
+
+    def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo) -> str:
+        """The folder `save_workflow` would put a workflow in when the save names no sub-directory.
+
+        Rung 4 of `_resolve_workflow_dir`. Resolves the situation through
+        `on_get_path_for_macro_request`, the same handler the real save goes through, so the
+        answer accounts for derivation rules and stored project variables rather than tracking
+        only what this manager's resolver knows. `sub_dirs` is left out so the folder is the one
+        a save with no hierarchy lands in; `file_name_base` and `file_extension` are required by
+        the macro but cannot change which folder it names, so they get placeholders and only the
+        parent is kept.
+
+        Falls back to the workspace root when the situation is absent, failed to parse, or cannot
+        resolve, since answering with the root is what dropping an optional `{workflow_dir}`
+        already did -- a never-saved workflow keeps a usable folder either way.
+        """
+        # Anchored so every answer here has one shape: the resolved path is fully absolute, and on
+        # Windows a bare `/workspace` carries no drive letter until it is anchored against the CWD.
+        workspace_root = str(resolve_path_safely(Path(self._resolve_builtin_workspace_dir())))
+
+        # Resolving the situation can reach `workflow_dir` again and land back here, so answer the
+        # root for the duration. The macro may name the builtin outright, or reach it through a
+        # directory: every v1 default directory is `{workflow_dir?:/}<name>`, and that form appends
+        # its own name once per pass, so an unguarded loop yields `outputs/outputs/outputs/...`.
+        if self._resolving_default_workflow_save_dir:
+            return workspace_root
+
+        parsed_macro = project_info.parsed_situation_schemas.get(BuiltInSituation.SAVE_WORKFLOW)
+        if parsed_macro is None:
+            return workspace_root
+
+        self._resolving_default_workflow_save_dir = True
+        try:
+            result = self.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=parsed_macro,
+                    variables={
+                        "file_name_base": _SAVE_DIR_PROBE_STEM,
+                        "file_extension": _SAVE_DIR_PROBE_EXTENSION,
+                    },
+                    project_id=project_info.project_id,
+                )
+            )
+        finally:
+            self._resolving_default_workflow_save_dir = False
+
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            logger.debug(
+                "Could not resolve the '%s' situation to find where an unsaved workflow would be "
+                "saved; using the workspace root (%s)",
+                BuiltInSituation.SAVE_WORKFLOW,
+                result.result_details,
+            )
+            return workspace_root
+
+        return str(result.absolute_path.parent)
 
     def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.
