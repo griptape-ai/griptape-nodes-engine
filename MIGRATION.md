@@ -25,7 +25,20 @@ Send a value back in the same form to set that exact type.
 [Parameter values](docs/guides/mcp/external_clients.md#parameter-values) lists the forms and which
 fields carry them.
 
-**Library authors.** To make a class you own save, decorate it with `register_value_codec` and
+**Library authors.** A field of your own request, result, or event payload that holds parameter
+values must be annotated `Value`. A field typed `Any` that holds a griptape object, or any value
+JSON can't represent, now fails to send:
+
+```python
+from griptape_nodes.serialization.values import Value
+
+
+@dataclass
+class ColorizeResultSuccess(ResultPayloadSuccess):
+    image: Value  # was: Any
+```
+
+To make a class you own save, decorate it with `register_value_codec` and
 give it `to_state()` and a `from_state()` classmethod. For a class you cannot edit, pass the
 conversion functions from your library's `before_library_nodes_loaded`:
 

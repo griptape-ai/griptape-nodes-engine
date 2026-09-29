@@ -45,6 +45,7 @@ the engine's request API from working without edits. Migration steps live in
   Annotate a field that carries parameter values `Value` to send them tagged with their type, as
   described in
   [`get_request_handlers`](docs/development/custom_nodes/advanced_libraries.md#get_request_handlers).
+  See [MIGRATION.md](MIGRATION.md#parameter-values-carry-their-type).
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
   first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
   Griptape Cloud.
