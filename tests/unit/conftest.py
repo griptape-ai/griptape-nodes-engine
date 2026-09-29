@@ -100,23 +100,34 @@ def isolate_user_config() -> Generator[Path, None, None]:
             reset_root_engine()
 
 
+_EXTERNAL_ENVIRONMENT_VARS = (
+    LIBRARY_PATHS_ENV_VAR,
+    LIBRARY_WORKER_REQUESTS_ENV_VAR,
+    "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE",
+    "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+    "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX",
+)
+
+
 @pytest.fixture(autouse=True)
-def isolate_external_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_external_environment() -> Generator[None, None, None]:
     """Clear the variables an externally managed environment sets for the engine.
 
     Library discovery reads GTN_LIBRARY_PATHS and every worker spawn reads the rest, so a suite run
     from inside such an environment (a studio launcher, a package manager's shell) would otherwise
     load that environment's libraries or prefix workers with its command. Tests that exercise these
     hooks set the variables themselves.
+
+    This saves and restores the variables itself instead of using `monkeypatch`: an autouse fixture
+    that requests `monkeypatch` creates it before the test's own fixtures, so it is torn down after
+    them. A test that combines `monkeypatch.chdir` with a temporary-directory fixture would then
+    still be inside that directory when it is removed, which Windows refuses.
     """
-    for name in (
-        LIBRARY_PATHS_ENV_VAR,
-        LIBRARY_WORKER_REQUESTS_ENV_VAR,
-        "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE",
-        "GTN_CONFIG_WORKER__COMMAND_PREFIX",
-        "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    saved = {name: os.environ.pop(name) for name in _EXTERNAL_ENVIRONMENT_VARS if name in os.environ}
+    yield
+    for name in _EXTERNAL_ENVIRONMENT_VARS:
+        os.environ.pop(name, None)
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)
