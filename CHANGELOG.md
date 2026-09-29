@@ -10,6 +10,25 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- With Griptape Cloud spending budgets, a node whose call a budget refuses fails with a message
+  naming the node and every budget that refused, and the editor's "Run blocked" bar shows it, for
+  example: "Budget stopped this run. 'Generate Poster' was blocked by the budget "Marketing Q3".
+  Contact your Griptape administrator." A node with its Failure output wired takes that branch, as
+  it does for any other error, and a loop stops at the first refused iteration. Sidebar chat
+  replies and the images they generate count against the open project's budgets, and a refusal
+  there ends the reply instead. See
+  [When a budget stops a run](https://docs.griptapenodes.com/en/stable/guides/editor/running_workflows/#when-a-budget-stops-a-run).
+  [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
+
+### Fixed
+
+- When a node fails partway through a run, the nodes that finished before it keep their results
+  on the canvas instead of being cleared.
+
+## [0.103.0] - 2026-09-29
+
 ### Changed
 
 - **Breaking:** The setting `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
@@ -28,24 +47,39 @@ the engine's request API from working without edits. Migration steps live in
 - A library whose isolated process shuts down before loading it now reports that as soon as the
   process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
   load that never finished.
+- Installing a library's dependencies no longer gives the engine an older copy of a package the
+  engine itself imports. A library's environment comes ahead of the engine's own on the import path,
+  so a library that resolved, for instance, an older `griptape` handed that copy to the engine too.
+  Library installs now carry the engine's own versions as minimum versions, so such a package
+  resolves no older than the engine's. A library that genuinely needs an older one is still
+  installed and still works; it is now listed in that library's problems, naming what it supplies
+  and what the engine expected, where before nothing connected the two.
+  [#5681](https://github.com/griptape-ai/griptape-nodes-engine/issues/5681)
+  [#5682](https://github.com/griptape-ai/griptape-nodes-engine/issues/5682)
+- Creating or switching to a project whose workspace differs now closes the open workflow, returning
+  you to the workflow picker. Before, the engine kept a workflow it no longer had a record of, so the
+  next workflow you opened sat on "Checking workflow" and the log filled with "is not registered on
+  this engine" warnings until you restarted the engine.
+  [#5692](https://github.com/griptape-ai/griptape-nodes-engine/issues/5692)
+- Saving a file from a workflow you have not saved yet no longer logs a stream of "Optional builtin
+  'workflow_dir' could not be resolved" warnings. `workflow_dir` now answers with the folder your
+  first save would default to, read from the project's `save_workflow` situation, so a project that
+  points workflow saves outside the workspace root writes those files there rather than at the root.
+  [#5669](https://github.com/griptape-ai/griptape-nodes-engine/issues/5669)
 - Creating a versioned output folder or file sequence in a project no longer fails with "requires
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
   `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
   callers only supply their own variables.
-- When a node fails partway through a run, the nodes that finished before it keep their results
-  on the canvas instead of being cleared.
+- A parameter that a node both shows and passes on, such as the text on a text node, keeps an edit
+  made after the node has run. Before, reopening the workflow or refreshing the page showed the
+  value from the last run instead of the edit.
+- Renaming a parameter that holds an output value now reports that the old name no longer has one,
+  alongside the new name's value. Before, only the new name was reported, so anything tracking
+  output values by parameter name kept the old name's value.
 
 ### Added
 
-- With Griptape Cloud spending budgets, a node whose call a budget refuses fails with a message
-  naming the node and every budget that refused, and the editor's "Run blocked" bar shows it, for
-  example: "Budget stopped this run. 'Generate Poster' was blocked by the budget "Marketing Q3".
-  Contact your Griptape administrator." A node with its Failure output wired takes that branch, as
-  it does for any other error, and a loop stops at the first refused iteration. Sidebar chat
-  replies and the images they generate count against the open project's budgets, and a refusal
-  there ends the reply instead. See
-  [When a budget stops a run](https://docs.griptapenodes.com/en/stable/guides/editor/running_workflows/#when-a-budget-stops-a-run).
-  [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
+- `claude-sonnet-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar.
 - Projects have two new situations for versioned output folders. `save_output_directory` creates
   `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
   run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
@@ -113,6 +147,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Connecting a video, image, or audio file uploaded through the editor to a node that requires that
+  media type no longer fails with a message saying the parameter must be an artifact.
+- Image, video, audio, and 3D parameters no longer fail when given an inline `data:` URI longer than
+  the operating system's file name limit, which any real image exceeds. The URI is kept as the
+  parameter's value.
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
@@ -148,5 +187,6 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.0...HEAD
+[0.103.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...v0.103.0
 [0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0
