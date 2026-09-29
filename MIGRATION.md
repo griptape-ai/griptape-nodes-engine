@@ -11,6 +11,48 @@ wait for worker libraries, a node waiting for its library's worker, and a projec
 each worker to adopt it. It no longer delays heartbeat enforcement, which is what the old name
 suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
 
+## Parameter values carry their type
+
+**Request API and editor clients.** A parameter value of a type JSON lacks arrives as a dict whose
+`$type` names its Python type. A tuple that arrived as `[1, 2]` now arrives as:
+
+```json
+{"$type": "builtins:tuple", "$value": [1, 2]}
+```
+
+Send a value back in the same form to set that exact type.
+
+[Parameter values](docs/guides/mcp/external_clients.md#parameter-values) lists the forms and which
+fields carry them.
+
+**Library authors.** A class you own saves by implementing `SavesState`. For a class you cannot
+edit, register a codec from your library's code:
+
+```python
+import numpy as np
+
+from griptape_nodes.exe_types.core_types import SavesState, register_value_codec
+
+
+class Palette(SavesState):
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+
+
+register_value_codec(
+    np.ndarray,
+    to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+    from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+)
+```
+
 ## `serializable=False` outputs are held in their own process across a worker boundary
 
 `Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it

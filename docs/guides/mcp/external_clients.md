@@ -121,10 +121,14 @@ Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP
 
 ## Parameter values
 
-Parameter and flow variable values use JSON everywhere they appear: in request results, in
-events, and in the requests that set them. Values of types JSON lacks, such as tuples, enums, and
-artifacts, carry their Python type under `$type`. Artifacts and other objects keep their fields
-beside `$type`:
+Every request, result, and event field that holds a parameter or flow variable value uses the form
+below, both in what the engine sends and in what it reads back. In element trees, such as
+`element_details` in `GetNodeElementDetailsResultSuccess` and `AlterElementEvent`, or
+`root_node_element` in `GetAllNodeInfoResultSuccess`, that means each element's `value` and
+`default_value`. Every other key in an element tree, such as `ui_options`, is plain JSON.
+
+Values of types JSON lacks, such as tuples, enums, and artifacts, carry their Python type under
+`$type`. Artifacts and other objects keep their fields beside `$type`:
 
 ```json
 {"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}

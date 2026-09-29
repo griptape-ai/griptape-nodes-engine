@@ -29,8 +29,9 @@ the engine's request API from working without edits. Migration steps live in
   their type when JSON has no such type, so a tuple arrives as
   `{"$type": "builtins:tuple", "$value": [1, 2]}` instead of a list. A value sent back in the same
   form is set with that exact type.
-  [Parameter values](docs/guides/mcp/external_clients.md#parameter-values) shows the form enums
-  and artifacts take, and lists the events and requests that carry them.
+  [Parameter values](docs/guides/mcp/external_clients.md#parameter-values) shows the form values
+  take and which fields carry them. See
+  [MIGRATION.md](MIGRATION.md#parameter-values-carry-their-type).
 - **Breaking:** `ControlFlowResolvedEvent` sends a parameter value with no plain-data form as `null`
   instead of as its text, and no longer has `unique_parameter_uuid_to_values`.
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
