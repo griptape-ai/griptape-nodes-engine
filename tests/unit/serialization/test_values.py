@@ -31,7 +31,7 @@ from griptape_nodes.serialization.values import (
     ValueEncodeError,
     decode_value,
     encode_value,
-    register_value_adapter,
+    register_value_codec,
 )
 
 if TYPE_CHECKING:
@@ -247,44 +247,54 @@ class TestAdapters:
         assert type(_round_trip(Label("x"))) is str
 
 
-class TestRegisteredAdapters:
+class TestRegisteredCodecs:
     @pytest.fixture(autouse=True)
-    def _restore_adapters(self) -> Generator[None, None, None]:
-        saved = list(values_module._adapters)
+    def _restore_codecs(self) -> Generator[None, None, None]:
+        saved = dict(values_module._codecs)
         yield
-        values_module._adapters[:] = saved
-        values_module._adapter_cache.clear()
+        values_module._codecs.clear()
+        values_module._codecs.update(saved)
 
-    def test_registered_adapter_covers_a_type_with_no_form(self) -> None:
-        class OpaqueAdapter:
-            def claims(self, cls: type) -> bool:
-                return cls is Opaque
-
-            def to_state(self, value: Opaque) -> None:  # noqa: ARG002
-                return None
-
-            def from_state(self, cls: type, state: None) -> Opaque:  # noqa: ARG002
-                return cls()
-
-        register_value_adapter(OpaqueAdapter())
+    def test_registered_codec_covers_a_type_with_no_form(self) -> None:
+        register_value_codec(Opaque, to_state=lambda _: None, from_state=lambda _: Opaque())
 
         assert type(_round_trip(Opaque())) is Opaque
 
-    def test_registered_adapter_wins_over_built_in_ones(self) -> None:
-        class UppercaseColorAdapter:
-            def claims(self, cls: type) -> bool:
-                return cls is Color
-
-            def to_state(self, value: Color) -> str:
-                return value.value.upper()
-
-            def from_state(self, cls: type, state: str) -> Color:
-                return cls(state.lower())
-
-        register_value_adapter(UppercaseColorAdapter())
+    def test_registered_codec_wins_over_built_in_adapters(self) -> None:
+        register_value_codec(
+            Color, to_state=lambda color: color.value.upper(), from_state=lambda state: Color(state.lower())
+        )
 
         assert encode_value(Color.RED) == {TYPE_KEY: f"{__name__}:Color", VALUE_KEY: "RED"}
         assert _round_trip(Color.RED) is Color.RED
+
+    def test_codec_covers_only_the_exact_class(self) -> None:
+        class OpaqueChild(Opaque):
+            pass
+
+        register_value_codec(Opaque, to_state=lambda _: None, from_state=lambda _: Opaque())
+
+        with pytest.raises(ValueEncodeError):
+            encode_value(OpaqueChild())
+
+    @pytest.mark.parametrize("cls", [str, dict, list, tuple, Path])
+    def test_type_the_codec_encodes_itself_cannot_be_registered(self, cls: type) -> None:
+        with pytest.raises(ValueError, match="always saved as themselves"):
+            register_value_codec(cls, to_state=str, from_state=str)
+
+    def test_second_module_registering_the_same_class_fails(self) -> None:
+        register_value_codec(Opaque, to_state=lambda _: None, from_state=lambda _: Opaque())
+        other_module_to_state = types.FunctionType((lambda _: None).__code__, {"__name__": "other_library.codecs"})
+
+        with pytest.raises(ValueError, match="already registered"):
+            register_value_codec(Opaque, to_state=other_module_to_state, from_state=lambda _: Opaque())
+
+    def test_same_module_registering_again_replaces_the_codec(self) -> None:
+        """As when a library file reloads."""
+        register_value_codec(Opaque, to_state=lambda _: "old", from_state=lambda _: Opaque())
+        register_value_codec(Opaque, to_state=lambda _: "new", from_state=lambda _: Opaque())
+
+        assert encode_value(Opaque()) == {TYPE_KEY: f"{__name__}:Opaque", VALUE_KEY: "new"}
 
 
 class TestEncodeFailures:
@@ -379,6 +389,23 @@ class TestUndecodedValues:
         data = [{TYPE_KEY: "other_process_library:Artifact", "pair": {TYPE_KEY: "builtins:tuple", VALUE_KEY: [1]}}]
 
         assert encode_value(decode_value(data)) == data
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {TYPE_KEY: "builtins:set", VALUE_KEY: [{TYPE_KEY: "other_process_library:Color", VALUE_KEY: 1}]},
+            {TYPE_KEY: "builtins:dict", VALUE_KEY: [[{TYPE_KEY: "other_process_library:Color", VALUE_KEY: 1}, "red"]]},
+        ],
+    )
+    def test_kept_value_where_a_key_goes_passes_through_quietly(
+        self, data: dict, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            decoded = decode_value(data)
+
+        assert type(decoded) is UndecodedValue
+        assert encode_value(decoded) == data
+        assert caplog.records == []
 
     def test_live_objects_pass_through(self) -> None:
         live = Opaque()
