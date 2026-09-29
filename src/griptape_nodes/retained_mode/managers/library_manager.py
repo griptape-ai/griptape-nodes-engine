@@ -1815,6 +1815,7 @@ class LibraryManager(EngineScoped):
 
         # Discover library files for metadata loading
         library_files = await self._discover_library_files()
+        environment_mode = self._uses_environment_dependencies()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
@@ -1827,6 +1828,11 @@ class LibraryManager(EngineScoped):
                 # can map this metadata back to the matching `libraries_to_register` row
                 # without re-implementing the engine's path resolution logic.
                 metadata_result.registered_path = discovered.registered_path
+                # is_registered is answered by library name, so a configured copy the environment
+                # refused would read as loaded whenever the environment provides a library of the
+                # same name. Only the environment's own entry can be the one that loaded.
+                if environment_mode and not discovered.from_environment:
+                    metadata_result.is_registered = False
                 successful_libraries.append(metadata_result)
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))

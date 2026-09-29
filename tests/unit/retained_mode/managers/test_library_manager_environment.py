@@ -432,6 +432,30 @@ class TestWhatTheEditorReads:
         assert json.loads(json.dumps(result.value)) == expected
 
 
+class TestSameNameInBothPlaces:
+    @pytest.mark.asyncio
+    async def test_a_refused_copy_with_the_environment_library_s_name_reads_as_not_loaded(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        """is_registered is answered by name, which both copies share; only the environment's copy loaded."""
+        configured = _write_library(tmp_path / "config" / "foo_lib", "Foo Library")
+        from_environment = _write_library(tmp_path / "env" / "foo_lib", "Foo Library")
+        configure(environment_paths=[from_environment], registered=[configured], environment_mode=True)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+
+        result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+
+        assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+        by_path = {entry.registered_path: entry for entry in result.successful_libraries}
+        assert by_path[str(from_environment)].is_registered is True
+        assert by_path[str(configured)].is_registered is False
+        # The name lookups everything else uses resolve to the environment's copy.
+        info = library_manager.get_library_info_by_library_name("Foo Library")
+        assert info is not None
+        assert info.library_path == str(from_environment)
+
+
 class TestNothingOutsideTheEnvironmentMixesIn:
     """Environment mode never adds a node type, a sandbox manifest, or an update the environment did not provide."""
 
