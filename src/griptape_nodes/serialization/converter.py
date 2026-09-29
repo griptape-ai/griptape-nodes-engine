@@ -293,7 +293,13 @@ def _make_dataclass_structure_fn(cls: type, conv: Converter) -> Any:
             if not f.init:
                 overrides[f.name] = override(omit=True)
         return make_dict_structure_fn(cls, conv, **overrides)
-    except NameError:
+    except NameError as error:
+        # Without field types, nested payloads and Value fields read back as plain dicts.
+        logger.warning(
+            "Reading '%s' from JSON leaves its fields as plain data, because a field's type cannot be resolved: %s",
+            cls.__qualname__,
+            error,
+        )
         return _make_fallback_structure_fn(cls)
 
 
