@@ -253,9 +253,10 @@ from griptape_nodes.serialization.legacy_pickle import (
 from griptape_nodes.serialization.values import (
     JsonValue,
     UndecodedValue,
+    Unencodable,
     ValueEncodeError,
     decode_value,
-    encode_value,
+    try_encode,
     value_key,
 )
 from griptape_nodes.traits.trait_resolver import resolve_trait
@@ -3783,10 +3784,9 @@ class NodeManager(EngineScoped):
         """Name each value that has no plain-data form, with the reason."""
         names = []
         for name, value in values.items():
-            try:
-                encode_value(value)
-            except ValueEncodeError as error:
-                names.append(f"'{name}' ({error})")
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                names.append(f"'{name}' ({encoded.reason})")
         return names
 
     @handles(ValidateNodeDependenciesRequest)
@@ -4888,10 +4888,9 @@ class NodeManager(EngineScoped):
                 if not parameter.serializable:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
-                try:
-                    encoded = encode_value(value)
-                except ValueEncodeError as error:
-                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, error)
+                encoded = try_encode(value)
+                if isinstance(encoded, Unencodable):
+                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
@@ -5063,15 +5062,14 @@ class NodeManager(EngineScoped):
                 value = node.parameter_output_values[parameter.name]
             else:
                 value = node._get_raw_parameter_value(parameter.name)
-            try:
-                encode_value(value)
-            except ValueEncodeError as error:
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
                 logger.warning(
                     "Node '%s' finished its flow with a '%s' value that cannot be sent on. Whoever ran "
                     "the flow receives no value for it. %s",
                     node.name,
                     parameter.name,
-                    error,
+                    encoded.reason,
                 )
                 value = None
             values[parameter.name] = value

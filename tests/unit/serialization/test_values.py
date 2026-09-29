@@ -28,10 +28,13 @@ from griptape_nodes.serialization.values import (
     TYPE_KEY,
     VALUE_KEY,
     UndecodedValue,
+    Unencodable,
     ValueEncodeError,
     decode_value,
+    encode_for_display,
     encode_value,
     register_value_codec,
+    try_encode,
 )
 
 if TYPE_CHECKING:
@@ -525,3 +528,27 @@ class TestLibraryModules:
 
         with pytest.raises(ValueEncodeError, match="no stable module name"):
             encode_value(library_class(1))
+
+
+class TestTryEncode:
+    def test_returns_what_encode_value_returns(self) -> None:
+        value = {"path": Path("/tmp/a"), "items": (1, 2)}  # noqa: S108
+
+        assert try_encode(value) == encode_value(value)
+
+    def test_returns_none_as_a_valid_encoding(self) -> None:
+        assert try_encode(None) is None
+
+    def test_returns_unencodable_with_the_reason(self) -> None:
+        with pytest.raises(ValueEncodeError) as raised:
+            encode_value(object())
+
+        result = try_encode(object())
+
+        assert result == Unencodable(reason=str(raised.value))
+
+    def test_finds_an_unencodable_value_inside_a_container(self) -> None:
+        assert isinstance(try_encode({"a": [object()]}), Unencodable)
+
+    def test_display_encoding_falls_back_to_text(self) -> None:
+        assert isinstance(encode_for_display(object()), str)

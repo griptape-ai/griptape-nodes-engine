@@ -18,6 +18,16 @@ runs that codec's code on the data, so a class from any loaded module can be bui
 process cannot build or is not allowed to import, such as one whose class lives in a library
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
 came from, so it passes through to a process that can build it.
+
+A value with no plain-data form is handled by where it is going, always through ``try_encode`` so
+each value is encoded once:
+
+- Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
+  leave it out, log a warning naming the node and parameter, and report it in the operation's
+  ``result_details`` (see ``dropped_values``). Never save its text in its place.
+- Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
+  the parameter.
+- Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
 """
 
 from __future__ import annotations
@@ -72,6 +82,13 @@ class ValueEncodeError(TypeError):
     """A value has no plain-data form."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Unencodable:
+    """Why a value has no plain-data form."""
+
+    reason: str
+
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -96,12 +113,20 @@ def encode_value(value: Any) -> JsonValue:
     return _encode(value, set())
 
 
-def encode_for_display(value: Any) -> JsonValue:
-    """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
+def try_encode(value: Any) -> JsonValue | Unencodable:
+    """Encode once. Callers choose what an Unencodable means for them and never re-encode."""
     try:
         return encode_value(value)
-    except ValueEncodeError:
+    except ValueEncodeError as error:
+        return Unencodable(str(error))
+
+
+def encode_for_display(value: Any) -> JsonValue:
+    """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
+    encoded = try_encode(value)
+    if isinstance(encoded, Unencodable):
         return str(value)
+    return encoded
 
 
 def decode_value(data: Any) -> Any:
