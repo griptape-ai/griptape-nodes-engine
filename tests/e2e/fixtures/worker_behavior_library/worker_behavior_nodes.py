@@ -204,9 +204,11 @@ class ChainEndNode(DataNode):
 class ReportsWithSetterNode(DataNode):
     """Reports its results through `set_parameter_value` rather than `parameter_output_values`.
 
-    Both spellings are common in libraries. `status` allows OUTPUT and nothing else, so the setter has
-    no authored value to store and the result belongs with the produced ones that travel back from a
-    worker. `note` also allows PROPERTY, so the same call stores an authored value the worker discards.
+    Both spellings are common in libraries. The three parameters cover the mode combinations a library
+    actually declares: OUTPUT alone, OUTPUT alongside PROPERTY so the value stays on display, and the
+    default, which is every mode and is what most parameters in a library are. All three publish, so a
+    value set on any of them while the node runs is a result and has to travel back from a worker.
+    `scratch` has no OUTPUT, so it has no port to publish on and stays behind.
     """
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
@@ -222,17 +224,31 @@ class ReportsWithSetterNode(DataNode):
         )
         self.add_parameter(
             Parameter(
-                name="note",
+                name="on_display",
                 type="str",
                 default_value="",
                 tooltip="",
                 allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
             )
         )
+        self.add_parameter(Parameter(name="defaulted", type="str", default_value="", tooltip=""))
+        self.add_parameter(
+            Parameter(
+                name="scratch",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
 
     def process(self) -> None:
         self.set_parameter_value("status", "reported")
-        self.set_parameter_value("note", "authored")
+        self.set_parameter_value("on_display", "shown")
+        self.set_parameter_value("defaulted", "defaulted-result")
+        self.set_parameter_value("scratch", "local only")
+        # Read back through the same API the value was set with.
+        self.set_parameter_value("status", self.get_parameter_value("status") + "-readback")
 
 
 class GrowsAnOutputListNode(DataNode):

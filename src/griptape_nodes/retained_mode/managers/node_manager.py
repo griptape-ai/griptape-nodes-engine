@@ -2954,12 +2954,15 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node._get_raw_parameter_value(request.parameter_name)
+        # Read back through the store the set actually wrote to. A node running its own body sets a
+        # result, which lands in parameter_output_values, and comparing the authored value against
+        # itself would report no change and skip the downstream invalidation below.
+        old_value = node._get_stored_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
         )
         # Get the "converted" value here.
-        finalized_value = node._get_raw_parameter_value(request.parameter_name)
+        finalized_value = node._get_stored_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
@@ -3693,7 +3696,7 @@ class NodeManager(EngineScoped):
                 )
 
             try:
-                with aprocess_scope(request.variables):
+                with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
                 # Pass the live exception through ``exception=`` so the

@@ -133,6 +133,12 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
+# Which node's body is running, for the same window as the flag above. That flag answers "is any
+# node running", which is what the detector and variable substitution want. Deciding where a set
+# stores its value needs the identity as well: a running node can set a value on a *different*
+# node, and on that node the value is an ordinary authored one, not something it produced.
+_running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
+
 
 class _PreservedTemplate(NamedTuple):
     """A stored {VAR} template that must survive a resolved output value.
@@ -185,7 +191,9 @@ def sanctioned_parameter_mutation() -> Iterator[None]:
 
 
 @contextmanager
-def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) -> Iterator[None]:
+def aprocess_scope(
+    precomputed_variables: dict[str, str | int] | None = None, node: BaseNode | None = None
+) -> Iterator[None]:
     """Mark the enclosed block as the actual aprocess() execution.
 
     The framework wraps ``await node.aprocess()`` with this so the
@@ -199,8 +207,11 @@ def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) ->
             {VAR} tokens without a NodeManager lookup. This is required for
             worker-executed nodes (which have no registry access) and is a
             performance shortcut for in-process nodes.
+        node: The node whose body is about to run. A value it sets on itself is
+            what this run produced; one it sets on another node is not.
     """
     token = _in_aprocess.set(True)
+    node_token = _running_node.set(node)
     # Pre-seed with orchestrator-resolved variables when provided; otherwise
     # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
     cache_token = VariableResolver.seed_cache(precomputed_variables)
@@ -208,6 +219,7 @@ def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) ->
         yield
     finally:
         _in_aprocess.reset(token)
+        _running_node.reset(node_token)
         VariableResolver.reset_cache(cache_token)
 
 
@@ -1079,10 +1091,10 @@ class BaseNode(ABC):
     ) -> None:
         """Attempt to set a Parameter's value.
 
-        A Parameter allowing OUTPUT and nothing else, set while this node's own body is running, stores
-        a produced value, the same as writing `parameter_output_values` directly, because a run is the
-        only thing that could have given such a Parameter a value. Every other set stores an authored
-        value, including one made at edit time or while loading a workflow.
+        A Parameter with an OUTPUT, set while this node's own body is running, stores a produced value,
+        the same as writing `parameter_output_values` directly, because a running node is computing
+        rather than being authored. Every other set stores an authored value, including one made at edit
+        time or while loading a workflow, and one made on a Parameter that has no OUTPUT to publish on.
 
         The Node may choose to store a different value (or type) than what was passed in.
         Conversion callbacks on the Parameter may raise Exceptions, which will cancel
@@ -1168,16 +1180,24 @@ class BaseNode(ABC):
     def _value_store_for(self, parameter: Parameter) -> dict[str, Any]:
         """Which of the node's two value stores a set on this Parameter writes to.
 
-        An OUTPUT-only Parameter set while the node's own body is running is storing what this run
-        produced, so it goes to `parameter_output_values`. That is also the only one of the two stores
-        that survives egress from a worker, which ships produced values back and leaves the node's
-        `parameter_values` behind.
+        What decides this is when the set happens, not which modes the Parameter allows. While this
+        node's own body is running it is computing, not being authored, so a value it sets on a
+        Parameter that has an OUTPUT to publish is what this run produced and belongs in
+        `parameter_output_values`. That is also the only one of the two stores that survives egress
+        from a worker, which ships produced values back and leaves the node's `parameter_values`
+        behind, so a result stored anywhere else is lost when the node's library runs isolated.
+
+        It has to be this node running, not any node: a running node can set a value on another node,
+        which is how a value reaches a connected input and how a node driving a subflow feeds it. On
+        the receiving node that value is an ordinary authored one.
+
+        Requiring OUTPUT keeps values with nowhere to go out of the produced store: a Parameter with
+        no OUTPUT has no port to publish on and nothing downstream reads it. Such a value set during a
+        run is scratch, and it stays authored.
 
         Outside that window every Parameter writes `parameter_values`, and the distinction matters:
         `parameter_output_values` is transient, cleared before each run and by `clear_node`. A value
-        set at edit time, in a constructor or from `after_value_set` has to outlive both, and the
-        engine's own writes are compared against `parameter_values` to decide whether a change needs
-        to invalidate anything downstream.
+        set at edit time, in a constructor or from `after_value_set` has to outlive both.
 
         A container's child is the exception, and writes `parameter_values` wherever it is set.
         Setting one rebuilds the whole container through `handle_container_parameter`, which reads its
@@ -1185,21 +1205,13 @@ class BaseNode(ABC):
         container itself is not a child, so it still records what the run produced, and that is the
         value downstream reads and the one that travels back from a worker.
         """
-        if _in_aprocess.get() and parameter.parent_container_name is None and self._is_output_only(parameter):
+        if (
+            _running_node.get() is self
+            and parameter.parent_container_name is None
+            and ParameterMode.OUTPUT in parameter.allowed_modes
+        ):
             return self.parameter_output_values
         return self.parameter_values
-
-    def _is_output_only(self, parameter: Parameter) -> bool:
-        """Whether this Parameter's value could only ever be one the node produced.
-
-        A Parameter allowing OUTPUT and nothing else has no authored value to hold: the editor cannot
-        type into it and no incoming connection delivers into it. Adding INPUT or PROPERTY makes the
-        distinction real again.
-        """
-        modes = parameter.allowed_modes
-        return (
-            ParameterMode.OUTPUT in modes and ParameterMode.INPUT not in modes and ParameterMode.PROPERTY not in modes
-        )
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
@@ -1236,21 +1248,22 @@ class BaseNode(ABC):
         return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
 
     def _get_stored_parameter_value(self, param_name: str) -> Any:
-        """The value an OUTPUT-only Parameter produced, else the one stored against its name.
+        """What the Parameter holds: the value this node produced, else the one authored against its name.
 
-        Unlike the write in `_value_store_for`, this is not limited to the window where the node's body
-        runs: a produced value is still what the Parameter holds once the run is over, and preferring it
-        is the precedence `GetParameterValueRequest` and `LocalWorkflowExecutor` already apply. Falling
-        through covers an OUTPUT-only Parameter whose value was set at edit time or replayed from a save,
-        which lands in `parameter_values`, and survives the pre-run clear there.
+        This is the precedence `GetParameterValueRequest` and `LocalWorkflowExecutor` already apply, and
+        applying it here is what makes a node's own read agree with what the editor and the engine see.
+        It is deliberately not limited to the window where the body runs, nor to Parameters that have an
+        OUTPUT: a produced value is still what the Parameter holds once the run is over, and
+        `publish_update_to_parameter` records one for any Parameter at all. Falling through covers a
+        value set at edit time or replayed from a save, which lands in `parameter_values` and survives
+        the pre-run clear there.
 
         Only the node author's read comes through here. `_get_raw_parameter_value` deliberately does not
         consult `parameter_output_values`: a `serializable=False` producer puts the live object there and
         the key standing in for it in `parameter_values`, and the engine's own readers save values,
         dispatch them to workers and send them to the editor, so they need the key.
         """
-        parameter = self.get_parameter_by_name(param_name)
-        if parameter is not None and self._is_output_only(parameter) and param_name in self.parameter_output_values:
+        if param_name in self.parameter_output_values:
             return self.parameter_output_values[param_name]
         return self._get_raw_parameter_value(param_name)
 

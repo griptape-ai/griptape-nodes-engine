@@ -213,17 +213,19 @@ The supported patterns for moving values:
     `self.parameter_output_values["my_param"] = value` inside
     `process`. Called from inside `process`,
     `self.set_parameter_value("my_param", value)` reaches the same
-    place when the parameter allows OUTPUT and nothing else, so an
-    output-only parameter is safe to set either way.
+    place for any parameter that allows OUTPUT, so either spelling is
+    safe. A parameter that does not allow OUTPUT has no port to
+    publish on, and a value set on it during a run is scratch that
+    stays in the worker.
 - **Cross-call state that must persist** belongs in the
     orchestrator. Issue a `SetParameterValueRequest` from inside
     `process` to update an authoritative value; on the next execute
     the new value will hydrate into `self.parameter_values`. Do not
     rely on `self.parameter_values[k] = v` mid-execute as a way to
     carry state forward — that mutation does not propagate. The same
-    goes for `self.set_parameter_value` on a parameter that allows
-    INPUT or PROPERTY: it writes the worker's own copy, which is
-    discarded when `process` returns.
+    goes for `self.set_parameter_value` on a parameter with no
+    OUTPUT: it writes the worker's own copy, which is discarded when
+    `process` returns.
 
 What does **not** work: setting `self.foo = ...` and expecting it to
 survive. The next execute gets a fresh node instance.
