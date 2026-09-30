@@ -177,7 +177,7 @@ def value_key(encoded: JsonValue) -> str:
 
 def has_plain_data_form(cls: type) -> bool:
     """Whether instances of ``cls`` encode to plain data that decodes back to ``cls``."""
-    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or cls in _codecs or _adapter_for(cls) is not None
+    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or _codec_for(cls) is not None
 
 
 class SavesState(Protocol):
