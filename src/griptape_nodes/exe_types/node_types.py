@@ -133,6 +133,12 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
+# Which node's body is running, for the same window as the flag above. That flag answers "is any
+# node running", which is what the detector and variable substitution want. Deciding whether a set
+# records a result needs the identity as well: a running node can set a value on a *different*
+# node, and on that node the value is an ordinary authored one, not something it produced.
+_running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
+
 
 class _PreservedTemplate(NamedTuple):
     """A stored {VAR} template that must survive a resolved output value.
@@ -185,7 +191,9 @@ def sanctioned_parameter_mutation() -> Iterator[None]:
 
 
 @contextmanager
-def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) -> Iterator[None]:
+def aprocess_scope(
+    precomputed_variables: dict[str, str | int] | None = None, node: BaseNode | None = None
+) -> Iterator[None]:
     """Mark the enclosed block as the actual aprocess() execution.
 
     The framework wraps ``await node.aprocess()`` with this so the
@@ -199,8 +207,11 @@ def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) ->
             {VAR} tokens without a NodeManager lookup. This is required for
             worker-executed nodes (which have no registry access) and is a
             performance shortcut for in-process nodes.
+        node: The node whose body is about to run. A value it sets on itself is
+            what this run produced; one it sets on another node is not.
     """
     token = _in_aprocess.set(True)
+    node_token = _running_node.set(node)
     # Pre-seed with orchestrator-resolved variables when provided; otherwise
     # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
     cache_token = VariableResolver.seed_cache(precomputed_variables)
@@ -208,6 +219,7 @@ def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) ->
         yield
     finally:
         _in_aprocess.reset(token)
+        _running_node.reset(node_token)
         VariableResolver.reset_cache(cache_token)
 
 
@@ -1079,6 +1091,10 @@ class BaseNode(ABC):
     ) -> None:
         """Attempt to set a Parameter's value.
 
+        The value goes to `parameter_values`. A Parameter with an OUTPUT, set while this node's own body
+        is running, additionally records it in `parameter_output_values`, since a running node is
+        computing and what it computes is what travels back when its library runs in its own process.
+
         The Node may choose to store a different value (or type) than what was passed in.
         Conversion callbacks on the Parameter may raise Exceptions, which will cancel
         the value assignment. Similarly, validator callbacks may reject the value and
@@ -1131,6 +1147,7 @@ class BaseNode(ABC):
                 final_value = self.before_value_set(parameter=parameter, value=candidate_value)
             # ACTUALLY SET THE NEW VALUE
             self.parameter_values[param_name] = final_value
+            self._also_record_as_result(parameter, final_value)
 
             # If a parameter value has been set at the top level of a container, wipe all children.
             # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
@@ -1139,6 +1156,7 @@ class BaseNode(ABC):
                 self._emit_parameter_lifecycle_event(parameter)
         else:
             self.parameter_values[param_name] = candidate_value
+            self._also_record_as_result(parameter, candidate_value)
         # handle with container parameters
         if parameter.parent_container_name is not None:
             # Does it have a parent container
@@ -1155,6 +1173,37 @@ class BaseNode(ABC):
                         initial_setup=initial_setup,
                         emit_change=False,
                     )
+
+    def _also_record_as_result(self, parameter: Parameter, value: Any) -> None:
+        """Additionally record `value` in `parameter_output_values` if it is something this run produced.
+
+        `parameter_values` always keeps the value, so this only ever adds. What it adds is reach: of the
+        node's two stores, `parameter_output_values` is the one that survives egress from a worker, which
+        ships produced values back and leaves the node's `parameter_values` behind. A node that reports
+        its result with the setter is therefore empty when its library runs isolated, unless the result
+        is recorded here as well. Writing both is what a library node does by hand today; doing it in the
+        setter is the same thing for the nodes that do not.
+
+        Moving the value here instead of copying it would not do: `parameter_output_values` is transient,
+        cleared before each run and by `clear_node`, and a value set during a run often has to outlive it.
+        `SeedParameter` is the example -- it rolls a seed mid-run so you can turn randomizing off and keep
+        the seed that gave you a result you liked.
+
+        A run is the window because outside it the node is being authored rather than computing, and it
+        has to be *this* node running, not any node: a running node can set a value on another node, which
+        is how a value reaches a connected input and how a node driving a subflow feeds it. That value is
+        not the recipient's result, and filing it as one would lose it to the recipient's pre-run clear.
+
+        A Parameter with no OUTPUT has no port to publish on, and a container's child never travels on its
+        own account -- `handle_container_parameter` rebuilds the whole container from its children, and it
+        is the container that publishes.
+        """
+        if (
+            _running_node.get() is self
+            and parameter.parent_container_name is None
+            and ParameterMode.OUTPUT in parameter.allowed_modes
+        ):
+            self.parameter_output_values[parameter.name] = value
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
@@ -2280,7 +2329,11 @@ class TrackedParameterOutputValues(dict[str, Any]):
     def __delitem__(self, key: str) -> None:
         if key in self:
             super().__delitem__(key)
-            self._emit_parameter_change_event(key, None, deleted=True)
+            # Emit the set value, as clear() does. Consumers display whatever the event carries,
+            # so None would blank a parameter that still has a value. Raw, also as clear() does: the
+            # public reader resolves a held object, which raises for one held in another process.
+            value = self._node._get_raw_parameter_value(key)
+            self._emit_parameter_change_event(key, value, deleted=True)
 
     def clear(self) -> None:
         if self:  # Only emit events if there were values to clear

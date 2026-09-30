@@ -43,7 +43,7 @@ def build_project_yaml() -> YAML:
 
 
 class ProjectTemplate(BaseModel):
-    """Complete project template loaded from project.yml."""
+    """Complete project template loaded from a `griptape-nodes-project.yml` file."""
 
     LATEST_SCHEMA_VERSION: ClassVar[str] = "1.0.0"
 

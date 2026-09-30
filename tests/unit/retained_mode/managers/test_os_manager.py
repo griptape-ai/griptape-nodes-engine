@@ -2150,6 +2150,26 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 3  # noqa: PLR2004
 
+    def test_project_directory_left_for_the_project_to_resolve(self, engine: Engine, temp_dir: Path) -> None:
+        """Regression: `{outputs}` supplied by the project, not the caller, must not count as a second slot.
+
+        DirectoryDestination and build_versioned_sequence_destination pass project macros
+        without binding `{outputs}`. The scan used to see `outputs` and `_index` both
+        unresolved and fail with "requires at most one unresolved variable".
+        """
+        outputs_dir = temp_dir / "outputs"
+        (outputs_dir / "renders_v001").mkdir(parents=True)
+        (outputs_dir / "renders_v002").mkdir()
+
+        os_manager = engine.os_manager
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/renders_v{###}"), variables={})
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 3  # noqa: PLR2004
+
 
 class TestMakeDirectoryRequest:
     """Test MakeDirectoryRequest handler."""

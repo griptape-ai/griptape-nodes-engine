@@ -16,6 +16,84 @@ the engine's request API from working without edits. Migration steps live in
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
 
+### Fixed
+
+- A node that reports a result with `set_parameter_value` now shows that result when the node runs
+  in a library's isolated process, instead of leaving the output empty. A parameter that has an
+  output, set while the node is running, now also records the value as a result, and results are what
+  travel back from an isolated process. This covers a parameter that is also kept on display, and one
+  that declares no modes at all, which is most of the parameters a library writes. Nothing the
+  parameter held before is given up: the value is still the parameter's own, so a node that sets one
+  mid-run and reads it on the next run, as a randomized seed does, reads what it set. A parameter
+  with no output has nowhere to publish, so a value set on it during a run stays in the process that
+  set it.
+  [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+
+## [0.103.0] - 2026-09-29
+
+### Changed
+
+- **Breaking:** The setting `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
+  (env `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`). With its heartbeat role removed, what it bounds
+  is how long a worker may take to load its library, which the new name states. A config file still
+  setting the old name silently falls back to the 600 second default.
+
+### Fixed
+
+- The process a library runs isolated in shuts down within about 35 seconds of losing the engine
+  that started it. Before, if that engine exited in the process's first 10 minutes, the process
+  stayed up until those 10 minutes had passed. `worker.library_load_timeout_s` no longer delays
+  that check; it still bounds how long the engine waits for the process to load its library.
+  Setting `worker.heartbeat_timeout_s` below 30 seconds does not shorten this, on purpose: a busy
+  engine can be slow to challenge, and a library's process must not read that as an engine that died.
+- A library whose isolated process shuts down before loading it now reports that as soon as the
+  process goes, instead of waiting out `worker.library_load_timeout_s` and then blaming a library
+  load that never finished.
+- Installing a library's dependencies no longer gives the engine an older copy of a package the
+  engine itself imports. A library's environment comes ahead of the engine's own on the import path,
+  so a library that resolved, for instance, an older `griptape` handed that copy to the engine too.
+  Library installs now carry the engine's own versions as minimum versions, so such a package
+  resolves no older than the engine's. A library that genuinely needs an older one is still
+  installed and still works; it is now listed in that library's problems, naming what it supplies
+  and what the engine expected, where before nothing connected the two.
+  [#5681](https://github.com/griptape-ai/griptape-nodes-engine/issues/5681)
+  [#5682](https://github.com/griptape-ai/griptape-nodes-engine/issues/5682)
+- Creating or switching to a project whose workspace differs now closes the open workflow, returning
+  you to the workflow picker. Before, the engine kept a workflow it no longer had a record of, so the
+  next workflow you opened sat on "Checking workflow" and the log filled with "is not registered on
+  this engine" warnings until you restarted the engine.
+  [#5692](https://github.com/griptape-ai/griptape-nodes-engine/issues/5692)
+- Saving a file from a workflow you have not saved yet no longer logs a stream of "Optional builtin
+  'workflow_dir' could not be resolved" warnings. `workflow_dir` now answers with the folder your
+  first save would default to, read from the project's `save_workflow` situation, so a project that
+  points workflow saves outside the workspace root writes those files there rather than at the root.
+  [#5669](https://github.com/griptape-ai/griptape-nodes-engine/issues/5669)
+- Creating a versioned output folder or file sequence in a project no longer fails with "requires
+  at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
+  `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
+  callers only supply their own variables.
+- A parameter that a node both shows and passes on, such as the text on a text node, keeps an edit
+  made after the node has run. Before, reopening the workflow or refreshing the page showed the
+  value from the last run instead of the edit.
+- Renaming a parameter that holds an output value now reports that the old name no longer has one,
+  alongside the new name's value. Before, only the new name was reported, so anything tracking
+  output values by parameter name kept the old name's value.
+- Saving HEIC, AVIF, or ICO bytes no longer rewrites the destination's extension to match the
+  detected format, and no longer fails when `coerce_extension_to_match_bytes` is off. The engine
+  does not recognize these formats, so the file is written at the extension you asked for and a
+  warning is logged.
+  [#5614](https://github.com/griptape-ai/griptape-nodes-engine/issues/5614)
+
+### Added
+
+- `claude-sonnet-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar.
+- Projects have two new situations for versioned output folders. `save_output_directory` creates
+  `{outputs}/renders_v001`, then `renders_v002` on the next run. `save_file_sequence` writes each
+  run's frames into a new version folder, such as `frames_v001/frames.0001.png`. Node libraries
+  use them through `ProjectDirectoryParameter` and `ProjectFileSequenceParameter`. Projects on
+  the legacy template fall back to the same layout. See
+  [Situations](https://docs.griptapenodes.com/en/stable/guides/projects/situations/#save_output_directory).
+
 ## [0.102.0] - 2026-09-24
 
 ### Added
@@ -76,6 +154,17 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Connecting a video, image, or audio file uploaded through the editor to a node that requires that
+  media type no longer fails with a message saying the parameter must be an artifact.
+- Image, video, audio, and 3D parameters no longer fail when given an inline `data:` URI longer than
+  the operating system's file name limit, which any real image exceeds. The URI is kept as the
+  parameter's value.
+- Image, video, audio, and 3D inputs given a file path use the file where it already is, instead of
+  copying it into `staticfiles/`. The copy could overwrite a different file with the same name. A
+  saved workflow now depends on its input files staying put: moving, renaming, or deleting one
+  breaks the workflow, and an input outside the workspace is referenced by its absolute path, so the
+  project is no longer portable across machines for those inputs.
+  [#5647](https://github.com/griptape-ai/griptape-nodes-engine/issues/5647)
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
@@ -111,5 +200,6 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.0...HEAD
+[0.103.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...v0.103.0
 [0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0

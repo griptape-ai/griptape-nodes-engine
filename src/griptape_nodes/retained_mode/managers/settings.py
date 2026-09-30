@@ -21,7 +21,7 @@ PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
-WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -31,6 +31,10 @@ DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
+LOG_TO_FILE_KEY = "logging.log_to_file"
+LOG_DIRECTORY_KEY = "logging.log_directory"
+LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
+SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so under this flag beta feature entries are converted to booleans, and one
 # that can't be converted fails validation so the variable is reported as a bad value.
@@ -124,6 +128,7 @@ ARTIFACTS = Category(name="Artifacts", description="Settings for artifact provid
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 BETA_FEATURES = Category(name="Beta Features", description="Experimental features that can be turned on or off")
+LOGGING = Category(name="Logging", description="Where engine logs are kept and how much history is retained")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -339,16 +344,20 @@ class WorkerSettings(BaseModel):
     )
     heartbeat_timeout_s: float = Field(
         default=15.0,
-        description="Seconds without a heartbeat response before a worker is evicted.",
+        description=(
+            "Seconds without a heartbeat response before a worker is evicted. A worker also shuts "
+            "itself down after this much orchestrator silence, but never sooner than 30 seconds, so "
+            "that an orchestrator too busy to challenge is not mistaken for one that exited."
+        ),
     )
-    heartbeat_startup_grace_s: float = Field(
+    library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Grace period in seconds after worker spawn before heartbeat timeouts are enforced. "
-            "Workers need time to install venv deps and import modules before they can respond. "
+            "Seconds a worker may take to load its library before the orchestrator marks the "
+            "library as FAILURE. Also bounds how long running a node waits for its library's worker "
+            "to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes; this also bounds how long the orchestrator waits for worker libraries "
-            "to load before marking them as FAILURE."
+            "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),
     )
 
@@ -416,6 +425,31 @@ class LibrarySettings(BaseModel):
         return LibraryDependencyInstallBehavior.ALWAYS
 
 
+class LoggingSettings(BaseModel):
+    """Settings for engine log capture, used when reporting a problem."""
+
+    log_to_file: bool = Field(
+        category=LOGGING,
+        default=True,
+        description="Write engine logs to a file as well as to the console. Each engine process writes its own file, rolling over at 10 MB and keeping 5 rollovers, so the total size per process is capped. Turn this off if you only ever need the logs from the session that is running right now.",
+    )
+    log_directory: str = Field(
+        category=LOGGING,
+        default="",
+        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means `<XDG_STATE_HOME>/griptape_nodes/logs`.",
+    )
+    log_retention_days: int = Field(
+        category=LOGGING,
+        default=7,
+        description="Delete engine log files that have not been written to for this many days. Checked when the engine starts, and again whenever a logging setting changes. The log file the engine is currently writing is never deleted, however old it is. Set to 0 to keep log files forever.",
+    )
+    session_log_buffer_lines: int = Field(
+        category=LOGGING,
+        default=5000,
+        description="How many of the most recent log lines the engine keeps in memory for the current session, so a problem report includes what just happened without you having to reproduce it. These lines carry whatever log_level allows, so raise log_level to DEBUG before reproducing a problem if you need debug detail in the report. Set to 0 to disable, which means a problem report can only include whatever reached the log files.",
+    )
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -452,6 +486,10 @@ class Settings(BaseModel):
         category=EXECUTION,
         default=LogLevel.INFO,
         description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
+    logging: LoggingSettings = Field(
+        category=LOGGING,
+        default_factory=LoggingSettings,
     )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,

@@ -328,6 +328,103 @@ class TestMultiHopChain:
         assert end.parameter_output_values["final"] == "start->middle->end"
 
 
+class TestResultsReportedWithTheSetter:
+    """`set_parameter_value` on an output is how plenty of libraries report a result.
+
+    Only produced values travel back from a worker, so a result the setter recorded nowhere else was
+    left behind and the output read empty on the orchestrator. What decides whether the setter also
+    records one is whether the parameter has an OUTPUT to publish on, not whether OUTPUT is the only
+    mode it allows.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_a_result_the_setter_stored(self) -> None:
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterReporter")
+
+        assert result.parameter_output_values["status"] == "reported-readback"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_a_result_on_a_parameter_the_editor_can_also_type_into(self) -> None:
+        """Allowing PROPERTY as well does not stop the parameter publishing, so the result travels."""
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterDisplayReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterDisplayReporter")
+
+        assert result.parameter_output_values["on_display"] == "shown"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_a_result_on_a_parameter_that_declared_no_modes(self) -> None:
+        """The default is every mode, and that is most of the parameters a library declares."""
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterDefaultReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterDefaultReporter")
+
+        assert result.parameter_output_values["defaulted"] == "defaulted-result"
+
+    @pytest.mark.asyncio
+    async def test_a_parameter_with_no_output_is_left_behind(self) -> None:
+        """With no OUTPUT there is no port to publish on, so a run's write to it is scratch."""
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterScratchReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterScratchReporter")
+
+        assert "scratch" not in result.parameter_output_values
+
+    @pytest.mark.asyncio
+    async def test_the_node_reads_back_what_it_just_set(self) -> None:
+        """A library that sets then reads through the same API has to see its own write."""
+        current_engine().library_manager._is_worker = True
+        _make("ReportsWithSetterNode", "SetterReadbackReporter")
+
+        result = await _execute("ReportsWithSetterNode", "SetterReadbackReporter")
+
+        assert result.parameter_output_values["status"] == "reported-readback"
+
+    @pytest.mark.asyncio
+    async def test_the_same_node_reports_the_same_way_on_the_orchestrator(self) -> None:
+        current_engine().library_manager._is_worker = False
+        _make("ReportsWithSetterNode", "LocalSetterReporter")
+
+        result = await _execute("ReportsWithSetterNode", "LocalSetterReporter")
+
+        assert result.parameter_output_values["status"] == "reported-readback"
+        assert result.parameter_output_values["on_display"] == "shown"
+        assert result.parameter_output_values["defaulted"] == "defaulted-result"
+        assert "scratch" not in result.parameter_output_values
+
+
+class TestAnOutputListGrownWhileRunning:
+    """Split Video's shape: an output-only `ParameterList` whose children are set as the node runs.
+
+    The children are rebuilt into the list by `handle_container_parameter`, which reads them raw, so
+    they stay authored and only the rebuilt list is a result.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_ships_the_whole_list(self) -> None:
+        current_engine().library_manager._is_worker = True
+        _make("GrowsAnOutputListNode", "ListGrower")
+
+        result = await _execute("GrowsAnOutputListNode", "ListGrower")
+
+        assert result.parameter_output_values["clips"] == ["clip0", "clip1"]
+
+    @pytest.mark.asyncio
+    async def test_the_same_node_on_the_orchestrator(self) -> None:
+        current_engine().library_manager._is_worker = False
+        node = _make("GrowsAnOutputListNode", "LocalListGrower")
+
+        await _execute("GrowsAnOutputListNode", "LocalListGrower")
+
+        assert node.get_parameter_value("clips") == ["clip0", "clip1"]
+
+
 class TestEditorTimeBehaviorOnRealNodes:
     """These are exactly what a schema stub would have dropped."""
 

@@ -275,6 +275,63 @@ class TestWorkflowWorkingDirectory:
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
+    def test_omitting_the_folder_does_not_warn(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        """A workflow nobody named a folder for still answers `workflow_dir`, so nothing degrades.
+
+        The folder its first save would default to is a prediction rather than a fact, but it is
+        the same place dropping the optional block already sent the file, so a saving node that
+        writes several files no longer pays a warning per file for a path that was never wrong.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    resolved = self._resolve_outputs(engine)
+
+                assert resolved == workspace / "outputs" / "img.png"
+                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_required_workflow_dir_resolves_without_a_folder(self, engine: Engine) -> None:
+        """`{workflow_dir}` with no `?` resolves too, rather than failing the whole request.
+
+        A macro that names the directory outright has no degraded form to fall back to, so a
+        library writing to `{workflow_dir}/...` used to be unusable until the first save.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                resolved = engine.handle_request(
+                    GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
+                )
+
+                assert isinstance(resolved, GetPathForMacroResultSuccess)
+                assert resolved.absolute_path == workspace / "notes.txt"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
     def test_relative_folder_is_anchored_to_the_workspace(self, engine: Engine) -> None:
         """A relative folder resolves against the workspace, not the process working directory.
 

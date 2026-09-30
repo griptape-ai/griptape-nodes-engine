@@ -39,6 +39,7 @@ from .request_handler_registration_problem import RequestHandlerRegistrationProb
 from .request_handlers_worker_incompatible_problem import RequestHandlersWorkerIncompatibleProblem
 from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
+from .shadowed_engine_packages_problem import ShadowedEnginePackagesProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
 from .ui_options_field_modified_warning_problem import UiOptionsFieldModifiedWarningProblem
 from .unresolved_model_provider_usage_reference_problem import UnresolvedModelProviderUsageReferenceProblem
@@ -87,6 +88,7 @@ __all__ = [
     "RequestHandlersWorkerIncompatibleProblem",
     "RetiredNodeDeclarationProblem",
     "SandboxDirectoryMissingProblem",
+    "ShadowedEnginePackagesProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",
     "UiOptionsFieldModifiedWarningProblem",
     "UnresolvedModelProviderUsageReferenceProblem",
