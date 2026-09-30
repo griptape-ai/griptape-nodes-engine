@@ -1,15 +1,13 @@
 """Filesystem requests must not cross the worker boundary.
 
 Forwarding-by-default made "every request a node can issue survives a cattrs round trip" a
-requirement, and the filesystem family does not meet it. Three separate ways:
+requirement, and the filesystem family does not meet it in two ways:
 
 - `content` is `str | bytes`. The wire form base64s bytes into a JSON string and cattrs resolves
   the union back to `str`, so a worker's write landed on disk as mojibake with no error raised
   anywhere. Silent data corruption.
 - A path carrying macro variables is a `MacroPath` wrapping a `ParsedMacro`, which will not
   serialize at all. The worker blocked until the forward timed out.
-- Four failure results declared `SequenceScanFailureReason | FileIOFailureReason`, which cattrs
-  could not disambiguate, so even the error could not travel. The converter reads these now.
 
 None of that is a reason to make the wire smarter: the workspace is shared on disk, so a worker's
 own answer was already the correct one. These tests pin the routing decision and the mechanism
