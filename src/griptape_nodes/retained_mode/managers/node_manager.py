@@ -339,7 +339,7 @@ class SerializedGroupResult:
 
 @dataclass(frozen=True)
 class CopiedValues:
-    """The values read from a copy, and why each one that could not be read was not."""
+    """Values read from a copy, and why each unreadable one was skipped."""
 
     values: dict[str, JsonValue]
     unreadable_reasons: dict[str, str]

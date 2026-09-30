@@ -19,12 +19,10 @@ process cannot build or is not allowed to import, such as one whose class lives 
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
 came from, so it passes through to a process that can build it.
 
-A value with no plain-data form is handled by where it is going, always through ``try_encode`` so
-each value is encoded once:
+A value with no plain-data form is handled by where it is going:
 
 - Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
-  leave it out, log a warning naming the node and parameter, and report it in the operation's
-  ``result_details`` (see ``dropped_values``). Never save its text in its place.
+  leave it out and list it as a ``DroppedValue``. Never save its text in its place.
 - Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
   the parameter.
 - Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
@@ -114,7 +112,7 @@ def encode_value(value: Any) -> JsonValue:
 
 
 def try_encode(value: Any) -> JsonValue | Unencodable:
-    """Encode once. Callers choose what an Unencodable means for them and never re-encode."""
+    """Return ``value`` encoded, or an ``Unencodable`` saying why it has no plain-data form."""
     try:
         return encode_value(value)
     except ValueEncodeError as error:

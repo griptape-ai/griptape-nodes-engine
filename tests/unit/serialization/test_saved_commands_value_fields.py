@@ -1,4 +1,4 @@
-"""No field of the commands that are saved, copied, or embedded in an image is a DisplayValue.
+"""No field of the commands that are saved, copied, or embedded in an image is a DisplayValue, except placeholders.
 
 A DisplayValue sends a value with no plain-data form as its text. In saved commands that text would
 be read back as the value, so every such field must be a strict Value.
