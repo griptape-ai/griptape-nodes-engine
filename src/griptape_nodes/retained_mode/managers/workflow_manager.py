@@ -248,6 +248,16 @@ ParameterShapeInfo = dict[str, Any]  # Parameter metadata dict from _convert_par
 NodeParameterMap = dict[str, ParameterShapeInfo]  # {param_name: param_info}
 WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: param_info}}
 
+
+class WorkflowShapeType(StrEnum):
+    """Top-level keys of a workflow shape: the Start Flow inputs and the End Flow outputs."""
+
+    INPUT = "input"
+    OUTPUT = "output"
+
+
+SHAPE_DEFAULT_VALUE_KEY = "default_value"  # Key in ParameterShapeInfo holding the parameter's default
+
 logger = logging.getLogger("griptape_nodes")
 
 # WorkflowManager.LoadProblemFrame writes this; is_loading_workflow reads it. Scoped to the
@@ -2723,8 +2733,8 @@ class WorkflowManager(EngineScoped):
         try:
             workflow_shape_dict = self.extract_workflow_shape(workflow_name=registry_key)
             workflow_shape = WorkflowShape(
-                inputs=workflow_shape_dict["input"],
-                outputs=workflow_shape_dict["output"],
+                inputs=workflow_shape_dict[WorkflowShapeType.INPUT],
+                outputs=workflow_shape_dict[WorkflowShapeType.OUTPUT],
             )
         except ValueError:
             workflow_shape = None
@@ -3452,8 +3462,8 @@ class WorkflowManager(EngineScoped):
         try:
             workflow_shape_dict = self.extract_workflow_shape(workflow_name=registry_key, flow_name=request.flow_name)
             workflow_shape = WorkflowShape(
-                inputs=workflow_shape_dict["input"],
-                outputs=workflow_shape_dict["output"],
+                inputs=workflow_shape_dict[WorkflowShapeType.INPUT],
+                outputs=workflow_shape_dict[WorkflowShapeType.OUTPUT],
             )
         except ValueError:
             workflow_shape = None
@@ -3740,8 +3750,8 @@ class WorkflowManager(EngineScoped):
 
         # Convert WorkflowShape to dict format expected by the rest of the method
         workflow_shape = {
-            "input": workflow_metadata.workflow_shape.inputs,
-            "output": workflow_metadata.workflow_shape.outputs,
+            WorkflowShapeType.INPUT: workflow_metadata.workflow_shape.inputs,
+            WorkflowShapeType.OUTPUT: workflow_metadata.workflow_shape.outputs,
         }
 
         # === imports ===
@@ -4020,9 +4030,9 @@ class WorkflowManager(EngineScoped):
             )
         )
 
-        # Generate individual arguments for each parameter in workflow_shape["input"]
-        if "input" in workflow_shape:
-            for node_name, node_params in workflow_shape["input"].items():
+        # Generate individual arguments for each parameter in workflow_shape[WorkflowShapeType.INPUT]
+        if WorkflowShapeType.INPUT in workflow_shape:
+            for node_name, node_params in workflow_shape[WorkflowShapeType.INPUT].items():
                 if isinstance(node_params, dict):
                     for param_name, param_info in node_params.items():
                         # Create CLI argument name: --{param_name}
@@ -4134,7 +4144,7 @@ class WorkflowManager(EngineScoped):
                     ],
                     orelse=[],
                 )
-                for node_name in workflow_shape.get("input", {})
+                for node_name in workflow_shape.get(WorkflowShapeType.INPUT, {})
             ]
         )
 
@@ -4173,7 +4183,7 @@ class WorkflowManager(EngineScoped):
                     ],
                     orelse=[],
                 )
-                for node_name, node_params in workflow_shape.get("input", {}).items()
+                for node_name, node_params in workflow_shape.get(WorkflowShapeType.INPUT, {}).items()
                 if isinstance(node_params, dict)
                 for param_name in node_params
             ]
@@ -5922,7 +5932,7 @@ class WorkflowManager(EngineScoped):
             "type",
             "input_types",
             "output_type",
-            "default_value",
+            SHAPE_DEFAULT_VALUE_KEY,
             "tooltip_as_input",
             "tooltip_as_property",
             "tooltip_as_output",
@@ -5949,7 +5959,7 @@ class WorkflowManager(EngineScoped):
         self,
         nodes: Sequence[BaseNode],
         workflow_shape: dict[str, Any],
-        workflow_shape_type: str,
+        workflow_shape_type: WorkflowShapeType,
     ) -> dict[str, Any]:
         """Creates a workflow shape from the nodes.
 
@@ -5962,7 +5972,7 @@ class WorkflowManager(EngineScoped):
                 # Expose only the parameters that are relevant for workflow input and output.
                 param_info = self.extract_parameter_shape_info(param, include_control_params=True)
                 if param_info is not None:
-                    if workflow_shape_type == "input":
+                    if workflow_shape_type == WorkflowShapeType.INPUT:
                         self._apply_set_value_as_default(node, param, param_info)
                     if node.name in workflow_shape[workflow_shape_type]:
                         cast("dict", workflow_shape[workflow_shape_type][node.name])[param.name] = param_info
@@ -5986,7 +5996,7 @@ class WorkflowManager(EngineScoped):
             json.dumps(value)
         except (TypeError, ValueError):
             return
-        param_info["default_value"] = value
+        param_info[SHAPE_DEFAULT_VALUE_KEY] = value
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow.
@@ -5999,7 +6009,7 @@ class WorkflowManager(EngineScoped):
             workflow_name: Registry key used in error messages.
             flow_name: Specific flow to inspect. If None, the top-level flow is used.
         """
-        workflow_shape: dict[str, Any] = {"input": {}, "output": {}}
+        workflow_shape: dict[str, Any] = {WorkflowShapeType.INPUT: {}, WorkflowShapeType.OUTPUT: {}}
 
         flow_manager = self.engine.flow_manager
         if flow_name is None:
@@ -6035,12 +6045,12 @@ class WorkflowManager(EngineScoped):
         workflow_shape = self._create_workflow_shape_from_nodes(
             nodes=start_nodes,
             workflow_shape=workflow_shape,
-            workflow_shape_type="input",
+            workflow_shape_type=WorkflowShapeType.INPUT,
         )
         workflow_shape = self._create_workflow_shape_from_nodes(
             nodes=end_nodes,
             workflow_shape=workflow_shape,
-            workflow_shape_type="output",
+            workflow_shape_type=WorkflowShapeType.OUTPUT,
         )
 
         return workflow_shape

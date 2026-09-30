@@ -82,7 +82,11 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 )
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
-from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow_manager import (
+    SHAPE_DEFAULT_VALUE_KEY,
+    WorkflowManager,
+    WorkflowShapeType,
+)
 
 
 def _register_unsaved_workflow(key: str, name: str) -> None:
@@ -4984,9 +4988,11 @@ class TestWorkflowShapeStartFlowDefaults:
 
     def _input_shape(self, engine: Engine, node: StartNode) -> dict[str, Any]:
         shape = engine.workflow_manager._create_workflow_shape_from_nodes(
-            nodes=[node], workflow_shape={"input": {}, "output": {}}, workflow_shape_type="input"
+            nodes=[node],
+            workflow_shape={WorkflowShapeType.INPUT: {}, WorkflowShapeType.OUTPUT: {}},
+            workflow_shape_type=WorkflowShapeType.INPUT,
         )
-        return shape["input"][node.name]
+        return shape[WorkflowShapeType.INPUT][node.name]
 
     def test_set_value_becomes_default(self, engine: Engine) -> None:
         node = _ShapeStartNode("Start Flow")
@@ -4994,14 +5000,14 @@ class TestWorkflowShapeStartFlowDefaults:
 
         shape = self._input_shape(engine, node)
 
-        assert shape["topic"]["default_value"] == "a dragon learns to knit"
+        assert shape["topic"][SHAPE_DEFAULT_VALUE_KEY] == "a dragon learns to knit"
 
     def test_unset_value_keeps_declared_default(self, engine: Engine) -> None:
         node = _ShapeStartNode("Start Flow")
 
         shape = self._input_shape(engine, node)
 
-        assert shape["topic"]["default_value"] == ""
+        assert shape["topic"][SHAPE_DEFAULT_VALUE_KEY] == ""
 
     def test_value_json_cannot_hold_keeps_declared_default(self, engine: Engine) -> None:
         node = _ShapeStartNode("Start Flow")
@@ -5009,17 +5015,19 @@ class TestWorkflowShapeStartFlowDefaults:
 
         shape = self._input_shape(engine, node)
 
-        assert shape["image"]["default_value"] is None
+        assert shape["image"][SHAPE_DEFAULT_VALUE_KEY] is None
 
     def test_end_flow_values_are_not_recorded(self, engine: Engine) -> None:
         node = _ShapeStartNode("End Flow")
         node.parameter_values["topic"] = "last run's output"
 
         shape = engine.workflow_manager._create_workflow_shape_from_nodes(
-            nodes=[node], workflow_shape={"input": {}, "output": {}}, workflow_shape_type="output"
+            nodes=[node],
+            workflow_shape={WorkflowShapeType.INPUT: {}, WorkflowShapeType.OUTPUT: {}},
+            workflow_shape_type=WorkflowShapeType.OUTPUT,
         )
 
-        assert shape["output"]["End Flow"]["topic"]["default_value"] == ""
+        assert shape[WorkflowShapeType.OUTPUT]["End Flow"]["topic"][SHAPE_DEFAULT_VALUE_KEY] == ""
 
 
 class TestExecuteWorkflowImport:
