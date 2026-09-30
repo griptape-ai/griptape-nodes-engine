@@ -391,8 +391,8 @@ def __getattr__(name: str) -> type[DataNode]:
 ```
 
 Cache the built class in module globals. Two lookups of the same node type must return
-the same object, because the engine caches the resolved class, `isinstance` checks
-compare against it, and saved values name it.
+the same object, because the engine caches the resolved class and `isinstance` checks
+compare against it.
 
 !!! warning "Set `__module__` explicitly when you build a class"
 
@@ -403,8 +403,8 @@ compare against it, and saved values name it.
     `__module__ == "abc"`.
 
     Nothing complains at load time. The failure appears later: reopening a saved
-    workflow imports `__module__` and looks up `__qualname__` on it, so any workflow
-    carrying a value your class defines will fail to reopen. Pass both explicitly:
+    workflow looks up `__qualname__` in `__module__`, so a value your class defines
+    comes back as plain data instead of as your class. Pass both explicitly:
 
     ```python
     return type(
