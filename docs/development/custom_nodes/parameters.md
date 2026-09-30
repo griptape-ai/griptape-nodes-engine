@@ -39,14 +39,16 @@ Parameter values are serialized when a node runs in its library's own process (s
 - pydantic models, dataclasses, and attrs classes
 - griptape objects such as artifacts and rulesets
 
-To serialize any other class, implement `SavesState`: a `to_state()` method that returns the
-types above, and a `from_state()` classmethod that rebuilds the object from them:
+To serialize any other class, decorate it with `register_value_codec` and give it a `to_state()`
+method that returns the types above, and a `from_state()` classmethod that rebuilds the object from
+them. Subclasses are covered too:
 
 ```python
-from griptape_nodes.exe_types.core_types import SavesState
+from griptape_nodes.exe_types.core_types import register_value_codec
 
 
-class Palette(SavesState):
+@register_value_codec
+class Palette:
     def __init__(self, colors: list[str]) -> None:
         self.colors = colors
 
@@ -58,19 +60,25 @@ class Palette(SavesState):
         return cls(state["colors"])
 ```
 
-For a class you cannot edit, such as one from another package, register its conversion once from
-your library's code. It covers that exact class, not its subclasses:
+For a class you cannot edit, such as one from another package, pass the conversion functions
+instead. They cover that exact class, not its subclasses, and only a class with no other way to
+save. Register them from your library's `before_library_nodes_loaded`, so every process that loads
+your library has them:
 
 ```python
 import numpy as np
 
 from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 
-register_value_codec(
-    np.ndarray,
-    to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
-    from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
-)
+
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
 ```
 
 ## Traits
