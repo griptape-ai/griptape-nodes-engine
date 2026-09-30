@@ -83,11 +83,13 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
 
 **Check it where behavior diverges** - Call `is_beta_enabled(FEATURE, self.engine.config_manager)` at the point where the old and new behavior split. Do not thread the result through call chains. It takes the config manager because engine-internal code must not use the `GriptapeNodes` facade.
 
+**Never read a flag's config value directly** - `is_beta_enabled` applies the master switch, `beta_features.enabled`, which turns every engine and library feature off when it is a real `false`. Reading `beta_features.<id>` or `library_beta_features.<library>.<id>` with `get_config_value` skips the master switch, the boolean rule, and expiry.
+
 **Rules**:
 
 - A flag must never change saved data or the protocol. Workflows have to open the same way whether a flag is on or off.
 - Every flag needs a `remove_by` date at most 180 days out. By then, promote the feature to default or delete it.
-- Ids are lowercase snake_case and unique across the editor and the engine. The editor's own flags are registered in griptape-vsl-gui, so check there before picking an id.
+- Ids are lowercase snake_case and unique across the editor and the engine. The editor's own flags are registered in griptape-vsl-gui, so check there before picking an id. `enabled` is reserved for the master switch.
 
 **When `test_beta_features.py` fails on `remove_by`** - The test fails on a fixed date, even on PRs that don't touch the flag. Fix it one of three ways: promote the feature to default, delete it, or extend `remove_by` (still at most 180 days out) and give the reason in the PR.
 

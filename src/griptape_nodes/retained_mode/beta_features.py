@@ -19,6 +19,9 @@ Register a feature at module level and check it where behavior diverges:
     if is_beta_enabled(PARALLEL_BRANCH_RESOLUTION, self.engine.config_manager):
         ...
 
+`is_beta_enabled` also applies the editor's master switch, `beta_features.enabled`, so always check
+features through it rather than reading their config values directly.
+
 `tests/unit/retained_mode/test_beta_features.py` fails once a feature passes its `remove_by` date
 or sets one more than 180 days out. See the "Beta features" section of CLAUDE.md.
 
@@ -46,6 +49,11 @@ logger = logging.getLogger("griptape_nodes")
 # settings module's import graph.
 BETA_FEATURES_KEY = "beta_features"
 LIBRARY_BETA_FEATURES_KEY = "library_beta_features"
+
+# The editor's master switch. It shares the `beta_features` map with engine feature values, so
+# no engine feature may use this id.
+BETA_FEATURES_ENABLED_ID = "enabled"
+BETA_FEATURES_ENABLED_KEY = f"{BETA_FEATURES_KEY}.{BETA_FEATURES_ENABLED_ID}"
 
 # The longest a feature may stay in beta. Engine features are held to it by a unit test, library
 # features by a warning when the library loads.
@@ -145,8 +153,16 @@ def register_beta_feature(feature: BetaFeature) -> BetaFeature:
     """Add a feature to the registry and return it, so it can be bound to a module constant.
 
     Raises:
-        ValueError: A feature with the same id is already registered.
+        ValueError: The id is reserved for the master switch, or a feature with the same id is
+            already registered.
     """
+    if feature.id == BETA_FEATURES_ENABLED_ID:
+        msg = (
+            f"Attempted to register beta feature '{feature.id}'. Failed because that id is reserved for the switch "
+            f"that turns all beta features on or off ({BETA_FEATURES_ENABLED_KEY}). Pick another id."
+        )
+        raise ValueError(msg)
+
     if feature.id in _registry:
         msg = f"Attempted to register beta feature '{feature.id}'. Failed because a feature with that id is already registered."
         raise ValueError(msg)
@@ -275,9 +291,14 @@ def is_beta_enabled(feature: BetaFeature, config_manager: ConfigManager) -> bool
     which turns any unrecognized string such as `"maybe"` into True. Environment variables are
     already booleans here, because the env layer coerces them through `Settings`.
 
-    An expired feature always uses its default. The editor hides it, so the user could no longer
-    see or change a value they had set.
+    When the user turns all beta features off with the master switch, every feature is off,
+    including expired ones and ones that default to on. This matches the editor. Otherwise an
+    expired feature always uses its default. The editor hides it, so the user could no longer see
+    or change a value they had set.
     """
+    if not beta_features_master_enabled(config_manager):
+        return False
+
     if feature.is_expired():
         return feature.default
 
@@ -286,6 +307,18 @@ def is_beta_enabled(feature: BetaFeature, config_manager: ConfigManager) -> bool
         return feature.default
 
     return value
+
+
+def beta_features_master_enabled(config_manager: ConfigManager) -> bool:
+    """Whether the editor's master switch lets beta features be on.
+
+    Only a real `false` turns them off. A missing value, `true`, or anything that isn't a boolean
+    leaves each feature to its own value, the same rule `is_beta_enabled` applies to features.
+    Turning the switch off leaves each feature's own value in the config, so turning it back on
+    restores them.
+    """
+    value = config_manager.get_config_value(BETA_FEATURES_ENABLED_KEY, should_load_env_var_if_detected=False)
+    return value is not False
 
 
 def library_config_slug(library_name: str) -> str:
