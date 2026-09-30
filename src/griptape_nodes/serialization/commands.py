@@ -56,7 +56,7 @@ class CommandsFormatError(Exception):
     """Data is not commands this version can read. The message completes 'Failed because ...'."""
 
 
-def check_element_modification_commands(commands: SerializedFlowCommands | SerializedSelectedNodesCommands) -> None:
+def check_request_fields(commands: SerializedFlowCommands | SerializedSelectedNodesCommands) -> None:
     """Refuse decoded commands holding a request anywhere serialization would not have put it.
 
     Each field must hold exactly the request type it declares. Pickle ignores declared types, so
@@ -71,13 +71,13 @@ def check_element_modification_commands(commands: SerializedFlowCommands | Seria
 
 
 def _check_dataclass(instance: Any) -> None:
+    field_types = _field_types(type(instance))
     for field in dataclasses.fields(instance):
-        declared = _field_types(type(instance))[field.name]
+        declared = field_types[field.name]
         _check_value(getattr(instance, field.name), declared, f"{type(instance).__qualname__}.{field.name}")
 
 
 def _check_value(value: Any, declared: Any, where: str) -> None:
-    """Check each request and command in ``value`` against the ``declared`` type that holds it."""
     declared = _without_new_types(declared)
     origin = typing.get_origin(declared)
     if origin in (typing.Union, types.UnionType):
@@ -189,5 +189,5 @@ def decode_commands[T: SerializedFlowCommands | SerializedSelectedNodesCommands]
         problems = "; ".join(transform_error(error))
         msg = f"the data is incomplete or damaged ({problems})"
         raise CommandsFormatError(msg) from error
-    check_element_modification_commands(commands)
+    check_request_fields(commands)
     return commands
