@@ -21,6 +21,7 @@ the engine's request API from working without edits. Migration steps live in
   `TIME TO RUN: <seconds> s for '<node name>' (<node type>)`. When a workflow run finishes, fails,
   or is cancelled, it also logs a `RUN SUMMARY` with the total time, the nodes grouped by which ran
   in parallel, slowest first, and the nodes inside each group or loop.
+  [#5717](https://github.com/griptape-ai/griptape-nodes-engine/issues/5717)
 
 ### Changed
 
