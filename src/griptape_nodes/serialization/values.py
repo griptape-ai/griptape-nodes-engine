@@ -14,7 +14,7 @@ pydantic models, dataclasses, attrs classes, and griptape objects.
 Decoding imports a ``$type``'s module only if it is already loaded, or its top-level package is
 ``griptape`` or ``griptape_nodes`` (this covers node library files, loaded lazily under
 ``griptape_nodes.node_libraries.*``). It builds only classes a codec covers, and building one
-runs its constructor on the data, so a class from any loaded module can be built. A value this
+runs that codec's code on the data, so a class from any loaded module can be built. A value this
 process cannot build or is not allowed to import, such as one whose class lives in a library
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
 came from, so it passes through to a process that can build it.
@@ -107,7 +107,7 @@ def decode_value(data: Any) -> Any:
 
 
 class SavesState(Protocol):
-    """A class that saves as the state ``to_state()`` returns and reopens through ``from_state()``."""
+    """What ``register_value_codec`` needs from a class it decorates."""
 
     def to_state(self) -> Any: ...
 
