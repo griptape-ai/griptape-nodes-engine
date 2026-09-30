@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
+from griptape_nodes.retained_mode.request_handlers import handled_request_types
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -845,6 +846,17 @@ class EventManager(EngineScoped):
             msg = f"Attempted to assign an event of type {request_type} to manager {callback.__name__}, but that request is already assigned to manager {existing_manager.__name__}."
             raise ValueError(msg)
         self._request_type_to_manager[request_type] = callback
+
+    def register_request_handlers(self, owner: object) -> None:
+        """Assign every `@handles` method on `owner` to the request types it names."""
+        seen: set[str] = set()
+        for klass in type(owner).__mro__:
+            for name, attr in vars(klass).items():
+                if name in seen:
+                    continue
+                seen.add(name)
+                for request_type in handled_request_types(attr):
+                    self.assign_manager_to_request_type(request_type, getattr(owner, name))
 
     def configure_worker_forwarding(
         self,

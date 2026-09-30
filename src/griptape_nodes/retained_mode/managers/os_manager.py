@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
@@ -388,78 +389,7 @@ class OSManager(EngineScoped):
     def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None):
         super().__init__(engine)
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(
-                request_type=OpenAssociatedFileRequest, callback=self.on_open_associated_file_request
-            )
-            event_manager.assign_manager_to_request_type(
-                request_type=ListDirectoryRequest, callback=self.on_list_directory_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ListDirectorySequencesRequest,
-                callback=self.on_list_directory_sequences_request,
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=DeduceSequencesFromFileListRequest,
-                callback=self.on_deduce_sequences_from_file_list_request,
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ScanSequencesRequest, callback=self.on_scan_sequences_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ReadFileRequest, callback=self.on_read_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CreateFileRequest, callback=self.on_create_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=RenameFileRequest, callback=self.on_rename_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=WriteFileRequest, callback=self.on_write_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=WriteTempFileRequest, callback=self.on_write_temp_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CopyTreeRequest, callback=self.on_copy_tree_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CopyFileRequest, callback=self.on_copy_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=DeleteFileRequest, callback=self.on_delete_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetFileInfoRequest, callback=self.on_get_file_info_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ResolveMacroPathRequest, callback=self.on_handle_resolve_macro_path_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetNextUnusedFilenameRequest, callback=self.on_get_next_unused_filename_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetNextVersionIndexRequest, callback=self.on_get_next_version_index_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=MakeDirectoryRequest, callback=self.on_make_directory_request
-            )
+            event_manager.register_request_handlers(self)
 
             # Store event_manager for direct access during resource registration
             self._event_manager = event_manager
@@ -1509,6 +1439,7 @@ class OSManager(EngineScoped):
             sys.stdout.flush()  # Recommended here https://docs.python.org/3/library/os.html#os.execvpe
             os.execvp(args[0], args)  # noqa: S606
 
+    @handles(OpenAssociatedFileRequest)
     def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         # Validate that exactly one of path_to_file or file_entry is provided
         if request.path_to_file is None and request.file_entry is None:
@@ -1669,6 +1600,7 @@ class OSManager(EngineScoped):
             mime_type = "text/plain"
         return mime_type
 
+    @handles(ListDirectoryRequest)
     def on_list_directory_request(self, request: ListDirectoryRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Handle a request to list directory contents."""
         try:
@@ -1898,6 +1830,7 @@ class OSManager(EngineScoped):
             logger.error(msg)
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
+    @handles(ListDirectorySequencesRequest)
     def on_list_directory_sequences_request(self, request: ListDirectorySequencesRequest) -> ResultPayload:
         """Handle a request to list only file sequences in a directory.
 
@@ -1935,6 +1868,7 @@ class OSManager(EngineScoped):
             result_details="Unexpected result type from on_list_directory_request.",
         )
 
+    @handles(DeduceSequencesFromFileListRequest)
     def on_deduce_sequences_from_file_list_request(self, request: DeduceSequencesFromFileListRequest) -> ResultPayload:
         """Handle a request to detect sequences from a caller-supplied file list.
 
@@ -1994,6 +1928,7 @@ class OSManager(EngineScoped):
             result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
         )
 
+    @handles(ScanSequencesRequest)
     async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to scan a path or pattern for file sequences.
 
@@ -2264,6 +2199,7 @@ class OSManager(EngineScoped):
                 failure_reason=FileIOFailureReason.IO_ERROR, result_details=f"Error reading from {location}: {e}"
             )
 
+    @handles(ReadFileRequest)
     async def on_read_file_request(self, request: ReadFileRequest) -> ResultPayload:
         """Handle a request to read file contents with automatic text/binary detection.
 
@@ -2343,6 +2279,7 @@ class OSManager(EngineScoped):
         logger.debug("Fallback to full image data URL")
         return data_url
 
+    @handles(GetNextUnusedFilenameRequest)
     def on_get_next_unused_filename_request(self, request: GetNextUnusedFilenameRequest) -> ResultPayload:
         """Handle a request to find the next available filename (preview only - no file creation)."""
         # Handle string paths specially: try base path first, then indexed
@@ -2424,6 +2361,7 @@ class OSManager(EngineScoped):
             else "Found available filename (no index needed)",
         )
 
+    @handles(GetNextVersionIndexRequest)
     def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
         """Handle a request to find the next available version index via a single glob pass."""
         scan_macro_path = self._bind_project_variables_for_index_scan(request.macro_path)
@@ -2457,6 +2395,7 @@ class OSManager(EngineScoped):
             else "Base path is available (no index needed)",
         )
 
+    @handles(WriteFileRequest)
     def on_write_file_request(self, request: WriteFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Handle a request to write content to a file with exclusive locking."""
         # Initialize success tracking variables
@@ -2937,6 +2876,7 @@ class OSManager(EngineScoped):
             result_details=result_details,
         )
 
+    @handles(WriteTempFileRequest)
     def on_write_temp_file_request(self, request: WriteTempFileRequest) -> ResultPayload:
         """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path.
 
@@ -3808,6 +3748,7 @@ class OSManager(EngineScoped):
 
         return removed_count > 0
 
+    @handles(MakeDirectoryRequest)
     def on_make_directory_request(self, request: MakeDirectoryRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to create a directory."""
         sanitized = sanitize_path_string(request.path)
@@ -3858,6 +3799,7 @@ class OSManager(EngineScoped):
             result_details=f"Directory created successfully at {dir_path}",
         )
 
+    @handles(CreateFileRequest)
     def on_create_file_request(self, request: CreateFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         """Handle a request to create a file or directory."""
         # Get the full path
@@ -3940,6 +3882,7 @@ class OSManager(EngineScoped):
             result_details=f"{'Directory' if request.is_directory else 'File'} created successfully at {file_path}",
         )
 
+    @handles(RenameFileRequest)
     def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to rename a file or directory."""
         # Resolve and validate paths
@@ -4014,6 +3957,7 @@ class OSManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(CopyFileRequest)
     def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to copy a single file."""
         # Resolve source path
@@ -4114,6 +4058,7 @@ class OSManager(EngineScoped):
             console.print(f"[red]Details: {e}[/red]")
             raise
 
+    @handles(DeleteFileRequest)
     async def on_delete_file_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
         self, request: DeleteFileRequest
     ) -> DeleteFileResultSuccess | DeleteFileResultFailure:
@@ -4238,6 +4183,7 @@ class OSManager(EngineScoped):
             result_details=result_details,
         )
 
+    @handles(GetFileInfoRequest)
     def on_get_file_info_request(  # noqa: PLR0911
         self, request: GetFileInfoRequest
     ) -> GetFileInfoResultSuccess | GetFileInfoResultFailure:
@@ -4307,6 +4253,7 @@ class OSManager(EngineScoped):
             result_details=f"Successfully retrieved file info for path {request.path}",
         )
 
+    @handles(ResolveMacroPathRequest)
     def on_handle_resolve_macro_path_request(
         self, request: ResolveMacroPathRequest
     ) -> ResolveMacroPathResultSuccess | ResolveMacroPathResultFailure:
@@ -4486,6 +4433,7 @@ class OSManager(EngineScoped):
 
         return CopyTreeStats(files_copied=files_copied, total_bytes_copied=total_bytes_copied)
 
+    @handles(CopyTreeRequest)
     def on_copy_tree_request(self, request: CopyTreeRequest) -> ResultPayload:
         """Handle a request to copy a directory tree."""
         # Validate paths

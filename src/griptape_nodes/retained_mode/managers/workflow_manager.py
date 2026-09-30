@@ -223,6 +223,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
@@ -516,127 +517,7 @@ class WorkflowManager(EngineScoped):
         # build_workflow() and therefore survives both editor loads and direct script execution.
         self._variable_substitution_enabled: dict[str, bool] = {}
 
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowFromScratchRequest, self.on_run_workflow_from_scratch_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowWithCurrentStateRequest,
-            self.on_run_workflow_with_current_state_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowFromRegistryRequest,
-            self.on_run_workflow_from_registry_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterWorkflowRequest,
-            self.on_register_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListAllWorkflowsRequest,
-            self.on_list_all_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListCallableWorkflowsRequest,
-            self.on_list_callable_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            DeleteWorkflowRequest,
-            self.on_delete_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RenameWorkflowRequest,
-            self.on_rename_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            MoveWorkflowRequest,
-            self.on_move_workflow_request,
-        )
-
-        event_manager.assign_manager_to_request_type(
-            SaveWorkflowRequest,
-            self.on_save_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SaveWorkflowFileFromSerializedFlowRequest,
-            self.on_save_workflow_file_from_serialized_flow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SaveSubflowToWorkflowRequest,
-            self.on_save_subflow_to_workflow,
-        )
-        event_manager.assign_manager_to_request_type(LoadWorkflowMetadata, self.on_load_workflow_metadata_request)
-        event_manager.assign_manager_to_request_type(
-            PublishWorkflowRequest,
-            self.on_publish_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetPublishOptionsRequest,
-            self.on_get_publish_options_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SetWorkflowMetadataRequest,
-            self.on_set_workflow_metadata_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetVariableSubstitutionEnabledRequest,
-            self.on_get_variable_substitution_enabled_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SetVariableSubstitutionEnabledRequest,
-            self.on_set_variable_substitution_enabled_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowInfoRequest,
-            self.on_get_workflow_info_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListAllWorkflowInfoRequest,
-            self.on_list_all_workflow_info_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowMetadataRequest,
-            self.on_get_workflow_metadata_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowRunCommandRequest,
-            self.on_get_workflow_run_command_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ImportWorkflowAsReferencedSubFlowRequest,
-            self.on_import_workflow_as_referenced_sub_flow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ImportWorkflowRequest,
-            self.on_import_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            BranchWorkflowRequest,
-            self.on_branch_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            CreateWorkflowFromTemplateRequest,
-            self.on_create_workflow_from_template_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            MergeWorkflowBranchRequest,
-            self.on_merge_workflow_branch_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ResetWorkflowBranchRequest,
-            self.on_reset_workflow_branch_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            CompareWorkflowsRequest,
-            self.on_compare_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RefreshWorkflowRegistryRequest,
-            self.on_refresh_workflow_registry_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterWorkflowsFromConfigRequest,
-            self.on_register_workflows_from_config_request,
-        )
+        event_manager.register_request_handlers(self)
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
@@ -677,6 +558,7 @@ class WorkflowManager(EngineScoped):
         # Return the stored value, or True if this workflow has never set the flag.
         return self._variable_substitution_enabled.get(workflow_name, True)
 
+    @handles(GetVariableSubstitutionEnabledRequest)
     def on_get_variable_substitution_enabled_request(
         self,
         request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
@@ -693,6 +575,7 @@ class WorkflowManager(EngineScoped):
             enabled=enabled,
         )
 
+    @handles(SetVariableSubstitutionEnabledRequest)
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest
     ) -> ResultPayload:
@@ -1128,6 +1011,7 @@ class WorkflowManager(EngineScoped):
         details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
         return details
 
+    @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with WorkflowManager.WorkflowSquelchContext(self):
@@ -1162,6 +1046,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
             )
 
+    @handles(RunWorkflowWithCurrentStateRequest)
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
@@ -1194,6 +1079,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
         )
 
+    @handles(RunWorkflowFromRegistryRequest)
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1279,6 +1165,7 @@ class WorkflowManager(EngineScoped):
                 existing_workflows.append(full_path)
             config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
 
+    @handles(RegisterWorkflowRequest)
     def on_register_workflow_request(self, request: RegisterWorkflowRequest) -> ResultPayload:
         # The registry key is derived from the file path (minus extension), independent of the display name.
         registry_key = derive_registry_key(request.file_name)
@@ -1337,6 +1224,7 @@ class WorkflowManager(EngineScoped):
         )
         return repaired_name
 
+    @handles(ImportWorkflowRequest)
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
         load_metadata_request = LoadWorkflowMetadata(file_name=request.file_path)
@@ -1374,6 +1262,7 @@ class WorkflowManager(EngineScoped):
             ),
         )
 
+    @handles(ListAllWorkflowsRequest)
     async def on_list_all_workflows_request(self, _request: ListAllWorkflowsRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1386,6 +1275,7 @@ class WorkflowManager(EngineScoped):
             workflows=workflows, result_details=f"Successfully retrieved {len(workflows)} workflows."
         )
 
+    @handles(ListCallableWorkflowsRequest)
     async def on_list_callable_workflows_request(self, _request: ListCallableWorkflowsRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1403,6 +1293,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved {len(workflow_names)} callable workflows.",
         )
 
+    @handles(DeleteWorkflowRequest)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
         # If the deleted workflow is the active one, tear down its flows/nodes and
         # pop the context stack BEFORE removing the registry entry, so downstream
@@ -1452,6 +1343,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
 
+    @handles(RenameWorkflowRequest)
     async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
         # Sanitize to a Python module-friendly name for the file stem (registry key).
         sanitized_stem = normalize_display_name(request.requested_name)
@@ -1634,6 +1526,7 @@ class WorkflowManager(EngineScoped):
             workflow_dependencies=wf_info.workflow_dependencies,
         )
 
+    @handles(GetWorkflowInfoRequest)
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
@@ -1672,6 +1565,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved workflow info for '{workflow_file_path}'.",
         )
 
+    @handles(ListAllWorkflowInfoRequest)
     def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
@@ -1699,6 +1593,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved workflow info for {len(workflow_infos)} workflows.",
         )
 
+    @handles(GetWorkflowMetadataRequest)
     def on_get_workflow_metadata_request(self, request: GetWorkflowMetadataRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
@@ -1711,6 +1606,7 @@ class WorkflowManager(EngineScoped):
             result_details="Successfully retrieved workflow metadata.",
         )
 
+    @handles(GetWorkflowRunCommandRequest)
     async def on_get_workflow_run_command_request(self, request: GetWorkflowRunCommandRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         workflow_name = request.workflow_name
         file_path = request.file_path
@@ -1891,6 +1787,7 @@ class WorkflowManager(EngineScoped):
             return write_result.error_details
         return None
 
+    @handles(SetWorkflowMetadataRequest)
     async def on_set_workflow_metadata_request(self, request: SetWorkflowMetadataRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1964,6 +1861,7 @@ class WorkflowManager(EngineScoped):
             msg = f"Invalid workflow_metadata: {e!s}"
             raise ValueError(msg) from e
 
+    @handles(MoveWorkflowRequest)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0915
         try:
             # Validate source workflow exists
@@ -2073,6 +1971,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
+    @handles(LoadWorkflowMetadata)
     async def on_load_workflow_metadata_request(  # noqa: C901, PLR0912, PLR0915
         self, request: LoadWorkflowMetadata
     ) -> ResultPayload:
@@ -2648,6 +2547,7 @@ class WorkflowManager(EngineScoped):
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
 
+    @handles(SaveWorkflowRequest)
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
         context_manager = self.engine.context_manager
@@ -3299,6 +3199,7 @@ class WorkflowManager(EngineScoped):
                 situation_name,
             )
 
+    @handles(SaveWorkflowFileFromSerializedFlowRequest)
     async def on_save_workflow_file_from_serialized_flow_request(
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
@@ -3416,6 +3317,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(SaveSubflowToWorkflowRequest)
     async def on_save_subflow_to_workflow(self, request: SaveSubflowToWorkflowRequest) -> ResultPayload:
         """Save a subflow back to its original workflow file."""
         registry_key = request.workflow_name
@@ -6092,6 +5994,7 @@ class WorkflowManager(EngineScoped):
         """
         return WorkflowShape(inputs=input_node_params, outputs=output_node_params)
 
+    @handles(GetPublishOptionsRequest)
     def on_get_publish_options_request(self, request: GetPublishOptionsRequest) -> ResultPayload:
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
@@ -6110,6 +6013,7 @@ class WorkflowManager(EngineScoped):
             result_details="No custom publish options for this publisher.",
         )
 
+    @handles(PublishWorkflowRequest)
     async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
         try:
             publisher_name = request.publisher_name
@@ -6212,6 +6116,7 @@ class WorkflowManager(EngineScoped):
 
         return final_result
 
+    @handles(ImportWorkflowAsReferencedSubFlowRequest)
     async def on_import_workflow_as_referenced_sub_flow_request(
         self, request: ImportWorkflowAsReferencedSubFlowRequest
     ) -> ResultPayload:
@@ -6408,6 +6313,7 @@ class WorkflowManager(EngineScoped):
         )
         return selected
 
+    @handles(BranchWorkflowRequest)
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a branch (copy) of an existing workflow with branch tracking."""
         try:
@@ -6609,6 +6515,7 @@ class WorkflowManager(EngineScoped):
             source_label = PurePosixPath(source_registry_key).name
         return f"{source_label} (branch {branch_counter})"
 
+    @handles(CreateWorkflowFromTemplateRequest)
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
         try:
@@ -6694,6 +6601,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(MergeWorkflowBranchRequest)
     def on_merge_workflow_branch_request(self, request: MergeWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Merge a branch back into its source workflow, removing the branch when complete."""
         try:
@@ -6796,6 +6704,7 @@ class WorkflowManager(EngineScoped):
             details = f"Failed to merge branch workflow '{request.workflow_name}' into source workflow '{source_workflow_name}': {e!s}"
             return MergeWorkflowBranchResultFailure(result_details=details)
 
+    @handles(ResetWorkflowBranchRequest)
     def on_reset_workflow_branch_request(self, request: ResetWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Reset a branch to match its source workflow, discarding branch changes."""
         try:
@@ -6880,6 +6789,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
+    @handles(CompareWorkflowsRequest)
     def on_compare_workflows_request(self, request: CompareWorkflowsRequest) -> ResultPayload:
         """Compare two workflows to determine if one is ahead, behind, or up-to-date relative to the other."""
         try:
@@ -7115,6 +7025,7 @@ class WorkflowManager(EngineScoped):
 
         self._walk_object_tree(obj, collect_class_import)
 
+    @handles(RefreshWorkflowRegistryRequest)
     async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
         try:
             await self.refresh_workflow_registry()
@@ -7122,6 +7033,7 @@ class WorkflowManager(EngineScoped):
             return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
         return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
+    @handles(RegisterWorkflowsFromConfigRequest)
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
     ) -> ResultPayload:

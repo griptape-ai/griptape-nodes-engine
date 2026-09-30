@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import MCPServerConfig
+from griptape_nodes.retained_mode.request_handlers import handles
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -53,16 +54,7 @@ class MCPManager:
         self.config_manager = config_manager
         if event_manager is not None:
             # Register event handlers
-            event_manager.assign_manager_to_request_type(ListMCPServersRequest, self.on_list_mcp_servers_request)
-            event_manager.assign_manager_to_request_type(GetMCPServerRequest, self.on_get_mcp_server_request)
-            event_manager.assign_manager_to_request_type(CreateMCPServerRequest, self.on_create_mcp_server_request)
-            event_manager.assign_manager_to_request_type(UpdateMCPServerRequest, self.on_update_mcp_server_request)
-            event_manager.assign_manager_to_request_type(DeleteMCPServerRequest, self.on_delete_mcp_server_request)
-            event_manager.assign_manager_to_request_type(EnableMCPServerRequest, self.on_enable_mcp_server_request)
-            event_manager.assign_manager_to_request_type(DisableMCPServerRequest, self.on_disable_mcp_server_request)
-            event_manager.assign_manager_to_request_type(
-                GetEnabledMCPServersRequest, self.on_get_enabled_mcp_servers_request
-            )
+            event_manager.register_request_handlers(self)
 
     def _get_mcp_servers(self, filter_by: dict[str, Any] | None = None) -> list[MCPServerConfig]:
         """Get the current MCP servers configuration, treating an unreadable config as empty.
@@ -151,6 +143,7 @@ class MCPManager:
             if value is not None:
                 setattr(server_config, config_field, value)
 
+    @handles(ListMCPServersRequest)
     def on_list_mcp_servers_request(
         self, request: ListMCPServersRequest
     ) -> ListMCPServersResultSuccess | ListMCPServersResultFailure:
@@ -174,6 +167,7 @@ class MCPManager:
             result_details=f"Successfully listed {len(servers_dict)} MCP servers",
         )
 
+    @handles(GetMCPServerRequest)
     def on_get_mcp_server_request(
         self, request: GetMCPServerRequest
     ) -> GetMCPServerResultSuccess | GetMCPServerResultFailure:
@@ -191,6 +185,7 @@ class MCPManager:
             result_details=f"Successfully retrieved MCP server '{request.name}'",
         )
 
+    @handles(CreateMCPServerRequest)
     def on_create_mcp_server_request(
         self, request: CreateMCPServerRequest
     ) -> CreateMCPServerResultSuccess | CreateMCPServerResultFailure:
@@ -245,6 +240,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully created MCP server '{request.name}'"
         )
 
+    @handles(UpdateMCPServerRequest)
     def on_update_mcp_server_request(
         self, request: UpdateMCPServerRequest
     ) -> UpdateMCPServerResultSuccess | UpdateMCPServerResultFailure:
@@ -279,6 +275,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully updated MCP server '{request.name}'"
         )
 
+    @handles(DeleteMCPServerRequest)
     def on_delete_mcp_server_request(
         self, request: DeleteMCPServerRequest
     ) -> DeleteMCPServerResultSuccess | DeleteMCPServerResultFailure:
@@ -310,6 +307,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully deleted MCP server '{request.name}'"
         )
 
+    @handles(EnableMCPServerRequest)
     def on_enable_mcp_server_request(
         self, request: EnableMCPServerRequest
     ) -> EnableMCPServerResultSuccess | EnableMCPServerResultFailure:
@@ -339,6 +337,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully enabled MCP server '{request.name}'"
         )
 
+    @handles(DisableMCPServerRequest)
     def on_disable_mcp_server_request(
         self, request: DisableMCPServerRequest
     ) -> DisableMCPServerResultSuccess | DisableMCPServerResultFailure:
@@ -368,6 +367,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully disabled MCP server '{request.name}'"
         )
 
+    @handles(GetEnabledMCPServersRequest)
     def on_get_enabled_mcp_servers_request(
         self,
         request: GetEnabledMCPServersRequest,  # noqa: ARG002

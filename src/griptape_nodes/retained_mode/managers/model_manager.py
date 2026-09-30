@@ -59,6 +59,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import cancel_subprocess
 from griptape_nodes.utils.model_download_errors import (
     RETRYABLE_KINDS,
@@ -380,20 +381,7 @@ class ModelManager(EngineScoped):
         self._download_processes = {}
 
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(DownloadModelRequest, self.on_handle_download_model_request)
-            event_manager.assign_manager_to_request_type(ListModelsRequest, self.on_handle_list_models_request)
-            event_manager.assign_manager_to_request_type(DeleteModelRequest, self.on_handle_delete_model_request)
-            event_manager.assign_manager_to_request_type(SearchModelsRequest, self.on_handle_search_models_request)
-            event_manager.assign_manager_to_request_type(GetModelInfoRequest, self.on_handle_get_model_info_request)
-            event_manager.assign_manager_to_request_type(
-                DeclareModelInvocationRequest, self.on_handle_declare_model_invocation_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListModelDownloadsRequest, self.on_handle_list_model_downloads_request
-            )
-            event_manager.assign_manager_to_request_type(
-                DeleteModelDownloadRequest, self.on_handle_delete_model_download_request
-            )
+            event_manager.register_request_handlers(self)
 
             event_manager.add_listener_to_app_event(AppInitializationComplete, self.on_app_initialization_complete)
 
@@ -472,6 +460,7 @@ class ModelManager(EngineScoped):
         status_dir.mkdir(parents=True, exist_ok=True)
         return status_dir
 
+    @handles(DownloadModelRequest)
     async def on_handle_download_model_request(self, request: DownloadModelRequest) -> ResultPayload:
         """Handle model download requests asynchronously.
 
@@ -711,6 +700,7 @@ class ModelManager(EngineScoped):
             if model_id in self._download_processes:
                 del self._download_processes[model_id]
 
+    @handles(ListModelsRequest)
     async def on_handle_list_models_request(self, request: ListModelsRequest) -> ResultPayload:  # noqa: ARG002
         """Handle model listing requests asynchronously.
 
@@ -741,6 +731,7 @@ class ModelManager(EngineScoped):
                 exception=e,
             )
 
+    @handles(DeleteModelRequest)
     async def on_handle_delete_model_request(self, request: DeleteModelRequest) -> ResultPayload:
         """Handle model deletion requests asynchronously.
 
@@ -788,6 +779,7 @@ class ModelManager(EngineScoped):
             result_details=result_details,
         )
 
+    @handles(SearchModelsRequest)
     async def on_handle_search_models_request(self, request: SearchModelsRequest) -> ResultPayload:
         """Handle model search requests asynchronously.
 
@@ -818,6 +810,7 @@ class ModelManager(EngineScoped):
                 result_details=result_details,
             )
 
+    @handles(GetModelInfoRequest)
     async def on_handle_get_model_info_request(self, request: GetModelInfoRequest) -> ResultPayload:
         """Fetch detailed info for a specific model from Hugging Face Hub.
 
@@ -902,6 +895,7 @@ class ModelManager(EngineScoped):
             None,
         )
 
+    @handles(DeclareModelInvocationRequest)
     def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
         """Acknowledge a node's declaration that it is about to invoke a model.
 
@@ -1194,6 +1188,7 @@ class ModelManager(EngineScoped):
             return True
         return recorded_kind in RETRYABLE_KINDS
 
+    @handles(ListModelDownloadsRequest)
     async def on_handle_list_model_downloads_request(self, request: ListModelDownloadsRequest) -> ResultPayload:
         """Handle model download status requests asynchronously.
 
@@ -1385,6 +1380,7 @@ class ModelManager(EngineScoped):
         # Get all download statuses
         return self._list_all_download_statuses()
 
+    @handles(DeleteModelDownloadRequest)
     async def on_handle_delete_model_download_request(self, request: DeleteModelDownloadRequest) -> ResultPayload:
         """Handle model download status deletion requests asynchronously.
 
