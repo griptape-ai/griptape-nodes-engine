@@ -361,7 +361,7 @@ class FlowManager(EngineScoped):
         self._global_dag_builder = DagBuilder(self.engine)
         self._node_executor = NodeExecutor(self.engine)
         # Collects node timings for the node_run_timing beta feature. The control flow starts each
-        # timed run, and whichever teardown path runs last logs its summary.
+        # timed run, and whichever teardown path runs first logs its summary.
         self.run_timer = NodeRunTimer()
 
     @property
