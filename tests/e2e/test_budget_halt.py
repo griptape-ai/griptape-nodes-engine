@@ -1,7 +1,7 @@
 """End-to-end coverage for a run that Griptape Cloud refuses over budget.
 
-The unit tests prove each piece: the body parses, the sentence reads well, the verdict survives a
-worker boundary. None of them proves the pieces are wired to each other. This suite runs a real
+The unit tests prove each piece: the body parses, the sentence reads well, the halt is found under
+whatever wrapped it. None of them proves the pieces are wired to each other. This suite runs a real
 flow against a real HTTP server answering a real 403, and asks the three questions an artist would:
 
 1. **Did the run stop?** A refusal the engine notices but does not act on is the worst outcome --
@@ -11,9 +11,8 @@ flow against a real HTTP server answering a real 403, and asks the three questio
 3. **Does a wired Failed branch still run?** A refusal is one node's failure. The Failed branch may
    lead somewhere the budget does not reach, such as a local model, so it is taken like any other.
 
-Both execution modes run every test. Sequential is parallel with ``max_nodes_in_parallel=1``, but
-the halt is worded in one machine and re-read in another, and only running both proves the wording
-survives the trip.
+Both execution modes run every test, since each frames a node failure on its own way out and the
+halt's wording has to survive both.
 """
 
 from __future__ import annotations
