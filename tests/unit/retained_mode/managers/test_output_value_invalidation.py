@@ -103,9 +103,9 @@ class TestEditInvalidatesOutputValue:
 
         file_path = _save_flow_to_disk(engine, flow_name, tmp_path, "edit_round_trip")
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
+            import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            monkeypatch.setattr(saving_module, "datetime", _FrozenDateTime)
             _reload_from_disk(engine, file_path)
 
         assert _get_value(engine, node_name, "value") == "edited"

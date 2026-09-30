@@ -524,7 +524,7 @@ class NodeExecutor(EngineScoped):
 
         Call this at the boundary that deserializes in-process, not at the one that packages.
         Generated workflow files are emitted by reflecting over each create command's non-default
-        fields (workflow_manager._generate_node_creation_code), so a command carrying
+        fields (WorkflowCodeGenerator._generate_node_creation_code), so a command carrying
         broadcast_result=False writes that transport detail into the saved artifact. Packaging runs
         before the execution-environment branch, and the private and cloud-publisher branches hand
         the very same serialized_flow_commands to SaveWorkflowFileFromSerializedFlowRequest -- so

@@ -108,7 +108,7 @@ def _generate_subflow_workflow_source(engine: Engine, library_json: Path) -> str
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )

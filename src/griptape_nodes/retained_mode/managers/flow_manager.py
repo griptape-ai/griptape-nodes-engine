@@ -177,6 +177,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
+from griptape_nodes.retained_mode.managers.workflow.shape import (
+    build_workflow_shape_from_parameter_info,
+    extract_parameter_shape_info,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -184,7 +188,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
+    from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
@@ -1565,7 +1569,7 @@ class FlowManager(EngineScoped):
         )
 
         # Build WorkflowShape from collected parameter shape data
-        workflow_shape = self.engine.workflow_manager.build_workflow_shape_from_parameter_info(
+        workflow_shape = build_workflow_shape_from_parameter_info(
             input_node_params=start_node_result.input_shape_data,
             output_node_params=end_node_packaging_result.output_shape_data,
         )
@@ -2253,9 +2257,7 @@ class FlowManager(EngineScoped):
         )
 
         # Extract parameter shape info for workflow shape (outputs to external consumers)
-        param_shape_info = self.engine.workflow_manager.extract_parameter_shape_info(
-            parameter, include_control_params=True
-        )
+        param_shape_info = extract_parameter_shape_info(parameter, include_control_params=True)
         if param_shape_info is not None:
             if end_node_name not in output_shape_data:
                 output_shape_data[end_node_name] = {}
@@ -2551,9 +2553,7 @@ class FlowManager(EngineScoped):
                 return PackageNodesAsSerializedFlowResultFailure(result_details=details)
 
             # Extract parameter shape info for workflow shape (inputs from external sources)
-            param_shape_info = self.engine.workflow_manager.extract_parameter_shape_info(
-                source_param, include_control_params=True
-            )
+            param_shape_info = extract_parameter_shape_info(source_param, include_control_params=True)
             if param_shape_info is not None:
                 if start_node_name not in input_shape_data:
                     input_shape_data[start_node_name] = {}
