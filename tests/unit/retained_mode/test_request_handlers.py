@@ -34,6 +34,11 @@ class _UnmarkedOverride(_Base):
     def on_ping(self, request: _PingRequest) -> ResultPayload: ...
 
 
+class _RemarkedOverride(_Base):
+    @handles(_PongRequest)
+    def on_ping(self, request: RequestPayload) -> ResultPayload: ...
+
+
 class _Stacked:
     @handles(_PingRequest)
     @handles(_PongRequest)
@@ -66,6 +71,15 @@ class TestRegisterRequestHandlers:
         event_manager.register_request_handlers(owner)
 
         assert event_manager._request_type_to_manager[_PingRequest] == owner.on_ping
+
+    def test_remarked_override_replaces_parent_marks(self) -> None:
+        event_manager = EventManager()
+        owner = _RemarkedOverride()
+
+        event_manager.register_request_handlers(owner)
+
+        assert _PingRequest not in event_manager._request_type_to_manager
+        assert event_manager._request_type_to_manager[_PongRequest] == owner.on_ping
 
     def test_second_owner_for_same_type_raises(self) -> None:
         event_manager = EventManager()
