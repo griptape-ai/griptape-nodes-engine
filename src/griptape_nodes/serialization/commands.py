@@ -9,12 +9,16 @@ parameter values keep the tagged form of ``values.py``, because a value can be o
 
 from __future__ import annotations
 
+import dataclasses
+import types
+import typing
 from typing import Any
 
 from cattrs import BaseValidationError, transform_error
 
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SerializedSelectedNodesCommands
+from griptape_nodes.retained_mode.events.node_events import SerializedSelectedNodesCommands
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterGroupToNodeRequest,
     AddParameterToNodeRequest,
@@ -53,33 +57,100 @@ class CommandsFormatError(Exception):
 
 
 def check_element_modification_commands(commands: SerializedFlowCommands | SerializedSelectedNodesCommands) -> None:
-    """Refuse decoded commands naming an element command type serialization never writes.
+    """Refuse decoded commands holding a request anywhere serialization would not have put it.
+
+    Each field must hold exactly the request type it declares. Pickle ignores declared types, so
+    without this a payload could put any request in, say, a node's lock command, which loading runs.
+    ``element_modification_commands`` declares any request, so it is held to the types in
+    ``ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES``.
 
     Raises:
-        CommandsFormatError: A node's element_modification_commands holds such a type.
+        CommandsFormatError: A field holds a request of another type.
     """
-    if isinstance(commands, SerializedFlowCommands):
-        _check_flow_commands(commands)
+    _check_dataclass(commands)
+
+
+def _check_dataclass(instance: Any) -> None:
+    for field in dataclasses.fields(instance):
+        declared = _field_types(type(instance))[field.name]
+        _check_value(getattr(instance, field.name), declared, f"{type(instance).__qualname__}.{field.name}")
+
+
+def _check_value(value: Any, declared: Any, where: str) -> None:
+    """Check each request and command in ``value`` against the ``declared`` type that holds it."""
+    declared = _without_new_types(declared)
+    origin = typing.get_origin(declared)
+    if origin in (typing.Union, types.UnionType):
+        _check_union_member(value, declared, where)
+        return
+    if origin in (list, set, frozenset, tuple, dict):
+        _check_items(value, declared, where)
+        return
+    if declared is RequestPayload:
+        if type(value) not in ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES:
+            _refuse(value, where)
+        return
+    if isinstance(declared, type) and dataclasses.is_dataclass(declared):
+        if type(value) is not declared:
+            _refuse(value, where)
+        _check_dataclass(value)
+        return
+    if isinstance(value, RequestPayload):
+        # A request where the declaration names no request type at all.
+        _refuse(value, where)
+
+
+def _check_union_member(value: Any, declared: Any, where: str) -> None:
+    if value is None:
+        return
+    matching = [option for option in typing.get_args(declared) if _is_instance_of(value, option)]
+    if not matching:
+        _refuse(value, where)
+    _check_value(value, matching[0], where)
+
+
+def _check_items(value: Any, declared: Any, where: str) -> None:
+    arguments = typing.get_args(declared)
+    if isinstance(value, dict):
+        item_type = arguments[1] if len(arguments) > 1 else Any
+        items = value.values()
+    elif isinstance(value, list | set | frozenset | tuple):
+        item_type = arguments[0] if arguments else Any
+        items = value
     else:
-        for node_commands in commands.serialized_node_commands:
-            _check_node_commands(node_commands)
+        return
+    for item in items:
+        _check_value(item, item_type, where)
 
 
-def _check_flow_commands(flow_commands: SerializedFlowCommands) -> None:
-    for node_commands in flow_commands.serialized_node_commands:
-        _check_node_commands(node_commands)
-    for sub_flow_commands in flow_commands.sub_flows_commands:
-        _check_flow_commands(sub_flow_commands)
+def _is_instance_of(value: Any, declared: Any) -> bool:
+    declared = _without_new_types(declared)
+    target = typing.get_origin(declared) or declared
+    if not isinstance(target, type):
+        return True
+    if dataclasses.is_dataclass(target):
+        return type(value) is target
+    return isinstance(value, target)
 
 
-def _check_node_commands(node_commands: SerializedNodeCommands) -> None:
-    for element_command in node_commands.element_modification_commands:
-        if type(element_command) not in ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES:
-            msg = (
-                f"a node's element command is a '{type(element_command).__qualname__}', which "
-                "Griptape Nodes never saves there"
-            )
-            raise CommandsFormatError(msg)
+def _without_new_types(declared: Any) -> Any:
+    while hasattr(declared, "__supertype__"):
+        declared = declared.__supertype__
+    return declared
+
+
+def _field_types(cls: type) -> dict[str, Any]:
+    if cls not in _FIELD_TYPES:
+        _FIELD_TYPES[cls] = typing.get_type_hints(cls)
+    return _FIELD_TYPES[cls]
+
+
+def _refuse(value: Any, where: str) -> typing.NoReturn:
+    msg = f"'{where}' holds a '{type(value).__qualname__}', which Griptape Nodes never saves there"
+    raise CommandsFormatError(msg)
+
+
+_FIELD_TYPES: dict[type, dict[str, Any]] = {}
 
 
 def encode_commands(commands: SerializedFlowCommands | SerializedSelectedNodesCommands) -> dict[str, JsonValue]:
