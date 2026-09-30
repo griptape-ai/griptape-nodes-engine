@@ -7,12 +7,13 @@ beside ``$type``; any other state sits under ``$value``:
     {"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", ...}
     {"$type": "builtins:tuple", "$value": [1, "b"]}
 
-A class's state comes from the first adapter that claims it. A class can supply its own by
-implementing ``SavesState``. A class you cannot edit can be covered with ``register_value_codec``.
+A class's state comes from its codec: a pair of functions to and from plain data. Library authors
+add codecs with ``register_value_codec``; the engine's built-in codecs cover enums, paths, dates,
+pydantic models, dataclasses, attrs classes, and griptape objects.
 
 Decoding imports a ``$type``'s module only if it is already loaded, or its top-level package is
 ``griptape`` or ``griptape_nodes`` (this covers node library files, loaded lazily under
-``griptape_nodes.node_libraries.*``). It builds only classes an adapter claims, and building one
+``griptape_nodes.node_libraries.*``). It builds only classes a codec covers, and building one
 runs its constructor on the data, so a class from any loaded module can be built. A value this
 process cannot build or is not allowed to import, such as one whose class lives in a library
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
@@ -31,19 +32,22 @@ import inspect
 import json
 import logging
 import math
+import sys
 import uuid
 import weakref
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self, overload
 
 import attrs
 from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.serialization.type_names import (
+    IMPORTABLE_TOP_LEVEL_PACKAGES,
     ModuleUnavailableError,
     TypeNameError,
     resolve_type_name,
+    stable_module_name,
     type_name,
 )
 
@@ -78,16 +82,6 @@ class UndecodedValue(dict):
         self.reason = reason
 
 
-class ValueAdapter(Protocol):
-    """Converts instances of the classes it claims to and from a state of plain data or values."""
-
-    def claims(self, cls: type) -> bool: ...
-
-    def to_state(self, value: Any) -> Any: ...
-
-    def from_state(self, cls: type, state: Any) -> Any: ...
-
-
 def encode_value(value: Any) -> JsonValue:
     """Return ``value`` as plain data that ``decode_value`` turns back into an equal value.
 
@@ -113,11 +107,7 @@ def decode_value(data: Any) -> Any:
 
 
 class SavesState(Protocol):
-    """A value that saves as the state ``to_state()`` returns and reopens through ``from_state()``.
-
-    Any class with these two methods saves this way. Inheriting from this only lets a type checker
-    check their signatures.
-    """
+    """A class that saves as the state ``to_state()`` returns and reopens through ``from_state()``."""
 
     def to_state(self) -> Any: ...
 
@@ -125,32 +115,56 @@ class SavesState(Protocol):
     def from_state(cls, state: Any) -> Self: ...
 
 
-def register_value_codec[T](
-    cls: type[T],
-    *,
-    to_state: Callable[[T], Any],
-    from_state: Callable[[Any], T],
-) -> None:
-    """Save and reopen values of exactly ``cls``, not its subclasses, with these functions.
+@overload
+def register_value_codec[T: SavesState](cls: type[T], /) -> type[T]: ...
 
-    For classes you cannot give ``to_state()`` and ``from_state()``. Checked after plain data,
-    containers, and ``Path``, and before every built-in adapter. Registering again from the module
-    that registered ``cls``, as when a library reloads, replaces the earlier functions.
+
+@overload
+def register_value_codec[T](
+    cls: type[T], /, *, to_state: Callable[[T], Any], from_state: Callable[[Any], T]
+) -> type[T]: ...
+
+
+def register_value_codec(
+    cls: type,
+    /,
+    *,
+    to_state: Callable[[Any], Any] | None = None,
+    from_state: Callable[[Any], Any] | None = None,
+) -> type:
+    """Make values of ``cls`` save and reopen.
+
+    As a class decorator, for a class you own: the class's own ``to_state()`` and ``from_state()``
+    classmethod are used, for it and its subclasses. With ``to_state`` and ``from_state``, for a
+    class you cannot edit: they cover exactly ``cls``, which must have no other way to save.
+    Register those from your library's ``before_library_nodes_loaded``, so every process that loads
+    the library has them.
+
+    Registering again from the same library, as when it reloads, replaces the codec. A class
+    another library registered keeps that library's codec, with a warning.
 
     Raises:
-        ValueError: ``cls`` is a type the codec encodes itself, or another module registered it.
+        ValueError: ``cls`` belongs to Griptape, already saves another way, or, as a decorator,
+            lacks ``to_state()`` or a ``from_state()`` classmethod.
+        TypeError: only one of ``to_state`` and ``from_state`` was given.
     """
-    if cls in _UNREGISTRABLE or issubclass(cls, Path):
-        msg = f"Attempted to register a codec for '{cls.__qualname__}'. Failed because values of that type are always saved as themselves."
-        raise ValueError(msg)
-    existing = _codecs.get(cls)
-    if existing is not None and existing.module != to_state.__module__:
-        msg = (
-            f"Attempted to register a codec for '{cls.__qualname__}' from '{to_state.__module__}'. "
-            f"Failed because '{existing.module}' already registered one."
+    owner = _owner_of(sys._getframe(1).f_globals.get("__name__", ""))
+    registration = _registration_for(cls, to_state, from_state, owner)
+    existing = _registered.get(cls)
+    if existing is not None and existing.owner != owner:
+        logger.warning(
+            "Attempted to register how '%s' values save from '%s'. Kept the one '%s' registered, so "
+            "values saved by '%s' reopen only where '%s' is installed.",
+            cls.__qualname__,
+            owner,
+            existing.owner,
+            owner,
+            existing.owner,
         )
-        raise ValueError(msg)
-    _codecs[cls] = _Codec(to_state=to_state, from_state=from_state, module=to_state.__module__)
+        return cls
+    _registered[cls] = registration
+    _codec_cache.clear()
+    return cls
 
 
 def _encode(value: Any, active: set[int]) -> JsonValue:
@@ -189,12 +203,9 @@ def _encode_compound(value: Any, cls: type, active: set[int]) -> JsonValue:  # n
     if isinstance(value, Path):
         # Named as Path, not PosixPath or WindowsPath, so a file saved on one OS opens on another.
         return _tagged(Path, str(value))
-    codec = _codecs.get(cls)
+    codec = _codec_for(cls)
     if codec is not None:
         return _tagged(cls, _encode(_codec_state(codec, value), active))
-    adapter = _adapter_for(cls)
-    if adapter is not None:
-        return _tagged(cls, _encode(_adapter_state(adapter, value), active))
     return _encode_as_base_type(value, cls, active)
 
 
@@ -224,17 +235,6 @@ def _encode_dict(value: dict, active: set[int]) -> JsonValue:
     # Wrapped, so a text "$type" key does not read as a tag. Encoded values held as data, such
     # as a saved workflow's value pool, stay readable this way.
     return _tagged(dict, encoded)
-
-
-def _adapter_state(adapter: ValueAdapter, value: Any) -> Any:
-    try:
-        return adapter.to_state(value)
-    except ValueEncodeError:
-        raise
-    except Exception as error:
-        # Adapters run library code, which can raise anything.
-        msg = f"A '{type(value).__qualname__}' value failed to produce its plain-data form: {error}"
-        raise ValueEncodeError(msg) from error
 
 
 def _tagged(cls: type, state: JsonValue) -> dict[str, JsonValue]:
@@ -277,26 +277,15 @@ def _build(cls: type, state: Any, data: dict[str, Any]) -> Any:
     builtin_decoder = _BUILTIN_DECODERS.get(cls)
     if builtin_decoder is not None:
         return _decode_builtin(builtin_decoder, cls, state, data)
-    codec = _codecs.get(cls)
-    if codec is not None:
-        return _decode_with_codec(codec, cls, state, data)
-    adapter = _adapter_for(cls)
-    if adapter is None:
+    codec = _codec_for(cls)
+    if codec is None:
         return UndecodedValue(data, f"'{data[TYPE_KEY]}' has no plain-data form in this process")
-    return _decode_with_adapter(adapter, cls, state, data)
-
-
-def _decode_with_adapter(adapter: ValueAdapter, cls: type, state: Any, data: dict[str, Any]) -> Any:
-    try:
-        return adapter.from_state(cls, state)
-    except Exception as error:
-        # Adapters run library code, which can raise anything.
-        return _undecodable(data, f"a saved '{cls.__qualname__}' value could not be rebuilt: {error}")
+    return _decode_with_codec(codec, cls, state, data)
 
 
 def _decode_with_codec(codec: _Codec, cls: type, state: Any, data: dict[str, Any]) -> Any:
     try:
-        return codec.from_state(state)
+        return codec.from_state(cls, state)
     except Exception as error:
         # Codecs run library code, which can raise anything.
         return _undecodable(data, f"a saved '{cls.__qualname__}' value could not be rebuilt: {error}")
@@ -344,14 +333,6 @@ def _decode_dict(state: dict | list[list[Any]]) -> dict:
     return {key: item for key, item in state}  # noqa: C416 pairs arrive as two-item lists, not tuples
 
 
-def _adapter_for(cls: type) -> ValueAdapter | None:
-    if cls in _adapter_cache:
-        return _adapter_cache[cls]
-    found = next((adapter for adapter in _adapters if adapter.claims(cls)), None)
-    _adapter_cache[cls] = found
-    return found
-
-
 def _codec_state(codec: _Codec, value: Any) -> Any:
     try:
         return codec.to_state(value)
@@ -363,139 +344,125 @@ def _codec_state(codec: _Codec, value: Any) -> Any:
         raise ValueEncodeError(msg) from error
 
 
-@dataclasses.dataclass(frozen=True)
-class _Codec:
-    to_state: Callable[[Any], Any]
-    from_state: Callable[[Any], Any]
-    module: str
+def _codec_for(cls: type) -> _Codec | None:
+    """A registered codec for ``cls`` or a decorated base class, else the first built-in rule that matches."""
+    if cls in _codec_cache:
+        return _codec_cache[cls]
+    found = _registered_codec_for(cls)
+    if found is None:
+        found = _builtin_codec_for(cls)
+    _codec_cache[cls] = found
+    return found
+
+
+def _registered_codec_for(cls: type) -> _Codec | None:
+    for base in cls.__mro__:
+        registration = _registered.get(base)
+        if registration is not None and (base is cls or registration.covers_subclasses):
+            return registration.codec
+    return None
+
+
+def _builtin_codec_for(cls: type) -> _Codec | None:
+    return next((codec for matches, codec in _BUILTIN_CODECS if matches(cls)), None)
+
+
+def _registration_for(
+    cls: type,
+    to_state: Callable[[Any], Any] | None,
+    from_state: Callable[[Any], Any] | None,
+    owner: str,
+) -> _Registration:
+    if cls in _PLAIN_DATA_TYPES or issubclass(cls, Path) or _is_griptape_class(cls):
+        msg = f"Attempted to register how '{cls.__qualname__}' values save. Failed because Griptape already defines it."
+        raise ValueError(msg)
+    if to_state is None and from_state is None:
+        if not (callable(getattr(cls, "to_state", None)) and _is_classmethod(cls, "from_state")):
+            msg = (
+                f"Attempted to register how '{cls.__qualname__}' values save. Failed because it needs a "
+                "to_state() method and a from_state() classmethod."
+            )
+            raise ValueError(msg)
+        return _Registration(_Codec(_call_to_state, _call_from_state), owner, covers_subclasses=True)
+    if to_state is None or from_state is None:
+        msg = f"Attempted to register how '{cls.__qualname__}' values save. Failed because it needs both to_state and from_state."
+        raise TypeError(msg)
+    already_saves = _registered_codec_for(cls) is not None or _builtin_codec_for(cls) is not None
+    if cls not in _registered and already_saves:
+        msg = (
+            f"Attempted to register how '{cls.__qualname__}' values save. Failed because it already saves another way."
+        )
+        raise ValueError(msg)
+    return _Registration(_Codec(to_state, _ignore_class(from_state)), owner, covers_subclasses=False)
+
+
+def _owner_of(module_name: str) -> str:
+    """The library a module belongs to, or the module itself outside a library."""
+    stable = stable_module_name(module_name)
+    if stable is not None and stable.startswith(_LIBRARY_NAMESPACE_PREFIX):
+        return ".".join(stable.split(".")[:3])
+    return module_name
+
+
+def _is_griptape_class(cls: type) -> bool:
+    return cls.__module__.partition(".")[0] in IMPORTABLE_TOP_LEVEL_PACKAGES and not cls.__module__.startswith(
+        _LIBRARY_NAMESPACE_PREFIX
+    )
 
 
 def _is_classmethod(cls: type, name: str) -> bool:
     return isinstance(inspect.getattr_static(cls, name, None), classmethod)
 
 
-class _StateMethodsAdapter:
-    """Classes that implement ``SavesState``."""
-
-    def claims(self, cls: type) -> bool:
-        return callable(getattr(cls, "to_state", None)) and _is_classmethod(cls, "from_state")
-
-    def to_state(self, value: Any) -> Any:
-        return value.to_state()
-
-    def from_state(self, cls: type, state: Any) -> Any:
-        return cls.from_state(state)  # pyright: ignore[reportAttributeAccessIssue]
+def _call_to_state(value: Any) -> Any:
+    return value.to_state()
 
 
-class _EnumAdapter:
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, enum.Enum)
-
-    def to_state(self, value: enum.Enum) -> Any:
-        return value.value
-
-    def from_state(self, cls: type, state: Any) -> Any:
-        return cls(state)
+def _call_from_state(cls: type, state: Any) -> Any:
+    return cls.from_state(state)
 
 
-class _PathAdapter:
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, PurePath)
-
-    def to_state(self, value: PurePath) -> str:
-        return str(value)
-
-    def from_state(self, cls: type, state: str) -> Any:
-        return cls(state)
+def _ignore_class(from_state: Callable[[Any], Any]) -> Callable[[type, Any], Any]:
+    return lambda _cls, state: from_state(state)
 
 
-class _IsoFormatAdapter:
-    """Dates, times, and datetimes, including subclasses such as pendulum's."""
-
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, (datetime.date, datetime.time))
-
-    def to_state(self, value: datetime.date | datetime.time) -> str:
-        return value.isoformat()
-
-    def from_state(self, cls: type, state: str) -> Any:
-        return cls.fromisoformat(state)  # pyright: ignore[reportAttributeAccessIssue]
+def _fields_state(value: Any) -> dict[str, Any]:
+    if attrs.has(type(value)):
+        return {field.alias: getattr(value, field.name) for field in attrs.fields(type(value)) if field.init}
+    return {field.name: getattr(value, field.name) for field in dataclasses.fields(value) if field.init}
 
 
-class _TimedeltaAdapter:
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, datetime.timedelta)
-
-    def to_state(self, value: datetime.timedelta) -> list[int]:
-        return [value.days, value.seconds, value.microseconds]
-
-    def from_state(self, cls: type, state: list[int]) -> Any:
-        days, seconds, microseconds = state
-        return cls(days=days, seconds=seconds, microseconds=microseconds)
+def _timedelta_state(value: datetime.timedelta) -> list[int]:
+    return [value.days, value.seconds, value.microseconds]
 
 
-class _TextFormAdapter:
-    """Classes that print as text their constructor reads back."""
-
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, (uuid.UUID, decimal.Decimal))
-
-    def to_state(self, value: uuid.UUID | decimal.Decimal) -> str:
-        return str(value)
-
-    def from_state(self, cls: type, state: str) -> Any:
-        return cls(state)
+def _timedelta_from_state(cls: type, state: list[int]) -> Any:
+    days, seconds, microseconds = state
+    return cls(days=days, seconds=seconds, microseconds=microseconds)
 
 
-class _NamedTupleAdapter:
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, tuple) and hasattr(cls, "_fields")
-
-    def to_state(self, value: Any) -> dict[str, Any]:
-        return value._asdict()
-
-    def from_state(self, cls: type, state: dict[str, Any]) -> Any:
-        return cls(**state)
+def _build_from_text(cls: type, state: str) -> Any:
+    return cls(state)
 
 
-class _PydanticAdapter:
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, BaseModel)
-
-    def to_state(self, value: BaseModel) -> Any:
-        return value.model_dump(mode="json")
-
-    def from_state(self, cls: type, state: Any) -> Any:
-        return cls.model_validate(state)  # pyright: ignore[reportAttributeAccessIssue]
+def _build_from_fields(cls: type, state: dict[str, Any]) -> Any:
+    return cls(**state)
 
 
-class _GriptapeAdapter:
-    """Griptape objects such as artifacts and rulesets."""
-
-    def claims(self, cls: type) -> bool:
-        return issubclass(cls, SerializableMixin)
-
-    def to_state(self, value: SerializableMixin) -> Any:
-        return value.to_dict()
-
-    def from_state(self, cls: type[SerializableMixin], state: Any) -> Any:
-        return cls.from_dict(state)
+@dataclasses.dataclass(frozen=True)
+class _Codec:
+    to_state: Callable[[Any], Any]
+    from_state: Callable[[type, Any], Any]
 
 
-class _FieldsAdapter:
-    """Dataclasses and attrs classes, by the fields their constructor takes."""
+@dataclasses.dataclass(frozen=True)
+class _Registration:
+    codec: _Codec
+    owner: str
+    covers_subclasses: bool
 
-    def claims(self, cls: type) -> bool:
-        return dataclasses.is_dataclass(cls) or attrs.has(cls)
 
-    def to_state(self, value: Any) -> dict[str, Any]:
-        if attrs.has(type(value)):
-            return {field.alias: getattr(value, field.name) for field in attrs.fields(type(value)) if field.init}
-        return {field.name: getattr(value, field.name) for field in dataclasses.fields(value) if field.init}
-
-    def from_state(self, cls: type, state: dict[str, Any]) -> Any:
-        return cls(**state)
-
+_LIBRARY_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
 
 _BUILTIN_DECODERS: dict[type, Any] = {
     tuple: tuple,
@@ -508,26 +475,37 @@ _BUILTIN_DECODERS: dict[type, Any] = {
     Path: Path,
 }
 
-# Types encoding handles before consulting codecs, so a codec for one would never run.
-_UNREGISTRABLE = frozenset(
+# Encoded as themselves or by _encode directly, before any codec is looked up.
+_PLAIN_DATA_TYPES = frozenset(
     {type(None), bool, int, float, str, bytes, bytearray, list, dict, tuple, set, frozenset, UndecodedValue}
 )
 
-# Weak, so classes from a reloaded library file are not kept alive.
-_codecs: weakref.WeakKeyDictionary[type, _Codec] = weakref.WeakKeyDictionary()
-
-_adapters: list[ValueAdapter] = [
-    _StateMethodsAdapter(),
-    _EnumAdapter(),
-    _PathAdapter(),
-    _IsoFormatAdapter(),
-    _TimedeltaAdapter(),
-    _TextFormAdapter(),
-    _NamedTupleAdapter(),
-    _PydanticAdapter(),
-    _GriptapeAdapter(),
-    _FieldsAdapter(),
+# The engine's codecs, matched by rule and tried in order. Private: a rule can cover classes that
+# belong to anyone, so libraries register by class instead.
+_BUILTIN_CODECS: list[tuple[Callable[[type], bool], _Codec]] = [
+    (lambda cls: issubclass(cls, enum.Enum), _Codec(lambda value: value.value, _build_from_text)),
+    (lambda cls: issubclass(cls, PurePath), _Codec(str, _build_from_text)),
+    (
+        lambda cls: issubclass(cls, (datetime.date, datetime.time)),
+        _Codec(lambda value: value.isoformat(), lambda cls, state: cls.fromisoformat(state)),
+    ),
+    (lambda cls: issubclass(cls, datetime.timedelta), _Codec(_timedelta_state, _timedelta_from_state)),
+    (lambda cls: issubclass(cls, (uuid.UUID, decimal.Decimal)), _Codec(str, _build_from_text)),
+    (
+        lambda cls: issubclass(cls, tuple) and hasattr(cls, "_fields"),
+        _Codec(lambda value: value._asdict(), _build_from_fields),
+    ),
+    (
+        lambda cls: issubclass(cls, BaseModel),
+        _Codec(lambda value: value.model_dump(mode="json"), lambda cls, state: cls.model_validate(state)),
+    ),
+    (
+        lambda cls: issubclass(cls, SerializableMixin),
+        _Codec(lambda value: value.to_dict(), lambda cls, state: cls.from_dict(state)),
+    ),
+    (lambda cls: dataclasses.is_dataclass(cls) or attrs.has(cls), _Codec(_fields_state, _build_from_fields)),
 ]
 
 # Weak, so classes from a reloaded library file are not kept alive.
-_adapter_cache: weakref.WeakKeyDictionary[type, ValueAdapter | None] = weakref.WeakKeyDictionary()
+_registered: weakref.WeakKeyDictionary[type, _Registration] = weakref.WeakKeyDictionary()
+_codec_cache: weakref.WeakKeyDictionary[type, _Codec | None] = weakref.WeakKeyDictionary()

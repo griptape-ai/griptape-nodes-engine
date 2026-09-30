@@ -72,6 +72,7 @@ class Crate:
     contents: list[Any] = attrs.field(factory=list)
 
 
+@register_value_codec
 class Temperature:
     """Supplies its own state."""
 
@@ -90,6 +91,10 @@ class Temperature:
     @classmethod
     def from_state(cls, state: dict[str, float]) -> Self:
         return cls(state["celsius"])
+
+
+class Kelvin(Temperature):
+    """Covered by its decorated base class."""
 
 
 class Opaque:
@@ -247,28 +252,49 @@ class TestAdapters:
         assert type(_round_trip(Label("x"))) is str
 
 
+class _Scale(enum.Enum):
+    SMALL = "small"
+
+
 class TestRegisteredCodecs:
     @pytest.fixture(autouse=True)
     def _restore_codecs(self) -> Generator[None, None, None]:
-        saved = dict(values_module._codecs)
+        saved = dict(values_module._registered)
         yield
-        values_module._codecs.clear()
-        values_module._codecs.update(saved)
+        values_module._registered.clear()
+        values_module._registered.update(saved)
+        values_module._codec_cache.clear()
 
-    def test_registered_codec_covers_a_type_with_no_form(self) -> None:
+    def test_decorated_class_saves_through_its_own_methods(self) -> None:
+        assert encode_value(Temperature(21.5)) == {TYPE_KEY: f"{__name__}:Temperature", "celsius": 21.5}
+
+    def test_decorated_class_covers_its_subclasses(self) -> None:
+        restored = _round_trip(Kelvin(3.0))
+
+        assert type(restored) is Kelvin
+
+    def test_methods_alone_do_not_make_a_class_savable(self) -> None:
+        class Undecorated:
+            def to_state(self) -> None:
+                return None
+
+            @classmethod
+            def from_state(cls, state: None) -> Self:  # noqa: ARG003
+                return cls()
+
+        with pytest.raises(ValueEncodeError):
+            encode_value(Undecorated())
+
+    def test_decorating_a_class_without_the_methods_fails(self) -> None:
+        with pytest.raises(ValueError, match="from_state"):
+            register_value_codec(Opaque)  # pyright: ignore[reportArgumentType] the missing methods are the point
+
+    def test_functions_cover_a_class_with_no_other_form(self) -> None:
         register_value_codec(Opaque, to_state=lambda _: None, from_state=lambda _: Opaque())
 
         assert type(_round_trip(Opaque())) is Opaque
 
-    def test_registered_codec_wins_over_built_in_adapters(self) -> None:
-        register_value_codec(
-            Color, to_state=lambda color: color.value.upper(), from_state=lambda state: Color(state.lower())
-        )
-
-        assert encode_value(Color.RED) == {TYPE_KEY: f"{__name__}:Color", VALUE_KEY: "RED"}
-        assert _round_trip(Color.RED) is Color.RED
-
-    def test_codec_covers_only_the_exact_class(self) -> None:
+    def test_functions_cover_only_the_exact_class(self) -> None:
         class OpaqueChild(Opaque):
             pass
 
@@ -277,24 +303,39 @@ class TestRegisteredCodecs:
         with pytest.raises(ValueEncodeError):
             encode_value(OpaqueChild())
 
-    @pytest.mark.parametrize("cls", [str, dict, list, tuple, Path])
-    def test_type_the_codec_encodes_itself_cannot_be_registered(self, cls: type) -> None:
-        with pytest.raises(ValueError, match="always saved as themselves"):
+    @pytest.mark.parametrize("cls", [_Scale, Box, Point])
+    def test_functions_cannot_replace_how_a_class_already_saves(self, cls: type) -> None:
+        with pytest.raises(ValueError, match="already saves another way"):
             register_value_codec(cls, to_state=str, from_state=str)
 
-    def test_second_module_registering_the_same_class_fails(self) -> None:
-        register_value_codec(Opaque, to_state=lambda _: None, from_state=lambda _: Opaque())
-        other_module_to_state = types.FunctionType((lambda _: None).__code__, {"__name__": "other_library.codecs"})
+    @pytest.mark.parametrize("cls", [str, dict, list, tuple, Path, ImageUrlArtifact])
+    def test_griptape_and_plain_types_cannot_be_registered(self, cls: type) -> None:
+        with pytest.raises(ValueError, match="Griptape already defines it"):
+            register_value_codec(cls, to_state=str, from_state=str)
 
-        with pytest.raises(ValueError, match="already registered"):
-            register_value_codec(Opaque, to_state=other_module_to_state, from_state=lambda _: Opaque())
-
-    def test_same_module_registering_again_replaces_the_codec(self) -> None:
+    def test_same_owner_registering_again_replaces_the_codec(self) -> None:
         """As when a library file reloads."""
         register_value_codec(Opaque, to_state=lambda _: "old", from_state=lambda _: Opaque())
         register_value_codec(Opaque, to_state=lambda _: "new", from_state=lambda _: Opaque())
 
         assert encode_value(Opaque()) == {TYPE_KEY: f"{__name__}:Opaque", VALUE_KEY: "new"}
+
+    def test_another_owner_keeps_the_first_codec_with_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        register_value_codec(Opaque, to_state=lambda _: "first", from_state=lambda _: Opaque())
+        other_library = {
+            "__name__": "other_library.codecs",
+            "register_value_codec": register_value_codec,
+            "Opaque": Opaque,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            exec(  # noqa: S102 runs the call from another module's globals
+                "register_value_codec(Opaque, to_state=lambda _: 'second', from_state=lambda _: Opaque())",
+                other_library,
+            )
+
+        assert encode_value(Opaque()) == {TYPE_KEY: f"{__name__}:Opaque", VALUE_KEY: "first"}
+        assert "other_library.codecs" in caplog.text
 
 
 class TestEncodeFailures:
@@ -326,14 +367,15 @@ class TestEncodeFailures:
         with pytest.raises(ValueEncodeError, match="inside a function"):
             encode_value(Local(1))
 
-    def test_adapter_error_becomes_an_encode_error(self) -> None:
+    def test_codec_error_becomes_an_encode_error(self) -> None:
+        @register_value_codec
         class Broken:
             def to_state(self) -> dict:
                 msg = "boom"
                 raise RuntimeError(msg)
 
             @classmethod
-            def from_state(cls, _state: dict) -> Self:
+            def from_state(cls, state: dict) -> Self:  # noqa: ARG003
                 return cls()
 
         with pytest.raises(ValueEncodeError, match="boom"):
