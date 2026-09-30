@@ -266,7 +266,7 @@ This section covers engine features. Node libraries, including the standard libr
         ...
     ```
 
-    `is_beta_enabled` also applies the master switch users turn all beta features off with, `beta_features.enabled`. When it is `false`, every feature is off. Always check a feature through `is_beta_enabled`, never by reading its config value directly.
+    `is_beta_enabled` also applies the global switch users turn all beta features off with, `beta_features.enabled`. When it is `false`, every feature is off. Always check a feature through `is_beta_enabled`, never by reading its config value directly.
 
 1. **Turn it on locally** by adding it to the `beta_features` section of your `griptape_nodes_config.json`:
 
@@ -288,7 +288,7 @@ This section covers engine features. Node libraries, including the standard libr
 
 - A beta feature must never change saved data or the protocol. Workflows have to open the same way whether the feature is on or off.
 - Every feature needs a `remove_by` date, at most 180 days out. By that date, make the feature standard or delete it.
-- Ids are lowercase snake_case and must be unique across the engine and the editor, so check the editor's features before picking one. `enabled` is reserved for the master switch.
+- Ids are lowercase snake_case and must be unique across the engine and the editor, so check the editor's features before picking one. `enabled` is reserved for the global switch.
 
 **When `tests/unit/retained_mode/test_beta_features.py` fails:** once a feature passes its `remove_by` date, this test fails on every PR, including ones that don't touch the feature. The failure names the feature and its owner. To fix it, make the feature standard, delete it, or extend `remove_by` (still at most 180 days out) and explain why in the PR.
 

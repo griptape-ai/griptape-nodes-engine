@@ -39,8 +39,10 @@ when you click the flask icon in the editor's header.
 
 Turning the switch off doesn't forget your choices. Each feature keeps
 the setting you gave it, and turning the switch back on restores them
-all. Use this when something behaves unexpectedly and you want the
-standard behavior back without changing each feature.
+all. While the switch is off, every beta feature is off, including the
+few that are on by default. Use this when something behaves
+unexpectedly and you want to rule out beta features without changing
+each one.
 
 ### Nodes already on the canvas
 

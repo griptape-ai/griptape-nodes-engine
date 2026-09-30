@@ -634,7 +634,7 @@ class Settings(BaseModel):
     beta_features: dict[str, bool] = Field(
         category=BETA_FEATURES,
         default_factory=dict,
-        description="Experimental features turned on or off, keyed by feature id. The editor's Beta settings page writes these. A feature missing from this map uses its default. Any key is accepted, so editor-only features never need an engine release. The `enabled` key is the master switch: `false` turns every editor, engine, and library beta feature off without changing their own values.",
+        description="Experimental features turned on or off, keyed by feature id. The editor's Beta settings page writes these. A feature missing from this map uses its default. Any key is accepted, so editor-only features never need an engine release. The `enabled` key is the global switch: `false` turns every editor, engine, and library beta feature off without changing their own values.",
     )
 
     library_beta_features: dict[str, dict[str, bool]] = Field(

@@ -155,7 +155,7 @@ class TestRegistry:
         with pytest.raises(ValueError, match="sample_feature"):
             register_beta_feature(_make_feature())
 
-    def test_master_switch_id_is_reserved(self) -> None:
+    def test_global_switch_id_is_reserved(self) -> None:
         with pytest.raises(ValueError, match="reserved"):
             register_beta_feature(_make_feature("enabled"))
 
@@ -233,7 +233,7 @@ class TestIsBetaEnabled:
 
     @pytest.mark.parametrize("default", [True, False])
     @pytest.mark.parametrize("expired", [True, False])
-    def test_master_off_turns_off_engine_feature(
+    def test_global_switch_off_turns_off_engine_feature(
         self, isolate_user_config: Path, *, default: bool, expired: bool
     ) -> None:
         manager = self._manager_with_user_config(
@@ -246,7 +246,7 @@ class TestIsBetaEnabled:
         assert is_beta_enabled(_make_feature(default=default, remove_by=remove_by), manager) is False
 
     @pytest.mark.parametrize("default", [True, False])
-    def test_master_off_turns_off_library_feature(self, isolate_user_config: Path, *, default: bool) -> None:
+    def test_global_switch_off_turns_off_library_feature(self, isolate_user_config: Path, *, default: bool) -> None:
         manager = self._manager_with_user_config(
             isolate_user_config,
             {"beta_features": {"enabled": False}, "library_beta_features": {LIBRARY_SLUG: {"fast_upscale": True}}},
@@ -257,22 +257,22 @@ class TestIsBetaEnabled:
         assert is_beta_enabled(feature, manager) is False
 
     @pytest.mark.parametrize("configured", [True, False])
-    @pytest.mark.parametrize("master", [True, "false", 0, None])
-    def test_master_that_is_not_false_changes_nothing(
-        self, isolate_user_config: Path, master: object, *, configured: bool
+    @pytest.mark.parametrize("global_switch", [True, "false", 0, None])
+    def test_global_switch_that_is_not_false_changes_nothing(
+        self, isolate_user_config: Path, global_switch: object, *, configured: bool
     ) -> None:
         manager = self._manager_with_user_config(
-            isolate_user_config, {"beta_features": {"enabled": master, "sample_feature": configured}}
+            isolate_user_config, {"beta_features": {"enabled": global_switch, "sample_feature": configured}}
         )
 
         assert is_beta_enabled(_make_feature(default=not configured), manager) is configured
 
-    def test_missing_master_changes_nothing(self, isolate_user_config: Path) -> None:
+    def test_missing_global_switch_changes_nothing(self, isolate_user_config: Path) -> None:
         manager = self._manager_with_user_config(isolate_user_config, {"beta_features": {"sample_feature": True}})
 
         assert is_beta_enabled(_make_feature(), manager) is True
 
-    def test_master_off_from_env_turns_off_features(
+    def test_global_switch_off_from_env_turns_off_features(
         self, isolate_user_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("GTN_CONFIG_BETA_FEATURES__ENABLED", "false")
