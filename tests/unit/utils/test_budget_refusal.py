@@ -16,7 +16,6 @@ import httpx2
 import openai
 import pytest
 
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.utils.budget_refusal import (
     BUDGET_EXCEEDED_CODE,
     BUDGET_HALT_PREFIX,
@@ -26,7 +25,6 @@ from griptape_nodes.utils.budget_refusal import (
     describe,
     describe_reply,
     halt_message,
-    is_budget_halt,
     log_line,
     refusal_from_body,
     refusal_from_exception,
@@ -605,38 +603,30 @@ class TestTheChatReplyMessage:
         assert "run" not in describe_reply(refusal)
 
 
-class TestTheVerdictSurvivesTheWorkerBoundary:
-    """A node runs in a worker; the halt decision is made on the orchestrator."""
+class TestFindingTheHaltUnderItsWrappers:
+    """A halt is worded once and then re-raised; by the time it is read it is buried.
 
-    def test_a_forwarded_budget_error_is_still_a_budget_halt(self) -> None:
-        """Crossing the boundary keeps type, message and traceback -- and nothing else.
+    A caller wraps the error it caught and raises its own, so the exception in hand is not the
+    halt and its message is not the halt's wording. The sentence handed onward has to be the one
+    written for the artist rather than the wrapper's retelling.
+    """
 
-        This is the test that fails the day someone renames `BudgetExceededError` or moves
-        the module: `isinstance` cannot work here, so recognition rides on the type name.
-        """
+    def test_the_wording_recovered_is_the_halt_and_not_the_wrapper(self) -> None:
         refusal = refusal_from_body(a_refusal_body())
         assert refusal is not None
-        original = BudgetExceededError(describe(refusal, node_name="Generate Poster"), refusal)
+        halt = BudgetExceededError(describe(refusal, node_name="Generate Poster"), refusal)
 
-        forwarded = converter.structure(converter.unstructure(original), Exception)
+        wrapped = RuntimeError("tool call failed: nested nonsense")
+        wrapped.__cause__ = halt
 
-        assert not isinstance(forwarded, BudgetExceededError)
-        assert is_budget_halt(forwarded)
+        recovered = halt_message(wrapped)
 
-    def test_a_forwarded_ordinary_error_is_not_a_budget_halt(self) -> None:
-        forwarded = converter.structure(converter.unstructure(ValueError("something else")), Exception)
+        assert recovered == str(halt)
 
-        assert not is_budget_halt(forwarded)
+    def test_an_unwrapped_halt_is_its_own_wording(self) -> None:
+        halt = BudgetExceededError(f"{BUDGET_HALT_PREFIX} x", BudgetRefusal())
 
-    def test_the_message_alone_is_enough(self) -> None:
-        """One library call site loses the exception entirely; the prefix is all that is left."""
-        assert is_budget_halt(message=f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call")
-
-    def test_an_ordinary_message_alone_is_not_enough(self) -> None:
-        assert not is_budget_halt(message="Node 'Generate Poster' encountered a problem: boom")
-
-    def test_nothing_at_all_is_not_a_budget_halt(self) -> None:
-        assert not is_budget_halt()
+        assert halt_message(halt) == str(halt)
 
     def test_the_error_carries_the_refusal_in_process(self) -> None:
         """A same-process caller can read the figures back off the exception."""
@@ -645,63 +635,12 @@ class TestTheVerdictSurvivesTheWorkerBoundary:
         error = BudgetExceededError("Budget stopped this run.", refusal)
 
         assert error.refusal is refusal
-        assert is_budget_halt(error)
-
-
-class TestFindingTheHaltUnderItsWrappers:
-    """A halt is worded once and then re-raised; by the time it is read it is buried.
-
-    The node executor raises ``RuntimeError("Node 'X' execution failed: ...") from exc``, so the
-    exception the scheduler reaps is not the halt and its message is not the halt's wording. These
-    tests fix the two things that depend on that: that the halt is still recognized, and that the
-    sentence handed onward is the one written for the artist rather than the wrapper's retelling.
-    """
-
-    def test_a_wrapped_halt_is_still_recognized(self) -> None:
-        refusal = refusal_from_body(a_refusal_body())
-        assert refusal is not None
-        halt = BudgetExceededError(describe(refusal, node_name="Generate Poster"), refusal)
-
-        wrapped = RuntimeError("Node 'Generate Poster' execution failed: something")
-        wrapped.__cause__ = halt
-
-        assert is_budget_halt(wrapped, str(wrapped))
-
-    def test_the_wording_recovered_is_the_halt_and_not_the_wrapper(self) -> None:
-        """What comes back has to start with the prefix: downstream recognizes it by that."""
-        refusal = refusal_from_body(a_refusal_body())
-        assert refusal is not None
-        halt = BudgetExceededError(describe(refusal, node_name="Generate Poster"), refusal)
-
-        wrapped = RuntimeError("Node 'Generate Poster' execution failed: nested nonsense")
-        wrapped.__cause__ = halt
-
-        recovered = halt_message(wrapped, str(wrapped))
-
-        assert recovered is not None
-        assert recovered.startswith(BUDGET_HALT_PREFIX)
-        assert "execution failed" not in recovered
-
-    def test_a_halt_forwarded_from_a_worker_and_then_wrapped_is_still_found(self) -> None:
-        """Both framings at once: the worker flattens the type, then the executor wraps it."""
-        refusal = refusal_from_body(a_refusal_body())
-        assert refusal is not None
-        original = BudgetExceededError(describe(refusal, node_name="Generate Poster"), refusal)
-        forwarded = converter.structure(converter.unstructure(original), Exception)
-
-        wrapped = RuntimeError("Node 'Generate Poster' execution failed: something")
-        wrapped.__cause__ = forwarded
-
-        recovered = halt_message(wrapped, str(wrapped))
-
-        assert recovered is not None
-        assert recovered.startswith(BUDGET_HALT_PREFIX)
 
     def test_a_wrapped_ordinary_failure_is_left_alone(self) -> None:
-        wrapped = RuntimeError("Node 'Generate Poster' execution failed: the file was missing")
+        wrapped = RuntimeError("tool call failed: the file was missing")
         wrapped.__cause__ = FileNotFoundError("no such file")
 
-        assert halt_message(wrapped, str(wrapped)) is None
+        assert halt_message(wrapped) is None
 
     def test_a_cycle_in_the_cause_chain_does_not_hang(self) -> None:
         """``__cause__`` is writable, so a cycle is reachable and must terminate the walk."""
@@ -710,4 +649,4 @@ class TestFindingTheHaltUnderItsWrappers:
         first.__cause__ = second
         second.__cause__ = first
 
-        assert halt_message(first, str(first)) is None
+        assert halt_message(first) is None

@@ -2850,9 +2850,6 @@ class FlowManager(EngineScoped):
                 error_message = resolution_machine.get_error_message()
                 result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
                 exception = RuntimeError(error_message)
-                # A short flow can run to its end inside start_flow, so this is where an
-                # errored run usually finishes.
-                self._announce_failed_run(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowResultFailure(
                     validation_exceptions=[exception] if error_message else [], result_details=result_details
@@ -2861,13 +2858,21 @@ class FlowManager(EngineScoped):
         if request.wait_for_completion:
             wait_error = await self._await_flow_completion(request.completion_timeout_ms)
             if wait_error is not None:
-                # The wait ends badly two ways. On a timeout the flow is still running and
-                # has to be stopped. On an error it has already stopped, and only the editor
-                # is left to tell.
+                # On timeout the flow is still running, so cancel it before returning
+                # failure. If the wait ended because the flow already errored, there is
+                # nothing left to cancel and check_for_existing_running_flow() returns False.
                 if self.check_for_existing_running_flow():
-                    await self._abandon_running_flow()
-                else:
-                    self._announce_failed_run(self._current_flow_error_message())
+                    try:
+                        await self.cancel_flow_run()
+                    except Exception as cancel_err:
+                        # Defensive: cancellation is best-effort cleanup. Surface a warning
+                        # but keep the original wait_error as the user-visible failure.
+                        logger.warning(
+                            "Attempted to cancel flow '%s' after wait_for_completion failure. "
+                            "Cancellation itself failed because of: %s",
+                            flow_name,
+                            cancel_err,
+                        )
                 exception = RuntimeError(wait_error)
                 return StartFlowResultFailure(
                     validation_exceptions=[exception],
@@ -2946,7 +2951,6 @@ class FlowManager(EngineScoped):
             resolution_machine = self._global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                self._announce_failed_run(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowFromNodeResultFailure(
                     validation_exceptions=[], result_details=error_message or "Flow execution failed"
@@ -4717,41 +4721,7 @@ class FlowManager(EngineScoped):
                 return resolution_machine.get_error_message() or "Flow errored during execution."
         return None
 
-    def _current_flow_error_message(self) -> str | None:
-        """Return why the running flow errored, or None if it did not.
-
-        Only valid before the machine is reset: resetting clears the resolution
-        machine's error, so a caller that cleans up first has nothing left to read.
-        """
-        if self._global_control_flow_machine is None:
-            return None
-        resolution_machine = self._global_control_flow_machine.resolution_machine
-        if not resolution_machine.is_errored():
-            return None
-        return resolution_machine.get_error_message()
-
-    def _announce_failed_run(self, failure_details: str | None) -> None:
-        """Tell the editor a run that has already stopped on an error is over, and why.
-
-        Sends the cancellation event without cancelling, because cancelling
-        resets the machine and clears the results of nodes that already finished.
-        """
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(result_details=failure_details))
-            )
-        )
-
-    async def cancel_flow_run(self, failure_details: str | None = None) -> None:
-        """Stop the running flow and tell the editor the run is over.
-
-        Args:
-            failure_details: Why the run is ending, when it failed. None for an
-                artist's Cancel. Sent on the cancellation event.
-        """
+    async def cancel_flow_run(self) -> None:
         if not self.check_for_existing_running_flow():
             errormsg = "Flow has not yet been started. Cannot cancel flow that hasn't begun."
             raise RuntimeError(errormsg)
@@ -4772,9 +4742,7 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(result_details=failure_details))
-            )
+            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
         )
 
     async def _abandon_running_flow(self) -> None:
@@ -4789,15 +4757,11 @@ class FlowManager(EngineScoped):
         fail on its own account. A failure to cancel politely must not be the reason the engine wedges
         permanently, so the reset happens either way -- and the cancellation's own error is logged
         rather than raised, because the error worth reporting is the one that ended the run.
-
-        The failure reason is read first, because every path below resets the machine that holds it.
         """
-        failure_details = self._current_flow_error_message()
-
         cancelled_gracefully = False
         if self.check_for_existing_running_flow():
             try:
-                await self.cancel_flow_run(failure_details=failure_details)
+                await self.cancel_flow_run()
                 cancelled_gracefully = True
             except Exception:
                 # Cancelling awaits arbitrary node code, so there is no narrower type to catch.
@@ -4815,9 +4779,7 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(result_details=failure_details))
-            )
+            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
         )
 
     def reset_global_execution_state(self) -> None:

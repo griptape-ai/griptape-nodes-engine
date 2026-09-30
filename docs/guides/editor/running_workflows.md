@@ -106,8 +106,6 @@ A few things worth knowing:
     would for any other error. Use it to fall back to a local model when a
     budget runs out. Retrying spends nothing new, because the refused call
     never reached the model.
-- **A loop stops at the first refused pass.** Every later pass would ask
-    the same budget and be refused too.
 - **Work already in flight still costs credits.** Budgets are checked
     before each call goes out, so a call that was already running when the
     budget filled up finishes and is billed.

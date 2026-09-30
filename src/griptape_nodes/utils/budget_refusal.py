@@ -3,7 +3,7 @@
 When a HARD budget has no room, Cloud refuses the call with HTTP 403 and a body
 naming every budget that refused. :func:`refusal_from_body` reads that body,
 :func:`describe` and :func:`describe_reply` word it for the artist, and
-:func:`is_budget_halt` recognizes the halt again after it crosses a worker boundary.
+:func:`halt_message` finds that wording again under whatever wrapped it.
 
 The halt names the node and the budgets and sends the artist to their
 administrator, short enough for the editor's Run blocked bar. Cloud's own
@@ -29,8 +29,8 @@ BUDGET_EXCEEDED_CODE = "budget_exceeded"
 BUDGET_HALT_PREFIX = "Budget stopped this run."
 """Opening words of every halt message.
 
-Where only the message survives (a worker boundary, or a library call site that
-drops the exception), these words are how a halt is recognized. A test pins them.
+The editor recognizes a halt by these words wherever they appear in a node's
+error, so they survive the framing the engine adds around a failure. A test pins them.
 """
 
 BUDGET_REPLY_HALT_PREFIX = "Budget stopped this reply."
@@ -213,22 +213,18 @@ def log_line(refusal: BudgetRefusal) -> str:
     )
 
 
-def halt_message(exception: BaseException | None = None, message: str | None = None) -> str | None:
-    """Return a budget halt's own wording from wherever it has ended up, or None.
+def halt_message(exception: BaseException) -> str | None:
+    """Return a budget halt's own wording from under whatever wrapped it, or None.
 
     The halt gets wrapped on its way out, so this walks the ``__cause__`` chain
-    and returns the halt's own wording. It matches a ``BudgetExceededError``, a
-    ``ForwardedException`` whose original type is one (from a worker), or, when
-    there is no exception, a message starting with :data:`BUDGET_HALT_PREFIX`.
+    for a ``BudgetExceededError`` and returns its wording rather than the wrapper's.
 
     Args:
-        exception: The exception that ended the node, including anything it was
-            raised from, when there is one.
-        message: The failure message, when there is one.
+        exception: The exception that ended the work, including anything it was
+            raised from.
 
     Returns:
-        The halt's wording, or None when a budget refusal is not what stopped
-        this run.
+        The halt's wording, or None when a budget refusal is not what stopped it.
     """
     seen: set[int] = set()
     current: BaseException | None = exception
@@ -236,27 +232,8 @@ def halt_message(exception: BaseException | None = None, message: str | None = N
         seen.add(id(current))
         if isinstance(current, BudgetExceededError):
             return str(current)
-        original_type = getattr(current, "original_type", None)
-        if isinstance(original_type, str) and original_type.endswith(f".{BudgetExceededError.__name__}"):
-            return str(current)
         current = current.__cause__
-
-    if message is not None and message.startswith(BUDGET_HALT_PREFIX):
-        return message
     return None
-
-
-def is_budget_halt(exception: BaseException | None = None, message: str | None = None) -> bool:
-    """Return whether a failure is a budget halt, on either side of a worker boundary.
-
-    Args:
-        exception: The exception that ended the node, when there is one.
-        message: The failure message, when there is one.
-
-    Returns:
-        True when a budget refusal is what stopped this run.
-    """
-    return halt_message(exception, message) is not None
 
 
 def _host_resolver(cloud_host: str | Callable[[], str]) -> Callable[[], str]:

@@ -121,7 +121,6 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     EventTranslationContext,
 )
 from griptape_nodes.retained_mode.variable_types import VariableScope
-from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -418,31 +417,6 @@ class NodeExecutor(EngineScoped):
         return (
             f"Node '{node_name}' execution failed: {type_prefix}{getattr(result, 'result_details', result)}{tb_suffix}"
         )
-
-    @staticmethod
-    def _raise_if_budget_halt(failure_details: object) -> None:
-        """Stop the loop when a budget refused an iteration, since every later one would be refused too.
-
-        Raised in the halt's own words so the scheduler recognizes it.
-        """
-        halt = budget_halt_message(message=str(failure_details))
-        if halt is None:
-            return
-        raise RuntimeError(halt)
-
-    @staticmethod
-    def _budget_halt_among(finished_iterations: set[asyncio.Task[IterationOutcome]]) -> str | None:
-        """Return the halt from whichever of these finished iterations a budget refused, or None."""
-        for task in finished_iterations:
-            if task.cancelled() or task.exception() is not None:
-                continue
-            outcome = task.result()
-            if outcome.succeeded:
-                continue
-            halt = budget_halt_message(message=outcome.detail)
-            if halt is not None:
-                return halt
-        return None
 
     @staticmethod
     def _format_loop_failure_message(
@@ -1383,7 +1357,6 @@ class NodeExecutor(EngineScoped):
                     start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                    self._raise_if_budget_halt(start_subflow_result.result_details)
                     logger.warning(
                         "Sequential iteration %d failed for loop ending at '%s'. Will attempt to extract partial results. Error: %s",
                         iteration_index,
@@ -1964,7 +1937,6 @@ class NodeExecutor(EngineScoped):
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
 
             if execution_failed:
-                self._raise_if_budget_halt(start_subflow_result.result_details)
                 logger.warning(
                     "While group '%s' iteration %d execution error: %s",
                     node.name,
@@ -3342,18 +3314,6 @@ class NodeExecutor(EngineScoped):
                 for iteration_index, flow_name, node_name_mappings in deserialized_flows
             ]
             try:
-                # Wait for each iteration as it finishes, so a budget refusal cancels the rest.
-                pending_iterations = set(iteration_tasks)
-                while pending_iterations:
-                    finished_iterations, pending_iterations = await asyncio.wait(
-                        pending_iterations, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    halt = self._budget_halt_among(finished_iterations)
-                    if halt is not None:
-                        for task in pending_iterations:
-                            task.cancel()
-                        await asyncio.gather(*pending_iterations, return_exceptions=True)
-                        raise RuntimeError(halt)
                 iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
             except asyncio.CancelledError:
                 for task in iteration_tasks:

@@ -22,14 +22,12 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from griptape_nodes.drivers.cloud_credentials import BASE_URL_SETTING_NAME
-from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.retained_mode.events.execution_events import (
-    ControlFlowCancelledEvent,
     NodeErrorEvent,
     StartFlowRequest,
     StartFlowResultFailure,
@@ -62,20 +60,12 @@ DRIVER_HALT_NODE_TYPE = "DriverHaltNode"
 REFUSED_PATH = "/api/refused"
 """Stub route that answers the way Cloud does when a HARD budget has no room."""
 
-BROKEN_PATH = "/api/broken"
-"""Stub route that fails for a reason that has nothing to do with budgets."""
-
 OK_PATH = "/api/ok"
-"""Stub route that answers the call, standing in for a node that finished before the failure."""
+"""Stub route that answers the call, standing in for one the budget does not cover."""
 
 OK_BODY = {"ok": True}
 
 _RUN_TIMEOUT_MS = 30_000
-
-LOOP_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "loop_library"
-# The loop packager resolves its own start/end node types out of the standard library by name,
-# so the loop fixture has to register under that name rather than one of its own.
-LOOP_LIBRARY_NAME = "Griptape Nodes Library"
 
 requires_fixture_library = pytest.mark.skipif(
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
@@ -132,12 +122,8 @@ def a_refusal_body() -> dict[str, Any]:
 class _StubCloudHandler(BaseHTTPRequestHandler):
     """Answers the routes these tests need and stays silent in the pytest output."""
 
-    refused_calls: ClassVar[list[str]] = []
-    """One entry per call answered with a refusal, so a test can tell stopping from carrying on."""
-
     def do_GET(self) -> None:  # BaseHTTPRequestHandler's spelling
         if self.path == REFUSED_PATH:
-            _StubCloudHandler.refused_calls.append(self.path)
             body = json.dumps(a_refusal_body()).encode()
             self.send_response(403)
         elif self.path == OK_PATH:
@@ -164,7 +150,6 @@ def stub_cloud(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     means a test using a stub host has to tell the engine the stub *is* Cloud, exactly as pointing
     the engine at a dev control plane would.
     """
-    _StubCloudHandler.refused_calls.clear()
     server = HTTPServer(("127.0.0.1", 0), _StubCloudHandler)
     host, port = server.server_address[0], server.server_address[1]
     base_url = f"http://{host}:{port}"
@@ -204,12 +189,10 @@ def registered_library(engine: Engine, tmp_path: Path, materialize_library: Call
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), result
 
 
-def _new_flow(engine: Engine, workflow_name: str, *, set_as_new_context: bool = False) -> str:
+def _new_flow(engine: Engine, workflow_name: str) -> str:
     """Create a workflow context and a single top-level flow to hold the test's nodes."""
     engine.context_manager.push_workflow(workflow_name=workflow_name)
-    result = engine.handle_request(
-        CreateFlowRequest(parent_flow_name=None, flow_name="Flow", set_as_new_context=set_as_new_context)
-    )
+    result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Flow"))
     assert isinstance(result, CreateFlowResultSuccess), result
     return result.flow_name
 
@@ -289,37 +272,11 @@ async def test_a_refusal_halts_the_run_and_names_every_budget(
     assert "$" not in details, f"Credits are the only figure Cloud and the engine agree on: {details}"
 
     assert len(node_errors) == 1, f"Expected exactly one node error, got {node_errors}"
-    assert node_errors[0].startswith(BUDGET_HALT_PREFIX), (
+    assert BUDGET_HALT_PREFIX in node_errors[0], (
         f"The node-level error the editor pins to the node is generic: {node_errors[0]}"
     )
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
         "The run never ended, so the editor's Run button never clears."
-    )
-
-
-@requires_fixture_library
-@pytest.mark.usefixtures("registered_library", "execution_mode")
-@pytest.mark.asyncio
-async def test_the_editor_is_told_the_run_was_cancelled_and_why(
-    engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
-    create_node: Callable[..., str],
-    stub_cloud: str,
-) -> None:
-    """Stopping someone's run silently leaves them watching a canvas that simply went quiet."""
-    flow_name = _new_flow(engine, "budget_halt_event_wf")
-    create_node(NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
-    _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
-
-    cancellations = _record_published(
-        engine, monkeypatch, ControlFlowCancelledEvent, lambda payload: payload.result_details
-    )
-
-    await _run(engine, flow_name)
-
-    assert cancellations, "The run stopped without telling the editor it had."
-    assert any(details is not None and BUDGET_HALT_PREFIX in str(details) for details in cancellations), (
-        f"The editor was told the run ended but not why: {cancellations}"
     )
 
 
@@ -357,34 +314,6 @@ async def test_a_refusal_takes_a_wired_failure_branch(
 @requires_fixture_library
 @pytest.mark.usefixtures("registered_library", "execution_mode")
 @pytest.mark.asyncio
-async def test_a_failed_run_keeps_what_the_nodes_before_it_made(
-    engine: Engine,
-    create_node: Callable[..., str],
-    connect: Callable[..., None],
-    stub_cloud: str,
-) -> None:
-    """Ending a failed run must not wipe the results of the nodes that finished before it.
-
-    Those may be paid generations; clearing them makes the artist pay again to get them back.
-    """
-    flow_name = _new_flow(engine, "failed_run_keeps_results_wf")
-    create_node(NODE_TYPE, "Finished", flow_name, library_name=LIBRARY_NAME)
-    create_node(UNHANDLED_NODE_TYPE, "Broken", flow_name, library_name=LIBRARY_NAME)
-    connect("Finished", "exec_out", "Broken", "exec_in")
-    _set_parameter(engine, "Finished", "url", f"{stub_cloud}{OK_PATH}")
-    _set_parameter(engine, "Broken", "url", f"{stub_cloud}{BROKEN_PATH}")
-
-    await _run(engine, flow_name)
-
-    finished = engine.node_manager.get_node_by_name("Finished")
-    assert finished.parameter_output_values.get("result") == json.dumps(OK_BODY), (
-        "The failed run cleared a result a node before it had already produced."
-    )
-
-
-@requires_fixture_library
-@pytest.mark.usefixtures("registered_library", "execution_mode")
-@pytest.mark.asyncio
 async def test_a_node_that_catches_nothing_still_halts_with_the_budgets_named(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -416,7 +345,7 @@ async def test_a_node_that_catches_nothing_still_halts_with_the_budgets_named(
     assert "Refused" in details, f"The halt does not say which node was refused: {details}"
 
     assert node_errors, "The node failed and the editor was told nothing about it."
-    assert node_errors[0].startswith(BUDGET_HALT_PREFIX), (
+    assert BUDGET_HALT_PREFIX in node_errors[0], (
         f"The node-level error the editor pins to the node is generic: {node_errors[0]}"
     )
 
@@ -463,61 +392,3 @@ async def test_a_node_that_worded_its_own_halt_keeps_it(
 
     details = str(result.result_details)
     assert details.count(BUDGET_HALT_PREFIX) == 1, f"The halt was worded more than once: {details}"
-
-
-@pytest.fixture
-def registered_loop_library(engine: Engine, tmp_path: Path, materialize_library: Callable[..., Path]) -> None:
-    """Register the loop fixture library, which supplies the loop nodes and the packager's endpoints."""
-    library_json = materialize_library(
-        tmp_path / "loop_library",
-        template=LOOP_FIXTURE_DIR / "griptape_nodes_library.json",
-        node_file=LOOP_FIXTURE_DIR / "loop_nodes.py",
-        name=LOOP_LIBRARY_NAME,
-    )
-    result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
-    assert isinstance(result, RegisterLibraryFromFileResultSuccess), result
-
-
-@requires_fixture_library
-@pytest.mark.usefixtures("registered_library", "registered_loop_library")
-@pytest.mark.asyncio
-@pytest.mark.parametrize("run_in_order", [True, False], ids=["in order", "all at once"])
-async def test_a_refusal_inside_a_loop_stops_the_loop(
-    engine: Engine,
-    create_node: Callable[..., str],
-    connect: Callable[..., None],
-    stub_cloud: str,
-    *,
-    run_in_order: bool,
-) -> None:
-    """A loop is where a budget wall costs most: every pass asks Cloud again and is refused again.
-
-    And the artist still has to be told which budget, not how many iterations were lost.
-    """
-    # The loop packager serializes the body out of the current flow context, so the flow has to be it.
-    flow_name = _new_flow(engine, "budget_halt_loop_wf", set_as_new_context=True)
-    # An iterative start node auto-creates its paired end node beside it, which needs a position.
-    start = create_node(
-        "LoopStartNode", "Loop", flow_name, library_name=LOOP_LIBRARY_NAME, metadata={"position": {"x": 0, "y": 0}}
-    )
-    create_node(UNHANDLED_NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
-    start_node = engine.node_manager.get_node_by_name(start)
-    assert isinstance(start_node, BaseIterativeStartNode), start_node
-    end_node = start_node.end_node
-    assert end_node is not None, "The loop start did not create its end node."
-    connect(start, "exec_out", "Refused", "exec_in")
-    connect("Refused", "exec_out", end_node.name, "add_item")
-    _set_parameter(engine, start, "run_in_order", run_in_order)
-    _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
-
-    result = await _run(engine, flow_name)
-
-    assert isinstance(result, StartFlowResultFailure), result
-    details = str(result.result_details)
-    assert details.count(BUDGET_HALT_PREFIX) == 1, f"The loop did not stop on the halt as one: {details}"
-    assert "Attempted to run all" not in details, f"The loop buried the halt in its own failure message: {details}"
-    assert "tight" in details, f"The loop's failure does not name the budget: {details}"
-    if run_in_order:
-        assert len(_StubCloudHandler.refused_calls) == 1, (
-            f"The loop asked Cloud again after it was refused: {len(_StubCloudHandler.refused_calls)} calls"
-        )
