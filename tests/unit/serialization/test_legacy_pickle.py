@@ -13,9 +13,10 @@ from PIL import Image
 
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.retained_mode.events.arbitrary_python_events import RunArbitraryPythonStringRequest
-from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
+    DeserializeSelectedNodesFromCommandsRequest,
     SerializedNodeCommands,
     SerializedSelectedNodesCommands,
 )
@@ -150,3 +151,101 @@ class TestElementCommandAllowlist:
 
         with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
             read_legacy_clipboard_commands(text, ())
+
+
+def _smuggled_selected_nodes(**overrides: object) -> SerializedSelectedNodesCommands:
+    node = SerializedNodeCommands(
+        create_node_command=CreateNodeRequest(node_type="Holder"),
+        element_modification_commands=[],
+        node_dependencies=NodeDependencies(),
+        node_uuid=SerializedNodeCommands.NodeUUID("node-1"),
+    )
+    fields: dict[str, object] = {
+        "serialized_node_commands": [node],
+        "set_parameter_value_commands": {"node-1": []},
+        "set_lock_commands_per_node": {"node-1": None},
+        "serialized_connection_commands": [],
+    }
+    fields.update(overrides)
+    return SerializedSelectedNodesCommands(**fields)  # type: ignore[arg-type]
+
+
+class TestCommandFieldTypes:
+    """A request in a field declared for another request type is refused, not run.
+
+    Pickle ignores declared field types, so each request-bearing field is checked after reading.
+    """
+
+    def test_request_in_the_lock_slot_is_refused(self) -> None:
+        commands = _smuggled_selected_nodes(
+            set_lock_commands_per_node={"node-1": RunArbitraryPythonStringRequest(python_string="import os")}
+        )
+        text = pickle.dumps(commands).decode("latin-1")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
+            read_legacy_clipboard_commands(text, ())
+
+    def test_request_in_a_parameter_value_slot_is_refused(self) -> None:
+        smuggled = SerializedNodeCommands.IndirectSetParameterValueCommand(
+            set_parameter_value_command=RunArbitraryPythonStringRequest(python_string="import os"),  # type: ignore[arg-type]
+            unique_value_uuid=SerializedNodeCommands.UniqueParameterValueUUID("value-1"),
+        )
+        commands = _smuggled_selected_nodes(set_parameter_value_commands={"node-1": [smuggled]})
+        text = pickle.dumps(commands).decode("latin-1")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
+            read_legacy_clipboard_commands(text, ())
+
+    def test_request_in_the_create_node_slot_is_refused(self) -> None:
+        node = SerializedNodeCommands(
+            create_node_command=RunArbitraryPythonStringRequest(python_string="import os"),  # type: ignore[arg-type]
+            element_modification_commands=[],
+            node_dependencies=NodeDependencies(),
+        )
+        commands = _smuggled_selected_nodes(serialized_node_commands=[node])
+        text = pickle.dumps(commands).decode("latin-1")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
+            read_legacy_clipboard_commands(text, ())
+
+    def test_request_in_the_flow_initialization_slot_is_refused(self) -> None:
+        commands = SerializedFlowCommands(
+            flow_initialization_command=RunArbitraryPythonStringRequest(python_string="import os"),  # type: ignore[arg-type]
+            serialized_node_commands=[],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=NodeDependencies(),
+            node_types_used=set(),
+        )
+        text = base64.b64encode(pickle.dumps(commands)).decode("ascii")
+
+        with pytest.raises(LegacyPickleError, match="RunArbitraryPythonStringRequest"):
+            read_legacy_image_flow_commands(text, ())
+
+    def test_paste_of_a_smuggled_lock_request_fails_without_running_it(
+        self,
+        engine: Engine,
+        library_name: str,
+        flow_name: str,  # noqa: ARG002
+    ) -> None:
+        node = SerializedNodeCommands(
+            create_node_command=CreateNodeRequest(node_type="LegacyValuesNode", specific_library_name=library_name),
+            element_modification_commands=[],
+            node_dependencies=NodeDependencies(),
+            node_uuid=SerializedNodeCommands.NodeUUID("node-1"),
+        )
+        commands = _smuggled_selected_nodes(
+            serialized_node_commands=[node],
+            set_lock_commands_per_node={"node-1": CreateFlowRequest(flow_name="Smuggled", parent_flow_name=None)},
+        )
+        result = engine.handle_request(
+            DeserializeSelectedNodesFromCommandsRequest(
+                deserialize_commands=pickle.dumps(commands).decode("latin-1"), pickled_values={}
+            )
+        )
+
+        assert not result.succeeded()
+        assert engine.object_manager.attempt_get_object_by_name("Smuggled") is None
