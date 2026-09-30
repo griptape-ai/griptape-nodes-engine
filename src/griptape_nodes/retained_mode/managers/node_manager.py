@@ -3710,10 +3710,10 @@ class NodeManager(EngineScoped):
         if unsendable:
             library_name = node.metadata.get("library", "its library")
             details = (
-                f"Node '{node.name}' produced {', '.join(unsendable)}, which cannot leave "
-                f"'{library_name}'s isolated process. Either give the value a plain-data form, or "
-                f"declare its parameter serializable=False so the value stays in that process and "
-                f"the next node receives a reference to it."
+                f"Attempted to send node '{node.name}' output {', '.join(unsendable)} out of "
+                f"'{library_name}'s isolated process. Failed because it has no plain-data form. Give "
+                f"the value a plain-data form, or declare its parameter serializable=False so the value "
+                f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
         return ExecuteNodeResultSuccess(
