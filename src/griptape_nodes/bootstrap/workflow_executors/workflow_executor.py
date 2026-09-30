@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class WorkflowExecutor:
     def __init__(self, *, pickle_control_flow_result: bool = False) -> None:  # noqa: ARG002
-        """``pickle_control_flow_result`` is deprecated and ignored; saved workflow files still pass it."""
+        """``pickle_control_flow_result`` is deprecated and ignored; workflow files saved by earlier versions still pass it."""
         self.output: dict | None = None
 
     async def __aenter__(self) -> Self:
