@@ -50,7 +50,7 @@ class TestCompleteStateFinishesTheRun:
 
         await CompleteState.on_enter(context)
 
-        run_timer = context.engine.flow_manager.node_executor.run_timer
+        run_timer = context.engine.flow_manager.run_timer
         run_timer.finish_run.assert_called_once_with(outcome)
 
     @pytest.mark.asyncio
@@ -59,7 +59,7 @@ class TestCompleteStateFinishesTheRun:
 
         await CompleteState.on_enter(context)
 
-        context.engine.flow_manager.node_executor.run_timer.finish_run.assert_not_called()
+        context.engine.flow_manager.run_timer.finish_run.assert_not_called()
 
 
 class TestStartFlowStartsTheRun:
@@ -77,7 +77,7 @@ class TestStartFlowStartsTheRun:
 
         await machine.start_flow(node, node)
 
-        context.engine.flow_manager.node_executor.run_timer.start_run.assert_called_once_with()
+        context.engine.flow_manager.run_timer.start_run.assert_called_once_with()
         cast("AsyncMock", machine.start).assert_awaited_once_with(ResolveNodeState)
 
     @pytest.mark.asyncio
@@ -89,7 +89,7 @@ class TestStartFlowStartsTheRun:
 
         await machine.start_flow(node, node)
 
-        context.engine.flow_manager.node_executor.run_timer.start_run.assert_not_called()
+        context.engine.flow_manager.run_timer.start_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_isolated_flow_does_not_restart_timing(self) -> None:
@@ -100,7 +100,7 @@ class TestStartFlowStartsTheRun:
 
         await machine.start_flow(node, node)
 
-        context.engine.flow_manager.node_executor.run_timer.start_run.assert_not_called()
+        context.engine.flow_manager.run_timer.start_run.assert_not_called()
 
 
 class TestParallelResolutionIsCanceled:

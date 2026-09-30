@@ -58,6 +58,21 @@ class TestBuildRunSummary:
             "    └── 1.000 s  'A' (AType)",
         ]
 
+    def test_staggered_nodes_do_not_chain_into_one_stage(self) -> None:
+        # A overlaps B and B overlaps C, but A and C never ran at the same time.
+        records = [_record("A", 0.0, 1.0), _record("B", 0.9, 2.0), _record("C", 1.9, 3.0)]
+
+        summary = build_run_summary(records, RunOutcome.COMPLETED, 0.0, 3.0)
+
+        assert summary.splitlines() == [
+            "RUN SUMMARY: completed in 3.000 s, 3 nodes ran",
+            "├── Stage 1 at 0.000 s, 2.000 s, 2 nodes in parallel",
+            "│   ├── 1.100 s  'B' (BType)",
+            "│   └── 1.000 s  'A' (AType)",
+            "└── Stage 2 at 1.900 s, 1.100 s",
+            "    └── 1.100 s  'C' (CType)",
+        ]
+
     def test_nodes_inside_a_loop_are_combined_under_it(self) -> None:
         records = [
             _record("Body", 0.1, 0.4, parent_name="Loop"),
@@ -140,3 +155,27 @@ class TestNodeRunTimer:
 
         assert "'New'" in caplog.text
         assert "'Old'" not in caplog.text
+
+    def test_nodes_that_stop_after_a_failure_is_recorded_are_in_the_summary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        timer = NodeRunTimer()
+        timer.start_run()
+        timer.set_outcome(RunOutcome.FAILED)
+        timer.record(_record("WindingDown", 0.0, 1.0, status=NodeRunStatus.CANCELLED))
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            timer.finish_run(RunOutcome.CANCELLED)
+
+        assert "RUN SUMMARY: failed" in caplog.text
+        assert "'WindingDown'" in caplog.text
+
+    def test_a_failure_replaces_a_cancellation(self, caplog: pytest.LogCaptureFixture) -> None:
+        timer = NodeRunTimer()
+        timer.start_run()
+        timer.set_outcome(RunOutcome.CANCELLED)
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            timer.finish_run(RunOutcome.FAILED)
+
+        assert "RUN SUMMARY: failed" in caplog.text

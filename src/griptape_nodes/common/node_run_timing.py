@@ -68,11 +68,13 @@ class NodeRunRecord:
 
 @dataclass
 class _Stage:
-    """Top-level node runs whose times overlapped, so they ran in parallel."""
+    """Top-level node runs that were all running at the same moment."""
 
     records: list[NodeRunRecord]
     started_at: float
     finished_at: float
+    # When the first node in the stage finished. A node that starts after this did not overlap it.
+    first_finished_at: float
 
 
 @dataclass
@@ -92,6 +94,7 @@ class NodeRunTimer:
     def __init__(self) -> None:
         self._run_started_at: float | None = None
         self._records: list[NodeRunRecord] = []
+        self._outcome: RunOutcome | None = None
 
     @property
     def is_timing(self) -> bool:
@@ -101,6 +104,7 @@ class NodeRunTimer:
         """Start timing a run, dropping anything left over from an earlier one."""
         self._run_started_at = time.perf_counter()
         self._records = []
+        self._outcome = None
 
     def record(self, record: NodeRunRecord) -> None:
         """Keep a node run for the summary. Ignored when no run is being timed."""
@@ -108,18 +112,32 @@ class NodeRunTimer:
             return
         self._records.append(record)
 
-    def finish_run(self, outcome: RunOutcome) -> None:
-        """Log the run's summary and stop timing. Does nothing when no run is being timed.
+    def set_outcome(self, outcome: RunOutcome) -> None:
+        """Record how the run ended, without ending it. Does nothing when no run is being timed.
 
-        A run can end through more than one path, such as a failure followed by a cancel, so only
-        the first call logs.
+        A failed run is torn down by cancelling it, so a cancellation never replaces an outcome
+        that was already recorded. Any other outcome replaces a cancellation.
         """
-        if self._run_started_at is None:
+        if not self.is_timing:
+            return
+        if self._outcome is not None and self._outcome is not RunOutcome.CANCELLED:
+            return
+        self._outcome = outcome
+
+    def finish_run(self, outcome: RunOutcome) -> None:
+        """Record `outcome`, log the run's summary, and stop timing.
+
+        Call this once the run's nodes have stopped, so that nodes still winding down are in the
+        summary. Does nothing when no run is being timed, so only the first call logs.
+        """
+        self.set_outcome(outcome)
+        if self._run_started_at is None or self._outcome is None:
             return
 
-        summary = build_run_summary(self._records, outcome, self._run_started_at, time.perf_counter())
+        summary = build_run_summary(self._records, self._outcome, self._run_started_at, time.perf_counter())
         self._run_started_at = None
         self._records = []
+        self._outcome = None
         logger.info(summary)
 
 
@@ -158,15 +176,28 @@ def build_run_summary(
 
 
 def _group_into_stages(records: list[NodeRunRecord]) -> list[_Stage]:
-    """Group runs whose start-to-finish times overlap. A new stage starts after a gap."""
+    """Group runs into stages in which every node was running at the same moment.
+
+    A run joins the current stage only if it started before every node in the stage finished.
+    Joining on overlap with any one node would chain staggered runs together: A overlapping B and
+    B overlapping C would put A and C in one stage though they never ran at once.
+    """
     stages: list[_Stage] = []
     for record in sorted(records, key=lambda r: r.started_at):
-        if stages and record.started_at < stages[-1].finished_at:
+        if stages and record.started_at < stages[-1].first_finished_at:
             stage = stages[-1]
             stage.records.append(record)
             stage.finished_at = max(stage.finished_at, record.finished_at)
+            stage.first_finished_at = min(stage.first_finished_at, record.finished_at)
             continue
-        stages.append(_Stage(records=[record], started_at=record.started_at, finished_at=record.finished_at))
+        stages.append(
+            _Stage(
+                records=[record],
+                started_at=record.started_at,
+                finished_at=record.finished_at,
+                first_finished_at=record.finished_at,
+            )
+        )
     return stages
 
 

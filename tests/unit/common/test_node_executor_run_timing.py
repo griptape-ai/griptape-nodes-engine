@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor
-from griptape_nodes.common.node_run_timing import RunOutcome
+from griptape_nodes.common.node_run_timing import NodeRunTimer, RunOutcome
 from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 
@@ -18,6 +18,7 @@ def _make_executor(config: dict[str, object]) -> NodeExecutor:
     executor = NodeExecutor(engine=MagicMock())
     mock_engine = cast("MagicMock", executor.engine)
     mock_engine.config_manager.get_config_value.side_effect = lambda key, **_kwargs: config.get(key)
+    mock_engine.flow_manager.run_timer = NodeRunTimer()
     mock_engine.ahandle_request = AsyncMock(
         return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={})
     )
@@ -64,11 +65,11 @@ class TestNodeRunTiming:
             return ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={})
 
         cast("MagicMock", executor.engine).ahandle_request = AsyncMock(side_effect=run_child_during_parent)
-        executor.run_timer.start_run()
+        executor.engine.flow_manager.run_timer.start_run()
         await executor.execute(_make_node("Loop"))
 
         with caplog.at_level(logging.INFO, logger="griptape_nodes"):
-            executor.run_timer.finish_run(RunOutcome.COMPLETED)
+            executor.engine.flow_manager.run_timer.finish_run(RunOutcome.COMPLETED)
 
         # The child ran while the parent was executing, so it is listed indented under it.
         # The TIME TO RUN lines are captured too when the logger is already at INFO, so pick the
@@ -83,12 +84,12 @@ class TestNodeRunTiming:
     async def test_records_a_failed_node_as_failed(self, caplog: pytest.LogCaptureFixture) -> None:
         executor = _make_executor({NODE_RUN_TIMING.config_key: True})
         cast("MagicMock", executor.engine).ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
-        executor.run_timer.start_run()
+        executor.engine.flow_manager.run_timer.start_run()
 
         with pytest.raises(RuntimeError):
             await executor.execute(_make_node())
         with caplog.at_level(logging.INFO, logger="griptape_nodes"):
-            executor.run_timer.finish_run(RunOutcome.FAILED)
+            executor.engine.flow_manager.run_timer.finish_run(RunOutcome.FAILED)
 
         assert "'TestNode' (MagicMock)  FAILED" in caplog.text
 
@@ -106,11 +107,11 @@ class TestNodeRunTiming:
     async def test_records_a_cancelled_node_as_cancelled(self, caplog: pytest.LogCaptureFixture) -> None:
         executor = _make_executor({NODE_RUN_TIMING.config_key: True})
         cast("MagicMock", executor.engine).ahandle_request = AsyncMock(side_effect=asyncio.CancelledError)
-        executor.run_timer.start_run()
+        executor.engine.flow_manager.run_timer.start_run()
 
         with pytest.raises(asyncio.CancelledError):
             await executor.execute(_make_node())
         with caplog.at_level(logging.INFO, logger="griptape_nodes"):
-            executor.run_timer.finish_run(RunOutcome.CANCELLED)
+            executor.engine.flow_manager.run_timer.finish_run(RunOutcome.CANCELLED)
 
         assert "'TestNode' (MagicMock)  CANCELLED" in caplog.text

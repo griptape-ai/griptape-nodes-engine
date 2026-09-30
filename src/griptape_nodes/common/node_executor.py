@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
-from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus, NodeRunTimer
+from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -127,7 +127,6 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -276,12 +275,6 @@ class LoopBodyNodes(NamedTuple):
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
-    def __init__(self, engine: Engine | None = None) -> None:
-        super().__init__(engine)
-        # Collects node timings for the node_run_timing beta feature. The control flow starts and
-        # finishes each timed run.
-        self.run_timer = NodeRunTimer()
-
     def get_workflow_handler(self, library_name: str) -> LibraryManager.RegisteredEventHandler:
         """Get the PublishWorkflowRequest handler for a library, or None if not available."""
         library_manager = self.engine.library_manager
@@ -319,7 +312,7 @@ class NodeExecutor(EngineScoped):
                     status=status,
                 )
                 logger.info("TIME TO RUN: %.3f s for '%s' (%s)", record.seconds, record.node_name, record.node_type)
-                self.run_timer.record(record)
+                self.engine.flow_manager.run_timer.record(record)
 
     async def _execute_by_node_type(self, node: BaseNode) -> None:
         """Run the node the way its type needs: in-process, as a loop, or in a subprocess."""

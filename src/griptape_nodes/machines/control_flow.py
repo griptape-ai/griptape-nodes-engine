@@ -158,7 +158,7 @@ class CompleteState(State):
             outcome = RunOutcome.FAILED
         elif resolution_machine.is_canceled():
             outcome = RunOutcome.CANCELLED
-        context.engine.flow_manager.node_executor.run_timer.finish_run(outcome)
+        context.engine.flow_manager.run_timer.finish_run(outcome)
 
         # Broadcast completion events for any remaining current nodes
         for current_node in context.current_nodes:
@@ -225,7 +225,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
     ) -> None:
         # An isolated flow is one loop iteration inside a run that is already being timed.
         if not self._context.is_isolated and is_beta_enabled(NODE_RUN_TIMING, self._context.engine.config_manager):
-            self._context.engine.flow_manager.node_executor.run_timer.start_run()
+            self._context.engine.flow_manager.run_timer.start_run()
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)
         self._context.current_nodes = current_nodes

@@ -17,7 +17,7 @@ import httpx2
 from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
-from griptape_nodes.common.node_run_timing import RunOutcome
+from griptape_nodes.common.node_run_timing import NodeRunTimer, RunOutcome
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
@@ -360,6 +360,9 @@ class FlowManager(EngineScoped):
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder(self.engine)
         self._node_executor = NodeExecutor(self.engine)
+        # Collects node timings for the node_run_timing beta feature. The control flow starts each
+        # timed run, and whichever teardown path runs last logs its summary.
+        self.run_timer = NodeRunTimer()
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -4731,9 +4734,9 @@ class FlowManager(EngineScoped):
         # Request cancellation on all nodes and wait for them to complete
         if self._global_control_flow_machine is not None:
             await self._global_control_flow_machine.cancel_flow()
-        # After the nodes have stopped, so their timings are in the summary. A no-op when the run
-        # already logged its summary on the way to CompleteState.
-        self._node_executor.run_timer.finish_run(RunOutcome.CANCELLED)
+        # After the nodes have stopped, so their timings are in the summary. A run that failed first
+        # keeps its failed outcome, and this is a no-op when CompleteState already logged it.
+        self.run_timer.finish_run(RunOutcome.CANCELLED)
 
         # Reset control flow machine
         if self._global_control_flow_machine is not None:
@@ -4762,8 +4765,8 @@ class FlowManager(EngineScoped):
         permanently, so the reset happens either way -- and the cancellation's own error is logged
         rather than raised, because the error worth reporting is the one that ended the run.
         """
-        # Before cancel_flow_run, which would otherwise report this failed run as cancelled.
-        self._node_executor.run_timer.finish_run(RunOutcome.FAILED)
+        # Recorded now and logged once the nodes have stopped, so the cancel below keeps it failed.
+        self.run_timer.set_outcome(RunOutcome.FAILED)
         cancelled_gracefully = False
         if self.check_for_existing_running_flow():
             try:
@@ -4772,6 +4775,8 @@ class FlowManager(EngineScoped):
             except Exception:
                 # Cancelling awaits arbitrary node code, so there is no narrower type to catch.
                 logger.exception("Failed to cancel a run that had already failed. Abandoning it instead.")
+        # A no-op when cancel_flow_run already logged the summary.
+        self.run_timer.finish_run(RunOutcome.FAILED)
 
         if cancelled_gracefully:
             # cancel_flow_run already reset the machine and told the editor the run is over.
