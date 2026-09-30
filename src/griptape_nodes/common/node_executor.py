@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import pickle
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
+from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus, NodeRunTimer
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -39,6 +41,7 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
+from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
@@ -124,6 +127,7 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -272,6 +276,12 @@ class LoopBodyNodes(NamedTuple):
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
+    def __init__(self, engine: Engine | None = None) -> None:
+        super().__init__(engine)
+        # Collects node timings for the node_run_timing beta feature. The control flow starts and
+        # finishes each timed run.
+        self.run_timer = NodeRunTimer()
+
     def get_workflow_handler(self, library_name: str) -> LibraryManager.RegisteredEventHandler:
         """Get the PublishWorkflowRequest handler for a library, or None if not available."""
         library_manager = self.engine.library_manager
@@ -286,8 +296,33 @@ class NodeExecutor(EngineScoped):
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
         """
+        # Read before this node takes the ContextVar over: a node run by a group or loop sees that
+        # group's name here.
+        parent_name = current_executing_node_name.get()
+        started_at = time.perf_counter()
+        status = NodeRunStatus.FAILED
+        try:
+            await self._execute_by_node_type(node)
+            status = NodeRunStatus.SUCCEEDED
+        except asyncio.CancelledError:
+            status = NodeRunStatus.CANCELLED
+            raise
+        finally:
+            if is_beta_enabled(NODE_RUN_TIMING, self.engine.config_manager):
+                record = NodeRunRecord(
+                    node_name=node.name,
+                    node_type=type(node).__name__,
+                    parent_name=parent_name,
+                    started_at=started_at,
+                    finished_at=time.perf_counter(),
+                    status=status,
+                )
+                logger.info("TIME TO RUN: %.3f s for '%s' (%s)", record.seconds, record.node_name, record.node_type)
+                self.run_timer.record(record)
+
+    async def _execute_by_node_type(self, node: BaseNode) -> None:
+        """Run the node the way its type needs: in-process, as a loop, or in a subprocess."""
         token = current_executing_node_name.set(node.name)
         try:
             # Handle while-loop node groups (RetryGroup, etc.)

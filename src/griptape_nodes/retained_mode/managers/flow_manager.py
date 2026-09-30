@@ -17,6 +17,7 @@ import httpx2
 from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.common.node_run_timing import RunOutcome
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
@@ -4730,6 +4731,9 @@ class FlowManager(EngineScoped):
         # Request cancellation on all nodes and wait for them to complete
         if self._global_control_flow_machine is not None:
             await self._global_control_flow_machine.cancel_flow()
+        # After the nodes have stopped, so their timings are in the summary. A no-op when the run
+        # already logged its summary on the way to CompleteState.
+        self._node_executor.run_timer.finish_run(RunOutcome.CANCELLED)
 
         # Reset control flow machine
         if self._global_control_flow_machine is not None:
@@ -4758,6 +4762,8 @@ class FlowManager(EngineScoped):
         permanently, so the reset happens either way -- and the cancellation's own error is logged
         rather than raised, because the error worth reporting is the one that ended the run.
         """
+        # Before cancel_flow_run, which would otherwise report this failed run as cancelled.
+        self._node_executor.run_timer.finish_run(RunOutcome.FAILED)
         cancelled_gracefully = False
         if self.check_for_existing_running_flow():
             try:

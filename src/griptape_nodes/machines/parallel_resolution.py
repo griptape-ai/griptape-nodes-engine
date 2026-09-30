@@ -1038,5 +1038,8 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
     def is_errored(self) -> bool:
         return self._context.workflow_state == WorkflowState.ERRORED
 
+    def is_canceled(self) -> bool:
+        return self._context.workflow_state == WorkflowState.CANCELED
+
     def get_error_message(self) -> str | None:
         return self._context.error_message
