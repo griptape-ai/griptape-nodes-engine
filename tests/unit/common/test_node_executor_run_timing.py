@@ -70,7 +70,11 @@ class TestNodeRunTiming:
             executor.run_timer.finish_run(RunOutcome.COMPLETED)
 
         # The child ran while the parent was executing, so it is listed indented under it.
-        lines = caplog.records[0].getMessage().splitlines()
+        # The TIME TO RUN lines are captured too when the logger is already at INFO, so pick the
+        # summary out by its text rather than its position.
+        summaries = [record.getMessage() for record in caplog.records if record.getMessage().startswith("RUN SUMMARY")]
+        assert len(summaries) == 1
+        lines = summaries[0].splitlines()
         assert re.fullmatch(r"    └── \d+\.\d{3} s  'Loop' \(MagicMock\)", lines[2])
         assert re.fullmatch(r"        └── \d+\.\d{3} s  'Body' \(MagicMock\)", lines[3])
 
