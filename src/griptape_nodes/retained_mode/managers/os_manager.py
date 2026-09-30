@@ -150,12 +150,12 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
-from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 

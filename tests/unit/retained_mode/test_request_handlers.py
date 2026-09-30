@@ -30,6 +30,10 @@ class _Child(_Base):
     def on_pong(self, request: _PongRequest) -> ResultPayload: ...
 
 
+class _UnmarkedOverride(_Base):
+    def on_ping(self, request: _PingRequest) -> ResultPayload: ...
+
+
 class _Stacked:
     @handles(_PingRequest)
     @handles(_PongRequest)
@@ -54,6 +58,14 @@ class TestRegisterRequestHandlers:
 
         assert event_manager._request_type_to_manager[_PingRequest] == owner.on_ping
         assert event_manager._request_type_to_manager[_PongRequest] == owner.on_pong
+
+    def test_unmarked_override_inherits_parent_mark(self) -> None:
+        event_manager = EventManager()
+        owner = _UnmarkedOverride()
+
+        event_manager.register_request_handlers(owner)
+
+        assert event_manager._request_type_to_manager[_PingRequest] == owner.on_ping
 
     def test_second_owner_for_same_type_raises(self) -> None:
         event_manager = EventManager()

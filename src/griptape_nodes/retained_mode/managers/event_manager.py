@@ -848,15 +848,16 @@ class EventManager(EngineScoped):
         self._request_type_to_manager[request_type] = callback
 
     def register_request_handlers(self, owner: object) -> None:
-        """Assign every `@handles` method on `owner` to the request types it names."""
-        seen: set[str] = set()
-        for klass in type(owner).__mro__:
+        """Assign each `@handles` method on `owner`. An unmarked override keeps its parent's marks."""
+        marks: dict[str, tuple[type[RequestPayload], ...]] = {}
+        for klass in reversed(type(owner).__mro__):
             for name, attr in vars(klass).items():
-                if name in seen:
-                    continue
-                seen.add(name)
-                for request_type in handled_request_types(attr):
-                    self.assign_manager_to_request_type(request_type, getattr(owner, name))
+                request_types = handled_request_types(attr)
+                if request_types:
+                    marks[name] = request_types
+        for name, request_types in marks.items():
+            for request_type in request_types:
+                self.assign_manager_to_request_type(request_type, getattr(owner, name))
 
     def configure_worker_forwarding(
         self,
