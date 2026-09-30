@@ -150,12 +150,17 @@ def parse_git_url_with_ref(url_with_ref: str) -> GitUrlWithRef:
                 return GitUrlWithRef(url=f"{parts[0]}:{path_parts[0]}", ref=path_parts[1])
         return GitUrlWithRef(url=url_with_ref, ref=None)
 
-    # For HTTPS/HTTP URLs and shorthand, split on last @
-    if "@" in url_with_ref:
-        # Use rsplit to split from the right, so we get the last @ (in case of user:pass@host format)
-        parts = url_with_ref.rsplit("@", 1)
-        if len(parts) == 2:  # noqa: PLR2004
-            return GitUrlWithRef(url=parts[0], ref=parts[1])
+    # Only look for @ref in the path so user:pass@host userinfo isn't mistaken for a ref.
+    path_start = 0
+    if "://" in url_with_ref:
+        authority_start = url_with_ref.index("://") + 3
+        path_start = url_with_ref.find("/", authority_start)
+        if path_start == -1:
+            return GitUrlWithRef(url=url_with_ref, ref=None)
+
+    at_index = url_with_ref.rfind("@", path_start)
+    if at_index != -1:
+        return GitUrlWithRef(url=url_with_ref[:at_index], ref=url_with_ref[at_index + 1 :])
 
     return GitUrlWithRef(url=url_with_ref, ref=None)
 

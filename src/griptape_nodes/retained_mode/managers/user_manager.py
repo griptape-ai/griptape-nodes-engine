@@ -12,7 +12,7 @@ from functools import cached_property
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 
 from griptape_nodes.drivers.cloud_credentials import (
     POLICY_DENIED_HINT,
@@ -63,7 +63,7 @@ class UserManager:
             url = f"{base_url}/api/users"
             headers = {"Authorization": f"Bearer {api_key}"}
 
-            response = httpx.get(url, headers=headers, timeout=5.0)
+            response = httpx2.get(url, headers=headers, timeout=5.0)
             response.raise_for_status()
 
             data = response.json()
@@ -79,9 +79,9 @@ class UserManager:
 
             logger.debug("No users found in API response")
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             logger.warning("Failed to fetch user (HTTP %s): %s", e.response.status_code, e)
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             logger.warning("Failed to fetch user (request error): %s", e)
         except Exception as e:
             logger.warning("Failed to fetch user (unexpected error): %s", e)
@@ -110,7 +110,7 @@ class UserManager:
             url = f"{base_url}/api/organizations"
             headers = {"Authorization": f"Bearer {api_key}"}
 
-            response = httpx.get(url, headers=headers, timeout=5.0)
+            response = httpx2.get(url, headers=headers, timeout=5.0)
             response.raise_for_status()
 
             data = response.json()
@@ -125,12 +125,12 @@ class UserManager:
 
             logger.debug("No organizations found in API response")
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             if e.response.status_code == HTTPStatus.FORBIDDEN and is_license_credential(api_key):
                 logger.warning("Failed to fetch user organization because %s", POLICY_DENIED_HINT)
             else:
                 logger.warning("Failed to fetch user organization (HTTP %s): %s", e.response.status_code, e)
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             logger.warning("Failed to fetch user organization (request error): %s", e)
         except Exception as e:
             logger.warning("Failed to fetch user organization (unexpected error): %s", e)

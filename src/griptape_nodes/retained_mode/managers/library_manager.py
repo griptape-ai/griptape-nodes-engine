@@ -7306,8 +7306,10 @@ class LibraryManager(EngineScoped):
 
     async def download_library_request(self, request: DownloadLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Download a library from a git repository."""
-        git_url = normalize_github_url(request.git_url)
-        branch_tag_commit = request.branch_tag_commit
+        parsed_url = parse_git_url_with_ref(normalize_github_url(request.git_url))
+        git_url = parsed_url.url
+        # Explicit branch_tag_commit wins over a url@ref suffix.
+        branch_tag_commit = request.branch_tag_commit or parsed_url.ref
         target_directory_name = request.target_directory_name
         download_directory = request.download_directory
 

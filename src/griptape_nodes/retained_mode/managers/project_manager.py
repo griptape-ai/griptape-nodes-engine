@@ -54,7 +54,6 @@ from griptape_nodes.files.path_utils import (
     resolve_file_path,
     resolve_path_safely,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import AppEvent
@@ -5053,7 +5052,7 @@ class ProjectManager(EngineScoped):
         workflow_name = context_manager.get_current_workflow_name()
         working_directory = context_manager.get_current_workflow_working_directory()
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
         except KeyError as e:
             if working_directory is not None:
                 return working_directory
@@ -5071,7 +5070,7 @@ class ProjectManager(EngineScoped):
                 return working_directory
             return self._resolve_default_workflow_save_dir(project_info)
 
-        workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
+        workflow_file_path = Path(self.engine.workflow_registry.get_complete_file_path(workflow.file_path))
         return str(workflow_file_path.parent)
 
     def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo) -> str:

@@ -1,9 +1,4 @@
-"""Tests for the serialized-artifact-dict branch of `normalize_artifact_input`.
-
-The dict branch reuses `_normalize_string_input`, so these only cover inputs it can
-resolve without a configured engine: HTTP URLs, and paths it fails to resolve. Static-storage
-upload needs a configured engine and is not covered; the data URI tests stub only the workspace.
-"""
+"""Tests for `normalize_artifact_input` and `normalize_artifact_list`."""
 
 import base64
 from pathlib import Path
@@ -14,6 +9,7 @@ import pytest
 from griptape.artifacts import AudioUrlArtifact, ImageArtifact, ImageUrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.utils import artifact_normalization
 from griptape_nodes.utils.artifact_normalization import normalize_artifact_input, normalize_artifact_list
 
@@ -179,3 +175,95 @@ def test_list_of_artifact_dicts_is_normalized_element_wise() -> None:
 
     assert isinstance(result[0], VideoUrlArtifact)
     assert result[1] == {"foo": "bar"}
+
+
+@pytest.fixture
+def static_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Give normalization a workspace with a real storage driver and a real `staticfiles/` copy.
+
+    `save_static_file` writes into `staticfiles/` the way the real manager does, so a copy made
+    by normalization shows up on disk instead of vanishing into a mock.
+    """
+    staticfiles = tmp_path / "staticfiles"
+    staticfiles.mkdir()
+
+    def save_static_file(data: bytes, file_name: str, *_args: Any, **_kwargs: Any) -> str:
+        (staticfiles / file_name).write_bytes(data)
+        return f"http://localhost:8124/workspace/staticfiles/{file_name}"
+
+    engine = MagicMock()
+    engine.config_manager.workspace_path = tmp_path
+    engine.static_files_manager.storage_driver = LocalStorageDriver(MagicMock(workspace_path=tmp_path), MagicMock())
+    engine.static_files_manager.save_static_file.side_effect = save_static_file
+    monkeypatch.setattr(artifact_normalization, "current_engine", lambda: engine)
+    return tmp_path
+
+
+def _staticfiles_contents(workspace: Path) -> list[Path]:
+    return sorted((workspace / "staticfiles").iterdir())
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative", "absolute"])
+def test_workspace_path_is_served_in_place(static_workspace: Path, relative: bool) -> None:  # noqa: FBT001
+    """A file path becomes a URL for that file, and nothing is copied into `staticfiles/`."""
+    file_path = static_workspace / "renders" / "image.jpg"
+    file_path.parent.mkdir()
+    file_path.write_bytes(b"data")
+    artifact_input = "renders/image.jpg" if relative else str(file_path)
+
+    result = normalize_artifact_input(artifact_input, ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value.startswith("http://localhost:8124/workspace/renders/image.jpg?")
+    assert _staticfiles_contents(static_workspace) == []
+
+
+def test_external_path_is_served_in_place(static_workspace: Path, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """A file outside the workspace is served from where it is, not copied in."""
+    file_path = tmp_path_factory.mktemp("external") / "image.jpg"
+    file_path.write_bytes(b"data")
+
+    result = normalize_artifact_input(str(file_path), ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert "/external/" in result.value
+    assert _staticfiles_contents(static_workspace) == []
+
+
+def test_stale_static_server_url_is_reminted(static_workspace: Path) -> None:
+    """A URL from an earlier session's port and version resolves to a fresh URL for the same file."""
+    file_path = static_workspace / "staticfiles" / "image.jpg"
+    file_path.write_bytes(b"data")
+    before = _staticfiles_contents(static_workspace)
+
+    result = normalize_artifact_input(
+        "http://localhost:53999/workspace/staticfiles/image.jpg?v=stale", ImageUrlArtifact
+    )
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value.startswith("http://localhost:8124/workspace/staticfiles/image.jpg?")
+    assert not result.value.endswith("v=stale")
+    assert _staticfiles_contents(static_workspace) == before
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("http://localhost:8124/workspace/staticfiles/missing.jpg?v=1", id="missing-workspace-file"),
+        pytest.param("http://localhost:8124/api/health", id="not-a-workspace-url"),
+        pytest.param("https://example.com/image.jpg", id="remote"),
+    ],
+)
+def test_url_that_names_no_local_file_is_wrapped_as_is(static_workspace: Path, url: str) -> None:
+    """A URL with no local file behind it is kept verbatim."""
+    result = normalize_artifact_input(url, ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value == url
+    assert _staticfiles_contents(static_workspace) == []
+
+
+def test_missing_path_is_returned_unchanged(static_workspace: Path) -> None:
+    """A path to nothing is handed back for the node's own validation to report."""
+    assert normalize_artifact_input("missing.jpg", ImageUrlArtifact) == "missing.jpg"
+    assert _staticfiles_contents(static_workspace) == []

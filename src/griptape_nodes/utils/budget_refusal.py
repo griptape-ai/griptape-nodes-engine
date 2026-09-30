@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlsplit
 
 import httpx
+import httpx2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -256,8 +257,10 @@ def _cloud_http_failure(exc: BaseException, resolve_host: Callable[[], str]) -> 
 
     Three shapes, one per HTTP client that spends credits:
 
-    - ``httpx.HTTPStatusError``: host-scoped, so a 403 from an MCP server or a
-      third-party API is not read as a budget refusal.
+    - ``httpx2.HTTPStatusError``, from the engine's own Cloud calls, and
+      ``httpx.HTTPStatusError``, from node libraries that still use httpx:
+      host-scoped, so a 403 from an MCP server or a third-party API is not read
+      as a budget refusal.
     - ``requests.exceptions.HTTPError``, from the Griptape SDK's Cloud drivers:
       host-scoped too, and duck-typed because ``requests`` is not an engine
       dependency.
@@ -269,7 +272,7 @@ def _cloud_http_failure(exc: BaseException, resolve_host: Callable[[], str]) -> 
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, httpx.HTTPStatusError):
+        if isinstance(current, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
             if current.request.url.host != resolve_host():
                 return None
             return CloudHttpFailure(status=current.response.status_code, body=_body_of(current.response))
@@ -309,11 +312,11 @@ def _parsed_body(parse: Callable[[], object]) -> object | None:
         return None
 
 
-def _body_of(response: httpx.Response) -> object | None:
+def _body_of(response: httpx.Response | httpx2.Response) -> object | None:
     """Parse a response body, returning None when it is not JSON or a stream never read it."""
     try:
         return response.json()
-    except (ValueError, httpx.ResponseNotRead):
+    except (ValueError, httpx.ResponseNotRead, httpx2.ResponseNotRead):
         return None
 
 

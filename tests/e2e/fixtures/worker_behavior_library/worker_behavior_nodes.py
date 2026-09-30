@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any
 
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import AsyncResult, DataNode
 from griptape_nodes.files.file import File
 from griptape_nodes.files.project_file import ProjectFileDestination
@@ -199,6 +199,79 @@ class ChainEndNode(DataNode):
 
     def process(self) -> None:
         self.parameter_output_values["final"] = f"{self.get_parameter_value('in_value')}->end"
+
+
+class ReportsWithSetterNode(DataNode):
+    """Reports its results through `set_parameter_value` rather than `parameter_output_values`.
+
+    Both spellings are common in libraries. The three parameters cover the mode combinations a library
+    actually declares: OUTPUT alone, OUTPUT alongside PROPERTY so the value stays on display, and the
+    default, which is every mode and is what most parameters in a library are. All three publish, so a
+    value set on any of them while the node runs is a result and has to travel back from a worker.
+    `scratch` has no OUTPUT, so it has no port to publish on and stays behind.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="status",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="on_display",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(Parameter(name="defaulted", type="str", default_value="", tooltip=""))
+        self.add_parameter(
+            Parameter(
+                name="scratch",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        self.set_parameter_value("status", "reported")
+        self.set_parameter_value("on_display", "shown")
+        self.set_parameter_value("defaulted", "defaulted-result")
+        self.set_parameter_value("scratch", "local only")
+        # Read back through the same API the value was set with.
+        self.set_parameter_value("status", self.get_parameter_value("status") + "-readback")
+
+
+class GrowsAnOutputListNode(DataNode):
+    """Grows an output-only `ParameterList` while running, as Split Video does.
+
+    The children are set through `set_parameter_value`; the list itself is rebuilt from them. Only the
+    rebuilt list is a result, so only it travels back from a worker.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.clips = ParameterList(
+            name="clips",
+            type="str",
+            tooltip="",
+            allowed_modes={ParameterMode.OUTPUT},
+        )
+        self.add_parameter(self.clips)
+
+    def process(self) -> None:
+        for item in ("clip0", "clip1"):
+            child = self.clips.add_child_parameter()
+            self.set_parameter_value(child.name, item)
 
 
 def _shout(value: Any) -> Any:

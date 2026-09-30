@@ -231,6 +231,17 @@ class TestRecognizingARefusal:
 
         assert from_flat == from_openai
 
+    def test_an_httpx2_error_parses_like_an_httpx_one(self) -> None:
+        """The engine's own Cloud calls use httpx2; node libraries may still use httpx."""
+        request = httpx2.Request("POST", f"https://{CLOUD_HOST}/api/images/generations")
+        response = httpx2.Response(403, json=a_refusal_body(), request=request)
+        with pytest.raises(httpx2.HTTPStatusError) as caught:
+            response.raise_for_status()
+
+        refusal = refusal_from_exception(caught.value, cloud_host=CLOUD_HOST)
+
+        assert refusal == refusal_from_exception(a_cloud_error(a_refusal_body()), cloud_host=CLOUD_HOST)
+
     def test_an_entitlement_403_is_not_a_budget_refusal(self) -> None:
         """A license that authenticates but is not entitled also answers 403."""
         body = {"error": {"code": "permission_denied", "message": "Not entitled.", "type": "permission_error"}}

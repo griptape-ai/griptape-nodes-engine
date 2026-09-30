@@ -39,7 +39,6 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
@@ -4141,13 +4140,13 @@ class NodeExecutor(EngineScoped):
             path_for_key = str(resolved)
         workflow_name = derive_registry_key(path_for_key)
 
-        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
             result = await self.engine.ahandle_request(load_workflow_metadata_request)
             if isinstance(result, LoadWorkflowMetadataResultSuccess):
-                WorkflowRegistry.generate_new_workflow(
+                self.engine.workflow_registry.generate_new_workflow(
                     registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
                 )
 

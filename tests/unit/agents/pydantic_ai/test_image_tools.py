@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
@@ -72,13 +72,13 @@ def _image_artifact_response(image_bytes: bytes, image_format: str = "png") -> d
 class _TransportRecorder:
     """Captures outgoing requests and supplies queued responses."""
 
-    requests: list[httpx.Request] = field(default_factory=list)
-    responses: list[httpx.Response] = field(default_factory=list)
+    requests: list[httpx2.Request] = field(default_factory=list)
+    responses: list[httpx2.Response] = field(default_factory=list)
 
 
 @pytest.fixture
 def patch_transport(monkeypatch: pytest.MonkeyPatch) -> _TransportRecorder:
-    """Route `httpx.AsyncClient.post` through a recording mock transport.
+    """Route `httpx2.AsyncClient.post` through a recording mock transport.
 
     Returns a recorder so a test can assert on captured requests and enqueue
     custom responses. The mock returns a PNG artifact unless a response is
@@ -86,17 +86,17 @@ def patch_transport(monkeypatch: pytest.MonkeyPatch) -> _TransportRecorder:
     """
     recorder = _TransportRecorder()
 
-    async def fake_post(self: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:  # noqa: ARG001
-        request = httpx.Request("POST", url, json=kwargs.get("json"), headers=kwargs.get("headers"))
+    async def fake_post(self: httpx2.AsyncClient, url: str, **kwargs: Any) -> httpx2.Response:  # noqa: ARG001
+        request = httpx2.Request("POST", url, json=kwargs.get("json"), headers=kwargs.get("headers"))
         recorder.requests.append(request)
         if recorder.responses:
             response = recorder.responses.pop(0)
         else:
-            response = httpx.Response(200, json=_image_artifact_response(b"image-bytes"))
+            response = httpx2.Response(200, json=_image_artifact_response(b"image-bytes"))
         response.request = request
         return response
 
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(httpx2.AsyncClient, "post", fake_post)
     return recorder
 
 
@@ -213,7 +213,7 @@ class TestGenerateImage:
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         patch_transport.responses.append(
-            httpx.Response(200, json=_image_artifact_response(b"jpeg-bytes", image_format="jpeg"))
+            httpx2.Response(200, json=_image_artifact_response(b"jpeg-bytes", image_format="jpeg"))
         )
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
@@ -225,7 +225,7 @@ class TestGenerateImage:
     async def test_raises_on_http_error(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
-        patch_transport.responses.append(httpx.Response(500, json={"error": "boom"}))
+        patch_transport.responses.append(httpx2.Response(500, json={"error": "boom"}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         # A Cloud failure becomes a ModelRetry so the agent turn survives.
@@ -237,7 +237,7 @@ class TestGenerateImage:
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         # Retrying a budget refusal only spends the turn being refused again.
-        patch_transport.responses.append(httpx.Response(403, json=a_refusal_body()))
+        patch_transport.responses.append(httpx2.Response(403, json=a_refusal_body()))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         with pytest.raises(BudgetExceededError) as raised:
@@ -249,7 +249,7 @@ class TestGenerateImage:
     async def test_raises_on_malformed_response(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
-        patch_transport.responses.append(httpx.Response(200, json={"unexpected": "shape"}))
+        patch_transport.responses.append(httpx2.Response(200, json={"unexpected": "shape"}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         with pytest.raises(ModelRetry):
@@ -260,7 +260,7 @@ class TestGenerateImage:
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         # A JSON body whose `artifact` is the wrong shape must not escape as TypeError.
-        patch_transport.responses.append(httpx.Response(200, json={"artifact": ["not", "a", "dict"]}))
+        patch_transport.responses.append(httpx2.Response(200, json={"artifact": ["not", "a", "dict"]}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         with pytest.raises(ModelRetry):

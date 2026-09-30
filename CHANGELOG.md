@@ -21,6 +21,27 @@ the engine's request API from working without edits. Migration steps live in
   [When a budget stops a run](https://docs.griptapenodes.com/en/stable/guides/editor/running_workflows/#when-a-budget-stops-a-run).
   [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
 
+### Changed
+
+- Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
+  engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
+  still work and act on the current engine's registry.
+
+### Fixed
+
+- `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
+  tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
+- A node that reports a result with `set_parameter_value` now shows that result when the node runs
+  in a library's isolated process, instead of leaving the output empty. A parameter that has an
+  output, set while the node is running, now also records the value as a result, and results are what
+  travel back from an isolated process. This covers a parameter that is also kept on display, and one
+  that declares no modes at all, which is most of the parameters a library writes. Nothing the
+  parameter held before is given up: the value is still the parameter's own, so a node that sets one
+  mid-run and reads it on the next run, as a randomized seed does, reads what it set. A parameter
+  with no output has nowhere to publish, so a value set on it during a run stays in the process that
+  set it.
+  [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+
 ## [0.103.0] - 2026-09-29
 
 ### Changed
@@ -29,9 +50,16 @@ the engine's request API from working without edits. Migration steps live in
   (env `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`). With its heartbeat role removed, what it bounds
   is how long a worker may take to load its library, which the new name states. A config file still
   setting the old name silently falls back to the 600 second default.
+- Workflows run in a subprocess now verify TLS certificates against the operating system's trust
+  store, matching the app.
 
 ### Fixed
 
+- A `Workflow Node` now starts each parameter it exposes from a workflow's `Start Flow` node with
+  the value set on that `Start Flow` node, instead of leaving it empty. The value is saved with the
+  workflow, so a workflow saved before this release needs saving again to carry it. Values such as
+  images keep the parameter's own default.
+  [#5698](https://github.com/griptape-ai/griptape-nodes-engine/issues/5698)
 - The process a library runs isolated in shuts down within about 35 seconds of losing the engine
   that started it. Before, if that engine exited in the process's first 10 minutes, the process
   stayed up until those 10 minutes had passed. `worker.library_load_timeout_s` no longer delays
@@ -70,6 +98,11 @@ the engine's request API from working without edits. Migration steps live in
 - Renaming a parameter that holds an output value now reports that the old name no longer has one,
   alongside the new name's value. Before, only the new name was reported, so anything tracking
   output values by parameter name kept the old name's value.
+- Saving HEIC, AVIF, or ICO bytes no longer rewrites the destination's extension to match the
+  detected format, and no longer fails when `coerce_extension_to_match_bytes` is off. The engine
+  does not recognize these formats, so the file is written at the extension you asked for and a
+  warning is logged.
+  [#5614](https://github.com/griptape-ai/griptape-nodes-engine/issues/5614)
 
 ### Added
 
@@ -146,6 +179,12 @@ the engine's request API from working without edits. Migration steps live in
 - Image, video, audio, and 3D parameters no longer fail when given an inline `data:` URI longer than
   the operating system's file name limit, which any real image exceeds. The URI is kept as the
   parameter's value.
+- Image, video, audio, and 3D inputs given a file path use the file where it already is, instead of
+  copying it into `staticfiles/`. The copy could overwrite a different file with the same name. A
+  saved workflow now depends on its input files staying put: moving, renaming, or deleting one
+  breaks the workflow, and an input outside the workspace is referenced by its absolute path, so the
+  project is no longer portable across machines for those inputs.
+  [#5647](https://github.com/griptape-ai/griptape-nodes-engine/issues/5647)
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
