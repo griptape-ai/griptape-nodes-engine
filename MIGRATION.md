@@ -25,16 +25,19 @@ Send a value back in the same form to set that exact type.
 [Parameter values](docs/guides/mcp/external_clients.md#parameter-values) lists the forms and which
 fields carry them.
 
-**Library authors.** A class you own saves by implementing `SavesState`. For a class you cannot
-edit, register a codec from your library's code:
+**Library authors.** To make a class you own save, decorate it with `register_value_codec` and
+give it `to_state()` and a `from_state()` classmethod. For a class you cannot edit, pass the
+conversion functions from your library's `before_library_nodes_loaded`:
 
 ```python
 import numpy as np
 
-from griptape_nodes.exe_types.core_types import SavesState, register_value_codec
+from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 
 
-class Palette(SavesState):
+@register_value_codec
+class Palette:
     def __init__(self, colors: list[str]) -> None:
         self.colors = colors
 
@@ -46,11 +49,13 @@ class Palette(SavesState):
         return cls(state["colors"])
 
 
-register_value_codec(
-    np.ndarray,
-    to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
-    from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
-)
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
 ```
 
 ## `serializable=False` outputs are held in their own process across a worker boundary
