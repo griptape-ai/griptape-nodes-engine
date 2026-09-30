@@ -18,6 +18,8 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
+  tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
   in a library's isolated process, instead of leaving the output empty. A parameter that has an
   output, set while the node is running, now also records the value as a result, and results are what
