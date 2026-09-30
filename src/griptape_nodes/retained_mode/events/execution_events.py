@@ -413,6 +413,8 @@ class NodeResolvedEvent(ExecutionPayload):
     parameter_output_values: dict
     node_type: str
     specific_library_name: str | None = None
+    # Wall-clock milliseconds the node spent executing. None when the node was not executed in this run.
+    duration_ms: float | None = None
 
 
 @dataclass

@@ -10,6 +10,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- `NodeResolvedEvent` now includes `duration_ms`, the milliseconds the node took to run, so an editor
+  can show per-node timing. It is `null` for a node that did not run, such as a locked node.
+
 ### Changed
 
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so

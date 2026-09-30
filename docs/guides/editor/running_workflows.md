@@ -103,6 +103,16 @@ independent of whether it's part of the current run. After a run ends, a
 node that errored keeps its red **Error** pill so you can still find it and
 inspect the message without having to remember which node failed.
 
+### Node timing and confetti
+
+When a node finishes, confetti bursts from it. The longer the node took,
+the bigger the burst, so the heavy steps of a workflow stand out. The node
+also keeps a badge in its header, such as **⏱ 312 ms**, showing how long
+the engine says it took to run. The badge stays until the node runs again.
+
+If your system is set to reduce motion, you get the badge without the
+confetti.
+
 ## The Logs panel
 
 The **Execution Log** panel (right sidebar) collects everything the engine
