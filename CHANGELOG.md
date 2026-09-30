@@ -10,6 +10,12 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- `NodeResolvedEvent` now includes `elapsed_ms`, the time the node took to execute in milliseconds,
+  so an editor can show how long each node of a run took. Clients that ignore the field are
+  unaffected, and it is absent when the engine did not time the node.
+
 ### Changed
 
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so

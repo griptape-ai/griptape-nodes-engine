@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
@@ -291,6 +292,7 @@ class ExecuteDagState(State):
                         parameter_output_values=display_output_values,
                         node_type=current_node.__class__.__name__,
                         specific_library_name=library_name,
+                        elapsed_ms=done_node.elapsed_ms,
                     )
                 )
             )
@@ -593,7 +595,9 @@ class ExecuteDagState(State):
     @staticmethod
     async def execute_node(engine: Engine, current_node: DagNode) -> None:
         executor = engine.flow_manager.node_executor
+        started_at = time.perf_counter()
         await executor.execute(current_node.node_reference)
+        current_node.elapsed_ms = (time.perf_counter() - started_at) * 1000
 
     @staticmethod
     async def on_enter(context: ParallelResolutionContext) -> type[State] | None:

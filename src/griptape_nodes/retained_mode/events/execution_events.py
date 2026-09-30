@@ -409,10 +409,22 @@ class ControlFlowCancelledEvent(ExecutionPayload):
 @dataclass
 @PayloadRegistry.register
 class NodeResolvedEvent(ExecutionPayload):
+    """A node finished executing.
+
+    Args:
+        node_name: The node that finished
+        parameter_output_values: The values the node produced, keyed by parameter name
+        node_type: The node's class name
+        specific_library_name: The library that provides the node, when exactly one does
+        elapsed_ms: How long the node took to execute, in milliseconds. ``None`` when the engine
+            did not time the execution.
+    """
+
     node_name: str
     parameter_output_values: dict
     node_type: str
     specific_library_name: str | None = None
+    elapsed_ms: float | None = None
 
 
 @dataclass
