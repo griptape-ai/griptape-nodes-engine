@@ -243,8 +243,8 @@ class TestTheDerivedMembershipIsReviewed:
             # os_events sequence scanning: these two read the same shared directories.
             "ListDirectorySequencesRequest",
             "ScanSequencesRequest",
-            # No filesystem I/O at all -- it groups a caller-supplied path list. Local only because
-            # its failure union cannot be structured; see category 3 in worker_routing.
+            # No filesystem I/O at all -- it groups a caller-supplied path list, so any process
+            # gives the same answer and forwarding would only add a round trip.
             "DeduceSequencesFromFileListRequest",
             # artifact_events: resolve a provider from a process-local registry while writing into
             # the project's previews directory.
