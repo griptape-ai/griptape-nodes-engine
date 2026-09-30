@@ -987,7 +987,7 @@ dependencies = [
                 if isinstance(obj, HuggingFaceModelParameter):
                     _hf_params.append(obj)
 
-            workflow_manager._walk_object_tree(node, collect_hf_param)
+            workflow_manager.codegen.walk_object_tree(node, collect_hf_param)
             for hf_param in hf_params:
                 for cmd in hf_param.get_download_commands():
                     if cmd not in seen:

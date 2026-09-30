@@ -249,7 +249,7 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     destination = ProjectFileDestination(str(tmp_path / f"{file_stem}.py"))
-    save_result = engine.workflow_manager._save_workflow_file_inline(
+    save_result = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=destination,
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -290,9 +290,9 @@ def _round_trip_single_value(engine: Engine, tmp_path: Path, file_stem: str, val
 
     file_path = _save_flow_to_disk(engine, flow_name, tmp_path, file_stem)
     with pytest.MonkeyPatch.context() as monkeypatch:
-        import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
+        import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 
-        monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+        monkeypatch.setattr(saving_module, "datetime", _FrozenDateTime)
         _reload_from_disk(engine, file_path)
 
     return _get_value(engine, node_name, "value")
@@ -636,9 +636,9 @@ class TestDeterministicSaveOutput:
         _set_value(engine, node_name, "value", {"a": 1, "b": [1, 2, 3]})
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
+            import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            monkeypatch.setattr(saving_module, "datetime", _FrozenDateTime)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "first_save")
             second_path = _save_flow_to_disk(engine, flow_name, tmp_path, "second_save")
@@ -670,9 +670,9 @@ class TestIdempotentSaveLoadSave:
         _set_value(engine, node_name, "value2", "some text")
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
+            import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            monkeypatch.setattr(saving_module, "datetime", _FrozenDateTime)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "roundtrip")
             first_source = _read_saved_source(first_path)
