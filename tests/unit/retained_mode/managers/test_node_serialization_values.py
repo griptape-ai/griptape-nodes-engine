@@ -21,7 +21,7 @@ from griptape_nodes.retained_mode.managers.node_manager import (
     NodeManager,
     SerializedParameterValueTracker,
 )
-from griptape_nodes.serialization.values import encode_value, value_key
+from griptape_nodes.serialization.values import encode_value, register_value_codec, value_key
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
@@ -43,6 +43,7 @@ class _NoPlainDataForm:
     """A value the value codec cannot encode."""
 
 
+@register_value_codec
 class _CountsEncodes:
     """Supplies its own state, counting how often it is asked for it."""
 
@@ -60,6 +61,7 @@ class _CountsEncodes:
         return cls(state["payload"])
 
 
+@register_value_codec
 class _FailsToEncode:
     """Its state cannot be produced, counting how many times it was asked."""
 
@@ -72,7 +74,7 @@ class _FailsToEncode:
         raise TypeError(msg)
 
     @classmethod
-    def from_state(cls, _state: dict) -> _FailsToEncode:
+    def from_state(cls, state: dict) -> _FailsToEncode:  # noqa: ARG003
         return cls()
 
 
