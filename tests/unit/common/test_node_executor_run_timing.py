@@ -1,5 +1,6 @@
 """Tests for the node_run_timing beta feature in NodeExecutor.execute()."""
 
+import asyncio
 import logging
 import re
 from typing import cast
@@ -100,3 +101,16 @@ class TestNodeRunTiming:
             await executor.execute(_make_node())
 
         assert any(record.getMessage().startswith("TIME TO RUN: ") for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_records_a_cancelled_node_as_cancelled(self, caplog: pytest.LogCaptureFixture) -> None:
+        executor = _make_executor({NODE_RUN_TIMING.config_key: True})
+        cast("MagicMock", executor.engine).ahandle_request = AsyncMock(side_effect=asyncio.CancelledError)
+        executor.run_timer.start_run()
+
+        with pytest.raises(asyncio.CancelledError):
+            await executor.execute(_make_node())
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            executor.run_timer.finish_run(RunOutcome.CANCELLED)
+
+        assert "'TestNode' (MagicMock)  CANCELLED" in caplog.text
