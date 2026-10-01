@@ -482,8 +482,7 @@ def _run_render(source: str, directory: Path) -> int:
         sys.stderr.write(f"{error}\n")
         return 1
 
-    # On stdout the empty section reads as a broken command, at the step where a release manager is
-    # reading what they are about to publish. The notes themselves stay on stdout alone.
+    # Kept off stdout so stdout carries the notes and nothing else.
     if not body:
         sys.stderr.write(f"Nothing to release: [Unreleased] is empty and {directory} holds no entries.\n")
     sys.stdout.write(body)

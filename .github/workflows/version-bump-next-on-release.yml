@@ -121,13 +121,10 @@ jobs:
           BRANCH="chore/bump-next-v${NEXT}"
           git checkout -b "$BRANCH"
           git add --all pyproject.toml uv.lock CHANGELOG.md
-          # changelog.d carries the deletions of the entries the roll folded in; staging CHANGELOG.md
-          # alone would leave them on main for the next release to publish a second time. The
-          # directory test is because git treats a pathspec matching nothing as fatal.
+          # A pathspec matching nothing is fatal, and the entries the roll deleted must land with it.
           test ! -d changelog.d || git add --all changelog.d
           git commit -m "chore: bump v${NEXT}"
-          # Only when this run folded them. A run that found the section already rolled leaves the
-          # entries alone, and those belong to the next release.
+          # Entries a run left alone, having found the section already rolled, belong to the next release.
           if [ "${{ steps.roll.outputs.rolled }}" = "true" ]; then
             make version/assert-rolled
           fi

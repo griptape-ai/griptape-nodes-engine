@@ -39,9 +39,8 @@ version/commit: ## Commit version.
 .PHONY: version/publish
 version/publish: ## Roll the changelog, then create and push git tags. Pass allow_empty=1 to release with no entries.
 	@git fetch --tags --force
-	@# The roll rewrites CHANGELOG.md and deletes the entry files it folds in, and this target then
-	@# commits, tags, and pushes both. An uncommitted edit to either rides into that tag unreviewed,
-	@# and an untracked entry file is gone for good.
+	@# The roll overwrites CHANGELOG.md and deletes the entry files, and this target tags and pushes
+	@# the result, so uncommitted work here ships unreviewed or is lost outright.
 	@git diff --quiet HEAD -- CHANGELOG.md changelog.d \
 		&& test -z "$$(git ls-files --others --exclude-standard -- changelog.d)" \
 		|| { echo "CHANGELOG.md or changelog.d holds changes that are not committed, and the roll would overwrite them."; \
@@ -49,10 +48,9 @@ version/publish: ## Roll the changelog, then create and push git tags. Pass allo
 		     exit 1; }
 	@uv run python scripts/changelog.py roll $$(make version/get) $(if $(allow_empty),--allow-empty)
 	@git checkout --quiet --detach
-	@# Named paths only, so nothing a maintainer happens to have staged rides into a commit this
-	@# target tags and pushes. git treats a pathspec it knows nothing about as fatal, and a release
-	@# branch cut before changelog.d existed has no entry files in it, so ask git rather than the
-	@# filesystem: an ignored .DS_Store is enough to keep the directory itself present.
+	@# Named paths, so nothing else a maintainer staged rides into a commit this target tags. Asks git
+	@# rather than testing the directory because a pathspec git knows nothing about is fatal, and an
+	@# ignored .DS_Store keeps the directory present on a branch cut before changelog.d existed.
 	@tracked_entries=$$(git ls-files changelog.d); \
 		git commit --quiet -m "chore: release v$$(make version/get)" -- CHANGELOG.md $${tracked_entries:+changelog.d}
 	@make version/assert-rolled
@@ -68,9 +66,6 @@ version/publish: ## Roll the changelog, then create and push git tags. Pass allo
 version/assert-rolled: ## Fail if HEAD still carries changelog.d entries.
 	@# Exempts what the roll never folds, so this must match _entry_paths in scripts/changelog.py: a
 	@# tracked file the roll leaves behind on purpose would block every release with no way out.
-	@# Names the files rather than prescribing a remedy, since the three callers recover differently:
-	@# version/publish is on a detached HEAD and restarts the step, the manual recipe amends, and CI
-	@# can only report. CONTRIBUTING.md, under Making a Release, carries each one.
 	@unfolded=$$(git ls-tree -r --name-only HEAD -- changelog.d | grep -v -e '^changelog\.d/README\.md$$' -e '/\.'); \
 		test -z "$$unfolded" \
 		|| { echo "HEAD still carries these changelog.d entries, so the roll did not reach this commit:"; \
