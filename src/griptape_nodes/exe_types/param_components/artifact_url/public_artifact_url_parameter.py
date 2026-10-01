@@ -318,6 +318,8 @@ class PublicArtifactUrlParameter:
         """
         if not self._is_not_found(error):
             return
+        # Nothing was stored in a bucket that is gone, and cleanup would only re-resolve it and fail.
+        self._take_upload_path()
         if self._storage_driver is driver:
             self._storage_driver = None
         for cache_key, bucket_id in list(self._bucket_id_cache.items()):

@@ -17,15 +17,17 @@ the engine's request API from working without edits. Migration steps live in
   and gets it back when the switch is turned on again. `GTN_CONFIG_BETA_FEATURES__ENABLED=false`
   turns every beta feature off for one session.
   [#5710](https://github.com/griptape-ai/griptape-nodes-engine/issues/5710)
-- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and `adelete_uploaded_artifact()`.
-  Nodes using them can upload multiple reference images concurrently without blocking other nodes or
-  delaying "Stop". Uploads interrupted by "Stop" finish and are deleted in the background.
+- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and
+  `adelete_uploaded_artifact()`. Nodes using them can upload multiple reference images concurrently
+  without blocking other nodes or delaying "Stop". Uploads interrupted by "Stop" finish and are
+  deleted in the background.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
 
 ### Changed
 
-- Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the first
-  upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts Griptape Cloud.
+- Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
+  first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
+  Griptape Cloud.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods

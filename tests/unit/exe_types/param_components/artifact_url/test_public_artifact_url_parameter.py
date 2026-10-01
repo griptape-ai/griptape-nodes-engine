@@ -288,12 +288,15 @@ def _clear_class_state() -> Iterator[None]:
 
 
 def _upload_error(status_code: int) -> RuntimeError:
-    """Build the error the storage driver raises for an HTTP failure."""
+    """Build the error upload_file raises when creating the asset fails, wrapped as the driver wraps it."""
     request = httpx2.Request("PUT", "https://bucket.example/asset")
-    error = RuntimeError(f"upload failed with {status_code}")
-    error.__cause__ = httpx2.HTTPStatusError(
+    http_error = httpx2.HTTPStatusError(
         str(status_code), request=request, response=httpx2.Response(status_code, request=request)
     )
+    create_asset_error = ValueError(f"Failed to create asset: {http_error}")
+    create_asset_error.__cause__ = http_error
+    error = RuntimeError(f"upload failed with {status_code}")
+    error.__cause__ = create_asset_error
     return error
 
 
@@ -384,6 +387,8 @@ class TestLazyStorageDriver:
 
         with pytest.raises(RuntimeError, match="upload failed"):
             await upload()
+        # Cleanup has nothing to delete in a bucket that is gone.
+        assert component.gtc_file_path is None
         assert await upload() == PUBLIC_URL
 
         lookups_before_and_after_failure = 2
