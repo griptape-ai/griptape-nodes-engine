@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowsFromConfigResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -62,10 +63,7 @@ class SyncManager(EngineScoped):
         )
         self._sync_dir.mkdir(parents=True, exist_ok=True)
 
-        event_manager.assign_manager_to_request_type(
-            StartSyncAllCloudWorkflowsRequest,
-            self.on_start_sync_all_cloud_workflows_request,
-        )
+        event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
             AppInitializationComplete,
@@ -126,6 +124,7 @@ class SyncManager(EngineScoped):
 
         return False
 
+    @handles(StartSyncAllCloudWorkflowsRequest)
     def on_start_sync_all_cloud_workflows_request(self, _request: StartSyncAllCloudWorkflowsRequest) -> ResultPayload:
         """Start syncing all cloud workflows to local synced_workflows directory."""
         try:

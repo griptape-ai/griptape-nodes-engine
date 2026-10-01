@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -77,10 +78,9 @@ class BudgetManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
-        event_manager.assign_manager_to_request_type(
-            GetAttributionContextRequest, self.on_get_attribution_context_request
-        )
+        event_manager.register_request_handlers(self)
 
+    @handles(GetAttributionContextRequest)
     def on_get_attribution_context_request(
         self,
         request: GetAttributionContextRequest,  # noqa: ARG002
