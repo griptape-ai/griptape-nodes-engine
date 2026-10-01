@@ -5104,15 +5104,14 @@ class NodeManager(EngineScoped):
                 value = node.parameter_output_values[parameter.name]
             else:
                 value = node._get_raw_parameter_value(parameter.name)
-            try:
-                encode_value(value)
-            except ValueEncodeError as error:
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
                 logger.warning(
                     "Node '%s' finished its flow with a '%s' value that cannot be sent on. Whoever ran "
                     "the flow receives no value for it. %s",
                     node.name,
                     parameter.name,
-                    error,
+                    encoded.reason,
                 )
                 value = None
             values[parameter.name] = value
