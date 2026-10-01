@@ -12,8 +12,10 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import urljoin
 
-from websockets.asyncio.client import connect
-from websockets.client import process_exception
+# websockets.asyncio.client is the only module that defines process_exception on every websockets
+# version this package supports. 17.x moved it to websockets.client and re-imports it here, which
+# pyright reports as a private import.
+from websockets.asyncio.client import connect, process_exception  # pyright: ignore[reportPrivateImportUsage]
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
