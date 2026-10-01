@@ -9,8 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
-from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
+from griptape_nodes.api_client import Client
+from griptape_nodes.bootstrap.utils.subprocess_websocket_base import (
+    SUBPROCESS_EVENTS_TOKEN_ENV_VAR,
+    SubprocessEventChannelError,
+    SubprocessWebSocketBaseMixin,
+    WebSocketMessage,
+)
 from griptape_nodes.retained_mode.events.base_events import (
     BaseEvent,
     EventResultFailure,
@@ -25,21 +32,27 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
     """Mixin providing WebSocket sender functionality for subprocess communication.
 
     This mixin handles:
+    - Connecting to the parent process's event server
     - Starting/stopping a WebSocket connection as a background task
     - Queuing and sending events to the parent process
     - Non-blocking event emission from the main event loop
     """
 
+    _events_url: str | None
+    _ws_client: Client | None
     _ws_send_queue: asyncio.Queue[WebSocketMessage]
     _ws_shutdown_event: asyncio.Event
 
-    def _init_websocket_sender(self, session_id: str) -> None:
+    def _init_websocket_sender(self, session_id: str, events_url: str | None) -> None:
         """Initialize WebSocket sender state.
 
         Args:
             session_id: Unique session ID for WebSocket topic.
+            events_url: Address of the parent process's event server.
         """
         self._init_websocket_base(session_id)
+        self._events_url = events_url
+        self._ws_client = None
         self._ws_send_queue = asyncio.Queue()
         self._ws_shutdown_event = asyncio.Event()
 
@@ -52,6 +65,31 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
         self._create_websocket_task(self._ws_send_loop())
 
         logger.info("WebSocket sender started for session %s", self._session_id)
+
+    async def _start_websocket_client(self) -> None:
+        """Connect to the parent process's event server.
+
+        Raises:
+            SubprocessEventChannelError: If the parent did not pass its address and token, or the
+                connection fails.
+        """
+        token = os.environ.get(SUBPROCESS_EVENTS_TOKEN_ENV_VAR)
+        if self._events_url is None or not token:
+            msg = (
+                "Attempted to report progress and results from this run back to the main engine. "
+                "Failed because the run was started without the main engine's connection details."
+            )
+            raise SubprocessEventChannelError(msg)
+
+        logger.info("Connecting to parent event server for session %s", self._session_id)
+        # Passing the token as the API key keeps the Griptape Cloud key out of this connection.
+        self._ws_client = Client(url=self._events_url, api_key=token)
+        try:
+            await self._ws_client.connect()
+        except ConnectionError as e:
+            msg = f"Attempted to report progress and results from this run back to the main engine. Failed due to {e}"
+            raise SubprocessEventChannelError(msg) from e
+        logger.info("Connected to parent event server for session %s", self._session_id)
 
     async def _ws_send_loop(self) -> None:
         """Background task to send queued messages."""
@@ -134,6 +172,15 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
         await self._stop_websocket_client()
 
         logger.info("WebSocket sender stopped for session %s", self._session_id)
+
+    async def _stop_websocket_client(self) -> None:
+        """Close the connection to the parent process's event server."""
+        if self._ws_client is None:
+            return
+
+        await self._ws_client.disconnect()
+        self._ws_client = None
+        logger.info("WebSocket client disconnected for session %s", self._session_id)
 
     async def _wait_for_websocket_queue_flush(self, timeout_seconds: float = 5.0) -> None:
         """Wait for all queued messages to be sent.

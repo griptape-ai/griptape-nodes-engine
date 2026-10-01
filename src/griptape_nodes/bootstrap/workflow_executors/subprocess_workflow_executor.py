@@ -101,6 +101,8 @@ class SubprocessWorkflowExecutor(WorkflowExecutor, PythonSubprocessExecutor, Sub
                 json.dumps(encode_value(flow_input)),
                 "--session-id",
                 self._session_id,
+                "--events-url",
+                self._get_events_url(),
                 "--storage-backend",
                 storage_backend.value,
                 "--workflow-path",
@@ -114,6 +116,7 @@ class SubprocessWorkflowExecutor(WorkflowExecutor, PythonSubprocessExecutor, Sub
                     cwd=Path(tmpdir),
                     env={
                         "GTN_CONFIG_ENABLE_WORKSPACE_FILE_WATCHING": "false",
+                        **self._get_events_env(),
                     },
                 )
             except Exception as e:
@@ -121,6 +124,8 @@ class SubprocessWorkflowExecutor(WorkflowExecutor, PythonSubprocessExecutor, Sub
                 logger.exception(msg)
                 raise SubprocessWorkflowExecutorError(msg) from e
             finally:
+                # The result and any failure arrive as events; let the last of them land first.
+                await self._wait_for_subprocess_events()
                 # Check if an exception was stored coming from the WebSocket
                 if self._stored_exception:
                     raise self._stored_exception
