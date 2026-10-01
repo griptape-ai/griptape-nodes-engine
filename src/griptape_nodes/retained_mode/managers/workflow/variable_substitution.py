@@ -1,5 +1,3 @@
-"""Per-workflow switch for resolving `{variable}` references in parameter values."""
-
 from __future__ import annotations
 
 import logging
@@ -29,14 +27,13 @@ logger = logging.getLogger("griptape_nodes")
 class VariableSubstitution(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Workflow registry key -> whether substitution is on. Missing means on. Kept here rather
-        # than in WorkflowMetadata because build_workflow() sets it, so it survives both editor
-        # loads and direct script execution.
+        # Missing keys enable substitution. This cannot live in WorkflowMetadata because
+        # build_workflow() must set it during both editor loads and direct script execution.
         self._enabled: dict[str, bool] = {}
         event_manager.register_request_handlers(self)
 
     def clear(self) -> None:
-        """Forget every workflow's flag when the engine is reset."""
+        """Clear all per-workflow substitution settings."""
         self._enabled.clear()
 
     def drop(self, workflow_key: str) -> None:

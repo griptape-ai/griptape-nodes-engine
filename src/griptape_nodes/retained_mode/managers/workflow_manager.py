@@ -88,7 +88,7 @@ from griptape_nodes.retained_mode.managers.workflow.file_operations import Workf
 from griptape_nodes.retained_mode.managers.workflow.loading import EPOCH_START
 from griptape_nodes.retained_mode.managers.workflow.publishing import WorkflowPublishing
 from griptape_nodes.retained_mode.managers.workflow.referenced_import import ReferencedWorkflowImport
-from griptape_nodes.retained_mode.managers.workflow.running import WorkflowRunner
+from griptape_nodes.retained_mode.managers.workflow.running import WorkflowRunner, collate_problems_by_type
 from griptape_nodes.retained_mode.managers.workflow.saving import (
     WorkflowSaver,
 )
@@ -366,7 +366,7 @@ class WorkflowManager(EngineScoped):
             if not wf_info.problems:
                 problems = "No problems detected."
             else:
-                collated_strings = self.runner.collate_problems_by_type(wf_info.problems)
+                collated_strings = collate_problems_by_type(wf_info.problems)
 
                 # Format for display
                 if len(collated_strings) == 1:
@@ -411,6 +411,10 @@ class WorkflowManager(EngineScoped):
     async def wait_for_workflows_loaded(self) -> None:
         """Wait until any registry refresh in progress has finished."""
         await self._workflows_loading_complete.wait()
+
+    def referenced_workflow(self, workflow_name: str) -> ReferencedWorkflowContext:
+        """Track `workflow_name` as the referenced workflow being imported for the `with` block."""
+        return self.ReferencedWorkflowContext(self, workflow_name)
 
     def squelch_workflow_altered(self) -> WorkflowSquelchContext:
         """Suppress workflow-altered events for the duration of the `with` block."""

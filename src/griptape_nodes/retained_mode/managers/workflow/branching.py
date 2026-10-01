@@ -1,5 +1,3 @@
-"""Branching, merging, resetting, templating, and comparing workflow files."""
-
 from __future__ import annotations
 
 import logging

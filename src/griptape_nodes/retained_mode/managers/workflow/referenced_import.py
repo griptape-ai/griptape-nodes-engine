@@ -1,5 +1,3 @@
-"""Handles importing a registered workflow into a flow as a referenced subflow."""
-
 from __future__ import annotations
 
 import logging
@@ -20,6 +18,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.workflow.loading import is_loading_workflow
+from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -133,7 +131,7 @@ class ReferencedWorkflowImport(EngineScoped):
         workflow_manager = self.engine.workflow_manager
         with self.engine.context_manager.flow(flow_name):
             if request.track_as_referenced:
-                with workflow_manager.ReferencedWorkflowContext(workflow_manager, request.workflow_name):
+                with workflow_manager.referenced_workflow(request.workflow_name):
                     workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
             else:
                 workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
@@ -192,9 +190,7 @@ class ReferencedWorkflowImport(EngineScoped):
         """
         if is_loading_workflow():
             return ResultDetails(message=message, level=level)
-        return ResultDetails(
-            *self.engine.workflow_manager.runner.execution_result_details(workflow_result, level=level, message=message)
-        )
+        return ResultDetails(*execution_result_details(workflow_result, level=level, message=message))
 
     @staticmethod
     def _select_top_level_imported_flow(

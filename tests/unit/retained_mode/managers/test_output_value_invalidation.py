@@ -27,8 +27,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from tests.unit.retained_mode.managers.test_workflow_save_load_roundtrip import (
     _clear_library_registry_state,  # noqa: F401  -- autouse fixture, needed in this module too
     _create_round_trip_node,
+    _freeze_workflow_clock,
     _fresh_flow,
-    _FrozenDateTime,
     _get_value,
     _reload_from_disk,
     _save_flow_to_disk,
@@ -103,9 +103,7 @@ class TestEditInvalidatesOutputValue:
 
         file_path = _save_flow_to_disk(engine, flow_name, tmp_path, "edit_round_trip")
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
-
-            monkeypatch.setattr(saving_module, "datetime", _FrozenDateTime)
+            _freeze_workflow_clock(monkeypatch)
             _reload_from_disk(engine, file_path)
 
         assert _get_value(engine, node_name, "value") == "edited"

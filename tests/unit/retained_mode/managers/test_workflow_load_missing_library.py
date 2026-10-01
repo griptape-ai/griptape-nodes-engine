@@ -83,6 +83,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
+from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -488,7 +489,7 @@ class TestEveryLibraryUnavailable:
         # One problem per library, not one per node...
         assert {problem.library_name for problem in result.problems} == {_AVAILABLE_LIBRARY, _UNAVAILABLE_LIBRARY}
         # ...and both collate into a single warning, because they are the same problem type.
-        assert len(reopened.workflow_manager.runner.collate_problems_by_type(result.problems)) == 1
+        assert len(collate_problems_by_type(result.problems)) == 1
         assert isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
         # The flow itself is engine-owned, so it is there to hold them.
@@ -872,7 +873,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         result = _run(reopened, host_path)
 
         assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
-        collated = reopened.workflow_manager.runner.collate_problems_by_type(result.problems)
+        collated = collate_problems_by_type(result.problems)
         assert len(collated) == 1
         assert "2 libraries" not in collated[0]
 

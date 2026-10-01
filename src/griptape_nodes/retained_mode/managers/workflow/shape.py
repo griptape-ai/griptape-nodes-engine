@@ -1,5 +1,3 @@
-"""A workflow's shape: the Start Flow inputs and End Flow outputs a caller can set and read."""
-
 from __future__ import annotations
 
 import json
