@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import handles
 
@@ -19,30 +19,67 @@ class _PongRequest(RequestPayload):
 
 class _Base:
     @handles(_PingRequest)
-    def on_ping(self, request: _PingRequest) -> ResultPayload: ...
+    def on_ping(self, request: _PingRequest) -> None:
+        pass
 
 
 class _Child(_Base):
     @handles(_PingRequest)
-    def on_ping(self, request: _PingRequest) -> ResultPayload: ...
+    def on_ping(self, request: _PingRequest) -> None:
+        pass
 
     @handles(_PongRequest)
-    def on_pong(self, request: _PongRequest) -> ResultPayload: ...
+    def on_pong(self, request: _PongRequest) -> None:
+        pass
 
 
 class _UnmarkedOverride(_Base):
-    def on_ping(self, request: _PingRequest) -> ResultPayload: ...
+    def on_ping(self, request: _PingRequest) -> None:
+        pass
 
 
 class _RemarkedOverride(_Base):
     @handles(_PongRequest)
-    def on_ping(self, request: RequestPayload) -> ResultPayload: ...
+    def on_ping(self, request: RequestPayload) -> None:
+        pass
 
 
 class _Stacked:
     @handles(_PingRequest)
     @handles(_PongRequest)
-    def on_either(self, request: RequestPayload) -> ResultPayload: ...
+    def on_either(self, request: RequestPayload) -> None:
+        pass
+
+
+class _Static:
+    @staticmethod
+    @handles(_PingRequest)
+    def on_ping(request: _PingRequest) -> None:
+        pass
+
+    @classmethod
+    @handles(_PongRequest)
+    def on_pong(cls, request: _PongRequest) -> None:
+        pass
+
+
+class TestHandles:
+    def test_bare_decorator_raises(self) -> None:
+        with pytest.raises(TypeError, match="takes one or more request types"):
+
+            class _Bare:
+                @handles  # type: ignore[arg-type]
+                def on_ping(self, request: _PingRequest) -> None:
+                    pass
+
+    def test_above_staticmethod_raises(self) -> None:
+        with pytest.raises(TypeError, match="directly above `def`"):
+
+            class _Misordered:
+                @handles(_PingRequest)
+                @staticmethod
+                def on_ping(request: _PingRequest) -> None:
+                    pass
 
 
 class TestRegisterRequestHandlers:
@@ -80,6 +117,15 @@ class TestRegisterRequestHandlers:
 
         assert _PingRequest not in event_manager._request_type_to_manager
         assert event_manager._request_type_to_manager[_PongRequest] == owner.on_ping
+
+    def test_registers_staticmethod_and_classmethod_handlers(self) -> None:
+        event_manager = EventManager()
+        owner = _Static()
+
+        event_manager.register_request_handlers(owner)
+
+        assert event_manager._request_type_to_manager[_PingRequest] == owner.on_ping
+        assert event_manager._request_type_to_manager[_PongRequest] == owner.on_pong
 
     def test_second_owner_for_same_type_raises(self) -> None:
         event_manager = EventManager()
