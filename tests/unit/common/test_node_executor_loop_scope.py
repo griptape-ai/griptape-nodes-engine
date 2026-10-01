@@ -113,6 +113,7 @@ async def test_while_iteration_subflow_runs_inside_the_loop_body_scope() -> None
             flow_name="BodyFlow_1",
             node_name_mappings={"Body": "Body_1"},
             packaged_start_node_name="S_1",
+            end_node_mapping=PackagedNodeParameterMapping(node_name="E", parameter_mappings={}),
             resolved_upstream_values={},
             iteration_startflow_params=[],
             reverse_node_mapping={"Body_1": "Body"},
