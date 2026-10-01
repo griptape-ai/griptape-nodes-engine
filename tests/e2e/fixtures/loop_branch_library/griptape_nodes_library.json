@@ -1,0 +1,82 @@
+{
+  "name": "Griptape Nodes Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library used by loop body branching tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "StartFlow",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Entry node for a packaged flow",
+        "display_name": "Start Flow"
+      }
+    },
+    {
+      "class_name": "EndFlow",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Exit node for a packaged flow",
+        "display_name": "End Flow"
+      }
+    },
+    {
+      "class_name": "BranchNode",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Follows the control output its take property names",
+        "display_name": "Branch"
+      }
+    },
+    {
+      "class_name": "StepNode",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Plain control node that records each run",
+        "display_name": "Step"
+      }
+    },
+    {
+      "class_name": "ProbeWhileGroupNode",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "While node group",
+        "display_name": "Probe While Group"
+      }
+    },
+    {
+      "class_name": "ProbeForEachGroupNode",
+      "file_path": "loop_branch_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Iterative node group over a fixed list",
+        "display_name": "Probe For Each Group"
+      }
+    }
+  ]
+}

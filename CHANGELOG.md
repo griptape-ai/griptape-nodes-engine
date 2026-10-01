@@ -41,6 +41,10 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- While, Retry and For Each groups now end, repeat, skip or break the loop according to the branch
+  the loop body took. Before, a node on a branch that was not taken could still run, and its exit
+  then counted as taken: a group whose body reached "Done" could run again, and a For Each group
+  whose body reached "Loop Complete" could break out of the loop.
 - `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
   tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
