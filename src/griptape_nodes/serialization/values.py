@@ -21,8 +21,8 @@ came from, so it passes through to a process that can build it.
 
 A value with no plain-data form is handled by where it is going:
 
-- Read back later (workflow save, copy and paste, packaged loop and group flows): leave it out and
-  log a warning. Never save its text in its place.
+- Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
+  leave it out and log a warning. Never save its text in its place.
 - Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
   the parameter.
 - Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.

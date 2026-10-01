@@ -256,6 +256,7 @@ from griptape_nodes.serialization.values import (
     JsonValue,
     UndecodedValue,
     Unencodable,
+    ValueEncodeError,
     decode_value,
     encodable_default,
     try_encode,
