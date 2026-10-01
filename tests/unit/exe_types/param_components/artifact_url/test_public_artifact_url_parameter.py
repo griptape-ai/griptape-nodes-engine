@@ -254,6 +254,17 @@ class TestUploadPathLifecycle:
 
         assert driver.delete_file.call_count == 1
 
+    def test_failed_delete_is_not_retried(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+        driver.delete_file.side_effect = RuntimeError("delete failed")
+
+        with pytest.raises(RuntimeError, match="delete failed"):
+            component.delete_uploaded_artifact()
+        component.delete_uploaded_artifact()
+
+        assert driver.delete_file.call_count == 1
+
     def test_delete_is_skipped_when_nothing_was_uploaded(self) -> None:
         component, driver = _make_component("https://example.com/img.png")
 

@@ -85,8 +85,12 @@ class PublicArtifactUrlParameter:
 
     @classmethod
     def _get_bucket_id(cls, engine: Engine, base_url: str, api_key: str, timeout: float | None = None) -> str:
-        configured_bucket_id = cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
-        return cls._resolve_bucket_id(configured_bucket_id, base_url, api_key, timeout=timeout)
+        return cls._resolve_bucket_id(cls._read_configured_bucket_id(engine), base_url, api_key, timeout=timeout)
+
+    @classmethod
+    def _read_configured_bucket_id(cls, engine: Engine) -> str | None:
+        # An engine request, so it must run on the event loop, never in a worker thread.
+        return cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
     @classmethod
     def _resolve_bucket_id(
@@ -210,34 +214,31 @@ class PublicArtifactUrlParameter:
 
         file_contents = await File(url).aread_bytes()
         driver = await self._aget_storage_driver()
-        self.gtc_file_path = self._build_upload_path(url)
+        upload_path = self._build_upload_path(url)
+        self.gtc_file_path = upload_path
         upload = asyncio.ensure_future(
-            asyncio.to_thread(driver.upload_file, path=self.gtc_file_path, file_content=file_contents)
+            asyncio.to_thread(driver.upload_file, path=upload_path, file_content=file_contents)
         )
         try:
             return await asyncio.shield(upload)
         except asyncio.CancelledError:
             # The thread cannot be interrupted. Rather than make a cancelled run wait out the
             # upload, let it finish in the background and delete what it uploaded.
-            self._delete_when_done(upload, driver, self.gtc_file_path)
-            self.gtc_file_path = None
+            self._take_upload_path()
+            self._delete_when_done(upload, driver, upload_path)
             raise
 
     def delete_uploaded_artifact(self) -> None:
-        if not self.gtc_file_path:
+        path = self._take_upload_path()
+        if path is None:
             return
-        self._get_storage_driver().delete_file(self.gtc_file_path)
-        # The upload is gone, so the path is forgotten: a second cleanup pass over the same
-        # helper must not issue another delete.
-        self.gtc_file_path = None
+        self._get_storage_driver().delete_file(path)
 
     async def adelete_uploaded_artifact(self) -> None:
         """Async variant of delete_uploaded_artifact that runs the delete in a thread."""
-        if not self.gtc_file_path:
+        path = self._take_upload_path()
+        if path is None:
             return
-        path = self.gtc_file_path
-        # Forgotten before the await so a concurrent cleanup pass does not delete it twice.
-        self.gtc_file_path = None
         driver = await self._aget_storage_driver()
         await to_thread(driver.delete_file, path)
 
@@ -268,6 +269,12 @@ class PublicArtifactUrlParameter:
     def _build_upload_path(self, url: str) -> Path:
         return Path("artifact_url_storage") / uuid4().hex / self._derive_upload_filename(url)
 
+    def _take_upload_path(self) -> Path | None:
+        # Forgotten before deleting, so a second or concurrent cleanup pass issues no second delete.
+        path = self.gtc_file_path
+        self.gtc_file_path = None
+        return path
+
     def _get_storage_driver(self) -> GriptapeCloudStorageDriver:
         if self._storage_driver is not None:
             return self._storage_driver
@@ -277,10 +284,7 @@ class PublicArtifactUrlParameter:
     async def _aget_storage_driver(self) -> GriptapeCloudStorageDriver:
         if self._storage_driver is not None:
             return self._storage_driver
-        # The secret is read on the loop because it is an engine request; the lookup is network only.
-        configured_bucket_id = self._get_secret_value(
-            self._node.engine, self.BUCKET_ID_NAME, should_error_on_not_found=False
-        )
+        configured_bucket_id = self._read_configured_bucket_id(self._node.engine)
         bucket_id = await to_thread(
             self._resolve_bucket_id,
             configured_bucket_id,
