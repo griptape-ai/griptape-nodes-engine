@@ -92,7 +92,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=MagicMock(),
             create_node_request=create_node_request,
-            dropped_values=[],
         )
 
         # Should return None (no values to serialize) but preserve resolution
@@ -136,7 +135,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            dropped_values=[],
         )
 
         # Resolution should be reset to UNRESOLVED due to serialization failure
@@ -187,7 +185,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            dropped_values=[],
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
@@ -231,7 +228,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            dropped_values=[],
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]

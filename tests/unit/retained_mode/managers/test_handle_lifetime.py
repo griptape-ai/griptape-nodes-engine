@@ -407,7 +407,6 @@ class TestSaving:
             unique_parameter_uuid_to_values=uuid_to_values,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_node_request,
-            dropped_values=[],
         )
 
         assert saved is None
@@ -429,7 +428,6 @@ class TestSaving:
             create_node_request=CreateNodeRequest(
                 node_type="_Producer", node_name="Producer", resolution=NodeResolutionState.RESOLVED.value
             ),
-            dropped_values=[],
         )
 
         assert saved is not None
@@ -827,7 +825,6 @@ class TestSavingAndPublishing:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            dropped_values=[],
             serialize_all_parameter_values=publishing,
         )
 
@@ -865,7 +862,6 @@ class TestAKeyThatReachedASerializableParameter:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            dropped_values=[],
         )
 
         assert saved is None

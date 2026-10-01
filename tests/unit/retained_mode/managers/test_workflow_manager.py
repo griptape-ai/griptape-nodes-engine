@@ -4,7 +4,7 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, Mock, call, create_autospec, patch
 
 import anyio
@@ -86,7 +86,6 @@ from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
     WorkflowShapeType,
 )
-from griptape_nodes.serialization.dropped_values import DroppedValue
 
 
 def _register_unsaved_workflow(key: str, name: str) -> None:
@@ -5117,7 +5116,6 @@ class TestSaveWorkflowOverwriteProtection:
         file_name: str,
         current_workflow_name: str,
         overwrite_existing: bool,
-        dropped_values: list[DroppedValue] | None = None,
     ) -> Any:
         """Drive on_save_workflow_request with only flow serialization mocked."""
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -5148,9 +5146,7 @@ class TestSaveWorkflowOverwriteProtection:
                 return GetTopLevelFlowResultSuccess(flow_name="ControlFlow_1", result_details="ok")
             if isinstance(req, SerializeFlowToCommandsRequest):
                 return SerializeFlowToCommandsResultSuccess(
-                    serialized_flow_commands=empty_commands,
-                    dropped_values=dropped_values or [],
-                    result_details="ok",
+                    serialized_flow_commands=empty_commands, result_details="ok"
                 )
             msg = f"Unexpected request type in test: {type(req).__name__}"
             raise AssertionError(msg)
@@ -5224,42 +5220,6 @@ class TestSaveWorkflowOverwriteProtection:
             assert result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
             # The other workflow's file is untouched.
             assert victim_path.read_text() == "# theirs"
-
-    def test_values_left_out_of_the_save_are_reported_as_a_warning(self, engine: Engine) -> None:
-        """The user sees which parameter values were not saved, beside the usual success detail."""
-        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
-
-        dropped = [
-            DroppedValue("Agent", "prompt", "A 'Widget' value has no plain-data form."),
-            DroppedValue("Agent", "seed", "A 'Gadget' value has no plain-data form.", is_default=True),
-        ]
-        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
-            result = self._save(
-                engine,
-                file_name="mine",
-                current_workflow_name="mine",
-                overwrite_existing=True,
-                dropped_values=dropped,
-            )
-
-        assert isinstance(result, SaveWorkflowResultSuccess)
-        details = cast("ResultDetails", result.result_details).result_details
-        assert [detail.level for detail in details] == [logging.INFO, logging.WARNING]
-        warning = details[1].message
-        assert "parameter 'prompt' on node 'Agent'" in warning
-        assert "default of parameter 'seed' on node 'Agent'" in warning
-        assert "Widget" in warning
-
-    def test_a_save_that_left_nothing_out_has_no_warning(self, engine: Engine) -> None:
-        """A save with nothing left out carries only its success detail."""
-        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
-
-        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
-            result = self._save(engine, file_name="mine", current_workflow_name="mine", overwrite_existing=True)
-
-        assert isinstance(result, SaveWorkflowResultSuccess)
-        details = cast("ResultDetails", result.result_details).result_details
-        assert [detail.level for detail in details] == [logging.INFO]
 
     def test_collision_overwrites_when_permitted(self, engine: Engine, temp_dir: Path) -> None:
         """``overwrite_existing=True`` (the default) still replaces the other workflow's file."""

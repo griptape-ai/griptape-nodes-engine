@@ -22,7 +22,7 @@ came from, so it passes through to a process that can build it.
 A value with no plain-data form is handled by where it is going:
 
 - Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
-  leave it out and list it as a ``DroppedValue``. Never save its text in its place.
+  leave it out and log a warning. Never save its text in its place.
 - Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
   the parameter.
 - Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
@@ -117,6 +117,21 @@ def try_encode(value: Any) -> JsonValue | Unencodable:
         return encode_value(value)
     except ValueEncodeError as error:
         return Unencodable(str(error))
+
+
+def encodable_default(default_value: Any, node_name: str | None, parameter_name: str | None) -> Any:
+    """Return ``default_value``, or None with a logged warning if it has no plain-data form."""
+    encoded = try_encode(default_value)
+    if not isinstance(encoded, Unencodable):
+        return default_value
+    logger.warning(
+        "Attempted to save the default value of parameter '%s' on node '%s'. Failed because %s "
+        "The parameter will reopen without that default.",
+        parameter_name,
+        node_name,
+        encoded.reason,
+    )
+    return None
 
 
 def encode_for_display(value: Any) -> JsonValue:

@@ -179,16 +179,11 @@ from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands
-from griptape_nodes.serialization.dropped_values import (
-    DroppedValue,
-    keep_encodable_default,
-    success_details,
-    unique_dropped_values,
-)
 from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_legacy_image_flow_commands
 from griptape_nodes.serialization.values import (
     Unencodable,
     decode_value,
+    encodable_default,
     try_encode,
     value_key,
 )
@@ -1490,7 +1485,6 @@ class FlowManager(EngineScoped):
             SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
         ] = {}
         packaged_nodes_internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization] = []
-        dropped_values: list[DroppedValue] = []
 
         # Step 5: Serialize nodes with local execution environment to prevent recursive loops
         serialized_package_nodes = self._serialize_package_nodes_for_local_execution(
@@ -1500,7 +1494,6 @@ class FlowManager(EngineScoped):
             node_name_to_uuid=node_name_to_uuid,
             set_parameter_value_commands=packaged_nodes_set_parameter_value_commands,
             internal_connections=packaged_nodes_internal_connections,
-            dropped_values=dropped_values,
         )
         if isinstance(serialized_package_nodes, PackageNodesAsSerializedFlowResultFailure):
             return serialized_package_nodes
@@ -1536,7 +1529,6 @@ class FlowManager(EngineScoped):
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             node_name_to_uuid=node_name_to_uuid,
             external_connections_dict=node_connections_dict,
-            dropped_values=dropped_values,
             node_group_node=node_group_node,
         )
         if isinstance(start_node_result, PackageNodesAsSerializedFlowResultFailure):
@@ -1650,18 +1642,12 @@ class FlowManager(EngineScoped):
             node_types_used=combined_node_types_used,
         )
 
-        dropped_values = unique_dropped_values(dropped_values)
         return PackageNodesAsSerializedFlowResultSuccess(
             serialized_flow_commands=final_serialized_flow,
             workflow_shape=workflow_shape,
             packaged_node_names=request.node_names,
             parameter_name_mappings=parameter_name_mappings,
-            dropped_values=dropped_values,
-            result_details=success_details(
-                f"Successfully packaged {len(request.node_names)} nodes as serialized flow.",
-                dropped_values,
-                action=f"package {len(request.node_names)} nodes as a flow",
-            ),
+            result_details=f"Successfully packaged {len(request.node_names)} nodes as serialized flow.",
         )
 
     def _validate_and_get_multi_node_library_info(
@@ -1732,7 +1718,6 @@ class FlowManager(EngineScoped):
             SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
         ],
         internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization],  # OUTPUT: will be populated
-        dropped_values: list[DroppedValue],  # OUTPUT: will be populated
     ) -> list[SerializedNodeCommands] | PackageNodesAsSerializedFlowResultFailure:
         """Serialize package nodes while temporarily setting execution environment to local to prevent recursive loops.
 
@@ -1743,7 +1728,6 @@ class FlowManager(EngineScoped):
             node_name_to_uuid: OUTPUT - Dictionary mapping node names to UUIDs (populated by this method)
             set_parameter_value_commands: OUTPUT - Dict mapping node UUIDs to parameter value commands (populated by this method)
             internal_connections: OUTPUT - List of connections between package nodes (populated by this method)
-            dropped_values: OUTPUT - Values left out because they have no plain-data form (populated by this method)
 
         Returns:
             List of SerializedNodeCommands on success, or PackageNodesAsSerializedFlowResultFailure on failure
@@ -1766,8 +1750,6 @@ class FlowManager(EngineScoped):
                 return PackageNodesAsSerializedFlowResultFailure(
                     result_details=f"Attempted to package nodes as serialized flow. Failed to serialize node '{node.name}': {serialize_result.result_details}"
                 )
-
-            dropped_values.extend(serialize_result.dropped_values)
 
             # Populate the shared node_name_to_uuid mapping
             create_cmd = serialize_result.serialized_node_commands.create_node_command
@@ -2329,7 +2311,6 @@ class FlowManager(EngineScoped):
         external_connections_dict: dict[
             str, ConnectionAnalysis
         ],  # Contains EXTERNAL connections only - used to determine which parameters need start node inputs
-        dropped_values: list[DroppedValue],  # OUTPUT: will be populated
         node_group_node: SubflowNodeGroup | None = None,
     ) -> PackagingStartNodeResult | PackageNodesAsSerializedFlowResultFailure:
         """Create start node commands and connections for external incoming connections."""
@@ -2379,7 +2360,6 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 parameter_name_mappings=parameter_name_mappings,
-                dropped_values=dropped_values,
             )
             if isinstance(result, PackageNodesAsSerializedFlowResultFailure):
                 return result
@@ -2415,7 +2395,6 @@ class FlowManager(EngineScoped):
                 start_node_parameter_value_commands=start_node_parameter_value_commands,
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                dropped_values=dropped_values,
             )
 
         # Build complete SerializedNodeCommands for start node
@@ -2446,7 +2425,6 @@ class FlowManager(EngineScoped):
         start_node_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand],
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
-        dropped_values: list[DroppedValue],
     ) -> None:
         """Apply parameter values from SubflowNodeGroup to the StartFlow node.
 
@@ -2461,7 +2439,6 @@ class FlowManager(EngineScoped):
             start_node_parameter_value_commands: List to append parameter value commands to
             unique_parameter_uuid_to_values: Dict to track unique parameter values
             serialized_parameter_value_tracker: Tracker for serialized parameter values
-            dropped_values: Receives each value left out because it has no plain-data form
 
         Raises:
             ValueError: If required metadata is missing from SubflowNodeGroup
@@ -2526,13 +2503,10 @@ class FlowManager(EngineScoped):
             encoded = try_encode(param_value)
             if isinstance(encoded, Unencodable):
                 logger.warning(
-                    "Attempted to pass parameter '%s' of node '%s' into the packaged flow. Failed because %s "
-                    "The flow runs without it.",
+                    "Attempted to pass '%s' into the packaged flow. Failed because %s The flow runs without it.",
                     prefixed_param_name,
-                    node_group_node.name,
                     encoded.reason,
                 )
-                dropped_values.append(DroppedValue(node_group_node.name, prefixed_param_name, encoded.reason))
                 continue
             value_id = id(param_value)
             unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
@@ -2564,7 +2538,6 @@ class FlowManager(EngineScoped):
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter],
-        dropped_values: list[DroppedValue],
     ) -> StartNodeIncomingDataResult | PackageNodesAsSerializedFlowResultFailure:
         """Create parameters and connections for incoming data connections to a specific target node."""
         start_node_parameter_commands = []
@@ -2615,7 +2588,6 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 create_node_request=start_create_node_command,
-                dropped_values=dropped_values,
             )
             if param_value_commands is not None:
                 # Modify each command to target the start node parameter instead
@@ -2630,9 +2602,7 @@ class FlowManager(EngineScoped):
                 node_name=start_node_name,
                 parameter_name=param_name,
                 type=source_param.output_type,
-                default_value=keep_encodable_default(
-                    source_param.default_value, source_node.name, source_param.name, dropped_values
-                ),
+                default_value=encodable_default(source_param.default_value, source_node.name, source_param.name),
                 tooltip=f"Parameter {target_parameter_name} from node {target_node_name} in packaged flow",
                 initial_setup=True,
             )
@@ -3804,7 +3774,6 @@ class FlowManager(EngineScoped):
 
             serialized_node_commands = []
             serialized_node_group_commands = []  # SubflowNodeGroups must be added LAST
-            dropped_values: list[DroppedValue] = []
             set_parameter_value_commands_per_node = {}  # Maps a node UUID to a list of set parameter value commands
             set_lock_commands_per_node = {}  # Maps a node UUID to a set Lock command, if it exists.
 
@@ -3841,7 +3810,6 @@ class FlowManager(EngineScoped):
                         return SerializeFlowToCommandsResultFailure(result_details=details)
 
                     serialized_node = serialize_node_result.serialized_node_commands
-                    dropped_values.extend(serialize_node_result.dropped_values)
 
                     # Store the serialized node's UUID for correlation to connections and setting parameter values later.
                     node_name_to_uuid[node_name] = serialized_node.node_uuid
@@ -3919,7 +3887,6 @@ class FlowManager(EngineScoped):
                             details = f"Attempted to serialize parent flow '{flow_name}'. Failed while serializing child flow '{child_flow}'."
                             return SerializeFlowToCommandsResultFailure(result_details=details)
                         serialized_flow = child_flow_result.serialized_flow_commands
-                        dropped_values.extend(child_flow_result.dropped_values)
                         sub_flow_commands.append(serialized_flow)
 
         # Append NodeGroup commands AFTER regular node commands
@@ -4027,11 +3994,7 @@ class FlowManager(EngineScoped):
             serialized_variable_commands=serialized_variable_commands,
         )
         details = f"Successfully serialized Flow '{flow_name}' into commands."
-        result = SerializeFlowToCommandsResultSuccess(
-            serialized_flow_commands=serialized_flow,
-            dropped_values=unique_dropped_values(dropped_values),
-            result_details=details,
-        )
+        result = SerializeFlowToCommandsResultSuccess(serialized_flow_commands=serialized_flow, result_details=details)
         return result
 
     @handles(DeserializeFlowFromCommandsRequest)
