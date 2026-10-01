@@ -237,7 +237,7 @@ class EventManager(EngineScoped):
         self._worker_response_topic: str | None = None
         self._websocket_event_loop: asyncio.AbstractEventLoop | None = None
         self._forward_timeout_ms: int | None = None
-        # Node-execution refcount. Incremented on worker_node_execution_scope entry,
+        # Node-execution refcount. Incremented on node_execution_scope entry,
         # decremented on exit. Plain instance state guarded by a lock so any thread
         # -- including threads spawned inside third-party libraries (diffusers,
         # transformers, etc.) during node execution -- can observe it via
@@ -873,12 +873,11 @@ class EventManager(EngineScoped):
         Called once at worker startup after the RequestClient is constructed and topics
         are subscribed. Inert on the orchestrator (never called there).
 
-        websocket_event_loop is the loop that owns the Client/RequestClient (the daemon
-        thread's loop). All RequestClient primitives -- its asyncio.Lock, the pending-
-        request Future, and the _try_match filter that claims responses -- are bound to
-        that loop. Forwarding calls must be dispatched there via run_coroutine_threadsafe;
-        awaiting RequestClient methods directly from the main loop or a ThreadRunner loop
-        causes cross-loop contention that stalls for seconds per request.
+        websocket_event_loop is the loop that owns the Client (the daemon thread's loop).
+        Forwarding is dispatched there via run_coroutine_threadsafe so the sync
+        handle_request path can block its own thread on the result, which is only safe when
+        the coroutine runs on another thread's loop. RequestClient's own state is
+        loop-agnostic, so the hop is about the blocking caller rather than about reaching it.
         """
         self._worker_request_client = request_client
         self._orchestrator_request_topic = orchestrator_request_topic
@@ -888,14 +887,17 @@ class EventManager(EngineScoped):
         self._worker_forwarding_enabled = True
 
     @contextmanager
-    def worker_node_execution_scope(self) -> Iterator[None]:
-        """Mark this worker as actively executing a node.
+    def node_execution_scope(self) -> Iterator[None]:
+        """Mark this process as actively executing a node.
 
         Increments a thread-safe refcount on entry and decrements on exit.
-        While the refcount is > 0, in_node_execution() returns True; the
-        worker-side RemoteHandler consults that flag to decide whether to
-        forward a request to the orchestrator or delegate to the original
-        local handler.
+        While the refcount is > 0, in_node_execution() returns True. Two
+        things read that flag: the worker-side RemoteHandler, to decide
+        whether to forward a request to the orchestrator or delegate to the
+        original local handler, and ResourceManager, which holds a release
+        hook back rather than freeing an object a running node may be using.
+        The second applies in-process too, which is why this is opened
+        wherever a node runs and not only on a worker.
 
         The refcount is plain instance state guarded by a lock, so any
         thread -- including threads spawned internally by third-party
@@ -918,7 +920,7 @@ class EventManager(EngineScoped):
                 self._node_execution_depth -= 1
 
     def in_node_execution(self) -> bool:
-        """Return True when this worker is currently inside a node-execution scope."""
+        """Return True when this process is currently inside a node-execution scope."""
         with self._node_execution_lock:
             return self._node_execution_depth > 0
 
@@ -952,6 +954,15 @@ class EventManager(EngineScoped):
         """Return the currently-registered handler callback for a request type, or None."""
         return self._request_type_to_manager.get(request_type)
 
+    def registered_request_types(self) -> list[type[RequestPayload]]:
+        """Every request type that currently has a handler.
+
+        A worker uses this to route requests made during node execution to the orchestrator
+        by default, rather than maintaining a list of types to forward that silently goes
+        stale whenever a new request type is added.
+        """
+        return list(self._request_type_to_manager.keys())
+
     async def forward_to_orchestrator(
         self,
         request: RP,
@@ -963,11 +974,11 @@ class EventManager(EngineScoped):
         payload, and reconstructs it as an EventResultSuccess/EventResultFailure whose
         shape matches the locally-dispatched path.
 
-        The RequestClient send/track/await happens on the websocket event loop
-        (configured via configure_worker_forwarding) so that its asyncio.Lock and
-        the pending-request Future live on the same loop as the _try_match filter
-        that resolves them. Awaiting those primitives from any other loop causes
-        cross-loop contention that stalls for seconds.
+        The send/track/await is dispatched onto the websocket event loop (configured via
+        configure_worker_forwarding), the loop that owns the transport. Reaching
+        RequestClient state does not require that -- the state is loop-agnostic -- but the
+        sync handle_request path does, since it blocks its own thread on the result and can
+        only do so when the coroutine runs on another thread's loop.
         """
         if (
             self._worker_request_client is None
@@ -1316,6 +1327,12 @@ class EventManager(EngineScoped):
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
+        """Subscribe to an app event raised in this process.
+
+        A listener never sees another process's copy. An app-event listener configures the process it
+        lives in, and a peer's payload describes the peer, so acting on it would corrupt the
+        receiver. A worker that has something to tell the orchestrator sends it a request.
+        """
         listener_set = self._app_event_listeners.get(app_event_type)
         if listener_set is None:
             listener_set = set()

@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
@@ -141,8 +140,14 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
             omitted.append(param.name)
             continue
 
-        value = node.get_parameter_value(param.name)
+        value = node._get_raw_parameter_value(param.name)
         if value is None:
+            continue
+        # A key into one process's memory is dead on reload, and this feeds image sidecar and PNG
+        # provenance, so it must not carry one. Reported alongside the deliberately excluded ones because
+        # the effect on the reader is the same: the value is not here.
+        if node.local_objects.contains_a_parked_object(value):
+            omitted.append(param.name)
             continue
 
         try:
@@ -153,11 +158,11 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
     return _ParameterCollection(values=values, omitted=omitted)
 
 
-def _collect_workflow_info(workflow_name: str) -> dict[str, Any]:
+def _collect_workflow_info(engine: Engine, workflow_name: str) -> dict[str, Any]:
     """Build the structured workflow provenance block for a given workflow name."""
     info: dict[str, Any] = {"name": workflow_name}
     try:
-        workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+        workflow = engine.workflow_registry.get_workflow_by_name(workflow_name)
         if workflow.metadata.creation_date:
             info["created"] = workflow.metadata.creation_date.isoformat()
         if workflow.metadata.last_modified_date:
@@ -195,7 +200,7 @@ def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
 
     try:
         workflow_name = context_manager.get_current_workflow_name()
-        result["workflow"] = _collect_workflow_info(workflow_name)
+        result["workflow"] = _collect_workflow_info(engine, workflow_name)
     except Exception:
         logger.warning("Failed to collect workflow name for provenance")
 

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
@@ -85,7 +84,7 @@ class ContextManager(EngineScoped):
             # at push time, so it goes stale the moment the workspace changes -- a project
             # switch re-registers workflows under the new workspace and the lookup then misses.
             # Callers that want the workflow's location (see ProjectManager's `workflow_dir`
-            # builtin) read this instead of round-tripping through WorkflowRegistry.
+            # builtin) read this instead of round-tripping through the workflow registry.
             self._file_path = file_path
             # The folder this workflow belongs to while it has no file of its own: the folder the
             # user was browsing when they created it. A DIRECTORY, unlike `_file_path`, which is
@@ -346,15 +345,17 @@ class ContextManager(EngineScoped):
         # When no workflow_name is supplied, mint a fresh "unsaved:<uuid>" key here so the
         # engine owns the namespace. Callers doing "create a new workflow" should omit the
         # name and read the resolved key off the success result.
-        resolved_name = request.workflow_name or f"{WorkflowRegistry.UNSAVED_KEY_PREFIX}{uuid.uuid4()}"
+        resolved_name = request.workflow_name or f"{self.engine.workflow_registry.UNSAVED_KEY_PREFIX}{uuid.uuid4()}"
 
         # Auto-register an unsaved registry entry when the caller is activating an
         # "unsaved:<uuid>" key. This makes every workflow (saved or not) a first-class
         # registry entry, so list/metadata/etc. calls don't need special-casing for
         # pre-save state. `ensure_unsaved` is idempotent.
-        if resolved_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX):
+        if resolved_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
             try:
-                WorkflowRegistry.ensure_unsaved(key=resolved_name, display_name=request.display_name or "Untitled")
+                self.engine.workflow_registry.ensure_unsaved(
+                    key=resolved_name, display_name=request.display_name or "Untitled"
+                )
             except ValueError as err:
                 msg = (
                     f"Attempted to auto-register unsaved workflow '{resolved_name}' "
@@ -518,6 +519,39 @@ class ContextManager(EngineScoped):
                 logger.error(msg)
                 raise ValueError(msg) from e
         return self.ElementContext(self, element)
+
+    def mirror_workflow_context(self, name: str | None, file_path: str | None, working_directory: str | None) -> None:
+        """Adopt another engine's workflow context as this engine's own.
+
+        A real stack entry rather than an override of the getters, because `has_current_workflow()`
+        answers two questions at once -- "is identity resolvable" and "is there an entry to index"
+        -- and satisfying only the first raises IndexError in `has_current_flow`, `push_flow`,
+        `pop_flow`, and the context setters.
+
+        Idempotent and never popped: this MIRRORS a peer's context rather than nesting under it, so
+        one entry is replaced in place. There is no push/pop pair whose ordering could interleave
+        while a worker runs nodes concurrently.
+        """
+        if name is None:
+            # The peer has no workflow, so this engine must have none either. A mirror left from an
+            # earlier execution would resolve paths against that workflow's folder while the peer
+            # resolves them workspace-relative -- the divergence this mirror exists to prevent,
+            # reached from the other direction. Only a mirror is ever on a worker's stack.
+            self._workflow_stack.clear()
+            return
+
+        state = self.WorkflowContextState(name=name, file_path=file_path, working_directory=working_directory)
+        if not self._workflow_stack:
+            self._workflow_stack.append(state)
+            return
+
+        current = self._workflow_stack[-1]
+        if current._name == name and current._file_path == file_path:
+            return
+
+        # Replace rather than append: a mirror tracks one peer context, and stacking would leave
+        # the previous workflow's entry to be read by whatever runs next.
+        self._workflow_stack[-1] = state
 
     def has_current_workflow(self) -> bool:
         """Check if there is an active Workflow context."""
@@ -772,12 +806,12 @@ class ContextManager(EngineScoped):
             # callers already handle.
             if file_path is None:
                 try:
-                    workflow = WorkflowRegistry.get_workflow_by_name(resolved_name)
+                    workflow = self.engine.workflow_registry.get_workflow_by_name(resolved_name)
                 except KeyError:
                     file_path = None
                 else:
                     if workflow.file_path is not None:
-                        file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
+                        file_path = self.engine.workflow_registry.get_complete_file_path(workflow.file_path)
         elif file_path is not None:
             resolved = canonicalize_for_identity(file_path)
             workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)
@@ -1063,9 +1097,10 @@ class ContextManager(EngineScoped):
             return self.CurrentWorkflow(workflow_name=None, is_saved=None)
 
         workflow_name = self.get_current_workflow_name()
-        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
             return self.CurrentWorkflow(workflow_name=workflow_name, is_saved=None)
 
         return self.CurrentWorkflow(
-            workflow_name=workflow_name, is_saved=WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
+            workflow_name=workflow_name,
+            is_saved=self.engine.workflow_registry.get_workflow_by_name(workflow_name).is_saved,
         )

@@ -2,8 +2,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter
-from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.node_types import (
+    AsyncResult,
+    SuccessFailureNode,
+    TrackedParameterOutputValues,
+    aprocess_scope,
+)
+from griptape_nodes.traits.slider import Slider
 
 from .mocks import MockNode
 
@@ -180,6 +186,118 @@ class TestTrackedParameterOutputValuesSetItem:
         mock_emit.assert_not_called()
 
 
+class TestASetDuringARunAlsoRecordsAResult:
+    """`set_parameter_value` always writes `parameter_values`, and sometimes also records a result.
+
+    A value a node sets on itself while its own body is running is what that run computed, and of the
+    node's two stores only `parameter_output_values` travels back from a library's isolated process. So
+    a set in that window writes both: the result reaches the rest of the graph, and the authored copy is
+    still there for the value to be read on the next run, after the produced store has been cleared.
+
+    Nothing outside that window records a result, and neither does a Parameter with no OUTPUT to
+    publish on, nor a container's child, which never travels on its own account.
+    """
+
+    def _node_with(self, param_name: str, modes: set[ParameterMode]) -> MockNode:
+        node = MockNode(name="node")
+        node.add_parameter(Parameter(name=param_name, type="str", tooltip="", allowed_modes=modes))
+        return node
+
+    def test_an_output_records_a_result_while_the_node_runs(self) -> None:
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("out", "done")
+
+        assert node.parameter_output_values["out"] == "done"
+        assert node.parameter_values["out"] == "done"
+
+    def test_the_value_survives_the_clear_before_the_next_run(self) -> None:
+        """`SeedParameter` rolls a seed mid-run, and turning randomizing off has to keep that seed."""
+        node = self._node_with("seed", {ParameterMode.PROPERTY, ParameterMode.INPUT, ParameterMode.OUTPUT})
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("seed", "1234")
+
+        node.parameter_output_values.silent_clear()
+        assert node.get_parameter_value("seed") == "1234"
+
+    def test_a_property_and_output_records_a_result(self) -> None:
+        """A Parameter kept on display still publishes, so what a run puts there is a result too."""
+        node = self._node_with("both", {ParameterMode.PROPERTY, ParameterMode.OUTPUT})
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("both", "computed")
+
+        assert node.parameter_output_values["both"] == "computed"
+
+    def test_the_default_modes_record_a_result(self) -> None:
+        """Declaring no modes at all allows OUTPUT, and that is most of the parameters in a library."""
+        node = MockNode(name="node")
+        node.add_parameter(Parameter(name="out", type="str", tooltip=""))
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("out", "computed")
+
+        assert node.parameter_output_values["out"] == "computed"
+
+    def test_a_set_at_edit_time_records_nothing(self) -> None:
+        """No run produced this, and a stale result would shadow it for every reader that prefers one."""
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+
+        node.set_parameter_value("out", "set before any run")
+
+        assert node.parameter_values["out"] == "set before any run"
+        assert "out" not in node.parameter_output_values
+
+    def test_a_set_on_another_node_records_nothing_there(self) -> None:
+        """A running node sets values on other nodes, and that is not the other node's result.
+
+        This is how a value reaches a connected input, and how a node driving a subflow feeds it. The
+        recipient is not running, and a result filed against it would be wiped by its own pre-run clear
+        before it ever ran.
+        """
+        node = self._node_with("out", {ParameterMode.OUTPUT})
+        downstream = self._node_with("out", {ParameterMode.OUTPUT})
+
+        with aprocess_scope(node=node):
+            downstream.set_parameter_value("out", "handed over")
+
+        assert downstream.parameter_values["out"] == "handed over"
+        assert "out" not in downstream.parameter_output_values
+
+    def test_a_parameter_with_no_output_records_nothing(self) -> None:
+        """With no OUTPUT there is no port to publish on, so a run's write to it is scratch."""
+        node = self._node_with("incoming", {ParameterMode.INPUT})
+        node.add_parameter(Parameter(name="knob", type="str", tooltip="", allowed_modes={ParameterMode.PROPERTY}))
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value("incoming", "delivered")
+            node.set_parameter_value("knob", "scratch")
+
+        assert node.parameter_values["incoming"] == "delivered"
+        assert node.parameter_values["knob"] == "scratch"
+        assert node.parameter_output_values == {}
+
+    def test_a_container_child_records_nothing_but_its_container_does(self) -> None:
+        """Setting a child rebuilds the container, and it is the container that publishes.
+
+        Split Video in the standard library grows an output-only `ParameterList` this way, adding a
+        child per clip and setting it while the node runs.
+        """
+        node = MockNode(name="node")
+        images = ParameterList(name="images", type="str", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        node.add_parameter(images)
+        child = images.add_child_parameter()
+
+        with aprocess_scope(node=node):
+            node.set_parameter_value(child.name, "img0")
+
+        assert child.name not in node.parameter_output_values
+        assert node.parameter_output_values["images"] == ["img0"]
+        assert node.get_parameter_value("images") == ["img0"]
+
+
 class TestErrorProxyNode:
     """The placeholder substituted for a node that could not be created."""
 
@@ -272,3 +390,62 @@ class TestLockedSuccessFailureNodeRouting:
         node._execution_succeeded = None
         assert node.get_next_control_output() is None
         assert node.stop_flow is True
+
+
+class TestOutputValueChangeDetection:
+    """`__setitem__` decides whether to emit by comparing old and new values.
+
+    A node can hold an array-like whose `__ne__` returns an array rather than a bool, so the
+    comparison itself raises and the assignment never completes.
+    """
+
+    class _ArrayLike:
+        """Mimics numpy's refusal to reduce an element-wise comparison to one bool."""
+
+        __hash__ = None  # type: ignore[assignment]
+
+        def __ne__(self, other: object) -> bool:
+            message = "The truth value of an array with more than one element is ambiguous."
+            raise ValueError(message)
+
+    def test_an_uncomparable_value_is_treated_as_changed(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(self._ArrayLike(), self._ArrayLike()) is True
+
+    def test_the_same_object_is_not_a_change(self) -> None:
+        """Identity is checked first, so re-assigning the same array-like never touches `__ne__`."""
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        value = self._ArrayLike()
+
+        assert _values_differ(value, value) is False
+
+    def test_ordinary_values_compare_normally(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(1, 2) is True
+        assert _values_differ("a", "a") is False
+
+
+class TestParameterVisibilityKeepsTraitStateLive:
+    def test_hiding_a_parameter_with_a_trait_stores_no_trait_copy(self) -> None:
+        node = MockNode()
+        parameter = Parameter(name="top", tooltip="t", traits={Slider(min_val=0, max_val=100)})
+        node.add_parameter(parameter)
+
+        node.hide_parameter_by_name("top")
+
+        assert parameter.ui_options["hide"] is True
+        assert "slider" not in parameter.authored_ui_options()
+
+    def test_a_later_trait_change_still_reaches_a_hidden_parameter(self) -> None:
+        node = MockNode()
+        trait = Slider(min_val=0, max_val=100)
+        parameter = Parameter(name="top", tooltip="t", traits={trait})
+        node.add_parameter(parameter)
+        node.hide_parameter_by_name("top")
+
+        trait.max = 512
+
+        assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}

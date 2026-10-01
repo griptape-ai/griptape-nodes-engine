@@ -39,7 +39,6 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
@@ -55,6 +54,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
     GriptapeEvent,
     InvolvedNodesEvent,
@@ -323,6 +323,10 @@ class NodeExecutor(EngineScoped):
                 await self.handle_loop_execution(node)
                 return
 
+            # Resolved here because only this process has workflow context to resolve it FROM;
+            # a worker would answer from an empty context and silently degrade the paths its node
+            # writes to. Harmless on the local route, where these are this process's own values.
+            workflow_context = self.engine.project_manager.workflow_context_for_dispatch()
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
@@ -332,6 +336,10 @@ class NodeExecutor(EngineScoped):
                     parameter_values=dict(node.parameter_values),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
+                    local_object_source=node.local_object_source,
+                    workflow_name=workflow_context.name,
+                    workflow_file_path=workflow_context.file_path,
+                    workflow_working_directory=workflow_context.working_directory,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
@@ -363,7 +371,7 @@ class NodeExecutor(EngineScoped):
         lazy fetch inside VariableResolver.get_variables_if_enabled fails with
         KeyError. Pre-seeding here lets the worker skip that path entirely.
         """
-        if not VariableResolver.is_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(self.engine):
             return {}
         try:
             flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
@@ -391,6 +399,13 @@ class NodeExecutor(EngineScoped):
         ``original_traceback`` here is what actually puts the worker
         frames in front of the user.
         """
+        # A node that declined to run did not fail while running, and saying so sends the reader looking
+        # for a crash that never happened. Matched on the type rather than on the attribute's presence:
+        # `result` is typed `Any` here, and anything at all answers a `getattr`.
+        if isinstance(result, ExecuteNodeResultFailure) and result.validation_exceptions:
+            reasons = "; ".join(str(exception) for exception in result.validation_exceptions)
+            return f"Node '{node_name}' did not run because it failed validation: {reasons}"
+
         type_prefix = ""
         tb_suffix = ""
         if isinstance(exc, ForwardedException):
@@ -2801,7 +2816,7 @@ class NodeExecutor(EngineScoped):
         if upstream_param.name in upstream_node.parameter_output_values:
             return upstream_node.parameter_output_values[upstream_param.name]
 
-        return upstream_node.get_parameter_value(upstream_param.name)
+        return upstream_node._get_raw_parameter_value(upstream_param.name)
 
     def _get_value_through_subflow_group_proxy(
         self,
@@ -2860,7 +2875,7 @@ class NodeExecutor(EngineScoped):
             if source_param.name in source_node.parameter_output_values:
                 value = source_node.parameter_output_values[source_param.name]
             else:
-                value = source_node.get_parameter_value(source_param.name)
+                value = source_node._get_raw_parameter_value(source_param.name)
 
             logger.debug(
                 "Traced through proxy: %s.%s -> %s.%s (value type: %s)",
@@ -4125,13 +4140,13 @@ class NodeExecutor(EngineScoped):
             path_for_key = str(resolved)
         workflow_name = derive_registry_key(path_for_key)
 
-        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
             result = await self.engine.ahandle_request(load_workflow_metadata_request)
             if isinstance(result, LoadWorkflowMetadataResultSuccess):
-                WorkflowRegistry.generate_new_workflow(
+                self.engine.workflow_registry.generate_new_workflow(
                     registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
                 )
 

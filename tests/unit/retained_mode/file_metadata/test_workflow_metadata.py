@@ -45,17 +45,17 @@ def _make_engine(
     flow.name = flow_name
     ctx.get_current_flow.return_value = flow
     engine.flow_manager.flow_state.return_value = (None, resolving_nodes or [], None)
+    engine.workflow_registry.get_workflow_by_name.side_effect = KeyError
 
     return engine
 
 
 class TestCollectWorkflowInfo:
     def test_returns_name_when_registry_lookup_fails(self) -> None:
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError("not found"),
-        ):
-            result = _collect_workflow_info("my_workflow")
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.side_effect = KeyError("not found")
+
+        result = _collect_workflow_info(engine, "my_workflow")
 
         assert result == {"name": "my_workflow"}
 
@@ -68,11 +68,10 @@ class TestCollectWorkflowInfo:
         workflow.metadata.engine_version_created_with = "1.2.3"
         workflow.metadata.description = None
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            return_value=workflow,
-        ):
-            result = _collect_workflow_info("my_workflow")
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.return_value = workflow
+
+        result = _collect_workflow_info(engine, "my_workflow")
 
         assert result["name"] == "my_workflow"
         assert "created" in result
@@ -87,11 +86,10 @@ class TestCollectWorkflowInfo:
         workflow.metadata.engine_version_created_with = None
         workflow.metadata.description = None
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            return_value=workflow,
-        ):
-            result = _collect_workflow_info("my_workflow")
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.return_value = workflow
+
+        result = _collect_workflow_info(engine, "my_workflow")
 
         assert result == {"name": "my_workflow"}
 
@@ -123,8 +121,10 @@ class TestCollectParameterValues:
 
         values = {"prompt": "hello", "model": "gpt-4"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2]
-        node.get_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -141,8 +141,10 @@ class TestCollectParameterValues:
 
         values = {"prompt": "hello", "password": "secret"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub, priv]
-        node.get_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -158,8 +160,10 @@ class TestCollectParameterValues:
         p, _ = _make_param("optional_param", value=None)
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_parameter_value.return_value = None
+        node._get_raw_parameter_value.return_value = None
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -174,8 +178,10 @@ class TestCollectParameterValues:
         p, _ = _make_param("output_image", value=None, modes={ParameterMode.OUTPUT})
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_parameter_value.return_value = "some_value"
+        node._get_raw_parameter_value.return_value = "some_value"
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -192,8 +198,10 @@ class TestCollectParameterValues:
 
         values = {"api_password": "s3cr3t", "db_password": "hunter2", "prompt": "hello"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2, p3]
-        node.get_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -216,11 +224,7 @@ class TestCollectRawProvenance:
     def test_returns_workflow_only_when_no_flow(self) -> None:
         engine = _make_engine(has_flow=False)
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = _collect_raw_provenance(engine)
+        result = _collect_raw_provenance(engine)
 
         assert "workflow" in result
         assert "flow" not in result
@@ -229,11 +233,7 @@ class TestCollectRawProvenance:
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = _collect_raw_provenance(engine)
+        result = _collect_raw_provenance(engine)
 
         assert result["flow"]["name"] == "ControlFlow_1"
         assert result["flow"]["resolving_nodes"] == ["MyNode"]
@@ -244,17 +244,15 @@ class TestCollectRawProvenance:
 
         param_values = {"password": "secret", "prompt": "hi"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = _collect_raw_provenance(engine)
+        result = _collect_raw_provenance(engine)
 
         assert "parameters_omitted" in result
         assert "password" in result["parameters_omitted"]
@@ -263,11 +261,7 @@ class TestCollectRawProvenance:
     def test_no_parameters_key_when_no_resolving_nodes(self) -> None:
         engine = _make_engine(resolving_nodes=[])
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = _collect_raw_provenance(engine)
+        result = _collect_raw_provenance(engine)
 
         assert "parameters" not in result
 
@@ -284,11 +278,7 @@ class TestCollectSidecarProvenance:
         engine = _make_engine(resolving_nodes=["NodeA", "NodeB"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine)
 
         assert result["flow"]["node_name"] == "NodeA"
         assert "resolving_nodes" not in result["flow"]
@@ -299,17 +289,15 @@ class TestCollectSidecarProvenance:
 
         param_values = {"password": "s3cr3t", "prompt": "hi"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine)
 
         assert result["parameters"] == {"prompt": "hi"}
         assert result["parameters_omitted"] == ["password"]
@@ -318,17 +306,15 @@ class TestCollectSidecarProvenance:
         pub, _ = _make_param("prompt", value=None)
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub]
-        node.get_parameter_value.return_value = "hello"
+        node._get_raw_parameter_value.return_value = "hello"
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine)
 
         assert "parameters_omitted" not in result
         assert "prompt" in result["parameters"]
@@ -336,11 +322,7 @@ class TestCollectSidecarProvenance:
     def test_no_flow_block_when_no_flow_context(self) -> None:
         engine = _make_engine(has_flow=False)
 
-        with patch(
-            "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-            side_effect=KeyError,
-        ):
-            result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine)
 
         assert "workflow" in result
         assert "flow" not in result
@@ -361,21 +343,17 @@ class TestCollectWorkflowMetadata:
 
         param_values = {"password": "s3cr3t", "prompt": "hello"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.file_metadata.workflow_metadata.WorkflowRegistry.get_workflow_by_name",
-                side_effect=KeyError,
-            ),
-            patch(
-                "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
-                return_value=None,
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
+            return_value=None,
         ):
             result = collect_workflow_metadata(engine)
 

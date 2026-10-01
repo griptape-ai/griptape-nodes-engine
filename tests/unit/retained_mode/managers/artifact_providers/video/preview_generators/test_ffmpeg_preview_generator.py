@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from unittest.mock import patch
 
 import anyio
 import pytest
@@ -517,6 +518,38 @@ class TestFFmpegPreviewGeneratorGeneration:
         assert result.stderr == ""
         assert video_stream["pix_fmt"] != "unknown"
         assert await _entry_names(temp_output_dir) == {"output.mp4"}
+
+    @pytest.mark.asyncio
+    async def test_promote_retries_transient_permission_error(self, temp_test_video: str, temp_output_dir: str) -> None:
+        """A transiently denied rename (Windows sharing violation) is retried, not failed.
+
+        Two generations promoting onto one destination, or a reader serving the old
+        file, can deny the rename for microseconds; the promote must ride it out.
+        """
+        generator = FFmpegPreviewGenerator(
+            source_file_location=temp_test_video,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 150, "max_height": 150},
+        )
+
+        real_replace = anyio.Path.replace
+        replace_calls = 0
+
+        async def transiently_denied_replace(self: anyio.Path, target: str) -> object:
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls < 3:  # noqa: PLR2004
+                msg = "The process cannot access the file because it is being used by another process"
+                raise PermissionError(msg)
+            return await real_replace(self, target)
+
+        with patch.object(anyio.Path, "replace", transiently_denied_replace):
+            result_filename = await generator.attempt_generate_preview()
+
+        assert replace_calls == 3  # noqa: PLR2004
+        assert (Path(temp_output_dir) / result_filename).exists()
 
     @pytest.mark.asyncio
     async def test_generate_creates_parent_directories(self, temp_test_video: str, temp_output_dir: str) -> None:

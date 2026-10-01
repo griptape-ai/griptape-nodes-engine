@@ -351,6 +351,10 @@ def _process(self) -> None:
     # ... make API call with headers ...
 ```
 
+The component also reads secrets with `GetSecretValueRequest` instead of reaching for
+`SecretsManager` directly, which is what lets it work when the node runs in a worker: manager
+accessors are refused there, so the manual version above only works on the orchestrator.
+
 ## Common Patterns
 
 ### Pattern 1: Simple Proxy API Usage

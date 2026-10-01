@@ -75,7 +75,7 @@ The most important area to focus on initially is the left panel, the node librar
 
 ## Adding Nodes to the Workspace
 
-There are three interactive methods to creating nodes (and even more in [Retained Mode](../../development/retained_mode.md))
+Here are the quickest ways to create nodes. See [Working with Nodes](../../guides/editor/working_with_nodes.md#adding-nodes) for every option in the editor, or [Retained Mode](../../development/retained_mode.md) to create nodes from a script.
 
 <div style="display: flex; justify-content: space-between; gap: 20px; margin-bottom: 30px;">
   <div style="flex: 1;">
@@ -87,19 +87,11 @@ There are three interactive methods to creating nodes (and even more in [Retaine
   </div>
 
 <div style="flex: 1;">
-    <p><strong>Double-Click</strong>: Simply double-click any node in the left panel to automatically place it in the center of your workspace.</p>
+    <p><strong>Tab or Shift+A</strong>: Pressing Tab or Shift+A with your cursor over the flow editor brings up a search field. You can type to find the node you want, and press Enter to create it.</p>
     <p align="center">
-      <img src="assets/create_node_dblClick.gif" alt="Double Click">
+      <img src="assets/create_node_spacebar.gif" alt="Tab or Shift+A Search">
     </p>
-    <h4 align="center">Double Click</h4>
-  </div>
-
-<div style="flex: 1;">
-    <p><strong>Shift+A or Double-Click</strong>: Pressing Shift+A or double-clicking on the flow editor brings up a search field. You can type to find the node you want, and enter to create it.</p>
-    <p align="center">
-      <img src="assets/create_node_spacebar.gif" alt="Shift+A or Double-Click">
-    </p>
-    <h4 align="center">Shift+A or Double-Click Search</h4>
+    <h4 align="center">Tab or Shift+A Search</h4>
   </div>
 </div>
 

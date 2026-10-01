@@ -37,8 +37,8 @@ class SetWorkflowContextRequest(RequestPayload):
                       over. A DIRECTORY, not a file path. Absolute paths are recommended;
                       if you supply a relative path it is anchored to the workspace directory
                       (not the project base directory, which may sit one level above). Optional:
-                      when None, an unsaved workflow has no folder and `{workflow_dir?:/}` keeps
-                      degrading to a workspace-relative path as before.
+                      when None, `{workflow_dir}` answers the folder this workflow's first save
+                      would land in, read from the project's `save_workflow` situation.
 
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name) |
              SetWorkflowContextFailure (workflow not found, working_directory names an

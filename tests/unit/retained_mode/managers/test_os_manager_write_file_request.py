@@ -203,14 +203,107 @@ class TestBlanketExceptionHandling:
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
-        # Mock _write_with_portalocker to raise unexpected exception (not FileExistsError or LockException)
-        with patch.object(os_manager, "_write_with_portalocker", side_effect=OSError("Unexpected I/O error")):
+        # Mock the atomic write primitive to raise an unclassified OSError
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=OSError("Unexpected I/O error"),
+        ):
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
         assert isinstance(result.result_details, ResultDetails)
-        assert "unexpected error" in result.result_details.result_details[0].message.lower()
+        assert "i/o error" in result.result_details.result_details[0].message.lower()
+
+    def test_text_overwrite_translates_newlines_to_platform_linesep(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Str OVERWRITE keeps the text-mode newline translation open(mode="w") did.
+
+        The atomic write path emits raw bytes, so without explicit translation
+        every text save on Windows would silently switch from CRLF to bare LF.
+        """
+        import os as os_module
+
+        monkeypatch.setattr(os_module, "linesep", "\r\n")
+
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="line one\nline two\n")
+
+        result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert file_path.read_bytes() == b"line one\r\nline two\r\n"
+
+    def test_unencodable_text_overwrite_maps_to_encoding_error(self, engine: Engine, temp_dir: Path) -> None:
+        """Text that cannot be represented in the requested encoding fails as ENCODING_ERROR."""
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="naïve café", encoding="ascii")
+
+        result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.ENCODING_ERROR
+        assert not file_path.exists()
+
+    def test_directory_destination_on_overwrite_maps_to_is_directory(self, engine: Engine, temp_dir: Path) -> None:
+        """An overwrite whose destination is a directory fails as IS_DIRECTORY."""
+        request = WriteFileRequest(file_path=str(temp_dir / "some.txt"), content="Content")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=IsADirectoryError("that is a directory"),
+        ):
+            result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
+
+    def test_windows_sharing_violation_maps_to_file_locked(self, engine: Engine, temp_dir: Path) -> None:
+        """A Windows sharing violation on the rename reports FILE_LOCKED, not PERMISSION_DENIED."""
+        locked_error = PermissionError("The process cannot access the file")
+        locked_error.winerror = 32  # ERROR_SHARING_VIOLATION  # type: ignore[attr-defined]
+
+        request = WriteFileRequest(file_path=str(temp_dir / "held.png"), content=b"payload")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=locked_error,
+        ):
+            result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
+        assert "in use by another process" in str(result.result_details)
+
+    def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, temp_dir: Path) -> None:
+        """A full destination volume fails as DISK_FULL with an actionable message.
+
+        Workstations with small local disks and assets on nearly-full shared storage
+        hit this for real; the failure must name the problem, and the atomic swap
+        guarantees the previous file survives it.
+        """
+        import errno
+
+        os_manager = engine.os_manager
+        file_path = temp_dir / "test.txt"
+        file_path.write_text("previous content")
+
+        request = WriteFileRequest(file_path=str(file_path), content="Content")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.DISK_FULL
+        assert isinstance(result.result_details, ResultDetails)
+        message = result.result_details.result_details[0].message.lower()
+        assert "disk" in message
+        assert "left unchanged" in message
+        assert file_path.read_text() == "previous content"
 
     def test_blanket_exception_on_macro_resolution_in_candidate_loop(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during CREATE_NEW macro resolution."""
@@ -2270,10 +2363,21 @@ class TestFailedWriteLeavesNoLitter:
     def test_overwrite_never_deletes_pre_existing_file(
         self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
     ) -> None:
-        """Guards the mode="x" gate: under "w" the file may predate us and hold real data."""
+        """A failed overwrite must leave the pre-existing file intact, with no temp debris.
+
+        The overwrite path writes a sibling temp file and renames it into place, so a
+        write that dies mid-flight (rigged here via fsync) never touches the
+        destination. This is the guarantee that keeps a full disk or a crash from
+        destroying real user data the way an in-place truncate would.
+        """
         target = outputs_dir / "precious.png"
         target.write_bytes(b"REAL USER DATA")
-        self._fail_lock_times(monkeypatch, count=None)
+
+        def failing_fsync(_fd: int) -> None:
+            msg = "fsync failed"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
 
         result = engine.os_manager.on_write_file_request(
             WriteFileRequest(
@@ -2285,6 +2389,8 @@ class TestFailedWriteLeavesNoLitter:
 
         assert isinstance(result, WriteFileResultFailure)
         assert target.read_bytes() == b"REAL USER DATA"
+        leftovers = [p for p in outputs_dir.iterdir() if p != target]
+        assert leftovers == []
 
 
 class TestMacroFailureMessageIsReadable:

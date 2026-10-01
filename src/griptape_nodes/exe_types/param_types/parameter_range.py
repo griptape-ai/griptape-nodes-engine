@@ -236,9 +236,7 @@ class ParameterRange(Parameter):
                     "hide_range_parameters": False,
                 }
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("range_slider", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("range_slider")
 
     @property
     def min_val(self) -> float:

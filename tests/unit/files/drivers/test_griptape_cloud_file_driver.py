@@ -95,7 +95,7 @@ class TestGriptapeCloudFileDriver:
         mock_download_response.content = b"cloud file content"
         mock_download_response.raise_for_status = Mock()
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.post = AsyncMock(return_value=mock_api_response)
             mock_client.get = AsyncMock(return_value=mock_download_response)
@@ -124,11 +124,11 @@ class TestGriptapeCloudFileDriver:
         mock_cloud_storage_driver: Any,  # noqa: ARG002
     ) -> None:
         """Test read raises RuntimeError on HTTP error."""
-        import httpx
+        import httpx2
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
-            mock_client.post = AsyncMock(side_effect=httpx.HTTPError("Connection failed"))
+            mock_client.post = AsyncMock(side_effect=httpx2.HTTPError("Connection failed"))
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_class.return_value = mock_client
@@ -147,7 +147,7 @@ class TestGriptapeCloudFileDriver:
         mock_response = Mock()
         mock_response.status_code = 200
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.post = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -167,7 +167,7 @@ class TestGriptapeCloudFileDriver:
         mock_response = Mock()
         mock_response.status_code = 404
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.post = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -202,7 +202,7 @@ class TestGriptapeCloudFileDriver:
         mock_head_response.headers = {"content-length": "5678"}
         mock_head_response.raise_for_status = Mock()
 
-        with patch("httpx.Client") as mock_client_class:
+        with patch("httpx2.Client") as mock_client_class:
             mock_client = Mock()
             mock_client.post = Mock(return_value=mock_api_response)
             mock_client.head = Mock(return_value=mock_head_response)
@@ -220,11 +220,11 @@ class TestGriptapeCloudFileDriver:
         mock_cloud_storage_driver: Any,  # noqa: ARG002
     ) -> None:
         """Test get_size returns 0 on HTTP error."""
-        import httpx
+        import httpx2
 
-        with patch("httpx.Client") as mock_client_class:
+        with patch("httpx2.Client") as mock_client_class:
             mock_client = Mock()
-            mock_client.post = Mock(side_effect=httpx.HTTPError("Connection failed"))
+            mock_client.post = Mock(side_effect=httpx2.HTTPError("Connection failed"))
             mock_client.__enter__ = Mock(return_value=mock_client)
             mock_client.__exit__ = Mock(return_value=None)
             mock_client_class.return_value = mock_client

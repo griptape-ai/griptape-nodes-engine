@@ -10,6 +10,20 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 
+class WorkerGoneError(Exception):
+    """Raised at whatever was awaiting a worker's reply, once that worker will never send one.
+
+    Carries the reason the worker went away, written where it is known -- eviction and a library
+    reload are different stories and only their own call sites can tell them. Raised rather than
+    cancelling the awaiting task, so a CancelledError keeps its single meaning: the flow was
+    cancelled.
+
+    Lives here, with the worker protocol's payloads, because both the manager that raises it and
+    the manager that turns it into a node failure import it at runtime, and events are the leaf of
+    the import graph.
+    """
+
+
 @dataclass
 @PayloadRegistry.register
 class RegisterWorkerRequest(RequestPayload):
@@ -38,6 +52,10 @@ class RegisterWorkerRequest(RequestPayload):
 @PayloadRegistry.register
 class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Worker registration succeeded.
+
+    Carries no project: the orchestrator sends the worker's first activation down the same path a
+    mid-session switch uses, so there is one sender and one adoption path rather than two that have
+    to be ordered against each other.
 
     Args:
         worker_engine_id: The engine_id of the worker that was registered.

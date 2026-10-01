@@ -1,5 +1,7 @@
 """Tests for VideoArtifactProvider.detect_format magic-byte sniffing."""
 
+import pytest
+
 from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifact_provider import (
     VideoArtifactProvider,
 )
@@ -64,11 +66,38 @@ class TestVideoDetectFormat:
     def test_avi_riff(self) -> None:
         assert VideoArtifactProvider.detect_format(_avi_bytes()) == "avi"
 
-    def test_gif_returns_gif(self) -> None:
-        assert VideoArtifactProvider.detect_format(_gif_bytes()) == "gif"
+    def test_gif_returns_none(self) -> None:
+        """GIF is claimed by the image provider, not video."""
+        assert VideoArtifactProvider.detect_format(_gif_bytes()) is None
 
     def test_short_data_returns_none(self) -> None:
         assert VideoArtifactProvider.detect_format(b"\x00\x01") is None
 
     def test_unidentifiable_returns_none(self) -> None:
         assert VideoArtifactProvider.detect_format(b"not a video stream") is None
+
+
+class TestDetectFormatContract:
+    """Every *sampled* return value of detect_format() must be a declared format.
+
+    This does not catch a new sniffing branch that returns an undeclared format
+    with no sample here to exercise it - that shape of drift (GH#5577's GIF
+    sniffing) is guarded by test_gif_returns_none above instead.
+    """
+
+    @pytest.mark.parametrize(
+        "byte_sample",
+        [
+            _mp4_bytes(),
+            _mov_bytes(),
+            _m4v_bytes(),
+            _webm_bytes(),
+            _mkv_bytes(),
+            _avi_bytes(),
+        ],
+        ids=["mp4", "mov", "m4v", "webm", "mkv", "avi"],
+    )
+    def test_detect_format_return_values_are_all_supported(self, byte_sample: bytes) -> None:
+        detected = VideoArtifactProvider.detect_format(byte_sample)
+        assert detected is not None
+        assert detected in VideoArtifactProvider.get_supported_formats()

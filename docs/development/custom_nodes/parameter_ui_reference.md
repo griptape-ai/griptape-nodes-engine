@@ -69,6 +69,7 @@ For each parameter, the editor picks a widget in this order:
 | `progress_bar` | Render the value as a progress bar instead of an editable input (for values a node reports, like 0–100). |
 
 For a bounded slider, use the `Slider` trait rather than writing `ui_options["slider"]` by hand — the trait also validates the range.
+Pass `soft_limits=True` when the range should only size the slider track, so a user can still type a value beyond it.
 
 ### Image types
 
@@ -117,13 +118,13 @@ For a bounded slider, use the `Slider` trait rather than writing `ui_options["sl
 
 ## Traits
 
-Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and, where relevant, the `ui_options` keys it manages — set the trait rather than the keys.
+Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and any `ui_options` keys it manages. Set the trait rather than those keys. A trait wins over stored values for its keys. Every `ui_options` write, from node code, the editor, or a saved file, is routed through [`state_from_ui_options`](parameters.md#traits).
 
 | Trait                | Typical types             | What it does                                                                                                   | `ui_options` it writes                                            |
 | -------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `Options`            | `str`, any                | Dropdown constrained to fixed choices, with optional search. `allow_custom=True` makes it a typeahead instead. | `simple_dropdown`, `show_search`, `search_filter`, `allow_custom` |
 | `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                         | `multi_options`                                                   |
-| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`; out-of-range values fail validation.                                   | `slider`                                                          |
+| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`. Out-of-range values fail validation unless `soft_limits=True`.         | `slider`                                                          |
 | `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                                   | —                                                                 |
 | `Button`             | `button`                  | Configures a button's label, variant, size, and click behavior.                                                | `button_label`, `variant`, `size`, `state`, `full_width`          |
 | `ColorPicker`        | `str`                     | Color swatch that opens a color picker; validates the format (`"hex"`, etc.).                                  | `color_picker`                                                    |

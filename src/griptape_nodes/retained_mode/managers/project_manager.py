@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import anyio
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -44,6 +45,8 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
@@ -51,7 +54,6 @@ from griptape_nodes.files.path_utils import (
     resolve_file_path,
     resolve_path_safely,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import AppEvent
@@ -59,6 +61,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
@@ -169,7 +172,9 @@ logger = logging.getLogger("griptape_nodes")
 # the canonicalized project file path string as their id (the legacy bridge), so
 # the id-space is mixed (GUID/custom ids, legacy path-string ids, and the
 # synthetic SYSTEM_DEFAULTS_KEY). The on-disk file path is a separate locator.
-ProjectID = str
+# ProjectID lives in project_events (payloads annotate with it and pydantic needs the name
+# resolvable at runtime); re-exported here because this module is where most callers look.
+from griptape_nodes.retained_mode.events.project_events import ProjectID  # noqa: E402
 
 # Synthetic identifier for the system default project template
 SYSTEM_DEFAULTS_KEY: ProjectID = "<system-defaults>"
@@ -184,6 +189,12 @@ BUILTIN_WORKSPACE_DIR = "workspace_dir"
 BUILTIN_WORKFLOW_NAME = "workflow_name"
 BUILTIN_WORKFLOW_DIR = "workflow_dir"
 BUILTIN_STATIC_FILES_DIR = "static_files_dir"
+
+# Stands in for the filename when resolving `save_workflow` purely to learn its folder. Never
+# reaches disk: only the parent of the resolved path is read. Carries no path separator, so it
+# cannot add a level the real filename would not have.
+_SAVE_DIR_PROBE_STEM = "workflow"
+_SAVE_DIR_PROBE_EXTENSION = "py"
 
 
 @dataclass(frozen=True)
@@ -420,6 +431,22 @@ class ProjectInfo:
 
     def __post_init__(self) -> None:
         self.computed_variable_names = BUILTIN_VARIABLES | frozenset(self.template.directories.keys())
+
+
+@dataclass(frozen=True)
+class _ResolvedAncestor:
+    """A parent project read and merged during a parent-chain walk, awaiting registration.
+
+    Held rather than registered on the spot because the walk runs before its caller has
+    decided anything: a child can still be rejected as unusable or denied by the
+    LOAD_PROJECT checkpoint after inheriting successfully, and such a child must not leave
+    its ancestors in the registry.
+    """
+
+    project_id: ProjectID
+    project_file_path: Path
+    template: ProjectTemplate
+    validation: ProjectValidationInfo
 
 
 @dataclass(frozen=True)
@@ -678,9 +705,28 @@ class ProjectManager(EngineScoped):
         # is selected. Any code path that previously cleared this to None now routes
         # back to system defaults via SetCurrentProjectRequest's default value.
         self._current_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        # The last activation that fully SUCCEEDED. `_current_project_id` is assigned before
+        # activation's fallible steps, so reading it mid-switch can observe a project about to be
+        # rolled back, and a worker registering in that window would adopt an abandoned one.
+        # Registration replies and switch fan-outs carry this pair instead.
+        self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        # TODO(griptape-ai/internal#266): delete the generation counters.
+        # They exist only to order adoptions that overlap, and they overlap only because each
+        # inbound message becomes its own coroutine while adoption awaits internally. Draining
+        # activations from a single-consumer queue makes ordering structural -- the wire already
+        # delivers in order -- at which point nothing needs a counter to reconstruct it.
+        self._project_generation: int = 0
+        # Worker-side: the highest generation this engine has adopted, so a stale activation
+        # (an older fan-out, or a registration reply racing a newer switch) is skipped.
+        self._last_adopted_generation: int = -1
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
+        # Set while `_resolve_default_workflow_save_dir` is resolving `save_workflow` to learn
+        # where an unsaved workflow would be saved. That resolution can reach `workflow_dir`
+        # again, directly or through a directory such as `{outputs}`, and each re-entry builds
+        # its own resolver, so the resolver's own cycle guard never sees the loop.
+        self._resolving_default_workflow_save_dir: bool = False
 
         # Track validation status for ALL load attempts (including MISSING/UNUSABLE)
         # This allows UI to query why a project failed to load
@@ -826,11 +872,13 @@ class ProjectManager(EngineScoped):
         # Resolve the parent chain (if declared) into a base ProjectTemplate.
         # Cycle detection seeds the visited set with the current project's path
         # so a self-reference also fails fast.
+        resolved_ancestors: list[_ResolvedAncestor] = []
         base_template = await self._resolve_parent_chain(
             overlay=overlay,
             project_file_path=project_file_path,
             validation=validation,
             visited={project_file_path},
+            resolved_ancestors=resolved_ancestors,
         )
         if base_template is None:
             # _resolve_parent_chain records the specific cause (e.g. an
@@ -859,19 +907,7 @@ class ProjectManager(EngineScoped):
         situation_schemas = self._parse_situation_macros(template.situations, validation)
         directory_schemas = self._parse_directory_macros(template.directories, validation)
 
-        # A declared variable that collides with a computed name (builtin or directory)
-        # is legal but shadowed: computed wins within the PROJECT tier, so the stored
-        # value is unreachable until the collision is removed. Warn, don't fail.
-        computed_names = BUILTIN_VARIABLES | set(template.directories.keys())
-        for var_name in template.variables:
-            if var_name in computed_names:
-                validation.add_warning(
-                    field_path=f"variables.{var_name}",
-                    message=(
-                        f"Variable '{var_name}' collides with a builtin or directory name. "
-                        f"The builtin/directory value wins; this variable will never resolve."
-                    ),
-                )
+        self._warn_shadowed_variables(template, validation)
 
         # Now check if validation is usable after collecting all errors
         if not validation.is_usable():
@@ -925,6 +961,10 @@ class ProjectManager(EngineScoped):
         # at load time); runtime writes to READ_WRITE entries mutate the layer and
         # persist back through the save-overlay path.
         self._install_project_variables(project_id, template)
+
+        # Only now that this project is cached: an ancestor the walk read is registered on
+        # behalf of a project that actually loaded, never one this method turned away.
+        self._commit_resolved_ancestors(resolved_ancestors)
 
         # Track validation status for all load attempts (for UI display)
         self._registered_template_status[project_file_path] = validation
@@ -1156,6 +1196,7 @@ class ProjectManager(EngineScoped):
         project_file_path: Path,
         validation: ProjectValidationInfo,
         visited: set[Path],
+        resolved_ancestors: list[_ResolvedAncestor],
     ) -> ProjectTemplate | None:
         """Resolve the parent chain declared by an overlay into a base ProjectTemplate.
 
@@ -1187,6 +1228,12 @@ class ProjectManager(EngineScoped):
         Errors during parent resolution (missing file, unregistered id, unparsable
         YAML, cycle) are recorded on the child's `validation` and surfaced to the
         caller as a None return.
+
+        Every ancestor the walk resolves is appended to `resolved_ancestors` instead of
+        being registered here, because whether they should be registered depends on what
+        the caller does next. A caller that goes on to cache its own project passes the
+        list to `_commit_resolved_ancestors`; a caller that bails, or only needed a merge
+        base, discards it.
         """
         # Precedence: an explicit parent_project_id (portable, registry-located)
         # wins and the path is ignored. parent_project_path is the legacy
@@ -1273,25 +1320,104 @@ class ProjectManager(EngineScoped):
             project_file_path=parent_file_path,
             validation=validation,
             visited={*visited, parent_file_path},
+            resolved_ancestors=resolved_ancestors,
         )
         if ancestor_base is None:
             return None
 
-        # Merge the parent overlay onto its own ancestor base using a fresh
-        # validation info so the parent's overrides don't bleed into the child's
-        # validation record. Errors during the parent merge still propagate
-        # upward via add_error below.
-        parent_merge_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        parent_template = ProjectTemplate.merge(ancestor_base, parent_overlay, parent_merge_validation)
-        if not parent_merge_validation.is_usable():
-            for problem in parent_merge_validation.problems:
+        # Merge the parent overlay onto its own ancestor base into the PARENT's own validation
+        # record, never the child's: the parent's overrides are not the child's problems, and an
+        # ancestor registered from this walk is listed with this record, so it has to carry
+        # everything _read_overlay found (above all the recoverable workspace_dir/libraries_dir
+        # errors that make a project FLAWED) and not just the merge. merge_problem_start marks
+        # where the merge's own problems begin, so only those propagate to the child below.
+        merge_problem_start = len(parent_validation.problems)
+        parent_template = ProjectTemplate.merge(ancestor_base, parent_overlay, parent_validation)
+        if not parent_validation.is_usable():
+            for problem in parent_validation.problems[merge_problem_start:]:
                 validation.add_error(
                     field_path=f"{parent_link_field}.{problem.field_path}",
                     message=f"Parent '{parent_label}': {problem.message}",
                     line_number=overlay.line_info.get_line(parent_link_field),
                 )
             return None
+
+        resolved_ancestors.append(
+            _ResolvedAncestor(
+                project_id=parent_overlay.id if parent_overlay.id is not None else str(parent_file_path),
+                project_file_path=parent_file_path,
+                template=parent_template,
+                validation=parent_validation,
+            )
+        )
         return parent_template
+
+    def _commit_resolved_ancestors(self, resolved_ancestors: list[_ResolvedAncestor]) -> None:
+        """Cache ancestors resolved during a parent-chain walk as loaded projects.
+
+        A parent named only by `parent_project_path` is read and merged by the walk but
+        would otherwise never enter the registry. The listing reports each entry's parent
+        by id, so an unregistered parent leaves `_reduce_parent_link_to_id` nothing to map
+        and it emits the parent's canonical path string instead -- a value no id-keyed
+        lookup resolves, which is what makes `GetProjectTemplateRequest` fail for a parent
+        the child inherited from successfully.
+
+        Call this only after the load that walked the chain has cached its own project. A
+        child rejected as unusable or denied by the LOAD_PROJECT checkpoint must leave no
+        ancestors behind, or a one-line child naming a forbidden parent would be enough to
+        put that parent in the registry.
+
+        The ancestors themselves are not gated on LOAD_PROJECT: access to a child does not
+        require access to its parent, and a child that reached this point already carries
+        the parent's merged content.
+
+        Registers in memory only. Ancestor paths are never appended to projects_to_register,
+        so inheriting from a parent does not mutate the user's persisted project list.
+        """
+        for ancestor in resolved_ancestors:
+            # An id already present is left untouched, whether it is this same file (already
+            # loaded, so its entry is at least as complete as this one) or a different file (a
+            # collision that a child's load has no business resolving by eviction).
+            if ancestor.project_id in self._successfully_loaded_project_templates:
+                continue
+
+            # Problems land on the ancestor's own validation record, which the child's merge
+            # never reads, so an ancestor whose macros do not parse is skipped here without
+            # changing the outcome of the load that walked through it.
+            situation_schemas = self._parse_situation_macros(ancestor.template.situations, ancestor.validation)
+            directory_schemas = self._parse_directory_macros(ancestor.template.directories, ancestor.validation)
+            self._warn_shadowed_variables(ancestor.template, ancestor.validation)
+            if not ancestor.validation.is_usable():
+                continue
+
+            self._successfully_loaded_project_templates[ancestor.project_id] = ProjectInfo(
+                project_id=ancestor.project_id,
+                project_file_path=ancestor.project_file_path,
+                project_base_dir=ancestor.project_file_path.parent,
+                template=ancestor.template,
+                validation=ancestor.validation,
+                parsed_situation_schemas=situation_schemas,
+                parsed_directory_schemas=directory_schemas,
+            )
+            self._install_project_variables(ancestor.project_id, ancestor.template)
+
+    def _warn_shadowed_variables(self, template: ProjectTemplate, validation: ProjectValidationInfo) -> None:
+        """Warn for each declared variable that a computed name shadows.
+
+        A declared variable that collides with a computed name (builtin or directory) is legal
+        but shadowed: computed wins within the PROJECT tier, so the stored value is unreachable
+        until the collision is removed. Warn, don't fail.
+        """
+        computed_names = BUILTIN_VARIABLES | set(template.directories.keys())
+        for var_name in template.variables:
+            if var_name in computed_names:
+                validation.add_warning(
+                    field_path=f"variables.{var_name}",
+                    message=(
+                        f"Variable '{var_name}' collides with a builtin or directory name. "
+                        f"The builtin/directory value wins; this variable will never resolve."
+                    ),
+                )
 
     def get_loaded_project_dir(self, project_id: str) -> Path | None:
         """Return the directory of a loaded, file-backed project, or None.
@@ -2900,7 +3026,13 @@ class ProjectManager(EngineScoped):
     async def _reload_after_project_switch(
         self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
-        """Reload libraries and optionally re-register workflows after a project switch.
+        """Close the open workflow, reload libraries, and re-register workflows after a switch.
+
+        A workspace change closes the open workflow, because re-registering the
+        workflows re-keys them against the new workspace: a context that outlives
+        its registry entry names a key nothing can look up again, and every
+        `workflow_dir` resolution against it warns for the life of the process.
+        Clients are expected to return the user to the workflow picker.
 
         Only reloads libraries when the project's library-affecting config
         actually changed: the reload triggers LibraryManager's reconcile, which
@@ -2909,15 +3041,33 @@ class ProjectManager(EngineScoped):
         default workspace) skips the deep reset. Workflows are re-registered only
         when the workspace directory changed.
 
-        Returns a failure result if the library reload (reconcile/engine_version
-        gate included) fails, otherwise None.
+        Returns a failure result if the workflow could not be closed, or if the
+        library reload (reconcile/engine_version gate included) fails, otherwise
+        None.
         """
+        # Ahead of refresh_workflow_registry, which deletes the entry this teardown resolves
+        # paths through, and ahead of the reload below, whose own clear then finds an empty
+        # stack and no-ops.
+        #
+        # Both failures below report altered_workflow_state: the teardown pops the context
+        # before the checks that can fail it, so the workflow is gone either way. A failure
+        # that claimed otherwise would leave the client showing a workflow the engine has
+        # dropped, which is the state this teardown exists to prevent.
+        if workspace_changed:
+            clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if not clear_result.succeeded():
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set project '{project_id}'. "
+                    f"Config updated but the open workflow could not be closed: {clear_result.result_details}",
+                    altered_workflow_state=True,
+                )
         if library_config_changed:
             reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
             if isinstance(reload_result, ReloadAllLibrariesResultFailure):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but library reload failed: {reload_result.result_details}",
+                    altered_workflow_state=True,
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
@@ -3071,14 +3221,21 @@ class ProjectManager(EngineScoped):
         if outcome.workspace_changed and self._initialization_complete:
             result.altered_workflow_state = True
 
-        # Push the switch to running workers so they adopt the orchestrator's project
-        # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Boot is handled separately (a worker boots like an engine and
-        # re-derives the same project), so emit only post-init and only when the
-        # project actually changed. A worker that boots like the orchestrator has the
-        # same registry, so the id resolves there too.
-        if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
+        # Push the switch to running workers so they adopt it even on a shallow switch (same
+        # workspace and library config) that would not restart them. Emitted on every change,
+        # including during boot, where it reaches zero workers and is inert -- gating on
+        # initialization instead missed a switch landing after a worker registered.
+        if previous_project_id != resolved_project_id:
+            changed = CurrentProjectChanged(project_id=resolved_project_id)
+            # The wire copy goes up first, still synchronous with the commit, so GUI clients
+            # see switches in commit order even when two overlap.
+            self._event_manager.put_event(AppEvent(payload=changed))
+            # The in-process listeners -- the worker fan-out -- are awaited BEFORE the switch
+            # reports success: the moment a caller sees the switch complete it may run a node,
+            # and a worker that has not yet adopted would run it against the old workspace.
+            # The queued copy above passes through these listeners a second time; the workers'
+            # generation guard skips that pass (or retries an adoption that failed here).
+            await self._event_manager.abroadcast_app_event(changed)
         return result
 
     def _refuse_unresolvable_declared_paths(
@@ -3249,6 +3406,10 @@ class ProjectManager(EngineScoped):
             if failure is not None:
                 return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
+        # Every path that reaches here established the project's layers completely: the
+        # requested switch, the boot seed, and the rollback re-activation all commit.
+        self._project_generation += 1
+        self._committed_project_id = resolved_project_id
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
     async def _apply_workspace_and_libraries_layers(
@@ -3350,7 +3511,62 @@ class ProjectManager(EngineScoped):
             return True
         self._config_manager.load_configs()
         await self._load_registered_projects()
+        if project_id in self._successfully_loaded_project_templates:
+            return True
+        # Registered-project discovery only covers projects_to_register, so a project the
+        # orchestrator holds via the persisted `project_file` -- which is how every install names
+        # its project after any prior activation -- is invisible to it. The id IS the canonical
+        # template path, so when a file exists there, load it with the orchestrator's own loader.
+        candidate = Path(project_id)
+        # Absolute only: the branch's premise is that the id IS the canonical template path. The
+        # id space also holds custom non-path ids, and probing those against this process's CWD
+        # could load an unrelated file that merely shares a relative name.
+        if candidate.is_absolute() and await anyio.Path(candidate).is_file():
+            load_result = await self.on_load_project_template_request(
+                LoadProjectTemplateRequest(project_path=candidate)
+            )
+            if load_result.failed():
+                logger.error(
+                    "Attempted to load project '%s' by path during re-derivation. Failed with: %s",
+                    project_id,
+                    load_result.result_details,
+                )
         return project_id in self._successfully_loaded_project_templates
+
+    def committed_project(self) -> tuple[ProjectID, int]:
+        """The last fully-successful activation, as (project id, generation).
+
+        This is what crosses to workers. `current_project_id` can name a project mid-switch that
+        is about to be rolled back; this pair only ever names one whose layers were established.
+        """
+        return (self._committed_project_id, self._project_generation)
+
+    def is_stale_adoption(self, project_id: ProjectID, generation: int) -> bool:
+        """True when `generation` is not newer than the last adoption this engine completed.
+
+        A worker receives activations from two racing sources -- the registration reply and the
+        switch fan-out. Ordering by generation is what makes the outcome deterministic: the
+        newest committed switch wins regardless of arrival order, and a stale one is skipped
+        before it can touch config layers. The generation is recorded separately, via
+        `record_adopted_generation` AFTER the activation succeeds, so a failed adoption does not
+        consume its generation and block a retry of the same switch. The flip side is accepted:
+        a FAILED newer adoption does not make an older in-flight one stale, so the worker can
+        land on the older project -- the orchestrator's loud log of the failed one is the signal
+        for that case.
+        """
+        if generation <= self._last_adopted_generation:
+            logger.info(
+                "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
+                project_id,
+                generation,
+                self._last_adopted_generation,
+            )
+            return True
+        return False
+
+    def record_adopted_generation(self, generation: int) -> None:
+        """Mark `generation` as adopted, once its activation has fully succeeded."""
+        self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
@@ -3611,8 +3827,14 @@ class ProjectManager(EngineScoped):
         upgraded_overlay = overlay._replace(project_template_schema_version=latest_version)
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        # The resolved ancestors are discarded: this walk only computes a merge base for the
+        # re-stamped overlay, and the load that registered this project already registered them.
         base_template = await self._resolve_parent_chain(
-            upgraded_overlay, project_file_path, validation, visited={canonicalize_for_identity(project_file_path)}
+            upgraded_overlay,
+            project_file_path,
+            validation,
+            visited={canonicalize_for_identity(project_file_path)},
+            resolved_ancestors=[],
         )
         if base_template is None or not validation.is_usable():
             return UpgradeProjectSchemaResultFailure(
@@ -4572,7 +4794,7 @@ class ProjectManager(EngineScoped):
 
         Raises ValueError when the project isn't loaded or the name isn't a computed name;
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
-        {workflow_dir} before the workflow is saved).
+        {workflow_dir} with no workflow in context).
         """
         effective = self.resolve_project_id(project_id)
         if effective is None:
@@ -4739,7 +4961,7 @@ class ProjectManager(EngineScoped):
                 raise NotImplementedError(msg)
 
             case "workspace_dir":
-                return str(self._config_manager.workspace_path)
+                return self._resolve_builtin_workspace_dir()
 
             case "workflow_name":
                 context_manager = self.engine.context_manager
@@ -4749,7 +4971,7 @@ class ProjectManager(EngineScoped):
                 return context_manager.get_current_workflow_name()
 
             case "workflow_dir":
-                return self._resolve_workflow_dir()
+                return self._resolve_workflow_dir(project_info)
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -4763,10 +4985,39 @@ class ProjectManager(EngineScoped):
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
 
-    def _resolve_workflow_dir(self) -> str:
+    def workflow_context_for_dispatch(self) -> WorkflowContextSnapshot:
+        """This engine's workflow context, in the form another engine can adopt.
+
+        Raw context, not resolved paths: the adopting engine then derives every workflow-dependent
+        value through its own normal code paths, so the two cannot drift and a new derived value
+        needs no new handoff.
+
+        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
+        answering from its own equally-empty context, so both degrade identically.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return WorkflowContextSnapshot()
+
+        return WorkflowContextSnapshot(
+            name=context_manager.get_current_workflow_name(),
+            file_path=context_manager.get_current_workflow_file_path(),
+            working_directory=context_manager.get_current_workflow_working_directory(),
+        )
+
+    def _resolve_builtin_workspace_dir(self) -> str:
+        """Resolve the `workspace_dir` builtin: the root every relative project path anchors to.
+
+        Also the last rung of `_resolve_workflow_dir`, which is why it is a method rather than
+        an inline expression -- the two must answer identically or a never-saved workflow's
+        files land somewhere `{workspace_dir}` does not describe.
+        """
+        return str(self._config_manager.workspace_path)
+
+    def _resolve_workflow_dir(self, project_info: ProjectInfo) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
 
-        Three sources, in descending order of authority:
+        Four sources, in descending order of authority:
 
         1. The file path retained on the context. The registry key is derived against the
            workspace that was active at push time, so a project switch -- which re-registers
@@ -4776,13 +5027,18 @@ class ProjectManager(EngineScoped):
            to a workspace-relative path, so saved media resolves somewhere it was never written.
         2. The registry entry for the context's name.
         3. The folder the workflow was created in, for a workflow that has never been saved and
-           so has no file to answer from. Last because a saved workflow's own location always
-           beats the folder it was created in -- the two differ as soon as the user saves
-           somewhere else.
+           so has no file to answer from. Below the two above because a saved workflow's own
+           location always beats the folder it was created in -- the two differ as soon as the
+           user saves somewhere else.
+        4. The folder the workflow WOULD be saved into, for a never-saved workflow whose creator
+           named no folder, read from the `save_workflow` situation with no sub-directories so a
+           template that anchors saves outside the workspace root is answered with its folder
+           rather than the root. Where the user later chooses to save is a choice at save time,
+           not a misprediction by this rung. See `_resolve_default_workflow_save_dir`.
 
         Raises:
-            RuntimeError: If no workflow is in context, or the workflow has neither a file nor
-                a folder to answer with.
+            RuntimeError: If no workflow is in context, or the context's workflow is not
+                registered on this engine.
         """
         context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
@@ -4796,7 +5052,7 @@ class ProjectManager(EngineScoped):
         workflow_name = context_manager.get_current_workflow_name()
         working_directory = context_manager.get_current_workflow_working_directory()
         try:
-            workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+            workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
         except KeyError as e:
             if working_directory is not None:
                 return working_directory
@@ -4812,11 +5068,66 @@ class ProjectManager(EngineScoped):
         if workflow.file_path is None:
             if working_directory is not None:
                 return working_directory
-            msg = f"Workflow '{workflow_name}' has not been saved yet"
-            raise RuntimeError(msg)
+            return self._resolve_default_workflow_save_dir(project_info)
 
-        workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
+        workflow_file_path = Path(self.engine.workflow_registry.get_complete_file_path(workflow.file_path))
         return str(workflow_file_path.parent)
+
+    def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo) -> str:
+        """The folder `save_workflow` would put a workflow in when the save names no sub-directory.
+
+        Rung 4 of `_resolve_workflow_dir`. Resolves the situation through
+        `on_get_path_for_macro_request`, the same handler the real save goes through, so the
+        answer accounts for derivation rules and stored project variables rather than tracking
+        only what this manager's resolver knows. `sub_dirs` is left out so the folder is the one
+        a save with no hierarchy lands in; `file_name_base` and `file_extension` are required by
+        the macro but cannot change which folder it names, so they get placeholders and only the
+        parent is kept.
+
+        Falls back to the workspace root when the situation is absent, failed to parse, or cannot
+        resolve, since answering with the root is what dropping an optional `{workflow_dir}`
+        already did -- a never-saved workflow keeps a usable folder either way.
+        """
+        # Anchored so every answer here has one shape: the resolved path is fully absolute, and on
+        # Windows a bare `/workspace` carries no drive letter until it is anchored against the CWD.
+        workspace_root = str(resolve_path_safely(Path(self._resolve_builtin_workspace_dir())))
+
+        # Resolving the situation can reach `workflow_dir` again and land back here, so answer the
+        # root for the duration. The macro may name the builtin outright, or reach it through a
+        # directory: every v1 default directory is `{workflow_dir?:/}<name>`, and that form appends
+        # its own name once per pass, so an unguarded loop yields `outputs/outputs/outputs/...`.
+        if self._resolving_default_workflow_save_dir:
+            return workspace_root
+
+        parsed_macro = project_info.parsed_situation_schemas.get(BuiltInSituation.SAVE_WORKFLOW)
+        if parsed_macro is None:
+            return workspace_root
+
+        self._resolving_default_workflow_save_dir = True
+        try:
+            result = self.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=parsed_macro,
+                    variables={
+                        "file_name_base": _SAVE_DIR_PROBE_STEM,
+                        "file_extension": _SAVE_DIR_PROBE_EXTENSION,
+                    },
+                    project_id=project_info.project_id,
+                )
+            )
+        finally:
+            self._resolving_default_workflow_save_dir = False
+
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            logger.debug(
+                "Could not resolve the '%s' situation to find where an unsaved workflow would be "
+                "saved; using the workspace root (%s)",
+                BuiltInSituation.SAVE_WORKFLOW,
+                result.result_details,
+            )
+            return workspace_root
+
+        return str(result.absolute_path.parent)
 
     def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.

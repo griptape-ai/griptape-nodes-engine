@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
@@ -171,10 +171,10 @@ class TestPushWorkflow:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
                     # Registered workspace-RELATIVE, so resolving the key genuinely depends on
                     # which workspace is active.
-                    WorkflowRegistry.generate_new_workflow(
+                    engine.workflow_registry.generate_new_workflow(
                         registry_key="subdir/my_flow", metadata=metadata, file_path="subdir/my_flow.py"
                     )
                     context_manager.push_workflow(workflow_name="subdir/my_flow")
@@ -267,7 +267,7 @@ class TestWorkflowWorkingDirectory:
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
                 # The folder is NOT the registry key: the workflow is still unsaved.
-                assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
+                assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
                 assert context_manager.get_current_workflow_file_path() is None
 
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
@@ -295,6 +295,63 @@ class TestWorkflowWorkingDirectory:
                 assert context_manager.get_current_workflow_working_directory() is None
 
                 assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_omitting_the_folder_does_not_warn(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        """A workflow nobody named a folder for still answers `workflow_dir`, so nothing degrades.
+
+        The folder its first save would default to is a prediction rather than a fact, but it is
+        the same place dropping the optional block already sent the file, so a saving node that
+        writes several files no longer pays a warning per file for a path that was never wrong.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    resolved = self._resolve_outputs(engine)
+
+                assert resolved == workspace / "outputs" / "img.png"
+                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_required_workflow_dir_resolves_without_a_folder(self, engine: Engine) -> None:
+        """`{workflow_dir}` with no `?` resolves too, rather than failing the whole request.
+
+        A macro that names the directory outright has no degraded form to fall back to, so a
+        library writing to `{workflow_dir}/...` used to be unusable until the first save.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                resolved = engine.handle_request(
+                    GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
+                )
+
+                assert isinstance(resolved, GetPathForMacroResultSuccess)
+                assert resolved.absolute_path == workspace / "notes.txt"
             finally:
                 config_manager.workspace_path = original
                 while context_manager.has_current_workflow():
@@ -544,7 +601,6 @@ class TestEnsureWorkflowAndFlowRequest:
         self._cleanup(engine)
 
     def test_auto_generates_workflow_name_when_none_given(self, engine: Engine) -> None:
-        from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,
             EnsureWorkflowAndFlowResultSuccess,
@@ -556,8 +612,8 @@ class TestEnsureWorkflowAndFlowRequest:
         result = context_manager.on_ensure_workflow_and_flow_request(EnsureWorkflowAndFlowRequest())
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
-        assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
-        assert WorkflowRegistry.has_workflow_with_name(result.workflow_name)
+        assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+        assert engine.workflow_registry.has_workflow_with_name(result.workflow_name)
         assert result.created_workflow is True
         assert result.created_flow is True
 
@@ -880,7 +936,7 @@ class TestCurrentWorkflowChangedIsSaved:
         engine.event_manager.initialize_queue(asyncio.Queue())
 
     @staticmethod
-    def _register_saved_workflow(key: str, file_path: str) -> None:
+    def _register_saved_workflow(engine: Engine, key: str, file_path: str) -> None:
         """Register a workflow that has a file behind it, as the workspace scan does at startup."""
         metadata = WorkflowMetadata(
             name=key,
@@ -889,7 +945,7 @@ class TestCurrentWorkflowChangedIsSaved:
             node_libraries_referenced=[],
             creation_date=datetime.now(UTC),
         )
-        WorkflowRegistry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=file_path)
+        engine.workflow_registry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=file_path)
 
     def test_opening_a_saved_workflow_reports_it_as_saved(self, engine: Engine, tmp_path: Path) -> None:
         """The ordinary open: the workflow has a file, so the editor shows no unsaved-work state."""
@@ -901,8 +957,8 @@ class TestCurrentWorkflowChangedIsSaved:
         original_workspace = config_manager.workspace_path
         config_manager.workspace_path = workspace
         try:
-            with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-                self._register_saved_workflow(key="saved_flow", file_path="saved_flow.py")
+            with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+                self._register_saved_workflow(engine, key="saved_flow", file_path="saved_flow.py")
 
                 with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                     context_manager.push_workflow(workflow_name="saved_flow")
@@ -917,7 +973,7 @@ class TestCurrentWorkflowChangedIsSaved:
         """A blank canvas is an "unsaved:" entry, and the editor has to know its work is unsaved."""
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                 result = context_manager.on_set_workflow_context_request(SetWorkflowContextRequest())
 
@@ -936,12 +992,12 @@ class TestCurrentWorkflowChangedIsSaved:
         """
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            WorkflowRegistry.ensure_unsaved(key="unsaved:abc-123", display_name="Untitled")
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+            engine.workflow_registry.ensure_unsaved(key="unsaved:abc-123", display_name="Untitled")
             context_manager.push_workflow(workflow_name="unsaved:abc-123")
 
-            WorkflowRegistry.rekey_workflow(old_key="unsaved:abc-123", new_key="my_flow")
-            WorkflowRegistry.get_workflow_by_name("my_flow").file_path = "my_flow.py"
+            engine.workflow_registry.rekey_workflow(old_key="unsaved:abc-123", new_key="my_flow")
+            engine.workflow_registry.get_workflow_by_name("my_flow").file_path = "my_flow.py"
 
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                 context_manager.rekey_workflow(
@@ -956,8 +1012,8 @@ class TestCurrentWorkflowChangedIsSaved:
         """With nothing open there is no workflow to be saved or unsaved, so neither is claimed."""
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            WorkflowRegistry.ensure_unsaved(key="unsaved:closing", display_name="Untitled")
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+            engine.workflow_registry.ensure_unsaved(key="unsaved:closing", display_name="Untitled")
             context_manager.push_workflow(workflow_name="unsaved:closing")
 
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
@@ -975,7 +1031,7 @@ class TestCurrentWorkflowChangedIsSaved:
         """
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                 context_manager.push_workflow(workflow_name="never_registered")
 
@@ -993,8 +1049,8 @@ class TestCurrentWorkflowChangedIsSaved:
         """
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            WorkflowRegistry.ensure_unsaved(key="unsaved:compare", display_name="Untitled")
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+            engine.workflow_registry.ensure_unsaved(key="unsaved:compare", display_name="Untitled")
 
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                 context_manager.push_workflow(workflow_name="unsaved:compare")
@@ -1016,11 +1072,11 @@ class TestCurrentWorkflowChangedIsSaved:
         """
         context_manager = engine.context_manager
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            WorkflowRegistry.ensure_unsaved(key="unsaved:in-place", display_name="Untitled")
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+            engine.workflow_registry.ensure_unsaved(key="unsaved:in-place", display_name="Untitled")
             context_manager.push_workflow(workflow_name="unsaved:in-place")
 
-            WorkflowRegistry.get_workflow_by_name("unsaved:in-place").file_path = "in_place.py"
+            engine.workflow_registry.get_workflow_by_name("unsaved:in-place").file_path = "in_place.py"
 
             with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
                 context_manager.push_workflow(workflow_name="unsaved:in-place")

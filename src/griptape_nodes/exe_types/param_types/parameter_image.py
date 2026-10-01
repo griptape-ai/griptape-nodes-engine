@@ -197,9 +197,7 @@ class ParameterImage(Parameter):
         if value:
             self.update_ui_options_key("pulse_on_run", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("pulse_on_run", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("pulse_on_run")
 
     @property
     def clickable_file_browser(self) -> bool:
@@ -220,9 +218,7 @@ class ParameterImage(Parameter):
         if value:
             self.update_ui_options_key("clickable_file_browser", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("clickable_file_browser", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("clickable_file_browser")
 
     @property
     def webcam_capture_image(self) -> bool:
@@ -243,9 +239,7 @@ class ParameterImage(Parameter):
         if value:
             self.update_ui_options_key("webcam_capture_image", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("webcam_capture_image", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("webcam_capture_image")
 
     @property
     def edit_mask(self) -> bool:
@@ -266,6 +260,4 @@ class ParameterImage(Parameter):
         if value:
             self.update_ui_options_key("edit_mask", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("edit_mask", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("edit_mask")

@@ -414,3 +414,70 @@ class GetConfigSchemaResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 @PayloadRegistry.register
 class GetConfigSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Configuration schema retrieval failed. Common causes: schema generation error, model validation issues."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListBetaFeaturesRequest(RequestPayload):
+    """List the beta features this engine and its loaded libraries define.
+
+    Use when: Showing engine and library features on the editor's Beta settings page. Values are
+    read and written separately, through each feature's `config_key`. Features past their
+    `remove_by` date are left out, because they always use their default.
+
+    Results: ListBetaFeaturesResultSuccess (empty list when no features are defined)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListBetaFeaturesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Beta features listed successfully.
+
+    Args:
+        features: One object per feature, engine features first, with keys `id`, `name`,
+            `description`, `default`, `owner`, `remove_by` (an ISO `YYYY-MM-DD` date string),
+            `library` (the defining library's name, or null for an engine feature), and
+            `config_key` (the dot-notation key holding the user's value, read and written with the
+            config requests). The editor is built against these names, so keep them exact.
+    """
+
+    features: list[dict[str, Any]]
+
+
+@dataclass
+@PayloadRegistry.register
+class IsBetaFeatureEnabledRequest(RequestPayload):
+    """Check whether a beta feature is on.
+
+    Use when: Node code needs to know whether a beta feature from its library is on. Nodes call
+    `BaseNode.is_beta_feature_enabled`, which sends this request so it works in a worker process
+    too. Engine code checks its own features with `is_beta_enabled` instead.
+
+    Args:
+        feature_id: The feature's id.
+        library_name: Name of the library that declares the feature, or None for an engine feature.
+
+    Results: IsBetaFeatureEnabledResultSuccess | IsBetaFeatureEnabledResultFailure (no such feature)
+    """
+
+    feature_id: str
+    library_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class IsBetaFeatureEnabledResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Beta feature checked successfully.
+
+    Args:
+        enabled: Whether the feature is on. The user's value when set, otherwise the feature's default.
+    """
+
+    enabled: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class IsBetaFeatureEnabledResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Beta feature check failed. Common causes: the library isn't loaded, or it doesn't declare the feature."""

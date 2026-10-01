@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultFailure,
@@ -58,8 +58,10 @@ if TYPE_CHECKING:
         ArbitraryCodeExecManager,
     )
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+    from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+    from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -169,7 +171,10 @@ class Engine:
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
+    _budget_manager: BudgetManager
+    _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
+    _workflow_registry: _WorkflowRegistry
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -178,8 +183,10 @@ class Engine:
             ArbitraryCodeExecManager,
         )
         from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+        from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
         from griptape_nodes.retained_mode.managers.event_manager import EventManager
         from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -214,9 +221,10 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
-        self._resource_manager = ResourceManager(self._event_manager)
+        self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
+        self._workflow_registry = _WorkflowRegistry(self._config_manager)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
@@ -245,6 +253,8 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        self._budget_manager = BudgetManager(self._event_manager, engine=self)
+        self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
         self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
@@ -359,8 +369,20 @@ class Engine:
         return self._manifest_manager
 
     @property
+    def budget_manager(self) -> BudgetManager:
+        return self._budget_manager
+
+    @property
+    def diagnostics_manager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
+
+    @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
+
+    @property
+    def workflow_registry(self) -> _WorkflowRegistry:
+        return self._workflow_registry
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -447,6 +469,12 @@ class Engine:
 
     def ManifestManager(self) -> ManifestManager:
         return self._manifest_manager
+
+    def BudgetManager(self) -> BudgetManager:
+        return self._budget_manager
+
+    def DiagnosticsManager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
 
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager
@@ -563,6 +591,17 @@ class Engine:
             context_manager.pop_flow()
         context_manager.pop_workflow()
 
+        # Every key referring to a held object lived on a node just deleted, so each entry would hold
+        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
+        #
+        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
+        # teardown shares: deleting the open workflow reaches this without going through that handler.
+        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
+        # workers about theirs.
+        dropped = self._resource_manager.drop_all_local_objects()
+        if dropped:
+            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
+
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)
@@ -656,10 +695,10 @@ class Engine:
                 workflow_info["has_active_flow"] = context_manager.has_current_flow()
 
                 # Get workflow file path from registry (None for unsaved workflows).
-                if WorkflowRegistry.has_workflow_with_name(workflow_name):
-                    workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+                if self._workflow_registry.has_workflow_with_name(workflow_name):
+                    workflow = self._workflow_registry.get_workflow_by_name(workflow_name)
                     if workflow.file_path is not None:
-                        absolute_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
+                        absolute_path = self._workflow_registry.get_complete_file_path(workflow.file_path)
                         workflow_info["workflow_file_path"] = absolute_path
 
         except Exception as err:

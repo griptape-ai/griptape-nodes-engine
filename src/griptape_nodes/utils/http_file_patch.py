@@ -1,6 +1,6 @@
-r"""Monkey-patch httpx and requests to transparently handle file:// URLs, local file paths, and cloud assets.
+r"""Monkey-patch httpx, httpx2, and requests to transparently handle file:// URLs, local file paths, and cloud assets.
 
-This module patches httpx and requests libraries at runtime to support:
+This module patches the httpx, httpx2, and requests libraries at runtime to support:
 - file:// URLs
 - Absolute local file paths (e.g., /path/to/file.txt, C:\path\to\file.txt)
 - Network paths (UNC paths like \\server\share\file.txt, if accessible)
@@ -12,13 +12,18 @@ Cloud asset URLs matching pattern /buckets/{id}/assets/{path} are automatically
 converted to presigned download URLs when credentials are available.
 """
 
+import functools
+import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import httpx
+import httpx2
 import requests
 
 from griptape_nodes.utils.url_utils import get_content_type_from_extension
@@ -34,30 +39,11 @@ HTTP_NOT_FOUND = 404
 HTTP_INTERNAL_SERVER_ERROR = 500
 HTTP_ERROR_THRESHOLD = 600
 
-# Store original functions to delegate non-file:// URLs
-_original_httpx_request: Any = None
-_original_httpx_get: Any = None
-_original_httpx_post: Any = None
-_original_httpx_put: Any = None
-_original_httpx_delete: Any = None
-_original_httpx_patch: Any = None
+_HTTP_VERBS = ("GET", "POST", "PUT", "DELETE", "PATCH")
+
+# Unpatched httpx2.request, used for cloud URL signing so the signing call does not recurse into the patch
+_original_signing_request: Any = None
 _original_requests_get: Any = None
-
-# Store original httpx.Client instance methods
-_original_httpx_client_request: Any = None
-_original_httpx_client_get: Any = None
-_original_httpx_client_post: Any = None
-_original_httpx_client_put: Any = None
-_original_httpx_client_delete: Any = None
-_original_httpx_client_patch: Any = None
-
-# Store original httpx.AsyncClient instance methods
-_original_httpx_async_client_request: Any = None
-_original_httpx_async_client_get: Any = None
-_original_httpx_async_client_post: Any = None
-_original_httpx_async_client_put: Any = None
-_original_httpx_async_client_delete: Any = None
-_original_httpx_async_client_patch: Any = None
 
 _patches_installed = False
 
@@ -92,19 +78,21 @@ def _is_local_file_path(url_str: str) -> bool:
 
 
 class FileHttpxResponse:
-    """Response wrapper that mimics httpx.Response interface for file:// URLs."""
+    """Response wrapper that mimics the httpx/httpx2 Response interface for file:// URLs."""
 
-    def __init__(self, content: bytes, status_code: int, file_path: str):
+    def __init__(self, content: bytes, status_code: int, file_path: str, *, http_module: ModuleType = httpx2):
         """Initialize file response.
 
         Args:
             content: File content as bytes
             status_code: HTTP status code (200 for success, 404/403/etc for errors)
             file_path: Path to the file for MIME type detection
+            http_module: httpx or httpx2, whichever the caller used, so raised errors match what it catches
         """
         self.content = content
         self.status_code = status_code
         self._file_path = file_path
+        self._http_module = http_module
 
         # Build headers dict
         headers_dict = {}
@@ -126,13 +114,11 @@ class FileHttpxResponse:
         if HTTP_BAD_REQUEST <= self.status_code < HTTP_ERROR_THRESHOLD:
             msg = f"File error: {self.status_code} for file:// URL: {self._file_path}"
             # Create a minimal request object for the exception
-            request = httpx.Request("GET", self._file_path)
-            raise httpx.HTTPStatusError(msg, request=request, response=self)  # type: ignore[arg-type]
+            request = self._http_module.Request("GET", self._file_path)
+            raise self._http_module.HTTPStatusError(msg, request=request, response=self)
 
     def json(self) -> Any:
         """Parse content as JSON."""
-        import json
-
         return json.loads(self.text)
 
 
@@ -175,17 +161,15 @@ class FileRequestsResponse:
 
     def json(self) -> Any:
         """Parse content as JSON."""
-        import json
-
         return json.loads(self.text)
 
 
-def _handle_file_url(url: str, *, response_type: type) -> FileHttpxResponse | FileRequestsResponse:
+def _handle_file_url(url: str, *, response_type: Callable[..., Any]) -> FileHttpxResponse | FileRequestsResponse:
     """Handle file:// URL by reading local file and returning HTTP-like response.
 
     Args:
         url: file:// URL to handle
-        response_type: Response class to instantiate (FileHttpxResponse or FileRequestsResponse)
+        response_type: Builds the response (FileHttpxResponse or FileRequestsResponse)
 
     Returns:
         Response wrapper with file content or error status
@@ -251,72 +235,76 @@ def _handle_file_url(url: str, *, response_type: type) -> FileHttpxResponse | Fi
     )
 
 
-def _patched_httpx_request(method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.request that handles file:// URLs, local file paths, and cloud asset URLs.
-
-    Args:
-        method: HTTP method (GET, POST, etc.)
-        url: URL to request (file://, http://, https://, cloud asset, etc.) or absolute file path
-        **kwargs: Additional arguments for httpx.request
+def _route_request(method: str, url: Any, response_type: Callable[..., Any]) -> Any:
+    """Decide where a request goes.
 
     Returns:
-        httpx.Response or FileHttpxResponse
+        A FileHttpxResponse for file:// URLs and local paths, otherwise the URL to send,
+        swapped for a signed download URL when it is a cloud asset GET.
     """
     # Lazy import to avoid circular dependency: utils/__init__.py -> http_file_patch -> storage drivers -> os_events -> payload_registry
     from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 
-    # Convert httpx.URL to string for checking
     url_str = str(url)
 
     # Detect and convert cloud asset URLs to signed download URLs (GET only)
     if method.upper() == "GET" and GriptapeCloudStorageDriver.is_cloud_asset_url(url_str):
         signed_url = GriptapeCloudStorageDriver.create_signed_download_url_from_asset_url(
-            url_str, httpx_request_func=_original_httpx_request
+            url_str, httpx_request_func=_original_signing_request
         )
         if signed_url:
-            return _original_httpx_request(method, signed_url, **kwargs)
+            return signed_url
         # If conversion failed, continue with original URL
 
     # Fast path: Skip filesystem checks for HTTP/HTTPS/FTP URLs (99%+ of requests)
     if _is_http_url(url_str):
-        return _original_httpx_request(method, url, **kwargs)
+        return url
 
-    # Handle existing file:// URLs
     if url_str.startswith("file://"):
-        return _handle_file_url(url_str, response_type=FileHttpxResponse)  # type: ignore[return-value]
+        return _handle_file_url(url_str, response_type=response_type)
 
-    # Detect and convert local file paths
     if _is_local_file_path(url_str):
-        file_url = str(Path(url_str).as_uri())
-        return _handle_file_url(file_url, response_type=FileHttpxResponse)  # type: ignore[return-value]
+        return _handle_file_url(str(Path(url_str).as_uri()), response_type=response_type)
 
-    # Delegate all other URLs to original httpx.request
-    return _original_httpx_request(method, url, **kwargs)
+    return url
 
 
-def _patched_httpx_get(url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.get that handles file:// URLs."""
-    return _patched_httpx_request("GET", url, **kwargs)
+def _patch_httpx_module(module: ModuleType) -> None:
+    """Patch an httpx-compatible module's request helpers and client `request` methods.
 
+    Client verb methods (`Client.get`, etc.) route through `Client.request`, so patching
+    `request` covers them. Module-level verbs call the unpatched internal `request`, so each
+    one is patched.
+    """
+    original_request = module.request
+    original_client_request = module.Client.request
+    original_async_client_request = module.AsyncClient.request
+    response_type = functools.partial(FileHttpxResponse, http_module=module)
 
-def _patched_httpx_post(url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.post that handles file:// URLs."""
-    return _patched_httpx_request("POST", url, **kwargs)
+    def patched_request(method: str, url: Any, **kwargs: Any) -> Any:
+        target = _route_request(method, url, response_type)
+        if isinstance(target, FileHttpxResponse):
+            return target
+        return original_request(method, target, **kwargs)
 
+    def patched_client_request(self: Any, method: str, url: Any, **kwargs: Any) -> Any:
+        target = _route_request(method, url, response_type)
+        if isinstance(target, FileHttpxResponse):
+            return target
+        return original_client_request(self, method, target, **kwargs)
 
-def _patched_httpx_put(url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.put that handles file:// URLs."""
-    return _patched_httpx_request("PUT", url, **kwargs)
+    async def patched_async_client_request(self: Any, method: str, url: Any, **kwargs: Any) -> Any:
+        # Synchronous file read is fine in async context
+        target = _route_request(method, url, response_type)
+        if isinstance(target, FileHttpxResponse):
+            return target
+        return await original_async_client_request(self, method, target, **kwargs)
 
-
-def _patched_httpx_delete(url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.delete that handles file:// URLs."""
-    return _patched_httpx_request("DELETE", url, **kwargs)
-
-
-def _patched_httpx_patch(url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.patch that handles file:// URLs."""
-    return _patched_httpx_request("PATCH", url, **kwargs)
+    setattr(module, "request", patched_request)  # noqa: B010
+    for verb in _HTTP_VERBS:
+        setattr(module, verb.lower(), functools.partial(patched_request, verb))
+    module.Client.request = patched_client_request
+    module.AsyncClient.request = patched_async_client_request
 
 
 def _patched_requests_get(url: str, **kwargs: Any) -> requests.Response | FileRequestsResponse:
@@ -335,7 +323,7 @@ def _patched_requests_get(url: str, **kwargs: Any) -> requests.Response | FileRe
     # Detect and convert cloud asset URLs to signed download URLs
     if GriptapeCloudStorageDriver.is_cloud_asset_url(url):
         signed_url = GriptapeCloudStorageDriver.create_signed_download_url_from_asset_url(
-            url, httpx_request_func=_original_httpx_request
+            url, httpx_request_func=_original_signing_request
         )
         if signed_url:
             return _original_requests_get(signed_url, **kwargs)
@@ -358,256 +346,29 @@ def _patched_requests_get(url: str, **kwargs: Any) -> requests.Response | FileRe
     return _original_requests_get(url, **kwargs)
 
 
-# ============================================================================
-# httpx.Client instance method patches (sync)
-# ============================================================================
-
-
-def _patched_client_request(
-    self: Any, method: str, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.request() that handles file:// URLs, local file paths, and cloud asset URLs.
-
-    Args:
-        self: The httpx.Client instance
-        method: HTTP method (GET, POST, etc.)
-        url: URL to request (file://, http://, https://, cloud asset, etc.) or absolute file path
-        **kwargs: Additional arguments for the request
-
-    Returns:
-        httpx.Response or FileHttpxResponse
-    """
-    # Lazy import to avoid circular dependency: utils/__init__.py -> http_file_patch -> storage drivers -> os_events -> payload_registry
-    from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
-
-    url_str = str(url)
-
-    # Cloud asset URL conversion (GET only)
-    if method.upper() == "GET" and GriptapeCloudStorageDriver.is_cloud_asset_url(url_str):
-        signed_url = GriptapeCloudStorageDriver.create_signed_download_url_from_asset_url(
-            url_str, httpx_request_func=_original_httpx_request
-        )
-        if signed_url:
-            return _original_httpx_client_request(self, method, signed_url, **kwargs)
-
-    # Fast path for HTTP/HTTPS/FTP
-    if _is_http_url(url_str):
-        return _original_httpx_client_request(self, method, url, **kwargs)
-
-    # Handle file:// URLs
-    if url_str.startswith("file://"):
-        return _handle_file_url(url_str, response_type=FileHttpxResponse)  # type: ignore[return-value]
-
-    # Handle local file paths
-    if _is_local_file_path(url_str):
-        file_url = str(Path(url_str).as_uri())
-        return _handle_file_url(file_url, response_type=FileHttpxResponse)  # type: ignore[return-value]
-
-    # Delegate to original
-    return _original_httpx_client_request(self, method, url, **kwargs)
-
-
-def _patched_client_get(self: Any, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.get() for file:// and cloud URLs."""
-    return _patched_client_request(self, "GET", url, **kwargs)
-
-
-def _patched_client_post(self: Any, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.post() for file:// and cloud URLs."""
-    return _patched_client_request(self, "POST", url, **kwargs)
-
-
-def _patched_client_put(self: Any, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.put() for file:// and cloud URLs."""
-    return _patched_client_request(self, "PUT", url, **kwargs)
-
-
-def _patched_client_delete(self: Any, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.delete() for file:// and cloud URLs."""
-    return _patched_client_request(self, "DELETE", url, **kwargs)
-
-
-def _patched_client_patch(self: Any, url: str | httpx.URL, **kwargs: Any) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.Client.patch() for file:// and cloud URLs."""
-    return _patched_client_request(self, "PATCH", url, **kwargs)
-
-
-# ============================================================================
-# httpx.AsyncClient instance method patches (async)
-# ============================================================================
-
-
-async def _patched_async_client_request(
-    self: Any, method: str, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.request() that handles file:// URLs, local file paths, and cloud asset URLs.
-
-    Args:
-        self: The httpx.AsyncClient instance
-        method: HTTP method (GET, POST, etc.)
-        url: URL to request (file://, http://, https://, cloud asset, etc.) or absolute file path
-        **kwargs: Additional arguments for the request
-
-    Returns:
-        httpx.Response or FileHttpxResponse
-    """
-    # Lazy import to avoid circular dependency: utils/__init__.py -> http_file_patch -> storage drivers -> os_events -> payload_registry
-    from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
-
-    url_str = str(url)
-
-    # Cloud asset URL conversion (GET only)
-    if method.upper() == "GET" and GriptapeCloudStorageDriver.is_cloud_asset_url(url_str):
-        signed_url = GriptapeCloudStorageDriver.create_signed_download_url_from_asset_url(
-            url_str, httpx_request_func=_original_httpx_request
-        )
-        if signed_url:
-            return await _original_httpx_async_client_request(self, method, signed_url, **kwargs)
-
-    # Fast path for HTTP/HTTPS/FTP
-    if _is_http_url(url_str):
-        return await _original_httpx_async_client_request(self, method, url, **kwargs)
-
-    # Handle file:// URLs (synchronous file read is fine in async context)
-    if url_str.startswith("file://"):
-        return _handle_file_url(url_str, response_type=FileHttpxResponse)  # type: ignore[return-value]
-
-    # Handle local file paths
-    if _is_local_file_path(url_str):
-        file_url = str(Path(url_str).as_uri())
-        return _handle_file_url(file_url, response_type=FileHttpxResponse)  # type: ignore[return-value]
-
-    # Delegate to original
-    return await _original_httpx_async_client_request(self, method, url, **kwargs)
-
-
-async def _patched_async_client_get(
-    self: Any, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.get() for file:// and cloud URLs."""
-    return await _patched_async_client_request(self, "GET", url, **kwargs)
-
-
-async def _patched_async_client_post(
-    self: Any, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.post() for file:// and cloud URLs."""
-    return await _patched_async_client_request(self, "POST", url, **kwargs)
-
-
-async def _patched_async_client_put(
-    self: Any, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.put() for file:// and cloud URLs."""
-    return await _patched_async_client_request(self, "PUT", url, **kwargs)
-
-
-async def _patched_async_client_delete(
-    self: Any, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.delete() for file:// and cloud URLs."""
-    return await _patched_async_client_request(self, "DELETE", url, **kwargs)
-
-
-async def _patched_async_client_patch(
-    self: Any, url: str | httpx.URL, **kwargs: Any
-) -> httpx.Response | FileHttpxResponse:
-    """Patched httpx.AsyncClient.patch() for file:// and cloud URLs."""
-    return await _patched_async_client_request(self, "PATCH", url, **kwargs)
-
-
-def _save_original_methods() -> None:
-    """Save original httpx and requests methods before patching."""
-    global _original_httpx_request  # noqa: PLW0603
-    global _original_httpx_get  # noqa: PLW0603
-    global _original_httpx_post  # noqa: PLW0603
-    global _original_httpx_put  # noqa: PLW0603
-    global _original_httpx_delete  # noqa: PLW0603
-    global _original_httpx_patch  # noqa: PLW0603
-    global _original_requests_get  # noqa: PLW0603
-    global _original_httpx_client_request  # noqa: PLW0603
-    global _original_httpx_client_get  # noqa: PLW0603
-    global _original_httpx_client_post  # noqa: PLW0603
-    global _original_httpx_client_put  # noqa: PLW0603
-    global _original_httpx_client_delete  # noqa: PLW0603
-    global _original_httpx_client_patch  # noqa: PLW0603
-    global _original_httpx_async_client_request  # noqa: PLW0603
-    global _original_httpx_async_client_get  # noqa: PLW0603
-    global _original_httpx_async_client_post  # noqa: PLW0603
-    global _original_httpx_async_client_put  # noqa: PLW0603
-    global _original_httpx_async_client_delete  # noqa: PLW0603
-    global _original_httpx_async_client_patch  # noqa: PLW0603
-
-    # Save original module-level functions
-    _original_httpx_request = httpx.request
-    _original_httpx_get = httpx.get
-    _original_httpx_post = httpx.post
-    _original_httpx_put = httpx.put
-    _original_httpx_delete = httpx.delete
-    _original_httpx_patch = httpx.patch
-    _original_requests_get = requests.get
-
-    # Save original httpx.Client instance methods
-    _original_httpx_client_request = httpx.Client.request
-    _original_httpx_client_get = httpx.Client.get
-    _original_httpx_client_post = httpx.Client.post
-    _original_httpx_client_put = httpx.Client.put
-    _original_httpx_client_delete = httpx.Client.delete
-    _original_httpx_client_patch = httpx.Client.patch
-
-    # Save original httpx.AsyncClient instance methods
-    _original_httpx_async_client_request = httpx.AsyncClient.request
-    _original_httpx_async_client_get = httpx.AsyncClient.get
-    _original_httpx_async_client_post = httpx.AsyncClient.post
-    _original_httpx_async_client_put = httpx.AsyncClient.put
-    _original_httpx_async_client_delete = httpx.AsyncClient.delete
-    _original_httpx_async_client_patch = httpx.AsyncClient.patch
-
-
-def _install_patches() -> None:
-    """Install patched methods to httpx and requests."""
-    # Install module-level patches
-    httpx.request = _patched_httpx_request  # type: ignore[assignment]
-    httpx.get = _patched_httpx_get  # type: ignore[assignment]
-    httpx.post = _patched_httpx_post  # type: ignore[assignment]
-    httpx.put = _patched_httpx_put  # type: ignore[assignment]
-    httpx.delete = _patched_httpx_delete  # type: ignore[assignment]
-    httpx.patch = _patched_httpx_patch  # type: ignore[assignment]
-    requests.get = _patched_requests_get  # type: ignore[assignment]
-
-    # Install httpx.Client instance method patches
-    httpx.Client.request = _patched_client_request  # type: ignore[method-assign]
-    httpx.Client.get = _patched_client_get  # type: ignore[method-assign]
-    httpx.Client.post = _patched_client_post  # type: ignore[method-assign]
-    httpx.Client.put = _patched_client_put  # type: ignore[method-assign]
-    httpx.Client.delete = _patched_client_delete  # type: ignore[method-assign]
-    httpx.Client.patch = _patched_client_patch  # type: ignore[method-assign]
-
-    # Install httpx.AsyncClient instance method patches
-    httpx.AsyncClient.request = _patched_async_client_request  # type: ignore[method-assign]
-    httpx.AsyncClient.get = _patched_async_client_get  # type: ignore[method-assign]
-    httpx.AsyncClient.post = _patched_async_client_post  # type: ignore[method-assign]
-    httpx.AsyncClient.put = _patched_async_client_put  # type: ignore[method-assign]
-    httpx.AsyncClient.delete = _patched_async_client_delete  # type: ignore[method-assign]
-    httpx.AsyncClient.patch = _patched_async_client_patch  # type: ignore[method-assign]
-
-
 def install_file_url_support() -> None:
-    """Install file:// URL support by patching httpx and requests at module level.
+    """Install file:// URL support by patching httpx, httpx2, and requests at module level.
 
     This should be called once at app initialization. Subsequent calls are no-ops.
     """
     global _patches_installed  # noqa: PLW0603
+    global _original_signing_request  # noqa: PLW0603
+    global _original_requests_get  # noqa: PLW0603
 
     # Prevent double-installation
     if _patches_installed:
         logger.debug("file:// URL support already installed, skipping")
         return
 
-    logger.debug("Installing file:// URL support for httpx and requests")
+    logger.debug("Installing file:// URL support for httpx, httpx2, and requests")
 
-    _save_original_methods()
-    _install_patches()
+    _original_signing_request = httpx2.request
+    _original_requests_get = requests.get
+
+    # httpx stays patched for node libraries that still call it directly
+    _patch_httpx_module(httpx)
+    _patch_httpx_module(httpx2)
+    requests.get = _patched_requests_get  # type: ignore[assignment]
 
     _patches_installed = True
     logger.debug("file:// URL support installed successfully")

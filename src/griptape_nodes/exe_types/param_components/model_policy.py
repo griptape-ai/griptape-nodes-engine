@@ -10,6 +10,11 @@ the policy layer once, hold the verdicts in an immutable snapshot, and answer lo
 components delegate here so a policy change lands in one place and the two surfaces cannot drift
 into giving opposite answers for the same model.
 
+Every node-attributed query is built by ``node_access_request``, including the live per-value
+re-asks a component makes at run time. Asking about a node means naming both the node type and the
+library it came from -- see that function -- and one construction point is what keeps the second
+half from being forgotten.
+
 What stays with each component: installing traits, writing ``ui_options``, deciding when to
 refresh, and choosing how a denial reaches the artist (row icon, badge, raised error).
 """
@@ -24,20 +29,58 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger("griptape_nodes")
 
-# Denial decoration, shared so a gated static dropdown and a gated HuggingFace dropdown are
-# indistinguishable to an artist.
-DENIED_ROW_ICON = "shield-off"
-DENIED_ROW_SUBTITLE = "Not permitted by your license"
-BADGE_TITLE = "Model Not Permitted"
+
+@dataclass(frozen=True)
+class DenialDecoration:
+    """How a refusal reads to an artist: the row it marks and the badge it raises.
+
+    Shared by both dropdown components, so a gated static dropdown and a gated HuggingFace
+    dropdown are indistinguishable.
+
+    There are two instances, and which one a parameter wears is the difference between an answer
+    and a missing answer. ``DENIED_DECORATION`` is for a check that ran and said no: the artist's
+    license does not cover the model, and nothing about that is a fault. ``CHECK_FAILED_DECORATION``
+    is for a check that could not run at all, which is the engine's fault and not theirs. The two
+    differ on every surface -- the row, the badge title, and the badge's opening line -- because a
+    surface still saying "not permitted by your license" would blame the artist's plan for an
+    engine-side fault, and they have no way to tell the two apart.
+
+    ``badge_lead`` is that opening line and carries a ``{value}`` placeholder for the model id;
+    ``apply_denial_badge`` fills it in and appends the consequence and the reason.
+    """
+
+    icon: str
+    row_subtitle: str
+    badge_title: str
+    badge_lead: str
+
+
+DENIED_DECORATION = DenialDecoration(
+    icon="shield-off",
+    row_subtitle="Not permitted by your license",
+    badge_title="Model Not Permitted",
+    badge_lead="Model `{value}` is not permitted.",
+)
+
+CHECK_FAILED_DECORATION = DenialDecoration(
+    # `alert-triangle` is what `ParameterMessage` maps its "warning" variant to; an unanswerable
+    # check is that, not a verdict.
+    icon="alert-triangle",
+    row_subtitle="Couldn't be checked",
+    badge_title="Model Check Failed",
+    # Only the consequence: `apply_denial_badge` appends `failure_detail`, which is what explains
+    # this state, and a lead that explained it too would say it twice before the part that helps.
+    badge_lead="`{value}` can't be used right now.",
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +169,22 @@ class ModelPolicySnapshot:
         """
         return bool(self.catalog_ids_by_provider_id) or self.has_unmatchable_entries
 
+    @property
+    def decoration(self) -> DenialDecoration:
+        """How this snapshot's refusals should read on a row and in a badge.
+
+        The one place the two states are told apart, so a surface cannot be missed and left
+        announcing a licensing problem for an engine-side fault.
+
+        Only ``failure_detail`` -- a query the engine could not answer -- reads as "couldn't be
+        checked". The ``unmatchable_denials`` refusal in ``denial_for`` deliberately does NOT:
+        policy really did deny a model there, and telling an artist their license was never
+        consulted would be false.
+        """
+        if self.failure_detail is not None:
+            return CHECK_FAILED_DECORATION
+        return DENIED_DECORATION
+
     def denial_for(  # noqa: PLR0911 -- a chain of early-exit verdicts, one per snapshot state
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
     ) -> CheckpointDenial | None:
@@ -170,8 +229,9 @@ class ModelPolicySnapshot:
                         detail=(
                             "Your license does not permit one of the models this node offers, and this "
                             "library does not describe its models precisely enough to tell which one. No "
-                            "model can be used here until the library is updated. Contact whoever "
-                            "maintains this node library."
+                            "model can be used here until the library is updated. If this node came with "
+                            "Griptape Nodes, please report it from the editor's File > Report Issue menu; "
+                            "otherwise, contact whoever maintains this node library."
                         )
                     ),
                 )
@@ -196,8 +256,42 @@ class ModelPolicySnapshot:
 DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 
 
-def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
-    """Ask the engine which of ``node_type``'s declared models are permitted.
+def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = None) -> QueryModelAccessForNodeRequest:
+    """Build the node-attributed access query for ``node``, naming the library it came from.
+
+    Both fields come off ``node.metadata``, where ``Library.create_node`` recorded them, because
+    neither is reliably derivable from the class. A class name is not unique across libraries --
+    two installed libraries may each register ``Flux2ImageGeneration`` -- and a library keys its
+    node types by the name its JSON declared, which ``register_lazy_node_type`` never compares to
+    ``__name__``. So a query built from ``type(node).__name__`` can resolve to no library or to no
+    type at all, and an unresolved query fails closed: every model on the node is denied, which
+    reads to an artist as a licensing problem when the check never ran. ``get_declared_models``,
+    which fills the same dropdown's choices, reads the same two fields.
+
+    A node built outside the library path -- a transient probe, a test fixture -- recorded neither,
+    so the type falls back to ``type(node).__name__`` and the library to ``None``, leaving the
+    engine's lookup-by-name that is correct whenever exactly one library declares the type.
+
+    Args:
+        node: The node the query is attributed to. Supplies both the node type and the library.
+        candidate_model_ids: Narrow the query to these catalog ids. ``None`` (default) lets the
+            engine derive the candidates from the node's declarations.
+    """
+    library_name = node.metadata.get("library")
+    if not isinstance(library_name, str):
+        library_name = None
+    node_type = node.metadata.get("node_type")
+    if not isinstance(node_type, str):
+        node_type = type(node).__name__
+    return QueryModelAccessForNodeRequest(
+        node_type=node_type,
+        specific_library_name=library_name,
+        candidate_model_ids=candidate_model_ids,
+    )
+
+
+def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPolicySnapshot:
+    """Ask the engine which of ``node``'s declared models are permitted.
 
     Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
     reentrant-bus-in-init: a node ``__init__`` on the stack inside a strict-mode scope, which
@@ -211,39 +305,43 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
     only after it runs.
 
     Args:
-        node_type: The node class name the manifest declares ``model_usage`` against.
+        node: The node whose declared models to check. Supplies the engine to ask, plus the
+            registered node type and library that ``node_access_request`` derives the query from.
         fail_closed: What an unanswerable query means. When True, the returned snapshot carries a
             ``failure_detail`` so every subsequent lookup denies -- a broken library registration
             must not silently open the gate. When False, the failure is treated as "this library
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
+    request = node_access_request(node)
     if reentrant_bus_in_init_would_report():
         logger.debug(
             "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
-            node_type,
+            request.node_type,
         )
         return DEFERRED_SNAPSHOT
-    result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
+    result = node.engine.handle_request(request)
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
         if not fail_closed:
-            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", node_type, details)
+            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", request.node_type, details)
             return ModelPolicySnapshot()
         logger.warning(
             "Could not resolve model access for node type '%s' (%s). Selections will be refused until this "
             "resolves. Verify the node's griptape_nodes_library.json entry declares a model_usage block.",
-            node_type,
+            request.node_type,
             details,
         )
-        # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
-        # and who to ask. The node type, the engine's reason, and the manifest instruction stay in
-        # the warning above -- an artist cannot edit a library manifest, and naming one reads as a
-        # licensing problem when the actual fault is a broken registration.
+        # Artist-facing, so it states the effect and where to report it, and nothing they cannot
+        # act on: the node type, the engine's reason, and the manifest instruction stay in the
+        # warning above. It names the menu rather than an action ("File > Report Issue" over "use
+        # Report Issue") because the same string surfaces as a run error under `gtn run` and in
+        # published workflows, where there is no menu in front of them.
         return ModelPolicySnapshot(
             failure_detail=(
-                "This node's models could not be checked against your license, so nothing can be "
-                "used here yet. Contact whoever maintains this node library."
+                "Griptape Nodes couldn't check which models this node is allowed to use, so nothing "
+                "can be used here yet. This is a bug, not a limit on your plan or your API key. "
+                "Please report it from the editor's File > Report Issue menu."
             )
         )
 
@@ -275,7 +373,7 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             "Node type '%s' declares model(s) %s that license policy DENIES, but they carry no "
             "provider_model_id, so the denial cannot be matched to a dropdown row. Refusing the whole "
             "parameter instead. Add provider_model_id to those catalog entries.",
-            node_type,
+            request.node_type,
             unmatchable_denials,
         )
 
@@ -288,18 +386,25 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
     )
 
 
-def apply_denial_badge(parameter: Parameter, value: str, denial: CheckpointDenial | None) -> None:
+def apply_denial_badge(
+    parameter: Parameter, value: str, denial: CheckpointDenial | None, *, decoration: DenialDecoration
+) -> None:
     """Set or clear ``parameter``'s denial badge.
 
     Always clears when there is no denial, so a badge cannot outlive the condition that set it
     (a license change, or enforcement being turned off entirely).
+
+    ``decoration`` is required rather than defaulted, so a caller cannot quietly raise a badge
+    saying "not permitted by your license" over a check that never ran. Pass the owning snapshot's
+    ``decoration``.
     """
     if denial is None:
         parameter.clear_badge()
         return
+    lead = decoration.badge_lead.format(value=value)
     parameter.set_badge(
         variant="error",
-        title=BADGE_TITLE,
-        message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
-        icon=DENIED_ROW_ICON,
+        title=decoration.badge_title,
+        message=f"{lead} Running this node will fail.\n\nReason(s): {denial.reason()}",
+        icon=decoration.icon,
     )

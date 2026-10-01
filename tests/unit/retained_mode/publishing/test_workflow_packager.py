@@ -13,8 +13,8 @@ import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry
-from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata
+from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
@@ -2089,9 +2089,9 @@ def _stub_handle_request(monkeypatch: pytest.MonkeyPatch, side_effect: Callable[
 def _stub_complete_file_path(monkeypatch: pytest.MonkeyPatch, resolve: Callable[[str], str]) -> None:
     """Resolve a workflow's registry-relative file path with ``resolve`` instead of the workspace."""
     monkeypatch.setattr(
-        WorkflowRegistry,
+        current_engine().workflow_registry,
         "get_complete_file_path",
-        create_autospec(WorkflowRegistry.get_complete_file_path, side_effect=resolve),
+        create_autospec(current_engine().workflow_registry.get_complete_file_path, side_effect=resolve),
     )
 
 
@@ -2131,4 +2131,4 @@ def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
         engine_version_created_with="0.1.0",
         node_libraries_referenced=[],
     )
-    return Workflow(registry_key=WorkflowRegistry._RegistryKey(), metadata=metadata, file_path=file_path)
+    return Workflow(registry=current_engine().workflow_registry, metadata=metadata, file_path=file_path)

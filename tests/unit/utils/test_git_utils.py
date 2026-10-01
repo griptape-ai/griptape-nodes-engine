@@ -138,6 +138,20 @@ class TestParseGitUrlWithRef:
         assert url == "user/repo"
         assert ref is None
 
+    def test_parse_git_url_with_ref_keeps_userinfo_when_no_ref(self) -> None:
+        """Test that user@host userinfo is not mistaken for a ref."""
+        url, ref = parse_git_url_with_ref("https://token@github.com/user/repo.git")
+
+        assert url == "https://token@github.com/user/repo.git"
+        assert ref is None
+
+    def test_parse_git_url_with_ref_splits_ref_after_userinfo(self) -> None:
+        """Test that a ref is split off a URL that also has userinfo."""
+        url, ref = parse_git_url_with_ref("https://token@github.com/user/repo.git@stable")
+
+        assert url == "https://token@github.com/user/repo.git"
+        assert ref == "stable"
+
     def test_parse_git_url_with_ref_handles_ssh_url_with_ref(self) -> None:
         """Test that SSH URL with @ref is parsed correctly."""
         url, ref = parse_git_url_with_ref("git@github.com:user/repo@stable")

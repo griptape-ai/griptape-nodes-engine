@@ -77,7 +77,6 @@ class Client:
         self._sending_task: asyncio.Task | None = None
         self._websocket: Any = None
         self._connection_ready = asyncio.Event()
-        self._reconnect_delay = 2.0
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: connect to WebSocket server."""

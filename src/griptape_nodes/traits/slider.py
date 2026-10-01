@@ -9,26 +9,55 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
 class Slider(Trait):
     min: Any = 0
     max: Any = 100
+    # When True the range only sizes the slider track: dragging stays within min/max,
+    # but a value typed outside them is accepted instead of rejected. This is the
+    # "soft limit" convention artists know from Nuke/Maya/Houdini.
+    soft_limits: bool = False
     element_id: str = field(default_factory=lambda: "Slider")
 
     _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
 
-    def __init__(self, min_val: float, max_val: float) -> None:
+    def __init__(self, min_val: float, max_val: float, *, soft_limits: bool = False) -> None:
         super().__init__()
         self.min = min_val
         self.max = max_val
+        self.soft_limits = soft_limits
+
+    def to_state(self) -> dict[str, Any]:
+        return {"min_val": self.min, "max_val": self.max, "soft_limits": self.soft_limits}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "min_val" in state:
+            self.min = state["min_val"]
+        if "max_val" in state:
+            self.max = state["max_val"]
+        if "soft_limits" in state:
+            self.soft_limits = state["soft_limits"]
 
     @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["slider"]
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        slider = ui_options.get("slider")
+        if not isinstance(slider, dict):
+            return {}
+        return {key: slider[key] for key in ("min_val", "max_val", "soft_limits") if key in slider}
 
     def ui_options_for_trait(self) -> dict:
-        return {"slider": {"min_val": self.min, "max_val": self.max}}
+        slider_options: dict[str, Any] = {"min_val": self.min, "max_val": self.max}
+        # Only emitted when soft, so hard-limited sliders keep their existing payload.
+        if self.soft_limits:
+            slider_options["soft_limits"] = True
+        return {"slider": slider_options}
 
     def validators_for_trait(self) -> list[Callable[..., Any]]:
-        def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001
+        if self.soft_limits:
+            return []
+
+        def validate(param: Parameter, value: Any) -> None:
             if hasattr(value, "__gt__") and hasattr(value, "__lt__") and (value > self.max or value < self.min):
-                msg = "Value out of range"
+                msg = (
+                    f"Attempted to set '{param.name}' to {value}. "
+                    f"Failed because it must be between {self.min} and {self.max}."
+                )
                 raise ValueError(msg)
 
         return [validate]

@@ -90,9 +90,7 @@ class ExecutionStatusComponent:
             return
 
         # Remove display_name to use default "Status" from name
-        ui_options = self._status_group.ui_options.copy()
-        ui_options.pop("display_name", None)
-        self._status_group.ui_options = ui_options
+        self._status_group.remove_ui_options_key("display_name")
 
     def set_execution_result(self, *, was_successful: bool, result_details: str) -> None:
         """Set the execution result values.

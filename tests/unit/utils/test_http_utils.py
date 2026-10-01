@@ -1,6 +1,6 @@
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_none
 
@@ -13,50 +13,50 @@ class TestIsRetryableHttpxError:
     """Tests for is_retryable_httpx_error predicate."""
 
     def test_connect_error_is_retryable(self) -> None:
-        exc = httpx.ConnectError("Connection refused")
+        exc = httpx2.ConnectError("Connection refused")
         assert is_retryable_httpx_error(exc) is True
 
     def test_timeout_exception_is_retryable(self) -> None:
-        exc = httpx.TimeoutException("Timed out")
+        exc = httpx2.TimeoutException("Timed out")
         assert is_retryable_httpx_error(exc) is True
 
     def test_read_timeout_is_retryable(self) -> None:
-        exc = httpx.ReadTimeout("Read timed out")
+        exc = httpx2.ReadTimeout("Read timed out")
         assert is_retryable_httpx_error(exc) is True
 
     def test_500_error_is_retryable(self) -> None:
-        response = httpx.Response(500, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Server Error", request=response.request, response=response)
+        response = httpx2.Response(500, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Server Error", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is True
 
     def test_502_error_is_retryable(self) -> None:
-        response = httpx.Response(502, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Bad Gateway", request=response.request, response=response)
+        response = httpx2.Response(502, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Bad Gateway", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is True
 
     def test_503_error_is_retryable(self) -> None:
-        response = httpx.Response(503, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Service Unavailable", request=response.request, response=response)
+        response = httpx2.Response(503, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Service Unavailable", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is True
 
     def test_400_error_is_not_retryable(self) -> None:
-        response = httpx.Response(400, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Bad Request", request=response.request, response=response)
+        response = httpx2.Response(400, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Bad Request", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is False
 
     def test_401_error_is_not_retryable(self) -> None:
-        response = httpx.Response(401, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Unauthorized", request=response.request, response=response)
+        response = httpx2.Response(401, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Unauthorized", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is False
 
     def test_404_error_is_not_retryable(self) -> None:
-        response = httpx.Response(404, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Not Found", request=response.request, response=response)
+        response = httpx2.Response(404, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Not Found", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is False
 
     def test_429_error_is_not_retryable(self) -> None:
-        response = httpx.Response(429, request=httpx.Request("GET", "https://example.com"))
-        exc = httpx.HTTPStatusError("Too Many Requests", request=response.request, response=response)
+        response = httpx2.Response(429, request=httpx2.Request("GET", "https://example.com"))
+        exc = httpx2.HTTPStatusError("Too Many Requests", request=response.request, response=response)
         assert is_retryable_httpx_error(exc) is False
 
     def test_generic_exception_is_not_retryable(self) -> None:
@@ -101,9 +101,9 @@ class TestRetryOnTransientError:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                response = httpx.Response(500, request=httpx.Request("GET", "https://example.com"))
+                response = httpx2.Response(500, request=httpx2.Request("GET", "https://example.com"))
                 msg = "Server Error"
-                raise httpx.HTTPStatusError(msg, request=response.request, response=response)
+                raise httpx2.HTTPStatusError(msg, request=response.request, response=response)
             return "ok"
 
         result = fail_once_then_succeed()
@@ -119,7 +119,7 @@ class TestRetryOnTransientError:
             call_count += 1
             if call_count == 1:
                 msg = "Connection refused"
-                raise httpx.ConnectError(msg)
+                raise httpx2.ConnectError(msg)
             return "ok"
 
         result = fail_once_then_succeed()
@@ -135,7 +135,7 @@ class TestRetryOnTransientError:
             call_count += 1
             if call_count == 1:
                 msg = "Timed out"
-                raise httpx.TimeoutException(msg)
+                raise httpx2.TimeoutException(msg)
             return "ok"
 
         result = fail_once_then_succeed()
@@ -149,11 +149,11 @@ class TestRetryOnTransientError:
         def always_404() -> str:
             nonlocal call_count
             call_count += 1
-            response = httpx.Response(404, request=httpx.Request("GET", "https://example.com"))
+            response = httpx2.Response(404, request=httpx2.Request("GET", "https://example.com"))
             msg = "Not Found"
-            raise httpx.HTTPStatusError(msg, request=response.request, response=response)
+            raise httpx2.HTTPStatusError(msg, request=response.request, response=response)
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(httpx2.HTTPStatusError):
             always_404()
         assert call_count == 1
 
@@ -164,11 +164,11 @@ class TestRetryOnTransientError:
         def always_500() -> str:
             nonlocal call_count
             call_count += 1
-            response = httpx.Response(500, request=httpx.Request("GET", "https://example.com"))
+            response = httpx2.Response(500, request=httpx2.Request("GET", "https://example.com"))
             msg = "Server Error"
-            raise httpx.HTTPStatusError(msg, request=response.request, response=response)
+            raise httpx2.HTTPStatusError(msg, request=response.request, response=response)
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(httpx2.HTTPStatusError):
             always_500()
         assert call_count == RETRY_MAX_ATTEMPTS
 
@@ -197,10 +197,10 @@ class TestRequestWithRetry:
     def test_succeeds_on_first_try(self) -> None:
         call_count = 0
 
-        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx.Response:
+        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx.Response(200, request=httpx.Request(method, url))
+            return httpx2.Response(200, request=httpx2.Request(method, url))
 
         response = request_with_retry("GET", "https://example.com", wait=wait_none(), httpx_request_func=mock_request)
         assert response.status_code == HTTP_OK
@@ -209,13 +209,13 @@ class TestRequestWithRetry:
     def test_retries_on_500_with_custom_request_func(self) -> None:
         call_count = 0
 
-        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx.Response:
+        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                response = httpx.Response(500, request=httpx.Request(method, url))
+                response = httpx2.Response(500, request=httpx2.Request(method, url))
                 response.raise_for_status()
-            return httpx.Response(200, request=httpx.Request(method, url))
+            return httpx2.Response(200, request=httpx2.Request(method, url))
 
         response = request_with_retry("GET", "https://example.com", wait=wait_none(), httpx_request_func=mock_request)
         assert response.status_code == HTTP_OK
@@ -224,14 +224,14 @@ class TestRequestWithRetry:
     def test_custom_max_attempts(self) -> None:
         call_count = 0
 
-        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx.Response:
+        def mock_request(method: str, url: str, **_kwargs: Any) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            response = httpx.Response(500, request=httpx.Request(method, url))
+            response = httpx2.Response(500, request=httpx2.Request(method, url))
             response.raise_for_status()
             return response  # unreachable, but required for type checker
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(httpx2.HTTPStatusError):
             request_with_retry(
                 "GET",
                 "https://example.com",
@@ -244,9 +244,9 @@ class TestRequestWithRetry:
     def test_passes_kwargs_through(self) -> None:
         captured_kwargs: dict[str, Any] = {}
 
-        def mock_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+        def mock_request(method: str, url: str, **kwargs: Any) -> httpx2.Response:
             captured_kwargs.update(kwargs)
-            return httpx.Response(200, request=httpx.Request(method, url))
+            return httpx2.Response(200, request=httpx2.Request(method, url))
 
         request_with_retry(
             "POST",
