@@ -44,6 +44,15 @@ class TestLocalSessionWorkflowExecutorCli:
 
         assert args.session_id is None
 
+    def test_cli_constructor_kwargs_includes_events_url(self) -> None:
+        parser = ArgumentParser()
+        LocalSessionWorkflowExecutor.add_cli_arguments(parser)
+        args = parser.parse_args(["--events-url", "ws://127.0.0.1:1234/"])
+
+        kwargs = LocalSessionWorkflowExecutor._cli_constructor_kwargs(args)
+
+        assert kwargs["events_url"] == "ws://127.0.0.1:1234/"
+
     def test_add_cli_arguments_includes_project_file_path(self) -> None:
         parser = ArgumentParser()
         LocalSessionWorkflowExecutor.add_cli_arguments(parser)

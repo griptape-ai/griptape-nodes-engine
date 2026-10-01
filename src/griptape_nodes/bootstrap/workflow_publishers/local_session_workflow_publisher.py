@@ -43,9 +43,9 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
     over WebSocket back to the parent process.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, events_url: str | None) -> None:
         super().__init__()
-        self._init_websocket_sender(session_id)
+        self._init_websocket_sender(session_id, events_url)
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and start WebSocket connection."""

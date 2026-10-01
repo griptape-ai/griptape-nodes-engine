@@ -27,12 +27,13 @@ class PublishWorkflowArgs:
     published_workflow_file_name: str
     pickle_control_flow_result: bool
     session_id: str | None = None
+    events_url: str | None = None
 
 
 async def _main(args: PublishWorkflowArgs) -> None:
     publisher: LocalWorkflowPublisher
     if args.session_id is not None:
-        publisher = LocalSessionWorkflowPublisher(session_id=args.session_id)
+        publisher = LocalSessionWorkflowPublisher(session_id=args.session_id, events_url=args.events_url)
     else:
         publisher = LocalWorkflowPublisher()
 
@@ -80,6 +81,11 @@ if __name__ == "__main__":
         default=None,
         help="Session ID for WebSocket event emission",
     )
+    parser.add_argument(
+        "--events-url",
+        default=None,
+        help="Address of the parent engine's event server",
+    )
     parsed_args = parser.parse_args()
 
     publish_args = PublishWorkflowArgs(
@@ -89,5 +95,6 @@ if __name__ == "__main__":
         published_workflow_file_name=parsed_args.published_workflow_file_name,
         pickle_control_flow_result=parsed_args.pickle_control_flow_result,
         session_id=parsed_args.session_id,
+        events_url=parsed_args.events_url,
     )
     asyncio.run(_main(publish_args))

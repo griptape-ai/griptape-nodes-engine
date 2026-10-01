@@ -47,6 +47,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         *,
         project_file_path: Path | None = None,
         pickle_control_flow_result: bool = False,
+        events_url: str | None = None,
     ):
         super().__init__(
             storage_backend=storage_backend,
@@ -54,7 +55,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             save_on_failure_path=save_on_failure_path,
             pickle_control_flow_result=pickle_control_flow_result,
         )
-        self._init_websocket_sender(session_id)
+        self._init_websocket_sender(session_id, events_url)
         self._on_start_flow_result = on_start_flow_result
 
     async def __aenter__(self) -> Self:
@@ -267,9 +268,15 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             default=None,
             help="ID of the session to use",
         )
+        parser.add_argument(
+            "--events-url",
+            default=None,
+            help="Address of the parent engine's event server",
+        )
 
     @classmethod
     def _cli_constructor_kwargs(cls, args: Namespace) -> dict[str, Any]:
         kwargs = super()._cli_constructor_kwargs(args)
         kwargs["session_id"] = args.session_id
+        kwargs["events_url"] = args.events_url
         return kwargs

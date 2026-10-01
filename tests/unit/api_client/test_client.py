@@ -1,14 +1,26 @@
-"""Tests for WebSocket client large payload warning."""
+"""Tests for the WebSocket client: large payload warning and connection failures."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import socket
+import ssl
+import time
+from http import HTTPStatus
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
+from websockets.asyncio.server import serve
 
-from griptape_nodes.api_client.client import LARGE_PAYLOAD_WARNING_THRESHOLD, Client
+from griptape_nodes.api_client import client as client_module
+from griptape_nodes.api_client.client import CONNECT_TIMEOUT_SECONDS, LARGE_PAYLOAD_WARNING_THRESHOLD, Client
+
+if TYPE_CHECKING:
+    from websockets.asyncio.server import ServerConnection
+    from websockets.http11 import Request, Response
 
 
 class TestClientLargePayloadWarning:
@@ -51,3 +63,83 @@ class TestClientLargePayloadWarning:
         await client._send_message(message)
 
         client._websocket.send.assert_called_once_with(json.dumps(message))
+
+
+class TestClientConnectFailures:
+    """connect() must report why it failed, fail fast when retrying cannot help, and stop redialing."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_credentials_fail_fast_with_the_http_status(self) -> None:
+        async def _reject(connection: ServerConnection, request: Request) -> Response:  # noqa: ARG001
+            return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+
+        async with serve(lambda _ws: asyncio.sleep(0), "127.0.0.1", 0, process_request=_reject) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = Client(api_key="bad-key", url=f"ws://127.0.0.1:{port}/")
+            started = time.monotonic()
+
+            with pytest.raises(ConnectionError, match="HTTP 401"):
+                await client.connect()
+
+        assert time.monotonic() - started < CONNECT_TIMEOUT_SECONDS / 2
+        assert client._receiving_task is not None
+        assert client._receiving_task.done()
+
+    @pytest.mark.asyncio
+    async def test_ssl_failure_fails_fast_instead_of_retrying(self) -> None:
+        async def _not_tls(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(_not_tls, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = Client(api_key="key", url=f"wss://127.0.0.1:{port}/")
+        started = time.monotonic()
+        try:
+            with pytest.raises(ConnectionError) as exc_info:
+                await client.connect()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert isinstance(exc_info.value.__cause__, ssl.SSLError)
+        assert time.monotonic() - started < CONNECT_TIMEOUT_SECONDS / 2
+
+    @pytest.mark.asyncio
+    async def test_unreachable_server_reports_the_network_error_and_stops_redialing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client_module, "CONNECT_TIMEOUT_SECONDS", 0.5)
+        # Bind and close a socket so the port is known to be closed.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        client = Client(api_key="key", url=f"ws://127.0.0.1:{port}/")
+
+        with pytest.raises(ConnectionError) as exc_info:
+            await client.connect()
+
+        assert isinstance(exc_info.value.__cause__, OSError)
+        assert "timeout" not in str(exc_info.value).lower()
+        assert client._receiving_task is not None
+        assert client._receiving_task.done()
+
+    @pytest.mark.asyncio
+    async def test_no_response_reports_the_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(client_module, "CONNECT_TIMEOUT_SECONDS", 0.5)
+
+        async def _silent(_reader: asyncio.StreamReader, _writer: asyncio.StreamWriter) -> None:
+            await asyncio.sleep(10)
+
+        server = await asyncio.start_server(_silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = Client(api_key="key", url=f"ws://127.0.0.1:{port}/")
+        try:
+            with pytest.raises(ConnectionError, match=r"no response within 0\.5 seconds"):
+                await client.connect()
+        finally:
+            server.close()
+
+        assert client._receiving_task is not None
+        assert client._receiving_task.done()
