@@ -232,6 +232,32 @@ class WorkflowPackager:
         """Expand the initial library set to include all transitive library_dependencies."""
         return GriptapeNodes.LibraryManager().resolve_transitive_library_deps(initial)
 
+    def _collect_workflow_libraries(self, workflow: Workflow) -> list[LibraryNameAndVersion]:
+        """Every library the bundle needs: the workflow's own, plus those of the workflows it references.
+
+        A workflow's header records only the libraries its own nodes need, so a workflow it
+        references contributes its libraries through its own header. Without them the bundle
+        installs and copies a library set the entrypoint workflow can satisfy but its sub-workflows
+        cannot, and the omission only shows up when the published workflow runs.
+
+        Problems the walk reports (a referenced workflow that is missing or unreadable) are logged
+        rather than raised: the referenced workflow may be one the packager is about to write into
+        the bundle by another path, and refusing to publish over it would be a regression for
+        bundles that work today.
+        """
+        referenced = GriptapeNodes.WorkflowManager().collect_referenced_workflow_dependencies(workflow.metadata)
+        for problem in referenced.problems:
+            logger.warning(
+                "Packaging workflow '%s': %s",
+                workflow.metadata.name,
+                type(problem).collate_problems_for_display([problem]),  # type: ignore[arg-type] # each problem renders its own type
+            )
+
+        libraries = list(workflow.metadata.node_libraries_referenced)
+        own_library_names = {lib.library_name for lib in libraries}
+        libraries.extend(lib for lib in referenced.libraries if lib.library_name not in own_library_names)
+        return self._resolve_all_library_deps(libraries)
+
     def copy_libraries(
         self,
         node_libraries: list[LibraryNameAndVersion],
@@ -495,7 +521,7 @@ class WorkflowPackager:
             f"griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@{engine_version}",
         ]
 
-        for library_ref in self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced):
+        for library_ref in self._collect_workflow_libraries(workflow):
             library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
             if library_data.metadata and library_data.metadata.dependencies:
                 pip_deps = library_data.metadata.dependencies.pip_dependencies
@@ -509,7 +535,7 @@ class WorkflowPackager:
     def collect_pip_install_flags(self, workflow: Workflow) -> list[str]:
         """Collect all unique pip install flags from the workflow's referenced libraries."""
         flags: list[str] = []
-        for library_ref in self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced):
+        for library_ref in self._collect_workflow_libraries(workflow):
             library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
             if library_data.metadata and library_data.metadata.dependencies:
                 install_flags = library_data.metadata.dependencies.pip_install_flags
@@ -1259,7 +1285,7 @@ dependencies = [
 
         # Copy libraries (including transitive library dependencies)
         self.emit_progress(15.0, "Copying libraries...")
-        all_libraries = self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced)
+        all_libraries = self._collect_workflow_libraries(workflow)
         library_paths = self.copy_libraries(
             node_libraries=all_libraries,
             destination_path=destination / "libraries",
