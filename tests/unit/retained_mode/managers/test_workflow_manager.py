@@ -82,7 +82,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow.codegen import WorkflowCodeGenerator
-from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
+from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
 from griptape_nodes.retained_mode.managers.workflow.saving import (
     SaveWorkflowScenario,
     SaveWorkflowTargetInfo,
@@ -2930,9 +2930,9 @@ class TestRunResultRendering:
             problems=problems,
         )
 
-    def test_problems_of_one_type_are_collated_into_a_single_warning(self, engine: Engine) -> None:
+    def test_problems_of_one_type_are_collated_into_a_single_warning(self) -> None:
         """Grouping is what lets five unregistered libraries say so once instead of five times."""
-        details = engine.workflow_manager.runner.execution_result_details(
+        details = execution_result_details(
             self._result(successful=True, libraries=("Library A", "Library B")), level=logging.DEBUG
         )
 
@@ -2942,13 +2942,13 @@ class TestRunResultRendering:
         assert details[1].message == self._PLACEHOLDERS
         assert details[2].message == "ran the file"
 
-    def test_a_failed_load_is_not_told_its_nodes_became_placeholders(self, engine: Engine) -> None:
+    def test_a_failed_load_is_not_told_its_nodes_became_placeholders(self) -> None:
         """Nothing opened, so promising placeholders next to an ERROR would misinform.
 
         The failure branch of on_run_workflow_from_registry_request clears all object state, so
         the canvas the message would be describing does not exist.
         """
-        details = engine.workflow_manager.runner.execution_result_details(
+        details = execution_result_details(
             self._result(successful=False, libraries=("Library A",)), level=logging.ERROR
         )
 
@@ -2957,16 +2957,14 @@ class TestRunResultRendering:
             (logging.ERROR, "ran the file"),
         ]
 
-    def test_a_clean_run_renders_only_its_own_detail(self, engine: Engine) -> None:
-        details = engine.workflow_manager.runner.execution_result_details(
-            self._result(successful=True, libraries=()), level=logging.DEBUG
-        )
+    def test_a_clean_run_renders_only_its_own_detail(self) -> None:
+        details = execution_result_details(self._result(successful=True, libraries=()), level=logging.DEBUG)
 
         assert [(detail.level, detail.message) for detail in details] == [(logging.DEBUG, "ran the file")]
 
-    def test_an_explicit_message_replaces_the_run_detail(self, engine: Engine) -> None:
+    def test_an_explicit_message_replaces_the_run_detail(self) -> None:
         """A wrapping handler keeps its own wording and still reports the problems."""
-        details = engine.workflow_manager.runner.execution_result_details(
+        details = execution_result_details(
             self._result(successful=True, libraries=("Library A",)),
             level=logging.DEBUG,
             message="Successfully imported workflow 'x' as referenced sub flow 'y'",
@@ -5586,3 +5584,29 @@ class TestRepairPathShapedDisplayName:
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch = engine.workflow_registry.get_workflow_by_name(result.branched_workflow_name)
         assert branch.metadata.name == "comp (branch 1)"
+
+
+class TestNodeLibraryDelegates:
+    """Node libraries call these on `GriptapeNodes.WorkflowManager()`; they must reach the parts."""
+
+    def test_run_workflow_delegates_to_runner(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+        result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+        with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
+            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+        run_mock.assert_awaited_once_with("flow.py")
+
+    def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+        visit = Mock()
+        with patch.object(workflow_manager.codegen, "walk_object_tree") as walk_mock:
+            workflow_manager._walk_object_tree("obj", visit)
+        walk_mock.assert_called_once_with("obj", visit, None)
+
+    def test_extract_workflow_shape_reads_the_flow_manager(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+        with patch(
+            "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape", return_value={"x": 1}
+        ) as extract_mock:
+            assert workflow_manager.extract_workflow_shape("wf", flow_name="f") == {"x": 1}
+        extract_mock.assert_called_once_with(engine.flow_manager, "wf", "f")

@@ -1,5 +1,3 @@
-"""Tracks the problems found while a workflow file loads."""
-
 from __future__ import annotations
 
 import contextvars

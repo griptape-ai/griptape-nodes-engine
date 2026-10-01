@@ -1,5 +1,3 @@
-"""Deleting, renaming, and moving workflow files."""
-
 from __future__ import annotations
 
 import logging

@@ -1,5 +1,3 @@
-"""Runs workflow files and answers run requests."""
-
 from __future__ import annotations
 
 import logging
@@ -87,6 +85,49 @@ class WorkflowExecutionResult(NamedTuple):
     problems: tuple[WorkflowProblem, ...] = ()
 
 
+def execution_result_details(
+    execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
+) -> list[ResultDetail]:
+    """The run's problems as warnings, ahead of its detail (or `message` in its place).
+
+    The problems come first: they explain both the placeholders on a successful load and,
+    on a failed one, the most likely reason the file could not be replayed. Every handler
+    that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
+    caller while its graph is quietly full of placeholders.
+    """
+    details = [
+        ResultDetail(message=problem, level=logging.WARNING)
+        for problem in collate_problems_by_type(execution_result.problems)
+    ]
+    # Only a load that survived has placeholders to point at; a failed one cleared the
+    # canvas. Said once for the whole load rather than per problem, which is what keeps
+    # the problems' own wording intact.
+    if execution_result.problems and execution_result.execution_successful:
+        details.append(
+            ResultDetail(
+                message="Nodes from the libraries above opened as placeholders. "
+                "They preserve the graph but cannot run until their library is available.",
+                level=logging.WARNING,
+            )
+        )
+    details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
+    return details
+
+
+def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
+    """Group problems by type and let each type render its own instances, one string per group.
+
+    Every problem class owns its wording and its singular/plural form, so grouping is what
+    lets a workflow with five unregistered libraries say so once instead of five times.
+    """
+    problems_by_type: dict[type, list[WorkflowProblem]] = defaultdict(list)
+    for problem in problems:
+        problems_by_type[type(problem)].append(problem)
+    return [
+        problem_class.collate_problems_for_display(instances) for problem_class, instances in problems_by_type.items()
+    ]
+
+
 class WorkflowRunner(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -128,12 +169,12 @@ class WorkflowRunner(EngineScoped):
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
-                    result_details=ResultDetails(*self.execution_result_details(execution_result, level=logging.DEBUG)),
+                    result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
             logger.error(execution_result.execution_details)
             return RunWorkflowFromScratchResultFailure(
-                result_details=ResultDetails(*self.execution_result_details(execution_result, level=logging.ERROR))
+                result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
             )
 
     @handles(RunWorkflowWithCurrentStateRequest)
@@ -162,11 +203,11 @@ class WorkflowRunner(EngineScoped):
         if execution_result.execution_successful:
             return RunWorkflowWithCurrentStateResultSuccess(
                 status=execution_result.status,
-                result_details=ResultDetails(*self.execution_result_details(execution_result, level=logging.DEBUG)),
+                result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
         logger.error(execution_result.execution_details)
         return RunWorkflowWithCurrentStateResultFailure(
-            result_details=ResultDetails(*self.execution_result_details(execution_result, level=logging.ERROR))
+            result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
         )
 
     @handles(RunWorkflowFromRegistryRequest)
@@ -220,7 +261,7 @@ class WorkflowRunner(EngineScoped):
                 result_messages = []
                 if context_warning:
                     result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.extend(self.execution_result_details(execution_result, level=logging.ERROR))
+                result_messages.extend(execution_result_details(execution_result, level=logging.ERROR))
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
@@ -233,7 +274,7 @@ class WorkflowRunner(EngineScoped):
         result_messages = []
         if context_warning:
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.extend(self.execution_result_details(execution_result, level=logging.DEBUG))
+        result_messages.extend(execution_result_details(execution_result, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status, result_details=ResultDetails(*result_messages)
         )
@@ -518,47 +559,3 @@ class WorkflowRunner(EngineScoped):
                     )
                 )
         return problems
-
-    @classmethod
-    def execution_result_details(
-        cls, execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
-    ) -> list[ResultDetail]:
-        """The run's problems as warnings, ahead of its detail (or `message` in its place).
-
-        The problems come first: they explain both the placeholders on a successful load and,
-        on a failed one, the most likely reason the file could not be replayed. Every handler
-        that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
-        caller while its graph is quietly full of placeholders.
-        """
-        details = [
-            ResultDetail(message=problem, level=logging.WARNING)
-            for problem in cls.collate_problems_by_type(execution_result.problems)
-        ]
-        # Only a load that survived has placeholders to point at; a failed one cleared the
-        # canvas. Said once for the whole load rather than per problem, which is what keeps
-        # the problems' own wording intact.
-        if execution_result.problems and execution_result.execution_successful:
-            details.append(
-                ResultDetail(
-                    message="Nodes from the libraries above opened as placeholders. "
-                    "They preserve the graph but cannot run until their library is available.",
-                    level=logging.WARNING,
-                )
-            )
-        details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
-        return details
-
-    @staticmethod
-    def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
-        """Group problems by type and let each type render its own instances, one string per group.
-
-        Every problem class owns its wording and its singular/plural form, so grouping is what
-        lets a workflow with five unregistered libraries say so once instead of five times.
-        """
-        problems_by_type: dict[type, list[WorkflowProblem]] = defaultdict(list)
-        for problem in problems:
-            problems_by_type[type(problem)].append(problem)
-        return [
-            problem_class.collate_problems_for_display(instances)
-            for problem_class, instances in problems_by_type.items()
-        ]

@@ -1,5 +1,3 @@
-"""Writes workflows to disk: save, save as, versioned saves, and subflow saves."""
-
 from __future__ import annotations
 
 import logging

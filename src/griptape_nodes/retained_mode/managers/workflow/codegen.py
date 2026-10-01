@@ -1,5 +1,3 @@
-"""Generates the Python source of a saved workflow file."""
-
 from __future__ import annotations
 
 import ast

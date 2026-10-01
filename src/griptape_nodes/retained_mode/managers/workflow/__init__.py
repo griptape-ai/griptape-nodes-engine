@@ -1,1 +1,1 @@
-"""Parts of WorkflowManager, split out by concern."""
+"""Parts of `WorkflowManager`, one per concern."""

@@ -1,5 +1,3 @@
-"""Listing workflows and reading or editing their metadata."""
-
 from __future__ import annotations
 
 import logging
@@ -41,6 +39,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
@@ -238,7 +237,7 @@ class WorkflowCatalog(EngineScoped):
 
     def _build_workflow_info_payload(self, wf_info: WorkflowManager.WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
-        collated_problems = self.engine.workflow_manager.runner.collate_problems_by_type(wf_info.problems)
+        collated_problems = collate_problems_by_type(wf_info.problems)
         return WorkflowInfoSummary(
             status=wf_info.status,
             workflow_name=wf_info.workflow_name,

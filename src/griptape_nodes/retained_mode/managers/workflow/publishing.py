@@ -1,5 +1,3 @@
-"""Handles requests to publish a workflow through a library's publisher."""
-
 from __future__ import annotations
 
 import asyncio
