@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
+    AddParameterToNodeResultFailure,
     AddParameterToNodeResultSuccess,
     AlterParameterDetailsRequest,
 )
@@ -196,6 +197,62 @@ class TestNodeManagerAddControlParameter:
         assert isinstance(parameter, expected_type)
         assert parameter.display_name == display_name
         assert parameter.ui_options["custom_option"] == "kept"
+
+    @pytest.mark.parametrize(
+        ("mode_allowed_input", "mode_allowed_output", "expected_type"),
+        [
+            (True, False, ControlParameterInput),
+            (False, True, ControlParameterOutput),
+        ],
+    )
+    def test_reconstructs_directional_control_without_serialized_sides(
+        self,
+        engine: Engine,
+        *,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+    ) -> None:
+        """A legacy request with only mode flags still keeps its directional control shape."""
+        node = BaseNode(name="ModeOnlyControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="mode_only_control",
+                tooltip="Mode-only control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("mode_only_control")
+        assert isinstance(parameter, expected_type)
+
+    def test_rejects_control_parameter_mixed_with_data_type(self, engine: Engine) -> None:
+        """Control ports cannot silently accept a non-control type during reconstruction."""
+        node = BaseNode(name="MixedControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="mixed_control",
+                tooltip="Mixed control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=[ParameterTypeBuiltin.STR.value],
+                mode_allowed_input=True,
+                mode_allowed_property=False,
+                mode_allowed_output=False,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultFailure)
+        assert "ParameterControlType" in str(result.result_details)
 
 
 class TestNodeManagerResolutionStateSerialization:
