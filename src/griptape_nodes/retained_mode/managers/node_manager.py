@@ -4883,7 +4883,7 @@ class NodeManager(EngineScoped):
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
 
                 if use_pickling:
-                    pickled_bytes = workflow_manager._patch_and_pickle_object(value)
+                    pickled_bytes = workflow_manager.codegen.patch_and_pickle_object(value)
                     unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
                 else:
                     # Use existing deep copy approach
@@ -5232,7 +5232,7 @@ class NodeManager(EngineScoped):
             value_id = id(param_value)
 
         try:
-            pickled_bytes = workflow_manager._patch_and_pickle_object(param_value)
+            pickled_bytes = workflow_manager.codegen.patch_and_pickle_object(param_value)
         except Exception:
             tracker.add_as_not_serializable(value_id)
             uuid_referenced_values[param_name] = None

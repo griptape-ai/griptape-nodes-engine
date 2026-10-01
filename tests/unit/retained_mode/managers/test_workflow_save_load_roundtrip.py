@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import griptape_nodes.retained_mode.managers.workflow.codegen as codegen_module
+import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -150,7 +152,7 @@ _FIXTURE_LIBRARY_SCHEMA: dict[str, Any] = {
 class _FrozenDateTime(datetime_module.datetime):
     """A ``datetime`` subclass whose ``now()`` always answers the same instant.
 
-    ``_generate_workflow_metadata_from_commands`` stamps ``last_modified_date`` with
+    ``WorkflowCodeGenerator.generate_workflow_metadata_from_commands`` stamps ``last_modified_date`` with
     ``datetime.now(tz=UTC)`` internally, with no caller-supplied override. Two saves of an
     otherwise-identical graph would then differ by that timestamp alone, which would make a
     byte-identical-output assertion fail for a reason that has nothing to do with the
@@ -162,6 +164,12 @@ class _FrozenDateTime(datetime_module.datetime):
     @classmethod
     def now(cls, tz: datetime_module.tzinfo | None = None) -> datetime_module.datetime:  # noqa: ARG003
         return cls._FIXED
+
+
+def _freeze_workflow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze `datetime` in every module that stamps a saved or reloaded workflow."""
+    for module in (codegen_module, saving_module):
+        monkeypatch.setattr(module, "datetime", _FrozenDateTime)
 
 
 @pytest.fixture(autouse=True)
@@ -249,7 +257,7 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     destination = ProjectFileDestination(str(tmp_path / f"{file_stem}.py"))
-    save_result = engine.workflow_manager._save_workflow_file_inline(
+    save_result = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=destination,
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -291,9 +299,7 @@ def _round_trip_single_value(engine: Engine, tmp_path: Path, file_stem: str, val
 
     file_path = _save_flow_to_disk(engine, flow_name, tmp_path, file_stem)
     with pytest.MonkeyPatch.context() as monkeypatch:
-        import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-        monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+        _freeze_workflow_clock(monkeypatch)
         _reload_from_disk(engine, file_path)
 
     return _get_value(engine, node_name, "value")
@@ -656,9 +662,7 @@ class TestDeterministicSaveOutput:
         _set_value(engine, node_name, "value", {"a": 1, "b": [1, 2, 3]})
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            _freeze_workflow_clock(monkeypatch)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "first_save")
             second_path = _save_flow_to_disk(engine, flow_name, tmp_path, "second_save")
@@ -707,9 +711,7 @@ class TestIdempotentSaveLoadSave:
         _set_value(engine, node_name, "value2", "some text")
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            _freeze_workflow_clock(monkeypatch)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "roundtrip")
             first_source = _read_saved_source(first_path)

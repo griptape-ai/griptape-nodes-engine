@@ -2,7 +2,7 @@
 
 Drives the real workflow generator end-to-end: registers a fixture library inside
 the test process, builds a flow that uses one of its nodes, serializes the flow
-through ``WorkflowManager._generate_workflow_file_content``, writes the emitted
+through ``WorkflowCodeGenerator.generate_workflow_file_content``, writes the emitted
 ``.py`` to disk, and runs it in a fresh ``python <file>`` subprocess.
 
 This is the bootstrap path issue #4584 describes: ``LocalWorkflowExecutor`` with
@@ -54,7 +54,7 @@ def _generate_echo_workflow_source(engine: Engine, library_json: Path) -> str:
 
     Uses the same path the engine uses when saving a workflow: register the library,
     create a flow, drop a node into it, ask FlowManager to serialize, then run the
-    serialized commands through ``WorkflowManager._generate_workflow_file_content``.
+    serialized commands through ``WorkflowCodeGenerator.generate_workflow_file_content``.
     The resulting source is what a user would see saved to disk.
     """
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -95,7 +95,7 @@ def _generate_echo_workflow_source(engine: Engine, library_json: Path) -> str:
         # workflow_shape=None keeps the file inert at import time.
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
