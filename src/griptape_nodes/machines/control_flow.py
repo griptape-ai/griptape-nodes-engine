@@ -367,10 +367,15 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         # PASS 1: control/start entries build the control-flow graphs.
         for node in (*categories.start_nodes, *categories.control_nodes):
             node.state = NodeResolutionState.UNRESOLVED
-            if node.name not in dag_builder.node_to_reference:
+            existing_reference = dag_builder.node_to_reference.get(node.name)
+            if existing_reference is None:
                 dag_builder.add_node_with_dependencies(node, node.name)
-                if node not in start_nodes:
-                    start_nodes.append(node)
+            else:
+                # An earlier entry's upstream data walk already adopted this node, but it has no
+                # incoming control and so holds its own control token: it must still advance control.
+                existing_reference.data_dependency_only = False
+            if node not in start_nodes:
+                start_nodes.append(node)
 
         # PASS 2: data sinks, after the control graphs exist.
         for node in categories.data_sink_nodes:
