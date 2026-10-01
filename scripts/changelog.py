@@ -59,7 +59,7 @@ ENTRY = re.compile(r"^\s*[-*] ")
 # An entry starts in column one; its continuation lines are indented, so they do not start a new one.
 TOP_LEVEL_ENTRY = re.compile(r"^[-*] ")
 BREAKING_ENTRY = re.compile(r"^[-*] \*\*Breaking:\*\*")
-COMMENT = re.compile(r"^\s*<!--.*-->\s*$")
+COMMENT = re.compile(r"^\s*<!--[\s\S]*?-->\s*$")
 CODE_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 # The Unreleased link compares the latest release tag to HEAD, so it carries the base URL and the
 # previous tag the rolled version compares against.
