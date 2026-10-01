@@ -294,7 +294,7 @@ async def _drain_background_tasks() -> None:
     pytest.fail("background work did not finish")
 
 
-def _make_lazy_component(mocker: Any, value: Any, *, bucket_secret: str | None = None) -> ComponentFixture:
+def _make_lazy_component(mocker: Any, value: Any, *, configured_bucket: str | None = None) -> ComponentFixture:
     component, driver = _make_component(value)
     component._node = MagicMock(parameter_values={"image": value})
     component._node.get_parameter_value.return_value = value
@@ -302,7 +302,7 @@ def _make_lazy_component(mocker: Any, value: Any, *, bucket_secret: str | None =
     component._api_key = "key"
     component._base_url = "https://base"
     component._request_timeout = None
-    mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=bucket_secret)
+    mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=configured_bucket)
     mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver", return_value=driver)
     return ComponentFixture(component=component, driver=driver)
 
@@ -345,6 +345,7 @@ class TestLazyStorageDriver:
 
     def test_driver_is_built_once_across_uploads(self, mocker: Any) -> None:
         component, driver = _make_lazy_component(mocker, "/inputs/a.png")
+        driver_cls = mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver", return_value=driver)
         mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
         mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"bytes")
 
@@ -353,7 +354,31 @@ class TestLazyStorageDriver:
             component.get_public_url_for_parameter()
 
         assert driver.upload_file.call_count == uploads
-        assert component._storage_driver is driver
+        assert driver_cls.call_count == 1
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    @pytest.mark.asyncio
+    async def test_failed_upload_revalidates_the_bucket_next_time(self, mocker: Any, *, use_async: bool) -> None:
+        # A configured bucket deleted mid-session must surface as the invalid-bucket error on the
+        # next upload, not as a 404 from a bucket the cache still trusts.
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png", configured_bucket="bucket-1")
+        driver.bucket_id = "bucket-1"
+        driver.upload_file.side_effect = [RuntimeError("404 from the bucket"), PUBLIC_URL]
+        lookup_mock = mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"bytes")
+        mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"bytes")
+
+        async def upload() -> str:
+            if use_async:
+                return await component.aget_public_url_for_parameter()
+            return component.get_public_url_for_parameter()
+
+        with pytest.raises(RuntimeError, match="404"):
+            await upload()
+        assert await upload() == PUBLIC_URL
+
+        lookups_before_and_after_failure = 2
+        assert lookup_mock.call_count == lookups_before_and_after_failure
 
 
 class TestAsyncPublicUrl:

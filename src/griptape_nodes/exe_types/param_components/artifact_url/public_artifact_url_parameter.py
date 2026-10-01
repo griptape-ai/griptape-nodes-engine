@@ -206,7 +206,11 @@ class PublicArtifactUrlParameter:
         # Resolved before recording the path, so a failed lookup leaves nothing for cleanup to delete.
         driver = self._get_storage_driver()
         self.gtc_file_path = self._build_upload_path(url)
-        return driver.upload_file(path=self.gtc_file_path, file_content=file_contents)
+        try:
+            return driver.upload_file(path=self.gtc_file_path, file_content=file_contents)
+        except RuntimeError:
+            self._forget_storage_driver(driver)
+            raise
 
     async def aget_public_url_for_parameter(self) -> str:
         """Resolve parameter values on the event loop, where node project context is available."""
@@ -226,6 +230,9 @@ class PublicArtifactUrlParameter:
         except asyncio.CancelledError:
             # The background cleanup owns the delete now.
             self._take_upload_path()
+            raise
+        except RuntimeError:
+            self._forget_storage_driver(driver)
             raise
 
     def delete_uploaded_artifact(self) -> None:
@@ -297,6 +304,18 @@ class PublicArtifactUrlParameter:
                 )
             )
         return self._build_storage_driver(bucket_id)
+
+    def _forget_storage_driver(self, driver: GriptapeCloudStorageDriver) -> None:
+        """Drop a driver whose upload failed, so the next upload revalidates its bucket.
+
+        The bucket is cached for the process, and a configured bucket deleted mid-session would
+        otherwise fail every later upload with a bare 404 instead of the invalid-bucket error.
+        """
+        if self._storage_driver is driver:
+            self._storage_driver = None
+        for cache_key, bucket_id in list(self._bucket_id_cache.items()):
+            if cache_key[:2] == (self._base_url, self._api_key) and bucket_id == driver.bucket_id:
+                self._bucket_id_cache.pop(cache_key, None)
 
     def _build_storage_driver(self, bucket_id: str) -> GriptapeCloudStorageDriver:
         self._storage_driver = GriptapeCloudStorageDriver(
