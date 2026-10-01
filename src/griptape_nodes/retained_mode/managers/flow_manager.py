@@ -2744,7 +2744,7 @@ class FlowManager(EngineScoped):
         return f"{prefix}{sanitized_node_name}_{parameter_name}"
 
     @handles(StartFlowRequest)
-    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         # which flow
         flow_name = request.flow_name
         if not flow_name:
@@ -2831,32 +2831,7 @@ class FlowManager(EngineScoped):
                     validation_exceptions=[exception] if error_message else [], result_details=result_details
                 )
 
-        if request.wait_for_completion:
-            wait_error = await self._await_flow_completion(request.completion_timeout_ms)
-            if wait_error is not None:
-                # On timeout the flow is still running, so cancel it before returning
-                # failure. If the wait ended because the flow already errored, there is
-                # nothing left to cancel and check_for_existing_running_flow() returns False.
-                if self.check_for_existing_running_flow():
-                    try:
-                        await self.cancel_flow_run()
-                    except Exception as cancel_err:
-                        # Defensive: cancellation is best-effort cleanup. Surface a warning
-                        # but keep the original wait_error as the user-visible failure.
-                        logger.warning(
-                            "Attempted to cancel flow '%s' after wait_for_completion failure. "
-                            "Cancellation itself failed because of: %s",
-                            flow_name,
-                            cancel_err,
-                        )
-                exception = RuntimeError(wait_error)
-                return StartFlowResultFailure(
-                    validation_exceptions=[exception],
-                    result_details=f"Flow '{flow_name}' did not complete cleanly: {wait_error}",
-                )
-            details = f"Flow '{flow_name}' kicked off and completed successfully."
-        else:
-            details = f"Successfully kicked off flow with name {flow_name}"
+        details = f"Flow '{flow_name}' ran to completion."
 
         return StartFlowResultSuccess(result_details=details)
 
@@ -4688,28 +4663,6 @@ class FlowManager(EngineScoped):
             self._global_control_flow_machine.is_advancing
             or self._global_control_flow_machine.resolution_machine.is_advancing
         )
-
-    async def _await_flow_completion(self, timeout_ms: int | None) -> str | None:
-        """Block until the current flow resolves, erroring, or the timeout elapses.
-
-        Polls `check_for_existing_running_flow()` because the control flow machine does not
-        expose a completion future today; this is the same signal the UI uses to decide when
-        the run is idle. Returns None on clean completion, or an error string describing why
-        the wait ended unsuccessfully (timeout, or flow error).
-        """
-        poll_interval_sec = 0.05
-        elapsed_ms = 0
-        while self.check_for_existing_running_flow():
-            if timeout_ms is not None and elapsed_ms >= timeout_ms:
-                return f"Timed out waiting for flow completion after {timeout_ms} ms."
-            await asyncio.sleep(poll_interval_sec)
-            elapsed_ms += int(poll_interval_sec * 1000)
-
-        if self._global_control_flow_machine is not None:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
-            if resolution_machine.is_errored():
-                return resolution_machine.get_error_message() or "Flow errored during execution."
-        return None
 
     async def cancel_flow_run(self) -> None:
         if not self.check_for_existing_running_flow():

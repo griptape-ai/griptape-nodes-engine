@@ -3252,9 +3252,6 @@ class NodeManager(EngineScoped):
         except Exception as e:
             details = f'Failed to resolve "{node_name}".  Error: {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4532 - support
-        # wait_for_completion / completion_timeout_ms here, mirroring StartFlowRequest so
-        # callers do not have to poll check_for_existing_running_flow() themselves.
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
 

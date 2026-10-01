@@ -7,10 +7,6 @@ from griptape_nodes.bootstrap.workflow_publishers.local_session_workflow_publish
     LocalSessionWorkflowPublisher,
 )
 from griptape_nodes.bootstrap.workflow_publishers.local_workflow_publisher import LocalWorkflowPublisher
-from griptape_nodes.utils import install_file_url_support
-
-# Install file:// URL support for httpx/requests in subprocess
-install_file_url_support()
 
 logging.basicConfig(level=logging.INFO)
 

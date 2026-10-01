@@ -168,8 +168,6 @@ async def test_running_group_stays_involved(
             StartFlowRequest(
                 flow_name=parent_flow,
                 flow_node_name=group_result.node_name,
-                wait_for_completion=True,
-                completion_timeout_ms=60000,
             )
         )
     assert isinstance(run_result, StartFlowResultSuccess), run_result

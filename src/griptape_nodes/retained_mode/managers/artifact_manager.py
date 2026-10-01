@@ -384,7 +384,7 @@ class ArtifactManager(EngineScoped):
         # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
         # artifact provider is what depends on `static_ffmpeg`, and every process that can run
         # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
-        # installed once, like `install_file_url_support`; later broadcasts (and later engines)
+        # installed once; later broadcasts (and later engines)
         # no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
 

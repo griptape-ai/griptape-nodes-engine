@@ -131,8 +131,6 @@ async def test_running_first_group_does_not_execute_second_groups_member(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="GroupA",
-            wait_for_completion=True,
-            completion_timeout_ms=30000,
         )
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
