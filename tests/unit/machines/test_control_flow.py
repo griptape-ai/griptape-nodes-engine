@@ -106,6 +106,24 @@ class TestSeedDagFromCategories:
         assert start.state == NodeResolutionState.UNRESOLVED
         assert control.state == NodeResolutionState.UNRESOLVED
 
+    def test_pass1_promotes_entry_already_adopted_as_data_dependency(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        start = _mock_node("Start")
+        control = _mock_node("Ctrl")
+        categories = DagNodeCategories(start_nodes=[start], control_nodes=[control], data_sink_nodes=[])
+        dag_builder = DagBuilder(self._connections())
+        monkeypatch.setattr(
+            DagBuilder, "collect_nodes_in_forward_control_path", staticmethod(lambda n, _e, _c: {n.name})
+        )
+
+        # Simulate an earlier entry's upstream data walk adopting Ctrl.
+        dag_builder.add_node(control).data_dependency_only = True
+
+        entry_nodes = ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, _node_manager())
+
+        # Ctrl is still an entry point, so it comes back and may advance control.
+        assert [node.name for node in entry_nodes] == ["Start", "Ctrl"]
+        assert dag_builder.node_to_reference["Ctrl"].data_dependency_only is False
+
     def test_pass2_defers_a_sink_fed_by_the_control_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         start = _mock_node("Start")
         sink = _mock_node("Sink")
