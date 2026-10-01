@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import logging
 import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass
@@ -249,6 +250,7 @@ from griptape_nodes.serialization.values import (
     UndecodedValue,
     Unencodable,
     decode_value,
+    encodable_default,
     try_encode,
     value_key,
 )
@@ -4212,6 +4214,10 @@ class NodeManager(EngineScoped):
                         alter_group_request = AlterParameterGroupDetailsRequest(**diff)
                         element_modification_commands.append(alter_group_request)
 
+            element_modification_commands = [
+                NodeManager._with_encodable_default(command, node_name) for command in element_modification_commands
+            ]
+
             # Now assignment of values to all of the parameters.
             set_value_commands = []
 
@@ -4895,6 +4901,16 @@ class NodeManager(EngineScoped):
         else:
             return {"ui_options": group.ui_options}
         return diff
+
+    @staticmethod
+    def _with_encodable_default(command: Any, node_name: str) -> Any:
+        """Return ``command``, with a default value that has no plain-data form replaced by None."""
+        if not isinstance(command, AddParameterToNodeRequest | AlterParameterDetailsRequest):
+            return command
+        default_value = encodable_default(command.default_value, node_name, command.parameter_name)
+        if default_value is command.default_value:
+            return command
+        return dataclasses.replace(command, default_value=default_value)
 
     @staticmethod
     def _handle_value_hashing(  # noqa: PLR0913, PLR0917

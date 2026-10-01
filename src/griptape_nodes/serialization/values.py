@@ -119,6 +119,21 @@ def try_encode(value: Any) -> JsonValue | Unencodable:
         return Unencodable(str(error))
 
 
+def encodable_default(default_value: Any, node_name: str | None, parameter_name: str | None) -> Any:
+    """Return ``default_value``, or None with a logged warning if it has no plain-data form."""
+    encoded = try_encode(default_value)
+    if not isinstance(encoded, Unencodable):
+        return default_value
+    logger.warning(
+        "Attempted to save the default value of parameter '%s' on node '%s'. Failed because %s "
+        "The parameter will reopen without that default.",
+        parameter_name,
+        node_name,
+        encoded.reason,
+    )
+    return None
+
+
 def encode_for_display(value: Any) -> JsonValue:
     """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
     encoded = try_encode(value)
