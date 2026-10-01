@@ -107,6 +107,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
 from griptape_nodes.utils.file_utils import mtimes_match
@@ -198,39 +199,7 @@ class ArtifactManager(EngineScoped):
         self._preview_mutex = KeyedMutex()
 
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(
-                GeneratePreviewRequest, self.on_handle_generate_preview_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GeneratePreviewFromDefaultsRequest, self.on_handle_generate_preview_from_defaults_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetPreviewForArtifactRequest, self.on_handle_get_preview_for_artifact_request
-            )
-            event_manager.assign_manager_to_request_type(
-                RegisterArtifactProviderRequest, self.on_handle_register_artifact_provider_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListArtifactProvidersRequest, self.on_handle_list_artifact_providers_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetArtifactProviderDetailsRequest, self.on_handle_get_artifact_provider_details_request
-            )
-            event_manager.assign_manager_to_request_type(
-                RegisterPreviewGeneratorRequest, self.on_handle_register_preview_generator_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListPreviewGeneratorsRequest, self.on_handle_list_preview_generators_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetPreviewGeneratorDetailsRequest, self.on_handle_get_preview_generator_details_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetArtifactSchemasRequest, self.on_handle_get_artifact_schemas_request
-            )
-            event_manager.assign_manager_to_request_type(
-                CheckArtifactReadPermissionRequest, self.on_check_artifact_read_permission_request
-            )
+            event_manager.register_request_handlers(self)
 
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
@@ -415,7 +384,7 @@ class ArtifactManager(EngineScoped):
         # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
         # artifact provider is what depends on `static_ffmpeg`, and every process that can run
         # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
-        # installed once, like `install_file_url_support`; later broadcasts (and later engines)
+        # installed once; later broadcasts (and later engines)
         # no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
 
@@ -438,6 +407,7 @@ class ArtifactManager(EngineScoped):
             logger.error(error_message)
             raise RuntimeError(error_message)
 
+    @handles(GeneratePreviewRequest)
     async def on_handle_generate_preview_request(  # noqa: PLR0911, C901, PLR0912, PLR0915
         self, request: GeneratePreviewRequest
     ) -> GeneratePreviewResultSuccess | GeneratePreviewResultFailure:
@@ -687,6 +657,7 @@ class ArtifactManager(EngineScoped):
 
         return GeneratePreviewResultSuccess(result_details=result_message, paths_to_preview=paths_to_preview)
 
+    @handles(GeneratePreviewFromDefaultsRequest)
     async def on_handle_generate_preview_from_defaults_request(
         self, request: GeneratePreviewFromDefaultsRequest
     ) -> GeneratePreviewFromDefaultsResultSuccess | GeneratePreviewFromDefaultsResultFailure:
@@ -745,6 +716,7 @@ class ArtifactManager(EngineScoped):
             result_details=result.result_details, paths_to_preview=result.paths_to_preview
         )
 
+    @handles(GetPreviewForArtifactRequest)
     async def on_handle_get_preview_for_artifact_request(
         self, request: GetPreviewForArtifactRequest
     ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
@@ -1041,6 +1013,7 @@ class ArtifactManager(EngineScoped):
             artifact_metadata=metadata.artifact_metadata,
         )
 
+    @handles(CheckArtifactReadPermissionRequest)
     def on_check_artifact_read_permission_request(
         self, request: CheckArtifactReadPermissionRequest
     ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
@@ -1065,6 +1038,7 @@ class ArtifactManager(EngineScoped):
             result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
         )
 
+    @handles(ListArtifactProvidersRequest)
     def on_handle_list_artifact_providers_request(
         self, _request: ListArtifactProvidersRequest
     ) -> ListArtifactProvidersResultSuccess | ListArtifactProvidersResultFailure:
@@ -1077,6 +1051,7 @@ class ArtifactManager(EngineScoped):
             result_details="Successfully listed artifact providers", friendly_names=friendly_names
         )
 
+    @handles(GetArtifactProviderDetailsRequest)
     def on_handle_get_artifact_provider_details_request(
         self, request: GetArtifactProviderDetailsRequest
     ) -> GetArtifactProviderDetailsResultSuccess | GetArtifactProviderDetailsResultFailure:
@@ -1100,6 +1075,7 @@ class ArtifactManager(EngineScoped):
             registered_preview_generators=preview_generator_names,
         )
 
+    @handles(RegisterArtifactProviderRequest)
     def on_handle_register_artifact_provider_request(
         self, request: RegisterArtifactProviderRequest
     ) -> RegisterArtifactProviderResultSuccess | RegisterArtifactProviderResultFailure:
@@ -1126,6 +1102,7 @@ class ArtifactManager(EngineScoped):
         # NOTE: Provider is NOT instantiated here - lazy instantiation happens on first use
         return RegisterArtifactProviderResultSuccess(result_details="Artifact provider registered successfully")
 
+    @handles(RegisterPreviewGeneratorRequest)
     def on_handle_register_preview_generator_request(
         self, request: RegisterPreviewGeneratorRequest
     ) -> RegisterPreviewGeneratorResultSuccess | RegisterPreviewGeneratorResultFailure:
@@ -1164,6 +1141,7 @@ class ArtifactManager(EngineScoped):
             result_details=f"Preview generator '{generator_name}' registered successfully"
         )
 
+    @handles(ListPreviewGeneratorsRequest)
     def on_handle_list_preview_generators_request(
         self, request: ListPreviewGeneratorsRequest
     ) -> ListPreviewGeneratorsResultSuccess | ListPreviewGeneratorsResultFailure:
@@ -1191,6 +1169,7 @@ class ArtifactManager(EngineScoped):
             preview_generator_names=preview_generator_names,
         )
 
+    @handles(GetPreviewGeneratorDetailsRequest)
     def on_handle_get_preview_generator_details_request(
         self, request: GetPreviewGeneratorDetailsRequest
     ) -> GetPreviewGeneratorDetailsResultSuccess | GetPreviewGeneratorDetailsResultFailure:
@@ -1248,6 +1227,7 @@ class ArtifactManager(EngineScoped):
             parameters=parameters_dict,
         )
 
+    @handles(GetArtifactSchemasRequest)
     def on_handle_get_artifact_schemas_request(
         self,
         request: GetArtifactSchemasRequest,  # noqa: ARG002

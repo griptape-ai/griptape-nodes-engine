@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import handles
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -39,13 +40,9 @@ class ObjectManager(EngineScoped):
     def __init__(self, _event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._name_to_objects = {}
-        _event_manager.assign_manager_to_request_type(
-            request_type=RenameObjectRequest, callback=self.on_rename_object_request
-        )
-        _event_manager.assign_manager_to_request_type(
-            request_type=ClearAllObjectStateRequest, callback=self.on_clear_all_object_state_request
-        )
+        _event_manager.register_request_handlers(self)
 
+    @handles(RenameObjectRequest)
     def on_rename_object_request(self, request: RenameObjectRequest) -> ResultPayload:
         # Does the source object exist?
         if request.object_name == request.requested_name:
@@ -109,6 +106,7 @@ class ObjectManager(EngineScoped):
             result_details = details
         return RenameObjectResultSuccess(final_name=final_name, result_details=result_details)
 
+    @handles(ClearAllObjectStateRequest)
     async def on_clear_all_object_state_request(self, request: ClearAllObjectStateRequest) -> ResultPayload:
         if not request.i_know_what_im_doing:
             details = "Attempted to clear all object state and delete everything. Failed because they didn't know what they were doing."

@@ -39,6 +39,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeInstance
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
@@ -124,39 +125,10 @@ class ResourceManager(EngineScoped):
         self._pending_worker_releases: list[str] = []
 
         # Register event handlers
-        event_manager.assign_manager_to_request_type(
-            request_type=ListRegisteredResourceTypesRequest, callback=self.on_list_registered_resource_types_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=RegisterResourceTypeRequest, callback=self.on_register_resource_type_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=CreateResourceInstanceRequest, callback=self.on_create_resource_instance_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=FreeResourceInstanceRequest, callback=self.on_free_resource_instance_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=AcquireResourceInstanceLockRequest, callback=self.on_acquire_resource_instance_lock_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=ReleaseResourceInstanceLockRequest, callback=self.on_release_resource_instance_lock_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=GetExecutionDeviceRequest, callback=self.on_get_execution_device_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=ListCompatibleResourceInstancesRequest,
-            callback=self.on_list_compatible_resource_instances_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=GetResourceInstanceStatusRequest, callback=self.on_get_resource_instance_status_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=ListResourceInstancesByTypeRequest, callback=self.on_list_resource_instances_by_type_request
-        )
+        event_manager.register_request_handlers(self)
 
     # Public Event Handlers
+    @handles(ListRegisteredResourceTypesRequest)
     def on_list_registered_resource_types_request(self, _request: ListRegisteredResourceTypesRequest) -> ResultPayload:
         """Handle request to list all registered resource types."""
         type_names = []
@@ -167,6 +139,7 @@ class ResourceManager(EngineScoped):
             resource_type_names=type_names, result_details="Successfully listed registered resource types"
         )
 
+    @handles(RegisterResourceTypeRequest)
     def on_register_resource_type_request(self, request: RegisterResourceTypeRequest) -> ResultPayload:
         """Handle request to register a new resource type."""
         self._resource_types.add(request.resource_type)
@@ -175,6 +148,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully registered resource type {type(request.resource_type).__name__}"
         )
 
+    @handles(CreateResourceInstanceRequest)
     def on_create_resource_instance_request(self, request: CreateResourceInstanceRequest) -> ResultPayload:
         """Handle request to create a new resource instance."""
         resource_type = self._get_resource_type_by_name(request.resource_type_name)
@@ -197,6 +171,7 @@ class ResourceManager(EngineScoped):
             instance_id=instance_id, result_details=f"Successfully created resource instance {instance_id}"
         )
 
+    @handles(FreeResourceInstanceRequest)
     def on_free_resource_instance_request(self, request: FreeResourceInstanceRequest) -> ResultPayload:
         """Handle request to free a resource instance."""
         instance = self._capability_instances.get(request.instance_id)
@@ -234,6 +209,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully freed resource instance {request.instance_id}"
         )
 
+    @handles(AcquireResourceInstanceLockRequest)
     def on_acquire_resource_instance_lock_request(self, request: AcquireResourceInstanceLockRequest) -> ResultPayload:
         """Handle request to acquire a resource instance lock."""
         resource_type = self._get_resource_type_by_name(request.resource_type_name)
@@ -275,6 +251,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully acquired lock on resource instance {instance_id} for {request.owner_id}",
         )
 
+    @handles(ReleaseResourceInstanceLockRequest)
     def on_release_resource_instance_lock_request(self, request: ReleaseResourceInstanceLockRequest) -> ResultPayload:
         """Handle request to release a resource instance lock."""
         instance = self._capability_instances.get(request.instance_id)
@@ -294,6 +271,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully released lock on resource instance {request.instance_id} from {request.owner_id}"
         )
 
+    @handles(GetExecutionDeviceRequest)
     def on_get_execution_device_request(self, request: GetExecutionDeviceRequest) -> ResultPayload:
         """Answer which compute device to run on, without importing a framework to find out.
 
@@ -337,6 +315,7 @@ class ResourceManager(EngineScoped):
             return [str(getattr(backend, "value", backend)) for backend in backends]
         return []
 
+    @handles(ListCompatibleResourceInstancesRequest)
     def on_list_compatible_resource_instances_request(
         self, request: ListCompatibleResourceInstancesRequest
     ) -> ResultPayload:
@@ -365,6 +344,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully found {len(instance_ids)} compatible resource instances",
         )
 
+    @handles(GetResourceInstanceStatusRequest)
     def on_get_resource_instance_status_request(self, request: GetResourceInstanceStatusRequest) -> ResultPayload:
         """Handle request to get resource instance status."""
         instance = self._capability_instances.get(request.instance_id)
@@ -385,6 +365,7 @@ class ResourceManager(EngineScoped):
             result_details=f"Successfully retrieved status for resource instance {request.instance_id}",
         )
 
+    @handles(ListResourceInstancesByTypeRequest)
     def on_list_resource_instances_by_type_request(self, request: ListResourceInstancesByTypeRequest) -> ResultPayload:
         """Handle request to list resource instances by type."""
         resource_type = self._get_resource_type_by_name(request.resource_type_name)

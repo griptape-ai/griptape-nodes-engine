@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -265,16 +266,9 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
-        event_manager.assign_manager_to_request_type(
-            request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=GetWorkflowContextRequest, callback=self.on_get_workflow_context_request
-        )
-        event_manager.assign_manager_to_request_type(
-            request_type=EnsureWorkflowAndFlowRequest, callback=self.on_ensure_workflow_and_flow_request
-        )
+        event_manager.register_request_handlers(self)
 
+    @handles(SetWorkflowContextRequest)
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
         # As of today, we only allow a single Workflow context at a time. This may change in the future.
         if self.has_current_workflow():
@@ -325,6 +319,7 @@ class ContextManager(EngineScoped):
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(workflow_name=resolved_name, result_details=msg)
 
+    @handles(GetWorkflowContextRequest)
     def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
         workflow_name = None
         is_saved = None
@@ -338,6 +333,7 @@ class ContextManager(EngineScoped):
             result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
         )
 
+    @handles(EnsureWorkflowAndFlowRequest)
     def on_ensure_workflow_and_flow_request(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 

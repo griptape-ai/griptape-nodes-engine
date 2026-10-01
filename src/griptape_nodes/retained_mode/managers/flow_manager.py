@@ -178,6 +178,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
@@ -310,46 +311,8 @@ class FlowManager(EngineScoped):
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        event_manager.assign_manager_to_request_type(CreateFlowRequest, self.on_create_flow_request)
-        event_manager.assign_manager_to_request_type(DeleteFlowRequest, self.on_delete_flow_request)
-        event_manager.assign_manager_to_request_type(ListNodesInFlowRequest, self.on_list_nodes_in_flow_request)
-        event_manager.assign_manager_to_request_type(ListFlowsInFlowRequest, self.on_list_flows_in_flow_request)
-        event_manager.assign_manager_to_request_type(
-            ListFlowsInCurrentContextRequest, self.on_list_flows_in_current_context_request
-        )
-        event_manager.assign_manager_to_request_type(AutoLayoutFlowRequest, self.on_auto_layout_flow_request)
-        event_manager.assign_manager_to_request_type(CreateConnectionRequest, self.on_create_connection_request)
-        event_manager.assign_manager_to_request_type(DeleteConnectionRequest, self.on_delete_connection_request)
-        event_manager.assign_manager_to_request_type(StartFlowRequest, self.on_start_flow_request)
-        event_manager.assign_manager_to_request_type(StartFlowFromNodeRequest, self.on_start_flow_from_node_request)
-        event_manager.assign_manager_to_request_type(SingleNodeStepRequest, self.on_single_node_step_request)
-        event_manager.assign_manager_to_request_type(SingleExecutionStepRequest, self.on_single_execution_step_request)
-        event_manager.assign_manager_to_request_type(
-            ContinueExecutionStepRequest, self.on_continue_execution_step_request
-        )
-        event_manager.assign_manager_to_request_type(CancelFlowRequest, self.on_cancel_flow_request)
-        event_manager.assign_manager_to_request_type(UnresolveFlowRequest, self.on_unresolve_flow_request)
+        event_manager.register_request_handlers(self)
 
-        event_manager.assign_manager_to_request_type(GetFlowStateRequest, self.on_get_flow_state_request)
-        event_manager.assign_manager_to_request_type(GetIsFlowRunningRequest, self.on_get_is_flow_running_request)
-        event_manager.assign_manager_to_request_type(
-            ValidateFlowDependenciesRequest, self.on_validate_flow_dependencies_request
-        )
-        event_manager.assign_manager_to_request_type(GetTopLevelFlowRequest, self.on_get_top_level_flow_request)
-        event_manager.assign_manager_to_request_type(GetFlowDetailsRequest, self.on_get_flow_details_request)
-        event_manager.assign_manager_to_request_type(GetFlowMetadataRequest, self.on_get_flow_metadata_request)
-        event_manager.assign_manager_to_request_type(SetFlowMetadataRequest, self.on_set_flow_metadata_request)
-        event_manager.assign_manager_to_request_type(SerializeFlowToCommandsRequest, self.on_serialize_flow_to_commands)
-        event_manager.assign_manager_to_request_type(
-            DeserializeFlowFromCommandsRequest, self.on_deserialize_flow_from_commands
-        )
-        event_manager.assign_manager_to_request_type(
-            ExtractFlowCommandsFromImageMetadataRequest, self.on_extract_flow_commands_from_image_metadata
-        )
-        event_manager.assign_manager_to_request_type(
-            PackageNodesAsSerializedFlowRequest, self.on_package_nodes_as_serialized_flow_request
-        )
-        event_manager.assign_manager_to_request_type(StartLocalSubflowRequest, self.on_start_local_subflow_request)
         self._name_to_parent_name = {}
         self._flow_to_referenced_workflow_name = {}
         self._connections = Connections()
@@ -542,6 +505,7 @@ class FlowManager(EngineScoped):
         """
         return self._flow_to_referenced_workflow_name.get(flow)
 
+    @handles(GetTopLevelFlowRequest)
     def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
         for flow_name, parent in self._name_to_parent_name.items():
             if parent is None:
@@ -552,6 +516,7 @@ class FlowManager(EngineScoped):
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
 
+    @handles(GetFlowDetailsRequest)
     def on_get_flow_details_request(self, request: GetFlowDetailsRequest) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
@@ -591,6 +556,7 @@ class FlowManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(GetFlowMetadataRequest)
     def on_get_flow_metadata_request(self, request: GetFlowMetadataRequest) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
@@ -616,6 +582,7 @@ class FlowManager(EngineScoped):
 
         return GetFlowMetadataResultSuccess(metadata=metadata, result_details=details)
 
+    @handles(SetFlowMetadataRequest)
     def on_set_flow_metadata_request(self, request: SetFlowMetadataRequest) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
@@ -647,6 +614,7 @@ class FlowManager(EngineScoped):
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
         return any([parent is None for parent in self._name_to_parent_name.values()])  # noqa: C419
 
+    @handles(CreateFlowRequest)
     def on_create_flow_request(self, request: CreateFlowRequest) -> ResultPayload:
         # Who is the parent?
         parent_name = request.parent_flow_name
@@ -720,6 +688,7 @@ class FlowManager(EngineScoped):
         return result
 
     # This needs to have a lot of branches to check the flow in all possible situations. In Current Context, or when the name is passed in.
+    @handles(DeleteFlowRequest)
     def on_delete_flow_request(self, request: DeleteFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         flow_name = request.flow_name
         flow = None
@@ -824,6 +793,7 @@ class FlowManager(EngineScoped):
         result = DeleteFlowResultSuccess(result_details=details)
         return result
 
+    @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(self, request: GetIsFlowRunningRequest) -> ResultPayload:
         obj_mgr = self.engine.object_manager
         if request.flow_name is None:
@@ -844,6 +814,7 @@ class FlowManager(EngineScoped):
             is_running=is_running, result_details=f"Successfully checked if flow is running: {is_running}"
         )
 
+    @handles(ListNodesInFlowRequest)
     def on_list_nodes_in_flow_request(self, request: ListNodesInFlowRequest) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
@@ -877,6 +848,7 @@ class FlowManager(EngineScoped):
         result = ListNodesInFlowResultSuccess(node_names=ret_list, result_details=details)
         return result
 
+    @handles(ListFlowsInFlowRequest)
     def on_list_flows_in_flow_request(self, request: ListFlowsInFlowRequest) -> ResultPayload:
         if request.parent_flow_name is not None:
             # Does this Flow even exist?
@@ -931,6 +903,7 @@ class FlowManager(EngineScoped):
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
 
+    @handles(CreateConnectionRequest)
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         # Vet the two nodes first.
         source_node_name = request.source_node_name
@@ -1261,6 +1234,7 @@ class FlowManager(EngineScoped):
 
         return result
 
+    @handles(DeleteConnectionRequest)
     def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
         # Vet the two nodes first.
         source_node_name = request.source_node_name
@@ -1455,6 +1429,7 @@ class FlowManager(EngineScoped):
         dag_node = self._global_dag_builder.node_to_reference.get(node.name)
         return dag_node is not None and dag_node.node_state is NodeState.PROCESSING
 
+    @handles(PackageNodesAsSerializedFlowRequest)
     def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: PackageNodesAsSerializedFlowRequest
     ) -> ResultPayload:
@@ -2772,7 +2747,8 @@ class FlowManager(EngineScoped):
         sanitized_node_name = node_name.replace(" ", "_").replace(".", "_")
         return f"{prefix}{sanitized_node_name}_{parameter_name}"
 
-    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    @handles(StartFlowRequest)
+    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         # which flow
         flow_name = request.flow_name
         if not flow_name:
@@ -2859,35 +2835,11 @@ class FlowManager(EngineScoped):
                     validation_exceptions=[exception] if error_message else [], result_details=result_details
                 )
 
-        if request.wait_for_completion:
-            wait_error = await self._await_flow_completion(request.completion_timeout_ms)
-            if wait_error is not None:
-                # On timeout the flow is still running, so cancel it before returning
-                # failure. If the wait ended because the flow already errored, there is
-                # nothing left to cancel and check_for_existing_running_flow() returns False.
-                if self.check_for_existing_running_flow():
-                    try:
-                        await self.cancel_flow_run()
-                    except Exception as cancel_err:
-                        # Defensive: cancellation is best-effort cleanup. Surface a warning
-                        # but keep the original wait_error as the user-visible failure.
-                        logger.warning(
-                            "Attempted to cancel flow '%s' after wait_for_completion failure. "
-                            "Cancellation itself failed because of: %s",
-                            flow_name,
-                            cancel_err,
-                        )
-                exception = RuntimeError(wait_error)
-                return StartFlowResultFailure(
-                    validation_exceptions=[exception],
-                    result_details=f"Flow '{flow_name}' did not complete cleanly: {wait_error}",
-                )
-            details = f"Flow '{flow_name}' kicked off and completed successfully."
-        else:
-            details = f"Successfully kicked off flow with name {flow_name}"
+        details = f"Flow '{flow_name}' ran to completion."
 
         return StartFlowResultSuccess(result_details=details)
 
+    @handles(StartFlowFromNodeRequest)
     async def on_start_flow_from_node_request(self, request: StartFlowFromNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         # Resolve the node first, falling back to the current-context node when node_name is
         # omitted. flow_name on this request is deprecated; when not supplied we derive it
@@ -3086,6 +3038,7 @@ class FlowManager(EngineScoped):
             details = f"Cannot start subflow '{flow_name}'. Start node '{start_node_name}' not found: {err}"
             return StartLocalSubflowResultFailure(result_details=details)
 
+    @handles(StartLocalSubflowRequest)
     async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
         flow_name = request.flow_name
         if not flow_name:
@@ -3158,6 +3111,7 @@ class FlowManager(EngineScoped):
 
         return StartLocalSubflowResultSuccess(result_details=f"Successfully executed local subflow '{flow_name}'")
 
+    @handles(GetFlowStateRequest)
     def on_get_flow_state_request(self, event: GetFlowStateRequest) -> ResultPayload:
         flow_name = event.flow_name
         if not flow_name:
@@ -3182,6 +3136,7 @@ class FlowManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(CancelFlowRequest)
     async def on_cancel_flow_request(self, request: CancelFlowRequest) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
@@ -3204,6 +3159,7 @@ class FlowManager(EngineScoped):
 
         return CancelFlowResultSuccess(result_details=details)
 
+    @handles(SingleNodeStepRequest)
     async def on_single_node_step_request(self, request: SingleNodeStepRequest) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
@@ -3228,6 +3184,7 @@ class FlowManager(EngineScoped):
 
         return SingleNodeStepResultSuccess(result_details=details)
 
+    @handles(SingleExecutionStepRequest)
     async def on_single_execution_step_request(self, request: SingleExecutionStepRequest) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
@@ -3257,6 +3214,7 @@ class FlowManager(EngineScoped):
 
         return SingleExecutionStepResultSuccess(result_details=details)
 
+    @handles(ContinueExecutionStepRequest)
     async def on_continue_execution_step_request(self, request: ContinueExecutionStepRequest) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
@@ -3277,6 +3235,7 @@ class FlowManager(EngineScoped):
         details = f"Successfully continued flow with name {flow_name}"
         return ContinueExecutionStepResultSuccess(result_details=details)
 
+    @handles(UnresolveFlowRequest)
     def on_unresolve_flow_request(self, request: UnresolveFlowRequest) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
@@ -3295,6 +3254,7 @@ class FlowManager(EngineScoped):
         details = f"Unresolved flow with name {flow_name}"
         return UnresolveFlowResultSuccess(result_details=details)
 
+    @handles(ValidateFlowDependenciesRequest)
     async def on_validate_flow_dependencies_request(self, request: ValidateFlowDependenciesRequest) -> ResultPayload:
         flow_name = request.flow_name
         # get the flow name
@@ -3325,6 +3285,7 @@ class FlowManager(EngineScoped):
             result_details=f"Validated flow dependencies: {len(all_exceptions)} exceptions found",
         )
 
+    @handles(ListFlowsInCurrentContextRequest)
     def on_list_flows_in_current_context_request(self, request: ListFlowsInCurrentContextRequest) -> ResultPayload:  # noqa: ARG002 (request isn't actually used)
         if not self.engine.context_manager.has_current_flow():
             details = "Attempted to list Flows in the Current Context. Failed because the Current Context was empty."
@@ -3343,6 +3304,7 @@ class FlowManager(EngineScoped):
 
         return ListFlowsInCurrentContextResultSuccess(flow_names=ret_list, result_details=details)
 
+    @handles(AutoLayoutFlowRequest)
     async def on_auto_layout_flow_request(self, request: AutoLayoutFlowRequest) -> ResultPayload:  # noqa: C901, PLR0912
         """Assign editor positions to every node in a flow by topological column layout.
 
@@ -3752,6 +3714,7 @@ class FlowManager(EngineScoped):
 
     # TODO: https://github.com/griptape-ai/griptape-nodes/issues/861
     # similar manager refactors: https://github.com/griptape-ai/griptape-nodes/issues/806
+    @handles(SerializeFlowToCommandsRequest)
     def on_serialize_flow_to_commands(self, request: SerializeFlowToCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         flow_name = request.flow_name
         flow = None
@@ -4025,6 +3988,7 @@ class FlowManager(EngineScoped):
         result = SerializeFlowToCommandsResultSuccess(serialized_flow_commands=serialized_flow, result_details=details)
         return result
 
+    @handles(DeserializeFlowFromCommandsRequest)
     def on_deserialize_flow_from_commands(self, request: DeserializeFlowFromCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912 (I am big and complicated and have a lot of negative edge-cases)
         # Do we want to create a NEW Flow to deserialize into, or use the one in the Current Context?
         if request.serialized_flow_commands.flow_initialization_command is None:
@@ -4553,6 +4517,7 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
 
+    @handles(ExtractFlowCommandsFromImageMetadataRequest)
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest
     ) -> ResultPayload:
@@ -4702,28 +4667,6 @@ class FlowManager(EngineScoped):
             self._global_control_flow_machine.is_advancing
             or self._global_control_flow_machine.resolution_machine.is_advancing
         )
-
-    async def _await_flow_completion(self, timeout_ms: int | None) -> str | None:
-        """Block until the current flow resolves, erroring, or the timeout elapses.
-
-        Polls `check_for_existing_running_flow()` because the control flow machine does not
-        expose a completion future today; this is the same signal the UI uses to decide when
-        the run is idle. Returns None on clean completion, or an error string describing why
-        the wait ended unsuccessfully (timeout, or flow error).
-        """
-        poll_interval_sec = 0.05
-        elapsed_ms = 0
-        while self.check_for_existing_running_flow():
-            if timeout_ms is not None and elapsed_ms >= timeout_ms:
-                return f"Timed out waiting for flow completion after {timeout_ms} ms."
-            await asyncio.sleep(poll_interval_sec)
-            elapsed_ms += int(poll_interval_sec * 1000)
-
-        if self._global_control_flow_machine is not None:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
-            if resolution_machine.is_errored():
-                return resolution_machine.get_error_message() or "Flow errored during execution."
-        return None
 
     async def cancel_flow_run(self) -> None:
         if not self.check_for_existing_running_flow():
