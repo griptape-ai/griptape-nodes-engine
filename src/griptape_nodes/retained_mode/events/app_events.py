@@ -305,6 +305,22 @@ class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
+class WorkflowRegistryChanged(AppPayload):
+    """Notification that the workflow registry changed without a client asking it to.
+
+    Emitted when a library's workflows enter the registry (engine start, library install, library
+    reload) or leave it (library uninstall), and when the workspace is rescanned (engine start,
+    switching to a project with a different workspace). A client showing the workflow list refetches
+    it on this.
+
+    Enqueued with `put_event`, like `EngineReadyEvent`, so it reaches the application layer and
+    the GUI. In-process subscribers registered via `add_listener_to_app_event` do not see it --
+    those fire only for events passed to `broadcast_app_event`.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
 class ConfigChanged(AppPayload):
     """Configuration value changed notification.
 

@@ -10,11 +10,24 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- Clients showing the workflow list are told when it changes without them asking, by the new
+  `WorkflowRegistryChanged` app event: when a library's templates come or go, and when the
+  workspace is rescanned.
+- `RegisterWorkflowRequest` takes a `library_name`, which ties the entry to that library: it goes
+  away when the library unloads, and survives a workspace rescan. Leave it unset for workflows the
+  user creates.
+
 ### Changed
 
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
+- Saving a workflow template that came from a library now always writes a new copy in the workspace,
+  leaving the library's file as the author shipped it. Before, only templates from Griptape's own
+  libraries were protected this way; a template from any other library was overwritten in place. A
+  workflow the user marked `is_template` themselves still saves normally.
 
 ### Fixed
 
@@ -30,6 +43,19 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- Installing a library mid-session puts its workflow templates in the workflow picker, and
+  uninstalling one takes them out again, without restarting the engine. Updating or reloading a
+  library picks up edits to its template files. Before, templates only appeared at engine start, an
+  uninstalled library kept offering them, and an install -> uninstall -> reinstall cycle piled up
+  stale entries.
+  [#3448](https://github.com/griptape-ai/griptape-nodes-engine/issues/3448)
+- Templates from libraries other than Griptape's own stay in the workflow picker. Before, they
+  dropped out whenever the workspace was rescanned, which happens at engine start and whenever the
+  workspace folder changes.
+- The library problems a workflow reports, such as needing a library you do not have installed or
+  a newer version of one, now follow libraries being installed, updated, or uninstalled
+  mid-session. Before, whichever verdict was reached when the workflow was first read stood for the
+  rest of the session.
 
 ## [0.103.0] - 2026-09-29
 
