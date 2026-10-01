@@ -218,16 +218,16 @@ class TestQueriesDuringLibraryReload:
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
         failed_unload = ReloadAllLibrariesResultFailure(result_details="unload failed")
-        real_ahandle_request = engine.ahandle_request
+        real_handle_request = engine.handle_request
 
-        async def refuse_unload(request: RequestPayload) -> ResultPayload:
+        def refuse_unload(request: RequestPayload) -> ResultPayload:
             if isinstance(request, UnloadLibraryFromRegistryRequest):
                 return failed_unload
-            return await real_ahandle_request(request)
+            return real_handle_request(request)
 
         with (
             patch.object(library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])) as load_all,
-            patch.object(library_manager.engine, "ahandle_request", side_effect=refuse_unload),
+            patch.object(library_manager.engine, "handle_request", side_effect=refuse_unload),
         ):
             result = await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
 

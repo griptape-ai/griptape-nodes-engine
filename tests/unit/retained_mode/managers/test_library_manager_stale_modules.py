@@ -7,7 +7,6 @@ engine has to say so, because nothing about the raw ImportError suggests it.
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -87,9 +86,7 @@ def _first_detail_message(result: ResultPayload) -> str:
 
 
 def _unload(manager: LibraryManager) -> None:
-    result = asyncio.run(
-        manager.unload_library_from_registry_request(UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME))
-    )
+    result = manager.unload_library_from_registry_request(UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME))
     assert result.succeeded()
 
 

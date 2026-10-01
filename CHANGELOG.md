@@ -40,8 +40,9 @@ the engine's request API from working without edits. Migration steps live in
 - Custom traits can keep settings a node changes at runtime, such as a narrowed range, when the
   workflow is saved and reopened, by implementing `to_state()` and `apply_state()`. See
   [MIGRATION.md](MIGRATION.md#traits-can-save-runtime-state).
-- Clients showing the workflow list are told when a library's templates come or go, by the new
-  `LibraryWorkflowsChanged` app event, instead of finding out the next time they ask.
+- Clients showing the workflow list are told when it changes without them asking, by the new
+  `WorkflowRegistryChanged` app event: when a library's templates come or go, and when the
+  workspace is rescanned.
 - `RegisterWorkflowRequest` takes a `library_name`, which ties the entry to that library: it goes
   away when the library unloads, and survives a workspace rescan. Leave it unset for workflows the
   user creates.
@@ -122,9 +123,10 @@ the engine's request API from working without edits. Migration steps live in
 - Templates from libraries other than Griptape's own stay in the workflow picker. Before, they
   dropped out whenever the workspace was rescanned, which happens at engine start and whenever the
   workspace folder changes.
-- A template that reports needing a library you do not have installed stops saying so once that
-  library is installed, and starts saying so when the library is uninstalled. Before, whichever
-  verdict was reached when the template was first read stood for the rest of the session.
+- The library problems a workflow reports, such as needing a library you do not have installed or
+  a newer version of one, now follow libraries being installed, updated, or uninstalled
+  mid-session. Before, whichever verdict was reached when the workflow was first read stood for the
+  rest of the session.
 
 [Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...HEAD
 [0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0

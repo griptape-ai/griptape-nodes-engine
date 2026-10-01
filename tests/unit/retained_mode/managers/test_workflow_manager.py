@@ -29,7 +29,7 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.library_events import GetLibraryMetadataResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -1730,97 +1730,85 @@ class TestWorkflowManager:
         assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
 
     @pytest.mark.asyncio
-    async def test_refreshing_verdicts_clears_a_dependency_that_has_since_arrived(
-        self, engine: Engine, tmp_path: Path
-    ) -> None:
-        """The verdict is computed when the header is read and cached until it is read again.
-
-        So a template registered while a library it names was uninstalled keeps saying so for the
-        rest of the session, even once that library is installed. The refresh is what re-reads it.
-        """
+    async def test_a_verdict_is_judged_again_once_a_library_arrives(self, engine: Engine, tmp_path: Path) -> None:
+        """A workflow judged while a library it names was missing stops saying so once it arrives."""
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
         engine.library_manager._libraries_loading_complete.set()
-        workflow_path = _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Late Library")
+        _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Late Library")
 
-        await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name="needs_a_library.py"))
-        flagged = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        flagged = await workflow_manager._get_current_workflow_info("needs_a_library.py")
+        assert flagged is not None
         assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in flagged.problems)
 
         with _library_installed(engine, "Late Library"):
-            await workflow_manager.refresh_verdicts_for_library("Late Library")
+            workflow_manager.note_library_set_changed()
+            settled = await workflow_manager._get_current_workflow_info("needs_a_library.py")
 
-        settled = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert settled is not None
         assert not any(isinstance(problem, LibraryNotRegisteredProblem) for problem in settled.problems)
         assert [dependency.status for dependency in settled.workflow_dependencies] == [WorkflowDependencyStatus.PERFECT]
 
     @pytest.mark.asyncio
-    async def test_refreshing_verdicts_flags_a_dependency_that_has_gone_away(
-        self, engine: Engine, tmp_path: Path
-    ) -> None:
-        """The other direction: uninstall a library and the workflows needing it said they were fine.
-
-        Same cached verdict, so the same refresh has to settle both -- which is why it goes by the
-        library a workflow names rather than by the problem that was recorded.
-        """
+    async def test_a_verdict_is_judged_again_once_a_library_leaves(self, engine: Engine, tmp_path: Path) -> None:
+        """The other direction: uninstall a library and the workflows needing it stop saying they are fine."""
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
         engine.library_manager._libraries_loading_complete.set()
-        workflow_path = _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Departing Library")
+        _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Departing Library")
 
         with _library_installed(engine, "Departing Library"):
-            await workflow_manager.on_load_workflow_metadata_request(
-                LoadWorkflowMetadata(file_name="needs_a_library.py")
-            )
-        healthy = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+            healthy = await workflow_manager._get_current_workflow_info("needs_a_library.py")
+        assert healthy is not None
         assert [dependency.status for dependency in healthy.workflow_dependencies] == [WorkflowDependencyStatus.PERFECT]
 
-        await workflow_manager.refresh_verdicts_for_library("Departing Library")
+        workflow_manager.note_library_set_changed()
+        settled = await workflow_manager._get_current_workflow_info("needs_a_library.py")
 
-        settled = workflow_manager._workflow_file_path_to_info[str(workflow_path)]
+        assert settled is not None
         assert settled.status is WorkflowManager.WorkflowStatus.FLAWED
         assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in settled.problems)
 
     @pytest.mark.asyncio
-    async def test_refreshing_verdicts_leaves_workflows_naming_another_library_alone(
-        self, engine: Engine, tmp_path: Path
-    ) -> None:
-        """Only the workflows that name the library are re-read, and re-reading means a file read each."""
+    async def test_an_unchanged_library_set_serves_the_cached_verdict(self, engine: Engine, tmp_path: Path) -> None:
+        """Judging re-reads the file, so a verdict nothing has invalidated is not judged again."""
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
         engine.library_manager._libraries_loading_complete.set()
-        _write_workflow_naming_library(tmp_path, "needs_this_one.py", "Arriving Library")
-        _write_workflow_naming_library(tmp_path, "needs_another.py", "Unrelated Library")
-        for file_name in ("needs_this_one.py", "needs_another.py"):
-            await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_name))
+        _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Some Library")
+        await workflow_manager._get_current_workflow_info("needs_a_library.py")
 
-        with patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock()) as reread:
-            await workflow_manager.refresh_verdicts_for_library("Arriving Library")
+        with patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock()) as rejudge:
+            cached = await workflow_manager._get_current_workflow_info("needs_a_library.py")
 
-        assert [call_args.args[0].file_name for call_args in reread.call_args_list] == [
-            str(tmp_path / "needs_this_one.py")
-        ]
+        assert cached is not None
+        rejudge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_forgetting_verdicts_drops_the_rows_for_unregistered_workflows(
+    async def test_a_library_changing_mid_judgement_leaves_the_verdict_stale(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        """An unloaded library's templates leave the registry, so nothing can ask about them again.
-
-        Their verdicts would otherwise sit in the cache for the life of the process, and every later
-        refresh would re-read files from a library that is gone.
-        """
+        """Judging awaits, so a library can finish loading part way through; that verdict must not count as current."""
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path
         engine.library_manager._libraries_loading_complete.set()
-        _write_workflow_naming_library(tmp_path, "template.py", "Departing Library")
-        _write_workflow_naming_library(tmp_path, "mine.py", "Departing Library")
-        for file_name in ("template.py", "mine.py"):
-            await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_name))
+        _write_workflow_naming_library(tmp_path, "needs_a_library.py", "Some Library")
+        real_judge = workflow_manager._judge_workflow_file
 
-        workflow_manager.forget_verdicts_for_workflows(["template.py"])
+        async def judge_while_a_library_loads(request: LoadWorkflowMetadata) -> ResultPayload:
+            result = await real_judge(request)
+            workflow_manager.note_library_set_changed()
+            return result
 
-        assert list(workflow_manager._workflow_file_path_to_info) == [str(tmp_path / "mine.py")]
+        with patch.object(workflow_manager, "_judge_workflow_file", side_effect=judge_while_a_library_loads):
+            await workflow_manager.on_load_workflow_metadata_request(
+                LoadWorkflowMetadata(file_name="needs_a_library.py")
+            )
+
+        with patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock()) as rejudge:
+            await workflow_manager._get_current_workflow_info("needs_a_library.py")
+
+        rejudge.assert_awaited_once()
 
     # --- WorkflowInfo payload helpers ---
 
@@ -1908,32 +1896,39 @@ class TestWorkflowManager:
 
     # --- GetWorkflowInfoRequest ---
 
-    def test_on_get_workflow_info_request_workflow_not_in_registry_fails(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_on_get_workflow_info_request_workflow_not_in_registry_fails(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest with unknown workflow_name returns failure."""
         workflow_manager = engine.workflow_manager
         request = GetWorkflowInfoRequest(workflow_name="missing_workflow")
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", side_effect=KeyError("not found")):
-            result = workflow_manager.on_get_workflow_info_request(request)
+            result = await workflow_manager.on_get_workflow_info_request(request)
 
         assert isinstance(result, GetWorkflowInfoResultFailure)
         assert "missing_workflow" in str(result.result_details)
 
-    def test_on_get_workflow_info_request_no_info_for_path_fails(self, engine: Engine) -> None:
-        """GetWorkflowInfoRequest returns failure when no WorkflowInfo is stored for the resolved path."""
+    @pytest.mark.asyncio
+    async def test_on_get_workflow_info_request_judges_a_workflow_with_no_verdict_yet(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Registering only reads a header, so the first request for a workflow's info judges it."""
         workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
         request = GetWorkflowInfoRequest(workflow_name="my_workflow")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow):
-            # _workflow_file_path_to_info is empty, so no info will be found
-            result = workflow_manager.on_get_workflow_info_request(request)
+            # Nothing is on disk, so the verdict judged here is that the file is missing.
+            result = await workflow_manager.on_get_workflow_info_request(request)
 
-        assert isinstance(result, GetWorkflowInfoResultFailure)
+        assert isinstance(result, GetWorkflowInfoResultSuccess)
+        assert result.status == WorkflowStatus.MISSING
 
-    def test_on_get_workflow_info_request_success(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_on_get_workflow_info_request_success(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest succeeds when WorkflowInfo exists for the workflow."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
@@ -1953,7 +1948,7 @@ class TestWorkflowManager:
         workflow_manager._workflow_file_path_to_info[info_key] = wf_info
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow):
-            result = workflow_manager.on_get_workflow_info_request(request)
+            result = await workflow_manager.on_get_workflow_info_request(request)
 
         assert isinstance(result, GetWorkflowInfoResultSuccess)
         assert result.status == "GOOD"
@@ -1963,18 +1958,20 @@ class TestWorkflowManager:
 
     # --- ListAllWorkflowInfoRequest ---
 
-    def test_on_list_all_workflow_info_request_registry_failure(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_on_list_all_workflow_info_request_registry_failure(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest returns failure when listing workflows raises."""
         workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
 
         with patch.object(WorkflowRegistry, "list_workflows", side_effect=Exception("registry error")):
-            result = workflow_manager.on_list_all_workflow_info_request(request)
+            result = await workflow_manager.on_list_all_workflow_info_request(request)
 
         assert isinstance(result, ListAllWorkflowInfoResultFailure)
         assert "registry error" in str(result.result_details)
 
-    def test_on_list_all_workflow_info_request_success(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_on_list_all_workflow_info_request_success(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest returns info for every workflow that has a stored WorkflowInfo."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
@@ -1997,15 +1994,19 @@ class TestWorkflowManager:
             patch.object(WorkflowRegistry, "list_workflows", return_value=["my_workflow"]),
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
         ):
-            result = workflow_manager.on_list_all_workflow_info_request(request)
+            result = await workflow_manager.on_list_all_workflow_info_request(request)
 
         assert isinstance(result, ListAllWorkflowInfoResultSuccess)
         assert "my_workflow" in result.workflow_infos
         assert result.workflow_infos["my_workflow"].status == "GOOD"
 
-    def test_on_list_all_workflow_info_request_skips_workflows_without_info(self, engine: Engine) -> None:
-        """ListAllWorkflowInfoRequest omits workflows that have no stored WorkflowInfo."""
+    @pytest.mark.asyncio
+    async def test_on_list_all_workflow_info_request_judges_workflows_with_no_verdict_yet(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A registered workflow nobody has asked about yet is judged, not left out."""
         workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
         request = ListAllWorkflowInfoRequest()
 
         mock_workflow = MagicMock()
@@ -2015,13 +2016,13 @@ class TestWorkflowManager:
             patch.object(WorkflowRegistry, "list_workflows", return_value=["my_workflow"]),
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
         ):
-            # _workflow_file_path_to_info is empty, so the workflow is skipped
-            result = workflow_manager.on_list_all_workflow_info_request(request)
+            result = await workflow_manager.on_list_all_workflow_info_request(request)
 
         assert isinstance(result, ListAllWorkflowInfoResultSuccess)
-        assert result.workflow_infos == {}
+        assert result.workflow_infos["my_workflow"].status == WorkflowStatus.MISSING
 
-    def test_on_list_all_workflow_info_request_skips_unknown_registry_keys(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_on_list_all_workflow_info_request_skips_unknown_registry_keys(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest skips registry keys that can't be looked up."""
         workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
@@ -2030,7 +2031,7 @@ class TestWorkflowManager:
             patch.object(WorkflowRegistry, "list_workflows", return_value=["ghost_workflow"]),
             patch.object(WorkflowRegistry, "get_workflow_by_name", side_effect=KeyError("not found")),
         ):
-            result = workflow_manager.on_list_all_workflow_info_request(request)
+            result = await workflow_manager.on_list_all_workflow_info_request(request)
 
         assert isinstance(result, ListAllWorkflowInfoResultSuccess)
         assert result.workflow_infos == {}

@@ -59,6 +59,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultSuccess,
     InitializationPhase,
     InitializationStatus,
+    WorkflowRegistryChanged,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -337,6 +338,8 @@ class WorkflowManager(EngineScoped):
         workflow_name: str | None = None
         workflow_dependencies: list[WorkflowDependencyInfo] = field(default_factory=list)
         problems: list[WorkflowProblem] = field(default_factory=list)
+        # The library set this verdict was judged against; see `note_library_set_changed`.
+        library_set_generation: int = 0
 
     _workflow_file_path_to_info: dict[str, WorkflowInfo]
 
@@ -490,6 +493,9 @@ class WorkflowManager(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
+        # Bumped whenever a library finishes loading or unloads. A cached verdict judged against
+        # an older generation is judged again the next time someone asks for it.
+        self._library_set_generation = 0
         self._squelch_workflow_altered_count = 0
         self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
@@ -751,6 +757,8 @@ class WorkflowManager(EngineScoped):
                     config_mgr.set_config_value(default_workflow_section, workflows_to_register)
         finally:
             self._workflows_loading_complete.set()
+
+        self._announce_workflow_registry_changed()
 
     def get_workflow_metadata(self, workflow_file_path: Path, block_name: str) -> list[re.Match[str]]:
         """Get the workflow metadata for a given workflow file path.
@@ -1623,7 +1631,7 @@ class WorkflowManager(EngineScoped):
             workflow_dependencies=wf_info.workflow_dependencies,
         )
 
-    def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
+    async def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
         except KeyError:
@@ -1643,14 +1651,13 @@ class WorkflowManager(EngineScoped):
             )
 
         workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-
-        if workflow_file_path not in self._workflow_file_path_to_info:
+        wf_info = await self._get_current_workflow_info(workflow.file_path)
+        if wf_info is None:
             details = (
                 f"Attempted to get workflow info. Failed because no info was found for path '{workflow_file_path}'."
             )
             return GetWorkflowInfoResultFailure(result_details=details)
 
-        wf_info = self._workflow_file_path_to_info[workflow_file_path]
         payload = self._build_workflow_info_payload(wf_info)
         return GetWorkflowInfoResultSuccess(
             status=payload.status,
@@ -1661,7 +1668,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved workflow info for '{workflow_file_path}'.",
         )
 
-    def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
+    async def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = WorkflowRegistry.list_workflows()
         except Exception as e:
@@ -1677,8 +1684,7 @@ class WorkflowManager(EngineScoped):
             # Unsaved workflows are registry-only (no on-disk metadata to summarize).
             if workflow.file_path is None:
                 continue
-            workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-            wf_info = self._workflow_file_path_to_info.get(workflow_file_path)
+            wf_info = await self._get_current_workflow_info(workflow.file_path)
             if wf_info is None:
                 continue
             workflow_infos[registry_key] = self._build_workflow_info_payload(wf_info)
@@ -1687,6 +1693,20 @@ class WorkflowManager(EngineScoped):
             workflow_infos=workflow_infos,
             result_details=f"Successfully retrieved workflow info for {len(workflow_infos)} workflows.",
         )
+
+    async def _get_current_workflow_info(self, file_path: str) -> WorkflowInfo | None:
+        """The verdict for a workflow file, judged again if the library set changed since.
+
+        Judging goes through `on_load_workflow_metadata_request`, which waits for any library
+        load in flight, so a verdict is never judged against a half-loaded set.
+        """
+        workflow_info_key = self._build_workflow_info_key(file_path)
+        cached_info = self._workflow_file_path_to_info.get(workflow_info_key)
+        if cached_info is not None and cached_info.library_set_generation == self._library_set_generation:
+            return cached_info
+
+        await self.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_path))
+        return self._workflow_file_path_to_info.get(workflow_info_key)
 
     def on_get_workflow_metadata_request(self, request: GetWorkflowMetadataRequest) -> ResultPayload:
         try:
@@ -2062,14 +2082,25 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
-    async def on_load_workflow_metadata_request(  # noqa: C901, PLR0912, PLR0915
-        self, request: LoadWorkflowMetadata
-    ) -> ResultPayload:
+    async def on_load_workflow_metadata_request(self, request: LoadWorkflowMetadata) -> ResultPayload:
         # The editor can send LoadWorkflowMetadata before library registration finishes
         # (observed on Windows, engine cold start). Without this gate, the dependency
-        # check below would race LibraryRegistry and return LibraryNotRegisteredProblem
+        # check would race LibraryRegistry and return LibraryNotRegisteredProblem
         # for libraries that are milliseconds from being registered.
         await self.engine.library_manager._libraries_loading_complete.wait()
+        # Read before judging, so a library changing mid-judgement leaves the verdict stale
+        # rather than current.
+        library_set_generation = self._library_set_generation
+        result = await self._judge_workflow_file(request)
+        workflow_info = self._workflow_file_path_to_info.get(self._build_workflow_info_key(request.file_name))
+        if workflow_info is not None:
+            workflow_info.library_set_generation = library_set_generation
+        return result
+
+    async def _judge_workflow_file(  # noqa: C901, PLR0912, PLR0915
+        self, request: LoadWorkflowMetadata
+    ) -> ResultPayload:
+        """Read a workflow's header and record how it fares against the loaded libraries."""
         # Let us go into the darkness.
         complete_file_path = self.engine.config_manager.workspace_path.joinpath(request.file_name)
         str_path = str(complete_file_path)
@@ -2092,18 +2123,8 @@ class WorkflowManager(EngineScoped):
 
         # We have valid dependencies, etc.
         # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
-        problems = []
+        problems = self._default_missing_dates(workflow_metadata)
         had_critical_error = False
-
-        # Confirm dates are correct.
-        if workflow_metadata.creation_date is None:
-            # Assign it to the epoch start and flag it as a warning.
-            workflow_metadata.creation_date = WorkflowManager.EPOCH_START
-            problems.append(MissingCreationDateProblem(default_date=str(WorkflowManager.EPOCH_START)))
-        if workflow_metadata.last_modified_date is None:
-            # Assign it to the epoch start and flag it as a warning.
-            workflow_metadata.last_modified_date = WorkflowManager.EPOCH_START
-            problems.append(MissingLastModifiedDateProblem(default_date=str(WorkflowManager.EPOCH_START)))
 
         list_libraries_result = await self.engine.ahandle_request(
             ListRegisteredLibrariesRequest(broadcast_result=False)
@@ -2283,6 +2304,17 @@ class WorkflowManager(EngineScoped):
             metadata=workflow_metadata, result_details="Workflow metadata loaded successfully."
         )
 
+    def _default_missing_dates(self, workflow_metadata: WorkflowMetadata) -> list[WorkflowProblem]:
+        """Fill in a missing creation or modification date with the epoch start, flagging each one."""
+        problems: list[WorkflowProblem] = []
+        if workflow_metadata.creation_date is None:
+            workflow_metadata.creation_date = WorkflowManager.EPOCH_START
+            problems.append(MissingCreationDateProblem(default_date=str(WorkflowManager.EPOCH_START)))
+        if workflow_metadata.last_modified_date is None:
+            workflow_metadata.last_modified_date = WorkflowManager.EPOCH_START
+            problems.append(MissingLastModifiedDateProblem(default_date=str(WorkflowManager.EPOCH_START)))
+        return problems
+
     def _read_workflow_metadata_for_request(
         self, workflow_file_path: Path, workflow_path: str
     ) -> WorkflowMetadata | LoadWorkflowMetadataResultFailure:
@@ -2364,38 +2396,32 @@ class WorkflowManager(EngineScoped):
         Pass `library_name` when the paths come from that library's `workflows` list, so the
         registry ties the resulting entries to the library's lifetime.
         """
-        return await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
+        registration = await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
+        if registration.succeeded:
+            self._announce_workflow_registry_changed()
+        return registration
 
-    async def refresh_verdicts_for_library(self, library_name: str) -> None:
-        """Re-read the header of every workflow recorded as depending on the named library.
+    def remove_library_workflows(self, library_name: str) -> None:
+        """Take every workflow `library_name` contributed out of the registry, with its verdict."""
+        removed = WorkflowRegistry.remove_workflows_from_library(library_name)
+        if not removed.registry_keys:
+            return
 
-        A workflow's dependency verdict is computed once, when its metadata is read, and cached
-        until it is read again, so a library arriving or leaving does not on its own change what
-        the workflow list says about it. Called whenever a library's presence or version changes,
-        which is exactly when those verdicts stop being true.
-
-        Only the workflows naming that library are re-read, found through the dependencies each
-        verdict already records; a library changing does not re-parse every workflow on disk.
-        """
-        stale_paths = [
-            workflow_path
-            for workflow_path, workflow_info in self._workflow_file_path_to_info.items()
-            if any(dependency.library_name == library_name for dependency in workflow_info.workflow_dependencies)
-        ]
-        for workflow_path in stale_paths:
-            # The keys are already absolute, and on_load_workflow_metadata_request joins its
-            # file_name onto the workspace, which leaves an absolute path alone, so the recompute
-            # lands back on the same key.
-            await self.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=workflow_path))
-
-    def forget_verdicts_for_workflows(self, workflow_file_paths: list[str]) -> None:
-        """Drop the cached verdicts for workflows that are no longer registered.
-
-        Nothing can ask about them again, and leaving the rows behind means every later refresh
-        re-reads files belonging to a library that is gone.
-        """
-        for workflow_file_path in workflow_file_paths:
+        for workflow_file_path in removed.file_paths:
             self._workflow_file_path_to_info.pop(self._build_workflow_info_key(workflow_file_path), None)
+        self._announce_workflow_registry_changed()
+
+    def note_library_set_changed(self) -> None:
+        """Mark every cached verdict stale, because a library finished loading or unloaded.
+
+        A verdict depends on which libraries are loaded, at which versions, and with which nodes,
+        so any of them changing can change it, in either direction.
+        """
+        self._library_set_generation += 1
+
+    def _announce_workflow_registry_changed(self) -> None:
+        """Tell clients showing the workflow list that the registry changed without them asking."""
+        self.engine.event_manager.put_event(AppEvent(payload=WorkflowRegistryChanged()))
 
     def _register_workflow(
         self,
@@ -7197,7 +7223,9 @@ class WorkflowManager(EngineScoped):
         already_registered = {
             workflow_file
             for workflow_file in all_workflow_files
-            if WorkflowRegistry.has_workflow_with_name(self._derive_registry_key_for_file(workflow_file))
+            if WorkflowRegistry.has_workflow_with_name(
+                self._derive_registry_key_for_file(workflow_file, library_name=library_name)
+            )
         }
         for workflow_file in already_registered:
             logger.debug("Skipping already registered workflow: %s", workflow_file)
@@ -7209,7 +7237,7 @@ class WorkflowManager(EngineScoped):
         # The WORKFLOWS phase of EngineInitializationProgress is the boot channel: the editor
         # reads any of it as the engine still initializing, which blanks the workflow picker and
         # sets it re-polling the registry. A library registering mid-session announces itself with
-        # LibraryWorkflowsChanged instead.
+        # WorkflowRegistryChanged instead.
         report_progress = library_name is None
 
         # Second pass: process each workflow file with progress events
@@ -7351,29 +7379,38 @@ class WorkflowManager(EngineScoped):
         Returns:
             Workflow name if registered successfully, None if it could not be registered
         """
-        # Parse metadata once and use it for both registration check and actual registration
-        load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_file))
-        load_metadata_result = await self.on_load_workflow_metadata_request(load_metadata_request)
-
-        if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-            logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
+        # Only the header is read here. Judging it against the loaded libraries waits until
+        # someone asks (see `_get_current_workflow_info`), because a library registering its
+        # workflows mid-load would otherwise judge them against a half-loaded set.
+        try:
+            workflow_metadata = read_workflow_metadata(workflow_file)
+        except WorkflowMetadataError as err:
+            logger.debug("Skipping workflow with invalid metadata: %s (%s)", workflow_file, err)
             return None
+        self._default_missing_dates(workflow_metadata)
 
-        file_path_to_register = self._relative_to_workspace_if_inside(workflow_file)
+        file_path_to_register = self._registry_file_path(workflow_file, library_name=library_name)
         registry_key = derive_registry_key(file_path_to_register)
 
-        # Hand the already-parsed metadata to the registrar so the file's TOML header is
-        # read once per workflow rather than twice.
-        if self._register_workflow(file_path_to_register, load_metadata_result.metadata, library_name=library_name):
-            return registry_key
-        return None
+        if not self._register_workflow(file_path_to_register, workflow_metadata, library_name=library_name):
+            return None
 
-    def _derive_registry_key_for_file(self, workflow_file: Path) -> str:
+        # The file may have changed since its verdict was last judged.
+        self._workflow_file_path_to_info.pop(self._build_workflow_info_key(file_path_to_register), None)
+        return registry_key
+
+    def _derive_registry_key_for_file(self, workflow_file: Path, *, library_name: str | None) -> str:
         """The registry key a file on disk would register under."""
-        return derive_registry_key(self._relative_to_workspace_if_inside(workflow_file))
+        return derive_registry_key(self._registry_file_path(workflow_file, library_name=library_name))
 
-    def _relative_to_workspace_if_inside(self, workflow_file: Path) -> str:
-        """Spell a workflow path the way the registry keys it: workspace-relative when it can be."""
+    def _registry_file_path(self, workflow_file: Path, *, library_name: str | None) -> str:
+        """Spell a workflow path the way the registry keys it.
+
+        A library's files stay where they are when the workspace moves, so they are keyed by
+        their absolute path. The workspace's own files are keyed relative to it.
+        """
+        if library_name is not None:
+            return str(workflow_file)
         workspace_path = self.engine.config_manager.workspace_path
         if workflow_file.is_relative_to(workspace_path):
             return str(workflow_file.relative_to(workspace_path))
