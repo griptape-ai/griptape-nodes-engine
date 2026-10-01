@@ -10,11 +10,22 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- A saved workflow placed in the sandbox library folder now appears as a node in the Sandbox
+  Library, with the workflow's Start Flow and End Flow parameters as its inputs and outputs, so it
+  can be reused inside another workflow. `RegisterSandboxNodeFromSourceRequest` accepts a saved
+  workflow too. See "Turning a workflow into a node" in the libraries guide.
+  [#5657](https://github.com/griptape-ai/griptape-nodes-engine/issues/5657)
+
 ### Changed
 
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
+- The sandbox library now loads nodes from folders linked into it, and `~` and environment
+  variables in `sandbox_library_directory` are expanded. A value that starts with `$` is still read
+  as a secret name.
 
 ### Fixed
 
@@ -30,6 +41,12 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- Saved workflows in the sandbox library folder are no longer run when the engine starts. Before,
+  a workflow saved in an older format could make itself the workflow the editor opened on every
+  launch.
+  [#5656](https://github.com/griptape-ai/griptape-nodes-engine/issues/5656)
+- A workflow used by a workflow node no longer appears twice in the workflow list when it is inside
+  the workspace.
 
 ## [0.103.0] - 2026-09-29
 

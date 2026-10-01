@@ -860,9 +860,14 @@ def _anchor_and_resolve(expanded: Path, base: Path | None) -> Path:
     ``canonicalize_expanded_for_identity``: the two differ only in whether they
     sanitize and expand first, and must not drift in what they do afterwards.
     """
+    return _anchor(expanded, base).resolve(strict=False)
+
+
+def _anchor(expanded: Path, base: Path | None) -> Path:
+    """Anchor a relative path to ``base`` (default CWD) and normalize it, following no symlinks."""
     if not expanded.is_absolute():
         expanded = (base if base is not None else Path.cwd()) / expanded
-    return resolve_path_safely(expanded).resolve(strict=False)
+    return resolve_path_safely(expanded)
 
 
 def canonicalize_expanded_for_identity(expanded: Path, *, base: Path | None = None) -> Path:
@@ -909,6 +914,26 @@ def canonicalize_for_identity(path: str | Path, *, base: Path | None = None) -> 
         Canonical absolute Path.
     """
     return _anchor_and_resolve(expand_path(sanitize_path_string(path)), base)
+
+
+def canonicalize_for_identity_preserving_symlinks(path: str | Path, *, base: Path | None = None) -> Path:
+    """Produce a path identity that names a symlink by the link rather than by its target.
+
+    Everything ``canonicalize_for_identity`` does except the final symlink resolution (and, like it,
+    without the Windows long-path prefix), so the result is still fit to be a key.
+
+    Use only where the link is the identity the engine already uses: directory scans report a
+    linked file by the link's path, so resolving it would place the file where no scan looked.
+
+    Args:
+        path: Raw path string or Path object (may contain ~, env vars, quotes,
+            shell escapes, or relative segments).
+        base: Base directory for relative paths. Defaults to ``Path.cwd()``.
+
+    Returns:
+        Absolute, normalized Path with any symlinks along it left intact.
+    """
+    return _anchor(expand_path(sanitize_path_string(path)), base)
 
 
 def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:

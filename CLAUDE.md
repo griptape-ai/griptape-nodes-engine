@@ -59,9 +59,11 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Use `canonicalize_for_identity` for keys** - When a path is about to become a dict key, cache key, dedupe-set member, or workspace-containment input, call `canonicalize_for_identity(path)` from `griptape_nodes.files.path_utils`. It sanitizes + expands `~`/env vars + absolutizes + follows symlinks, so two spellings of the same file collide. Prefer it over ad-hoc `Path(x).resolve()`, which skips `expanduser` and causes identity drift.
 
+**Use `canonicalize_for_identity_preserving_symlinks` when the link is the identity** - A directory scan names a file by the link it was reached through, so paths that must match a scan (such as workflow registry keys and the sandbox library's paths) keep the link: use `canonicalize_for_identity_preserving_symlinks(path, base=...)`, which does everything `canonicalize_for_identity` does except follow symlinks.
+
 **Use `canonicalize_for_io` for OS-level I/O** - Reach for `canonicalize_for_io(path)` only when handing a path directly to the OS (inside a handler or driver, or calling `open()`/`os.*` yourself). It does the same work as the identity variant without following symlinks and adds the Windows long-path prefix when needed.
 
-**Prefer the named helpers over composing primitives** - `sanitize_path_string`, `expand_path`, `resolve_path_safely`, and `normalize_path_for_platform` are building blocks. If you find yourself chaining them, use one of the two canonicalize helpers instead so behavior stays consistent across call sites.
+**Prefer the named helpers over composing primitives** - `sanitize_path_string`, `expand_path`, `resolve_path_safely`, and `normalize_path_for_platform` are building blocks. If you find yourself chaining them, use one of the three canonicalize helpers instead so behavior stays consistent across call sites.
 
 ## Beta Features
 

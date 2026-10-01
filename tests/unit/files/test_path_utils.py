@@ -12,6 +12,7 @@ from griptape_nodes.files.path_utils import (
     _apply_windows_long_path_prefix,
     canonicalize_expanded_for_identity,
     canonicalize_for_identity,
+    canonicalize_for_identity_preserving_symlinks,
     canonicalize_for_io,
     canonicalize_to_posix,
     decompose_source_path,
@@ -1435,6 +1436,52 @@ class TestCanonicalizeForIdentity:
 
         result = canonicalize_for_identity(link)
         assert result == target.resolve()
+
+
+class TestCanonicalizeForIdentityPreservingSymlinks:
+    """Tests for canonicalize_for_identity_preserving_symlinks."""
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_a_link_keeps_its_own_path(self, tmp_path: Path) -> None:
+        """A link is named by where it sits, not by what it points at."""
+        target = tmp_path / "outside" / "real.txt"
+        target.parent.mkdir()
+        target.touch()
+        link = tmp_path / "inside" / "link.txt"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        assert canonicalize_for_identity_preserving_symlinks(link) == link
+
+    def test_expands_tilde(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+
+        result = canonicalize_for_identity_preserving_symlinks("~/project.yml")
+
+        assert result == tmp_path / "project.yml"
+
+    def test_anchors_relative_to_base(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks("sub/file.txt", base=tmp_path)
+
+        assert result == tmp_path / "sub" / "file.txt"
+
+    def test_normalizes_dot_and_dotdot(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks(f"{tmp_path}/a/../b/./c.txt")
+
+        assert result == tmp_path / "b" / "c.txt"
+
+    def test_matches_canonicalize_for_identity_when_no_links_are_involved(self, tmp_path: Path) -> None:
+        """The two agree on any path with no link along it; only symlink handling differs."""
+        target = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_for_identity_preserving_symlinks(target) == canonicalize_for_identity(target)
+
+    def test_carries_no_windows_long_path_prefix(self, tmp_path: Path) -> None:
+        """Unlike canonicalize_for_io the result is fit to be a key, so it keeps no prefix."""
+        result = canonicalize_for_identity_preserving_symlinks(tmp_path / "file.txt")
+
+        assert not str(result).startswith("\\\\?\\")
 
 
 class TestCanonicalizeExpandedForIdentity:
