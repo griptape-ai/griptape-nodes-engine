@@ -10,6 +10,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Added
+
+- A node generated from a library's `workflow_nodes` entry now shows a progress bar while it runs,
+  filling as the nodes inside its workflow finish.
+
 ### Changed
 
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so

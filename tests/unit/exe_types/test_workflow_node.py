@@ -12,6 +12,7 @@ from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
     WorkflowNodeDefinitionError,
+    WorkflowNodeProgress,
     WorkflowNodeRoutingError,
     WorkflowParameterRoute,
     build_workflow_node_class,
@@ -21,6 +22,7 @@ from griptape_nodes.exe_types.workflow_node import (
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.execution_events import NodeResolvedEvent
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
 CONTROL_TYPE = "parametercontroltype"
@@ -472,3 +474,80 @@ class TestEditorPreviewMetadata:
         # The node is still usable; only the preview is unavailable.
         assert "_workflow_file_value" not in node.metadata
         assert node.get_parameter_by_name("text") is not None
+
+
+def _resolved(node_name: str) -> NodeResolvedEvent:
+    return NodeResolvedEvent(node_name=node_name, parameter_output_values={}, node_type="Stub")
+
+
+def _build_shout_node() -> WorkflowNode:
+    shape = WorkflowShape(
+        inputs={"Start Flow": {"text": _param("text")}},
+        outputs={"End Flow": {"result": _param("result")}},
+    )
+    node_class = build_workflow_node_class(
+        node_type="ShoutWorkflow",
+        workflow_file_path=Path("/library/shout_workflow.py"),
+        workflow_metadata=_metadata(shape),
+    )
+    return node_class(name="Shout It")
+
+
+class TestProgress:
+    """The generated node's progress bar fills as the nodes inside its subflow resolve."""
+
+    def test_node_carries_a_progress_bar(self) -> None:
+        node = _build_shout_node()
+
+        progress_param = node.get_parameter_by_name("progress")
+        assert progress_param is not None
+        assert progress_param.allowed_modes == {ParameterMode.PROPERTY}
+        assert progress_param.ui_options.get("progress_bar") is True
+
+    def test_workflow_parameter_named_progress_is_kept(self) -> None:
+        """A workflow's own `progress` parameter wins over the bar rather than colliding with it."""
+        shape = WorkflowShape(
+            inputs={"Start Flow": {"progress": _param("progress", "int")}},
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        node_class = build_workflow_node_class(
+            node_type="ProgressWorkflow",
+            workflow_file_path=Path("/library/progress_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+
+        node = node_class(name="Has Progress")
+
+        progress_param = node.get_parameter_by_name("progress")
+        assert progress_param is not None
+        assert progress_param.type == "int"
+        assert node._build_progress() is None
+
+    def test_counts_only_tracked_nodes_once_each(self) -> None:
+        node = _build_shout_node()
+        progress = WorkflowNodeProgress(node)
+        progress.track(["Start Flow_1", "Work_1", "Work_2", "End Flow_1"])
+
+        progress.on_node_resolved(_resolved("Start Flow_1"))
+        assert node.parameter_output_values["progress"] == 1 / 4
+
+        # A node from another run, and a tracked node resolving a second time, leave the bar alone.
+        progress.on_node_resolved(_resolved("Somebody Else"))
+        progress.on_node_resolved(_resolved("Start Flow_1"))
+        assert node.parameter_output_values["progress"] == 1 / 4
+
+        progress.on_node_resolved(_resolved("Work_1"))
+        assert node.parameter_output_values["progress"] == 2 / 4
+
+    def test_complete_fills_the_bar_and_reset_empties_it(self) -> None:
+        """Nodes off the execution path never resolve, so a finished run fills the bar explicitly."""
+        node = _build_shout_node()
+        progress = WorkflowNodeProgress(node)
+        progress.track(["Start Flow_1", "Unused_1", "End Flow_1"])
+        progress.on_node_resolved(_resolved("Start Flow_1"))
+
+        progress.complete()
+        assert node.parameter_output_values["progress"] == 1.0
+
+        progress.reset()
+        assert node.parameter_output_values["progress"] == 0.0

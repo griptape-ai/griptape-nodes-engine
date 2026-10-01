@@ -12,6 +12,7 @@ changes.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,7 +20,11 @@ import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
-from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultSuccess
+from griptape_nodes.retained_mode.events.execution_events import (
+    ParameterValueUpdateEvent,
+    StartFlowRequest,
+    StartFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -92,7 +97,8 @@ def test_workflow_node_registers_with_shape_derived_parameters(
     # `text` comes from the workflow's Start Flow node, `result` from its End Flow node. Control
     # parameters in the shape are dropped in favor of the node's own control flow, and so is the End
     # Flow node's Status group, which reports on that node's run rather than on the workflow's output.
-    assert [parameter.name for parameter in node.parameters] == ["exec_in", "exec_out", "text", "result"]
+    # `progress` is the node's own progress bar.
+    assert [parameter.name for parameter in node.parameters] == ["exec_in", "exec_out", "text", "result", "progress"]
     assert node.get_parameter_by_name("exec_out") is node.control_parameter_out
 
 
@@ -121,15 +127,33 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
     )
     assert set_result.succeeded(), set_result
 
-    run_result = await engine.ahandle_request(
-        StartFlowRequest(
-            flow_name=parent_flow,
-            flow_node_name="Shout It",
-            wait_for_completion=True,
-            completion_timeout_ms=60000,
+    # Execution events reach listeners only once a queue exists; the editor's session sets one up.
+    engine.event_manager.initialize_queue(asyncio.Queue())
+    progress_values: list[float] = []
+
+    def record_progress(event: ParameterValueUpdateEvent) -> None:
+        if event.node_name == "Shout It" and event.parameter_name == "progress":
+            progress_values.append(event.value)
+
+    engine.event_manager.add_listener_to_execution_event(ParameterValueUpdateEvent, record_progress)
+    try:
+        run_result = await engine.ahandle_request(
+            StartFlowRequest(
+                flow_name=parent_flow,
+                flow_node_name="Shout It",
+                wait_for_completion=True,
+                completion_timeout_ms=60000,
+            )
         )
-    )
+    finally:
+        engine.event_manager.remove_listener_for_execution_event(ParameterValueUpdateEvent, record_progress)
     assert isinstance(run_result, StartFlowResultSuccess), run_result
+
+    # The bar starts empty, moves as the workflow's nodes resolve, and ends full.
+    assert progress_values[0] == 0.0
+    assert any(0.0 < value < 1.0 for value in progress_values), progress_values
+    assert progress_values[-1] == 1.0
+    assert progress_values == sorted(progress_values)
 
     node = engine.node_manager.get_node_by_name("Shout It")
     assert node.state == NodeResolutionState.RESOLVED

@@ -14,14 +14,16 @@ The generated node types are ordinary ``BaseNode`` subclasses built by
 from __future__ import annotations
 
 import logging
+import threading
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
+from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, EndNode, StartNode
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.retained_mode.events.execution_events import (
+    NodeResolvedEvent,
     StartLocalSubflowRequest,
     StartLocalSubflowResultSuccess,
 )
@@ -35,7 +37,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
     from pathlib import Path
 
     from griptape_nodes.node_library.workflow_registry import (
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
         _WorkflowRegistry,
     )
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -75,6 +78,10 @@ WORKFLOW_NODE_KEY = "workflow_node"
 # subflow. Shared contract with the standard library's SubflowWorkflowNode, which stores its
 # dropdown selection here.
 WORKFLOW_FILE_VALUE_KEY = "_workflow_file_value"
+
+# The progress bar every generated node carries, matching the name `ProgressBarComponent` uses. A
+# workflow that exposes its own parameter under this name keeps it, and the node goes without a bar.
+PROGRESS_PARAMETER_NAME = "progress"
 
 
 class WorkflowNodeDefinitionError(Exception):
@@ -313,16 +320,32 @@ class WorkflowNode(ControlNode):
         for surface_name, surface_parameter in self.workflow_surface.parameters.items():
             self.add_parameter(_build_surface_parameter(surface_name, surface_parameter))
 
+        if PROGRESS_PARAMETER_NAME not in self.workflow_surface.parameters:
+            self.add_parameter(
+                Parameter(
+                    name=PROGRESS_PARAMETER_NAME,
+                    output_type="float",
+                    allowed_modes={ParameterMode.PROPERTY},
+                    tooltip="How much of the workflow has finished running (0.0 to 1.0)",
+                    ui_options={"progress_bar": True},
+                    settable=False,
+                )
+            )
+
     def after_node_deleted(self) -> None:
         self._discard_subflow()
 
     async def aprocess(self) -> None:
+        progress = self._build_progress()
+        if progress is not None:
+            progress.reset()
+
         subflow_name = await self._load_subflow()
         live_routes = self._resolve_live_routes(subflow_name)
 
         self._apply_inputs(subflow_name, live_routes)
 
-        result = await self.engine.ahandle_request(StartLocalSubflowRequest(flow_name=subflow_name))
+        result = await self._run_subflow(subflow_name, progress)
         if not isinstance(result, StartLocalSubflowResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
@@ -331,6 +354,8 @@ class WorkflowNode(ControlNode):
             raise RuntimeError(msg)  # noqa: TRY004 - the workflow failed at run time; this is not a type error
 
         self._collect_outputs(subflow_name, live_routes)
+        if progress is not None:
+            progress.complete()
 
     def _publish_workflow_registry_key(self) -> None:
         """Register the backing workflow and record its key so the editor can preview it.
@@ -409,6 +434,31 @@ class WorkflowNode(ControlNode):
 
         self.metadata[SUBFLOW_NAME_KEY] = import_result.created_flow_name
         return import_result.created_flow_name
+
+    def _build_progress(self) -> WorkflowNodeProgress | None:
+        if PROGRESS_PARAMETER_NAME in self.workflow_surface.parameters:
+            return None
+        return WorkflowNodeProgress(self)
+
+    async def _run_subflow(self, subflow_name: str, progress: WorkflowNodeProgress | None) -> ResultPayload:
+        """Run the imported subflow, advancing `progress` as each of its nodes resolves.
+
+        The listener is scoped to this one run because resolution events carry no run identifier.
+        Imported node names are unique within the session, so filtering on the subflow's own node
+        names keeps another node's concurrent run from moving this node's bar.
+        """
+        request = StartLocalSubflowRequest(flow_name=subflow_name)
+        if progress is None:
+            return await self.engine.ahandle_request(request)
+
+        flow = self.engine.flow_manager.get_flow_by_name(subflow_name)
+        progress.track(flow.nodes)
+        event_manager = self.engine.event_manager
+        event_manager.add_listener_to_execution_event(NodeResolvedEvent, progress.on_node_resolved)
+        try:
+            return await self.engine.ahandle_request(request)
+        finally:
+            event_manager.remove_listener_for_execution_event(NodeResolvedEvent, progress.on_node_resolved)
 
     def _register_workflow(self) -> str:
         """Return the backing workflow's registry key, registering it if it is not registered yet."""
@@ -531,6 +581,49 @@ class WorkflowNode(ControlNode):
             # type, so a downstream node is already wired to them and needs to see that this run
             # produced nothing rather than keep reading the previous run's value.
             self.parameter_output_values[surface_name] = value
+
+
+class WorkflowNodeProgress:
+    """Drives a `WorkflowNode`'s progress bar from the share of its subflow's nodes that have resolved.
+
+    Resolution events arrive on whichever thread resolved the node, so the count is kept under a
+    lock. Nodes off the subflow's execution path never resolve, which is why a successful run
+    finishes with `complete` rather than relying on the count reaching the total.
+    """
+
+    def __init__(self, node: BaseNode) -> None:
+        self._node = node
+        self._lock = threading.Lock()
+        self._pending: set[str] = set()
+        self._total = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._pending = set()
+            self._total = 0
+            self._publish(0.0)
+
+    def track(self, node_names: Iterable[str]) -> None:
+        with self._lock:
+            self._pending = set(node_names)
+            self._total = len(self._pending)
+            self._publish(0.0)
+
+    def on_node_resolved(self, event: NodeResolvedEvent) -> None:
+        with self._lock:
+            # A node resolving again (inside a loop, say) has already been counted.
+            if event.node_name not in self._pending:
+                return
+            self._pending.discard(event.node_name)
+            self._publish((self._total - len(self._pending)) / self._total)
+
+    def complete(self) -> None:
+        with self._lock:
+            self._pending = set()
+            self._publish(1.0)
+
+    def _publish(self, value: float) -> None:
+        self._node.publish_update_to_parameter(PROGRESS_PARAMETER_NAME, value)
 
 
 def build_workflow_node_class(
