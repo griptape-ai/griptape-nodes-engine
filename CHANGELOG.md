@@ -12,6 +12,11 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Changed
 
+- Serializing an event walks its request and result payloads once instead of twice, which shows up
+  most on events carrying large parameter values. Every key and value is unchanged; the payload
+  field now appears last in the serialized order rather than first, which affects only a byte
+  comparison of the JSON text.
+
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
