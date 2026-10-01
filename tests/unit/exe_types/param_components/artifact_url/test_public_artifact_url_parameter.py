@@ -284,7 +284,6 @@ def _clear_bucket_id_cache() -> Iterator[None]:
 
 
 def _make_lazy_component(mocker: Any, value: Any, *, bucket_secret: str | None = None) -> ComponentFixture:
-    """Build a component whose storage driver is built on first use, as __init__ leaves it."""
     component, driver = _make_component(value)
     component._node = MagicMock(parameter_values={"image": value})
     component._node.get_parameter_value.return_value = value
@@ -298,8 +297,6 @@ def _make_lazy_component(mocker: Any, value: Any, *, bucket_secret: str | None =
 
 
 class TestBucketIdCache:
-    """Resolving the bucket is a network round trip, and a node builds one helper per upload."""
-
     def test_same_configuration_resolves_once(self, mocker: Any) -> None:
         default_mock = mocker.patch(
             f"{MODULE}.GriptapeCloudStorageDriver.get_default_bucket_id", return_value="org-default"
@@ -380,8 +377,7 @@ class TestAsyncPublicUrl:
 
     @pytest.mark.asyncio
     async def test_uploads_run_concurrently(self, mocker: Any) -> None:
-        # Each upload waits at the barrier until the other arrives, so this only passes if
-        # both are in flight at once, i.e. neither blocked the event loop.
+        # Both uploads must reach the barrier concurrently.
         barrier = threading.Barrier(2, timeout=5)
 
         def upload_file(*, path: Path, file_content: bytes) -> str:  # noqa: ARG001
@@ -447,8 +443,6 @@ class TestAsyncCancel:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        # Cancel returned while the upload was still in flight, and the node's cleanup has
-        # nothing left to delete.
         assert not release.is_set()
         assert component.gtc_file_path is None
         driver.delete_file.assert_not_called()

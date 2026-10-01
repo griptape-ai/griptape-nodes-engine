@@ -42,11 +42,10 @@ class PublicArtifactUrlParameter:
     BUCKET_ID_NAME = "GT_CLOUD_BUCKET_ID"
     supported_artifact_types: ClassVar[list[type]] = [ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact]
     supported_artifact_type_names: ClassVar[list[str]] = [cls.__name__ for cls in supported_artifact_types]
-    # Resolved bucket IDs keyed by (base_url, api_key, configured secret). Resolving one costs a
-    # network round trip, and a node uploading N references builds N helpers.
+    # Bucket lookup requires a network round trip; cache results across helper instances.
     _bucket_id_cache: ClassVar[dict[tuple[str, str, str | None], str]] = {}
     _bucket_id_cache_lock: ClassVar[threading.Lock] = threading.Lock()
-    # Uploads and deletes outliving a cancelled run. Held so the event loop does not drop them.
+    # Keep cancelled-run uploads and cleanup alive until completion.
     _background_tasks: ClassVar[set[asyncio.Future[Any]]] = set()
 
     def __init__(
@@ -80,7 +79,7 @@ class PublicArtifactUrlParameter:
 
         self._api_key = api_key
         self._base_url = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-        # Built on first upload: building it resolves the bucket over the network.
+        # Building the driver resolves the bucket over the network.
         self._storage_driver: GriptapeCloudStorageDriver | None = None
 
     @classmethod
@@ -89,19 +88,16 @@ class PublicArtifactUrlParameter:
 
     @classmethod
     def _read_configured_bucket_id(cls, engine: Engine) -> str | None:
-        # An engine request, so it must run on the event loop, never in a worker thread.
+        # Engine requests must run on the event loop.
         return cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
     @classmethod
     def _resolve_bucket_id(
         cls, configured_bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None
     ) -> str:
-        """Resolve the bucket to upload to, once per process for a given configuration.
-
-        Makes no engine requests, so it is safe to run off the event loop.
-        """
+        """Run bucket resolution off the event loop without making engine requests."""
         cache_key = (base_url, api_key, configured_bucket_id)
-        # Held across the lookup so concurrent first uploads resolve once, not once each.
+        # Hold the lock across lookup so concurrent first uploads share the result.
         with cls._bucket_id_cache_lock:
             cached = cls._bucket_id_cache.get(cache_key)
             if cached is not None:
@@ -202,12 +198,7 @@ class PublicArtifactUrlParameter:
         return self._get_storage_driver().upload_file(path=self.gtc_file_path, file_content=file_contents)
 
     async def aget_public_url_for_parameter(self) -> str:
-        """Async variant of get_public_url_for_parameter that keeps the event loop free.
-
-        Reading the value stays on the loop, since resolving a macro path such as
-        "{inputs}/..." needs the node's project context. Only the network calls run in a
-        thread, so several uploads can run at once and a cancel is handled promptly.
-        """
+        """Resolve parameter values on the event loop, where node project context is available."""
         url = self._get_url_to_publish()
         if self._is_public(url):
             return url
@@ -222,8 +213,7 @@ class PublicArtifactUrlParameter:
         try:
             return await asyncio.shield(upload)
         except asyncio.CancelledError:
-            # The thread cannot be interrupted. Rather than make a cancelled run wait out the
-            # upload, let it finish in the background and delete what it uploaded.
+            # The upload thread cannot be interrupted; delete its result when it finishes.
             self._take_upload_path()
             self._delete_when_done(upload, driver, upload_path)
             raise
@@ -235,7 +225,6 @@ class PublicArtifactUrlParameter:
         self._get_storage_driver().delete_file(path)
 
     async def adelete_uploaded_artifact(self) -> None:
-        """Async variant of delete_uploaded_artifact that runs the delete in a thread."""
         path = self._take_upload_path()
         if path is None:
             return
@@ -270,7 +259,7 @@ class PublicArtifactUrlParameter:
         return Path("artifact_url_storage") / uuid4().hex / self._derive_upload_filename(url)
 
     def _take_upload_path(self) -> Path | None:
-        # Forgotten before deleting, so a second or concurrent cleanup pass issues no second delete.
+        # Clear before deletion to prevent concurrent cleanup from deleting twice.
         path = self.gtc_file_path
         self.gtc_file_path = None
         return path
