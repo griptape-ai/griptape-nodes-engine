@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import threading
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlparse
@@ -22,9 +23,10 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.files.file import File
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
-from griptape_nodes.utils.async_utils import to_thread
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.engine import Engine
@@ -42,10 +44,13 @@ class PublicArtifactUrlParameter:
     BUCKET_ID_NAME = "GT_CLOUD_BUCKET_ID"
     supported_artifact_types: ClassVar[list[type]] = [ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact]
     supported_artifact_type_names: ClassVar[list[str]] = [cls.__name__ for cls in supported_artifact_types]
+    # Process-wide on purpose: keys carry the base URL and credential, so engines never share an entry.
     # Bucket lookup requires a network round trip; cache results across helper instances.
     _bucket_id_cache: ClassVar[dict[tuple[str, str, str | None], str]] = {}
-    _bucket_id_cache_lock: ClassVar[threading.Lock] = threading.Lock()
-    # Keep cancelled-run uploads and cleanup alive until completion.
+    # One lock per cache key, so a slow lookup does not hold up other configurations.
+    _bucket_id_locks: ClassVar[dict[tuple[str, str, str | None], threading.Lock]] = {}
+    _bucket_id_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+    # Keep work outliving a cancelled run alive until completion.
     _background_tasks: ClassVar[set[asyncio.Future[Any]]] = set()
 
     def __init__(
@@ -95,10 +100,15 @@ class PublicArtifactUrlParameter:
     def _resolve_bucket_id(
         cls, configured_bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None
     ) -> str:
-        """Run bucket resolution off the event loop without making engine requests."""
+        """Safe to run in a worker thread: makes no engine requests."""
         cache_key = (base_url, api_key, configured_bucket_id)
-        # Hold the lock across lookup so concurrent first uploads share the result.
-        with cls._bucket_id_cache_lock:
+        cached = cls._bucket_id_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        with cls._bucket_id_locks_guard:
+            key_lock = cls._bucket_id_locks.setdefault(cache_key, threading.Lock())
+        # Held across the lookup so concurrent first uploads share one result.
+        with key_lock:
             cached = cls._bucket_id_cache.get(cache_key)
             if cached is not None:
                 return cached
@@ -108,7 +118,6 @@ class PublicArtifactUrlParameter:
 
     @classmethod
     def _lookup_bucket_id(cls, bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None) -> str:
-
         # A blank/whitespace-only secret is treated the same as an unset one: it can't
         # point at a real bucket and, left alone, produces confusing downstream 404s from
         # request URLs like `/api/buckets//assets/...`. Validate a configured ID with a
@@ -194,8 +203,10 @@ class PublicArtifactUrlParameter:
             return url
 
         file_contents = File(url).read_bytes()
+        # Resolved before recording the path, so a failed lookup leaves nothing for cleanup to delete.
+        driver = self._get_storage_driver()
         self.gtc_file_path = self._build_upload_path(url)
-        return self._get_storage_driver().upload_file(path=self.gtc_file_path, file_content=file_contents)
+        return driver.upload_file(path=self.gtc_file_path, file_content=file_contents)
 
     async def aget_public_url_for_parameter(self) -> str:
         """Resolve parameter values on the event loop, where node project context is available."""
@@ -207,15 +218,14 @@ class PublicArtifactUrlParameter:
         driver = await self._aget_storage_driver()
         upload_path = self._build_upload_path(url)
         self.gtc_file_path = upload_path
-        upload = asyncio.ensure_future(
-            asyncio.to_thread(driver.upload_file, path=upload_path, file_content=file_contents)
-        )
         try:
-            return await asyncio.shield(upload)
+            return await self._run_off_loop(
+                partial(driver.upload_file, path=upload_path, file_content=file_contents),
+                after_cancelled_call=partial(driver.delete_file, upload_path),
+            )
         except asyncio.CancelledError:
-            # The upload thread cannot be interrupted; delete its result when it finishes.
+            # The background cleanup owns the delete now.
             self._take_upload_path()
-            self._delete_when_done(upload, driver, upload_path)
             raise
 
     def delete_uploaded_artifact(self) -> None:
@@ -229,7 +239,7 @@ class PublicArtifactUrlParameter:
         if path is None:
             return
         driver = await self._aget_storage_driver()
-        await to_thread(driver.delete_file, path)
+        await self._run_off_loop(partial(driver.delete_file, path))
 
     def _get_url_to_publish(self) -> str:
         # A helper instance lives as long as the node, so an upload path recorded by an
@@ -274,13 +284,18 @@ class PublicArtifactUrlParameter:
         if self._storage_driver is not None:
             return self._storage_driver
         configured_bucket_id = self._read_configured_bucket_id(self._node.engine)
-        bucket_id = await to_thread(
-            self._resolve_bucket_id,
-            configured_bucket_id,
-            self._base_url,
-            self._api_key,
-            timeout=self._request_timeout,
-        )
+        cache_key = (self._base_url, self._api_key, configured_bucket_id)
+        bucket_id = self._bucket_id_cache.get(cache_key)
+        if bucket_id is None:
+            bucket_id = await self._run_off_loop(
+                partial(
+                    self._resolve_bucket_id,
+                    configured_bucket_id,
+                    self._base_url,
+                    self._api_key,
+                    timeout=self._request_timeout,
+                )
+            )
         return self._build_storage_driver(bucket_id)
 
     def _build_storage_driver(self, bucket_id: str) -> GriptapeCloudStorageDriver:
@@ -294,23 +309,32 @@ class PublicArtifactUrlParameter:
         return self._storage_driver
 
     @classmethod
-    def _delete_when_done(cls, upload: asyncio.Future[str], driver: GriptapeCloudStorageDriver, path: Path) -> None:
-        def on_done(finished: asyncio.Future[str]) -> None:
-            cls._background_tasks.discard(finished)
-            if finished.cancelled() or finished.exception() is not None:
-                return
-            cleanup = asyncio.ensure_future(asyncio.to_thread(driver.delete_file, path))
-            cls._background_tasks.add(cleanup)
-            cleanup.add_done_callback(cls._forget_background_task)
+    async def _run_off_loop[T](
+        cls, call: Callable[[], T], *, after_cancelled_call: Callable[[], Any] | None = None
+    ) -> T:
+        """Run a blocking call in a thread without making a cancelled caller wait for it.
 
-        cls._background_tasks.add(upload)
-        upload.add_done_callback(on_done)
+        The thread cannot be interrupted, so a cancelled call finishes in the background, followed
+        by `after_cancelled_call` whether it succeeded or not.
+        """
+        task = asyncio.ensure_future(asyncio.to_thread(call))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cls._finish_in_background(task, then=after_cancelled_call)
+            raise
 
     @classmethod
-    def _forget_background_task(cls, task: asyncio.Future[Any]) -> None:
-        cls._background_tasks.discard(task)
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning("Failed to delete an upload left by a cancelled run: %s", task.exception())
+    def _finish_in_background(cls, task: asyncio.Future[Any], *, then: Callable[[], Any] | None = None) -> None:
+        def on_done(finished: asyncio.Future[Any]) -> None:
+            cls._background_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                logger.warning("A Griptape Cloud request left by a cancelled run failed: %s", finished.exception())
+            if then is not None:
+                cls._finish_in_background(asyncio.ensure_future(asyncio.to_thread(then)))
+
+        cls._background_tasks.add(task)
+        task.add_done_callback(on_done)
 
     @staticmethod
     def _is_public(url: str) -> bool:

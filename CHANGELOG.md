@@ -17,9 +17,9 @@ the engine's request API from working without edits. Migration steps live in
   and gets it back when the switch is turned on again. `GTN_CONFIG_BETA_FEATURES__ENABLED=false`
   turns every beta feature off for one session.
   [#5710](https://github.com/griptape-ai/griptape-nodes-engine/issues/5710)
-- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and `adelete_uploaded_artifact()`. Nodes
-  using them can upload multiple reference images concurrently without blocking other nodes or delaying
-  **Stop**. Interrupted uploads finish and are deleted in the background.
+- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and `adelete_uploaded_artifact()`.
+  Nodes using them can upload multiple reference images concurrently without blocking other nodes or
+  delaying "Stop". Uploads interrupted by "Stop" finish and are deleted in the background.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
 
 ### Changed
