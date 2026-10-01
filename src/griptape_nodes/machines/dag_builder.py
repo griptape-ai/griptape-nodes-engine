@@ -61,6 +61,8 @@ class DagNode:
         task_reference: The running task, once the node has been dispatched.
         node_state: Where the node is in its execution lifecycle.
         node_reference: The node itself.
+        execution_duration_ms: How long the node took to run in milliseconds, or None if it has not
+            run to completion (or did not run, like a locked node).
         data_dependency_only: True when the node was pulled into a graph solely to feed someone
             else's data input, so it must not advance control when it finishes. See
             ``ExecuteDagState._should_skip_control_flow``.
@@ -69,6 +71,7 @@ class DagNode:
     task_reference: asyncio.Task | None = field(default=None)
     node_state: NodeState = field(default=NodeState.WAITING)
     node_reference: BaseNode
+    execution_duration_ms: float | None = field(default=None)
     data_dependency_only: bool = field(default=False)
 
 

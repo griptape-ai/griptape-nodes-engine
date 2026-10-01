@@ -413,6 +413,9 @@ class NodeResolvedEvent(ExecutionPayload):
     parameter_output_values: dict
     node_type: str
     specific_library_name: str | None = None
+    # How long the node took to run, in milliseconds. None when the node did not run this time
+    # (for example a locked node), so clients show nothing instead of a made-up time.
+    duration_ms: float | None = None
 
 
 @dataclass
