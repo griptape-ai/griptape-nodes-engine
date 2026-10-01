@@ -16,6 +16,12 @@ the engine's request API from working without edits. Migration steps live in
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
 
+### Removed
+
+- **Breaking:** `StartFlowRequest` no longer accepts `wait_for_completion` or `completion_timeout_ms`.
+  The request already answers once the run ends, so neither had any effect. Drop them from calls. To
+  bound a run, wrap the call in `asyncio.wait_for` and send `CancelFlowRequest` on timeout.
+
 ### Fixed
 
 - `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
