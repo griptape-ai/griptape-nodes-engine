@@ -19,6 +19,7 @@ from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 from griptape_nodes.common.parameter_hydration import hydrate_value
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
+from griptape_nodes.files.file import File
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
 from griptape_nodes.utils.async_utils import to_thread
@@ -192,8 +193,6 @@ class PublicArtifactUrlParameter:
         if self._is_public(url):
             return url
 
-        from griptape_nodes.files.file import File
-
         file_contents = File(url).read_bytes()
         self.gtc_file_path = self._build_upload_path(url)
         return self._get_storage_driver().upload_file(path=self.gtc_file_path, file_content=file_contents)
@@ -208,8 +207,6 @@ class PublicArtifactUrlParameter:
         url = self._get_url_to_publish()
         if self._is_public(url):
             return url
-
-        from griptape_nodes.files.file import File
 
         file_contents = await File(url).aread_bytes()
         driver = await self._aget_storage_driver()
