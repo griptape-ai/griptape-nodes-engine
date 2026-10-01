@@ -4641,6 +4641,13 @@ class NodeManager(EngineScoped):
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
                             logger.warning(details)
+                    else:
+                        logger.warning(
+                            "Attempted to paste the value of parameter '%s' on node '%s'. Failed because the "
+                            "copied value could not be read, so the parameter uses its default.",
+                            param_request.parameter_name,
+                            param_request.node_name,
+                        )
                 lock_command = commands.set_lock_commands_per_node[node_command.node_uuid]
                 if lock_command is not None:
                     lock_node_result = self.engine.handle_request(lock_command)

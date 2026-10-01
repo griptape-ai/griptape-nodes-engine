@@ -8,8 +8,10 @@ is used.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -428,6 +430,17 @@ class TestCopyPaste:
 
         assert isinstance(result, SerializeSelectedNodesToCommandsResultFailure)
         assert "'_Handle' value has no plain-data form" in str(result.result_details)
+
+    def test_unreadable_copied_value_names_its_parameter(
+        self, engine: Engine, library_name: str, flow_name: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        copied = self._copy(engine, _create_node(engine, library_name, flow_name, "A").name)
+        unreadable = dataclasses.replace(copied, pickled_values=dict.fromkeys(copied.pickled_values, "not json"))
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        pasted = self._paste(engine, unreadable)
+
+        assert f"parameter 'items' on node '{pasted.name}'" in caplog.text
 
     @pytest.mark.usefixtures("flow_name")
     def test_unreadable_copied_nodes_fail_the_paste(self, engine: Engine) -> None:
