@@ -246,7 +246,7 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.converter import converter, safe_unstructure
-from griptape_nodes.serialization.values import UndecodedValue, ValueEncodeError, encode_value
+from griptape_nodes.serialization.values import UndecodedValue, Unencodable, try_encode
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3799,10 +3799,9 @@ class NodeManager(EngineScoped):
         """Name each value that has no plain-data form, with the reason."""
         names = []
         for name, value in values.items():
-            try:
-                encode_value(value)
-            except ValueEncodeError as error:
-                names.append(f"'{name}' ({error})")
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                names.append(f"'{name}' ({encoded.reason})")
         return names
 
     @handles(ValidateNodeDependenciesRequest)
