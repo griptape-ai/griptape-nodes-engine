@@ -21,7 +21,7 @@ PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
-WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -344,16 +344,20 @@ class WorkerSettings(BaseModel):
     )
     heartbeat_timeout_s: float = Field(
         default=15.0,
-        description="Seconds without a heartbeat response before a worker is evicted.",
+        description=(
+            "Seconds without a heartbeat response before a worker is evicted. A worker also shuts "
+            "itself down after this much orchestrator silence, but never sooner than 30 seconds, so "
+            "that an orchestrator too busy to challenge is not mistaken for one that exited."
+        ),
     )
-    heartbeat_startup_grace_s: float = Field(
+    library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Grace period in seconds after worker spawn before heartbeat timeouts are enforced. "
-            "Workers need time to install venv deps and import modules before they can respond. "
+            "Seconds a worker may take to load its library before the orchestrator marks the "
+            "library as FAILURE. Also bounds how long running a node waits for its library's worker "
+            "to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes; this also bounds how long the orchestrator waits for worker libraries "
-            "to load before marking them as FAILURE."
+            "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),
     )
 

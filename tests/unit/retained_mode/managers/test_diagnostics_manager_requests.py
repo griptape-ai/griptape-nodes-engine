@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from griptape_nodes.common.diagnostics.bundle import (
@@ -619,14 +619,14 @@ class TestBundleWrittenToStaticFiles:
         """This route is the one that uploads, so the network is one of the ways it fails.
 
         With the cloud storage backend configured, saving a static file uploads it and then asks
-        for a download URL over HTTP. `httpx` errors are not `OSError`s, so a refused connection
+        for a download URL over HTTP. `httpx2` errors are not `OSError`s, so a refused connection
         came out of the handler as a raw exception -- and the editor has nothing to show for one.
         """
         with (
             patch.object(
                 engine.static_files_manager,
                 "save_static_file",
-                side_effect=httpx.ConnectError("All connection attempts failed"),
+                side_effect=httpx2.ConnectError("All connection attempts failed"),
             ),
             caplog.at_level(logging.ERROR, logger=LOGGER_NAME),
         ):

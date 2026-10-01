@@ -6,6 +6,7 @@ import errno
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -23,6 +24,7 @@ from fileseq.exceptions import FileSeqException
 from rich.console import Console
 
 from griptape_nodes.common.macro_parser import (
+    SEQUENCE_VARIABLE_NAME,
     MacroResolutionError,
     MacroResolutionFailure,
     MacroSyntaxError,
@@ -166,6 +168,14 @@ MAX_INDEXED_CANDIDATES = 1000
 # string before truncating the rest with "(+N more)". Larger lists overwhelm
 # the artist's status panel; the full list lives on `missing_item_numbers`.
 ABORTED_AT_GAP_PREVIEW_COUNT = 5
+
+# Placeholder bound to the index slot while GetNextVersionIndexRequest resolves the rest of
+# a macro through the project. Picked to be a digit run that never shows up in a real path,
+# so its rendered form can be located in the resolved string and swapped back for the slot.
+VERSION_INDEX_SENTINEL = 918273645
+
+# Matches one `{...}` variable group in a macro template.
+MACRO_VARIABLE_GROUP_PATTERN = re.compile(r"\{[^{}]*\}")
 
 
 @dataclass
@@ -889,6 +899,70 @@ class OSManager(EngineScoped):
     # CREATE_NEW File Collision Policy - Helper Methods
     # ============================================================================
 
+    def _bind_project_variables_for_index_scan(self, macro_path: MacroPath) -> MacroPath:
+        """Bake project directories and builtins into a macro so only its `{_index}` slot is left open.
+
+        Callers such as `DirectoryDestination` and `build_versioned_sequence_destination` pass
+        project macros like `{outputs}/renders_v{###}` without binding `{outputs}`. The index
+        scan only sees caller variables, so it would find two unresolved variables and fail.
+
+        The macro is resolved through `GetPathForMacroRequest` with a sentinel number in the
+        index slot. The sentinel's rendered text is then swapped back for the original slot
+        text, giving an absolute template such as `/project/outputs/renders_v{###}`.
+
+        Args:
+            macro_path: MacroPath whose template contains an unresolved `{_index}` slot.
+
+        Returns:
+            A MacroPath with only the index slot unresolved. Returns `macro_path` unchanged
+            when project resolution fails or the slot cannot be located, so callers that
+            bind every variable themselves are scanned as given.
+        """
+        template = macro_path.parsed_macro.template
+        if SEQUENCE_VARIABLE_NAME in macro_path.variables:
+            return macro_path
+
+        slot_groups = [
+            group
+            for group in MACRO_VARIABLE_GROUP_PATTERN.findall(template)
+            if self._is_single_variable_group(group, SEQUENCE_VARIABLE_NAME)
+        ]
+        if not slot_groups:
+            return macro_path
+
+        sentinel_vars: MacroVariables = {SEQUENCE_VARIABLE_NAME: VERSION_INDEX_SENTINEL}
+        rendered_slots = [ParsedMacro(group).resolve(sentinel_vars) for group in slot_groups]
+
+        result = self.engine.handle_request(
+            GetPathForMacroRequest(
+                parsed_macro=macro_path.parsed_macro,
+                variables={**macro_path.variables, **sentinel_vars},
+                failure_log_level=logging.DEBUG,
+            )
+        )
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            return macro_path
+
+        resolved = canonicalize_to_posix(result.absolute_path)
+        pieces: list[str] = []
+        cursor = 0
+        for group, rendered in zip(slot_groups, rendered_slots, strict=True):
+            position = resolved.find(rendered, cursor)
+            if position == -1:
+                return macro_path
+            pieces.append(resolved[cursor:position])
+            pieces.append(group)
+            cursor = position + len(rendered)
+        pieces.append(resolved[cursor:])
+
+        # A resolved path containing literal braces cannot be re-parsed as a macro.
+        try:
+            bound_macro = ParsedMacro("".join(pieces))
+        except MacroSyntaxError:
+            return macro_path
+
+        return MacroPath(parsed_macro=bound_macro, variables={})
+
     def _identify_index_variable(self, parsed_macro: ParsedMacro, variables: MacroVariables) -> ParsedVariable | None:
         """Identify which variable should be used for auto-incrementing.
 
@@ -1378,6 +1452,18 @@ class OSManager(EngineScoped):
         For a value collapsed onto the platforms we support, use `platform_name()`.
         """
         return sys.platform
+
+    @staticmethod
+    def _is_single_variable_group(group: str, variable_name: str) -> bool:
+        """Return True if a `{...}` template group parses to exactly one variable named `variable_name`."""
+        try:
+            parsed = ParsedMacro(group)
+        except MacroSyntaxError:
+            return False
+        variables = parsed.get_variables()
+        if len(variables) != 1:
+            return False
+        return next(iter(variables)).name == variable_name
 
     @staticmethod
     def is_windows() -> bool:
@@ -2340,8 +2426,9 @@ class OSManager(EngineScoped):
 
     def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
         """Handle a request to find the next available version index via a single glob pass."""
-        parsed_macro = request.macro_path.parsed_macro
-        variables = request.macro_path.variables
+        scan_macro_path = self._bind_project_variables_for_index_scan(request.macro_path)
+        parsed_macro = scan_macro_path.parsed_macro
+        variables = scan_macro_path.variables
 
         try:
             index_info = self._identify_index_variable(parsed_macro, variables)

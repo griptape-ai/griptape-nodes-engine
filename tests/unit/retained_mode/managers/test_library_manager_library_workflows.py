@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.node_library.library_registry import Library, LibraryMetadata, LibrarySchema
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.app_events import WorkflowRegistryChanged
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
@@ -216,13 +216,13 @@ class TestRegisterWorkflowsForLibrary:
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", workspace),
         ):
             await library_manager.register_workflows_for_library(
                 _library_info(library_dir / "griptape_nodes_library.json")
             )
-            registered = list(WorkflowRegistry._workflows)
+            registered = list(engine.workflow_registry._workflows)
 
         # `as_posix` rather than `str` because `derive_registry_key` normalizes separators to
         # forward slashes, so on Windows the key is "C:/.../test_lib/example" and never the
@@ -243,12 +243,12 @@ class TestRegisterWorkflowsForLibrary:
         try:
             with (
                 patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
-                patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+                patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             ):
                 await asyncio.wait_for(
                     library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json")), timeout=10
                 )
-                registered = [workflow.library_name for workflow in WorkflowRegistry._workflows.values()]
+                registered = [workflow.library_name for workflow in engine.workflow_registry._workflows.values()]
         finally:
             library_manager._libraries_loading_complete.set()
 
@@ -303,7 +303,7 @@ class TestRegistryChangesAreAnnounced:
         put_event = MagicMock()
 
         with (
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             patch.object(engine.event_manager, "put_event", put_event),
         ):
             await engine.workflow_manager.register_list_of_workflows(
@@ -319,7 +319,7 @@ class TestRegistryChangesAreAnnounced:
         workflow_files = [str(tmp_path / "example.py")]
         put_event = MagicMock()
 
-        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+        with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
             await engine.workflow_manager.register_list_of_workflows(workflow_files, library_name=LIBRARY_NAME)
             with patch.object(engine.event_manager, "put_event", put_event):
                 await engine.workflow_manager.register_list_of_workflows(workflow_files, library_name=LIBRARY_NAME)
@@ -336,7 +336,7 @@ class TestRegistryChangesAreAnnounced:
         assert _registry_changes_announced(put_event) == 1
 
 
-class TestUnregisterWorkflowsForLibrary:
+class TestRemoveLibraryWorkflows:
     @pytest.fixture(autouse=True)
     def _engine_knows_the_library(self, engine: Engine, tmp_path: Path) -> Iterator[None]:
         """The library is one this engine loaded, which is the only way unloading it is reached."""
@@ -349,7 +349,7 @@ class TestUnregisterWorkflowsForLibrary:
             yield
 
     def test_removes_the_library_workflows_and_announces_it(self, engine: Engine) -> None:
-        library_manager = engine.library_manager
+        workflow_manager = engine.workflow_manager
         event_manager = MagicMock()
         mine = _library_entry()
         theirs = MagicMock(library_name="OtherLib")
@@ -357,15 +357,15 @@ class TestUnregisterWorkflowsForLibrary:
 
         with (
             patch.dict(
-                WorkflowRegistry._workflows,
+                engine.workflow_registry._workflows,
                 {"lib/example": mine, "other/example": theirs, "user_workflow": users},
                 clear=True,
             ),
             patch.object(engine, "_event_manager", event_manager),
         ):
-            library_manager._unregister_workflows_for_library(LIBRARY_NAME)
+            workflow_manager.remove_library_workflows(LIBRARY_NAME)
 
-            assert sorted(WorkflowRegistry._workflows) == ["other/example", "user_workflow"]
+            assert sorted(engine.workflow_registry._workflows) == ["other/example", "user_workflow"]
 
         assert _registry_changes_announced(event_manager.put_event) == 1
 
@@ -374,33 +374,13 @@ class TestUnregisterWorkflowsForLibrary:
 
         with (
             patch.dict(
-                WorkflowRegistry._workflows,
+                engine.workflow_registry._workflows,
                 {"user_workflow": MagicMock(library_name=None)},
                 clear=True,
             ),
             patch.object(engine, "_event_manager", event_manager),
         ):
-            engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
-
-        assert _registry_changes_announced(event_manager.put_event) == 0
-
-    def test_leaves_alone_a_library_this_engine_never_registered(self, engine: Engine) -> None:
-        """The mirror of the guard on the register side, and for the same reason.
-
-        `WorkflowRegistry` is process-global and a library's entries are identified by its name alone,
-        so in a process running more than one Engine an unguarded delete would take the other engine's
-        entries.
-        """
-        event_manager = MagicMock()
-
-        with (
-            patch.dict(engine.library_manager._library_file_path_to_info, {}, clear=True),
-            patch.dict(WorkflowRegistry._workflows, {"lib/example": _library_entry()}, clear=True),
-            patch.object(engine, "_event_manager", event_manager),
-        ):
-            engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
-
-            assert list(WorkflowRegistry._workflows) == ["lib/example"]
+            engine.workflow_manager.remove_library_workflows(LIBRARY_NAME)
 
         assert _registry_changes_announced(event_manager.put_event) == 0
 
@@ -412,14 +392,14 @@ class TestUnregisterWorkflowsForLibrary:
         """
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"),
-            patch.dict(WorkflowRegistry._workflows, {"lib/example": _library_entry()}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {"lib/example": _library_entry()}, clear=True),
         ):
             result = engine.library_manager.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
             )
 
             assert result.succeeded()
-            assert "lib/example" not in WorkflowRegistry._workflows
+            assert "lib/example" not in engine.workflow_registry._workflows
 
     def test_forgets_the_verdicts_of_the_workflows_it_took_out(self, engine: Engine) -> None:
         """Their entries are gone, so nothing can ask about them and nothing would clean them up.
@@ -434,10 +414,10 @@ class TestUnregisterWorkflowsForLibrary:
         )
 
         with (
-            patch.dict(WorkflowRegistry._workflows, {"lib/example": _library_entry()}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {"lib/example": _library_entry()}, clear=True),
             patch.dict(workflow_manager._workflow_file_path_to_info, {info_key: verdict}, clear=True),
         ):
-            engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
+            engine.workflow_manager.remove_library_workflows(LIBRARY_NAME)
 
             assert info_key not in workflow_manager._workflow_file_path_to_info
 
@@ -707,7 +687,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
                     library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
                 ),
                 patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
-                patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+                patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             ):
                 result = await asyncio.wait_for(
                     library_manager.register_library_from_file_request(
@@ -715,7 +695,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
                     ),
                     timeout=10,
                 )
-                registered = [workflow.library_name for workflow in WorkflowRegistry._workflows.values()]
+                registered = [workflow.library_name for workflow in engine.workflow_registry._workflows.values()]
         finally:
             library_manager._libraries_loading_complete.set()
 
@@ -749,19 +729,19 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
             patch.dict(library_manager._library_file_path_to_info, {library_info.library_path: library_info}),
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", workspace),
         ):
             await library_manager.register_workflows_for_library(library_info)
 
-            registered = WorkflowRegistry.get_workflow_by_name(registry_key)
+            registered = engine.workflow_registry.get_workflow_by_name(registry_key)
             assert registered.metadata.is_griptape_provided is False
             assert registered.library_name == LIBRARY_NAME
 
             # An empty list skips the workspace scan; the clear is the part under test.
             await workflow_manager.refresh_workflow_registry(workflows_to_register=[])
 
-            assert list(WorkflowRegistry._workflows) == [registry_key]
+            assert list(engine.workflow_registry._workflows) == [registry_key]
 
     @pytest.mark.asyncio
     async def test_the_scan_skips_installed_library_roots_but_still_walks_sandbox_ones(
@@ -796,11 +776,11 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
                 {installed_info.library_path: installed_info, sandbox_info.library_path: sandbox_info},
                 clear=True,
             ),
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", workspace),
         ):
             await workflow_manager.refresh_workflow_registry(workflows_to_register=[str(workspace)])
-            registered = sorted(WorkflowRegistry._workflows)
+            registered = sorted(engine.workflow_registry._workflows)
 
         assert registered == ["libraries/sandbox_lib/in_development"]
 
@@ -828,10 +808,10 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
                 {library_info.library_path: library_info},
                 clear=True,
             ),
-            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", workspace),
         ):
             await workflow_manager._process_workflows_for_registration([str(library_dir)], library_name=LIBRARY_NAME)
-            registered = list(WorkflowRegistry._workflows)
+            registered = list(engine.workflow_registry._workflows)
 
         assert registered == [(library_dir / "example").as_posix()]

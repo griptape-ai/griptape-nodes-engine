@@ -137,13 +137,11 @@ class ImageArtifactProvider(BaseArtifactProvider):
         return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
 
     @classmethod
-    def detect_format(cls, data: bytes) -> str | None:  # noqa: C901, PLR0911
+    def detect_format(cls, data: bytes) -> str | None:  # noqa: PLR0911
         """Magic-byte sniff for common image formats.
 
         Pure prefix checks; no PIL parsing or decompression-bomb scans, so this
-        is safe to run on every byte write regardless of payload type. HEIC and
-        AVIF are recognized directly via their ISO BMFF brands so their writes
-        don't depend on optional Pillow plugins (e.g. ``pillow-heif``).
+        is safe to run on every byte write regardless of payload type.
         """
         if len(data) < cls._SNIFF_MIN_HEADER_BYTES:
             return None
@@ -160,13 +158,6 @@ class ImageArtifactProvider(BaseArtifactProvider):
             return "bmp"
         if head[:4] in (b"II*\x00", b"MM\x00*"):
             return "tiff"
-        if head[:4] == b"\x00\x00\x01\x00":
-            return "ico"
-        # ISO BMFF image brands (HEIC / HEIF / AVIF).
-        if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"):
-            return "heic"
-        if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis"):
-            return "avif"
         return None
 
     @classmethod

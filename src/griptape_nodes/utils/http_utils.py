@@ -3,7 +3,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
-import httpx
+import httpx2
 from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 from tenacity.wait import WaitBaseT
 
@@ -16,18 +16,18 @@ RETRY_WAIT_MAX_SECONDS = 10
 
 
 def is_retryable_httpx_error(exc: BaseException) -> bool:
-    """Return True for transient httpx errors that warrant a retry.
+    """Return True for transient httpx2 errors that warrant a retry.
 
     Retries on:
-    - Connection errors (httpx.ConnectError)
-    - Timeouts (httpx.TimeoutException)
+    - Connection errors (httpx2.ConnectError)
+    - Timeouts (httpx2.TimeoutException)
     - Server errors (HTTP 5xx)
 
     Does not retry on client errors (HTTP 4xx) or other exceptions.
     """
-    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+    if isinstance(exc, (httpx2.ConnectError, httpx2.TimeoutException)):
         return True
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, httpx2.HTTPStatusError):
         return exc.response.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
     return False
 
@@ -52,9 +52,9 @@ def request_with_retry(
     *,
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     wait: WaitBaseT = DEFAULT_RETRY_WAIT,
-    httpx_request_func: Callable[..., httpx.Response] | None = None,
+    httpx_request_func: Callable[..., httpx2.Response] | None = None,
     **kwargs: Any,
-) -> httpx.Response:
+) -> httpx2.Response:
     """Make an HTTP request with automatic retries on transient errors.
 
     Convenience wrapper for standalone/static-method use where a decorated
@@ -65,15 +65,15 @@ def request_with_retry(
         url: The URL to request.
         max_attempts: Maximum number of retry attempts.
         wait: Tenacity wait strategy for backoff between retries.
-        httpx_request_func: Optional httpx request callable. Use this to pass
-            the original (unpatched) httpx.request when calling from within
+        httpx_request_func: Optional httpx2 request callable. Use this to pass
+            the original (unpatched) httpx2.request when calling from within
             monkey-patched code to avoid infinite recursion.
         **kwargs: Passed through to the request function.
 
     Returns:
-        The httpx.Response (already checked via raise_for_status).
+        The httpx2.Response (already checked via raise_for_status).
     """
-    func = httpx_request_func or httpx.request
+    func = httpx_request_func or httpx2.request
 
     @retry(
         retry=retry_if_exception(is_retryable_httpx_error),
@@ -82,7 +82,7 @@ def request_with_retry(
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
-    def _do_request() -> httpx.Response:
+    def _do_request() -> httpx2.Response:
         response = func(method, url, **kwargs)
         response.raise_for_status()
         return response

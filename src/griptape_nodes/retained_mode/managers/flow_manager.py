@@ -13,7 +13,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
-import httpx
+import httpx2
 from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
@@ -4569,7 +4569,7 @@ class FlowManager(EngineScoped):
         if is_url:
             # Handle URL: download the image
             try:
-                response = httpx.get(file_url_or_path, timeout=30.0)
+                response = httpx2.get(file_url_or_path, timeout=30.0)
                 response.raise_for_status()
                 pil_image = Image.open(BytesIO(response.content))
             except Exception as e:

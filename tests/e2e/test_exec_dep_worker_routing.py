@@ -522,11 +522,11 @@ class TestManagerAccessDuringWorkerExecution:
             with pytest.raises(RuntimeError, match="ReadFileRequest"):
                 GriptapeNodes.OSManager()
 
-    def test_the_guard_covers_every_manager_but_static_files(self) -> None:
+    def test_the_guard_covers_every_accessor_but_static_files(self) -> None:
         """The guard is broad by design: silently-wrong local answers are worse than errors.
 
-        Sweeps every manager accessor on the facade rather than naming a few, so adding an
-        accessor without deciding its worker story fails here instead of shipping unguarded.
+        Sweeps every accessor on the facade rather than naming a few, so adding an accessor
+        without deciding its worker story fails here instead of shipping unguarded.
         """
         current_engine().library_manager._is_worker = True
         event_manager = current_engine().event_manager
@@ -535,7 +535,7 @@ class TestManagerAccessDuringWorkerExecution:
         accessors = [
             name
             for name, member in vars(GriptapeNodes).items()
-            if isinstance(member, classmethod) and name[0].isupper() and name.endswith("Manager")
+            if isinstance(member, classmethod) and name[0].isupper()
         ]
         assert len(accessors) > minimum_believable_sweep, "sweep found too few accessors to be believed"
 

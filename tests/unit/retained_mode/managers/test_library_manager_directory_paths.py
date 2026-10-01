@@ -203,6 +203,48 @@ class TestDownloadLibraryRequestPath:
         assert result.existing_path == str(Path("/opt/libraries/repo"))
 
 
+class TestDownloadLibraryRequestUrlRef:
+    """Test download_library_request honors a url@ref suffix."""
+
+    async def _clone_args(self, engine: Engine, git_url: str, branch_tag_commit: str | None) -> tuple:
+        config_mgr = MagicMock()
+        config_mgr.resolved_libraries_root.return_value = Path("/workspace/libraries")
+
+        request = MagicMock()
+        request.git_url = git_url
+        request.branch_tag_commit = branch_tag_commit
+        request.target_directory_name = None
+        request.download_directory = None
+
+        with (
+            patch.object(engine, "_config_manager", config_mgr),
+            patch("anyio.Path.mkdir"),
+            patch("anyio.Path.exists", return_value=False),
+            patch.object(asyncio, "to_thread", side_effect=GitCloneError("stop test here")) as mock_to_thread,
+        ):
+            await engine.library_manager.download_library_request(request)
+
+        _, clone_url, target_path, ref = mock_to_thread.call_args.args
+        return clone_url, target_path, ref
+
+    @pytest.mark.asyncio
+    async def test_url_ref_suffix_becomes_clone_ref(self, engine: Engine) -> None:
+        """The @ref suffix is stripped from the clone URL and target dir and used as the ref."""
+        clone_url, target_path, ref = await self._clone_args(engine, "https://github.com/user/repo@stable", None)
+
+        assert clone_url == "https://github.com/user/repo.git"
+        assert target_path == Path("/workspace/libraries/repo")
+        assert ref == "stable"
+
+    @pytest.mark.asyncio
+    async def test_explicit_branch_tag_commit_overrides_url_ref(self, engine: Engine) -> None:
+        """An explicit branch_tag_commit wins over the URL's @ref suffix."""
+        clone_url, _, ref = await self._clone_args(engine, "https://github.com/user/repo@stable", "main")
+
+        assert clone_url == "https://github.com/user/repo.git"
+        assert ref == "main"
+
+
 class TestUpdateLibraryRequestExistingPath:
     """Test update_library_request reports the dirty library directory in ``existing_path``."""
 

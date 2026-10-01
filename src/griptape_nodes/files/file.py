@@ -969,7 +969,8 @@ class FileDestinationProvider(Protocol):
     """Protocol for nodes that provide a FileDestination without serializing it over the wire."""
 
     @property
-    def file_destination(self) -> FileDestination | None: ...
+    def file_destination(self) -> FileDestination | None:
+        """The destination downstream nodes should write to, or None if the node has not configured one."""
 
 
 def _to_bytes(fc: FileContent) -> bytes:

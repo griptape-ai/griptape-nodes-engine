@@ -128,6 +128,31 @@ class TestFileSequenceEntry:
         assert "000042" in f._file_path
 
 
+class TestStripSequenceToken:
+    """Tests for strip_sequence_token()."""
+
+    def test_no_token_returned_unchanged(self) -> None:
+        assert file_sequence.strip_sequence_token("render") == "render"
+
+    def test_hash_token_stripped(self) -> None:
+        assert file_sequence.strip_sequence_token("render_####") == "render"
+
+    def test_printf_token_stripped(self) -> None:
+        assert file_sequence.strip_sequence_token("render_%04d") == "render"
+
+    def test_dot_separator_stripped(self) -> None:
+        assert file_sequence.strip_sequence_token("render.####") == "render"
+
+    def test_multiple_tokens_raise(self) -> None:
+        with pytest.raises(file_sequence.FileSequenceError):
+            file_sequence.strip_sequence_token("render_#### v%04d")
+
+    @pytest.mark.parametrize("stem", ["####", "_####", "%04d"])
+    def test_token_only_stem_raises(self, stem: str) -> None:
+        with pytest.raises(file_sequence.FileSequenceError, match="no text besides the frame number"):
+            file_sequence.strip_sequence_token(stem)
+
+
 class TestFileSequenceDestination:
     """Tests for FileSequenceDestination."""
 
@@ -194,6 +219,18 @@ class TestFileSequenceDestination:
         macro_path = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/frames/frame_####.exr"), {})
         dest = file_sequence.FileSequenceDestination(macro_path)
         with mock.patch(HANDLE_REQUEST_PATH, return_value=failure), pytest.raises(file_sequence.FileSequenceError):
+            dest.entry(0)
+
+    def test_entry_raises_friendly_error_on_unparsable_resolved_path(self, tmp_path: pathlib.Path) -> None:
+        resolved = tmp_path / "render_#### v%04d.exr"
+        path_success = project_events.GetPathForMacroResultSuccess(
+            result_details="OK",
+            resolved_path=resolved,
+            absolute_path=resolved,
+        )
+        macro_path = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/frame_####.exr"), {})
+        dest = file_sequence.FileSequenceDestination(macro_path)
+        with mock.patch(HANDLE_REQUEST_PATH, return_value=path_success), pytest.raises(file_sequence.FileSequenceError):
             dest.entry(0)
 
     def test_on_entry_written_sets_file_sequence(self) -> None:
@@ -430,6 +467,15 @@ class TestBuildVersionedSequenceDestination:
 
         assert "_index" in dest._macro_path.variables
         assert "extra" in dest._macro_path.variables
+
+    def test_template_without_version_slot_is_returned_unversioned(self) -> None:
+        macro = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/frames/frames.####.png"), {})
+
+        with mock.patch(HANDLE_REQUEST_PATH) as mock_handle:
+            dest = file_sequence.build_versioned_sequence_destination(macro)
+
+        mock_handle.assert_not_called()
+        assert dest._macro_path is macro
 
     def test_existing_file_policy_forwarded(self) -> None:
         index_result = os_events.GetNextVersionIndexResultSuccess(result_details="OK", index=1)
