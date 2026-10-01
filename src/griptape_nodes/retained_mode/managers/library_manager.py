@@ -271,7 +271,7 @@ from griptape_nodes.serialization.type_names import (
     is_dynamic_module_name,
     register_stable_module_name,
 )
-from griptape_nodes.serialization.values import ValueEncodeError, encode_value
+from griptape_nodes.serialization.values import Unencodable, try_encode
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
@@ -5720,9 +5720,7 @@ class LibraryManager(EngineScoped):
     @staticmethod
     def _encodable_or_none(value: Any) -> Any:
         """Return value if it has a plain-data form, otherwise None."""
-        try:
-            encode_value(value)
-        except ValueEncodeError:
+        if isinstance(try_encode(value), Unencodable):
             return None
         return value
 

@@ -179,7 +179,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_CO
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
-from griptape_nodes.serialization.values import Unencodable, decode_value, try_encode, value_key
+from griptape_nodes.serialization.values import Unencodable, decode_value, encodable_default, try_encode, value_key
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -2588,7 +2588,7 @@ class FlowManager(EngineScoped):
                 node_name=start_node_name,
                 parameter_name=param_name,
                 type=source_param.output_type,
-                default_value=source_param.default_value,
+                default_value=encodable_default(source_param.default_value, source_node.name, source_param.name),
                 tooltip=f"Parameter {target_parameter_name} from node {target_node_name} in packaged flow",
                 initial_setup=True,
             )
