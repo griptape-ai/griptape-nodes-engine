@@ -1944,3 +1944,39 @@ class TestExecutionEventSubscription:
         manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output"))
 
         assert received == []
+
+
+class TestPutEventReportsWhetherItEnqueued:
+    """`put_event` answers whether the event actually went on the queue.
+
+    Most callers fire and forget, but one that tracks what it has already announced -- e.g.
+    ContextManager's CurrentWorkflowChanged broadcast -- has to tell an enqueued event from a
+    dropped one, or it remembers a switch as announced that reached nobody.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_false_before_the_queue_exists(self) -> None:
+        manager = EventManager()
+
+        assert manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output")) is False
+
+    @pytest.mark.asyncio
+    async def test_returns_true_once_the_event_is_on_the_queue(self) -> None:
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        assert manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output")) is True
+        assert queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_aput_event_reports_the_same_way(self) -> None:
+        manager = EventManager()
+
+        assert await manager.aput_event(ProgressEvent(value="x", node_name="n", parameter_name="output")) is False
+
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        assert await manager.aput_event(ProgressEvent(value="x", node_name="n", parameter_name="output")) is True
+        assert queue.qsize() == 1
