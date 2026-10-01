@@ -100,15 +100,18 @@ jobs:
       # merges until this PR lands, so nothing new reaches [Unreleased] first.
       - name: Roll the changelog
         if: steps.compute.outputs.skip == 'false'
+        id: roll
         run: |
           TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
           RELEASED="${TAG#v}"
           if grep -q "^## \[${RELEASED}\]" CHANGELOG.md; then
             echo "CHANGELOG.md already has a section for ${RELEASED}."
+            echo "rolled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           DATE=$(git show "${TAG}:CHANGELOG.md" 2>/dev/null | sed -n "s/^## \[${RELEASED}\] - \([0-9-]*\).*/\1/p")
           uv run --no-project scripts/changelog.py roll "$RELEASED" --date "${DATE:-$(date -u +%F)}" --allow-empty
+          echo "rolled=true" >> "$GITHUB_OUTPUT"
 
       - name: Create bump branch and commit
         if: steps.compute.outputs.skip == 'false'
@@ -117,8 +120,17 @@ jobs:
           NEXT="${{ steps.compute.outputs.next }}"
           BRANCH="chore/bump-next-v${NEXT}"
           git checkout -b "$BRANCH"
-          git add pyproject.toml uv.lock CHANGELOG.md
+          git add --all pyproject.toml uv.lock CHANGELOG.md
+          # changelog.d carries the deletions of the entries the roll folded in; staging CHANGELOG.md
+          # alone would leave them on main for the next release to publish a second time. The
+          # directory test is because git treats a pathspec matching nothing as fatal.
+          test ! -d changelog.d || git add --all changelog.d
           git commit -m "chore: bump v${NEXT}"
+          # Only when this run folded them. A run that found the section already rolled leaves the
+          # entries alone, and those belong to the next release.
+          if [ "${{ steps.roll.outputs.rolled }}" = "true" ]; then
+            make version/assert-rolled
+          fi
           git push origin "$BRANCH" --force
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 

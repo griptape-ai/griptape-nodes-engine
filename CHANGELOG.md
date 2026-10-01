@@ -10,32 +10,7 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
-### Changed
-
-- Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
-  engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
-  still work and act on the current engine's registry.
-
-### Removed
-
-- **Breaking:** `StartFlowRequest` no longer accepts `wait_for_completion` or `completion_timeout_ms`.
-  The request already answers once the run ends, so neither had any effect. Drop them from calls. To
-  bound a run, wrap the call in `asyncio.wait_for` and send `CancelFlowRequest` on timeout.
-
-### Fixed
-
-- `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
-  tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
-- A node that reports a result with `set_parameter_value` now shows that result when the node runs
-  in a library's isolated process, instead of leaving the output empty. A parameter that has an
-  output, set while the node is running, now also records the value as a result, and results are what
-  travel back from an isolated process. This covers a parameter that is also kept on display, and one
-  that declares no modes at all, which is most of the parameters a library writes. Nothing the
-  parameter held before is given up: the value is still the parameter's own, so a node that sets one
-  mid-run and reads it on the next run, as a randomized seed does, reads what it set. A parameter
-  with no output has nowhere to publish, so a value set on it during a run stays in the process that
-  set it.
-  [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+<!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
 ## [0.103.0] - 2026-09-29
 
