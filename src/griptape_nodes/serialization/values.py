@@ -18,6 +18,14 @@ runs that codec's code on the data, so a class from any loaded module can be bui
 process cannot build or is not allowed to import, such as one whose class lives in a library
 another process loads, decodes to an ``UndecodedValue`` that encodes back to exactly the data it
 came from, so it passes through to a process that can build it.
+
+A value with no plain-data form is handled by where it is going:
+
+- Read back later (workflow save, copy and paste, packaged loop and group flows): leave it out and
+  log a warning. Never save its text in its place.
+- Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
+  the parameter.
+- Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
 """
 
 from __future__ import annotations
@@ -67,6 +75,13 @@ class ValueEncodeError(TypeError):
     """A value has no plain-data form."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Unencodable:
+    """Why a value has no plain-data form."""
+
+    reason: str
+
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -89,6 +104,14 @@ def encode_value(value: Any) -> JsonValue:
         ValueEncodeError: ``value``, or something inside it, has no plain-data form.
     """
     return _encode(value, set())
+
+
+def try_encode(value: Any) -> JsonValue | Unencodable:
+    """Return ``value`` encoded, or an ``Unencodable`` saying why it has no plain-data form."""
+    try:
+        return encode_value(value)
+    except ValueEncodeError as error:
+        return Unencodable(str(error))
 
 
 def decode_value(data: Any) -> Any:
