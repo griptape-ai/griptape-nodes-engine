@@ -6,11 +6,13 @@ import mimetypes
 import os
 import threading
 from functools import partial
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import httpx2
 from griptape.artifacts.audio_url_artifact import AudioUrlArtifact
 from griptape.artifacts.error_artifact import ErrorArtifact
 from griptape.artifacts.image_url_artifact import ImageUrlArtifact
@@ -208,8 +210,8 @@ class PublicArtifactUrlParameter:
         self.gtc_file_path = self._build_upload_path(url)
         try:
             return driver.upload_file(path=self.gtc_file_path, file_content=file_contents)
-        except RuntimeError:
-            self._forget_storage_driver(driver)
+        except RuntimeError as e:
+            self._forget_storage_driver_if_bucket_missing(driver, e)
             raise
 
     async def aget_public_url_for_parameter(self) -> str:
@@ -231,8 +233,8 @@ class PublicArtifactUrlParameter:
             # The background cleanup owns the delete now.
             self._take_upload_path()
             raise
-        except RuntimeError:
-            self._forget_storage_driver(driver)
+        except RuntimeError as e:
+            self._forget_storage_driver_if_bucket_missing(driver, e)
             raise
 
     def delete_uploaded_artifact(self) -> None:
@@ -242,10 +244,13 @@ class PublicArtifactUrlParameter:
         self._get_storage_driver().delete_file(path)
 
     async def adelete_uploaded_artifact(self) -> None:
+        if self.gtc_file_path is None:
+            return
+        # Resolved before taking the path, so a cancel during resolution leaves the path recorded.
+        driver = await self._aget_storage_driver()
         path = self._take_upload_path()
         if path is None:
             return
-        driver = await self._aget_storage_driver()
         await self._run_off_loop(partial(driver.delete_file, path))
 
     def _get_url_to_publish(self) -> str:
@@ -305,12 +310,14 @@ class PublicArtifactUrlParameter:
             )
         return self._build_storage_driver(bucket_id)
 
-    def _forget_storage_driver(self, driver: GriptapeCloudStorageDriver) -> None:
-        """Drop a driver whose upload failed, so the next upload revalidates its bucket.
+    def _forget_storage_driver_if_bucket_missing(self, driver: GriptapeCloudStorageDriver, error: Exception) -> None:
+        """After a 404, drop the cached bucket so the next upload revalidates it.
 
-        The bucket is cached for the process, and a configured bucket deleted mid-session would
-        otherwise fail every later upload with a bare 404 instead of the invalid-bucket error.
+        A configured bucket deleted mid-session would otherwise fail every later upload with a
+        bare 404 instead of the invalid-bucket error. Transient failures keep the cache.
         """
+        if not self._is_not_found(error):
+            return
         if self._storage_driver is driver:
             self._storage_driver = None
         for cache_key, bucket_id in list(self._bucket_id_cache.items()):
@@ -344,16 +351,38 @@ class PublicArtifactUrlParameter:
             raise
 
     @classmethod
-    def _finish_in_background(cls, task: asyncio.Future[Any], *, then: Callable[[], Any] | None = None) -> None:
+    def _finish_in_background(
+        cls,
+        task: asyncio.Future[Any],
+        *,
+        then: Callable[[], Any] | None = None,
+        failure_message: str = "A Griptape Cloud request left by a cancelled run failed: %s",
+    ) -> None:
         def on_done(finished: asyncio.Future[Any]) -> None:
             cls._background_tasks.discard(finished)
-            if not finished.cancelled() and finished.exception() is not None:
-                logger.warning("A Griptape Cloud request left by a cancelled run failed: %s", finished.exception())
+            if finished.cancelled():
+                # Only the event loop shutting down cancels this, and nothing can run after that.
+                return
+            if finished.exception() is not None:
+                logger.warning(failure_message, finished.exception())
             if then is not None:
-                cls._finish_in_background(asyncio.ensure_future(asyncio.to_thread(then)))
+                cls._finish_in_background(
+                    asyncio.ensure_future(asyncio.to_thread(then)),
+                    failure_message="Failed to delete an upload left by a cancelled run, so it stays in the bucket: %s",
+                )
 
         cls._background_tasks.add(task)
         task.add_done_callback(on_done)
+
+    @staticmethod
+    def _is_not_found(error: BaseException) -> bool:
+        # The driver wraps HTTP errors in RuntimeError, so look down the cause chain.
+        cause: BaseException | None = error
+        while cause is not None:
+            if isinstance(cause, httpx2.HTTPStatusError) and cause.response.status_code == HTTPStatus.NOT_FOUND:
+                return True
+            cause = cause.__cause__
+        return False
 
     @staticmethod
     def _is_public(url: str) -> bool:

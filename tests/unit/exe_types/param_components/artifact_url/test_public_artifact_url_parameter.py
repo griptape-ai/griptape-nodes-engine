@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import MagicMock, Mock
 
+import httpx2
 import pytest
 from griptape.artifacts import ErrorArtifact
 from griptape.artifacts.image_url_artifact import ImageUrlArtifact
@@ -286,6 +287,16 @@ def _clear_class_state() -> Iterator[None]:
     PublicArtifactUrlParameter._background_tasks.clear()
 
 
+def _upload_error(status_code: int) -> RuntimeError:
+    """Build the error the storage driver raises for an HTTP failure."""
+    request = httpx2.Request("PUT", "https://bucket.example/asset")
+    error = RuntimeError(f"upload failed with {status_code}")
+    error.__cause__ = httpx2.HTTPStatusError(
+        str(status_code), request=request, response=httpx2.Response(status_code, request=request)
+    )
+    return error
+
+
 async def _drain_background_tasks() -> None:
     for _ in range(500):
         if not PublicArtifactUrlParameter._background_tasks:
@@ -359,11 +370,9 @@ class TestLazyStorageDriver:
     @pytest.mark.parametrize("use_async", [False, True])
     @pytest.mark.asyncio
     async def test_failed_upload_revalidates_the_bucket_next_time(self, mocker: Any, *, use_async: bool) -> None:
-        # A configured bucket deleted mid-session must surface as the invalid-bucket error on the
-        # next upload, not as a 404 from a bucket the cache still trusts.
         component, driver = _make_lazy_component(mocker, "/inputs/a.png", configured_bucket="bucket-1")
         driver.bucket_id = "bucket-1"
-        driver.upload_file.side_effect = [RuntimeError("404 from the bucket"), PUBLIC_URL]
+        driver.upload_file.side_effect = [_upload_error(404), PUBLIC_URL]
         lookup_mock = mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
         mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"bytes")
         mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"bytes")
@@ -373,12 +382,26 @@ class TestLazyStorageDriver:
                 return await component.aget_public_url_for_parameter()
             return component.get_public_url_for_parameter()
 
-        with pytest.raises(RuntimeError, match="404"):
+        with pytest.raises(RuntimeError, match="upload failed"):
             await upload()
         assert await upload() == PUBLIC_URL
 
         lookups_before_and_after_failure = 2
         assert lookup_mock.call_count == lookups_before_and_after_failure
+
+    @pytest.mark.asyncio
+    async def test_transient_upload_failure_keeps_the_cached_bucket(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png", configured_bucket="bucket-1")
+        driver.bucket_id = "bucket-1"
+        driver.upload_file.side_effect = [_upload_error(503), PUBLIC_URL]
+        lookup_mock = mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"bytes")
+
+        with pytest.raises(RuntimeError, match="upload failed"):
+            await component.aget_public_url_for_parameter()
+        assert await component.aget_public_url_for_parameter() == PUBLIC_URL
+
+        lookup_mock.assert_called_once()
 
 
 class TestAsyncPublicUrl:
@@ -476,11 +499,20 @@ class TestBucketLookupLocks:
         slow.start()
         assert started.wait(timeout=5)
 
+        results: list[str] = []
+        fast = threading.Thread(
+            target=lambda: results.append(PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "fast"))
+        )
         try:
-            assert PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "fast") == "bucket-fast"
+            fast.start()
+            fast.join(timeout=1)
+            # Checked while the slow lookup still holds its lock.
+            assert not fast.is_alive()
+            assert results == ["bucket-fast"]
         finally:
             release.set()
             slow.join(timeout=5)
+            fast.join(timeout=5)
 
 
 class TestAsyncDelete:
@@ -508,6 +540,30 @@ class TestAsyncDelete:
 
 
 class TestAsyncCancel:
+    @pytest.mark.asyncio
+    async def test_cancel_while_resolving_the_driver_keeps_the_path_for_cleanup(self, mocker: Any) -> None:
+        release = threading.Event()
+        started = threading.Event()
+
+        def resolve(*_args: Any, **_kwargs: Any) -> str:
+            started.set()
+            release.wait(timeout=5)
+            return "bucket-1"
+
+        component, _ = _make_lazy_component(mocker, "https://example.com/img.png")
+        mocker.patch.object(PublicArtifactUrlParameter, "_resolve_bucket_id", side_effect=resolve)
+        component.gtc_file_path = Path("artifact_url_storage/abc/a.png")
+
+        task = asyncio.create_task(component.adelete_uploaded_artifact())
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert component.gtc_file_path == Path("artifact_url_storage/abc/a.png")
+        release.set()
+        await _drain_background_tasks()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("upload_fails", [False, True])
     async def test_cancel_returns_before_the_upload_and_deletes_it_after(
