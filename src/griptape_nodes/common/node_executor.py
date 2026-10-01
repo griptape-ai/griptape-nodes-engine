@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import pickle
+import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -12,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
+from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -39,6 +42,7 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
+from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
@@ -122,7 +126,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator, Mapping
 
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -133,6 +137,28 @@ logger = logging.getLogger("griptape_nodes")
 # Tracks the name of the node currently being executed in this async context.
 # Each asyncio task gets its own copy, so parallel node execution is safe.
 current_executing_node_name: ContextVar[str | None] = ContextVar("current_executing_node_name", default=None)
+
+# Maps the copies of loop body nodes that iterations run back to the nodes on the canvas, so the
+# node_run_timing summary uses the names the user sees. Set while a loop's iterations run.
+loop_copy_canvas_names: ContextVar[Mapping[str, str] | None] = ContextVar("loop_copy_canvas_names", default=None)
+
+
+@contextmanager
+def canvas_names_for_loop_copies(copy_to_original: Mapping[str, str]) -> Iterator[None]:
+    """Name the loop body copies an iteration runs after their nodes on the canvas.
+
+    A nested loop copies nodes that are already copies of the outer loop's body, so each original
+    is looked up in the outer loop's names too.
+    """
+    outer_names = loop_copy_canvas_names.get() or {}
+    names = dict(outer_names)
+    for copy_name, original_name in copy_to_original.items():
+        names[copy_name] = outer_names.get(original_name, original_name)
+    token = loop_copy_canvas_names.set(names)
+    try:
+        yield
+    finally:
+        loop_copy_canvas_names.reset(token)
 
 
 class IterationControlAction(StrEnum):
@@ -286,8 +312,38 @@ class NodeExecutor(EngineScoped):
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
         """
+        # A loop iteration runs a renamed copy of each body node, so record the canvas names.
+        canvas_names = loop_copy_canvas_names.get() or {}
+        node_name = canvas_names.get(node.name, node.name)
+        # Read before this node takes the ContextVar over: a node run by a group or loop sees that
+        # group's name here.
+        parent_name = current_executing_node_name.get()
+        if parent_name is not None:
+            parent_name = canvas_names.get(parent_name, parent_name)
+        started_at = time.perf_counter()
+        status = NodeRunStatus.FAILED
+        try:
+            await self._execute_by_node_type(node)
+            status = NodeRunStatus.SUCCEEDED
+        except asyncio.CancelledError:
+            status = NodeRunStatus.CANCELLED
+            raise
+        finally:
+            if is_beta_enabled(NODE_RUN_TIMING, self.engine.config_manager):
+                record = NodeRunRecord(
+                    node_name=node_name,
+                    node_type=type(node).__name__,
+                    parent_name=parent_name,
+                    started_at=started_at,
+                    finished_at=time.perf_counter(),
+                    status=status,
+                )
+                logger.info("TIME TO RUN: %.3f s for '%s' (%s)", record.seconds, record.node_name, record.node_type)
+                self.engine.flow_manager.run_timer.record(record)
+
+    async def _execute_by_node_type(self, node: BaseNode) -> None:
+        """Run the node the way its type needs: in-process, as a loop, or in a subprocess."""
         token = current_executing_node_name.set(node.name)
         try:
             # Handle while-loop node groups (RetryGroup, etc.)
@@ -1347,7 +1403,10 @@ class NodeExecutor(EngineScoped):
                     flow_name,
                     packaged_start_node_name,
                 )
-                with EventTranslationContext(event_manager, reverse_node_mapping):
+                with (
+                    EventTranslationContext(event_manager, reverse_node_mapping),
+                    canvas_names_for_loop_copies(reverse_node_mapping),
+                ):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=packaged_start_node_name,
@@ -1925,7 +1984,10 @@ class NodeExecutor(EngineScoped):
             )
 
             # Execute the subflow
-            with EventTranslationContext(event_manager, reverse_node_mapping):
+            with (
+                EventTranslationContext(event_manager, reverse_node_mapping),
+                canvas_names_for_loop_copies(reverse_node_mapping),
+            ):
                 start_subflow_request = StartLocalSubflowRequest(
                     flow_name=flow_name,
                     start_node=packaged_start_node_name,
@@ -3232,11 +3294,17 @@ class NodeExecutor(EngineScoped):
             packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
 
             async def run_single_iteration(
-                flow_name: str, iteration_index: int, start_node_name: str
+                flow_name: str, iteration_index: int, start_node_name: str, node_name_mappings: dict[str, str]
             ) -> IterationOutcome:
                 """Run a single iteration flow and report whether it finished, and why not."""
+                reverse_node_mapping = {
+                    packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
+                }
                 # Suppress execution events during parallel iteration to prevent flooding websockets
-                with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
+                with (
+                    EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS),
+                    canvas_names_for_loop_copies(reverse_node_mapping),
+                ):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=start_node_name,
@@ -3308,6 +3376,7 @@ class NodeExecutor(EngineScoped):
                         flow_name,
                         iteration_index,
                         node_name_mappings.get(packaged_start_node_name),
+                        node_name_mappings,
                     )
                 )
                 for iteration_index, flow_name, node_name_mappings in deserialized_flows

@@ -17,6 +17,11 @@ the engine's request API from working without edits. Migration steps live in
   and gets it back when the switch is turned on again. `GTN_CONFIG_BETA_FEATURES__ENABLED=false`
   turns every beta feature off for one session.
   [#5710](https://github.com/griptape-ai/griptape-nodes-engine/issues/5710)
+- A "Node run timing" beta feature writes how long each node took to run to the engine log, as
+  `TIME TO RUN: <seconds> s for '<node name>' (<node type>)`. When a workflow run finishes, fails,
+  or is cancelled, it also logs a `RUN SUMMARY` with the total time, the nodes grouped by which ran
+  in parallel, slowest first, and the nodes inside each group or loop.
+  [#5717](https://github.com/griptape-ai/griptape-nodes-engine/issues/5717)
 
 ### Changed
 

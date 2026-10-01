@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from griptape_nodes.common.node_run_timing import RunOutcome
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
@@ -12,6 +13,7 @@ from griptape_nodes.exe_types.node_types import (
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
+from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -149,6 +151,15 @@ class CompleteState(State):
             logger.debug("Isolated subflow '%s' is complete.", context.flow_name)
             return None
 
+        # A failed or cancelled run also ends here, once the resolution machine has wound down.
+        resolution_machine = context.resolution_machine
+        outcome = RunOutcome.COMPLETED
+        if resolution_machine.is_errored():
+            outcome = RunOutcome.FAILED
+        elif resolution_machine.is_canceled():
+            outcome = RunOutcome.CANCELLED
+        context.engine.flow_manager.run_timer.finish_run(outcome)
+
         # Broadcast completion events for any remaining current nodes
         for current_node in context.current_nodes:
             # Use pickle-based serialization for complex parameter output values
@@ -212,6 +223,9 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
     async def start_flow(
         self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
     ) -> None:
+        # An isolated flow is one loop iteration inside a run that is already being timed.
+        if not self._context.is_isolated and is_beta_enabled(NODE_RUN_TIMING, self._context.engine.config_manager):
+            self._context.engine.flow_manager.run_timer.start_run()
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)
         self._context.current_nodes = current_nodes

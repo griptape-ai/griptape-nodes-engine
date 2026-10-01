@@ -340,3 +340,19 @@ def _entry_label(index: int, entry: Any) -> str:
 
 def _today() -> date:
     return datetime.now(tz=UTC).date()
+
+
+# Registered engine features. Kept below the helpers above because registering calls them.
+
+NODE_RUN_TIMING = register_beta_feature(
+    BetaFeature(
+        id="node_run_timing",
+        name="Node run timing",
+        description=(
+            "Writes how long each node took to run to the engine log, and a summary when a workflow run "
+            "finishes, fails, or is cancelled, showing which nodes ran in parallel and which were slowest."
+        ),
+        owner="@shhlife",
+        remove_by=date(2027, 3, 29),
+    )
+)
