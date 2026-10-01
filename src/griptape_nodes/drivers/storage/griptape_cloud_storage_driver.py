@@ -4,7 +4,7 @@ import logging
 import os
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlparse
 
 import httpx2
@@ -16,8 +16,6 @@ from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.utils.http_utils import request_with_retry, retry_on_transient_error
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
@@ -544,7 +542,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
     def is_cloud_asset_url(url_str: str, base_url: str | None = None) -> bool:
         """Check if URL is a Griptape Cloud asset URL with domain validation.
 
-        Static version for use without driver instance (e.g., the http_file_patch layer).
+        Static version for use without driver instance.
         Detects URLs matching pattern: https://cloud.griptape.ai/buckets/{id}/assets/{path}
         Validates domain matches expected cloud domain.
 
@@ -655,66 +653,3 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             return None
         else:
             return bucket_id
-
-    @staticmethod
-    def create_signed_download_url_from_asset_url(
-        asset_url: str,
-        bucket_id: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        *,
-        httpx_request_func: Callable[..., Any],
-    ) -> str | None:
-        """Create a signed download URL for a cloud asset.
-
-        Static version for use without driver instance (e.g., the http_file_patch layer).
-
-        Args:
-            asset_url: Cloud asset URL to convert
-            bucket_id: Bucket ID. If None, reads from GT_CLOUD_BUCKET_ID env var.
-            api_key: Credential. If None, resolves the license, then GT_CLOUD_API_KEY.
-            base_url: Cloud base URL. If None, reads from GT_CLOUD_BASE_URL env var.
-            httpx_request_func: The httpx2 request function to use (original, not patched)
-
-        Returns:
-            Signed download URL if successful, None if fails
-        """
-        # Get credentials from parameters or environment
-        if bucket_id is None:
-            bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
-        if api_key is None:
-            api_key = resolve_cloud_credential()
-        if base_url is None:
-            base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-
-        # Guard: Check for required credentials
-        if not bucket_id:
-            logger.debug("GT_CLOUD_BUCKET_ID not set, skipping cloud URL conversion: %s", asset_url)
-            return None
-
-        if not api_key:
-            logger.debug("No Griptape Cloud credential set, skipping cloud URL conversion: %s", asset_url)
-            return None
-
-        # Extract workspace-relative path
-        workspace_path = GriptapeCloudStorageDriver.extract_workspace_path_from_cloud_url(asset_url)
-        if not workspace_path:
-            logger.debug("Could not extract workspace path from cloud URL: %s", asset_url)
-            return None
-
-        # Build API URL for signed download URL
-        api_url = urljoin(base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
-
-        # Make API request to get signed URL
-        try:
-            headers = {"Authorization": f"Bearer {api_key}"}
-            response = request_with_retry(
-                "POST", api_url, httpx_request_func=httpx_request_func, json={"method": "GET"}, headers=headers
-            )
-        except Exception as e:
-            logger.warning("Failed to create signed download URL for %s: %s", asset_url, e)
-            return None
-
-        signed_url = response.json()["url"]
-        logger.info("Converted cloud asset URL to signed URL: %s", asset_url)
-        return signed_url

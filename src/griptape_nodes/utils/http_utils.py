@@ -1,5 +1,4 @@
 import logging
-from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
@@ -52,7 +51,6 @@ def request_with_retry(
     *,
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     wait: WaitBaseT = DEFAULT_RETRY_WAIT,
-    httpx_request_func: Callable[..., httpx2.Response] | None = None,
     **kwargs: Any,
 ) -> httpx2.Response:
     """Make an HTTP request with automatic retries on transient errors.
@@ -65,15 +63,11 @@ def request_with_retry(
         url: The URL to request.
         max_attempts: Maximum number of retry attempts.
         wait: Tenacity wait strategy for backoff between retries.
-        httpx_request_func: Optional httpx2 request callable. Use this to pass
-            the original (unpatched) httpx2.request when calling from within
-            monkey-patched code to avoid infinite recursion.
-        **kwargs: Passed through to the request function.
+        **kwargs: Passed through to httpx2.request.
 
     Returns:
         The httpx2.Response (already checked via raise_for_status).
     """
-    func = httpx_request_func or httpx2.request
 
     @retry(
         retry=retry_if_exception(is_retryable_httpx_error),
@@ -83,7 +77,7 @@ def request_with_retry(
         reraise=True,
     )
     def _do_request() -> httpx2.Response:
-        response = func(method, url, **kwargs)
+        response = httpx2.request(method, url, **kwargs)
         response.raise_for_status()
         return response
 

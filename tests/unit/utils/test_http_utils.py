@@ -1,4 +1,5 @@
 from typing import Any
+from unittest.mock import patch
 
 import httpx2
 import pytest
@@ -202,11 +203,12 @@ class TestRequestWithRetry:
             call_count += 1
             return httpx2.Response(200, request=httpx2.Request(method, url))
 
-        response = request_with_retry("GET", "https://example.com", wait=wait_none(), httpx_request_func=mock_request)
+        with patch("httpx2.request", side_effect=mock_request):
+            response = request_with_retry("GET", "https://example.com", wait=wait_none())
         assert response.status_code == HTTP_OK
         assert call_count == 1
 
-    def test_retries_on_500_with_custom_request_func(self) -> None:
+    def test_retries_on_500(self) -> None:
         call_count = 0
 
         def mock_request(method: str, url: str, **_kwargs: Any) -> httpx2.Response:
@@ -217,7 +219,8 @@ class TestRequestWithRetry:
                 response.raise_for_status()
             return httpx2.Response(200, request=httpx2.Request(method, url))
 
-        response = request_with_retry("GET", "https://example.com", wait=wait_none(), httpx_request_func=mock_request)
+        with patch("httpx2.request", side_effect=mock_request):
+            response = request_with_retry("GET", "https://example.com", wait=wait_none())
         assert response.status_code == HTTP_OK
         assert call_count == EXPECTED_CALLS_AFTER_ONE_FAILURE
 
@@ -231,14 +234,8 @@ class TestRequestWithRetry:
             response.raise_for_status()
             return response  # unreachable, but required for type checker
 
-        with pytest.raises(httpx2.HTTPStatusError):
-            request_with_retry(
-                "GET",
-                "https://example.com",
-                max_attempts=CUSTOM_MAX_ATTEMPTS,
-                wait=wait_none(),
-                httpx_request_func=mock_request,
-            )
+        with patch("httpx2.request", side_effect=mock_request), pytest.raises(httpx2.HTTPStatusError):
+            request_with_retry("GET", "https://example.com", max_attempts=CUSTOM_MAX_ATTEMPTS, wait=wait_none())
         assert call_count == CUSTOM_MAX_ATTEMPTS
 
     def test_passes_kwargs_through(self) -> None:
@@ -248,13 +245,13 @@ class TestRequestWithRetry:
             captured_kwargs.update(kwargs)
             return httpx2.Response(200, request=httpx2.Request(method, url))
 
-        request_with_retry(
-            "POST",
-            "https://example.com",
-            wait=wait_none(),
-            httpx_request_func=mock_request,
-            json={"key": "value"},
-            headers={"Authorization": "Bearer token"},
-        )
+        with patch("httpx2.request", side_effect=mock_request):
+            request_with_retry(
+                "POST",
+                "https://example.com",
+                wait=wait_none(),
+                json={"key": "value"},
+                headers={"Authorization": "Bearer token"},
+            )
         assert captured_kwargs["json"] == {"key": "value"}
         assert captured_kwargs["headers"] == {"Authorization": "Bearer token"}
