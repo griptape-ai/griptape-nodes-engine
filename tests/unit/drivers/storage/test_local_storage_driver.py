@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
@@ -63,7 +63,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url delegates to OSManager with correct policy."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -92,7 +92,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url uses resolved filename from OSManager."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -131,7 +131,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url defaults to OVERWRITE policy."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -358,7 +358,7 @@ class TestLocalStorageDriverDeleteFile:
         if status_code is None:
             response.raise_for_status.return_value = None
         else:
-            response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            response.raise_for_status.side_effect = httpx2.HTTPStatusError(
                 f"http {status_code}", request=Mock(), response=response
             )
         return Mock(return_value=response)
@@ -367,7 +367,7 @@ class TestLocalStorageDriverDeleteFile:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
         delete_mock = self._delete_mock(None)
 
-        with patch(f"{self.MODULE}.httpx.delete", delete_mock):
+        with patch(f"{self.MODULE}.httpx2.delete", delete_mock):
             driver.delete_file(Path("artifact_url_storage/abc/video.mp4"))
 
         args, _ = delete_mock.call_args
@@ -376,14 +376,14 @@ class TestLocalStorageDriverDeleteFile:
     def test_absent_file_is_a_no_op(self) -> None:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
 
-        with patch(f"{self.MODULE}.httpx.delete", self._delete_mock(404)):
+        with patch(f"{self.MODULE}.httpx2.delete", self._delete_mock(404)):
             driver.delete_file(TEST_FILE_PATH)
 
     def test_raises_on_server_error(self) -> None:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
 
         with (
-            patch(f"{self.MODULE}.httpx.delete", self._delete_mock(500)),
+            patch(f"{self.MODULE}.httpx2.delete", self._delete_mock(500)),
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             driver.delete_file(TEST_FILE_PATH)

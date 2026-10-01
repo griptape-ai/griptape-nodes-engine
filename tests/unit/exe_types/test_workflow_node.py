@@ -19,7 +19,7 @@ from griptape_nodes.exe_types.workflow_node import (
     flatten_shape_section,
     pair_shape_nodes,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
@@ -429,7 +429,7 @@ class TestEditorPreviewMetadata:
         node = node_class(name="Shout It")
 
         registry_key = node.metadata["_workflow_file_value"]
-        assert WorkflowRegistry.has_workflow_with_name(registry_key)
+        assert current_engine().workflow_registry.has_workflow_with_name(registry_key)
 
     def test_workflow_is_internal_flag_is_respected_not_overridden(self, tmp_path: Path) -> None:
         """The workflow's own is_internal flag wins.
@@ -454,7 +454,7 @@ class TestEditorPreviewMetadata:
         node = node_class(name="Shout It")
 
         registry_key = node.metadata["_workflow_file_value"]
-        assert WorkflowRegistry.get_workflow_by_name(registry_key).metadata.is_internal is False
+        assert current_engine().workflow_registry.get_workflow_by_name(registry_key).metadata.is_internal is False
 
     def test_missing_workflow_file_leaves_preview_unavailable(self) -> None:
         shape = WorkflowShape(

@@ -103,9 +103,11 @@ class VideoArtifactProvider(BaseArtifactProvider):
         # ISO BMFF: 'ftyp' at bytes 4-8, brand at bytes 8-12.
         if head[4:8] == b"ftyp":
             brand = head[8:12]
-            # Audio-only and image ISO BMFF brands are claimed by their own providers.
+            # Audio-only brands are claimed by their own providers.
             if brand in (b"M4A ", b"M4B "):
                 return None
+            # Image ISO BMFF brands (HEIC/HEIF/AVIF) would otherwise fall through to the "mp4"
+            # default below and be misdetected as video.
             if brand in (b"heic", b"heix", b"mif1", b"heim", b"heis", b"msf1", b"avif", b"avis"):
                 return None
             if brand == b"qt  ":

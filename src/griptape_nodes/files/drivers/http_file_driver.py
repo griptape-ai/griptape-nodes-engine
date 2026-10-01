@@ -1,6 +1,6 @@
 """File driver for HTTP/HTTPS locations."""
 
-import httpx
+import httpx2
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 
@@ -40,11 +40,11 @@ class HttpFileDriver(BaseFileDriver):
             RuntimeError: If download fails or HTTP error occurs
         """
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.get(location, timeout=timeout)
                 response.raise_for_status()
                 return response.content
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             msg = f"Failed to download from {location}: {e}"
             raise RuntimeError(msg) from e
 
@@ -58,10 +58,10 @@ class HttpFileDriver(BaseFileDriver):
             True if URL returns 2xx status code
         """
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.head(location, timeout=10.0)
                 return response.status_code < _HTTP_SUCCESS_THRESHOLD
-        except (httpx.HTTPError, Exception):
+        except (httpx2.HTTPError, Exception):
             return False
 
     def get_size(self, location: str) -> int:
@@ -74,14 +74,14 @@ class HttpFileDriver(BaseFileDriver):
             Size in bytes from Content-Length header, or 0 if unavailable
 
         Note:
-            This is a synchronous operation but uses httpx sync client.
+            This is a synchronous operation but uses httpx2 sync client.
             Returns 0 if Content-Length header is not available.
         """
         try:
-            with httpx.Client() as client:
+            with httpx2.Client() as client:
                 response = client.head(location, timeout=10.0)
                 response.raise_for_status()
                 content_length = response.headers.get("content-length")
                 return int(content_length) if content_length else 0
-        except (httpx.HTTPError, ValueError, Exception):
+        except (httpx2.HTTPError, ValueError, Exception):
             return 0

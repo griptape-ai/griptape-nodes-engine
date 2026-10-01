@@ -3722,7 +3722,7 @@ class NodeManager(EngineScoped):
                 )
 
             try:
-                with aprocess_scope(request.variables):
+                with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
                 # Pass the live exception through ``exception=`` so the

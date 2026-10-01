@@ -3,7 +3,7 @@
 import os
 from urllib.parse import urljoin, urlparse
 
-import httpx
+import httpx2
 
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
@@ -118,7 +118,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=timeout)
                 response.raise_for_status()
                 signed_url = response.json()["url"]
@@ -127,7 +127,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
                 download_response.raise_for_status()
                 return download_response.content
 
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             msg = f"Failed to download from cloud storage at {location}: {e}"
             raise RuntimeError(msg) from e
 
@@ -151,11 +151,11 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 # TODO: Standardize timeout values https://github.com/griptape-ai/griptape-nodes/issues/3958
                 response = await client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=10.0)
                 return response.status_code < _HTTP_SUCCESS_THRESHOLD
-        except (httpx.HTTPError, Exception):
+        except (httpx2.HTTPError, Exception):
             return False
 
     def get_size(self, location: str) -> int:
@@ -181,7 +181,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            with httpx.Client() as client:
+            with httpx2.Client() as client:
                 response = client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=10.0)
                 response.raise_for_status()
                 signed_url = response.json()["url"]
@@ -191,5 +191,5 @@ class GriptapeCloudFileDriver(BaseFileDriver):
                 content_length = head_response.headers.get("content-length")
                 return int(content_length) if content_length else 0
 
-        except (httpx.HTTPError, ValueError, Exception):
+        except (httpx2.HTTPError, ValueError, Exception):
             return 0

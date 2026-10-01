@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
@@ -235,7 +235,7 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
         with (
             patch.object(driver, "create_signed_upload_url") as mock_create_signed_upload_url,
             patch.object(driver, "create_signed_download_url") as mock_create_signed_download_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             mock_create_signed_upload_url.return_value = {
                 "method": "PUT",
@@ -283,7 +283,7 @@ class TestGriptapeCloudStorageDriverBucketExists:
     def test_returns_false_on_404(self) -> None:
         response = Mock()
         response.status_code = 404
-        error = httpx.HTTPStatusError("not found", request=Mock(), response=response)
+        error = httpx2.HTTPStatusError("not found", request=Mock(), response=response)
 
         with patch(f"{self.MODULE}.request_with_retry", side_effect=error):
             result = GriptapeCloudStorageDriver.bucket_exists(
@@ -295,7 +295,7 @@ class TestGriptapeCloudStorageDriverBucketExists:
     def test_raises_on_non_404_error(self) -> None:
         response = Mock()
         response.status_code = 500
-        error = httpx.HTTPStatusError("server error", request=Mock(), response=response)
+        error = httpx2.HTTPStatusError("server error", request=Mock(), response=response)
 
         with (
             patch(f"{self.MODULE}.request_with_retry", side_effect=error),
@@ -359,7 +359,7 @@ class TestGriptapeCloudStorageDriverGetDefaultBucketId:
     def test_raises_on_http_error(self) -> None:
         response = Mock()
         response.status_code = 500
-        error = httpx.HTTPStatusError("server error", request=Mock(), response=response)
+        error = httpx2.HTTPStatusError("server error", request=Mock(), response=response)
 
         with (
             patch(f"{self.MODULE}.request_with_retry", side_effect=error),
@@ -496,10 +496,10 @@ class TestGriptapeCloudStorageDriverDeleteFile:
         )
 
     @staticmethod
-    def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    def _status_error(status_code: int) -> httpx2.HTTPStatusError:
         response = Mock()
         response.status_code = status_code
-        return httpx.HTTPStatusError(f"http {status_code}", request=Mock(), response=response)
+        return httpx2.HTTPStatusError(f"http {status_code}", request=Mock(), response=response)
 
     def test_deletes_asset_at_workspace_relative_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
         with patch.object(cloud_storage_driver, "_request") as mock_request:

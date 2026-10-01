@@ -2,7 +2,7 @@ import logging
 from http import HTTPStatus
 from typing import Any
 
-import httpx
+import httpx2
 from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 from tenacity.wait import WaitBaseT
 
@@ -15,18 +15,18 @@ RETRY_WAIT_MAX_SECONDS = 10
 
 
 def is_retryable_httpx_error(exc: BaseException) -> bool:
-    """Return True for transient httpx errors that warrant a retry.
+    """Return True for transient httpx2 errors that warrant a retry.
 
     Retries on:
-    - Connection errors (httpx.ConnectError)
-    - Timeouts (httpx.TimeoutException)
+    - Connection errors (httpx2.ConnectError)
+    - Timeouts (httpx2.TimeoutException)
     - Server errors (HTTP 5xx)
 
     Does not retry on client errors (HTTP 4xx) or other exceptions.
     """
-    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+    if isinstance(exc, (httpx2.ConnectError, httpx2.TimeoutException)):
         return True
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, httpx2.HTTPStatusError):
         return exc.response.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
     return False
 
@@ -52,7 +52,7 @@ def request_with_retry(
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     wait: WaitBaseT = DEFAULT_RETRY_WAIT,
     **kwargs: Any,
-) -> httpx.Response:
+) -> httpx2.Response:
     """Make an HTTP request with automatic retries on transient errors.
 
     Convenience wrapper for standalone/static-method use where a decorated
@@ -63,10 +63,10 @@ def request_with_retry(
         url: The URL to request.
         max_attempts: Maximum number of retry attempts.
         wait: Tenacity wait strategy for backoff between retries.
-        **kwargs: Passed through to httpx.request.
+        **kwargs: Passed through to httpx2.request.
 
     Returns:
-        The httpx.Response (already checked via raise_for_status).
+        The httpx2.Response (already checked via raise_for_status).
     """
 
     @retry(
@@ -76,8 +76,8 @@ def request_with_retry(
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
-    def _do_request() -> httpx.Response:
-        response = httpx.request(method, url, **kwargs)
+    def _do_request() -> httpx2.Response:
+        response = httpx2.request(method, url, **kwargs)
         response.raise_for_status()
         return response
 

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
@@ -223,12 +223,12 @@ def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
     """Return the HTTP status of a Griptape Cloud failure, or None if it isn't one.
 
     Two unrelated shapes reach this code: Pydantic AI's ``ModelHTTPError`` carries
-    ``status_code`` directly (the chat path), while ``httpx.HTTPStatusError`` keeps
+    ``status_code`` directly (the chat path), while ``httpx2.HTTPStatusError`` keeps
     it on ``response`` (the image path). The image toolset also wraps its failure in
     ``ModelRetry`` with ``raise ... from exc``, so follow the cause chain.
 
     Only errors from ``cloud_host`` count. An agent turn also talks to remote MCP
-    servers, which raise the same ``httpx.HTTPStatusError``; attributing their 403
+    servers, which raise the same ``httpx2.HTTPStatusError``; attributing their 403
     to Griptape licensing would send the user to their Griptape administrator over
     an expired token on their own MCP server.
     """
@@ -236,7 +236,7 @@ def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, httpx.HTTPStatusError):
+        if isinstance(current, httpx2.HTTPStatusError):
             if current.request.url.host == cloud_host:
                 return current.response.status_code
             return None
@@ -265,19 +265,19 @@ def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | N
     (e.g. an HTTP status error or a bad JSON body — those aren't "server down").
     """
     where = f" at '{base_url}'" if base_url else ""
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+    if isinstance(exc, (httpx2.ConnectError, httpx2.ConnectTimeout)):
         return (
             f"Couldn't reach the model provider{where}. Is the local server "
             "(e.g. LMStudio or Ollama) running and reachable at that address?"
         )
-    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+    if isinstance(exc, (httpx2.ReadTimeout, httpx2.WriteTimeout, httpx2.PoolTimeout)):
         return (
             f"The model provider{where} didn't respond in time. Is the local "
             "server (e.g. LMStudio or Ollama) running and reachable at that address?"
         )
-    # Other httpx.RequestError subclasses (DNS failures, connection drops, etc.)
+    # Other httpx2.RequestError subclasses (DNS failures, connection drops, etc.)
     # are still connection-shaped from the user's perspective.
-    if isinstance(exc, httpx.RequestError):
+    if isinstance(exc, httpx2.RequestError):
         return (
             f"Couldn't connect to the model provider{where}. Is the local "
             "server (e.g. LMStudio or Ollama) running and reachable at that address?"
@@ -877,7 +877,7 @@ class AgentManager(EngineScoped):
             if request.api_key:
                 headers["Authorization"] = f"Bearer {request.api_key}"
 
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx2.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{base_url}/models", headers=headers)
                 response.raise_for_status()
 
@@ -887,7 +887,7 @@ class AgentManager(EngineScoped):
                 models=models,
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
-        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        except (httpx2.HTTPStatusError, httpx2.RequestError, ValueError) as e:
             # Keep the raw exception in the logs for debugging, but surface a
             # message the user can act on when the provider is simply offline.
             logger.warning("Attempted to list models from '%s'. Failed with: %s", request.base_url, e)
@@ -1269,7 +1269,7 @@ async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact
     if text:
         live.append(text)
         persist.append(text)
-    async with httpx.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
+    async with httpx2.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
         for url in image_urls:
             content = await _download_image_content(client, url)
             if content is None:
@@ -1305,7 +1305,7 @@ async def _rehydrate_history(messages: list[ModelMessage]) -> list[ModelMessage]
     ]
     if not image_requests:
         return messages
-    async with httpx.AsyncClient(timeout=_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+    async with httpx2.AsyncClient(timeout=_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS) as client:
         # Rehydrate every image-bearing message concurrently so a slow or
         # unreachable static server bounds the whole turn's stall to one
         # timeout, not one per message.
@@ -1333,7 +1333,7 @@ async def _rehydrate_history(messages: list[ModelMessage]) -> list[ModelMessage]
     return rehydrated_messages
 
 
-async def _rehydrate_message(client: httpx.AsyncClient, message: ModelRequest) -> _RehydratedMessage:
+async def _rehydrate_message(client: httpx2.AsyncClient, message: ModelRequest) -> _RehydratedMessage:
     """Return a copy of ``message`` with each user-prompt ``ImageUrl`` inlined.
 
     Downloads for a message run concurrently. The result also carries how many
@@ -1385,7 +1385,7 @@ def _message_has_image_url(message: ModelMessage) -> bool:
     return False
 
 
-async def _download_image_content(client: httpx.AsyncClient, url: str) -> BinaryContent | None:
+async def _download_image_content(client: httpx2.AsyncClient, url: str) -> BinaryContent | None:
     """Download an image URL and wrap its bytes as inline ``BinaryContent``.
 
     Returns ``None`` when the download fails so the caller can drop the
@@ -1394,13 +1394,13 @@ async def _download_image_content(client: httpx.AsyncClient, url: str) -> Binary
     try:
         response = await client.get(url)
         response.raise_for_status()
-    except httpx.HTTPError as e:
+    except httpx2.HTTPError as e:
         logger.warning("Attempted to attach image from %s. Skipping it because the download failed with %s.", url, e)
         return None
     return BinaryContent(data=response.content, media_type=_resolve_image_media_type(response, url))
 
 
-def _resolve_image_media_type(response: httpx.Response, url: str) -> str:
+def _resolve_image_media_type(response: httpx2.Response, url: str) -> str:
     """Determine the image media type from the response header, then the URL.
 
     Prefers the server's ``Content-Type`` and falls back to guessing from the
