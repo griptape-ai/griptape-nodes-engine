@@ -248,9 +248,7 @@ from griptape_nodes.serialization.converter import converter, safe_unstructure
 from griptape_nodes.serialization.values import (
     UndecodedValue,
     Unencodable,
-    ValueEncodeError,
     decode_value,
-    encode_value,
     try_encode,
     value_key,
 )
@@ -4884,10 +4882,9 @@ class NodeManager(EngineScoped):
                 if not parameter.serializable:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
-                try:
-                    encoded = encode_value(value)
-                except ValueEncodeError as error:
-                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, error)
+                encoded = try_encode(value)
+                if isinstance(encoded, Unencodable):
+                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
