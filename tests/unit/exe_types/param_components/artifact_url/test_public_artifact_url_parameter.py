@@ -6,7 +6,10 @@ from an upstream failure -- in addition to the original UrlArtifact / bare-strin
 paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
+import asyncio
 import re
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import MagicMock, Mock
@@ -257,3 +260,192 @@ class TestUploadPathLifecycle:
         component.delete_uploaded_artifact()
 
         driver.delete_file.assert_not_called()
+
+
+MODULE = "griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_parameter"
+
+
+@pytest.fixture(autouse=True)
+def _clear_bucket_id_cache() -> Iterator[None]:
+    PublicArtifactUrlParameter._bucket_id_cache.clear()
+    yield
+    PublicArtifactUrlParameter._bucket_id_cache.clear()
+
+
+def _make_lazy_component(mocker: Any, value: Any, *, bucket_secret: str | None = None) -> ComponentFixture:
+    """Build a component whose storage driver is built on first use, as __init__ leaves it."""
+    component, driver = _make_component(value)
+    component._node = MagicMock(parameter_values={"image": value})
+    component._node.get_parameter_value.return_value = value
+    component._storage_driver = None
+    component._api_key = "key"
+    component._base_url = "https://base"
+    component._request_timeout = None
+    mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=bucket_secret)
+    mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver", return_value=driver)
+    return ComponentFixture(component=component, driver=driver)
+
+
+class TestBucketIdCache:
+    """Resolving the bucket is a network round trip, and a node builds one helper per upload."""
+
+    def test_same_configuration_resolves_once(self, mocker: Any) -> None:
+        default_mock = mocker.patch(
+            f"{MODULE}.GriptapeCloudStorageDriver.get_default_bucket_id", return_value="org-default"
+        )
+
+        first = PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "key")
+        second = PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "key")
+
+        assert first == second == "org-default"
+        default_mock.assert_called_once()
+
+    def test_changed_secret_resolves_again(self, mocker: Any) -> None:
+        mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver.get_default_bucket_id", return_value="org-default")
+        exists_mock = mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver.bucket_exists", return_value=True)
+
+        assert PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "key") == "org-default"
+        assert PublicArtifactUrlParameter._resolve_bucket_id("bucket-9", "https://base", "key") == "bucket-9"
+        exists_mock.assert_called_once()
+
+    def test_failed_lookup_is_not_cached(self, mocker: Any) -> None:
+        mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver.bucket_exists", side_effect=[False, True])
+
+        with pytest.raises(RuntimeError, match="invalid bucket ID"):
+            PublicArtifactUrlParameter._resolve_bucket_id("bucket-9", "https://base", "key")
+        assert PublicArtifactUrlParameter._resolve_bucket_id("bucket-9", "https://base", "key") == "bucket-9"
+
+
+class TestLazyStorageDriver:
+    def test_pass_through_never_resolves_a_bucket(self, mocker: Any) -> None:
+        component, _ = _make_lazy_component(mocker, "https://example.com/img.png")
+        lookup_mock = mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id")
+
+        assert component.get_public_url_for_parameter() == "https://example.com/img.png"
+        lookup_mock.assert_not_called()
+
+    def test_driver_is_built_once_across_uploads(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png")
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"bytes")
+
+        uploads = 2
+        for _ in range(uploads):
+            component.get_public_url_for_parameter()
+
+        assert driver.upload_file.call_count == uploads
+        assert component._storage_driver is driver
+
+
+class TestAsyncPublicUrl:
+    @pytest.mark.asyncio
+    async def test_already_public_passes_through(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "https://example.com/img.png")
+
+        assert await component.aget_public_url_for_parameter() == "https://example.com/img.png"
+        driver.upload_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_error_artifact_raises_with_upstream_message(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, ErrorArtifact(value="upstream blew up"))
+
+        with pytest.raises(RuntimeError, match="upstream blew up"):
+            await component.aget_public_url_for_parameter()
+        driver.upload_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_local_file_is_read_async_and_uploaded(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "/inputs/frame.jpeg")
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        aread_mock = mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"jpeg-bytes")
+
+        assert await component.aget_public_url_for_parameter() == PUBLIC_URL
+
+        aread_mock.assert_awaited_once()
+        uploaded_path = driver.upload_file.call_args.kwargs["path"]
+        assert uploaded_path.name == "frame.jpeg"
+        assert driver.upload_file.call_args.kwargs["file_content"] == b"jpeg-bytes"
+        assert component.gtc_file_path == uploaded_path
+
+    @pytest.mark.asyncio
+    async def test_uploads_run_concurrently(self, mocker: Any) -> None:
+        # Each upload waits at the barrier until the other arrives, so this only passes if
+        # both are in flight at once, i.e. neither blocked the event loop.
+        barrier = threading.Barrier(2, timeout=5)
+
+        def upload_file(*, path: Path, file_content: bytes) -> str:  # noqa: ARG001
+            barrier.wait()
+            return PUBLIC_URL
+
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"bytes")
+        first, first_driver = _make_lazy_component(mocker, "/inputs/a.png")
+        second, second_driver = _make_lazy_component(mocker, "/inputs/b.png")
+        first_driver.upload_file.side_effect = upload_file
+        second_driver.upload_file.side_effect = upload_file
+
+        results = await asyncio.gather(first.aget_public_url_for_parameter(), second.aget_public_url_for_parameter())
+
+        assert results == [PUBLIC_URL, PUBLIC_URL]
+
+
+class TestAsyncDelete:
+    STALE_PATH = Path("artifact_url_storage/deadbeef/reference.mp4")
+
+    @pytest.mark.asyncio
+    async def test_delete_forgets_the_path(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "https://example.com/img.png")
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        component.gtc_file_path = self.STALE_PATH
+
+        await component.adelete_uploaded_artifact()
+        await component.adelete_uploaded_artifact()
+
+        driver.delete_file.assert_called_once_with(self.STALE_PATH)
+        assert component.gtc_file_path is None
+
+    @pytest.mark.asyncio
+    async def test_delete_is_skipped_when_nothing_was_uploaded(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "https://example.com/img.png")
+
+        await component.adelete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()
+
+
+class TestAsyncCancel:
+    @pytest.mark.asyncio
+    async def test_cancel_does_not_wait_for_the_upload_and_deletes_it_after(self, mocker: Any) -> None:
+        release = threading.Event()
+        started = threading.Event()
+
+        def upload_file(*, path: Path, file_content: bytes) -> str:  # noqa: ARG001
+            started.set()
+            release.wait(timeout=5)
+            return PUBLIC_URL
+
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png")
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+        mocker.patch("griptape_nodes.files.file.File.aread_bytes", return_value=b"bytes")
+        driver.upload_file.side_effect = upload_file
+
+        task = asyncio.create_task(component.aget_public_url_for_parameter())
+        await asyncio.to_thread(started.wait, 5)
+        uploaded_path = driver.upload_file.call_args.kwargs["path"]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Cancel returned while the upload was still in flight, and the node's cleanup has
+        # nothing left to delete.
+        assert not release.is_set()
+        assert component.gtc_file_path is None
+        driver.delete_file.assert_not_called()
+
+        release.set()
+        for _ in range(500):
+            if not PublicArtifactUrlParameter._background_tasks:
+                break
+            await asyncio.sleep(0.01)
+        driver.delete_file.assert_called_once_with(uploaded_path)
+        assert not PublicArtifactUrlParameter._background_tasks

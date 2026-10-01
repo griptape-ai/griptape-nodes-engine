@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import mimetypes
 import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlparse
@@ -18,11 +21,14 @@ from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE,
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
+from griptape_nodes.utils.async_utils import to_thread
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.engine import Engine
+
+logger = logging.getLogger("griptape_nodes")
 
 
 class PublicArtifactUrlParameter:
@@ -35,6 +41,12 @@ class PublicArtifactUrlParameter:
     BUCKET_ID_NAME = "GT_CLOUD_BUCKET_ID"
     supported_artifact_types: ClassVar[list[type]] = [ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact]
     supported_artifact_type_names: ClassVar[list[str]] = [cls.__name__ for cls in supported_artifact_types]
+    # Resolved bucket IDs keyed by (base_url, api_key, configured secret). Resolving one costs a
+    # network round trip, and a node uploading N references builds N helpers.
+    _bucket_id_cache: ClassVar[dict[tuple[str, str, str | None], str]] = {}
+    _bucket_id_cache_lock: ClassVar[threading.Lock] = threading.Lock()
+    # Uploads and deletes outliving a cancelled run. Held so the event loop does not drop them.
+    _background_tasks: ClassVar[set[asyncio.Future[Any]]] = set()
 
     def __init__(
         self,
@@ -65,18 +77,36 @@ class PublicArtifactUrlParameter:
             )
             raise ValueError(msg)
 
-        base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-        self._storage_driver = GriptapeCloudStorageDriver(
-            node.engine.config_manager,
-            bucket_id=self._get_bucket_id(node.engine, base, api_key, timeout=self._request_timeout),
-            api_key=api_key,
-            base_url=base,
-            request_timeout=self._request_timeout,
-        )
+        self._api_key = api_key
+        self._base_url = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        # Built on first upload: building it resolves the bucket over the network.
+        self._storage_driver: GriptapeCloudStorageDriver | None = None
 
     @classmethod
     def _get_bucket_id(cls, engine: Engine, base_url: str, api_key: str, timeout: float | None = None) -> str:
-        bucket_id: str | None = cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
+        configured_bucket_id = cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
+        return cls._resolve_bucket_id(configured_bucket_id, base_url, api_key, timeout=timeout)
+
+    @classmethod
+    def _resolve_bucket_id(
+        cls, configured_bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None
+    ) -> str:
+        """Resolve the bucket to upload to, once per process for a given configuration.
+
+        Makes no engine requests, so it is safe to run off the event loop.
+        """
+        cache_key = (base_url, api_key, configured_bucket_id)
+        # Held across the lookup so concurrent first uploads resolve once, not once each.
+        with cls._bucket_id_cache_lock:
+            cached = cls._bucket_id_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            bucket_id = cls._lookup_bucket_id(configured_bucket_id, base_url, api_key, timeout=timeout)
+            cls._bucket_id_cache[cache_key] = bucket_id
+            return bucket_id
+
+    @classmethod
+    def _lookup_bucket_id(cls, bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None) -> str:
 
         # A blank/whitespace-only secret is treated the same as an unset one: it can't
         # point at a real bucket and, left alone, produces confusing downstream 404s from
@@ -158,10 +188,67 @@ class PublicArtifactUrlParameter:
         )
 
     def get_public_url_for_parameter(self) -> str:
+        url = self._get_url_to_publish()
+        if self._is_public(url):
+            return url
+
+        from griptape_nodes.files.file import File
+
+        file_contents = File(url).read_bytes()
+        self.gtc_file_path = self._build_upload_path(url)
+        return self._get_storage_driver().upload_file(path=self.gtc_file_path, file_content=file_contents)
+
+    async def aget_public_url_for_parameter(self) -> str:
+        """Async variant of get_public_url_for_parameter that keeps the event loop free.
+
+        Reading the value stays on the loop, since resolving a macro path such as
+        "{inputs}/..." needs the node's project context. Only the network calls run in a
+        thread, so several uploads can run at once and a cancel is handled promptly.
+        """
+        url = self._get_url_to_publish()
+        if self._is_public(url):
+            return url
+
+        from griptape_nodes.files.file import File
+
+        file_contents = await File(url).aread_bytes()
+        driver = await self._aget_storage_driver()
+        self.gtc_file_path = self._build_upload_path(url)
+        upload = asyncio.ensure_future(
+            asyncio.to_thread(driver.upload_file, path=self.gtc_file_path, file_content=file_contents)
+        )
+        try:
+            return await asyncio.shield(upload)
+        except asyncio.CancelledError:
+            # The thread cannot be interrupted. Rather than make a cancelled run wait out the
+            # upload, let it finish in the background and delete what it uploaded.
+            self._delete_when_done(upload, driver, self.gtc_file_path)
+            self.gtc_file_path = None
+            raise
+
+    def delete_uploaded_artifact(self) -> None:
+        if not self.gtc_file_path:
+            return
+        self._get_storage_driver().delete_file(self.gtc_file_path)
+        # The upload is gone, so the path is forgotten: a second cleanup pass over the same
+        # helper must not issue another delete.
+        self.gtc_file_path = None
+
+    async def adelete_uploaded_artifact(self) -> None:
+        """Async variant of delete_uploaded_artifact that runs the delete in a thread."""
+        if not self.gtc_file_path:
+            return
+        path = self.gtc_file_path
+        # Forgotten before the await so a concurrent cleanup pass does not delete it twice.
+        self.gtc_file_path = None
+        driver = await self._aget_storage_driver()
+        await to_thread(driver.delete_file, path)
+
+    def _get_url_to_publish(self) -> str:
         # A helper instance lives as long as the node, so an upload path recorded by an
         # earlier run is cleared before anything else: it would otherwise be re-deleted by
         # delete_uploaded_artifact, and callers read gtc_file_path to tell an upload from
-        # the already-public pass-through below.
+        # the already-public pass-through.
         self.gtc_file_path = None
 
         # Parameter values that crossed a JSON boundary (orchestrator <-> worker, workflow load)
@@ -177,31 +264,67 @@ class PublicArtifactUrlParameter:
             )
             raise RuntimeError(msg)  # noqa: TRY004 the upstream failure is a runtime error, not a type error.
 
-        url = parameter_value.value if isinstance(parameter_value, UrlArtifact) else parameter_value
+        if isinstance(parameter_value, UrlArtifact):
+            return parameter_value.value
+        return parameter_value
 
-        # check if the URL is already public
-        if url.startswith(("http://", "https://")) and "localhost" not in url:
-            return url
+    def _build_upload_path(self, url: str) -> Path:
+        return Path("artifact_url_storage") / uuid4().hex / self._derive_upload_filename(url)
 
-        from griptape_nodes.files.file import File
+    def _get_storage_driver(self) -> GriptapeCloudStorageDriver:
+        if self._storage_driver is not None:
+            return self._storage_driver
+        bucket_id = self._get_bucket_id(self._node.engine, self._base_url, self._api_key, timeout=self._request_timeout)
+        return self._build_storage_driver(bucket_id)
 
-        file_contents = File(url).read_bytes()
-        filename = self._derive_upload_filename(url)
+    async def _aget_storage_driver(self) -> GriptapeCloudStorageDriver:
+        if self._storage_driver is not None:
+            return self._storage_driver
+        # The secret is read on the loop because it is an engine request; the lookup is network only.
+        configured_bucket_id = self._get_secret_value(
+            self._node.engine, self.BUCKET_ID_NAME, should_error_on_not_found=False
+        )
+        bucket_id = await to_thread(
+            self._resolve_bucket_id,
+            configured_bucket_id,
+            self._base_url,
+            self._api_key,
+            timeout=self._request_timeout,
+        )
+        return self._build_storage_driver(bucket_id)
 
-        self.gtc_file_path = Path("artifact_url_storage") / uuid4().hex / filename
+    def _build_storage_driver(self, bucket_id: str) -> GriptapeCloudStorageDriver:
+        self._storage_driver = GriptapeCloudStorageDriver(
+            self._node.engine.config_manager,
+            bucket_id=bucket_id,
+            api_key=self._api_key,
+            base_url=self._base_url,
+            request_timeout=self._request_timeout,
+        )
+        return self._storage_driver
 
-        # upload to Griptape Cloud and get a public URL
-        public_url = self._storage_driver.upload_file(path=self.gtc_file_path, file_content=file_contents)
+    @classmethod
+    def _delete_when_done(cls, upload: asyncio.Future[str], driver: GriptapeCloudStorageDriver, path: Path) -> None:
+        def on_done(finished: asyncio.Future[str]) -> None:
+            cls._background_tasks.discard(finished)
+            if finished.cancelled() or finished.exception() is not None:
+                return
+            cleanup = asyncio.ensure_future(asyncio.to_thread(driver.delete_file, path))
+            cls._background_tasks.add(cleanup)
+            cleanup.add_done_callback(cls._forget_background_task)
 
-        return public_url
+        cls._background_tasks.add(upload)
+        upload.add_done_callback(on_done)
 
-    def delete_uploaded_artifact(self) -> None:
-        if not self.gtc_file_path:
-            return
-        self._storage_driver.delete_file(self.gtc_file_path)
-        # The upload is gone, so the path is forgotten: a second cleanup pass over the same
-        # helper must not issue another delete.
-        self.gtc_file_path = None
+    @classmethod
+    def _forget_background_task(cls, task: asyncio.Future[Any]) -> None:
+        cls._background_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("Failed to delete an upload left by a cancelled run: %s", task.exception())
+
+    @staticmethod
+    def _is_public(url: str) -> bool:
+        return url.startswith(("http://", "https://")) and "localhost" not in url
 
     @staticmethod
     def _derive_upload_filename(url: str) -> str:
