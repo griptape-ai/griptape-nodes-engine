@@ -86,6 +86,10 @@ class MyLibrary(AdvancedNodeLibrary):
         )
 ```
 
+A value of any other class is left out when a workflow is saved and when nodes are copied or
+pasted, with a warning in the log that names the node and parameter. Set `serializable=False` on a
+parameter whose value is never meant to be saved, and it is left out without a warning.
+
 ## Traits
 
 Add functionality via `add_trait()`:

@@ -179,7 +179,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_CO
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
-from griptape_nodes.serialization.values import ValueEncodeError, decode_value, encode_value, value_key
+from griptape_nodes.serialization.values import Unencodable, decode_value, try_encode, value_key
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -2486,13 +2486,12 @@ class FlowManager(EngineScoped):
             # Strip the prefix to get the original parameter name for the StartFlow node
             original_param_name = prefixed_param_name.removeprefix(f"{class_name_prefix}_")
 
-            try:
-                encoded = encode_value(param_value)
-            except ValueEncodeError as error:
+            encoded = try_encode(param_value)
+            if isinstance(encoded, Unencodable):
                 logger.warning(
                     "Attempted to pass '%s' into the packaged flow. Failed because %s The flow runs without it.",
                     prefixed_param_name,
-                    error,
+                    encoded.reason,
                 )
                 continue
             value_id = id(param_value)
@@ -3656,13 +3655,12 @@ class FlowManager(EngineScoped):
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
     ) -> SerializedFlowCommands.SerializedVariableCommand:
         """Pool the variable's encoded value under a hash of its content and build the indirect command."""
-        try:
-            encoded = encode_value(variable.value)
-        except ValueEncodeError as error:
+        encoded = try_encode(variable.value)
+        if isinstance(encoded, Unencodable):
             logger.warning(
                 "Attempted to save variable '%s'. Failed because %s It will reopen with no value.",
                 variable.name,
-                error,
+                encoded.reason,
             )
             encoded = None
         unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
