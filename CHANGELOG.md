@@ -41,6 +41,9 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Directory cleanup now counts files in subfolders toward `max_directory_size_gb` instead of
+  failing with a file-not-found error.
+  [#5724](https://github.com/griptape-ai/griptape-nodes-engine/issues/5724)
 - `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
   tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
