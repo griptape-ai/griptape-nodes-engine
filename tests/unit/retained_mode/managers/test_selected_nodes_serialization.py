@@ -14,7 +14,7 @@ on the host running the suite).
 
 from __future__ import annotations
 
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from typing import TYPE_CHECKING
 
 import pytest
