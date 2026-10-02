@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 from pydantic import BaseModel, field_validator
 
@@ -63,6 +64,10 @@ class UpdateProviderPayload(BaseModel):
             msg = "must be a non-empty string if provided"
             raise ValueError(msg)
         return v
+
+    def _cattrs_unstructure(self, converter: Any) -> dict[str, Any]:  # noqa: ARG002
+        # Only the fields a caller set, so the receiver applies exactly those.
+        return self.model_dump(mode="json", exclude_unset=True)
 
 
 @dataclass

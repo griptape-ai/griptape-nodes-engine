@@ -631,7 +631,7 @@ class SerializedSelectedNodesCommands:
     set_parameter_value_commands: dict[
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
-    set_lock_commands_per_node: dict[SerializedNodeCommands.NodeUUID, SetLockNodeStateRequest]
+    set_lock_commands_per_node: dict[SerializedNodeCommands.NodeUUID, SetLockNodeStateRequest | None]
     serialized_connection_commands: list[IndirectConnectionSerialization]
 
 

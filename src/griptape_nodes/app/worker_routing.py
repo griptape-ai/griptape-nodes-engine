@@ -360,7 +360,9 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         #
         # All of os_events, because the workspace is shared on disk (OpenAssociatedFileRequest
         # excepted), plus the named artifact_events requests that answer out of this process's
-        # provider registry.
+        # provider registry. DeduceSequencesFromFileListRequest arrives here too but does no I/O: it
+        # groups a caller-supplied path list, so any process gives the same answer and forwarding
+        # would only add a round trip.
         *_LOCAL_ONLY_FILESYSTEM_REQUESTS,
         # The payload IS the file body, so forwarding would base64 a whole generated asset across
         # the boundary on every save. The worker writes it through its own storage driver instead and
@@ -390,17 +392,7 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # share a machine, and wrong the moment a venue runs anywhere else.
         GetExecutionDeviceRequest,
         #
-        # --- 3. The wire cannot carry it today --------------------------------------------------
-        #
-        # One member, reaching the set through the splat rather than by name.
-        # DeduceSequencesFromFileListRequest does no filesystem I/O -- it groups a caller-supplied
-        # path list -- so shared-disk authority does not bind it; what does is its failure result
-        # declaring `SequenceScanFailureReason | FileIOFailureReason`, a union cattrs cannot
-        # disambiguate. Fix that and it can forward.
-        #
-        # Everything else the wire cannot carry also has a permanent reason and is filed under it.
-        #
-        # --- 4. Carries a live Python object ----------------------------------------------------
+        # --- 3. Carries a live Python object ----------------------------------------------------
         #
         # Carries a ResourceType instance, which `json.dumps(default=str)` turns into a string: the
         # orchestrator would register that string and the worker nothing, with no error either side.

@@ -2,18 +2,37 @@
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
-from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException
-from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException, RequestPayload
+from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
+from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
 from griptape_nodes.serialization.converter import (
     _is_json_primitive_union,
     converter,
 )
-from griptape_nodes.serialization.values import Value  # noqa: TC001 cattrs resolves the annotations at runtime
+from griptape_nodes.serialization.values import Value, ValueEncodeError
+
+
+class _UnresolvableHints(NamedTuple):
+    """Like a NamedTuple naming a type imported only under TYPE_CHECKING."""
+
+    message: str
+    problem: "_NotImported | None"  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+
+
+@dataclass
+class _RequestsPayload:
+    requests: "list[RequestPayload]" = field(default_factory=list)
+
+
+@dataclass
+class _UnregisteredRequest(RequestPayload):
+    pass
 
 
 @dataclass
@@ -241,3 +260,47 @@ class TestExceptionWireForm:
         assert str(rebuilt) == "legacy stringified error"
         assert rebuilt.original_type is None
         assert rebuilt.original_traceback is None
+
+
+class TestNamedTupleFields:
+    """NamedTuples in modules using ``from __future__ import annotations`` structure by their field types."""
+
+    def test_fields_structure_as_their_types(self) -> None:
+        library = DiscoveredLibrary(path=Path("/libraries/one.json"), is_sandbox=False)
+
+        restored = converter.structure(json.loads(json.dumps(converter.unstructure(library))), DiscoveredLibrary)
+
+        assert restored == library
+        assert type(restored.path) is type(library.path)
+
+    def test_unresolvable_hints_fall_back_to_runtime_values(self) -> None:
+        issue = _UnresolvableHints("m", None)
+
+        data = converter.unstructure(issue)
+
+        assert data == ("m", None)
+        assert converter.structure(list(data), _UnresolvableHints) == issue
+
+
+class TestRequestFields:
+    """A field typed ``RequestPayload`` carries each request with its registered name."""
+
+    def test_each_request_comes_back_as_its_own_type(self) -> None:
+        payload = _RequestsPayload(
+            requests=[
+                AddParameterToNodeRequest(parameter_name="speed", node_name="A"),
+                SetParameterValueRequest(parameter_name="speed", node_name="A", value=(1, "b")),
+            ]
+        )
+
+        data = json.loads(json.dumps(converter.unstructure(payload)))
+
+        assert [item["request_type"] for item in data["requests"]] == [
+            "AddParameterToNodeRequest",
+            "SetParameterValueRequest",
+        ]
+        assert converter.structure(data, _RequestsPayload) == payload
+
+    def test_unregistered_request_fails_to_send(self) -> None:
+        with pytest.raises(ValueEncodeError, match="not registered"):
+            converter.unstructure(_RequestsPayload(requests=[_UnregisteredRequest()]))

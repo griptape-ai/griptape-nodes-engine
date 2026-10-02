@@ -117,6 +117,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetFlowMetadataResultSuccess,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
     ListFlowsInCurrentContextRequest,
     ListFlowsInCurrentContextResultFailure,
     ListFlowsInCurrentContextResultSuccess,
@@ -172,7 +173,6 @@ from griptape_nodes.retained_mode.events.variable_events import (
     ListVariablesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY

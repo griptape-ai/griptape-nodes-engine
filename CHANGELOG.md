@@ -34,6 +34,10 @@ the engine's request API from working without edits. Migration steps live in
   [MIGRATION.md](MIGRATION.md#parameter-values-carry-their-type).
 - **Breaking:** `ControlFlowResolvedEvent` sends a parameter value with no plain-data form as `null`
   instead of as its text, and no longer has `unique_parameter_uuid_to_values`.
+- **Breaking:** In `SerializeFlowToCommandsResultSuccess` and
+  `ExtractFlowCommandsFromImageMetadataResultSuccess`, each node's `element_modification_commands`
+  lists `{"request_type": ..., "request": {...}}` entries, the form `EventRequestBatch` takes,
+  instead of each request's fields alone, so each request reads back as its own type.
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
   first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
   Griptape Cloud.
@@ -62,6 +66,9 @@ the engine's request API from working without edits. Migration steps live in
   an artifact comes back as the artifact.
 - Parameter values recorded in an image's workflow provenance name their type when JSON has none,
   the same way the request API sends them.
+- A class in a request field typed `type`, such as `RegisterArtifactProviderRequest.provider_class`,
+  is sent as `module:Qualname` instead of `module.Qualname`, the form parameter values name
+  classes by.
 
 ### Deprecated
 
@@ -93,6 +100,9 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- `DeserializeFlowFromCommandsRequest` and `SaveWorkflowFileFromSerializedFlowRequest` sent as JSON
+  read their nested node, connection, and parameter commands back as commands, instead of as plain
+  dicts the request could not use.
 - Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
   the same types, instead of as plain dicts.
 - A loop or subflow run in a separate process no longer hands back one parameter's value in place
@@ -104,6 +114,16 @@ the engine's request API from working without edits. Migration steps live in
   whose class belongs to a library the receiving process does not load still arrives as a dict, and
   reaches the next process that does load it unchanged.
   [#4475](https://github.com/griptape-ai/griptape-nodes-engine/issues/4475)
+- A request with a field typed `type`, such as `RegisterArtifactProviderRequest`, reads back from
+  JSON into the class it names, instead of failing.
+  [#5437](https://github.com/griptape-ai/griptape-nodes-engine/issues/5437)
+- `ScanSequencesResultFailure`, `ListDirectoryResultFailure`, `ListDirectorySequencesResultFailure`,
+  and `DeduceSequencesFromFileListResultFailure` read back from JSON with their `failure_reason`,
+  instead of failing because it may come from either of two enums.
+  [#5438](https://github.com/griptape-ai/griptape-nodes-engine/issues/5438)
+- `UpdateAgentProviderRequest` sent as JSON with only some provider fields set reads back with just
+  those fields, instead of failing validation on the ones left out.
+  [#5439](https://github.com/griptape-ai/griptape-nodes-engine/issues/5439)
 
 ## [0.103.0] - 2026-09-29
 
