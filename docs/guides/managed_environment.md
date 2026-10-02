@@ -56,7 +56,8 @@ With `environment`:
 - Checking a library for updates reports no update and says updates come from the environment,
     without contacting its git remote.
 - The Sandbox Library is neither scanned nor loaded, and adding a sandbox node from a file fails
-    with a message saying the environment manages libraries.
+    with a message saying the environment manages libraries, unless the environment allows a
+    sandbox (see [Allowing a sandbox library](#allowing-a-sandbox-library)).
 - No `.venv` or `.venv-exec` folder is created, and none left from an earlier run is used.
 - A library that declares another library as a dependency is satisfied only by a library in
     `GTN_LIBRARY_PATHS`. If the environment doesn't provide it, the library reports the missing
@@ -70,6 +71,35 @@ With `environment`:
 
 A misspelled value in `GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE` is reported in the engine log and
 ignored, rather than quietly falling back to `venv`.
+
+### Allowing a sandbox library
+
+Some studios want artists to develop their own nodes while everything else stays under the
+environment's control. Set `library.environment_allows_sandbox` to `true` (or
+`GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX=true`) alongside the environment source:
+
+```bash
+export GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE=environment
+export GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX=true
+```
+
+Then:
+
+- The Sandbox Library (the folder in **Settings → Library → Sandbox Settings**) is scanned and
+    loaded, and sandbox nodes can be added.
+- No virtual environment is built for it. Everything a sandbox node imports must already be in
+    the environment; a node that imports something missing reports the import error.
+- Only the sandbox is let in. Every other library the environment doesn't list is still refused.
+
+The setting has no effect when `library.dependency_source` is `venv`, where the sandbox always
+works. It accepts `true` or `false` in any letter case; any other value from the environment
+variable is reported in the engine log and ignored, which keeps the sandbox refused.
+
+`ReloadSandboxLibraryRequest` reloads only the sandbox library, so new or changed node files show
+up without restarting the engine. Environment libraries stay loaded and their workers keep
+running. Nodes already in a workflow keep the version they were created with until you recreate
+them. Without the opt-in, the request fails with a message saying the environment doesn't include
+a sandbox library.
 
 ### `worker.command_prefix`
 
@@ -147,6 +177,8 @@ Most package managers can set these variables for you: each library's package ad
     environment doesn't provide it. Ask whoever manages your studio's setup to add it.
 - Installing, updating, or switching a library's version from the editor doesn't work; those
     changes come from the studio's environment.
+- The Sandbox Library works only if your studio allows it. When it does, refreshing reloads just
+    the sandbox; picking up changes to the studio's own libraries needs a relaunch.
 - If running a node says its worker couldn't start because the environment doesn't say which
     packages it needs, the environment is missing an entry for that library. Editing the node and
     saving the workflow still work.

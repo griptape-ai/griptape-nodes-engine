@@ -179,6 +179,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
     ReloadAllLibrariesResultSuccess,
+    ReloadSandboxLibraryRequest,
+    ReloadSandboxLibraryResultFailure,
+    ReloadSandboxLibraryResultSuccess,
     ScanSandboxDirectoryRequest,
     ScanSandboxDirectoryResultFailure,
     ScanSandboxDirectoryResultSuccess,
@@ -218,7 +221,9 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.external_environment import (
     LIBRARY_PATHS_ENV_VAR,
+    environment_allows_sandbox,
     library_paths_from_environment,
+    sandbox_refused_by_environment,
     uses_environment_dependencies,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
@@ -1783,10 +1788,10 @@ class LibraryManager(EngineScoped):
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
 
-        # Generate sandbox library metadata if configured. Not when the environment provides the
-        # libraries: the sandbox never loads then, and scanning it writes its manifest.
+        # Generate sandbox library metadata if configured. Not when the environment refuses the
+        # sandbox: it never loads then, and scanning it writes its manifest.
         sandbox_library_dir = None
-        if not self._uses_environment_dependencies():
+        if not self._sandbox_refused_by_environment():
             sandbox_library_dir = self._get_sandbox_directory()
         if sandbox_library_dir:
             # Try to load existing JSON first - only scan if load fails
@@ -2187,8 +2192,9 @@ class LibraryManager(EngineScoped):
         discovers files that exist on disk but are absent from the manifest, and the loader
         resolves their class names and writes the manifest back for us.
         """
-        # The environment decides every node type that exists, so none is added from a loose file.
-        if self._uses_environment_dependencies():
+        # The environment decides every node type that exists, so none is added from a loose file
+        # unless the environment opted in to a sandbox.
+        if self._sandbox_refused_by_environment():
             return RegisterSandboxNodeFromSourceResultFailure(
                 result_details=self._environment_provides_libraries_message(
                     f"add the sandbox node in '{request.file_path}'"
@@ -2465,7 +2471,7 @@ class LibraryManager(EngineScoped):
 
         # Checked here rather than only at discovery, so a library registered by path from the
         # editor or a script is held to the same rule as one found at startup.
-        if self._uses_environment_dependencies() and library_info.library_path not in self._environment_library_paths:
+        if self._uses_environment_dependencies() and not self._is_allowed_in_environment(library_info):
             self._mark_not_provided_by_environment(library_info)
             self._library_file_path_to_info[library_info.library_path] = library_info
             details = (
@@ -6181,6 +6187,80 @@ class LibraryManager(EngineScoped):
 
         return new_downloads
 
+    @handles(ReloadSandboxLibraryRequest)
+    async def reload_sandbox_library_request(self, request: ReloadSandboxLibraryRequest) -> ResultPayload:  # noqa: ARG002
+        """Reload only the sandbox library: unregister it, rescan its directory, and register it again.
+
+        Every other library stays loaded and no worker is restarted, which is what lets an artist
+        pick up a new sandbox node in a studio environment without relaunching. Workflow state is
+        not cleared; nodes already in a workflow keep the class they were created with.
+        """
+        if self._sandbox_refused_by_environment():
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    "Attempted to reload the sandbox library. Failed because the engine is running in an "
+                    "environment that provides its libraries, and this environment does not include a "
+                    "sandbox library."
+                )
+            )
+
+        if self._get_sandbox_directory() is None:
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    "Attempted to reload the sandbox library. Failed because no sandbox directory is set up, "
+                    "or the configured one does not exist. Set it in Settings -> Libraries -> Sandbox "
+                    "Settings first."
+                )
+            )
+
+        # A reload of everything may be rebuilding the registry; unloading mid-rebuild would race it.
+        await self._libraries_loading_complete.wait()
+
+        if self._is_library_name_registered(LibraryManager.SANDBOX_LIBRARY_NAME):
+            unload_result = self.unload_library_from_registry_request(
+                UnloadLibraryFromRegistryRequest(library_name=LibraryManager.SANDBOX_LIBRARY_NAME)
+            )
+            if not unload_result.succeeded():
+                return ReloadSandboxLibraryResultFailure(
+                    result_details=(
+                        f"Attempted to reload the sandbox library. Failed because it could not be unloaded: "
+                        f"{unload_result.result_details}"
+                    )
+                )
+
+        # A sandbox that failed to load is not registered, so the unload above left its record; drop
+        # it so the rescan starts clean instead of finding it still in FAILURE.
+        for stale_path in [path for path, info in self._library_file_path_to_info.items() if info.is_sandbox]:
+            del self._library_file_path_to_info[stale_path]
+
+        sandbox_json_path = self._discover_sandbox_library()
+        if sandbox_json_path is None:
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    "Attempted to reload the sandbox library. Failed because its directory could not be "
+                    "scanned for node files. Check the engine log for details."
+                )
+            )
+
+        register_result = await self.register_library_from_file_request(
+            RegisterLibraryFromFileRequest(file_path=str(sandbox_json_path), load_as_default_library=False)
+        )
+        if not isinstance(register_result, RegisterLibraryFromFileResultSuccess):
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    f"Attempted to reload the sandbox library. Failed because it could not be loaded: "
+                    f"{register_result.result_details}"
+                )
+            )
+
+        node_types = LibraryRegistry.get_library(name=LibraryManager.SANDBOX_LIBRARY_NAME).get_registered_nodes()
+        return ReloadSandboxLibraryResultSuccess(
+            node_types=node_types,
+            result_details=ResultDetails(
+                message=f"Reloaded the sandbox library with {len(node_types)} node type(s).", level=logging.INFO
+            ),
+        )
+
     @handles(ReloadAllLibrariesRequest)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # Bracket the reload like on_app_initialization_complete so the heartbeat reports
@@ -6411,6 +6491,59 @@ class LibraryManager(EngineScoped):
         """Whether library.dependency_source is 'environment'."""
         return uses_environment_dependencies(self.engine.config_manager)
 
+    def _sandbox_refused_by_environment(self) -> bool:
+        """Whether the environment provides the libraries and has not opted in to a sandbox library."""
+        return sandbox_refused_by_environment(self.engine.config_manager)
+
+    def _is_allowed_in_environment(self, library_info: LibraryManager.LibraryInfo) -> bool:
+        """Whether `library_info` may load when the environment provides the libraries.
+
+        A library the environment lists always may; the sandbox library may when the environment
+        opted in with library.environment_allows_sandbox.
+        """
+        if library_info.library_path in self._environment_library_paths:
+            return True
+        return library_info.is_sandbox and environment_allows_sandbox(self.engine.config_manager)
+
+    def _discover_sandbox_library(self) -> Path | None:
+        """Scan the sandbox directory, write its manifest, and record it. Returns the manifest path.
+
+        None when no sandbox directory is configured or the scan fails. A record left from a
+        discovery that refused the sandbox is dropped first, so allowing the sandbox takes effect
+        without a restart.
+        """
+        sandbox_library_dir = self._get_sandbox_directory()
+        if sandbox_library_dir is None:
+            return None
+
+        # Generate/update the sandbox library JSON file
+        metadata_result = self.scan_sandbox_directory_request(
+            ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
+        )
+        if not isinstance(metadata_result, ScanSandboxDirectoryResultSuccess):
+            return None
+
+        sandbox_json_path = sandbox_library_dir / LibraryManager.LIBRARY_CONFIG_FILENAME
+        sandbox_json_path_str = str(sandbox_json_path)
+
+        # Write the schema to JSON so it exists for lifecycle phases
+        write_succeeded = self._write_library_schema_to_json(metadata_result.library_schema, sandbox_json_path)
+        if write_succeeded:
+            logger.debug(
+                "Wrote sandbox library schema with %d nodes to '%s' during discovery",
+                len(metadata_result.library_schema.nodes),
+                sandbox_json_path,
+            )
+        # Continue anyway if write failed - lifecycle will fail gracefully
+
+        existing = self._library_file_path_to_info.get(sandbox_json_path_str)
+        if existing is not None and self._is_not_provided_by_environment(existing):
+            del self._library_file_path_to_info[sandbox_json_path_str]
+
+        # Create LibraryInfo entry for the sandbox library
+        self._create_library_info_entry(sandbox_json_path_str, is_sandbox=True)
+        return sandbox_json_path
+
     @staticmethod
     def _environment_provides_libraries_message(attempted: str) -> str:
         """The failure for a library change the environment, not the engine, is responsible for."""
@@ -6419,7 +6552,7 @@ class LibraryManager(EngineScoped):
             f"provides its libraries, so libraries are added and updated by whoever set up that environment."
         )
 
-    async def discover_libraries_request(  # noqa: C901 (sandbox, environment, and config sources each branch)
+    async def discover_libraries_request(
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
@@ -6442,9 +6575,10 @@ class LibraryManager(EngineScoped):
             discovered.registration.path for discovered in config_library_entries if discovered.from_environment
         }
 
-        # The environment decides every library that loads, so the sandbox is reported rather
-        # than scanned: scanning writes its manifest into the workspace.
-        if request.include_sandbox and environment_mode:
+        # The environment decides every library that loads, so unless it opted in to a sandbox the
+        # sandbox is reported rather than scanned: scanning writes its manifest into the workspace.
+        sandbox_refused = self._sandbox_refused_by_environment()
+        if request.include_sandbox and sandbox_refused:
             sandbox_library_dir = self._get_sandbox_directory()
             if sandbox_library_dir:
                 self._create_not_provided_library_info_entry(
@@ -6455,38 +6589,11 @@ class LibraryManager(EngineScoped):
                 )
 
         # Process sandbox library first if requested
-        if request.include_sandbox and not environment_mode:
-            sandbox_library_dir = self._get_sandbox_directory()
-            if sandbox_library_dir:
-                # Generate/update the sandbox library JSON file
-                metadata_result = self.scan_sandbox_directory_request(
-                    ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
-                )
-
-                # If generation succeeded, write JSON and add the sandbox library
-                if isinstance(metadata_result, ScanSandboxDirectoryResultSuccess):
-                    sandbox_json_path = sandbox_library_dir / LibraryManager.LIBRARY_CONFIG_FILENAME
-                    sandbox_json_path_str = str(sandbox_json_path)
-
-                    # Write the schema to JSON so it exists for lifecycle phases
-                    write_succeeded = self._write_library_schema_to_json(
-                        metadata_result.library_schema, sandbox_json_path
-                    )
-                    if write_succeeded:
-                        logger.debug(
-                            "Wrote sandbox library schema with %d nodes to '%s' during discovery",
-                            len(metadata_result.library_schema.nodes),
-                            sandbox_json_path,
-                        )
-                    # Continue anyway if write failed - lifecycle will fail gracefully
-
-                    # Add to discovered libraries with is_sandbox=True
-                    if sandbox_json_path not in seen_libraries:
-                        seen_libraries.add(sandbox_json_path)
-                        discovered_libraries.append(DiscoveredLibrary(path=sandbox_json_path, is_sandbox=True))
-
-                    # Create LibraryInfo entry for the sandbox library
-                    self._create_library_info_entry(sandbox_json_path_str, is_sandbox=True)
+        if request.include_sandbox and not sandbox_refused:
+            sandbox_json_path = self._discover_sandbox_library()
+            if sandbox_json_path is not None and sandbox_json_path not in seen_libraries:
+                seen_libraries.add(sandbox_json_path)
+                discovered_libraries.append(DiscoveredLibrary(path=sandbox_json_path, is_sandbox=True))
 
         # Add all regular libraries from config
         for discovered in config_library_entries:

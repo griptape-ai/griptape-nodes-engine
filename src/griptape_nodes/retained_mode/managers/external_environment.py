@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_DEPENDENCY_SOURCE_KEY,
+    LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY,
     WORKER_COMMAND_PREFIX_KEY,
     LibraryDependencySource,
 )
@@ -83,6 +84,25 @@ def read_dependency_source(config_manager: ConfigManager) -> LibraryDependencySo
 def uses_environment_dependencies(config_manager: ConfigManager) -> bool:
     """Whether the environment, not the engine, provides libraries and their dependencies."""
     return read_dependency_source(config_manager) is LibraryDependencySource.ENVIRONMENT
+
+
+def environment_allows_sandbox(config_manager: ConfigManager) -> bool:
+    """The configured `library.environment_allows_sandbox`, read from its raw config value.
+
+    Only a real true, or the text 'true' in any letter case, allows the sandbox; anything else
+    keeps it refused. The Settings validator has already warned about a value it could not read.
+    """
+    raw_value = config_manager.get_config_value(LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY, default=False)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, str):
+        return raw_value.strip().lower() == "true"
+    return False
+
+
+def sandbox_refused_by_environment(config_manager: ConfigManager) -> bool:
+    """Whether the environment provides the libraries and has not opted in to a sandbox library."""
+    return uses_environment_dependencies(config_manager) and not environment_allows_sandbox(config_manager)
 
 
 def read_worker_command_prefix(config_manager: ConfigManager) -> list[str]:
