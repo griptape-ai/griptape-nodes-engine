@@ -106,18 +106,14 @@ class ExampleNodeErrorNode(DataNode):
         )
         if isinstance(result, GetSecretValueResultSuccess) and result.value:
             return None
-        # Name the exact setting and where to find it. A validation exception can be a NodeError
-        # too, so it can carry a link.
+        # Name the exact setting and where to find it, so the message still helps in logs. A
+        # validation exception can be a NodeError too, so it can carry a link. A link starting with
+        # "#" opens a place in the editor: this one opens API Keys & Secrets filtered to the key.
         msg = f"{self.API_KEY_NAME} is not set. Add it in Settings → API Keys & Secrets, then run the node again."
         return [
             NodeError(
                 msg,
-                links=[
-                    NodeErrorLink(
-                        label="Editing settings",
-                        url="https://docs.griptapenodes.com/guides/configuration/#editing-settings-in-the-editor",
-                    )
-                ],
+                links=[NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={self.API_KEY_NAME}")],
             )
         ]
 
@@ -171,7 +167,8 @@ class ExampleNodeErrorNode(DataNode):
 
     def _raise_unsupported_format(self) -> NoReturn:
         # Links point to pages that explain how to fix the problem. The editor shows them apart from
-        # the message, so the message stays readable in logs too. Up to three, http or https only.
+        # the message, so the message stays readable in logs too. Up to three, http or https, or "#"
+        # links into the editor (see the missing API key case).
         msg = "Image format 'image/heic' is not supported. Convert the image to PNG or JPEG and try again."
         raise NodeError(
             msg,

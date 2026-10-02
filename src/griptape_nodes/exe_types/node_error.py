@@ -17,7 +17,8 @@ class NodeErrorLink:
     """Link text, e.g. "Supported image formats"."""
 
     url: str
-    """http or https only."""
+    """An http or https page, or a place in the editor starting with "#", such as
+    "#settings-secrets?filter=MY_KEY"."""
 
 
 class NodeError(Exception):
@@ -37,7 +38,8 @@ class NodeError(Exception):
             Values are shown as text.
         response: The provider's response body. Never include headers. Dropped if it is not
             JSON-serializable or is larger than 16 KB.
-        links: Up to three http(s) pages that explain the failure.
+        links: Up to three http(s) pages that explain the failure, or "#" links that open the
+            place in the editor where the user can fix it.
     """
 
     def __init__(

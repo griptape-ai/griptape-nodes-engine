@@ -273,11 +273,11 @@ raise NodeError(
 `NodeError` takes three optional keyword arguments. The editor shows each one in its own place in
 the error panel:
 
-| Argument   | What it's for                                                                 | Limits                                                       |
-| ---------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `fields`   | Labelled values a user may need to quote to support, such as a request ID.    | Text or number values.                                       |
-| `response` | The provider's response body, so the details are there if someone needs them. | Body only, never headers. Dropped if over 16 KB or not JSON. |
-| `links`    | `NodeErrorLink(label=..., url=...)` pages that explain the failure.           | Up to 3, `http` or `https` only, labels up to 80 characters. |
+| Argument   | What it's for                                                                                                          | Limits                                                                                  |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `fields`   | Labelled values a user may need to quote to support, such as a request ID.                                             | Text or number values.                                                                  |
+| `response` | The provider's response body, so the details are there if someone needs them.                                          | Body only, never headers. Dropped if over 16 KB or not JSON.                            |
+| `links`    | `NodeErrorLink(label=..., url=...)` pages that explain the failure, or places in the editor where the user can fix it. | Up to 3. `http`, `https`, or `#` for a place in the editor. Labels up to 80 characters. |
 
 ```python
 raise NodeError(
@@ -300,7 +300,9 @@ message and type are shown, but the editor only reads `fields`, `response`, and 
     provider's explanation as the message, and put the status code and request ID in `fields`.
 - **A required API key is missing.** Check it in `validate_before_node_run`, so the node fails
     before it starts. Name the exact key and say to add it in **Settings → API Keys & Secrets**.
-    A validation exception can be a `NodeError` too, so it can carry a link.
+    A validation exception can be a `NodeError` too, so it can carry a link. A link that starts
+    with `#` opens a place in the editor, so the user can go straight to the key:
+    `NodeErrorLink(label="Add the API key", url="#settings-secrets?filter=MY_SERVICE_API_KEY")`.
 - **Polling gives up.** Say how long the node waited and what to do next. Put the job or
     generation ID in `fields` so the user can check on it later.
 - **The response contains image data.** Remove base64 data from a response before attaching it.

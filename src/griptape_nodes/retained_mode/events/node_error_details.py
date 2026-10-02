@@ -20,6 +20,8 @@ MAX_RESPONSE_BYTES = 16 * 1024
 MAX_LINKS = 3
 MAX_LINK_LABEL_CHARS = 80
 ALLOWED_LINK_SCHEMES = ("http://", "https://")
+# A link starting with "#" opens a place in the editor, such as "#settings-secrets?filter=MY_KEY".
+EDITOR_LINK_PREFIX = "#"
 RESPONSE_DROPPED_FIELD = "response_dropped"
 
 
@@ -154,7 +156,7 @@ def _coerce_link(item: Any) -> NodeErrorLink | None:
     if not isinstance(label, str) or not isinstance(url, str):
         logger.debug("Dropped node error link with a non-string label or url")
         return None
-    if not url.lower().startswith(ALLOWED_LINK_SCHEMES):
-        logger.debug("Dropped node error link %r; only http and https are allowed", url)
+    if not url.startswith(EDITOR_LINK_PREFIX) and not url.lower().startswith(ALLOWED_LINK_SCHEMES):
+        logger.debug("Dropped node error link %r; only http, https, and editor (#) links are allowed", url)
         return None
     return NodeErrorLink(label=label[:MAX_LINK_LABEL_CHARS], url=url)

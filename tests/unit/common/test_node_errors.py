@@ -265,6 +265,26 @@ class TestNodeErrorAttachments:
         assert from_worker.links == expected
         assert from_worker.message == "Processing failed: proxy client error"
 
+    def test_editor_link_survives_on_both_paths(self) -> None:
+        link = NodeErrorLink(label="Add the API key", url="#settings-secrets?filter=MY_KEY")
+
+        in_process = build_node_error_details(NODE_NAME, self._node_error(links=[link]))
+        from_worker = build_node_error_details(NODE_NAME, _across_worker(self._node_error(links=[link])))
+
+        assert in_process.links == [link]
+        assert from_worker.links == [link]
+
+    def test_other_schemes_are_still_dropped(self) -> None:
+        links = [
+            NodeErrorLink(label="File", url="file:///etc/passwd"),
+            NodeErrorLink(label="Relative", url="settings-secrets"),
+            NodeErrorLink(label="Data", url="data:text/html,hi"),
+        ]
+
+        details = build_node_error_details(NODE_NAME, self._node_error(links=links))
+
+        assert details.links == []
+
     def test_links_are_capped_at_three_with_short_labels(self) -> None:
         links = [NodeErrorLink(label="x" * 200, url=f"https://example.com/{i}") for i in range(5)]
 

@@ -135,7 +135,9 @@ async def test_missing_api_key_is_caught_before_the_node_runs(
     expected = "EXAMPLE_SERVICE_API_KEY is not set. Add it in Settings → API Keys & Secrets, then run the node again."
     assert event.error.messages == [expected]
     assert event.error.exception_type == "griptape_nodes.exe_types.node_error.NodeError"
-    assert [link.label for link in event.error.links] == ["Editing settings"]
+    assert [(link.label, link.url) for link in event.error.links] == [
+        ("Add the API key", "#settings-secrets?filter=EXAMPLE_SERVICE_API_KEY")
+    ]
 
 
 @pytest.mark.usefixtures("registered_library")
