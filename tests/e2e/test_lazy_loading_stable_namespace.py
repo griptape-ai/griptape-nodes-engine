@@ -2,8 +2,8 @@
 
 With lazy node loading (``library.lazy_node_loading``, the default), registering a library
 imports nothing: each node's module loads on first use. But saved workflows reference library
-classes through their stable namespace (``griptape_nodes.node_libraries.<lib>.<file>``), both as
-``from`` imports emitted into the generated Python and inside pickled parameter values. Before
+classes through their stable namespace (``griptape_nodes.node_libraries.<lib>.<file>``), in the
+type tags of their saved parameter values and, in files saved by earlier engines, pickles. Before
 the ``StableNamespaceImportFinder`` meta-path hook, those imports only resolved if the module
 happened to be in ``sys.modules`` already, so opening any workflow that carried a
 library-defined value failed with ``No module named 'griptape_nodes.node_libraries'`` the moment
@@ -12,7 +12,7 @@ lazy loading shipped.
 This suite drives the full regression path: build a workflow whose parameter value is an object
 defined in a fixture library, save it through the real generator, then execute the generated
 ``.py`` in a fresh subprocess whose config has lazy loading enabled. The subprocess must import
-the stable namespace and unpickle the value without ever having resolved a node class first.
+the stable namespace and decode the value without ever having resolved a node class first.
 """
 
 from __future__ import annotations
@@ -202,8 +202,8 @@ def _wrap_with_runtime_assertions(workflow_source: str) -> str:
     """Append a ``__main__`` block that runs build_workflow and prints the round-tripped payload.
 
     The subprocess this runs in has lazy node loading enabled and never resolves a node class
-    before build_workflow executes, so the deferred stable-namespace import and the pickled
-    parameter value inside the generated source are what exercise the import path under test.
+    before build_workflow executes, so decoding the tagged parameter value inside the generated
+    source is what exercises the import path under test.
     """
     runtime_block = """
 
@@ -259,7 +259,7 @@ def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path, engine: En
 
     Regression test for the lazy-node-loading rollback: opening any workflow failed with
     ``No module named 'griptape_nodes.node_libraries'`` because the stable namespaces its
-    imports and pickles reference were only present in ``sys.modules`` after an eager load.
+    saved values reference were only present in ``sys.modules`` after an eager load.
     The eager-save case is the literal field failure: workflows saved by earlier (eager)
     engines must open after updating to an engine that loads nodes lazily.
     """
@@ -273,8 +273,8 @@ def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path, engine: En
 
     workflow_source = _generate_payload_workflow_source(engine, library_json, lazy_save=lazy_save)
     runnable_source = _wrap_with_runtime_assertions(workflow_source)
-    assert f"from {STABLE_NAMESPACE} import LazyPayload" in workflow_source, (
-        "The generator must emit the deferred stable-namespace import for the pickled payload;"
+    assert f"'$type': '{STABLE_NAMESPACE}:LazyPayload'" in workflow_source, (
+        "The saved payload must be tagged with its stable namespace;"
         " without it this test would not exercise the lazy import path."
     )
 

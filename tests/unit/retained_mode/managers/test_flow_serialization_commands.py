@@ -461,19 +461,6 @@ class TestUniqueValuePoolSharedAcrossSubtree:
     """A value shared by nodes in different Flows of the same subtree should pool to one entry."""
 
     @pytest.mark.usefixtures("clean_object_state")
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "EFFICIENCY: on_serialize_flow_to_commands creates a fresh unique_parameter_uuid_to_values "
-            "dict and a fresh SerializedParameterValueTracker for every recursive "
-            "SerializeFlowToCommandsRequest() call it issues for a child Flow (SerializeFlowToCommandsRequest "
-            "carries no tracker fields to pass one through), so a value shared by a node in the "
-            "parent Flow and a node in a child Flow is pickled/stored twice under two different "
-            "UUIDs instead of being pooled once. Intended contract: the unique-value pool is shared "
-            "across a Flow's whole subtree, matching the dedup a value gets when both nodes are in "
-            "the same Flow. - see #5436"
-        ),
-    )
     def test_shared_value_across_flow_boundary_appears_once_in_pool(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="wf_shared_value_pool")
         parent_name = _create_flow(engine, "parent")
