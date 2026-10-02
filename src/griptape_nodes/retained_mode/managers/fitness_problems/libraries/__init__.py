@@ -21,6 +21,7 @@ from .library_dependency_problem import LibraryDependencyProblem
 from .library_json_decode_problem import LibraryJsonDecodeProblem
 from .library_load_exception_problem import LibraryLoadExceptionProblem
 from .library_not_found_problem import LibraryNotFoundProblem
+from .library_not_provided_by_environment_problem import LibraryNotProvidedByEnvironmentProblem
 from .library_problem import LibraryProblem
 from .library_schema_exception_problem import LibrarySchemaExceptionProblem
 from .library_schema_validation_problem import LibrarySchemaValidationProblem
@@ -70,6 +71,7 @@ __all__ = [
     "LibraryJsonDecodeProblem",
     "LibraryLoadExceptionProblem",
     "LibraryNotFoundProblem",
+    "LibraryNotProvidedByEnvironmentProblem",
     "LibraryProblem",
     "LibrarySchemaExceptionProblem",
     "LibrarySchemaValidationProblem",

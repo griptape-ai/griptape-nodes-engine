@@ -216,6 +216,11 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.external_environment import (
+    LIBRARY_PATHS_ENV_VAR,
+    library_paths_from_environment,
+    uses_environment_dependencies,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
@@ -231,6 +236,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     LibraryJsonDecodeProblem,
     LibraryLoadExceptionProblem,
     LibraryNotFoundProblem,
+    LibraryNotProvidedByEnvironmentProblem,
     LibraryProblem,
     LibrarySchemaExceptionProblem,
     LibrarySchemaValidationProblem,
@@ -599,10 +605,14 @@ class LibraryManager(EngineScoped):
 
         For directory entries that expand into multiple library files, every discovered
         child shares the parent directory's `registered_path`.
+
+        `from_environment` is True for a library listed in `GTN_LIBRARY_PATHS`, whose
+        `registered_path` is then the verbatim entry from that variable.
         """
 
         registration: LibraryRegistration
         registered_path: str
+        from_environment: bool = False
 
     class ResolvedDiscoveryPath(NamedTuple):
         """A config `libraries_to_register` entry resolved to a concrete on-disk path.
@@ -695,6 +705,9 @@ class LibraryManager(EngineScoped):
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
+        # Manifest paths the last discovery found through GTN_LIBRARY_PATHS. When
+        # library.dependency_source is 'environment' these are the only libraries allowed to load.
+        self._environment_library_paths: set[str] = set()
         event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
@@ -841,6 +854,10 @@ class LibraryManager(EngineScoped):
         Returns None when the directory does not exist. A failed build leaves it behind, so
         callers must consult `execution_env_failure_reason` before treating a path as usable.
         """
+        # The environment provides the worker's packages; a .venv-exec left from an earlier run
+        # in venv mode must not front them.
+        if self._uses_environment_dependencies():
+            return None
         library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
             return None
@@ -1039,6 +1056,11 @@ class LibraryManager(EngineScoped):
         matches = [info for info in self._library_file_path_to_info.values() if info.library_name == library_name]
         if not matches:
             return None
+        # A configured copy the environment does not provide is never the one to act on while the
+        # environment's own copy of the same library is known.
+        provided = [info for info in matches if not self._is_not_provided_by_environment(info)]
+        if provided:
+            matches = provided
         for library_info in matches:
             if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED:
                 return library_info
@@ -1233,12 +1255,35 @@ class LibraryManager(EngineScoped):
         # record alongside the copy that loaded -- so a match on the failed one answers "not
         # installed here" for a library that is. Prefer an entry that actually names itself.
         matches = [
-            info for info in self._library_file_path_to_info.values() if repo_name in Path(info.library_path).parts
+            info
+            for info in self._library_file_path_to_info.values()
+            if self._library_path_names_repo(info.library_path, repo_name)
         ]
         named = next((info for info in matches if info.library_name is not None), None)
         if named is not None:
             return named
         return matches[0] if matches else None
+
+    def _library_path_names_repo(self, library_path: str, repo_name: str) -> bool:
+        """Whether a folder in `library_path` is named after the repository `repo_name`.
+
+        Provisioning clones a download into a folder with the repository's exact name. An
+        environment lays its libraries out itself, and a tool that normalizes package names spells
+        `griptape-nodes-library-openexr` as `griptape_nodes_library_openexr`, so when the
+        environment provides the libraries the comparison also ignores letter case and treats `-`
+        and `_` alike.
+        """
+        parts = Path(library_path).parts
+        if repo_name in parts:
+            return True
+        if not self._uses_environment_dependencies():
+            return False
+        normalized_repo_name = self._normalize_repo_name(repo_name)
+        return any(self._normalize_repo_name(part) == normalized_repo_name for part in parts)
+
+    @staticmethod
+    def _normalize_repo_name(name: str) -> str:
+        return name.lower().replace("-", "_")
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
         """Return a collated display string for a LibraryInfo's problems, or None if there are none."""
@@ -1716,6 +1761,7 @@ class LibraryManager(EngineScoped):
 
         # Discover library files for metadata loading
         library_files = await self._discover_library_files()
+        environment_mode = self._uses_environment_dependencies()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
@@ -1728,12 +1774,20 @@ class LibraryManager(EngineScoped):
                 # can map this metadata back to the matching `libraries_to_register` row
                 # without re-implementing the engine's path resolution logic.
                 metadata_result.registered_path = discovered.registered_path
+                # is_registered is answered by library name, so a configured copy the environment
+                # refused would read as loaded whenever the environment provides a library of the
+                # same name. Only the environment's own entry can be the one that loaded.
+                if environment_mode and not discovered.from_environment:
+                    metadata_result.is_registered = False
                 successful_libraries.append(metadata_result)
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
 
-        # Generate sandbox library metadata if configured
-        sandbox_library_dir = self._get_sandbox_directory()
+        # Generate sandbox library metadata if configured. Not when the environment provides the
+        # libraries: the sandbox never loads then, and scanning it writes its manifest.
+        sandbox_library_dir = None
+        if not self._uses_environment_dependencies():
+            sandbox_library_dir = self._get_sandbox_directory()
         if sandbox_library_dir:
             # Try to load existing JSON first - only scan if load fails
             sandbox_json_path = sandbox_library_dir / LibraryManager.LIBRARY_CONFIG_FILENAME
@@ -2133,6 +2187,14 @@ class LibraryManager(EngineScoped):
         discovers files that exist on disk but are absent from the manifest, and the loader
         resolves their class names and writes the manifest back for us.
         """
+        # The environment decides every node type that exists, so none is added from a loose file.
+        if self._uses_environment_dependencies():
+            return RegisterSandboxNodeFromSourceResultFailure(
+                result_details=self._environment_provides_libraries_message(
+                    f"add the sandbox node in '{request.file_path}'"
+                )
+            )
+
         # Resolve and validate the sandbox directory. Agents cannot register nodes on a
         # system that has not opted in to a sandbox.
         sandbox_dir = self._get_sandbox_directory()
@@ -2400,6 +2462,18 @@ class LibraryManager(EngineScoped):
         # Extract prerequisites
         library_info = prereq_result.library_info
         file_path = prereq_result.file_path
+
+        # Checked here rather than only at discovery, so a library registered by path from the
+        # editor or a script is held to the same rule as one found at startup.
+        if self._uses_environment_dependencies() and library_info.library_path not in self._environment_library_paths:
+            self._mark_not_provided_by_environment(library_info)
+            self._library_file_path_to_info[library_info.library_path] = library_info
+            details = (
+                f"Attempted to load the library at '{library_info.library_path}'. Failed because the engine is "
+                f"running in an environment that provides its libraries, and this library is not listed in "
+                f"{LIBRARY_PATHS_ENV_VAR}."
+            )
+            return RegisterLibraryFromFileResultFailure(result_details=details)
 
         # Phase 2: Progress through lifecycle phases
         progression_result = await self._progress_library_through_lifecycle(
@@ -2726,11 +2800,15 @@ class LibraryManager(EngineScoped):
                                 default=LibraryDependencyInstallBehavior.ALWAYS,
                                 cast_type=str,
                             )
+                            environment_mode = self._uses_environment_dependencies()
                             for dep in griptape_library_deps:
                                 parsed_dep = self._parse_dependency_url(dep.url)
                                 repo_name = parsed_dep.repo_name
                                 already_registered = any(
-                                    (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
+                                    (
+                                        info.library_name == repo_name
+                                        or self._library_path_names_repo(info.library_path, repo_name)
+                                    )
                                     and info.lifecycle_state != LibraryManager.LibraryLifecycleState.FAILURE
                                     and info.fitness
                                     not in (
@@ -2742,6 +2820,27 @@ class LibraryManager(EngineScoped):
                                 if already_registered:
                                     logger.debug(
                                         "Library dependency '%s' is already registered, skipping download",
+                                        dep.url,
+                                    )
+                                    continue
+                                # Only a library the environment provides can satisfy a dependency
+                                # then; a download would be a library nobody put in the environment.
+                                if environment_mode:
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message=(
+                                                    "The environment this engine runs in does not provide it, and "
+                                                    "libraries are not downloaded in that case. Ask whoever set up "
+                                                    "this environment to add it."
+                                                ),
+                                            )
+                                        )
+                                        library_info.fitness = LibraryManager.LibraryFitness.FLAWED
+                                    logger.info(
+                                        "Library '%s' depends on '%s', which the environment does not provide.",
+                                        library_info.library_name,
                                         dep.url,
                                     )
                                     continue
@@ -3130,9 +3229,15 @@ class LibraryManager(EngineScoped):
         return problems
 
     @handles(RegisterLibraryFromRequirementSpecifierRequest)
-    async def register_library_from_requirement_specifier_request(
+    async def register_library_from_requirement_specifier_request(  # noqa: PLR0911 (each failure returns its own result)
         self, request: RegisterLibraryFromRequirementSpecifierRequest
     ) -> ResultPayload:
+        if self._uses_environment_dependencies():
+            return RegisterLibraryFromRequirementSpecifierResultFailure(
+                result_details=self._environment_provides_libraries_message(
+                    f"install library '{request.requirement_specifier}'"
+                )
+            )
         try:
             package_name = Requirement(request.requirement_specifier).name
             # Determine venv path for dependency installation
@@ -3474,6 +3579,10 @@ class LibraryManager(EngineScoped):
         execution directory is not on the path, so its edit-time venv is still spliced.
         """
         if self._execution_env_is_already_on_sys_path(library_name):
+            return
+
+        # The environment already put every package on the path before the engine started.
+        if self._uses_environment_dependencies():
             return
 
         venv_path = self._get_library_venv_path(library_name, library_file_path, execution=False)
@@ -4273,9 +4382,12 @@ class LibraryManager(EngineScoped):
 
                 await self._load_and_track_library(lib_path, current_library_index, total_libraries)
 
-            # Remove any missing libraries AFTER we've loaded them for the user.
-            user_libraries_section = LIBRARIES_TO_REGISTER_KEY
-            self._remove_missing_libraries_from_config(config_category=user_libraries_section)
+            # Remove any missing libraries AFTER we've loaded them for the user. Not when the
+            # environment provides the libraries: the config's entries were not what loaded, and a
+            # studio launch must leave the artist's own settings as it found them.
+            if not self._uses_environment_dependencies():
+                user_libraries_section = LIBRARIES_TO_REGISTER_KEY
+                self._remove_missing_libraries_from_config(config_category=user_libraries_section)
 
             return reconcile_failures
         finally:
@@ -4386,6 +4498,10 @@ class LibraryManager(EngineScoped):
         engine_version_failure = self._check_engine_version()
         if engine_version_failure is not None:
             return [engine_version_failure]
+
+        # The environment provides every library, so there is nothing here to provision.
+        if self._uses_environment_dependencies():
+            return []
 
         config_mgr = self.engine.config_manager
         raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
@@ -4678,6 +4794,13 @@ class LibraryManager(EngineScoped):
 
         if not git_urls:
             logger.debug("No libraries to download from config")
+            return
+
+        if self._uses_environment_dependencies():
+            logger.info(
+                "Not downloading %d configured libraries: the environment provides this engine's libraries.",
+                len(git_urls),
+            )
             return
 
         logger.debug("Starting download of %d libraries from config", len(git_urls))
@@ -6231,7 +6354,72 @@ class LibraryManager(EngineScoped):
             executes_in_worker=executes_in_worker,
         )
 
-    async def discover_libraries_request(
+    def _create_not_provided_library_info_entry(
+        self,
+        file_path_str: str,
+        *,
+        is_sandbox: bool,
+        enabled: bool,
+        registered_path: str | None,
+    ) -> None:
+        """Record a configured library that is not loaded because the environment does not provide it.
+
+        Used when library.dependency_source is 'environment'. The entry is replaced on every
+        discovery, because the same path may have loaded before the setting changed. A disabled
+        entry stays disabled without a problem: it was not going to load either way. The manifest
+        is read only for the library's name and version, so the problem names what the artist knows.
+        """
+        library_name = None
+        library_version = None
+        if is_sandbox:
+            library_name = LibraryManager.SANDBOX_LIBRARY_NAME
+        else:
+            metadata_result = self.load_library_metadata_from_file_request(
+                LoadLibraryMetadataFromFileRequest(file_path=file_path_str)
+            )
+            if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
+                library_name = metadata_result.library_schema.name
+                library_version = metadata_result.library_schema.metadata.library_version
+
+        library_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISABLED,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path=file_path_str,
+            is_sandbox=is_sandbox,
+            enabled=enabled,
+            library_name=library_name,
+            library_version=library_version,
+            registered_path=registered_path,
+        )
+        if enabled:
+            self._mark_not_provided_by_environment(library_info)
+        self._library_file_path_to_info[file_path_str] = library_info
+
+    @staticmethod
+    def _mark_not_provided_by_environment(library_info: LibraryManager.LibraryInfo) -> None:
+        """Fail `library_info` because the environment does not provide it, reporting that once."""
+        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+        library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+        if not any(isinstance(problem, LibraryNotProvidedByEnvironmentProblem) for problem in library_info.problems):
+            library_info.problems.append(LibraryNotProvidedByEnvironmentProblem(library_path=library_info.library_path))
+
+    @staticmethod
+    def _is_not_provided_by_environment(library_info: LibraryManager.LibraryInfo) -> bool:
+        return any(isinstance(problem, LibraryNotProvidedByEnvironmentProblem) for problem in library_info.problems)
+
+    def _uses_environment_dependencies(self) -> bool:
+        """Whether library.dependency_source is 'environment'."""
+        return uses_environment_dependencies(self.engine.config_manager)
+
+    @staticmethod
+    def _environment_provides_libraries_message(attempted: str) -> str:
+        """The failure for a library change the environment, not the engine, is responsible for."""
+        return (
+            f"Attempted to {attempted}. Failed because the engine is running in an environment that "
+            f"provides its libraries, so libraries are added and updated by whoever set up that environment."
+        )
+
+    async def discover_libraries_request(  # noqa: C901 (sandbox, environment, and config sources each branch)
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
@@ -6249,9 +6437,25 @@ class LibraryManager(EngineScoped):
 
         discovered_libraries = []
         seen_libraries = set()
+        environment_mode = self._uses_environment_dependencies()
+        self._environment_library_paths = {
+            discovered.registration.path for discovered in config_library_entries if discovered.from_environment
+        }
+
+        # The environment decides every library that loads, so the sandbox is reported rather
+        # than scanned: scanning writes its manifest into the workspace.
+        if request.include_sandbox and environment_mode:
+            sandbox_library_dir = self._get_sandbox_directory()
+            if sandbox_library_dir:
+                self._create_not_provided_library_info_entry(
+                    str(sandbox_library_dir / LibraryManager.LIBRARY_CONFIG_FILENAME),
+                    is_sandbox=True,
+                    enabled=True,
+                    registered_path=None,
+                )
 
         # Process sandbox library first if requested
-        if request.include_sandbox:
+        if request.include_sandbox and not environment_mode:
             sandbox_library_dir = self._get_sandbox_directory()
             if sandbox_library_dir:
                 # Generate/update the sandbox library JSON file
@@ -6289,6 +6493,17 @@ class LibraryManager(EngineScoped):
             entry = discovered.registration
             file_path = Path(entry.path)
             file_path_str = entry.path
+
+            # A configured library the environment does not provide is recorded with the reason and
+            # left out of the discovered list, so nothing tries to load it.
+            if environment_mode and not discovered.from_environment:
+                self._create_not_provided_library_info_entry(
+                    file_path_str,
+                    is_sandbox=False,
+                    enabled=entry.enabled,
+                    registered_path=discovered.registered_path,
+                )
+                continue
 
             # Add to discovered libraries with is_sandbox=False
             if file_path not in seen_libraries:
@@ -6530,7 +6745,7 @@ class LibraryManager(EngineScoped):
 
         return LoadLibrariesResultSuccess(result_details=ResultDetails(message=message, level=logging.INFO))
 
-    async def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
+    async def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:  # noqa: C901 (environment, config, and download sources each branch)
         """Discover library JSON files from config and workspace recursively.
 
         Returns:
@@ -6545,7 +6760,9 @@ class LibraryManager(EngineScoped):
         discovered_entries: list[LibraryManager.DiscoveredLibraryEntry] = []
         seen_paths: set[Path] = set()
 
-        async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
+        async def process_path(
+            path: Path, *, enabled: bool, registered_path: str, from_environment: bool = False
+        ) -> None:
             """Process a path, handling both files and directories."""
             if await anyio.Path(path).is_dir():
                 # Recursively find library files. find_files_recursive skips hidden
@@ -6562,6 +6779,7 @@ class LibraryManager(EngineScoped):
                             LibraryManager.DiscoveredLibraryEntry(
                                 registration=LibraryRegistration(path=str(lib_path), enabled=enabled),
                                 registered_path=registered_path,
+                                from_environment=from_environment,
                             )
                         )
             elif path.suffix == ".json" and path not in seen_paths:
@@ -6570,8 +6788,24 @@ class LibraryManager(EngineScoped):
                     LibraryManager.DiscoveredLibraryEntry(
                         registration=LibraryRegistration(path=str(path), enabled=enabled),
                         registered_path=registered_path,
+                        from_environment=from_environment,
                     )
                 )
+
+        # Libraries the environment provides come first, so a libraries_to_register entry naming the
+        # same manifest is the duplicate, not the environment's copy.
+        for environment_path in library_paths_from_environment(os.environ):
+            resolved = self._resolve_discovery_path(
+                LibraryRegistration(path=environment_path), config_mgr.workspace_path
+            )
+            if resolved is None:
+                logger.warning(
+                    "Ignoring '%s' in %s: there is no library at that path.", environment_path, LIBRARY_PATHS_ENV_VAR
+                )
+                continue
+            await process_path(
+                resolved.path, enabled=True, registered_path=resolved.registered_path, from_environment=True
+            )
 
         # Add from config
         config_libraries = config_mgr.get_config_value(user_libraries_section, default=[])
@@ -6579,6 +6813,12 @@ class LibraryManager(EngineScoped):
             resolved = self._resolve_discovery_path(entry, config_mgr.workspace_path)
             if resolved is not None:
                 await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
+
+        # Nothing is downloaded when the environment provides the libraries, so there is no
+        # provisioned copy to find. The libraries_to_register entries above are still discovered,
+        # so each can be reported as not provided rather than silently vanishing.
+        if self._uses_environment_dependencies():
+            return discovered_entries
 
         # Add provisioned git-sourced libraries. Each libraries_to_download entry is
         # cloned into the workspace libraries_directory by reconcile; discovery
@@ -6706,6 +6946,24 @@ class LibraryManager(EngineScoped):
         except KeyError:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no Library with that name was registered."
             return CheckLibraryUpdateResultFailure(result_details=details)
+
+        # The environment chose this version, and a newer one arrives only through it, so there is
+        # nothing to ask git about. Answered as a success: nothing is wrong with the library.
+        if self._uses_environment_dependencies():
+            current_version = library.get_metadata().library_version
+            return CheckLibraryUpdateResultSuccess(
+                has_update=False,
+                current_version=current_version,
+                latest_version=current_version,
+                git_remote=None,
+                git_ref=None,
+                local_commit=None,
+                remote_commit=None,
+                result_details=(
+                    f"Library '{library_name}' is provided by the environment this engine runs in. "
+                    f"Updates come from whoever set up that environment."
+                ),
+            )
 
         # Find the library file path. Route through the shared resolver so the update path
         # (_validate_and_prepare_library_for_git_operation) and this check path can never
@@ -7034,6 +7292,11 @@ class LibraryManager(EngineScoped):
         """
         library_name = request.library_name
 
+        if self._uses_environment_dependencies():
+            return UpdateLibraryResultFailure(
+                result_details=self._environment_provides_libraries_message(f"update library '{library_name}'")
+            )
+
         # Validate library and prepare for git operation
         validation_result = await self._validate_and_prepare_library_for_git_operation(
             library_name=library_name,
@@ -7161,10 +7424,17 @@ class LibraryManager(EngineScoped):
         )
 
     @handles(SwitchLibraryRefRequest)
-    async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:
+    async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:  # noqa: PLR0911 (each failure returns its own result)
         """Switch a library to a different git branch or tag."""
         library_name = request.library_name
         ref_name = request.ref_name
+
+        if self._uses_environment_dependencies():
+            return SwitchLibraryRefResultFailure(
+                result_details=self._environment_provides_libraries_message(
+                    f"switch library '{library_name}' to '{ref_name}'"
+                )
+            )
 
         # Validate library and prepare for git operation
         validation_result = await self._validate_and_prepare_library_for_git_operation(
@@ -7263,6 +7533,13 @@ class LibraryManager(EngineScoped):
     @handles(DownloadLibraryRequest)
     async def download_library_request(self, request: DownloadLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Download a library from a git repository."""
+        if self._uses_environment_dependencies():
+            return DownloadLibraryResultFailure(
+                result_details=self._environment_provides_libraries_message(
+                    f"download the library at '{request.git_url}'"
+                )
+            )
+
         parsed_url = parse_git_url_with_ref(normalize_github_url(request.git_url))
         git_url = parsed_url.url
         # Explicit branch_tag_commit wins over a url@ref suffix.
@@ -7404,7 +7681,7 @@ class LibraryManager(EngineScoped):
         )
 
     @handles(InstallLibraryDependenciesRequest)
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901 (edit and execution environments each branch)
         """Install a library's dependencies into its edit-time and execution environments.
 
         Edit-time dependencies go into ``.venv``, which is always created even when there is
@@ -7425,6 +7702,15 @@ class LibraryManager(EngineScoped):
         library_data = metadata_result.library_schema
         library_name = library_data.name
         library_metadata = library_data.metadata
+
+        # Neither environment is built, and nothing on disk is touched: the environment the engine
+        # was started in already holds this library's packages.
+        if self._uses_environment_dependencies():
+            details = f"Library '{library_name}' uses the packages its environment provides; nothing to install"
+            logger.debug(details)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name, dependencies_installed=0, result_details=details
+            )
 
         pip_dependencies = []
         pip_dependencies_exec = []
@@ -7896,6 +8182,11 @@ class LibraryManager(EngineScoped):
     @handles(SyncLibrariesRequest)
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
+        if self._uses_environment_dependencies():
+            return SyncLibrariesResultFailure(
+                result_details=self._environment_provides_libraries_message("sync libraries")
+            )
+
         # Phase 1: Download missing libraries from both config keys
         config_mgr = self.engine.config_manager
 

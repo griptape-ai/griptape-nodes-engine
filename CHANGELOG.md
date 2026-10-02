@@ -23,6 +23,12 @@ the engine's request API from working without edits. Migration steps live in
   deleted in the background.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
 
+- Studios can run the engine inside an environment their own tools prepare. Libraries listed in the
+  `GTN_LIBRARY_PATHS` environment variable load before `libraries_to_register`. Setting
+  `library.dependency_source` to `environment` makes those the only libraries that load and stops
+  the engine from downloading libraries or building virtual environments. See
+  [Running in a Managed Environment](https://docs.griptapenodes.com/en/stable/guides/managed_environment/).
+
 ### Changed
 
 - Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
