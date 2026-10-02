@@ -567,9 +567,14 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
             `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
             without reading the message, because they mean different things to whoever is looking:
             nothing ran, versus something ran and broke.
+        exception_from_node: True when `exception` was raised by the node's own code while it ran,
+            so its message is in the node's words. False when the engine wrote `result_details` for
+            the user and `exception` is only the cause, such as a worker that stopped responding.
+            `NodeErrorEvent.error` uses the exception's message only when this is True.
     """
 
     validation_exceptions: list[Exception] | None = None
+    exception_from_node: bool = False
 
 
 @dataclass

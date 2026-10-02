@@ -210,7 +210,7 @@ class TestExecuteFailureContract:
     async def test_error_carries_the_exception_the_node_raised(self) -> None:
         node = _make_node(name="Broken")
         raised = KeyError("Key 'b' not found")
-        failure = ExecuteNodeResultFailure(result_details="boom", exception=raised)
+        failure = ExecuteNodeResultFailure(result_details="boom", exception=raised, exception_from_node=True)
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -220,6 +220,7 @@ class TestExecuteFailureContract:
             await executor.execute(node)
 
         assert caught.value.exception is raised
+        assert caught.value.exception_from_node is True
         assert caught.value.__cause__ is raised
         assert caught.value.validation_exceptions == []
 

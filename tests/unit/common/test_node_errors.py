@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.events.node_error_details import (
     MAX_RESPONSE_BYTES,
     RESPONSE_DROPPED_FIELD,
 )
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 
 NODE_NAME = "Get Dictionary Value by Key"
 
@@ -52,6 +53,7 @@ def _executor_error(result: ExecuteNodeResultFailure) -> NodeExecutionError:
         message,
         result_details=str(result.result_details),
         exception=result.exception,
+        exception_from_node=result.exception_from_node,
         validation_exceptions=result.validation_exceptions,
     )
 
@@ -60,6 +62,7 @@ def _failed_while_running(exc: Exception) -> ExecuteNodeResultFailure:
     return ExecuteNodeResultFailure(
         result_details=f"Attempted to execute node '{NODE_NAME}'. Failed with error: {exc}",
         exception=exc,
+        exception_from_node=True,
     )
 
 
@@ -130,6 +133,51 @@ class TestMessage:
 
         assert details.message == "no worker is available"
         assert details.exception_type is None
+
+    def test_engine_written_failure_keeps_the_engines_message(self) -> None:
+        # Shaped like node_manager's WorkerGoneError failure: the engine wrote result_details for
+        # the user, and the exception is only the cause.
+        cause = _raised(WorkerGoneError("worker 'a1b2c3' stopped responding and was shut down."))
+        details_text = (
+            f"Attempted to run node '{NODE_NAME}' in a separate process. Failed because {cause} "
+            "Editing the node still works and your workflow keeps it."
+        )
+        result = ExecuteNodeResultFailure(result_details=details_text, exception=cause)
+
+        details = build_node_error_details(NODE_NAME, _executor_error(result))
+
+        assert details.message == details_text
+        assert details.exception_type == "griptape_nodes.retained_mode.events.worker_events.WorkerGoneError"
+
+    def test_parameter_set_failure_keeps_which_parameter(self) -> None:
+        # Shaped like node_manager's set_parameter_value failure, which names the parameter.
+        cause = _raised(ValueError("must be a positive number"))
+        details_text = f"Attempted to set parameter 'steps' on node '{NODE_NAME}'. Failed with error: {cause}"
+        result = ExecuteNodeResultFailure(result_details=details_text, exception=cause)
+
+        details = build_node_error_details(NODE_NAME, _executor_error(result))
+
+        assert details.message == details_text
+        assert details.exception_type == "builtins.ValueError"
+
+    def test_engine_written_failure_from_a_worker_keeps_the_engines_message(self) -> None:
+        result = ExecuteNodeResultFailure(
+            result_details="Attempted to run the node. Failed because the worker stopped responding.",
+            exception=_across_worker(RuntimeError("worker 'a1b2c3' gone")),
+        )
+
+        details = build_node_error_details(NODE_NAME, _executor_error(result))
+
+        assert details.message == "Attempted to run the node. Failed because the worker stopped responding."
+        assert details.exception_type == "builtins.RuntimeError"
+
+    def test_exception_from_node_survives_the_worker_boundary(self) -> None:
+        result = _failed_while_running(_raised(ValueError("boom")))
+
+        wire = json.loads(json.dumps(converter.unstructure(result)))
+        rebuilt = converter.structure(wire, ExecuteNodeResultFailure)
+
+        assert rebuilt.exception_from_node is True
 
     def test_other_exceptions_use_their_own_message(self) -> None:
         details = build_node_error_details(NODE_NAME, _raised(ZeroDivisionError("division by zero")))

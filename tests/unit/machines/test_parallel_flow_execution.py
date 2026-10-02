@@ -688,7 +688,9 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         flattened = "Node 'n' execution failed: Attempted to execute node 'n'. Failed with error: \"n: Key 'b'\""
 
         async def _boom() -> None:
-            raise NodeExecutionError(flattened, result_details="unused", exception=raised) from raised
+            raise NodeExecutionError(
+                flattened, result_details="unused", exception=raised, exception_from_node=True
+            ) from raised
 
         task = asyncio.ensure_future(_boom())
         await asyncio.sleep(0)

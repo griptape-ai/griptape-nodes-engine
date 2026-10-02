@@ -347,12 +347,15 @@ class NodeExecutor(EngineScoped):
                 exc = getattr(result, "exception", None)
                 msg = self._format_node_failure_message(node.name, result, exc)
                 validation_exceptions = None
+                exception_from_node = False
                 if isinstance(result, ExecuteNodeResultFailure):
                     validation_exceptions = result.validation_exceptions
+                    exception_from_node = result.exception_from_node
                 raise NodeExecutionError(
                     msg,
                     result_details=str(getattr(result, "result_details", result)),
                     exception=exc,
+                    exception_from_node=exception_from_node,
                     validation_exceptions=validation_exceptions,
                 ) from exc
             # Copy outputs back onto the in-memory node. Write directly into

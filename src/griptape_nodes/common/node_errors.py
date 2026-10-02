@@ -26,7 +26,10 @@ class NodeExecutionError(RuntimeError):
 
     * ``validation_exceptions``: the node declined to run. No exception was raised, so there is no
       ``__cause__`` to read them from.
-    * ``exception``: the node raised while running. Also chained as ``__cause__``.
+    * ``exception`` with ``exception_from_node``: the node raised while running, so the exception's
+      message is in the node's words. Also chained as ``__cause__``.
+    * ``exception`` without ``exception_from_node``: the engine wrote ``result_details`` for the
+      user, such as when a worker stopped responding, and the exception is only the cause.
     * Neither: the engine failed the request before the node ran, and ``result_details`` says why.
     """
 
@@ -36,11 +39,13 @@ class NodeExecutionError(RuntimeError):
         *,
         result_details: str,
         exception: BaseException | None = None,
+        exception_from_node: bool = False,
         validation_exceptions: list[Exception] | None = None,
     ) -> None:
         super().__init__(message)
         self.result_details = result_details
         self.exception = exception
+        self.exception_from_node = exception_from_node
         self.validation_exceptions = validation_exceptions or []
 
 
@@ -62,6 +67,13 @@ def build_node_error_details(node_name: str, error: BaseException | list[Excepti
         return _from_validation(node_name, error.validation_exceptions)
     if error.exception is None:
         return NodeErrorDetails(message=_strip_node_name(node_name, error.result_details))
+    if not error.exception_from_node:
+        # The engine wrote result_details for the user, and they say more than the exception that
+        # caused them. The exception still tells the reader what kind of failure it was.
+        return NodeErrorDetails(
+            message=_strip_node_name(node_name, error.result_details),
+            exception_type=_exception_type(error.exception),
+        )
     return _from_exception(node_name, error.exception)
 
 
@@ -77,11 +89,7 @@ def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDe
 
 
 def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
-    details = NodeErrorDetails(message=_message(node_name, exc))
-    if isinstance(exc, ForwardedException):
-        details.exception_type = exc.original_type
-    else:
-        details.exception_type = qualified_type_name(exc)
+    details = NodeErrorDetails(message=_message(node_name, exc), exception_type=_exception_type(exc))
     if isinstance(exc, ForwardedNodeError):
         attachments = exc.attachments
     elif isinstance(exc, NodeError):
@@ -92,6 +100,12 @@ def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
     details.response = attachments.response
     details.links = attachments.links
     return details
+
+
+def _exception_type(exc: BaseException) -> str | None:
+    if isinstance(exc, ForwardedException):
+        return exc.original_type
+    return qualified_type_name(exc)
 
 
 def _message(node_name: str, exc: BaseException) -> str:

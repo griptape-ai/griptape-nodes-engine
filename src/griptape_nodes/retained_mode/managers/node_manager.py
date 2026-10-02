@@ -3680,6 +3680,7 @@ class NodeManager(EngineScoped):
                 return ExecuteNodeResultFailure(
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
+                    exception_from_node=True,
                 )
             finally:
                 # The scratch marker only means anything while the run is in flight. A parameter
