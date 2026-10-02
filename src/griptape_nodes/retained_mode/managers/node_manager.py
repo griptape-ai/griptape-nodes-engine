@@ -3725,7 +3725,14 @@ class NodeManager(EngineScoped):
             return None
 
         logger.error("%s: %s", node_name, budget_log_line(refusal))
-        return BudgetExceededError(describe_budget_refusal(refusal, node_name=node_name), refusal, node_name=node_name)
+        halt = BudgetExceededError(describe_budget_refusal(refusal, node_name=node_name), refusal, node_name=node_name)
+        # Raised from the failure rather than only built, so the halt keeps the original as its
+        # cause and has a traceback of its own; without one the converter forwards no traceback
+        # across the worker boundary.
+        try:
+            raise halt from exc
+        except BudgetExceededError:
+            return halt
 
     def _named_budget_halt(self, exc: Exception) -> BudgetExceededError | None:
         """Return the halt on this chain that already names its node, if there is one."""

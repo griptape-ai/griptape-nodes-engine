@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.utils.budget_refusal import (
     BUDGET_HALT_PREFIX,
@@ -56,6 +57,21 @@ class TestExecutionFailureNamesTheRefusedNode:
         assert "'Upscale'" in str(failure.result_details)
         assert '"tight"' in str(failure.result_details)
         assert any("Upscale" in record.getMessage() for record in caplog.records)
+
+    def test_the_halt_keeps_the_original_failure_and_its_stack(self) -> None:
+        """The halt replaces the node's exception, so it has to carry where the refusal came from."""
+        wrapped = RuntimeError("Attempted to upscale the video. Failed due to a 403.")
+        wrapped.__cause__ = _cloud_refusal()
+
+        failure = _node_manager()._execution_failure(wrapped, "Upscale")
+
+        halt = failure.exception
+        assert halt is not None
+        assert halt.__cause__ is wrapped
+        assert halt.__traceback__ is not None
+        forwarded = converter.unstructure(halt)["traceback"]
+        assert "Attempted to upscale the video" in forwarded
+        assert "HTTPStatusError" in forwarded
 
     def test_a_driver_halt_is_reworded_to_name_the_node(self) -> None:
         driver_halt = _driver_halt()
