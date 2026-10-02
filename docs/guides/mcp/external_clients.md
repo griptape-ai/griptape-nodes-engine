@@ -119,6 +119,28 @@ npx -y @modelcontextprotocol/inspector
 
 Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP** as the transport. If the connection fails with `TypeError: NetworkError when attempting to fetch resource`, it's almost always CORS: the engine's MCP server does not currently emit `Access-Control-Allow-Origin` headers, so cross-origin browser fetches are blocked. Use the CLI command above instead, or run the inspector with browser security relaxed.
 
+## Parameter values
+
+Every request, result, and event field that holds a parameter or flow variable value uses the form
+below, both in what the engine sends and in what it reads back.
+
+Values of types JSON lacks, such as tuples, enums, and artifacts, carry their Python type under
+`$type`. Artifacts and other objects keep their fields beside `$type`:
+
+```json
+{"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
+```
+
+Other values, such as tuples and enums, sit under `$value`:
+
+```json
+{"$type": "builtins:tuple", "$value": [1, "b"]}
+{"$type": "my_library.colors:Color", "$value": "red"}
+```
+
+A value that can't be written as JSON, such as an open file, is sent as its Python `str()`, for
+example `"<_io.TextIOWrapper name='notes.txt' mode='r' encoding='UTF-8'>"`.
+
 ## Install the workflow-construction skill
 
 The engine ships a [`griptape-nodes-workflows` skill](https://docs.griptapenodes.com/en/stable/skills/griptape-nodes-workflows/SKILL/) that teaches an agent how to drive the MCP tools described above (cold-start recipe, `EventRequestBatch`, common gotchas). Claude Code, Cursor, and VS Code natively load skills with the `name` + `description` frontmatter convention from [agentskills.io](https://agentskills.io), so installation is a directory drop.

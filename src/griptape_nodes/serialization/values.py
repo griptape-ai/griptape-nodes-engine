@@ -69,6 +69,10 @@ VALUE_KEY = "$value"
 type Value = Any
 """Any parameter value. Payload fields annotated with it cross the wire as tagged plain data."""
 
+type DisplayValue = Any
+"""A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
+that a value with no plain-data form is sent as its text instead of failing."""
+
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
 
@@ -113,6 +117,29 @@ def try_encode(value: Any) -> JsonValue | Unencodable:
         return encode_value(value)
     except ValueEncodeError as error:
         return Unencodable(str(error))
+
+
+def encodable_default(default_value: Any, node_name: str | None, parameter_name: str | None) -> Any:
+    """Return ``default_value``, or None with a logged warning if it has no plain-data form."""
+    encoded = try_encode(default_value)
+    if not isinstance(encoded, Unencodable):
+        return default_value
+    logger.warning(
+        "Attempted to save the default value of parameter '%s' on node '%s'. Failed because %s "
+        "The parameter will reopen without that default.",
+        parameter_name,
+        node_name,
+        encoded.reason,
+    )
+    return None
+
+
+def encode_for_display(value: Any) -> JsonValue:
+    """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
+    encoded = try_encode(value)
+    if isinstance(encoded, Unencodable):
+        return str(value)
+    return encoded
 
 
 def decode_value(data: Any) -> Any:
