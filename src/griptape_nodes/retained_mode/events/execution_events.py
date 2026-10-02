@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
@@ -441,8 +442,18 @@ class NodeFinishProcessEvent(ExecutionPayload):
 @dataclass
 @PayloadRegistry.register
 class NodeErrorEvent(ExecutionPayload):
+    """A node failed during a flow run.
+
+    Args:
+        node_name: The node that failed.
+        error_message: The failure as one flattened string, for logs and older editors.
+        error: The same failure in parts, without engine preambles or the node name prefix.
+            Optional so events from older engines still parse.
+    """
+
     node_name: str
     error_message: str
+    error: NodeErrorDetails | None = None
 
 
 @dataclass

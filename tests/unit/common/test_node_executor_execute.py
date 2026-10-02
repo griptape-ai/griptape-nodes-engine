@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.common.node_errors import NodeExecutionError
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups import (
@@ -204,6 +205,40 @@ class TestExecuteFailureContract:
             await executor.execute(node)
 
         assert node.parameter_output_values == {}
+
+    @pytest.mark.asyncio
+    async def test_error_carries_the_exception_the_node_raised(self) -> None:
+        node = _make_node(name="Broken")
+        raised = KeyError("Key 'b' not found")
+        failure = ExecuteNodeResultFailure(result_details="boom", exception=raised)
+
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=failure)
+
+        with pytest.raises(NodeExecutionError) as caught:
+            await executor.execute(node)
+
+        assert caught.value.exception is raised
+        assert caught.value.__cause__ is raised
+        assert caught.value.validation_exceptions == []
+
+    @pytest.mark.asyncio
+    async def test_error_carries_the_exceptions_of_a_node_that_declined_to_run(self) -> None:
+        node = _make_node(name="Broken")
+        reasons: list[Exception] = [ValueError("Needs a GPU")]
+        failure = ExecuteNodeResultFailure(result_details="declined", validation_exceptions=reasons)
+
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=failure)
+
+        with pytest.raises(NodeExecutionError) as caught:
+            await executor.execute(node)
+
+        assert caught.value.validation_exceptions == reasons
+        assert caught.value.exception is None
+        assert caught.value.result_details == "declined"
 
 
 class TestExecuteSpecialNodeRouting:

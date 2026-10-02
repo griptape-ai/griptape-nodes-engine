@@ -19,6 +19,8 @@ from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, bui
 if TYPE_CHECKING:
     import builtins
 
+    from griptape_nodes.retained_mode.events.node_error_details import ErrorAttachments
+
 logger = logging.getLogger(__name__)
 
 
@@ -278,6 +280,26 @@ class ForwardedException(Exception):  # noqa: N818
         super().__init__(message)
         self.original_type = original_type
         self.original_traceback = original_traceback
+
+
+class ForwardedNodeError(ForwardedException):
+    """A ``NodeError`` that crossed the worker boundary, with what it attached.
+
+    Kept separate from ``ForwardedException`` so only the exceptions that had
+    attachments carry them. ``build_node_error_details`` reads ``attachments``
+    into ``NodeErrorEvent.error``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        original_type: str | None = None,
+        original_traceback: str | None = None,
+        attachments: ErrorAttachments,
+    ) -> None:
+        super().__init__(message, original_type=original_type, original_traceback=original_traceback)
+        self.attachments = attachments
 
 
 # Failure result payload abstract base class

@@ -22,6 +22,17 @@ the engine's request API from working without edits. Migration steps live in
   without blocking other nodes or delaying "Stop". Uploads interrupted by "Stop" finish and are
   deleted in the background.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
+- `NodeErrorEvent` has an optional `error` field that holds a node failure in parts: the node's own
+  message without the engine's "Attempted to execute node" wrapping or a leading node name, the
+  exception type, one message per problem when a node fails validation, and anything the node
+  attached with `NodeError`. `error_message` is unchanged.
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
+- Nodes can raise `NodeError` from `griptape_nodes.exe_types.core_types` to attach labelled values
+  such as a request ID, the provider's response body, and up to three documentation links, instead
+  of putting them in the message text. They reach the editor in `NodeErrorEvent.error`, also when
+  the node runs in a worker. See
+  [Writing Error Messages](docs/development/custom_nodes/error_handling.md#writing-error-messages).
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
 
 ### Changed
 
@@ -32,6 +43,10 @@ the engine's request API from working without edits. Migration steps live in
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
+- `RunArbitraryPythonStringRequest` failures now start with the exception type, such as
+  `ZeroDivisionError: division by zero`, instead of `ERROR: division by zero`. This is the text a
+  node that runs Python code shows when the code fails.
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
 
 ### Removed
 

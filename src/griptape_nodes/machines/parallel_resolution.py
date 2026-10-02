@@ -5,6 +5,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.common.node_errors import build_node_error_details
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
@@ -674,6 +675,7 @@ class ExecuteDagState(State):
                             payload=NodeErrorEvent(
                                 node_name=error_node_name,
                                 error_message=str(e),
+                                error=build_node_error_details(error_node_name, e),
                             )
                         )
                     )
@@ -704,6 +706,7 @@ class ExecuteDagState(State):
                             payload=NodeErrorEvent(
                                 node_name=validation_node_name,
                                 error_message=str(exceptions),
+                                error=build_node_error_details(validation_node_name, exceptions),
                             )
                         )
                     )
@@ -830,6 +833,7 @@ class ExecuteDagState(State):
                                 payload=NodeErrorEvent(
                                     node_name=node_name,
                                     error_message=str(exc),
+                                    error=build_node_error_details(node_name, exc),
                                 )
                             )
                         )
