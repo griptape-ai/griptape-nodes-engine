@@ -16,6 +16,12 @@ from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.retained_mode.events.node_error_details import (
+    ErrorAttachments,
+    qualified_type_name,
+    sanitize_attachments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +52,20 @@ converter.register_unstructure_hook_func(
 
 # Exception -> structured dict.
 #
-# The three dict keys are the wire form of ``ForwardedException``:
+# The three required dict keys are the wire form of ``ForwardedException``:
 #   ``type``      -> ``ForwardedException.original_type``      -> ``[<type>]`` prefix
 #   ``message``   -> ``ForwardedException.args[0]``            -> message body
 #   ``traceback`` -> ``ForwardedException.original_traceback`` -> ``Worker traceback:`` block
 # ``_structure_exception`` rebuilds the placeholder on the receiving side, and
 # ``NodeExecutor._format_node_failure_message`` renders the prefix and block
 # into the user-visible ``RuntimeError`` message.
+#
+# A ``NodeError`` adds a fourth key, ``attachments``, holding its ``fields``, ``response``, and
+# ``links`` -> ``ForwardedNodeError.attachments`` -> ``NodeErrorEvent.error``. They are sanitized
+# here so the response cap holds on this hop too and nothing unserializable reaches the wire. A
+# ``ForwardedNodeError`` sent on again sends the same key, so the attachments survive another hop.
+# Its type and traceback do not: ``type`` becomes ``ForwardedNodeError`` and ``traceback`` is None,
+# because the placeholder was never raised. Plain ``ForwardedException`` has always behaved this way.
 def _unstructure_exception(obj: Exception) -> dict[str, Any]:
     if obj.__traceback__ is None:
         tb = None
@@ -62,11 +75,37 @@ def _unstructure_exception(obj: Exception) -> dict[str, Any]:
         except Exception:
             logger.debug("Failed to format traceback for %s", type(obj).__name__, exc_info=True)
             tb = None
-    return {
-        "type": f"{type(obj).__module__}.{type(obj).__qualname__}",
+    payload: dict[str, Any] = {
+        "type": qualified_type_name(obj),
         "message": str(obj),
         "traceback": tb,
     }
+    attachments = _node_error_attachments(obj)
+    if attachments is None:
+        return payload
+    payload["attachments"] = {
+        "fields": attachments.fields,
+        "response": attachments.response,
+        "links": [{"label": link.label, "url": link.url} for link in attachments.links],
+    }
+    return payload
+
+
+def _node_error_attachments(obj: Exception) -> ErrorAttachments | None:
+    """Return the attachments to send for a ``NodeError``, or None for any other exception.
+
+    A ``ForwardedNodeError`` being sent on again keeps the attachments it arrived with. Only the
+    attachments: its original type and traceback are not carried past the first hop.
+    """
+    # Lazy import to avoid a circular dependency: base_events imports from this module, so
+    # ForwardedNodeError cannot be imported at module load. Same reason as _structure_exception.
+    from griptape_nodes.retained_mode.events.base_events import ForwardedNodeError
+
+    if isinstance(obj, ForwardedNodeError):
+        return obj.attachments
+    if isinstance(obj, NodeError):
+        return sanitize_attachments(obj.fields, obj.response, obj.links)
+    return None
 
 
 converter.register_unstructure_hook_func(
@@ -136,14 +175,22 @@ def _structure_exception(obj: Any, _cls: type) -> Exception:
     # from this module (event_converter is registered at import time
     # from base_events), so ForwardedException cannot be imported at
     # module load.
-    from griptape_nodes.retained_mode.events.base_events import ForwardedException
+    from griptape_nodes.retained_mode.events.base_events import ForwardedException, ForwardedNodeError
 
     if not isinstance(obj, dict):
         return ForwardedException(str(obj))
-    return ForwardedException(
-        str(obj.get("message", "")),
+    message = str(obj.get("message", ""))
+    raw_attachments = obj.get("attachments")
+    if not isinstance(raw_attachments, dict):
+        return ForwardedException(message, original_type=obj.get("type"), original_traceback=obj.get("traceback"))
+    attachments = sanitize_attachments(
+        raw_attachments.get("fields"), raw_attachments.get("response"), raw_attachments.get("links")
+    )
+    return ForwardedNodeError(
+        message,
         original_type=obj.get("type"),
         original_traceback=obj.get("traceback"),
+        attachments=attachments,
     )
 
 

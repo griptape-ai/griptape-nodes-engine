@@ -35,6 +35,7 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 )
 from griptape_nodes.exe_types.elements.trait import Trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
+from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
 
 __all__ = [
     "VALID_BADGE_VARIANTS",
@@ -47,6 +48,8 @@ __all__ = [
     "ControlParameterOutput",
     "DeprecationMessage",
     "ElementMessageCallback",
+    "NodeError",
+    "NodeErrorLink",
     "NodeMessagePayload",
     "NodeMessageResult",
     "Parameter",

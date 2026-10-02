@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
+from griptape_nodes.common.node_errors import NodeExecutionError
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -345,7 +346,18 @@ class NodeExecutor(EngineScoped):
             if not isinstance(result, ExecuteNodeResultSuccess):
                 exc = getattr(result, "exception", None)
                 msg = self._format_node_failure_message(node.name, result, exc)
-                raise RuntimeError(msg) from exc  # noqa: TRY004
+                validation_exceptions = None
+                exception_from_node = False
+                if isinstance(result, ExecuteNodeResultFailure):
+                    validation_exceptions = result.validation_exceptions
+                    exception_from_node = result.exception_from_node
+                raise NodeExecutionError(
+                    msg,
+                    result_details=str(getattr(result, "result_details", result)),
+                    exception=exc,
+                    exception_from_node=exception_from_node,
+                    validation_exceptions=validation_exceptions,
+                ) from exc
             # Copy outputs back onto the in-memory node. Write directly into
             # parameter_output_values (not through set_parameter_value, which
             # targets parameter_values and re-fires before/after_value_set and
