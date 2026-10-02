@@ -59,10 +59,10 @@ the engine's request API from working without edits. Migration steps live in
   open.
   [#5441](https://github.com/griptape-ai/griptape-nodes-engine/issues/5441)
 - A parameter value with no plain-data form is no longer written to saved workflow files, so its
-  node runs again when the workflow reopens. It is also left out of copied nodes, and out of the
-  copy of a loop's or group's nodes that its iterations run, so those copies use the parameter's
-  default. Values flowing into the loop from outside it still arrive. A default value with no
-  plain-data form on a parameter added to a node is left out the same way. See
+  node runs again when the workflow reopens. It is also left out of copied nodes, exported images,
+  and the copy of a loop's or group's nodes that its iterations run, so those copies use the
+  parameter's default. Values flowing into the loop from outside it still arrive. A default value
+  with no plain-data form on a parameter added to a node is left out the same way. See
   [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
   that are saved, and how to make a class savable.
 - A node in a library running in its own process fails with an error naming the parameter when an
@@ -79,6 +79,10 @@ the engine's request API from working without edits. Migration steps live in
   classes by.
 - `ExecuteNodeRequest` results are no longer broadcast to clients by default. The request carries
   a node's run between its flow and the process it runs in, and no client uses the result.
+- Copied nodes, and the workflow embedded in an exported PNG, are stored as JSON instead of pickle,
+  and the embedded workflow is compressed, so exported PNG files are smaller. Nodes copied and PNG
+  files exported by earlier versions still paste and load. A PNG exported by this version doesn't
+  load its workflow in earlier ones.
 
 ### Deprecated
 
@@ -93,6 +97,8 @@ the engine's request API from working without edits. Migration steps live in
   will be removed in a later release. Use `encode_value` from `griptape_nodes.serialization.values`
   to turn a parameter value into plain data. It no longer uses a griptape object's `to_dict()`, or
   falls back to a value's text.
+- Nodes copied, and PNG files exported, by earlier versions still paste and load, with a warning,
+  but a later release will stop reading them. Export the image again to keep its workflow loadable.
 
 ### Removed
 
@@ -138,6 +144,17 @@ the engine's request API from working without edits. Migration steps live in
 - `UpdateAgentProviderRequest` sent as JSON with only some provider fields set reads back with just
   those fields, instead of failing validation on the ones left out.
   [#5439](https://github.com/griptape-ai/griptape-nodes-engine/issues/5439)
+- A workflow embedded in a PNG loads in a later session even when a node holds a value whose class
+  a node library defines, such as the library's own enum or artifact. PNG files exported by earlier
+  versions with such values load too, instead of failing.
+
+### Security
+
+- Loading a workflow from a PNG, and pasting nodes, no longer unpickle the data unrestricted, no
+  longer run a command in a place serialization never writes that type of command, and no longer
+  import a saved control's module from outside Griptape Nodes and its libraries. Each gap let a
+  crafted image or clipboard payload run any command or module when loaded. Data from earlier
+  versions is read by a reader that builds only saved value types and applies the same checks.
 
 ## [0.103.0] - 2026-09-29
 

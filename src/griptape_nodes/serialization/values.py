@@ -21,8 +21,8 @@ came from, so it passes through to a process that can build it.
 
 A value with no plain-data form is handled by where it is going:
 
-- Read back later (workflow save, copy and paste, packaged loop and group flows): leave it out and
-  log a warning. Never save its text in its place.
+- Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
+  leave it out and log a warning. Never save its text in its place.
 - Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
   the parameter.
 - Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
@@ -173,6 +173,11 @@ def is_plain_data(value: Any) -> bool:
 def value_key(encoded: JsonValue) -> str:
     """A key that is the same for every encoding of equal content, for pooling saved values."""
     return hashlib.sha256(_canonical_json(encoded).encode("utf-8")).hexdigest()[:32]
+
+
+def has_plain_data_form(cls: type) -> bool:
+    """Whether instances of ``cls`` encode to plain data that decodes back to ``cls``."""
+    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or _codec_for(cls) is not None
 
 
 class SavesState(Protocol):
@@ -532,6 +537,8 @@ class _Registration:
 
 
 _LIBRARY_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
+
+_PLAIN_TYPES: frozenset[type] = frozenset({type(None), bool, int, str, list, dict})
 
 _BUILTIN_DECODERS: dict[type, Any] = {
     tuple: tuple,
