@@ -67,8 +67,10 @@ def build_node_error_details(node_name: str, error: BaseException | list[Excepti
 
 def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDetails:
     if not exceptions:
+        # Both callers guard against an empty list. Kept so a future caller can't crash the
+        # error-reporting path, and messages=[] still tells the editor the node never ran.
         logger.debug("Node '%s' reported a validation failure with no exceptions", node_name)
-        return NodeErrorDetails(message="")
+        return NodeErrorDetails(message="The node failed validation but did not say why.", messages=[])
     details = _from_exception(node_name, exceptions[0])
     details.messages = [_message(node_name, exception) for exception in exceptions]
     return details

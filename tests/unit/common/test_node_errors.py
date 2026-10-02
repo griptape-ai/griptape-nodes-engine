@@ -155,6 +155,12 @@ class TestValidation:
 
         assert details.messages == ["Needs a GPU", "Needs torch"]
 
+    def test_empty_validation_list_still_reads_as_a_validation_failure(self) -> None:
+        details = build_node_error_details(NODE_NAME, [])
+
+        assert details.messages == []
+        assert details.message == "The node failed validation but did not say why."
+
     def test_single_validation_exception_still_sets_messages(self) -> None:
         details = build_node_error_details(NODE_NAME, [ValueError("Only one")])
 
