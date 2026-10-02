@@ -111,7 +111,9 @@ def _sanitize_response(value: Any) -> dict[str, Any] | None:
         # allow_nan=False because NaN and Infinity are not JSON: the editor's JSON.parse would
         # reject the whole event, not just the response.
         serialized = json.dumps(value, allow_nan=False)
-    except (TypeError, ValueError):
+    # RecursionError from a deeply nested response. This runs while reporting a failure, so
+    # letting it escape would replace the node's error with an engine crash.
+    except (TypeError, ValueError, RecursionError):
         logger.debug("Dropped node error response that is not JSON-serializable", exc_info=True)
         return None
     if len(serialized.encode("utf-8")) > MAX_RESPONSE_BYTES:

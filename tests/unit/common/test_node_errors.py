@@ -230,6 +230,21 @@ class TestNodeErrorAttachments:
             assert details.response is None
             assert details.fields == {RESPONSE_DROPPED_FIELD: "true"}
 
+    def test_deeply_nested_response_is_dropped_without_failing(self) -> None:
+        # Deep enough to exceed the C JSON encoder's own recursion limit, which is higher than
+        # sys.getrecursionlimit().
+        depth = 10_000
+        nested: dict[str, Any] = {}
+        innermost = nested
+        for _ in range(depth):
+            innermost["next"] = {}
+            innermost = innermost["next"]
+
+        details = build_node_error_details(NODE_NAME, self._node_error(response=nested))
+
+        assert details.response is None
+        assert details.message == "Processing failed: proxy client error"
+
     def test_https_link_survives_and_javascript_link_is_dropped(self) -> None:
         links = [
             NodeErrorLink(label="Supported image formats", url="https://docs.griptapenodes.com/formats"),
