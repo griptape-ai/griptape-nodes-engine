@@ -64,8 +64,6 @@ OK_PATH = "/api/ok"
 
 OK_BODY = {"ok": True}
 
-_RUN_TIMEOUT_MS = 30_000
-
 requires_fixture_library = pytest.mark.skipif(
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"Budget Halt Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
@@ -236,9 +234,7 @@ def _record_published(
 
 async def _run(engine: Engine, flow_name: str) -> Any:
     """Run the flow to completion and hand back whatever the engine concluded."""
-    return await engine.ahandle_request(
-        StartFlowRequest(flow_name=flow_name, wait_for_completion=True, completion_timeout_ms=_RUN_TIMEOUT_MS)
-    )
+    return await engine.ahandle_request(StartFlowRequest(flow_name=flow_name))
 
 
 @requires_fixture_library

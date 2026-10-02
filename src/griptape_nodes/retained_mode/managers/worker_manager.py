@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -186,16 +187,7 @@ class WorkerManager(EngineScoped):
             cast_type=float,
         )
 
-        event_manager.assign_manager_to_request_type(
-            worker_events.RegisterWorkerRequest, self.handle_register_worker_request
-        )
-        event_manager.assign_manager_to_request_type(
-            worker_events.WorkerHeartbeatRequest, self.handle_worker_heartbeat_request
-        )
-        event_manager.assign_manager_to_request_type(
-            worker_events.UnregisterWorkerRequest, self.handle_unregister_worker_request
-        )
-        event_manager.assign_manager_to_request_type(worker_events.StartWorkerRequest, self.handle_start_worker_request)
+        event_manager.register_request_handlers(self)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -265,6 +257,7 @@ class WorkerManager(EngineScoped):
             request_client=request_client,
         )
 
+    @handles(worker_events.RegisterWorkerRequest)
     async def handle_register_worker_request(
         self,
         request: worker_events.RegisterWorkerRequest,
@@ -324,6 +317,7 @@ class WorkerManager(EngineScoped):
             worker_request_topic=worker_request_topic,
         )
 
+    @handles(worker_events.WorkerHeartbeatRequest)
     def handle_worker_heartbeat_request(
         self,
         request: worker_events.WorkerHeartbeatRequest,
@@ -335,6 +329,7 @@ class WorkerManager(EngineScoped):
             result_details="Worker alive.",
         )
 
+    @handles(worker_events.UnregisterWorkerRequest)
     async def handle_unregister_worker_request(
         self,
         request: worker_events.UnregisterWorkerRequest,
@@ -838,6 +833,7 @@ class WorkerManager(EngineScoped):
         """Clear the session-ready gate so future worker spawns wait for a new session."""
         self._session_ready_event.clear()
 
+    @handles(worker_events.StartWorkerRequest)
     async def handle_start_worker_request(
         self, request: worker_events.StartWorkerRequest
     ) -> worker_events.StartWorkerResultSuccess | worker_events.StartWorkerResultFailure:

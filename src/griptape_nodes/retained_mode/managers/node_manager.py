@@ -245,6 +245,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefusal, refusal_from_exception
@@ -361,88 +362,7 @@ class NodeManager(EngineScoped):
         # task to cancel.
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
-        event_manager.assign_manager_to_request_type(CreateNodeRequest, self.on_create_node_request)
-        event_manager.assign_manager_to_request_type(
-            AddNodesToNodeGroupRequest, self.on_add_nodes_to_node_group_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RemoveNodeFromNodeGroupRequest, self.on_remove_node_from_node_group_request
-        )
-        event_manager.assign_manager_to_request_type(DeleteNodeRequest, self.on_delete_node_request)
-        event_manager.assign_manager_to_request_type(MoveNodeToNewFlowRequest, self.on_move_node_to_new_flow_request)
-        event_manager.assign_manager_to_request_type(
-            GetNodeResolutionStateRequest, self.on_get_node_resolution_state_request
-        )
-        event_manager.assign_manager_to_request_type(GetNodeMetadataRequest, self.on_get_node_metadata_request)
-        event_manager.assign_manager_to_request_type(SetNodeMetadataRequest, self.on_set_node_metadata_request)
-        event_manager.assign_manager_to_request_type(
-            BatchSetNodeMetadataRequest, self.on_batch_set_node_metadata_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListConnectionsForNodeRequest, self.on_list_connections_for_node_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetConnectionsForParameterRequest, self.on_get_connections_for_parameter_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListParametersOnNodeRequest, self.on_list_parameters_on_node_request
-        )
-        event_manager.assign_manager_to_request_type(AddParameterToNodeRequest, self.on_add_parameter_to_node_request)
-        event_manager.assign_manager_to_request_type(
-            AddParameterGroupToNodeRequest, self.on_add_parameter_group_to_node_request
-        )
-        event_manager.assign_manager_to_request_type(
-            AlterParameterGroupDetailsRequest, self.on_alter_parameter_group_details_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RemoveParameterFromNodeRequest, self.on_remove_parameter_from_node_request
-        )
-        event_manager.assign_manager_to_request_type(GetParameterDetailsRequest, self.on_get_parameter_details_request)
-        event_manager.assign_manager_to_request_type(
-            AlterParameterDetailsRequest, self.on_alter_parameter_details_request
-        )
-        event_manager.assign_manager_to_request_type(GetParameterValueRequest, self.on_get_parameter_value_request)
-        event_manager.assign_manager_to_request_type(SetParameterValueRequest, self.on_set_parameter_value_request)
-        event_manager.assign_manager_to_request_type(RenameParameterRequest, self.on_rename_parameter_request)
-        event_manager.assign_manager_to_request_type(
-            ReorderParameterListItemRequest, self.on_reorder_parameter_list_item_request
-        )
-        event_manager.assign_manager_to_request_type(MigrateParameterRequest, self.on_migrate_parameter_request)
-        event_manager.assign_manager_to_request_type(ResolveNodeRequest, self.on_resolve_from_node_request)
-        event_manager.assign_manager_to_request_type(GetAllNodeInfoRequest, self.on_get_all_node_info_request)
-        event_manager.assign_manager_to_request_type(
-            GetCompatibleParametersRequest, self.on_get_compatible_parameters_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ValidateNodeDependenciesRequest, self.on_validate_node_dependencies_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetNodeElementDetailsRequest, self.on_get_node_element_details_request
-        )
-        event_manager.assign_manager_to_request_type(SerializeNodeToCommandsRequest, self.on_serialize_node_to_commands)
-        event_manager.assign_manager_to_request_type(
-            DeserializeNodeFromCommandsRequest, self.on_deserialize_node_from_commands
-        )
-        event_manager.assign_manager_to_request_type(
-            SerializeSelectedNodesToCommandsRequest, self.on_serialize_selected_nodes_to_commands
-        )
-        event_manager.assign_manager_to_request_type(
-            DeserializeSelectedNodesFromCommandsRequest, self.on_deserialize_selected_nodes_from_commands
-        )
-        event_manager.assign_manager_to_request_type(DuplicateSelectedNodesRequest, self.on_duplicate_selected_nodes)
-        event_manager.assign_manager_to_request_type(SetLockNodeStateRequest, self.on_toggle_lock_node_request)
-        event_manager.assign_manager_to_request_type(GetFlowForNodeRequest, self.on_get_flow_for_node_request)
-        event_manager.assign_manager_to_request_type(SendNodeMessageRequest, self.on_send_node_message_request)
-        event_manager.assign_manager_to_request_type(
-            CanResetNodeToDefaultsRequest, self.on_can_reset_node_to_defaults_request
-        )
-        event_manager.assign_manager_to_request_type(ResetNodeToDefaultsRequest, self.on_reset_node_to_defaults_request)
-        event_manager.assign_manager_to_request_type(UnresolveNodeRequest, self.on_unresolve_node_request)
-        event_manager.assign_manager_to_request_type(
-            BatchSetNodeLockStateRequest, self.on_batch_set_lock_node_state_request
-        )
-        event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
-        event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
+        event_manager.register_request_handlers(self)
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
@@ -749,6 +669,7 @@ class NodeManager(EngineScoped):
 
         return "\n\n".join(parts)
 
+    @handles(CreateNodeRequest)
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
@@ -1114,6 +1035,7 @@ class NodeManager(EngineScoped):
 
         return node_group
 
+    @handles(AddNodesToNodeGroupRequest)
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
         """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
 
@@ -1212,6 +1134,7 @@ class NodeManager(EngineScoped):
 
         return node_group
 
+    @handles(RemoveNodeFromNodeGroupRequest)
     def on_remove_node_from_node_group_request(self, request: RemoveNodeFromNodeGroupRequest) -> ResultPayload:
         """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup.
 
@@ -1407,6 +1330,7 @@ class NodeManager(EngineScoped):
 
         return False
 
+    @handles(DeleteNodeRequest)
     async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name
         node = None
@@ -1530,6 +1454,7 @@ class NodeManager(EngineScoped):
             )
         return DeleteNodeResultSuccess(result_details=details)
 
+    @handles(MoveNodeToNewFlowRequest)
     def on_move_node_to_new_flow_request(self, request: MoveNodeToNewFlowRequest) -> ResultPayload:  # noqa: PLR0911
         """Move a node from one flow to another flow.
 
@@ -1598,6 +1523,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(GetNodeResolutionStateRequest)
     def on_get_node_resolution_state_request(self, request: GetNodeResolutionStateRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -1625,6 +1551,7 @@ class NodeManager(EngineScoped):
         result = GetNodeResolutionStateResultSuccess(state=node_state.name, result_details=details)
         return result
 
+    @handles(GetNodeMetadataRequest)
     def on_get_node_metadata_request(self, request: GetNodeMetadataRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -1653,6 +1580,7 @@ class NodeManager(EngineScoped):
         result = GetNodeMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
+    @handles(SetNodeMetadataRequest)
     def on_set_node_metadata_request(self, request: SetNodeMetadataRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -1683,6 +1611,7 @@ class NodeManager(EngineScoped):
         result = SetNodeMetadataResultSuccess(result_details=details)
         return result
 
+    @handles(BatchSetNodeMetadataRequest)
     def on_batch_set_node_metadata_request(self, request: BatchSetNodeMetadataRequest) -> ResultPayload:
         updated_nodes = []
         failed_nodes = {}
@@ -1727,6 +1656,7 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully updated metadata for {len(updated_nodes)} nodes.",
         )
 
+    @handles(ListConnectionsForNodeRequest)
     def on_list_connections_for_node_request(self, request: ListConnectionsForNodeRequest) -> ResultPayload:  # noqa: C901, PLR0912 Removed list comprehension
         node_name = request.node_name
         node = None
@@ -1799,6 +1729,7 @@ class NodeManager(EngineScoped):
         )
         return result
 
+    @handles(GetConnectionsForParameterRequest)
     def on_get_connections_for_parameter_request(
         self, request: GetConnectionsForParameterRequest
     ) -> GetConnectionsForParameterResultFailure | GetConnectionsForParameterResultSuccess:
@@ -1877,6 +1808,7 @@ class NodeManager(EngineScoped):
         )
         return result
 
+    @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(self, request: ListParametersOnNodeRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -1924,6 +1856,7 @@ class NodeManager(EngineScoped):
             counter += 1
         return f"{base_name}_{counter}"
 
+    @handles(AddParameterToNodeRequest)
     def on_add_parameter_to_node_request(self, request: AddParameterToNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -2086,6 +2019,7 @@ class NodeManager(EngineScoped):
         )
         return result
 
+    @handles(AddParameterGroupToNodeRequest)
     def on_add_parameter_group_to_node_request(  # noqa: C901, PLR0911
         self, request: AddParameterGroupToNodeRequest
     ) -> ResultPayload:
@@ -2152,6 +2086,7 @@ class NodeManager(EngineScoped):
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
+    @handles(RemoveParameterFromNodeRequest)
     def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -2270,6 +2205,7 @@ class NodeManager(EngineScoped):
         result = RemoveParameterFromNodeResultSuccess(result_details=details)
         return result
 
+    @handles(GetParameterDetailsRequest)
     def on_get_parameter_details_request(self, request: GetParameterDetailsRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -2334,6 +2270,7 @@ class NodeManager(EngineScoped):
         )
         return result
 
+    @handles(GetNodeElementDetailsRequest)
     def on_get_node_element_details_request(self, request: GetNodeElementDetailsRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -2531,6 +2468,7 @@ class NodeManager(EngineScoped):
 
         return None
 
+    @handles(AlterParameterDetailsRequest)
     def on_alter_parameter_details_request(self, request: AlterParameterDetailsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         node_name = request.node_name
         node = None
@@ -2612,6 +2550,7 @@ class NodeManager(EngineScoped):
         result = AlterParameterDetailsResultSuccess(result_details=details)
         return result
 
+    @handles(AlterParameterGroupDetailsRequest)
     def on_alter_parameter_group_details_request(  # noqa: PLR0911
         self, request: AlterParameterGroupDetailsRequest
     ) -> ResultPayload:
@@ -2662,6 +2601,7 @@ class NodeManager(EngineScoped):
         return AlterParameterGroupDetailsResultSuccess(result_details=details)
 
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
+    @handles(GetParameterValueRequest)
     def on_get_parameter_value_request(self, request: GetParameterValueRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
@@ -2717,6 +2657,7 @@ class NodeManager(EngineScoped):
         modified: bool
 
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
+    @handles(SetParameterValueRequest)
     def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -3003,6 +2944,7 @@ class NodeManager(EngineScoped):
     # want to give clear reasoning for each failure.
     # For PLR0915 (too many statements): very little reusable code here, want to be explicit and
     # make debugger use friendly.
+    @handles(GetAllNodeInfoRequest)
     def on_get_all_node_info_request(self, request: GetAllNodeInfoRequest) -> ResultPayload:  # noqa: C901, PLR0911
         node_name = request.node_name
         node = None
@@ -3090,6 +3032,7 @@ class NodeManager(EngineScoped):
         )
         return result
 
+    @handles(GetCompatibleParametersRequest)
     def on_get_compatible_parameters_request(self, request: GetCompatibleParametersRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -3238,6 +3181,7 @@ class NodeManager(EngineScoped):
             raise KeyError(msg)
         return self._name_to_parent_flow_name[node_name]
 
+    @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         node_name = request.node_name
         debug_mode = request.debug_mode
@@ -3312,12 +3256,10 @@ class NodeManager(EngineScoped):
         except Exception as e:
             details = f'Failed to resolve "{node_name}".  Error: {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4532 - support
-        # wait_for_completion / completion_timeout_ms here, mirroring StartFlowRequest so
-        # callers do not have to poll check_for_existing_running_flow() themselves.
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
 
+    @handles(ExecuteNodeRequest)
     async def on_execute_node_request(self, request: ExecuteNodeRequest) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
 
@@ -3597,6 +3539,7 @@ class NodeManager(EngineScoped):
             worker_request_topic=worker_request_topic,
         )
 
+    @handles(CancelExecuteNodeRequest)
     async def on_cancel_execute_node_request(self, request: CancelExecuteNodeRequest) -> ResultPayload:
         """Worker-side handler: cancel an in-flight aprocess task by request_id.
 
@@ -3883,6 +3826,7 @@ class NodeManager(EngineScoped):
             )
         return None
 
+    @handles(ValidateNodeDependenciesRequest)
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
         obj_manager = self.engine.object_manager
@@ -4004,6 +3948,7 @@ class NodeManager(EngineScoped):
             child_uuids=child_uuids,
         )
 
+    @handles(SerializeNodeToCommandsRequest)
     def on_serialize_node_to_commands(self, request: SerializeNodeToCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -4433,6 +4378,7 @@ class NodeManager(EngineScoped):
                     )
                     self.engine.handle_request(create_old_outgoing_connections_request)
 
+    @handles(DeserializeNodeFromCommandsRequest)
     def on_deserialize_node_from_commands(self, request: DeserializeNodeFromCommandsRequest) -> ResultPayload:
         # Issue the creation command first.
         create_node_request = request.serialized_node_commands.create_node_command
@@ -4473,6 +4419,7 @@ class NodeManager(EngineScoped):
         details = f"Successfully deserialized a serialized set of Node Creation commands for node '{node_name}'."
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
 
+    @handles(SerializeSelectedNodesToCommandsRequest)
     def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
         self, request: SerializeSelectedNodesToCommandsRequest
     ) -> ResultPayload:
@@ -4647,6 +4594,7 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully serialized {len(request.nodes_to_serialize)} selected nodes to commands.",
         )
 
+    @handles(DeserializeSelectedNodesFromCommandsRequest)
     def on_deserialize_selected_nodes_from_commands(  # noqa: C901, PLR0912, PLR0915
         self,
         request: DeserializeSelectedNodesFromCommandsRequest,
@@ -4789,6 +4737,7 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully deserialized {len(node_uuid_to_name)} nodes from commands.",
         )
 
+    @handles(DuplicateSelectedNodesRequest)
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
         serialize_result = self.engine.handle_request(
             SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=request.nodes_to_duplicate)
@@ -5358,6 +5307,7 @@ class NodeManager(EngineScoped):
         tracker.add_as_serializable(value_id, unique_uuid)
         return unique_uuid
 
+    @handles(RenameParameterRequest)
     def on_rename_parameter_request(self, request: RenameParameterRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         """Handle renaming a parameter on a node.
 
@@ -5473,6 +5423,7 @@ class NodeManager(EngineScoped):
         if had_output_value:
             node.parameter_output_values[new_name] = output_value
 
+    @handles(SetLockNodeStateRequest)
     def on_toggle_lock_node_request(self, request: SetLockNodeStateRequest) -> ResultPayload:
         node_name = request.node_name
         if node_name is None:
@@ -5494,6 +5445,7 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully set lock state to {node.lock} for node '{node_name}'.",
         )
 
+    @handles(BatchSetNodeLockStateRequest)
     def on_batch_set_lock_node_state_request(self, request: BatchSetNodeLockStateRequest) -> ResultPayload:
         updated: list[str] = []
         failed: dict[str, str] = {}
@@ -5518,6 +5470,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(SendNodeMessageRequest)
     def on_send_node_message_request(self, request: SendNodeMessageRequest) -> ResultPayload:
         """Handle a SendNodeMessageRequest by calling the node's message callback.
 
@@ -5576,6 +5529,7 @@ class NodeManager(EngineScoped):
             altered_workflow_state=callback_result.altered_workflow_state,
         )
 
+    @handles(GetFlowForNodeRequest)
     def on_get_flow_for_node_request(self, request: GetFlowForNodeRequest) -> ResultPayload:
         """Get the flow name that contains a specific node."""
         try:
@@ -5589,6 +5543,7 @@ class NodeManager(EngineScoped):
                 result_details=f"Node '{request.node_name}' not found or not assigned to any flow.",
             )
 
+    @handles(MigrateParameterRequest)
     def on_migrate_parameter_request(
         self, request: MigrateParameterRequest
     ) -> MigrateParameterResultFailure | MigrateParameterResultSuccess:
@@ -5941,6 +5896,7 @@ class NodeManager(EngineScoped):
 
         return CanResetResult(can_reset=True, editor_tooltip_reason=None)
 
+    @handles(CanResetNodeToDefaultsRequest)
     def on_can_reset_node_to_defaults_request(self, request: CanResetNodeToDefaultsRequest) -> ResultPayload:
         """Check if a node can be reset to its default state."""
         node_name = request.node_name
@@ -5990,6 +5946,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(ResetNodeToDefaultsRequest)
     async def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Reset a node to its default state while preserving connections where possible."""
         node_name = request.node_name
@@ -6134,6 +6091,7 @@ class NodeManager(EngineScoped):
             result_details=ResultDetails(message=details, level=log_level),
         )
 
+    @handles(ReorderParameterListItemRequest)
     def on_reorder_parameter_list_item_request(self, request: ReorderParameterListItemRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle reordering an item within a ParameterList.
 
@@ -6212,6 +6170,7 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."
         )
 
+    @handles(UnresolveNodeRequest)
     def on_unresolve_node_request(self, request: UnresolveNodeRequest) -> ResultPayload:
         """Mark a single node UNRESOLVED and propagate to downstream nodes."""
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)

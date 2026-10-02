@@ -264,6 +264,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
@@ -694,77 +695,7 @@ class LibraryManager(EngineScoped):
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
-        event_manager.assign_manager_to_request_type(
-            ListRegisteredLibrariesRequest, self.on_list_registered_libraries_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListCapableLibraryEventHandlersRequest, self.on_list_capable_event_handlers
-        )
-        event_manager.assign_manager_to_request_type(
-            ListNodeTypesInLibraryRequest, self.on_list_node_types_in_library_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetNodeMetadataFromLibraryRequest,
-            self.get_node_metadata_from_library_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            DescribeNodeTypeRequest,
-            self.describe_node_type_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            LoadLibraryMetadataFromFileRequest,
-            self.load_library_metadata_from_file_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterLibraryFromFileRequest,
-            self.register_library_from_file_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterLibraryFromRequirementSpecifierRequest, self.register_library_from_requirement_specifier_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListCategoriesInLibraryRequest,
-            self.list_categories_in_library_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetLibraryMetadataRequest,
-            self.get_library_metadata_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetAllInfoForLibraryRequest, self.on_get_all_info_for_library_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetAllInfoForAllLibrariesRequest, self.on_get_all_info_for_all_libraries_request
-        )
-        event_manager.assign_manager_to_request_type(
-            LoadMetadataForAllLibrariesRequest, self.load_metadata_for_all_libraries_request
-        )
-        event_manager.assign_manager_to_request_type(ScanSandboxDirectoryRequest, self.scan_sandbox_directory_request)
-        event_manager.assign_manager_to_request_type(
-            RegisterSandboxNodeFromSourceRequest, self.register_sandbox_node_from_source_request
-        )
-        event_manager.assign_manager_to_request_type(
-            UnloadLibraryFromRegistryRequest, self.unload_library_from_registry_request
-        )
-        event_manager.assign_manager_to_request_type(ReloadAllLibrariesRequest, self.reload_libraries_request)
-        event_manager.assign_manager_to_request_type(LoadLibrariesRequest, self.load_libraries_request)
-        event_manager.assign_manager_to_request_type(CheckLibraryUpdateRequest, self.check_library_update_request)
-        event_manager.assign_manager_to_request_type(UpdateLibraryRequest, self.update_library_request)
-        event_manager.assign_manager_to_request_type(SwitchLibraryRefRequest, self.switch_library_ref_request)
-        event_manager.assign_manager_to_request_type(DownloadLibraryRequest, self.download_library_request)
-        event_manager.assign_manager_to_request_type(
-            InstallLibraryDependenciesRequest, self.install_library_dependencies_request
-        )
-        event_manager.assign_manager_to_request_type(SyncLibrariesRequest, self.sync_libraries_request)
-        event_manager.assign_manager_to_request_type(InspectLibraryRepoRequest, self.inspect_library_repo_request)
-        event_manager.assign_manager_to_request_type(
-            GetLibrarySourceInfoRequest, self.on_get_library_source_info_request
-        )
-        event_manager.assign_manager_to_request_type(GetEngineSourceInfoRequest, self.on_get_engine_source_info_request)
-        event_manager.assign_manager_to_request_type(
-            PreviewProjectProvisioningRequest, self.on_preview_project_provisioning_request
-        )
-        event_manager.assign_manager_to_request_type(ReportLibraryLoadedRequest, self.on_report_library_loaded_request)
+        event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
             AppInitializationComplete,
@@ -816,6 +747,7 @@ class LibraryManager(EngineScoped):
             return
         await self._library_load_reporter(request)
 
+    @handles(ReportLibraryLoadedRequest)
     async def on_report_library_loaded_request(self, request: ReportLibraryLoadedRequest) -> ResultPayload:
         """Record how a library loaded in the worker that hosts it.
 
@@ -1446,6 +1378,7 @@ class LibraryManager(EngineScoped):
         """Get all registered event handlers for a specific request type."""
         return self._library_event_handler_mappings.get(request_type, {})
 
+    @handles(ListCapableLibraryEventHandlersRequest)
     def on_list_capable_event_handlers(self, request: ListCapableLibraryEventHandlersRequest) -> ResultPayload:
         """Get all registered event handlers for a specific request type."""
         request_type = PayloadRegistry.get_type(request.request_type)
@@ -1473,6 +1406,7 @@ class LibraryManager(EngineScoped):
             result_details=f"Successfully listed {len(handler_mappings)} capable library event handlers",
         )
 
+    @handles(ListRegisteredLibrariesRequest)
     async def on_list_registered_libraries_request(self, _request: ListRegisteredLibrariesRequest) -> ResultPayload:
         await self._libraries_loading_complete.wait()
         # Make a COPY of the list
@@ -1487,6 +1421,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
+    @handles(GetLibrarySourceInfoRequest)
     async def on_get_library_source_info_request(self, request: GetLibrarySourceInfoRequest) -> ResultPayload:
         """Return the filesystem paths for a registered library's source files.
 
@@ -1526,6 +1461,7 @@ class LibraryManager(EngineScoped):
             result_details=f"Source info for library '{request.library}'.",
         )
 
+    @handles(GetEngineSourceInfoRequest)
     def on_get_engine_source_info_request(self, _request: GetEngineSourceInfoRequest) -> ResultPayload:
         """Return the filesystem path of the installed ``griptape_nodes`` package.
 
@@ -1555,6 +1491,7 @@ class LibraryManager(EngineScoped):
             result_details="Engine source info.",
         )
 
+    @handles(ListNodeTypesInLibraryRequest)
     def on_list_node_types_in_library_request(self, request: ListNodeTypesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -1577,6 +1514,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
+    @handles(GetLibraryMetadataRequest)
     def get_library_metadata_request(self, request: GetLibraryMetadataRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -1594,6 +1532,7 @@ class LibraryManager(EngineScoped):
         result = GetLibraryMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
+    @handles(LoadLibraryMetadataFromFileRequest)
     def load_library_metadata_from_file_request(  # noqa: PLR0911, C901
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
@@ -1762,6 +1701,7 @@ class LibraryManager(EngineScoped):
         """
         return library_name in LibraryRegistry.list_libraries()
 
+    @handles(LoadMetadataForAllLibrariesRequest)
     async def load_metadata_for_all_libraries_request(
         self,
         request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
@@ -2113,6 +2053,7 @@ class LibraryManager(EngineScoped):
 
         return sandbox_library_dir
 
+    @handles(ScanSandboxDirectoryRequest)
     def scan_sandbox_directory_request(
         self,
         request: ScanSandboxDirectoryRequest,
@@ -2144,6 +2085,7 @@ class LibraryManager(EngineScoped):
             ),
         )
 
+    @handles(GetNodeMetadataFromLibraryRequest)
     def get_node_metadata_from_library_request(self, request: GetNodeMetadataFromLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -2169,6 +2111,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
+    @handles(RegisterSandboxNodeFromSourceRequest)
     def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911
         self, request: RegisterSandboxNodeFromSourceRequest
     ) -> ResultPayload:
@@ -2310,6 +2253,7 @@ class LibraryManager(EngineScoped):
             result_details=summary,
         )
 
+    @handles(DescribeNodeTypeRequest)
     def describe_node_type_request(self, request: DescribeNodeTypeRequest) -> ResultPayload:
         # Resolve the library for this node type. When no library is supplied, we rely on
         # LibraryRegistry to pick the unique library that provides it.
@@ -2412,6 +2356,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(ListCategoriesInLibraryRequest)
     def list_categories_in_library_request(self, request: ListCategoriesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -2427,6 +2372,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
+    @handles(RegisterLibraryFromFileRequest)
     async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
         """Register a library by name or path, progressing through all lifecycle phases.
 
@@ -3183,6 +3129,7 @@ class LibraryManager(EngineScoped):
 
         return problems
 
+    @handles(RegisterLibraryFromRequirementSpecifierRequest)
     async def register_library_from_requirement_specifier_request(
         self, request: RegisterLibraryFromRequirementSpecifierRequest
     ) -> ResultPayload:
@@ -3575,6 +3522,7 @@ class LibraryManager(EngineScoped):
             logger.debug("Could not check venv write permissions for %s: %s", venv_path, e)
             return False
 
+    @handles(UnloadLibraryFromRegistryRequest)
     def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
         try:
             LibraryRegistry.unregister_library(
@@ -3654,6 +3602,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
+    @handles(GetAllInfoForAllLibrariesRequest)
     async def on_get_all_info_for_all_libraries_request(
         self, request: GetAllInfoForAllLibrariesRequest
     ) -> ResultPayload:
@@ -3661,6 +3610,7 @@ class LibraryManager(EngineScoped):
         await self._libraries_loading_complete.wait()
         return await self.get_all_info_for_all_libraries_request(request)
 
+    @handles(GetAllInfoForLibraryRequest)
     async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
         """Registered entry point: hold the caller until any in-flight reload finishes.
 
@@ -4331,6 +4281,7 @@ class LibraryManager(EngineScoped):
         finally:
             self._libraries_loading_complete.set()
 
+    @handles(PreviewProjectProvisioningRequest)
     async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
     ) -> PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure:
@@ -6107,6 +6058,7 @@ class LibraryManager(EngineScoped):
 
         return new_downloads
 
+    @handles(ReloadAllLibrariesRequest)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # Bracket the reload like on_app_initialization_complete so the heartbeat reports
         # is_initializing during a mid-session reload too. finally clears it even on failure.
@@ -6449,6 +6401,7 @@ class LibraryManager(EngineScoped):
             attributes[CheckpointAttribute.LIFECYCLE_STAGE] = stage.value
         return attributes
 
+    @handles(LoadLibrariesRequest)
     async def load_libraries_request(self, request: LoadLibrariesRequest) -> ResultPayload:  # noqa: ARG002, C901, PLR0912
         """Load all libraries from configuration (backward compatibility wrapper).
 
@@ -6737,6 +6690,7 @@ class LibraryManager(EngineScoped):
             return None
         return version_info.commit_datetime
 
+    @handles(CheckLibraryUpdateRequest)
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
         library_name = request.library_name
@@ -7070,6 +7024,7 @@ class LibraryManager(EngineScoped):
 
         return new_version
 
+    @handles(UpdateLibraryRequest)
     async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911
         """Update a library to the latest version using the appropriate git strategy.
 
@@ -7205,6 +7160,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(SwitchLibraryRefRequest)
     async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:
         """Switch a library to a different git branch or tag."""
         library_name = request.library_name
@@ -7304,6 +7260,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(DownloadLibraryRequest)
     async def download_library_request(self, request: DownloadLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Download a library from a git repository."""
         parsed_url = parse_git_url_with_ref(normalize_github_url(request.git_url))
@@ -7446,6 +7403,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(InstallLibraryDependenciesRequest)
     async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
         """Install a library's dependencies into its edit-time and execution environments.
 
@@ -7935,6 +7893,7 @@ class LibraryManager(EngineScoped):
 
         await self._install_under_engine_floors(argv, library_venv_python_path, capture_output=capture_output)
 
+    @handles(SyncLibrariesRequest)
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
         # Phase 1: Download missing libraries from both config keys
@@ -8146,6 +8105,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    @handles(InspectLibraryRepoRequest)
     async def inspect_library_repo_request(self, request: InspectLibraryRepoRequest) -> ResultPayload:
         """Inspect a library's metadata from a git repository without downloading the full repository."""
         git_url = request.git_url
