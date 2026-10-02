@@ -269,6 +269,17 @@ class TestNodeErrorAttachments:
         assert len(details.links) == expected_link_count
         assert all(len(link.label) == expected_label_length for link in details.links)
 
+    def test_attachments_survive_being_forwarded_twice(self) -> None:
+        exc = self._node_error(fields={"generation_id": "90db"}, response={"status": "ERRORED"})
+        first_hop = _across_worker(exc)
+
+        second_hop = converter.structure(json.loads(json.dumps(converter.unstructure(first_hop, Exception))), Exception)
+        details = build_node_error_details(NODE_NAME, second_hop)
+
+        assert isinstance(second_hop, ForwardedNodeError)
+        assert details.fields == {"generation_id": "90db"}
+        assert details.response == {"status": "ERRORED"}
+
     def test_only_a_node_error_crosses_as_a_forwarded_node_error(self) -> None:
         plain = _across_worker(ValueError("boom"))
         node_error = _across_worker(self._node_error())

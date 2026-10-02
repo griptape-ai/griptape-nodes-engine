@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.retained_mode.events.node_error_details import (
+    ErrorAttachments,
     qualified_type_name,
     sanitize_attachments,
 )
@@ -61,7 +62,8 @@ converter.register_unstructure_hook_func(
 #
 # A ``NodeError`` adds a fourth key, ``attachments``, holding its ``fields``, ``response``, and
 # ``links`` -> ``ForwardedNodeError.attachments`` -> ``NodeErrorEvent.error``. They are sanitized
-# here so the response cap holds on this hop too and nothing unserializable reaches the wire.
+# here so the response cap holds on this hop too and nothing unserializable reaches the wire. A
+# ``ForwardedNodeError`` sent on again sends the same key, so the attachments survive every hop.
 def _unstructure_exception(obj: Exception) -> dict[str, Any]:
     if obj.__traceback__ is None:
         tb = None
@@ -76,15 +78,32 @@ def _unstructure_exception(obj: Exception) -> dict[str, Any]:
         "message": str(obj),
         "traceback": tb,
     }
-    if not isinstance(obj, NodeError):
+    attachments = _node_error_attachments(obj)
+    if attachments is None:
         return payload
-    attachments = sanitize_attachments(obj.fields, obj.response, obj.links)
     payload["attachments"] = {
         "fields": attachments.fields,
         "response": attachments.response,
         "links": [{"label": link.label, "url": link.url} for link in attachments.links],
     }
     return payload
+
+
+def _node_error_attachments(obj: Exception) -> ErrorAttachments | None:
+    """Return the attachments to send for a ``NodeError``, or None for any other exception.
+
+    A ``ForwardedNodeError`` being sent on again keeps the attachments it arrived with, so the
+    round trip holds across more than one hop.
+    """
+    # Lazy import to avoid a circular dependency: base_events imports from this module, so
+    # ForwardedNodeError cannot be imported at module load. Same reason as _structure_exception.
+    from griptape_nodes.retained_mode.events.base_events import ForwardedNodeError
+
+    if isinstance(obj, ForwardedNodeError):
+        return obj.attachments
+    if isinstance(obj, NodeError):
+        return sanitize_attachments(obj.fields, obj.response, obj.links)
+    return None
 
 
 converter.register_unstructure_hook_func(
