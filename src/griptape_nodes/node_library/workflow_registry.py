@@ -325,9 +325,8 @@ class _WorkflowRegistry:
         disk; existence is verified at construction time); omit it for unsaved in-memory
         entries. Unsaved keys must start with `UNSAVED_KEY_PREFIX`.
 
-        `library_name` names the library contributing the entry, and is what takes it out again
-        when that library unloads. Leave it None for the workspace scan and for anything the user
-        creates.
+        `library_name` names the library contributing the entry; it is removed when that library
+        unloads. Leave it None for the workspace scan and for anything the user creates.
         """
         if registry_key in self._workflows:
             msg = f"Workflow with registry key '{registry_key}' already registered."
@@ -415,11 +414,7 @@ class _WorkflowRegistry:
         self._remove_workflows_where(lambda workflow: workflow.library_name is None)
 
     def remove_workflows_from_library(self, library_name: str) -> RemovedWorkflows:
-        """Remove every workflow `library_name` contributed and report what went.
-
-        The files come back alongside the keys because a caller holding per-file state, such as
-        `WorkflowManager`'s dependency verdicts, cannot find it once the entries are gone.
-        """
+        """Remove every workflow `library_name` contributed and report what went."""
         removed_keys = [key for key, workflow in self._workflows.items() if workflow.library_name == library_name]
         removed_file_paths = []
         for key in removed_keys:
@@ -539,9 +534,8 @@ class Workflow:
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
 
     `library_name` is the library that contributed the entry, or None for the workspace scan and
-    anything the user creates. Recorded on write because the header cannot answer it: its flags
-    survive the file being copied out of the library, so a copy sitting in the workspace would
-    still claim to be the library's.
+    anything the user creates. It is recorded at registration rather than read from the header,
+    because a copy of the file in the workspace carries the same header.
     """
 
     metadata: WorkflowMetadata
@@ -610,8 +604,7 @@ class Workflow:
         # Customers of this function need that, so let's stuff it in.
         ret_val["file_path"] = self.file_path
         ret_val["is_saved"] = self.is_saved
-        # Not in the schema either: which library contributed the entry is a property of the
-        # registration, not of the file. Clients group templates by it.
+        # Not in the schema either: it comes from the registration, not the file.
         ret_val["library_name"] = self.library_name
 
         if synced_path is not None and workspace_path is not None and self.file_path is not None:

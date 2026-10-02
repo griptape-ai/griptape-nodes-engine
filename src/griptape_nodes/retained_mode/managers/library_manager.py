@@ -2451,9 +2451,7 @@ class LibraryManager(EngineScoped):
         if isinstance(prereq_result, RegisterLibraryFromFileResultFailure):
             return prereq_result
 
-        # SUCCESS CHECK (library already loaded). Returning here rather than leaning on
-        # registration being idempotent: opening a workflow re-requests every library it
-        # references, and each pass would re-read the header of every template on disk.
+        # SUCCESS CHECK (library already loaded)
         if isinstance(prereq_result, RegisterLibraryFromFileResultSuccess):
             return prereq_result
 
@@ -4904,9 +4902,8 @@ class LibraryManager(EngineScoped):
         # Register all secrets now that libraries are loaded and settings are merged
         self.engine.secrets_manager.register_all_secrets()
 
-        # We have to load all libraries before we attempt to load workflows. This scan covers the
-        # user's workspace only; library-contributed entries are registered by the library load
-        # and left alone here.
+        # We have to load all libraries before we attempt to load workflows. Each library has
+        # already registered its own; this scans the workspace.
         await self.engine.workflow_manager.refresh_workflow_registry()
 
         # Signal readiness so the application layer can render its library status
@@ -4928,12 +4925,7 @@ class LibraryManager(EngineScoped):
     async def register_workflows_for_library(self, library_info: LibraryManager.LibraryInfo) -> None:
         """Register the workflows one library declares, owned by that library.
 
-        The registry records the owner, so unloading the library later removes exactly these
-        entries, and a workspace rescan -- which clears everything it found itself -- leaves
-        them alone.
-
-        Workers are skipped: they import node classes for the orchestrator and never serve
-        workflow lists.
+        Workers are skipped: they never serve workflow lists.
         """
         library_name = library_info.library_name
         if library_name is None or self._is_worker:
@@ -4948,9 +4940,7 @@ class LibraryManager(EngineScoped):
     def _collect_workflow_files_for_library(self, library_info: LibraryManager.LibraryInfo) -> list[str]:
         """Collect the absolute paths of the workflow files a single library declares.
 
-        The `workflows` entries in `griptape_nodes_library.json` are relative to that JSON
-        file, so they resolve against the library's own directory. That directory is already
-        on `sys.path` from when the library loaded, so a workflow's relative imports resolve.
+        The `workflows` entries in `griptape_nodes_library.json` are relative to that JSON file.
         """
         if library_info.library_name is None:
             return []

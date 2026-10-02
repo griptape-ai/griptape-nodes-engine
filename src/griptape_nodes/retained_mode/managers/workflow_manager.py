@@ -724,15 +724,11 @@ class WorkflowManager(EngineScoped):
         return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
-        # Close the gate before touching the registry, not after. on_list_all_workflows_request
-        # and its siblings wait on this event, so clearing the registry first leaves a window
-        # where they answer from a half-empty registry.
+        # Close the gate before clearing, so list requests never answer from a half-empty registry.
         self._workflows_loading_complete.clear()
 
         try:
-            # Clear the workflows this scan found last time before re-scanning, so that a
-            # workspace change (e.g. project switch) takes effect cleanly. Entries from any other
-            # source stay put: this scan never claimed them.
+            # Clear what this scan found last time, so a workspace change takes effect cleanly.
             self.engine.workflow_registry.clear_workspace_workflows()
 
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
@@ -2405,11 +2401,8 @@ class WorkflowManager(EngineScoped):
     ) -> WorkflowRegistrationResult:
         """Register every workflow found at the given paths, returning which ones landed.
 
-        Only newly registered keys appear in `succeeded`; a path whose key is already in the
-        registry is skipped and shows up in neither list.
-
-        Pass `library_name` when the paths come from that library's `workflows` list, so the
-        registry ties the resulting entries to the library's lifetime.
+        Already-registered paths are skipped and appear in neither list. Pass `library_name` when
+        the paths come from that library's `workflows` list.
         """
         registration = await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
         if registration.succeeded:
@@ -3168,11 +3161,8 @@ class WorkflowManager(EngineScoped):
     def _is_protected_template(self, workflow: Workflow | None) -> bool:
         """True when saving this workflow has to copy it instead of overwriting it.
 
-        A template belonging to someone other than the user: one a library contributed, or one
-        Griptape ships. Going by the recorded library is what lets an author ship a template
-        carrying nothing but `is_template`, without also knowing to set `is_griptape_provided` to
-        keep the editor out of their library directory. A workflow the user marked `is_template`
-        themselves is theirs to overwrite, as is the copy this produces.
+        That is a template a library contributed or Griptape ships. A workflow the user marked
+        `is_template` themselves is theirs to overwrite.
         """
         if workflow is None:
             return False
@@ -7251,10 +7241,7 @@ class WorkflowManager(EngineScoped):
             workflows_to_register, library_name=library_name
         )
 
-        # Dropped here rather than inside the loop below, so a second pass over the same paths
-        # neither reports them as failures nor counts them towards the progress total.
-        # Re-registering a library's workflows is a normal event: a library sync issues a second
-        # whole-set load.
+        # Skipped up front so a second pass over the same paths is neither a failure nor progress.
         already_registered = {
             workflow_file
             for workflow_file in all_workflow_files
@@ -7269,10 +7256,8 @@ class WorkflowManager(EngineScoped):
         # Track progress
         total_workflows = len(workflow_files_to_process)
 
-        # The WORKFLOWS phase of EngineInitializationProgress is the boot channel: the editor
-        # reads any of it as the engine still initializing, which blanks the workflow picker and
-        # sets it re-polling the registry. A library registering mid-session announces itself with
-        # WorkflowRegistryChanged instead.
+        # The editor reads WORKFLOWS progress as the engine still booting, so only the workspace
+        # scan reports it. A library registering mid-session sends WorkflowRegistryChanged instead.
         report_progress = library_name is None
 
         # Second pass: process each workflow file with progress events
@@ -7323,12 +7308,9 @@ class WorkflowManager(EngineScoped):
         Returns:
             The workflow files found, deduplicated.
         """
-        # Registered-library roots (excluding sandbox) whose bundled workflow files the workspace
-        # scan must skip. Library-declared workflows enter the registry through LibraryManager,
-        # under the library's name so they live and die with it; a second entry from this scan would
-        # be the workspace's and would outlive the library. Sandbox libraries are intentionally left
-        # scannable so in-development workflows appear. None of it applies when a library is the one
-        # registering: its own files are exactly what it is asking for.
+        # The workspace scan skips registered-library roots (excluding sandbox): their workflows
+        # are registered by the library itself. Sandbox libraries stay scannable so in-development
+        # workflows appear.
         library_exclusion_roots: list[Path] = []
         if library_name is None:
             for library_info in self.engine.library_manager._library_file_path_to_info.values():
