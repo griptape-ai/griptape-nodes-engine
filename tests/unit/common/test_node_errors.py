@@ -23,6 +23,15 @@ from griptape_nodes.retained_mode.events.node_error_details import (
 NODE_NAME = "Get Dictionary Value by Key"
 
 
+class _MissingSettingError(KeyError):
+    def __str__(self) -> str:
+        return f"Setting {self.args[0]!r} is missing"
+
+
+class _PlainKeySubclassError(KeyError):
+    pass
+
+
 def _raised(exc: Exception) -> Exception:
     try:
         raise exc  # noqa: TRY301
@@ -75,6 +84,23 @@ class TestMessage:
         details = build_node_error_details(NODE_NAME, _across_worker(KeyError(5)))
 
         assert details.message == "5"
+
+    def test_key_error_subclass_keeps_its_own_str_on_both_paths(self) -> None:
+        exc = _MissingSettingError("strength")
+
+        in_process = build_node_error_details(NODE_NAME, _raised(exc))
+        from_worker = build_node_error_details(NODE_NAME, _across_worker(exc))
+
+        assert in_process.message == "Setting 'strength' is missing"
+        assert from_worker.message == "Setting 'strength' is missing"
+
+    def test_key_error_subclass_without_its_own_str_matches_on_both_paths(self) -> None:
+        exc = _PlainKeySubclassError("strength")
+
+        in_process = build_node_error_details(NODE_NAME, _raised(exc))
+        from_worker = build_node_error_details(NODE_NAME, _across_worker(exc))
+
+        assert in_process.message == from_worker.message == "'strength'"
 
     def test_engine_preambles_never_reach_the_message(self) -> None:
         error = _executor_error(_failed_while_running(_raised(ValueError("Image is required"))))

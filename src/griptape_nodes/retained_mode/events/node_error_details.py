@@ -73,8 +73,12 @@ def exception_display_message(exc: BaseException) -> str:
 
     ``KeyError.__str__`` returns the repr of its argument, so ``str(KeyError("x"))`` is ``'x'``
     with quotes. Every other built-in returns the argument as written.
+
+    Only an exact ``KeyError`` is unquoted. A subclass may define its own ``__str__``, and the worker
+    path can only recognize ``builtins.KeyError`` by name, so matching subclasses here would make
+    the two paths disagree.
     """
-    if isinstance(exc, KeyError) and len(exc.args) == 1 and isinstance(exc.args[0], str):
+    if type(exc) is KeyError and len(exc.args) == 1 and isinstance(exc.args[0], str):
         return exc.args[0]
     return str(exc)
 
