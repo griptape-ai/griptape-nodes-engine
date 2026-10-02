@@ -18,7 +18,10 @@ class NodeErrorLink:
 
     url: str
     """An http or https page, or a place in the editor starting with "#", such as
-    "#settings-secrets?filter=MY_KEY"."""
+    "#settings-secrets?filter=MY_KEY". URL-encode any values in a "#" link's query.
+
+    The engine accepts any "#" link and passes it through. The editor decides which places it
+    opens, and only follows routes that navigate, never ones that change anything."""
 
 
 class NodeError(Exception):

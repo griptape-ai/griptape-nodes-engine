@@ -302,7 +302,9 @@ message and type are shown, but the editor only reads `fields`, `response`, and 
     before it starts. Name the exact key and say to add it in **Settings → API Keys & Secrets**.
     A validation exception can be a `NodeError` too, so it can carry a link. A link that starts
     with `#` opens a place in the editor, so the user can go straight to the key:
-    `NodeErrorLink(label="Add the API key", url="#settings-secrets?filter=MY_SERVICE_API_KEY")`.
+    `NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={quote(API_KEY_NAME)}")`,
+    with `quote` from `urllib.parse`. The editor decides which `#` links it opens, and only
+    follows ones that go somewhere, never ones that change anything.
 - **Polling gives up.** Say how long the node waited and what to do next. Put the job or
     generation ID in `fields` so the user can check on it later.
 - **The response contains image data.** Remove base64 data from a response before attaching it.

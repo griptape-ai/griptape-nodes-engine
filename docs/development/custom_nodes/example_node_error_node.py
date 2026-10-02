@@ -21,6 +21,7 @@ Copy this file into your sandbox library folder to try it in the editor.
 from __future__ import annotations
 
 from typing import Any, NoReturn
+from urllib.parse import quote
 
 import httpx
 
@@ -113,7 +114,10 @@ class ExampleNodeErrorNode(DataNode):
         return [
             NodeError(
                 msg,
-                links=[NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={self.API_KEY_NAME}")],
+                # URL-encode values in the query, so a key name with "&" or "#" can't break the link.
+                links=[
+                    NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={quote(self.API_KEY_NAME)}")
+                ],
             )
         ]
 
