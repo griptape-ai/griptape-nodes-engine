@@ -88,7 +88,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultSuccess,
@@ -246,6 +245,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.serialization.converter import converter, safe_unstructure
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.exception_utils import readable_exception_message
 

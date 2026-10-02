@@ -48,7 +48,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     RemoveElementEvent,
@@ -58,6 +57,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.serialization.converter import safe_unstructure
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
