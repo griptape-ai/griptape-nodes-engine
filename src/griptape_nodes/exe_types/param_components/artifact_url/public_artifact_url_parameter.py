@@ -273,8 +273,10 @@ class PublicArtifactUrlParameter:
         if isinstance(parameter_value, UrlArtifact):
             return parameter_value.value
         if isinstance(parameter_value, dict):
-            # The editor sets artifact parameters to artifact-shaped dicts.
-            return parameter_value.get("value")
+            # Artifact-shaped dict: an UndecodedValue from a library this process doesn't load,
+            # or an untagged dict from a client or an older saved workflow.
+            url: Any = parameter_value.get("value")
+            return url
         return parameter_value
 
     def _build_upload_path(self, url: str) -> Path:
