@@ -273,8 +273,17 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         # Add in our deltas.
         our_dict["name"] = self.name
         our_dict["type"] = self.type
-        our_dict["input_types"] = self.input_types
-        our_dict["output_type"] = self.output_type
+        # Preserve the declared side for control ports. The public accessors intentionally expose
+        # the opposite side for compatibility with property-mode checks, but serialization must
+        # retain the directional shape so a proxy reloads as ControlParameterInput/Output.
+        from griptape_nodes.exe_types.elements.control_parameters import ControlParameter
+
+        if isinstance(self, ControlParameter):
+            our_dict["input_types"] = self._input_types
+            our_dict["output_type"] = self._output_type
+        else:
+            our_dict["input_types"] = self.input_types
+            our_dict["output_type"] = self.output_type
         our_dict["default_value"] = self.default_value
         our_dict["tooltip"] = self.tooltip
         our_dict["tooltip_as_input"] = self.tooltip_as_input

@@ -319,7 +319,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         side_parameters = self.metadata.setdefault(metadata_key, [])
         if parameter_name in side_parameters:
             return
-        side_parameters.append(parameter_name)
+        # Keep the built-in execution rails first for legacy editor layouts while treating all
+        # other entries as an unordered membership set.
+        if parameter_name in {"group_exec_in", "group_exec_out"}:
+            side_parameters.insert(0, parameter_name)
+        else:
+            side_parameters.append(parameter_name)
 
     def _clone_and_add_parameter(self, param: Parameter, new_name: str) -> None:
         """Clone a parameter with a new name and add it to this node.
@@ -372,10 +377,18 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         request = AddParameterToNodeRequest(
             node_name=self.name,
             parameter_name=original_param.name,
+            type=original_param.type,
             input_types=input_types,
             output_type=output_type,
-            tooltip="",
+            # AddParameterToNodeRequest requires a concrete tooltip. Some dynamically
+            # created parameters leave it unset, so preserve the request round-trip with
+            # the same empty-tooltip semantics used by the parameter manager.
+            tooltip=original_param.tooltip or "",
+            # A boundary proxy bridges an external edge and an internal edge. It therefore
+            # intentionally exposes both modes even though its concrete control-port shape is
+            # directional, and must not expose PROPERTY mode.
             mode_allowed_input=True,
+            mode_allowed_property=False,
             mode_allowed_output=True,
         )
         # Add with a request, because this will handle naming for us.
@@ -468,7 +481,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.engine.handle_request(create_first_connection)
         self.engine.handle_request(create_second_connection)
 
-    def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901
+    def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901, PLR0912
         """Remove tracking of an external connection, restore original connection, and clean up proxy parameter.
 
         Args:
@@ -499,19 +512,43 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     msg = f"{self.name}: Failed to delete internal outgoing connection from {node.name}.{parameter_name} to proxy {proxy_parameter.name}: {delete_result.result_details}"
                     raise RuntimeError(msg)
 
-                # Now create the new connection! We need to get the connections from the proxy parameter
+                # Create the direct edge while the node is temporarily ungrouped. Otherwise the
+                # normal connection handler sees a group boundary and immediately creates a new
+                # proxy instead of restoring the original edge.
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
-                        CreateConnectionRequest(
-                            source_parameter_name=parameter_name,
-                            target_parameter_name=connection.target_parameter.name,
-                            source_node_name=node.name,
-                            target_node_name=connection.target_node.name,
+                    previous_parent_group = node.parent_group
+                    node.parent_group = None
+                    try:
+                        create_result = self.engine.flow_manager.on_create_connection_request(
+                            CreateConnectionRequest(
+                                source_parameter_name=parameter_name,
+                                target_parameter_name=connection.target_parameter.name,
+                                source_node_name=node.name,
+                                target_node_name=connection.target_node.name,
+                            )
                         )
-                    )
+                    finally:
+                        node.parent_group = previous_parent_group
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct outgoing connection from {node.name}.{parameter_name} to {connection.target_node.name}.{connection.target_parameter.name}: {create_result.result_details}"
                         raise RuntimeError(msg)
+
+                    # Creating the direct edge can replace this wall edge when the target only
+                    # accepts one incoming connection. In that case the connection manager has
+                    # already removed it, so make the cleanup idempotent instead of reporting a
+                    # false RemoveNodeFromNodeGroup failure.
+                    if any(candidate is connection for candidate in connections.connections.values()):
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                            DeleteConnectionRequest(
+                                source_parameter_name=connection.source_parameter.name,
+                                target_parameter_name=connection.target_parameter.name,
+                                source_node_name=connection.source_node.name,
+                                target_node_name=connection.target_node.name,
+                            )
+                        )
+                        if delete_result.failed():
+                            msg = f"{self.name}: Failed to delete outgoing wall connection from proxy {proxy_parameter.name} to {connection.target_node.name}.{connection.target_parameter.name}: {delete_result.result_details}"
+                            raise RuntimeError(msg)
 
         # Get all incoming connections
         incoming_connections = connections.get_incoming_connections_from_node(node, from_node=self)
@@ -534,19 +571,41 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     msg = f"{self.name}: Failed to delete internal incoming connection from proxy {proxy_parameter.name} to {node.name}.{parameter_name}: {delete_result.result_details}"
                     raise RuntimeError(msg)
 
-                # Now create the new connection! We need to get the connections to the proxy parameter
+                # Create the direct edge while the node is temporarily ungrouped. Otherwise the
+                # normal connection handler sees a group boundary and immediately creates a new
+                # proxy instead of restoring the original edge.
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
-                        CreateConnectionRequest(
-                            source_parameter_name=connection.source_parameter.name,
-                            target_parameter_name=parameter_name,
-                            source_node_name=connection.source_node.name,
-                            target_node_name=node.name,
+                    previous_parent_group = node.parent_group
+                    node.parent_group = None
+                    try:
+                        create_result = self.engine.flow_manager.on_create_connection_request(
+                            CreateConnectionRequest(
+                                source_parameter_name=connection.source_parameter.name,
+                                target_parameter_name=parameter_name,
+                                source_node_name=connection.source_node.name,
+                                target_node_name=node.name,
+                            )
                         )
-                    )
+                    finally:
+                        node.parent_group = previous_parent_group
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
                         raise RuntimeError(msg)
+
+                    # The direct connection may have replaced the wall edge already because the
+                    # internal target only accepts one input. Do not fail on that normal path.
+                    if any(candidate is connection for candidate in connections.connections.values()):
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                            DeleteConnectionRequest(
+                                source_parameter_name=connection.source_parameter.name,
+                                target_parameter_name=connection.target_parameter.name,
+                                source_node_name=connection.source_node.name,
+                                target_node_name=self.name,
+                            )
+                        )
+                        if delete_result.failed():
+                            msg = f"{self.name}: Failed to delete incoming wall connection from {connection.source_node.name}.{connection.source_parameter.name} to proxy {proxy_parameter.name}: {delete_result.result_details}"
+                            raise RuntimeError(msg)
 
     def _cleanup_proxy_parameter(self, proxy_parameter: Parameter, metadata_key: str) -> None:
         """Clean up proxy parameter if it has no more connections.
@@ -555,17 +614,38 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             proxy_parameter: The proxy parameter to potentially clean up
             metadata_key: The metadata key ('left_parameters' or 'right_parameters')
         """
-        if proxy_parameter.name not in self._proxy_param_to_connections:
+        connection_count = self._proxy_param_to_connections.get(proxy_parameter.name)
+        if connection_count is not None:
+            # A proxy is installed before its two replacement connections are created. The first
+            # replacement can itself cross an enclosing group and be deleted during the next
+            # remap, so retain the proxy until both sides of the bridge have been accounted for.
+            connection_count -= 1
+            self._proxy_param_to_connections[proxy_parameter.name] = connection_count
+            if connection_count > 0:
+                return
+
+        # The counter is empty after deserialization, so the actual graph is the source of truth
+        # when a restored group is edited. Never remove a proxy while either bridge edge remains.
+        connections = self.engine.flow_manager.get_connections()
+        has_incoming = bool(connections.get_incoming_connections_to_parameter(self, proxy_parameter))
+        has_outgoing = bool(connections.get_outgoing_connections_from_parameter(self, proxy_parameter))
+        if has_incoming or has_outgoing:
             return
 
-        self._proxy_param_to_connections[proxy_parameter.name] -= 1
-        if self._proxy_param_to_connections[proxy_parameter.name] == 0:
-            self.engine.node_manager.on_remove_parameter_from_node_request(
-                request=RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name)
+        self._proxy_param_to_connections.pop(proxy_parameter.name, None)
+        remove_result = self.engine.node_manager.on_remove_parameter_from_node_request(
+            request=RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name)
+        )
+        if remove_result.failed():
+            logger.warning(
+                "%s could not remove unused proxy parameter '%s': %s",
+                self.name,
+                proxy_parameter.name,
+                remove_result.result_details,
             )
-            del self._proxy_param_to_connections[proxy_parameter.name]
-            if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
-                self.metadata[metadata_key].remove(proxy_parameter.name)
+            return
+        if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
+            self.metadata[metadata_key].remove(proxy_parameter.name)
 
     def _remap_outgoing_connections(self, node: BaseNode, connections: Connections) -> None:
         """Remap outgoing connections that go through proxy parameters.
@@ -1073,12 +1153,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if not conn_list:
             return
 
-        # All connections share the same external parameter
-        # For outgoing: the internal (source) parameter is shared
-        # For incoming: the external (source) parameter is shared
+        # All connections share the same external parameter. The proxy's semantic name and
+        # declared shape come from the parameter on the group side: incoming proxies mirror the
+        # internal target, while outgoing proxies mirror the internal source. Using the external
+        # source for both directions makes incoming Flow In proxies look like exec_out ports.
         first_conn = conn_list[0]
-        # Use source_parameter in both cases since we group by source
-        grouped_parameter = first_conn.source_parameter
+        grouped_parameter = first_conn.target_parameter if is_incoming else first_conn.source_parameter
 
         # Check if there's an existing proxy parameter we can reuse
         existing_proxy = self._find_existing_proxy_for_source(
@@ -1236,10 +1316,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         connections = self.engine.flow_manager.get_connections()
         for node in nodes:
+            self.unmap_node_connections(node, connections)
+        for node in nodes:
             node.parent_group = None
             self.nodes.pop(node.name)
-        for node in nodes:
-            self.unmap_node_connections(node, connections)
 
         self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
