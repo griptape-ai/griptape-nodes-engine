@@ -28,7 +28,9 @@ the engine's request API from working without edits. Migration steps live in
   `library.dependency_source` to `environment` makes those the only libraries that load and stops
   the engine from downloading libraries or building virtual environments. `worker.command_prefix`
   starts each library's worker inside that library's own environment, filled in from
-  `GTN_LIBRARY_WORKER_REQUESTS`. See
+  `GTN_LIBRARY_WORKER_REQUESTS`. `library.environment_allows_sandbox` keeps the sandbox library
+  available in that mode, and `ReloadSandboxLibraryRequest` reloads just the sandbox without
+  touching other libraries or their workers. See
   [Running in a Managed Environment](https://docs.griptapenodes.com/en/stable/guides/managed_environment/).
 
 ### Changed

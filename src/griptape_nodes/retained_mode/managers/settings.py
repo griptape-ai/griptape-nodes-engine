@@ -32,6 +32,7 @@ LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_DEPENDENCY_SOURCE_KEY = "library.dependency_source"
+LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY = "library.environment_allows_sandbox"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 LOG_TO_FILE_KEY = "logging.log_to_file"
@@ -41,8 +42,8 @@ SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so under this flag beta feature entries are converted to booleans, and one
 # that can't be converted fails validation so the variable is reported as a bad value. The other
-# settings that need a string converted (`worker.command_prefix`, `library.dependency_source`)
-# read the same flag.
+# settings that need a string converted (`worker.command_prefix`, `library.dependency_source`,
+# `library.environment_allows_sandbox`) read the same flag.
 BETA_FEATURES_FROM_ENV_CONTEXT = "beta_features_from_env"
 
 logger = logging.getLogger("griptape_nodes")
@@ -439,9 +440,21 @@ class LibrarySettings(BaseModel):
             "'environment' is for an engine started inside an environment another tool has already "
             "prepared: the engine loads only the libraries listed in the GTN_LIBRARY_PATHS environment "
             "variable, never builds virtual environments, never downloads, updates, or installs "
-            "libraries, and marks every other configured library (libraries_to_register entries and the "
-            "sandbox library) as not provided by the environment. A library dependency is then "
+            "libraries, and marks every other configured library (libraries_to_register entries, and the "
+            "sandbox library unless library.environment_allows_sandbox is true) as not provided by the "
+            "environment. A library dependency is then "
             "satisfied only by a library the environment provides."
+        ),
+    )
+    environment_allows_sandbox: bool = Field(
+        default=False,
+        description=(
+            "Only matters when library.dependency_source is 'environment'. When true, the sandbox library "
+            "(sandbox_library_directory) is still scanned and loaded, and sandbox nodes can be added, so "
+            "artists can develop nodes inside a studio environment. No virtual environment is built for "
+            "it: everything its nodes import must already be in the environment. Every other library "
+            "the environment does not provide is still refused. False (the default) refuses the sandbox "
+            "library too."
         ),
     )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
@@ -509,6 +522,29 @@ class LibrarySettings(BaseModel):
             f"Ignoring {LIBRARY_DEPENDENCY_SOURCE_KEY}: expected one of {allowed}, got {v!r}. Using 'venv'.",
         )
         return LibraryDependencySource.VENV
+
+    @field_validator("environment_allows_sandbox", mode="before")
+    @classmethod
+    def validate_environment_allows_sandbox(cls, v: Any, info: ValidationInfo) -> bool:
+        """Accept true or false in any letter case, and keep a bad value from resetting the whole config.
+
+        From a GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX variable an unrecognized value raises,
+        so the env loader reports the variable and ignores it. From a config file it falls back to
+        false with a warning, which keeps the sandbox refused.
+        """
+        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            return v.strip().lower() == "true"
+        if from_env:
+            msg = f"{LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY} must be true or false, got {v!r}"
+            raise ValueError(msg)
+        _warn_once(
+            (LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY, repr(v)),
+            f"Ignoring {LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY}: expected true or false, got {v!r}. Using false.",
+        )
+        return False
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod

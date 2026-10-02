@@ -14,15 +14,18 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     LIBRARY_WORKER_REQUESTS_ENV_VAR,
     WorkerCommand,
     WorkerCommandRefusal,
+    environment_allows_sandbox,
     library_paths_from_environment,
     read_dependency_source,
     read_worker_command_prefix,
     resolve_worker_command,
+    sandbox_refused_by_environment,
     worker_requests_from_environment,
 )
 from griptape_nodes.retained_mode.managers.settings import (
     BETA_FEATURES_FROM_ENV_CONTEXT,
     LIBRARY_DEPENDENCY_SOURCE_KEY,
+    LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY,
     WORKER_COMMAND_PREFIX_KEY,
     LibraryDependencySource,
     LibrarySettings,
@@ -211,6 +214,12 @@ class TestReadingTheSettings:
 
         assert read_dependency_source(config) is LibraryDependencySource.VENV
 
+    @pytest.mark.parametrize(("raw", "expected"), [(" TRUE ", True), ("no", False), (1, False), (None, False)])
+    def test_only_true_or_the_text_true_allows_the_sandbox(self, raw: object, *, expected: bool) -> None:
+        config = _config_returning({LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY: raw})
+
+        assert environment_allows_sandbox(config) is expected
+
     def test_a_prefix_that_is_not_a_list_is_not_used(self) -> None:
         config = _config_returning({WORKER_COMMAND_PREFIX_KEY: "tool env --"})
 
@@ -283,6 +292,49 @@ class TestSettingsValidation:
         with pytest.raises(ValidationError, match="must be one of"):
             LibrarySettings.model_validate({"dependency_source": "somewhere"}, context=_FROM_ENV)
 
+    def test_a_typed_sandbox_setting_is_kept(self) -> None:
+        settings = LibrarySettings.model_validate({"environment_allows_sandbox": True})
+
+        assert settings.environment_allows_sandbox is True
+
+    def test_a_bad_sandbox_setting_in_a_config_file_keeps_the_sandbox_refused(self) -> None:
+        settings = LibrarySettings.model_validate({"environment_allows_sandbox": "maybe"})
+
+        assert settings.environment_allows_sandbox is False
+
+    def test_a_bad_sandbox_setting_from_the_environment_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be true or false"):
+            LibrarySettings.model_validate({"environment_allows_sandbox": "maybe"}, context=_FROM_ENV)
+
+
+class TestEnvironmentAllowsSandbox:
+    @pytest.mark.parametrize(("raw", "expected"), [("TRUE", True), ("true", True), ("False", False)])
+    def test_true_or_false_in_any_letter_case(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, *, expected: bool
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX", raw)
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert environment_allows_sandbox(manager) is expected
+
+    def test_a_bad_value_is_reported_and_keeps_the_sandbox_refused(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX", "maybe")
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE", "environment")
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert environment_allows_sandbox(manager) is False
+        assert sandbox_refused_by_environment(manager) is True
+        assert "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX" in caplog.text
+
+    def test_it_matters_only_in_environment_mode(self) -> None:
+        config = _config_returning({LIBRARY_ENVIRONMENT_ALLOWS_SANDBOX_KEY: False})
+
+        assert sandbox_refused_by_environment(config) is False
+
 
 class TestSuiteIsolation:
     def test_the_environment_the_suite_runs_in_is_not_read(self) -> None:
@@ -296,5 +348,6 @@ class TestSuiteIsolation:
             LIBRARY_WORKER_REQUESTS_ENV_VAR,
             "GTN_CONFIG_LIBRARY__DEPENDENCY_SOURCE",
             "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+            "GTN_CONFIG_LIBRARY__ENVIRONMENT_ALLOWS_SANDBOX",
         ):
             assert name not in os.environ
