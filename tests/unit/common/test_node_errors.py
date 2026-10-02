@@ -220,6 +220,16 @@ class TestNodeErrorAttachments:
 
         assert details.response is None
 
+    def test_response_with_nan_is_dropped_with_a_marker(self) -> None:
+        exc = self._node_error(response={"score": float("nan")})
+
+        in_process = build_node_error_details(NODE_NAME, exc)
+        from_worker = build_node_error_details(NODE_NAME, _across_worker(exc))
+
+        for details in (in_process, from_worker):
+            assert details.response is None
+            assert details.fields == {RESPONSE_DROPPED_FIELD: "true"}
+
     def test_https_link_survives_and_javascript_link_is_dropped(self) -> None:
         links = [
             NodeErrorLink(label="Supported image formats", url="https://docs.griptapenodes.com/formats"),

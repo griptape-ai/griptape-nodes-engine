@@ -108,7 +108,9 @@ def _sanitize_response(value: Any) -> dict[str, Any] | None:
         logger.debug("Dropped node error response of type %s; expected a dict", type(value).__name__)
         return None
     try:
-        serialized = json.dumps(value)
+        # allow_nan=False because NaN and Infinity are not JSON: the editor's JSON.parse would
+        # reject the whole event, not just the response.
+        serialized = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
         logger.debug("Dropped node error response that is not JSON-serializable", exc_info=True)
         return None
