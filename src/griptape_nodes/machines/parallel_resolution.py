@@ -33,7 +33,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
-from griptape_nodes.serialization.converter import safe_unstructure
+from griptape_nodes.serialization.values import encode_for_display
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
@@ -236,8 +236,8 @@ class ExecuteDagState(State):
         if logger.level <= logging.DEBUG:
             logger.debug(
                 "INPUTS: %s\nOUTPUTS: %s",
-                safe_unstructure(current_node.parameter_values),
-                safe_unstructure(current_node.parameter_output_values),
+                encode_for_display(dict(current_node.parameter_values)),
+                encode_for_display(dict(current_node.parameter_output_values)),
             )
 
         for parameter_name, value in current_node.parameter_output_values.items():

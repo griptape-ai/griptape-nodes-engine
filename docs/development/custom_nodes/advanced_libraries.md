@@ -206,6 +206,10 @@ therefore the same payload classes. Give that module a distinctive name: every l
 directory lands on the same `sys.path`, so `events.py` risks resolving to another
 library's file.
 
+A field that carries a parameter value, such as an artifact, must be annotated `Value` from
+`griptape_nodes.serialization.values` (`image: Value`) so it reads back as the same type. A field
+holding a value JSON can't represent fails to send.
+
 **2. Return the pair from the hook.**
 
 ```python
