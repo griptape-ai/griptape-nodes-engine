@@ -3695,15 +3695,7 @@ class NodeManager(EngineScoped):
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
             return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
-        # Pass the live exception through ``exception=`` so the
-        # converter can capture worker-side frames into a
-        # ForwardedException on the orchestrator. Without this
-        # the orchestrator only sees the type and message --
-        # PR06's whole reason for the dict wire-format -- and
-        # NodeExecutor._format_node_failure_message would have
-        # nothing to surface. ``__traceback__`` is populated
-        # because ``exc`` was actually raised, so the strict-mode
-        # tripwire stays quiet for raise-in-process.
+        # The raised exception itself, so its traceback crosses the worker boundary.
         return ExecuteNodeResultFailure(
             result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
             exception=exc,
