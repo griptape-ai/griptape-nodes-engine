@@ -14,7 +14,8 @@ category unless it declares its own, which is how
 The env var column is the `__`-joined path config_manager._load_config_from_env_vars parses: a
 scalar gets `GTN_CONFIG_<PATH>`, a mapping (`type: object` with `additionalProperties`, e.g.
 artifacts) gets a `__<KEY>` template since any entry can be set that way, and a list gets "n/a"
-because the Settings model accepts no string form for one.
+because the Settings model accepts no string form for one -- unless its Field marks
+`env_var_format: json_list`, meaning its validator parses the variable as a JSON list.
 
 A model reached as a list entry or mapping value (e.g. MCPServerConfig under mcp_servers) has no
 dotted key of its own, so it gets a table under Entry Types, linked from the setting's type cell.
@@ -45,6 +46,10 @@ CWD_DEPENDENT_DEFAULTS = {"workspace_directory": "<current_working_directory>/Gr
 MAX_DEFAULT_LIST_ITEMS = 3
 
 NOT_SETTABLE_FROM_ENV = "n/a (edit config file)"
+
+# The `json_schema_extra` marker a list setting carries when its env var takes a JSON list.
+ENV_VAR_FORMAT_KEY = "env_var_format"
+JSON_LIST_ENV_VAR_FORMAT = "json_list"
 
 LeafKind = Literal["scalar", "mapping", "other"]
 
@@ -461,6 +466,8 @@ def _resolve_env_var_label(path: tuple[str, ...], prop: dict, defs: dict) -> str
 
     if kind == "mapping":
         return f"`{env_var}__<KEY>`"
+    if prop.get(ENV_VAR_FORMAT_KEY) == JSON_LIST_ENV_VAR_FORMAT:
+        return f"`{env_var}` (JSON list)"
     if kind == "other":
         return NOT_SETTABLE_FROM_ENV
     return f"`{env_var}`"
@@ -483,7 +490,8 @@ def _render_markdown(rows: list[SettingRow], entry_types: list[EntryType]) -> st
         '`"worker.heartbeat_timeout_s"` key is ignored. Settings with a `GTN_CONFIG_*` env var, including the '
         "`GTN_CONFIG_<PATH>` form with `__` between the parts of a dotted key and the `GTN_CONFIG_<NAME>__<KEY>` "
         "form for a mapping-valued setting's entries, can also be overridden from the environment; list-valued "
-        "settings must be edited in a config file. A mapping's keys are matched case-sensitively but the whole "
+        "settings must be edited in a config file unless their environment variable is marked as taking a JSON list. "
+        "A mapping's keys are matched case-sensitively but the whole "
         "variable name is lowercased, so only an already-lowercase key is reachable from the environment (see the "
         "guide for details)."
     )
