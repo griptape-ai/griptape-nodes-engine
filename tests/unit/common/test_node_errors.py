@@ -80,6 +80,13 @@ class TestMessage:
         assert details.message == "Key 'b' not found"
         assert details.exception_type == "builtins.KeyError"
 
+    def test_key_error_without_arguments_from_worker_keeps_its_empty_text(self) -> None:
+        # str(KeyError()) is "", which is not a Python literal, so unquoting has nothing to undo.
+        details = build_node_error_details(NODE_NAME, _across_worker(KeyError()))
+
+        assert details.message == ""
+        assert details.exception_type == "builtins.KeyError"
+
     def test_non_string_key_error_from_worker_keeps_its_text(self) -> None:
         details = build_node_error_details(NODE_NAME, _across_worker(KeyError(5)))
 
