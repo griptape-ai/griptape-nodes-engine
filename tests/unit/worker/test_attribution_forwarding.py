@@ -24,8 +24,11 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import EventResultSuccess
 from griptape_nodes.retained_mode.events.budget_events import (
+    BudgetAccessRequest,
+    BudgetAccessResultSuccess,
     GetAttributionContextRequest,
     GetAttributionContextResultSuccess,
+    ReportUsageRequest,
 )
 from tests.unit.worker.harness import InProcessWorkerHarness
 
@@ -141,3 +144,38 @@ class TestAttributionForwardingIsWired:
 
         assert isinstance(event_result.result, GetAttributionContextResultSuccess)
         assert event_result.result.header_value == "from-the-orchestrator"
+
+
+class TestSpendRequestsAreForwardedFromWorkers:
+    """The check and the report also run on the orchestrator, which holds the authoritative chain."""
+
+    @pytest.mark.parametrize("request_type", [BudgetAccessRequest, ReportUsageRequest])
+    def test_not_answered_locally(self, request_type: type) -> None:
+        assert request_type not in LOCAL_ONLY_REQUEST_TYPES
+
+    @pytest.mark.asyncio
+    async def test_the_node_fields_cross_the_boundary(self) -> None:
+        """The orchestrator has no current node, so `node_type` and `node_id` ride on the request."""
+        harness = InProcessWorkerHarness()
+        received: list[BudgetAccessRequest] = []
+
+        async def orchestrator_handler(request: BudgetAccessRequest) -> BudgetAccessResultSuccess:
+            received.append(request)
+            return BudgetAccessResultSuccess(correlation_id="c", checked=True, result_details="ok")
+
+        async def worker_local_handler(request: BudgetAccessRequest) -> BudgetAccessResultSuccess:  # noqa: ARG001
+            return BudgetAccessResultSuccess(correlation_id="local", checked=False, result_details="ok")
+
+        harness.orchestrator.assign_manager_to_request_type(BudgetAccessRequest, orchestrator_handler)
+        harness.worker.assign_manager_to_request_type(BudgetAccessRequest, worker_local_handler)
+        harness.install_remote_handler(BudgetAccessRequest)
+
+        with harness.worker.node_execution_scope():
+            result_event = await harness.worker.ahandle_request(
+                BudgetAccessRequest(model_id="m", estimated_cost_micro_usd=5, node_type="T", node_id="n-1")
+            )
+
+        assert isinstance(result_event.result, BudgetAccessResultSuccess)
+        assert result_event.result.correlation_id == "c"
+        assert (received[0].model_id, received[0].estimated_cost_micro_usd) == ("m", 5)
+        assert (received[0].node_type, received[0].node_id) == ("T", "n-1")

@@ -125,11 +125,8 @@ def resolve_cloud_credential(
     return secrets_manager.get_secret(secret_name, should_error_on_not_found=False)
 
 
-def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:
-    """Return the hostname of the Griptape Cloud deployment in use.
-
-    Used to tell Cloud's HTTP failures apart from those of MCP servers and
-    third-party APIs.
+def resolve_cloud_base_url(secrets_manager: SecretsManager | None = None) -> str:
+    """Return the base URL of the Griptape Cloud deployment in use.
 
     Args:
         secrets_manager: Reads the override from the workspace and global
@@ -137,14 +134,29 @@ def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:
             available; without it a workspace ``.env`` override is missed.
 
     Returns:
-        The hostname, or an empty string if the configured URL has none.
+        The configured base URL, or :data:`DEFAULT_CLOUD_BASE_URL`.
     """
     if secrets_manager is None:
         base_url = os.getenv(BASE_URL_SETTING_NAME)
     else:
         base_url = secrets_manager.get_secret(BASE_URL_SETTING_NAME, should_error_on_not_found=False)
 
-    return urlsplit(base_url or DEFAULT_CLOUD_BASE_URL).hostname or ""
+    return base_url or DEFAULT_CLOUD_BASE_URL
+
+
+def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:
+    """Return the hostname of the Griptape Cloud deployment in use.
+
+    Used to tell Cloud's HTTP failures apart from those of MCP servers and
+    third-party APIs.
+
+    Args:
+        secrets_manager: See :func:`resolve_cloud_base_url`.
+
+    Returns:
+        The hostname, or an empty string if the configured URL has none.
+    """
+    return urlsplit(resolve_cloud_base_url(secrets_manager)).hostname or ""
 
 
 def is_license_credential(credential: str | None) -> bool:
