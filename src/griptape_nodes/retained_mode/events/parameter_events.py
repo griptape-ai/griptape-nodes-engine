@@ -27,6 +27,14 @@ class AddParameterToNodeRequest(RequestPayload):
     Use when: Dynamically adding inputs/outputs to nodes, customizing node interfaces,
     building configurable nodes. Supports type validation, tooltips, and mode restrictions.
 
+    Also adds an item slot to a ParameterList input (e.g. `items` on CreateImageList,
+    `input_images` on image generators). These lists start with no slots, and the list
+    parameter itself cannot be a connection target. Pass only node_name and
+    parent_container_name=<list name>; the slot copies the list's type and modes, and its
+    generated name comes back as parameter_name (`<list name>_ParameterListUniqueParamID_<hex>`).
+    Use that name as the target of CreateConnectionRequest or SetParameterValueRequest.
+    Add one slot per item.
+
     Args:
         node_name: Name of the node to add parameter to (None for current context)
         parameter_name: Name of the new parameter (None for auto-generated)
