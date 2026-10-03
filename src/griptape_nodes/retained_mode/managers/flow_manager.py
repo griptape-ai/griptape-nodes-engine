@@ -998,6 +998,13 @@ class FlowManager(EngineScoped):
         # Validate that the data type from the source is allowed by the target.
         if not target_param.is_incoming_type_allowed(source_param.output_type):
             details = f'Connection failed on type mismatch "{source_node_name}.{request.source_parameter_name}" type({source_param.output_type}) to "{target_node_name}.{request.target_parameter_name}" types({target_param.input_types}) '
+            if isinstance(target_param, ParameterList):
+                details += (
+                    f'"{request.target_parameter_name}" is a list of slots and cannot be connected to directly. '
+                    f'Add a slot with AddParameterToNodeRequest(node_name="{target_node_name}", '
+                    f'parent_container_name="{request.target_parameter_name}"), then connect to the '
+                    "parameter_name it returns."
+                )
             return CreateConnectionResultFailure(result_details=details)
 
         # Ask each node involved to bless this union.
