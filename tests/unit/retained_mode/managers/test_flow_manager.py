@@ -1014,7 +1014,8 @@ class _ImageCollector(DataNode):
         super().__init__(name, metadata)
         self.add_parameter(ParameterList(name="items", type="ImageUrlArtifact", tooltip=""))
 
-    def process(self) -> None: ...
+    def process(self) -> None:
+        pass
 
 
 class TestConnectingToParameterList:
