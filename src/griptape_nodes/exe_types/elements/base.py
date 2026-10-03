@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
 from griptape_nodes.exe_types.elements.badge import handle_badge_message, write_badge_fields
+from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -190,6 +191,11 @@ class BaseNodeElement:
         # Also propagate to any existing children of the child
         for grandchild in child.find_elements_by_type(BaseNodeElement, find_recursively=True):
             grandchild._node_context = self._node_context
+
+        if self._node_context is not None:
+            for element in [child, *child.find_elements_by_type(BaseNodeElement, find_recursively=True)]:
+                if isinstance(element, UIOptionsMixin):
+                    element.report_ui_option_conflicts()
 
         # Emit event if we have node context
         if self._node_context is not None:
