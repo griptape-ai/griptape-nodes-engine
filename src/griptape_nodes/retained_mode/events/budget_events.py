@@ -1,13 +1,13 @@
-"""Events for budget attribution.
+"""Events for budget attribution and direct-to-provider spend.
 
-The engine is the only party that knows which project a credit-consuming call belongs to. These
-events hand a caller one ready-to-send header value. They make no network call and read no
-credential; they label a call, they do not decide whether the call is allowed. Cloud decides
-that, and `griptape_nodes.utils.budget_refusal` turns its refusal into something an artist can
-act on.
+The engine is the only party that knows which project a credit-consuming call belongs to.
+`GetAttributionContextRequest` hands a caller one ready-to-send header value for calls that go
+through Griptape Cloud. A node calling a provider directly (BYOK) bypasses Cloud, so it asks
+first with `BudgetAccessRequest` and reports what it spent with `ReportUsageRequest`.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -89,3 +89,116 @@ class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     Sending nothing rather than `{"v": 1}` keeps the engine from asserting a fact it does not
     have. The loss is visible only in the engine's log.
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class BudgetAccessRequest(RequestPayload):
+    """Ask Griptape Cloud whether a direct provider call fits the budgets it is attributed to.
+
+    Fails open: if Cloud cannot be reached or gives no usable answer, the call is cleared with
+    `checked=False`. Only an explicit deny from Cloud fails. A network blip must not halt work
+    the org may not even be billed for, and an offline bypass of self-declared spend cannot be
+    enforced anyway.
+
+    Use when: A node is about to call a model provider directly, not through the Griptape proxy.
+
+    Args:
+        model_id: Stable catalog key of the model being invoked (e.g., "gtc_claude_opus_4_7")
+        estimated_cost_micro_usd: Expected cost of the call. When omitted, the call is refused
+            only by budgets with no headroom left.
+        node_type: Library class of the calling node, for attribution
+        node_id: Opaque id of the calling node, for attribution. Never the node's label.
+
+    Results: BudgetAccessResultSuccess (cleared to proceed) |
+        BudgetAccessResultFailure (a budget refused the call; the node should not make it)
+    """
+
+    model_id: str
+    estimated_cost_micro_usd: int | None = None
+    node_type: str | None = None
+    node_id: str | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class BudgetAccessResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The call is cleared; make it, then report it with `ReportUsageRequest`.
+
+    Args:
+        correlation_id: Pass this on `ReportUsageRequest` so Cloud can pair the check with the report
+        checked: False when Cloud could not be asked and the call was cleared without a check
+        effective_remaining_credits: The tightest headroom across every matching budget, when checked
+    """
+
+    correlation_id: str
+    checked: bool
+    effective_remaining_credits: int | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """A budget refused the call. The node should not make it.
+
+    `result_details` is the halt message naming every budget that refused, and `exception` is a
+    `BudgetExceededError`; raise it from the node so the run stops with that message.
+
+    Args:
+        blocked_by: Cloud's entry for every budget that refused, as sent
+        correlation_id: The id the check was made under
+    """
+
+    blocked_by: list[dict[str, Any]]
+    correlation_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportUsageRequest(RequestPayload):
+    """Report what a direct provider call cost, so it counts against budgets and shows in usage.
+
+    Best-effort: the report is sent in the background, retried briefly, and dropped with a log
+    line if Cloud cannot take it. A node must never fail over its usage report.
+
+    Use when: A node has just finished a direct provider call (not through the Griptape proxy).
+
+    Args:
+        declared_cost_micro_usd: What the call cost, in millionths of a US dollar
+        provider: Provider name, e.g. "anthropic"
+        model: Model name or catalog key
+        activity_type: Kind of call, e.g. "chat_completion"
+        node_type: Library class of the calling node, for attribution
+        node_id: Opaque id of the calling node, for attribution. Never the node's label.
+        correlation_id: From the `BudgetAccessResultSuccess` of the check before this call, if any
+
+    Results: ReportUsageResultSuccess (queued) | ReportUsageResultFailure (not sent)
+    """
+
+    declared_cost_micro_usd: int
+    provider: str | None = None
+    model: str | None = None
+    activity_type: str | None = None
+    node_type: str | None = None
+    node_id: str | None = None
+    correlation_id: str | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportUsageResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The report is queued. Delivery is not confirmed.
+
+    Args:
+        idempotency_key: The key the report is sent under, the same on every retry
+    """
+
+    idempotency_key: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportUsageResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The report was not sent. Never fail a node over this."""
