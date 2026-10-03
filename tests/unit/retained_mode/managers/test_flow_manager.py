@@ -947,7 +947,8 @@ class _ImageSource(DataNode):
             Parameter(name="image", type="ImageUrlArtifact", tooltip="", allowed_modes={ParameterMode.OUTPUT})
         )
 
-    def process(self) -> None: ...
+    def process(self) -> None:
+        pass
 
 
 class _ImageCollector(DataNode):
