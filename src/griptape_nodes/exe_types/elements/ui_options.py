@@ -50,6 +50,9 @@ class UIOptionsMixin:
         pending.append(conflict)
         self.report_ui_option_conflicts()
 
+    def _on_node_attached(self) -> None:
+        self.report_ui_option_conflicts()
+
     def report_ui_option_conflicts(self) -> None:
         """Log conflicts found at construction once the element belongs to a node.
 

@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
 from griptape_nodes.exe_types.elements.badge import handle_badge_message, write_badge_fields
-from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -184,22 +183,20 @@ class BaseNodeElement:
         if child._parent is not None:
             child._parent.remove_child(child)
         child._parent = self
-        # Propagate node context to children
-        child._node_context = self._node_context
         self._children.append(child)
 
-        # Also propagate to any existing children of the child
-        for grandchild in child.find_elements_by_type(BaseNodeElement, find_recursively=True):
-            grandchild._node_context = self._node_context
-
-        if self._node_context is not None:
-            for element in [child, *child.find_elements_by_type(BaseNodeElement, find_recursively=True)]:
-                if isinstance(element, UIOptionsMixin):
-                    element.report_ui_option_conflicts()
+        # Propagate node context to the child and all of its descendants
+        for element in [child, *child.find_elements_by_type(BaseNodeElement, find_recursively=True)]:
+            element._node_context = self._node_context
+            if self._node_context is not None:
+                element._on_node_attached()
 
         # Emit event if we have node context
         if self._node_context is not None:
             self._node_context._emit_parameter_lifecycle_event(child)
+
+    def _on_node_attached(self) -> None:
+        """Hook run when this element joins a node. Subclasses and mixins override it."""
 
     def remove_child(self, child: BaseNodeElement | str) -> None:
         """Remove a child element from the hierarchy.
