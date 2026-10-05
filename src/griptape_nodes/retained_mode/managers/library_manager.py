@@ -7864,12 +7864,16 @@ class LibraryManager(EngineScoped):
             try:
                 await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
             except subprocess.CalledProcessError as constrained_error:
+                # stderr is None when output was not captured (debug mode), where uv already printed it.
+                reason = (constrained_error.stderr or "").strip()
+                if not reason:
+                    reason = f"the installer exited with code {constrained_error.returncode}"
                 logger.warning(
                     "Attempted to install dependencies into the environment at %s under the versions this engine runs "
-                    "on. Failed due to: the installer exited with code %s. Installing without them; the result may "
-                    "hold components older than the engine's own.",
+                    "on. Installing without them; the result may hold components older than the engine's own. "
+                    "Failed due to: %s",
                     library_venv_python_path,
-                    constrained_error.returncode,
+                    reason,
                 )
             else:
                 return
