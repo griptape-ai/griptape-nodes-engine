@@ -29,6 +29,8 @@ the engine's request API from working without edits. Migration steps live in
   first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
   Griptape Cloud.
   [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
+- Serializing an event now walks its payload once instead of twice, cutting serialization cost —
+  most noticeably on events with large parameter values.
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
