@@ -1174,6 +1174,63 @@ class TestUpdateLibraryGit:
 
         assert get_local_commit_sha(clone) == moved_sha
 
+    def test_update_library_git_keeps_stable_when_nightly_shares_the_commit(self, temp_dir: Path) -> None:
+        """Test that a library on stable keeps following stable when nightly points at the same commit."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "stable")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+        stable_sha = head_sha(clone)
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == stable_sha
+        assert get_current_tag(clone) == "stable"
+
+    def test_update_library_git_keeps_stable_after_a_no_op_update(self, temp_dir: Path) -> None:
+        """Test that the tracked tag survives updates that don't move HEAD, which write no reflog entry."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "stable")
+        update_library_git(clone)
+        run_git(clone, "reflog", "expire", "--expire=now", "--all")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+
+        update_library_git(clone)
+
+        assert get_current_tag(clone) == "stable"
+
+    def test_update_library_git_keeps_nightly_when_stable_shares_the_commit(self, temp_dir: Path) -> None:
+        """Test that a library on nightly keeps following nightly when stable points at the same commit."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "nightly")
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone, "nightly")
+        run_git(origin, "tag", "stable")
+        run_git(clone, "fetch", "--tags", "origin")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+        nightly_sha = head_sha(origin)
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == nightly_sha
+
     def test_update_library_git_raises_error_when_detached_head_without_known_tag(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised for a detached HEAD that isn't on a known tag."""
         origin = make_origin_repo(temp_dir / "origin")

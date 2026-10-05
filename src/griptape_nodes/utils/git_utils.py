@@ -302,6 +302,13 @@ _GIT_MISSING_MESSAGE = (
 # thread until the engine is restarted.
 _GIT_TIMEOUT_SECONDS = 600
 
+# Repository-local git config key naming the tag a detached-HEAD library follows.
+_TRACKED_TAG_CONFIG_KEY = "griptape-nodes.trackedTag"
+
+# Reflog subject git writes for a checkout, e.g. "checkout: moving from main to stable"
+# or "checkout: moving from 1a2b3c to refs/tags/stable".
+_CHECKOUT_REFLOG_PATTERN = re.compile(r"^checkout: moving from \S+ to (?P<target>\S+)$")
+
 # Transports a library URL is allowed to use. Anything outside this list, notably a
 # "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
 # before a connection is attempted.
@@ -512,12 +519,56 @@ def _current_branch(library_path: Path) -> str | None:
 def _tag_at_head(library_path: Path) -> str | None:
     """Name of a tag pointing at HEAD, or None when HEAD isn't tagged.
 
-    Reports the first name git lists when several tags share the commit.
+    Several tags often share a commit: right after a release, ``stable`` and ``nightly``
+    both point at it. git lists them alphabetically, so the first name says nothing about
+    which one the library follows. Prefer the tag last checked out on purpose: the one
+    recorded by ``_remember_tracked_tag``, else the newest tag checkout in HEAD's reflog.
+    Fall back to the first listed tag only when neither names a tag at HEAD.
     """
-    tags = _try_git(["tag", "--points-at", "HEAD"], library_path)
-    if not tags:
+    tags_output = _try_git(["tag", "--points-at", "HEAD"], library_path)
+    if not tags_output:
         return None
-    return tags.splitlines()[0].strip()
+    tags = [tag.strip() for tag in tags_output.splitlines() if tag.strip()]
+
+    tracked_tag = _try_git(["config", "--get", _TRACKED_TAG_CONFIG_KEY], library_path)
+    if tracked_tag in tags:
+        return tracked_tag
+
+    reflog_tag = _last_checked_out_tag(library_path, tags)
+    if reflog_tag is not None:
+        return reflog_tag
+
+    return tags[0]
+
+
+def _last_checked_out_tag(library_path: Path, candidate_tags: list[str]) -> str | None:
+    """Newest tag among candidate_tags that HEAD's reflog shows being checked out, or None."""
+    reflog = _try_git(["reflog", "show", "--format=%gs", "HEAD"], library_path)
+    if not reflog:
+        return None
+
+    for subject in reflog.splitlines():
+        match = _CHECKOUT_REFLOG_PATTERN.match(subject.strip())
+        if match is None:
+            continue
+        target = match.group("target").removeprefix("refs/tags/")
+        if target in candidate_tags:
+            return target
+    return None
+
+
+def _remember_tracked_tag(library_path: Path, tag_name: str, error_cls: type[GitError]) -> None:
+    """Record tag_name as the tag this checkout follows, so updates keep following it.
+
+    The reflog alone can't hold this: a checkout that doesn't move HEAD writes no entry,
+    and entries expire, so a library that rarely changes would lose its channel.
+    """
+    _run_git(
+        ["config", _TRACKED_TAG_CONFIG_KEY, tag_name],
+        error_msg=f"Failed to record tracked tag {tag_name} at {library_path}",
+        cwd=library_path,
+        error_cls=error_cls,
+    )
 
 
 def _ref_exists(library_path: Path, ref: str) -> bool:
@@ -832,6 +883,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _remember_tracked_tag(library_path, tag_name, GitPullError)
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -956,6 +1008,7 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
             cwd=library_path,
             error_cls=GitRefError,
         )
+        _remember_tracked_tag(library_path, ref_name, GitRefError)
     elif _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
         # -B resets an existing local branch onto the freshly fetched remote tip.
         _run_git(
@@ -1021,6 +1074,8 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
             cwd=target_path,
             error_cls=GitCloneError,
         )
+        if _current_branch(target_path) is None and _ref_exists(target_path, f"refs/tags/{branch_tag_commit}"):
+            _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
 
 

@@ -43,6 +43,10 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- A library on a moving tag such as `stable` keeps following that tag when updated, instead of
+  switching to `nightly` whenever both tags point at the same commit. The library checkout records
+  the tag it follows, and Library Management reports it as the current ref.
+  [#5744](https://github.com/griptape-ai/griptape-nodes-engine/issues/5744)
 - `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
   tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
