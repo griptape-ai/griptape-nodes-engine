@@ -8,6 +8,7 @@ the real config system.
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -69,6 +70,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ProviderConfig,
     RunAgentRequest,
     RunAgentRequestArtifact,
+    RunAgentResultFailure,
     RunAgentResultSuccess,
     RunRecord,
     ThreadMetadata,
@@ -76,6 +78,11 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
+)
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextResultFailure,
+    GetAttributionContextResultSuccess,
 )
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
@@ -101,6 +108,9 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
@@ -1248,6 +1258,71 @@ class TestExplainAgentRunError:
 
         assert "not entitled" not in message
 
+    def test_budget_refusal_is_explained_as_a_halt(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A chat refusal arrives as a raw 403; the artist should read which budget refused it.
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body=a_refusal_body())
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
+
+        assert message.startswith(BUDGET_REPLY_HALT_PREFIX)
+        assert "tight" in message
+        assert len(caplog.records) == 1
+
+    def test_a_halt_a_tool_already_worded_is_not_logged_again(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The image tool logs its refusal before raising, and pydantic-ai may wrap what it raised.
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+        wrapped = RuntimeError("tool call failed")
+        wrapped.__cause__ = halt
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(wrapped, "griptape_cloud")
+
+        assert message == str(halt)
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_a_budget_halt_is_the_whole_failure_detail(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The editor recognizes a halt by its opening words, so no toast repeats the chat thread.
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+
+        async def refused(_request: RunAgentRequest) -> None:
+            raise halt
+
+        monkeypatch.setattr(providers_manager, "_run_agent", refused)
+
+        result = await providers_manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert result.result_details.result_details[0].message == str(halt)
+
+    @pytest.mark.asyncio
+    async def test_any_other_failure_is_framed_as_an_agent_error(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(_request: RunAgentRequest) -> None:
+            msg = "the provider hung up"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(providers_manager, "_run_agent", broken)
+
+        result = await providers_manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert result.result_details.result_details[0].message.startswith("Error running agent: ")
+
 
 _CLOUD_HOST = "cloud.griptape.ai"
 
@@ -1307,6 +1382,49 @@ async def _stub_compose_prompt(text: str, _url_artifacts: list[RunAgentRequestAr
     return ComposedPrompt(live=text, persist=text)
 
 
+async def _no_attribution(_request: object) -> GetAttributionContextResultFailure:
+    """Answer the attribution lookup as when no project is open."""
+    return GetAttributionContextResultFailure(result_details="no project")
+
+
+class TestAttributionHeaders:
+    """A Griptape Cloud chat turn carries the budget attribution header; others don't."""
+
+    @staticmethod
+    def _manager(provider_type: str, answer: object) -> tuple[AgentManager, list[object]]:
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_provider_name = "p"
+        manager._providers = [ProviderConfig(name="p", type=provider_type, model="m")]
+        asked: list[object] = []
+
+        async def ahandle_request(request: object) -> object:
+            asked.append(request)
+            return answer
+
+        manager._engine = SimpleNamespace(ahandle_request=ahandle_request)  # type: ignore[assignment]
+        return manager, asked
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_sends_the_header(self) -> None:
+        answer = GetAttributionContextResultSuccess(header_value="abc", project_chain=["p1"], result_details="ok")
+        manager, _asked = self._manager("griptape_cloud", answer)
+
+        assert await manager._attribution_headers(None) == {"X-Griptape-Attribution": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_sends_nothing(self) -> None:
+        manager, _asked = self._manager("griptape_cloud", await _no_attribution(None))
+
+        assert await manager._attribution_headers(None) == {}
+
+    @pytest.mark.asyncio
+    async def test_other_providers_are_not_asked(self) -> None:
+        manager, asked = self._manager("openai", None)
+
+        assert await manager._attribution_headers(None) == {}
+        assert asked == []
+
+
 class TestRunAgentResultPayloadContract:
     """`_run_agent`'s three success branches must agree on the payload's keys.
 
@@ -1350,6 +1468,7 @@ class TestRunAgentResultPayloadContract:
             # `_run_agent` reads the enabled MCP servers on every run; these
             # tests are about the result payload, so report none configured.
             handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+            ahandle_request=_no_attribution,
         )
         return manager
 

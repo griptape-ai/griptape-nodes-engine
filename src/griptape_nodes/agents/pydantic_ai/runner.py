@@ -58,7 +58,7 @@ from griptape_nodes.agents.pydantic_ai.model import build_model
 from griptape_nodes.drivers.cloud_models import ProviderID
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
+    from collections.abc import AsyncIterable, Awaitable, Callable, Mapping, Sequence
     from pathlib import Path
 
     from pydantic_ai._run_context import RunContext
@@ -341,6 +341,7 @@ class PydanticAgentRunner:
         history_rehydrator: Callable[[list[ModelMessage]], Awaitable[list[ModelMessage]]] | None = None,
         extra_toolsets: Sequence[AbstractToolset[Any]] | None = None,
         extra_instructions: str | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -378,6 +379,10 @@ class PydanticAgentRunner:
             extra_instructions: Instructions to append for this run only, in the
                 same additive spirit. Guidance that belongs to a toolset passed
                 via ``extra_toolsets`` travels here, so the two stay in sync.
+            extra_headers: HTTP headers to send on this run's model calls, and on
+                any Griptape Cloud call a tool makes. Per run, because a value
+                such as the budget attribution header follows the project open
+                when the turn starts.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -426,6 +431,7 @@ class PydanticAgentRunner:
                 capabilities=capabilities or None,
                 toolsets=list(extra_toolsets) if extra_toolsets else None,
                 instructions=extra_instructions or None,
+                model_settings={"extra_headers": dict(extra_headers)} if extra_headers else None,
             )
         )
         try:

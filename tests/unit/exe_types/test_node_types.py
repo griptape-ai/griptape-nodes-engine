@@ -5,6 +5,7 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
 from griptape_nodes.traits.slider import Slider
+from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, BudgetRefusal
 
 from .mocks import MockNode
 
@@ -332,3 +333,31 @@ class TestParameterVisibilityKeepsTraitStateLive:
         trait.max = 512
 
         assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}
+
+
+class TestBudgetHaltsTakeTheFailureBranch:
+    """A budget refusal is one node's failure, routed like any other.
+
+    A Failed branch may lead somewhere the budget does not reach, such as a local model, so
+    the node's wiring decides what happens next.
+    """
+
+    @staticmethod
+    def _a_budget_error() -> BudgetExceededError:
+        return BudgetExceededError(
+            f"{BUDGET_HALT_PREFIX} Griptape Cloud refused the next call.",
+            BudgetRefusal(),
+        )
+
+    def test_a_budget_error_takes_a_connected_failure_branch(self) -> None:
+        node = SuccessFailureNode(name="refused_call")
+        node._has_outgoing_connections = Mock(return_value=True)  # type: ignore[method-assign]
+
+        node._handle_failure_exception(self._a_budget_error())
+
+    def test_a_budget_error_raises_with_nothing_connected(self) -> None:
+        node = SuccessFailureNode(name="refused_call")
+        node._has_outgoing_connections = Mock(return_value=False)  # type: ignore[method-assign]
+
+        with pytest.raises(BudgetExceededError):
+            node._handle_failure_exception(self._a_budget_error())
