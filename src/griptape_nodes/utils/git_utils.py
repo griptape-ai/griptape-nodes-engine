@@ -719,8 +719,7 @@ def has_uncommitted_changes(library_path: Path) -> bool:
         msg = f"Cannot check status: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    # Untracked files inside a submodule (build output from installing vendored code) are not
-    # edits, and reset --hard would not remove them, so they would block every update.
+    # reset --hard cannot remove untracked submodule files, so treating them as edits would block updates.
     status = _run_git(
         ["status", "--porcelain", "--ignore-submodules=untracked"],
         error_msg=f"Failed to check git status at {library_path}",
@@ -749,11 +748,9 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
 
 
 def _realign_submodules(library_path: Path) -> None:
-    """Move submodules to the commits HEAD records, if that needs no discarding.
+    """Catch submodules up to HEAD before the status check, so a stale one is not read as an edit.
 
-    Runs before the uncommitted-changes check, so a submodule left behind by an earlier failed
-    sync, or by an engine that did not sync them, does not read as a local edit. Failure is left
-    for that check to report.
+    Submodules with edits are left as they are, for that check to report.
     """
     try:
         _update_submodules(library_path, error_msg="Could not realign submodules", error_cls=GitError)
@@ -1083,7 +1080,6 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
 
 
 def _finish_clone(git_url: str, target_path: Path, branch_tag_commit: str | None) -> None:
-    """Check out the requested ref in a fresh clone, then its submodules."""
     if branch_tag_commit:
         # A single checkout covers all three: a remote branch name becomes a local
         # tracking branch, a tag or commit lands on a detached HEAD.

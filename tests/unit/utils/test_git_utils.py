@@ -1470,7 +1470,6 @@ class TestSubmodules:
         assert has_uncommitted_changes(clone) is False
 
     def test_update_realigns_a_submodule_left_behind_without_overwrite(self, temp_dir: Path) -> None:
-        """An install updated before submodules were synced has a stale submodule tree."""
         origin = self.make_origin_with_submodule(temp_dir)
         upstream = temp_dir / "upstream"
         clone = temp_dir / "clone"
