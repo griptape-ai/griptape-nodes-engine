@@ -1254,6 +1254,7 @@ class TestUpdateLibraryGit:
         with pytest.raises(GitRefError):
             switch_branch_or_tag(clone, "stable")
         blocker.unlink()
+        assert get_current_ref(clone) == "stable"
 
         update_library_git(clone)
 
@@ -1358,19 +1359,46 @@ class TestSwitchBranchOrTag:
 
         assert get_current_tag(clone) == "stable"
 
-    def test_switch_branch_or_tag_leaves_tree_alone_when_recording_fails(self, temp_dir: Path) -> None:
-        """Test that a failure to record the tag fails the switch before the working tree moves."""
+    def test_switch_branch_or_tag_keeps_the_old_tag_when_the_checkout_fails(self, temp_dir: Path) -> None:
+        """Test that a failed switch to nightly leaves the library reporting and updating on stable."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        clone = clone_repo(origin, temp_dir / "clone")
+        switch_branch_or_tag(clone, "stable")
+        stable_sha = head_sha(clone)
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "nightly")
+
+        # An untracked file the nightly commit would overwrite makes the checkout fail after the fetch.
+        blocker = clone / "extra.txt"
+        blocker.write_text("local", encoding="utf-8")
+        with pytest.raises(GitRefError):
+            switch_branch_or_tag(clone, "nightly")
+        blocker.unlink()
+        assert get_current_ref(clone) == "stable"
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == stable_sha
+        assert get_current_ref(clone) == "stable"
+
+    def test_switch_branch_or_tag_to_a_branch_stops_reporting_the_recorded_tag(self, temp_dir: Path) -> None:
+        """Test that a tag recorded by an earlier switch is not reported once on a branch."""
         origin = make_origin_repo(temp_dir / "origin")
         run_git(origin, "tag", "v1.0.0")
         clone = clone_repo(origin, temp_dir / "clone")
+        switch_branch_or_tag(clone, "v1.0.0")
 
-        with (
-            patch("griptape_nodes.utils.git_utils._remember_tracked_tag", side_effect=GitRefError("boom")),
-            pytest.raises(GitRefError, match="boom"),
-        ):
-            switch_branch_or_tag(clone, "v1.0.0")
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance main")
+        switch_branch_or_tag(clone, "main")
 
         assert get_current_ref(clone) == "main"
+        assert get_current_tag(clone) is None
 
     def test_switch_branch_or_tag_checks_out_remote_only_branch(self, temp_dir: Path) -> None:
         """Test that a branch only present on the remote is checked out as a tracking branch."""
