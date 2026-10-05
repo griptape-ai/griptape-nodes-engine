@@ -748,10 +748,10 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
 
 
 def _realign_submodules(library_path: Path) -> None:
-    """Catch up submodules left behind HEAD before the status check, so they don't read as edits.
+    """Realign submodules that are behind the commits recorded by HEAD, so they don't read as edits.
 
-    Only a submodule checked out at an ancestor of the commit HEAD records is moved. One on any
-    other commit may hold the user's work, so it is left for the status check to report.
+    Only submodules whose current commit is an ancestor of the recorded commit are moved. A
+    divergent or ahead checkout may contain user work and remains for the status check to report.
     """
     root = get_git_repository_root(library_path)
     if root is None:
@@ -773,14 +773,14 @@ def _realign_submodules(library_path: Path) -> None:
 
 
 def _moved_submodule_paths(root: Path) -> list[str]:
-    """Paths, relative to root, of submodules checked out at a commit other than the one HEAD records."""
+    """Return paths, relative to root, of submodules not at the commit HEAD records."""
     status = _try_git(["submodule", "status"], root)
     if not status:
         return []
 
     paths = []
     for line in status.splitlines():
-        # "+<sha> <path>" or "+<sha> <path> (<describe>)". "+" marks a moved submodule.
+        # `git submodule status` prefixes moved submodules with "+" and may append "(<describe>)".
         if not line.startswith("+"):
             continue
         _sha, _, rest = line[1:].partition(" ")
@@ -791,7 +791,7 @@ def _moved_submodule_paths(root: Path) -> list[str]:
 
 
 def _submodule_is_behind(root: Path, path: str) -> bool:
-    """Whether the submodule's checkout is an ancestor of the commit HEAD records for it."""
+    """Return whether the checkout is an ancestor of the submodule commit recorded by HEAD."""
     recorded = _try_git(["rev-parse", f"HEAD:{path}"], root)
     if recorded is None:
         return False
