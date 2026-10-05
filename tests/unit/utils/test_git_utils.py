@@ -71,9 +71,21 @@ def remove_repo(path: Path) -> None:
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command with a throwaway identity so commits succeed without machine git config."""
+    """Run a git command with a throwaway identity so commits succeed without machine git config.
+
+    Allows the file transport so local repositories can be added as submodules.
+    """
     return subprocess.run(  # noqa: S603
-        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", *args],  # noqa: S607
+        [  # noqa: S607
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "protocol.file.allow=always",
+            *args,
+        ],
         cwd=cwd,
         check=True,
         capture_output=True,
@@ -1354,6 +1366,150 @@ class TestCloneRepository:
 
         with pytest.raises(GitCloneError, match="Git error while cloning"):
             clone_repository(str(temp_dir / "does-not-exist"), target)
+
+
+class TestSubmodules:
+    """Test that clones, updates, and ref switches leave submodules at the commit HEAD records."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @staticmethod
+    def commit_file(repo: Path, name: str, content: str) -> str:
+        (repo / name).write_text(content, encoding="utf-8")
+        run_git(repo, "add", ".")
+        run_git(repo, "commit", "-m", f"write {name}")
+        return head_sha(repo)
+
+    def make_origin_with_submodule(self, temp_dir: Path) -> Path:
+        """Create temp_dir/upstream and an origin library that vendors it at vendor/upstream."""
+        upstream = temp_dir / "upstream"
+        upstream.mkdir()
+        run_git(upstream, "init", "-b", "main")
+        self.commit_file(upstream, "code.py", "v1")
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "submodule", "add", str(upstream), "vendor/upstream")
+        run_git(origin, "commit", "-m", "add submodule")
+        return origin
+
+    def bump_submodule(self, origin: Path, upstream: Path) -> str:
+        """Advance upstream and commit the new submodule pointer in origin. Returns the new upstream SHA."""
+        sha = self.commit_file(upstream, "code.py", "v2")
+        submodule = origin / "vendor" / "upstream"
+        run_git(submodule, "fetch", "origin")
+        run_git(submodule, "checkout", sha)
+        run_git(origin, "add", "vendor/upstream")
+        run_git(origin, "commit", "-m", "bump submodule")
+        return sha
+
+    def test_clone_repository_populates_submodules(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        target = temp_dir / "clone"
+
+        clone_repository(str(origin), target)
+
+        assert head_sha(target / "vendor" / "upstream") == head_sha(upstream)
+        assert has_uncommitted_changes(target) is False
+
+    def test_clone_repository_checks_out_submodules_at_the_requested_ref(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "tag", "v1")
+        self.bump_submodule(origin, upstream)
+        target = temp_dir / "clone"
+
+        clone_repository(str(origin), target, "v1")
+
+        assert head_sha(target / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(target) is False
+
+    def test_git_update_from_remote_moves_submodules_to_the_new_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+
+        git_update_from_remote(clone)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_to_moving_tag_moves_submodules_to_the_new_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        run_git(origin, "tag", "latest")
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone, "latest")
+        new_sha = self.bump_submodule(origin, upstream)
+        run_git(origin, "tag", "-f", "latest")
+
+        update_to_moving_tag(clone, "latest")
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_with_overwrite_discards_changes_inside_submodules(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+        (clone / "vendor" / "upstream" / "code.py").write_text("dirty", encoding="utf-8")
+
+        update_library_git(clone, overwrite_existing=True)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_heals_a_submodule_left_behind_by_an_earlier_update(self, temp_dir: Path) -> None:
+        """An install updated before submodules were synced has a stale submodule tree."""
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+        run_git(clone, "fetch", "origin")
+        run_git(clone, "reset", "--hard", "origin/main")
+        assert has_uncommitted_changes(clone) is True
+
+        update_library_git(clone, overwrite_existing=True)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_switch_branch_or_tag_moves_submodules_to_the_ref_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "tag", "v1")
+        self.bump_submodule(origin, upstream)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+
+        switch_branch_or_tag(clone, "v1")
+
+        assert head_sha(clone / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_switch_branch_moves_submodules_to_the_branch_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "branch", "stable")
+        self.bump_submodule(origin, upstream)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+
+        switch_branch(clone, "stable")
+
+        assert head_sha(clone / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(clone) is False
 
 
 class TestSparseCheckoutLibraryJson:

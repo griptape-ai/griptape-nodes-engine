@@ -716,6 +716,24 @@ def has_uncommitted_changes(library_path: Path) -> bool:
     return bool(status)
 
 
+def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[GitError], force: bool = False) -> None:
+    """Check out every submodule at the commit HEAD records, cloning any that are missing.
+
+    reset and checkout move submodule pointers without touching the submodule trees, which then
+    read as uncommitted changes on the next update. A no-op for repositories without submodules.
+
+    Args:
+        library_path: Any path inside the repository. git applies this repository-wide.
+        error_msg: Prefix for the raised exception's message.
+        error_cls: Exception type to raise when the command fails.
+        force: Discard local changes inside submodules.
+    """
+    args = ["submodule", "update", "--init", "--recursive"]
+    if force:
+        args.append("--force")
+    _run_git(args, error_msg=error_msg, cwd=library_path, error_cls=error_cls)
+
+
 def _resolve_update_upstream(library_path: Path) -> str:
     """Validate that a branch-based update is possible and return the upstream ref name.
 
@@ -778,6 +796,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     error_msg = f"Git error during update at {library_path}"
     _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _update_submodules(library_path, error_msg=error_msg, error_cls=GitPullError, force=overwrite_existing)
 
     logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream)
 
@@ -832,6 +851,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _update_submodules(library_path, error_msg=error_msg, error_cls=GitPullError, force=overwrite_existing)
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -903,6 +923,7 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
 
     if _ref_exists(library_path, f"refs/heads/{branch_name}"):
         _run_git(["checkout", branch_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
+        _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
         logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
         return
 
@@ -917,6 +938,7 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
         cwd=library_path,
         error_cls=GitRefError,
     )
+    _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
     logger.debug(
         "Created and checked out tracking branch %s from %s at %s", branch_name, remote_branch_name, library_path
     )
@@ -970,6 +992,7 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
         msg = f"Ref {ref_name} not found at {library_path}"
         raise GitRefError(msg)
 
+    _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
     logger.debug("Checked out %s at %s", ref_name, library_path)
 
 
@@ -1022,6 +1045,13 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
             error_cls=GitCloneError,
         )
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
+
+    # After the checkout, so submodules land on the commits the requested ref records.
+    _update_submodules(
+        target_path,
+        error_msg=f"Failed to fetch submodules of {git_url} in {target_path}",
+        error_cls=GitCloneError,
+    )
 
 
 def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
