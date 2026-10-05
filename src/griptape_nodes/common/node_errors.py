@@ -8,6 +8,8 @@ import logging
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ForwardedNodeError
 from griptape_nodes.retained_mode.events.node_error_details import (
+    MAX_LINKS,
+    ErrorAttachments,
     NodeErrorDetails,
     exception_display_message,
     qualified_type_name,
@@ -83,23 +85,44 @@ def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDe
         # error-reporting path, and messages=[] still tells the editor the node never ran.
         logger.debug("Node '%s' reported a validation failure with no exceptions", node_name)
         return NodeErrorDetails(message="The node failed validation but did not say why.", messages=[])
-    details = _from_exception(node_name, exceptions[0])
-    details.messages = [_message(node_name, exception) for exception in exceptions]
+    details = NodeErrorDetails(
+        message=_message(node_name, exceptions[0]),
+        exception_type=_exception_type(exceptions[0]),
+        messages=[_message(node_name, exception) for exception in exceptions],
+    )
+    # Any exception in the list may be a NodeError, such as one linking to the missing secret.
+    # On a clash the earlier exception wins: its field value, its response, its links first.
+    for exception in exceptions:
+        attachments = _attachments(exception)
+        if attachments is None:
+            continue
+        for key, value in attachments.fields.items():
+            details.fields.setdefault(key, value)
+        if details.response is None:
+            details.response = attachments.response
+        for link in attachments.links:
+            if len(details.links) < MAX_LINKS and link not in details.links:
+                details.links.append(link)
     return details
 
 
 def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
     details = NodeErrorDetails(message=_message(node_name, exc), exception_type=_exception_type(exc))
-    if isinstance(exc, ForwardedNodeError):
-        attachments = exc.attachments
-    elif isinstance(exc, NodeError):
-        attachments = sanitize_attachments(exc.fields, exc.response, exc.links)
-    else:
+    attachments = _attachments(exc)
+    if attachments is None:
         return details
     details.fields = attachments.fields
     details.response = attachments.response
     details.links = attachments.links
     return details
+
+
+def _attachments(exc: BaseException) -> ErrorAttachments | None:
+    if isinstance(exc, ForwardedNodeError):
+        return exc.attachments
+    if isinstance(exc, NodeError):
+        return sanitize_attachments(exc.fields, exc.response, exc.links)
+    return None
 
 
 def _exception_type(exc: BaseException) -> str | None:

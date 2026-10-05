@@ -221,6 +221,39 @@ class TestValidation:
 
         assert details.messages == ["Only one"]
 
+    def test_attachments_of_a_later_node_error_are_kept_on_both_paths(self) -> None:
+        link = NodeErrorLink(label="Add the API key", url="#settings-secrets?filter=MY_KEY")
+        missing_key = NodeError("API key MY_KEY is missing.", fields={"secret": "MY_KEY"}, links=[link])
+
+        in_process = build_node_error_details(NODE_NAME, [ValueError("Prompt is required."), missing_key])
+        from_worker = build_node_error_details(
+            NODE_NAME, [_across_worker(ValueError("Prompt is required.")), _across_worker(missing_key)]
+        )
+
+        for details in (in_process, from_worker):
+            assert details.message == "Prompt is required."
+            assert details.messages == ["Prompt is required.", "API key MY_KEY is missing."]
+            assert details.fields == {"secret": "MY_KEY"}
+            assert details.links == [link]
+
+    def test_attachments_from_several_node_errors_are_merged(self) -> None:
+        def docs(i: int) -> NodeErrorLink:
+            return NodeErrorLink(label=f"Docs {i}", url=f"https://docs.griptapenodes.com/{i}")
+
+        first = NodeError("First", fields={"request_id": "r1"}, response={"status": "A"}, links=[docs(1), docs(2)])
+        second = NodeError(
+            "Second",
+            fields={"request_id": "r2", "error_code": "E7"},
+            response={"status": "B"},
+            links=[docs(2), docs(3), docs(4)],
+        )
+
+        details = build_node_error_details(NODE_NAME, [first, second])
+
+        assert details.fields == {"request_id": "r1", "error_code": "E7"}
+        assert details.response == {"status": "A"}
+        assert details.links == [docs(1), docs(2), docs(3)]
+
 
 class TestErrorMessageUnchanged:
     def test_executor_message_matches_the_formatted_failure(self) -> None:
