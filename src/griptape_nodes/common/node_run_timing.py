@@ -14,15 +14,29 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.text import Text
 from rich.tree import Tree
 
+from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
+from griptape_nodes.retained_mode.managers.settings import LOG_NODE_RUN_TIMING_KEY
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+
 logger = logging.getLogger("griptape_nodes")
 
 # Wide enough that deep trees with long node names stay on one line each.
 _RENDER_WIDTH = 500
+
+
+def is_node_run_timing_enabled(config_manager: ConfigManager) -> bool:
+    """Whether node run timing is on: the beta feature and the user's logging setting must both be on."""
+    if not is_beta_enabled(NODE_RUN_TIMING, config_manager):
+        return False
+    return config_manager.get_config_value(LOG_NODE_RUN_TIMING_KEY, default=True, cast_type=bool)
 
 
 class NodeRunStatus(StrEnum):

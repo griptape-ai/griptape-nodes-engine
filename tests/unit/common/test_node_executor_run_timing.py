@@ -12,12 +12,15 @@ from griptape_nodes.common.node_executor import NodeExecutor, canvas_names_for_l
 from griptape_nodes.common.node_run_timing import NodeRunTimer, RunOutcome
 from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.managers.settings import LOG_NODE_RUN_TIMING_KEY
 
 
 def _make_executor(config: dict[str, object]) -> NodeExecutor:
     executor = NodeExecutor(engine=MagicMock())
     mock_engine = cast("MagicMock", executor.engine)
-    mock_engine.config_manager.get_config_value.side_effect = lambda key, **_kwargs: config.get(key)
+    mock_engine.config_manager.get_config_value.side_effect = lambda key, default=None, **_kwargs: config.get(
+        key, default
+    )
     mock_engine.flow_manager.run_timer = NodeRunTimer()
     mock_engine.ahandle_request = AsyncMock(
         return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={})
@@ -48,6 +51,24 @@ class TestNodeRunTiming:
     @pytest.mark.asyncio
     async def test_logs_nothing_when_disabled(self, caplog: pytest.LogCaptureFixture) -> None:
         executor = _make_executor({})
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await executor.execute(_make_node())
+
+        assert not any("TIME TO RUN" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_logs_nothing_when_the_logging_setting_is_off(self, caplog: pytest.LogCaptureFixture) -> None:
+        executor = _make_executor({NODE_RUN_TIMING.config_key: True, LOG_NODE_RUN_TIMING_KEY: False})
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await executor.execute(_make_node())
+
+        assert not any("TIME TO RUN" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_logging_setting_alone_does_not_turn_timing_on(self, caplog: pytest.LogCaptureFixture) -> None:
+        executor = _make_executor({LOG_NODE_RUN_TIMING_KEY: True})
 
         with caplog.at_level(logging.INFO, logger="griptape_nodes"):
             await executor.execute(_make_node())

@@ -12,6 +12,7 @@ from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachi
 from griptape_nodes.machines.fsm import WorkflowState
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING
+from griptape_nodes.retained_mode.managers.settings import LOG_NODE_RUN_TIMING_KEY
 
 
 def _make_context(*, is_isolated: bool = False, errored: bool = False, canceled: bool = False) -> MagicMock:
@@ -66,7 +67,9 @@ class TestStartFlowStartsTheRun:
     @staticmethod
     def _set_timing(context: MagicMock, *, enabled: bool) -> None:
         config = {NODE_RUN_TIMING.config_key: enabled}
-        context.engine.config_manager.get_config_value.side_effect = lambda key, **_kwargs: config.get(key)
+        context.engine.config_manager.get_config_value.side_effect = lambda key, default=None, **_kwargs: config.get(
+            key, default
+        )
 
     @pytest.mark.asyncio
     async def test_starts_timing_when_enabled(self) -> None:
@@ -84,6 +87,20 @@ class TestStartFlowStartsTheRun:
     async def test_does_not_start_timing_when_disabled(self) -> None:
         context = _make_context()
         self._set_timing(context, enabled=False)
+        machine = _make_machine(context)
+        node = MagicMock()
+
+        await machine.start_flow(node, node)
+
+        context.engine.flow_manager.run_timer.start_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_start_timing_when_the_logging_setting_is_off(self) -> None:
+        context = _make_context()
+        config = {NODE_RUN_TIMING.config_key: True, LOG_NODE_RUN_TIMING_KEY: False}
+        context.engine.config_manager.get_config_value.side_effect = lambda key, default=None, **_kwargs: config.get(
+            key, default
+        )
         machine = _make_machine(context)
         node = MagicMock()
 

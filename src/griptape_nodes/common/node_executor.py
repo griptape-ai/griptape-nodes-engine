@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
-from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus
+from griptape_nodes.common.node_run_timing import NodeRunRecord, NodeRunStatus, is_node_run_timing_enabled
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -42,7 +42,6 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
-from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
@@ -330,7 +329,7 @@ class NodeExecutor(EngineScoped):
             status = NodeRunStatus.CANCELLED
             raise
         finally:
-            if is_beta_enabled(NODE_RUN_TIMING, self.engine.config_manager):
+            if is_node_run_timing_enabled(self.engine.config_manager):
                 record = NodeRunRecord(
                     node_name=node_name,
                     node_type=type(node).__name__,

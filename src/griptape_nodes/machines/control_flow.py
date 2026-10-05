@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from griptape_nodes.common.node_run_timing import RunOutcome
+from griptape_nodes.common.node_run_timing import RunOutcome, is_node_run_timing_enabled
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
@@ -13,7 +13,6 @@ from griptape_nodes.exe_types.node_types import (
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
-from griptape_nodes.retained_mode.beta_features import NODE_RUN_TIMING, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -224,7 +223,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
     ) -> None:
         # An isolated flow is one loop iteration inside a run that is already being timed.
-        if not self._context.is_isolated and is_beta_enabled(NODE_RUN_TIMING, self._context.engine.config_manager):
+        if not self._context.is_isolated and is_node_run_timing_enabled(self._context.engine.config_manager):
             self._context.engine.flow_manager.run_timer.start_run()
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)

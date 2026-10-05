@@ -35,6 +35,7 @@ LOG_TO_FILE_KEY = "logging.log_to_file"
 LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
 SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
+LOG_NODE_RUN_TIMING_KEY = "logging.log_node_run_timing"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so under this flag beta feature entries are converted to booleans, and one
 # that can't be converted fails validation so the variable is reported as a bad value.
@@ -447,6 +448,11 @@ class LoggingSettings(BaseModel):
         category=LOGGING,
         default=5000,
         description="How many of the most recent log lines the engine keeps in memory for the current session, so a problem report includes what just happened without you having to reproduce it. These lines carry whatever log_level allows, so raise log_level to DEBUG before reproducing a problem if you need debug detail in the report. Set to 0 to disable, which means a problem report can only include whatever reached the log files.",
+    )
+    log_node_run_timing: bool = Field(
+        category=LOGGING,
+        default=True,
+        description="Write how long each node took to run to the engine log, and a summary when a workflow run finishes, fails, or is cancelled, showing which nodes ran in parallel and which were slowest. While this is in beta, the 'Node run timing' beta feature must also be on.",
     )
 
 
