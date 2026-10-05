@@ -73,10 +73,7 @@ def remove_repo(path: Path) -> None:
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command with a throwaway identity so commits succeed without machine git config.
-
-    Allows the file transport so local repositories can be added as submodules.
-    """
+    """Run git with fixture-only identity and local-file transport settings."""
     return subprocess.run(  # noqa: S603
         [  # noqa: S607
             "git",
@@ -1374,11 +1371,8 @@ class TestCloneRepository:
 
 
 class TestSubmodules:
-    """Test that clones, updates, and ref switches leave submodules at the commit HEAD records."""
-
     @pytest.fixture
     def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
@@ -1395,7 +1389,6 @@ class TestSubmodules:
         return head_sha(repo)
 
     def make_origin_with_submodule(self, temp_dir: Path) -> Path:
-        """Create temp_dir/upstream and an origin library that vendors it at vendor/upstream."""
         upstream = temp_dir / "upstream"
         upstream.mkdir()
         run_git(upstream, "init", "-b", "main")
@@ -1406,7 +1399,6 @@ class TestSubmodules:
         return origin
 
     def bump_submodule(self, origin: Path, upstream: Path) -> str:
-        """Advance upstream and commit the new submodule pointer in origin. Returns the new upstream SHA."""
         sha = self.commit_file(upstream, "code.py", "v2")
         submodule = origin / "vendor" / "upstream"
         run_git(submodule, "fetch", "origin")
@@ -1478,7 +1470,6 @@ class TestSubmodules:
         assert has_uncommitted_changes(clone) is False
 
     def test_update_heals_a_submodule_left_behind_by_an_earlier_update(self, temp_dir: Path) -> None:
-        """An install updated before submodules were synced has a stale submodule tree."""
         origin = self.make_origin_with_submodule(temp_dir)
         upstream = temp_dir / "upstream"
         clone = temp_dir / "clone"
@@ -1523,8 +1514,6 @@ class TestSubmodules:
 
 
 class TestSubmoduleProtocols:
-    """Test the transports a library's submodules may use."""
-
     def test_clone_repository_refuses_a_submodule_on_the_local_disk(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         local.mkdir()

@@ -307,9 +307,8 @@ _GIT_TIMEOUT_SECONDS = 600
 # before a connection is attempted.
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 
-# Submodule URLs come from the library's own .gitmodules, not from the user. Without `file`, a
-# library cannot pull a repository off the user's disk into its checkout. git blocks that by
-# default, and GIT_ALLOW_PROTOCOL would otherwise override it.
+# Submodule URLs come from the library, so they cannot use `file` to read repositories from the
+# user's disk. GIT_ALLOW_PROTOCOL would otherwise override git's default block.
 _GIT_SUBMODULE_ALLOWED_PROTOCOLS = "git:http:https:ssh"
 
 # git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
@@ -730,12 +729,6 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
 
     reset and checkout move submodule pointers without touching the submodule trees, which then
     read as uncommitted changes on the next update. A no-op for repositories without submodules.
-
-    Args:
-        library_path: Any path inside the repository. git applies this repository-wide.
-        error_msg: Prefix for the raised exception's message.
-        error_cls: Exception type to raise when the command fails.
-        force: Discard local changes inside submodules.
     """
     args = ["submodule", "update", "--init", "--recursive"]
     if force:
