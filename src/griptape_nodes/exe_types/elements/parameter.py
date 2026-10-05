@@ -84,7 +84,7 @@ class ParameterBase(BaseNodeElement, ABC):
         pass
 
 
-class Parameter(BaseNodeElement, UIOptionsMixin):
+class Parameter(UIOptionsMixin, BaseNodeElement):
     # This is the list of types that the Parameter can accept, either externally or when internally treated as a property.
     # Today, we can accept multiple types for input, but only a single output type.
     tooltip: str | list[dict]  # Default tooltip, can be string or list of dicts
