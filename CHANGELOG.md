@@ -22,9 +22,20 @@ the engine's request API from working without edits. Migration steps live in
   or is cancelled, it also logs a `RUN SUMMARY` with the total time, the nodes grouped by which ran
   in parallel, slowest first, and the nodes inside each group or loop.
   [#5717](https://github.com/griptape-ai/griptape-nodes-engine/issues/5717)
+- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and
+  `adelete_uploaded_artifact()`. Nodes using them can upload multiple reference images concurrently
+  without blocking other nodes or delaying "Stop". Uploads interrupted by "Stop" finish and are
+  deleted in the background.
+  [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
 
 ### Changed
 
+- Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
+  first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
+  Griptape Cloud.
+  [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
+- Serializing an event now walks its payload once instead of twice, cutting serialization cost —
+  most noticeably on events with large parameter values.
 - Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
   engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
   still work and act on the current engine's registry.
@@ -49,6 +60,9 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- The "Conflicting values" warning for a parameter's `ui_options` now names the node, its type, and
+  the library that defined it, so it is clear which library author to contact.
+  [#5742](https://github.com/griptape-ai/griptape-nodes-engine/issues/5742)
 
 ## [0.103.0] - 2026-09-29
 
