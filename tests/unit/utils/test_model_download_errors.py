@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import errno
 
-import httpx
+import httpx2
 import pytest
 from huggingface_hub.errors import (
     GatedRepoError,
@@ -29,8 +29,8 @@ MODEL_ID = "black-forest-labs/FLUX.1-dev"
 
 def _hub_error(error_class: type[HfHubHTTPError], status_code: int) -> HfHubHTTPError:
     """Build a hub error the way `hf_raise_for_status` does, response and all."""
-    request = httpx.Request("GET", f"https://huggingface.co/api/models/{MODEL_ID}")
-    return error_class(f"{status_code} Client Error.", response=httpx.Response(status_code, request=request))
+    request = httpx2.Request("GET", f"https://huggingface.co/api/models/{MODEL_ID}")
+    return error_class(f"{status_code} Client Error.", response=httpx2.Response(status_code, request=request))
 
 
 def _wrapped_by_the_hub(cause: Exception) -> LocalEntryNotFoundError:
@@ -65,14 +65,16 @@ class TestClassify:
         assert classify(_hub_error(HfHubHTTPError, 429)) is DownloadErrorKind.RATE_LIMITED
 
     def test_other_http_failures_stay_unclassified(self) -> None:
-        """Also guards the branch order: every HfHubHTTPError is an httpx.HTTPError and an OSError."""
+        """Also guards the branch order: every HfHubHTTPError is an httpx2.HTTPError and an OSError."""
         assert classify(_hub_error(HfHubHTTPError, 500)) is DownloadErrorKind.UNKNOWN
 
     def test_full_disk(self) -> None:
         assert classify(OSError(errno.ENOSPC, "No space left on device")) is DownloadErrorKind.NO_DISK_SPACE
 
     def test_unreachable_host_mid_transfer(self) -> None:
-        assert classify(httpx.ConnectError("nodename nor servname provided")) is (DownloadErrorKind.NETWORK_UNREACHABLE)
+        assert classify(httpx2.ConnectError("nodename nor servname provided")) is (
+            DownloadErrorKind.NETWORK_UNREACHABLE
+        )
 
     def test_unreachable_host_before_any_transfer(self) -> None:
         """The shape an offline download actually fails with.
@@ -81,7 +83,7 @@ class TestClassify:
         `LocalEntryNotFoundError`, which is a FileNotFoundError rather than an httpx error, so the
         transport branch alone left the common offline case unclassified.
         """
-        offline = _wrapped_by_the_hub(httpx.ConnectError("[Errno 8] nodename nor servname provided"))
+        offline = _wrapped_by_the_hub(httpx2.ConnectError("[Errno 8] nodename nor servname provided"))
 
         assert classify(offline) is DownloadErrorKind.NETWORK_UNREACHABLE
 

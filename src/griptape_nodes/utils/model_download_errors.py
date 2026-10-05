@@ -22,7 +22,7 @@ from enum import StrEnum
 from http import HTTPStatus
 from typing import NamedTuple
 
-import httpx
+import httpx2
 from huggingface_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
@@ -91,7 +91,7 @@ def classify(exc: Exception) -> DownloadErrorKind:  # noqa: C901, PLR0911
         DownloadErrorKind: The matching kind, or `UNKNOWN` when nothing fits.
     """
     # Order is load-bearing: GatedRepoError is a RepositoryNotFoundError, and every
-    # HfHubHTTPError is also an httpx.HTTPError and an OSError.
+    # HfHubHTTPError is also an httpx2.HTTPError and an OSError.
     if isinstance(exc, GatedRepoError):
         if exc.response.status_code == HTTPStatus.FORBIDDEN:
             return DownloadErrorKind.GATED_NO_ACCESS
@@ -113,7 +113,7 @@ def classify(exc: Exception) -> DownloadErrorKind:  # noqa: C901, PLR0911
         return DownloadErrorKind.NO_DISK_SPACE
     if isinstance(exc, LocalEntryNotFoundError):
         return _classify_hub_fallback(exc)
-    if isinstance(exc, httpx.TransportError):
+    if isinstance(exc, httpx2.TransportError):
         return DownloadErrorKind.NETWORK_UNREACHABLE
     return DownloadErrorKind.UNKNOWN
 

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12.0, <3.14"
 
 [[package]]
@@ -666,7 +666,7 @@ requires-dist = [
     { name = "griptape", specifier = ">=1.10.2" },
     { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
     { name = "httpx2", specifier = ">=2.12.0,<3.0.0" },
-    { name = "huggingface-hub", specifier = ">=1.9.0" },
+    { name = "huggingface-hub", specifier = ">=2.1.1" },
     { name = "json-repair", specifier = ">=0.46.1" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "packaging", specifier = ">=25.0" },
@@ -819,22 +819,22 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.28.0"
+version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
-    { name = "httpx" },
+    { name = "httpx2" },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/ae/222a91937ebee7f62c0ca8f5ee0afd97577caf24c0abb927d1f5c7e9f6d2/huggingface_hub-1.28.0.tar.gz", hash = "sha256:46a2e950c09234de54093d587d1675382f0d08dbd600d9fb599b5932f5b2c6cb", size = 959609, upload-time = "2026-08-18T12:27:15.101Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/58/542f21ca4af36c79b157280abc1874cd0d8dedd45a8a3554759a859abe02/huggingface_hub-2.1.1.tar.gz", hash = "sha256:c56285bb7047ff1fe510f23be0705934fb3fd43afda75543341e6574a7e79630", size = 1037212, upload-time = "2026-10-01T12:32:34.793Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/0e/eafef18f1a75e125e68395db21131db0cf868a128ecd2fce69b4df6c584b/huggingface_hub-1.28.0-py3-none-any.whl", hash = "sha256:58a8bacb03072edfc38067065e9dc24bbb34805410fcd36a1632de0b329660bb", size = 793202, upload-time = "2026-08-18T12:27:12.719Z" },
+    { url = "https://files.pythonhosted.org/packages/33/23/885b3a3b510c305f1d84421913935e19b6a48b93d173a0541674c1e88c2a/huggingface_hub-2.1.1-py3-none-any.whl", hash = "sha256:d76fa1d8e6a59e01f012b1d88da604c099c7a0f2e26b1cc7d708f0a4283bd2a2", size = 838033, upload-time = "2026-10-01T12:32:32.91Z" },
 ]
 
 [[package]]
