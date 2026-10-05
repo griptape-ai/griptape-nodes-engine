@@ -307,13 +307,18 @@ _GIT_TIMEOUT_SECONDS = 600
 # before a connection is attempted.
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 
+# Submodule URLs come from the library's own .gitmodules, not from the user. Without `file`, a
+# library cannot pull a repository off the user's disk into its checkout. git blocks that by
+# default, and GIT_ALLOW_PROTOCOL would otherwise override it.
+_GIT_SUBMODULE_ALLOWED_PROTOCOLS = "git:http:https:ssh"
+
 # git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
 # `ext` helper hands its address to a shell. The prefix is anchored and excludes "/", ":" and
 # "[" so a normal URL ("https://host/x") and an IPv6 literal ("https://[::1]/x") don't match.
 _REMOTE_HELPER_URL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
 
 
-def _git_env() -> dict[str, str]:
+def _git_env(allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS) -> dict[str, str]:
     """Build the environment for a git subprocess.
 
     The engine runs headless, so git must never block on an interactive credential
@@ -328,7 +333,7 @@ def _git_env() -> dict[str, str]:
     return {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
+        "GIT_ALLOW_PROTOCOL": allowed_protocols,
     }
 
 
@@ -388,7 +393,9 @@ def _git_os_error(cwd: Path | None, error: OSError) -> GitError:
     return GitError(msg)
 
 
-def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+def _git(
+    args: list[str], cwd: Path | None, allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS
+) -> subprocess.CompletedProcess[str]:
     """Run a git command to completion without inspecting its exit code.
 
     Raises:
@@ -400,7 +407,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(  # noqa: S603
             ["git", *args],  # noqa: S607
             cwd=cwd,
-            env=_git_env(),
+            env=_git_env(allowed_protocols),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             # git writes paths, refs, and messages as UTF-8 regardless of the process locale,
@@ -428,6 +435,7 @@ def _run_git(
     error_msg: str,
     cwd: Path | None = None,
     error_cls: type[GitError] = GitError,
+    allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS,
 ) -> str:
     """Run a git command and return its stripped stdout.
 
@@ -436,6 +444,7 @@ def _run_git(
         error_msg: Prefix for the raised exception's message. git's stderr is appended to it.
         cwd: Directory to run the command in.
         error_cls: Exception type to raise when the command fails.
+        allowed_protocols: Transports git may use, as a GIT_ALLOW_PROTOCOL list.
 
     Returns:
         str: The command's stdout, stripped.
@@ -446,7 +455,7 @@ def _run_git(
         GitRepositoryError: If cwd is not a directory.
         GitError: If git times out or cannot be run for any other reason.
     """
-    result = _git(args, cwd)
+    result = _git(args, cwd, allowed_protocols)
     if result.returncode != 0:
         msg = f"{error_msg}: {result.stderr.strip()}"
         raise error_cls(msg)
@@ -731,7 +740,13 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
     args = ["submodule", "update", "--init", "--recursive"]
     if force:
         args.append("--force")
-    _run_git(args, error_msg=error_msg, cwd=library_path, error_cls=error_cls)
+    _run_git(
+        args,
+        error_msg=error_msg,
+        cwd=library_path,
+        error_cls=error_cls,
+        allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+    )
 
 
 def _resolve_update_upstream(library_path: Path) -> str:

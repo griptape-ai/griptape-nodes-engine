@@ -16,8 +16,10 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.utils import git_utils
 from griptape_nodes.utils.git_utils import (
     _GIT_ALLOWED_PROTOCOLS,
+    _GIT_SUBMODULE_ALLOWED_PROTOCOLS,
     _GIT_TIMEOUT_SECONDS,
     GitCloneError,
     GitError,
@@ -830,7 +832,10 @@ class TestGitEnvironment:
 
         assert mock_run.call_args_list
         for call in mock_run.call_args_list:
-            assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
+            if call.args[0][1] == "submodule":
+                assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_SUBMODULE_ALLOWED_PROTOCOLS
+            else:
+                assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
             assert call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
@@ -1377,6 +1382,11 @@ class TestSubmodules:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
+    @pytest.fixture(autouse=True)
+    def allow_file_submodules(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The fixtures vendor local repositories, which production refuses for submodules."""
+        monkeypatch.setattr(git_utils, "_GIT_SUBMODULE_ALLOWED_PROTOCOLS", _GIT_ALLOWED_PROTOCOLS)
+
     @staticmethod
     def commit_file(repo: Path, name: str, content: str) -> str:
         (repo / name).write_text(content, encoding="utf-8")
@@ -1510,6 +1520,27 @@ class TestSubmodules:
 
         assert head_sha(clone / "vendor" / "upstream") == old_sha
         assert has_uncommitted_changes(clone) is False
+
+
+class TestSubmoduleProtocols:
+    """Test the transports a library's submodules may use."""
+
+    def test_clone_repository_refuses_a_submodule_on_the_local_disk(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        local.mkdir()
+        run_git(local, "init", "-b", "main")
+        (local / "secret.txt").write_text("secret", encoding="utf-8")
+        run_git(local, "add", ".")
+        run_git(local, "commit", "-m", "secret")
+        origin = make_origin_repo(tmp_path / "origin")
+        run_git(origin, "submodule", "add", str(local), "vendor/local")
+        run_git(origin, "commit", "-m", "add submodule")
+        target = tmp_path / "clone"
+
+        with pytest.raises(GitCloneError, match="Failed to fetch submodules"):
+            clone_repository(str(origin), target)
+
+        assert not (target / "vendor" / "local" / "secret.txt").exists()
 
 
 class TestSparseCheckoutLibraryJson:
