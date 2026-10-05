@@ -248,11 +248,31 @@ class TestValidation:
             links=[docs(2), docs(3), docs(4)],
         )
 
-        details = build_node_error_details(NODE_NAME, [first, second])
+        exceptions: list[Exception] = [first, second]
+        details = build_node_error_details(NODE_NAME, exceptions)
 
         assert details.fields == {"request_id": "r1", "error_code": "E7"}
         assert details.response == {"status": "A"}
         assert details.links == [docs(1), docs(2), docs(3)]
+
+    def test_dropped_marker_is_removed_when_another_response_is_kept(self) -> None:
+        kept = NodeError("Kept", response={"status": "A"})
+        dropped = NodeError("Dropped", response={"image": "A" * MAX_RESPONSE_BYTES})
+
+        orders: list[list[Exception]] = [[kept, dropped], [dropped, kept]]
+        for exceptions in orders:
+            details = build_node_error_details(NODE_NAME, exceptions)
+
+            assert details.response == {"status": "A"}
+            assert RESPONSE_DROPPED_FIELD not in details.fields
+
+    def test_dropped_marker_stays_when_no_response_is_kept(self) -> None:
+        dropped = NodeError("Dropped", response={"image": "A" * MAX_RESPONSE_BYTES})
+
+        details = build_node_error_details(NODE_NAME, [ValueError("Prompt is required."), dropped])
+
+        assert details.response is None
+        assert details.fields == {RESPONSE_DROPPED_FIELD: "true"}
 
 
 class TestErrorMessageUnchanged:

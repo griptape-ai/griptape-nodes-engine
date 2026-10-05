@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ForwardedNodeError
 from griptape_nodes.retained_mode.events.node_error_details import (
     MAX_LINKS,
+    RESPONSE_DROPPED_FIELD,
     ErrorAttachments,
     NodeErrorDetails,
     exception_display_message,
@@ -103,6 +104,9 @@ def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDe
         for link in attachments.links:
             if len(details.links) < MAX_LINKS and link not in details.links:
                 details.links.append(link)
+    # The marker says no response could be shown, which is false once another exception's was kept.
+    if details.response is not None:
+        details.fields.pop(RESPONSE_DROPPED_FIELD, None)
     return details
 
 
