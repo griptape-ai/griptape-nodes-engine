@@ -1,0 +1,124 @@
+{
+  "EventRequest": {
+    "request_id": "r1",
+    "response_topic": "t",
+    "event_type": "EventRequest",
+    "request_type": "GetParameterValueRequest",
+    "request": {
+      "broadcast_result": true,
+      "request_id": null,
+      "failure_log_level": null,
+      "fields": null,
+      "parameter_name": "p",
+      "node_name": "n"
+    }
+  },
+  "EventRequestBatch": {
+    "event_type": "EventRequestBatch",
+    "requests": [
+      {
+        "request_id": "a",
+        "response_topic": null,
+        "event_type": "EventRequest",
+        "request_type": "GetParameterValueRequest",
+        "request": {
+          "broadcast_result": true,
+          "request_id": null,
+          "failure_log_level": null,
+          "fields": null,
+          "parameter_name": "p",
+          "node_name": "n"
+        }
+      }
+    ]
+  },
+  "EventResultSuccess": {
+    "request_id": "r1",
+    "response_topic": null,
+    "retained_mode": "m",
+    "event_type": "EventResultSuccess",
+    "request_type": "GetParameterValueRequest",
+    "result_type": "GetParameterValueResultSuccess",
+    "request": {
+      "broadcast_result": true,
+      "request_id": null,
+      "failure_log_level": null,
+      "fields": null,
+      "parameter_name": "p",
+      "node_name": "n"
+    },
+    "result": {
+      "result_details": {
+        "result_details": [
+          {
+            "level": 10,
+            "message": "done"
+          }
+        ]
+      },
+      "altered_workflow_state": false,
+      "input_types": [
+        "str"
+      ],
+      "type": "str",
+      "output_type": "str",
+      "value": {
+        "a": [
+          1,
+          2,
+          {
+            "b": "c"
+          }
+        ]
+      }
+    }
+  },
+  "EventResultFailure": {
+    "request_id": "r2",
+    "response_topic": null,
+    "retained_mode": null,
+    "event_type": "EventResultFailure",
+    "request_type": "GetParameterValueRequest",
+    "result_type": "GetParameterValueResultFailure",
+    "request": {
+      "broadcast_result": true,
+      "request_id": null,
+      "failure_log_level": null,
+      "fields": null,
+      "parameter_name": "p",
+      "node_name": "n"
+    },
+    "result": {
+      "result_details": {
+        "result_details": [
+          {
+            "level": 40,
+            "message": "nope"
+          }
+        ]
+      },
+      "altered_workflow_state": false,
+      "exception": null
+    }
+  },
+  "ExecutionEvent": {
+    "event_type": "ExecutionEvent",
+    "payload_type": "CurrentControlNodeEvent",
+    "payload": {
+      "node_name": "n"
+    }
+  },
+  "AppEvent": {
+    "event_type": "AppEvent",
+    "payload_type": "AppInitializationComplete",
+    "payload": {
+      "libraries_to_download": [],
+      "libraries_to_register": [],
+      "workflows_to_register": [],
+      "models_to_download": [],
+      "skip_library_loading": false,
+      "is_worker": false,
+      "static_server_base_url": null
+    }
+  }
+}

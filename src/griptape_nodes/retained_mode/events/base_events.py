@@ -352,8 +352,35 @@ class BaseEvent(BaseModel, ABC):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization and add event_type."""
-        result = super().dict(*args, **kwargs)
+        """Override dict to handle payload serialization and add event_type.
+
+        The signature matches pydantic's ``BaseModel.dict`` for compatibility, but no argument is
+        honored: the overrides below choose their own ``exclude`` set. Raise rather than silently
+        ignore an argument, since a caller passing one would otherwise get the full dict with no
+        indication that its ``exclude``/``include`` was dropped.
+        """
+        self._reject_dict_args(args, kwargs)
+        return self._envelope()
+
+    @staticmethod
+    def _reject_dict_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Fail loudly if a caller passes pydantic-style args to an event's dict() override."""
+        if args or kwargs:
+            msg = f"dict() does not accept arguments; got args={args!r}, kwargs={kwargs!r}"
+            raise TypeError(msg)
+
+    def _envelope(self, exclude: set[str] | None = None) -> dict[str, Any]:
+        """Serialize the event, optionally skipping fields the caller re-serializes itself.
+
+        Subclasses that overwrite a Payload-typed field with ``safe_unstructure`` output pass that
+        field name in ``exclude``: pydantic would otherwise walk the whole payload graph to build a
+        value discarded on the next line.
+
+        ``event_type`` and the ``{field}_type`` entries are injected here rather than by the
+        callers, because the wire format depends on them: ``from_dict`` resolves the concrete
+        payload class from ``{field}_type``, and consumers dispatch on ``event_type``.
+        """
+        result = self.model_dump(exclude=exclude)
 
         # Add event type based on class name
         result["event_type"] = self.__class__.__name__
@@ -401,7 +428,8 @@ class EventRequest[P: Payload](BaseEvent):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
+        self._reject_dict_args(args, kwargs)
+        result = self._envelope(exclude={"request"})
         result["request"] = safe_unstructure(self.request)
         return result
 
@@ -442,7 +470,8 @@ class EventRequestBatch(BaseEvent):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Serialize the envelope, recursing into each inner request's own serializer."""
-        result = super().dict(*args, **kwargs)
+        self._reject_dict_args(args, kwargs)
+        result = self._envelope(exclude={"requests"})
         result["requests"] = [inner.dict() for inner in self.requests]
         return result
 
@@ -479,7 +508,8 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
+        self._reject_dict_args(args, kwargs)
+        result = self._envelope(exclude={"request", "result"})
         result["request"] = safe_unstructure(self.request)
         result_dict = safe_unstructure(self.result)
         if self.request.fields is not None and self.result.succeeded():
@@ -577,7 +607,8 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
+        self._reject_dict_args(args, kwargs)
+        result = self._envelope(exclude={"payload"})
         result["payload"] = safe_unstructure(self.payload)
         return result
 
@@ -611,7 +642,8 @@ class AppEvent[A: AppPayload](BaseEvent):
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
+        self._reject_dict_args(args, kwargs)
+        result = self._envelope(exclude={"payload"})
         result["payload"] = safe_unstructure(self.payload)
         return result
 
