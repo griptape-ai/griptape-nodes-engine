@@ -49,7 +49,6 @@ def _library(*, version: str = "1.0.0") -> MagicMock:
 def _validation_context() -> LibraryGitOperationContext:
     """Build the pre-flight result update_library_request works from."""
     return LibraryGitOperationContext(
-        library=MagicMock(),
         old_version="1.0.0",
         library_file_path=str(LIBRARY_DIR / "griptape_nodes_library.json"),
         library_dir=LIBRARY_DIR,

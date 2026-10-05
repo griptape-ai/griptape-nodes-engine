@@ -43,6 +43,9 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Changing a library's branch or tag in "Library Management" now works on a library that failed to
+  load, so a library built for a newer engine can be switched back to a version this engine can run.
+  Previously the only libraries that could be switched or updated were the ones already loaded.
 - `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
   tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
 - A node that reports a result with `set_parameter_value` now shows that result when the node runs
