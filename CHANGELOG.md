@@ -55,6 +55,9 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- Closing a workflow that contains node groups, such as a ForEach Group, no longer logs a
+  "subflow doesn't exist" warning for each group.
+  [#5746](https://github.com/griptape-ai/griptape-nodes-engine/issues/5746)
 
 ## [0.103.0] - 2026-09-29
 
