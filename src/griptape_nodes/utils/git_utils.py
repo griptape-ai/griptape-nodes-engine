@@ -748,14 +748,54 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
 
 
 def _realign_submodules(library_path: Path) -> None:
-    """Catch submodules up to HEAD before the status check, so a stale one is not read as an edit.
+    """Catch up submodules left behind HEAD before the status check, so they don't read as edits.
 
-    Submodules with edits are left as they are, for that check to report.
+    Only a submodule checked out at an ancestor of the commit HEAD records is moved. One on any
+    other commit may hold the user's work, so it is left for the status check to report.
     """
+    root = get_git_repository_root(library_path)
+    if root is None:
+        return
+
+    stale_paths = [path for path in _moved_submodule_paths(root) if _submodule_is_behind(root, path)]
+    if not stale_paths:
+        return
+
     try:
-        _update_submodules(library_path, error_msg="Could not realign submodules", error_cls=GitError)
+        _run_git(
+            ["submodule", "update", "--recursive", "--", *stale_paths],
+            error_msg="Could not realign submodules",
+            cwd=root,
+            allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+        )
     except GitError as e:
-        logger.debug("Leaving submodules at %s as they are: %s", library_path, e)
+        logger.debug("Leaving submodules at %s as they are: %s", root, e)
+
+
+def _moved_submodule_paths(root: Path) -> list[str]:
+    """Paths, relative to root, of submodules checked out at a commit other than the one HEAD records."""
+    status = _try_git(["submodule", "status"], root)
+    if not status:
+        return []
+
+    paths = []
+    for line in status.splitlines():
+        # "+<sha> <path>" or "+<sha> <path> (<describe>)". "+" marks a moved submodule.
+        if not line.startswith("+"):
+            continue
+        _sha, _, rest = line[1:].partition(" ")
+        if rest.endswith(")") and " (" in rest:
+            rest = rest.rsplit(" (", 1)[0]
+        paths.append(rest)
+    return paths
+
+
+def _submodule_is_behind(root: Path, path: str) -> bool:
+    """Whether the submodule's checkout is an ancestor of the commit HEAD records for it."""
+    recorded = _try_git(["rev-parse", f"HEAD:{path}"], root)
+    if recorded is None:
+        return False
+    return _try_git(["merge-base", "--is-ancestor", "HEAD", recorded], root / path) is not None
 
 
 def _resolve_update_upstream(library_path: Path) -> str:
@@ -823,7 +863,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _update_submodules(
         library_path,
-        error_msg=f"Updated {library_path} but could not fetch its submodules. Updating again retries",
+        error_msg=f"Updated {library_path} but could not fetch or check out its submodules",
         error_cls=GitPullError,
         force=overwrite_existing,
     )
@@ -884,7 +924,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _update_submodules(
         library_path,
-        error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch its submodules. Updating again retries",
+        error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch or check out its submodules",
         error_cls=GitPullError,
         force=overwrite_existing,
     )
@@ -1075,7 +1115,10 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
     try:
         _finish_clone(git_url, target_path, branch_tag_commit)
     except GitError:
-        shutil.rmtree(target_path, onexc=_clear_readonly_and_retry)
+        try:
+            shutil.rmtree(target_path, onexc=_clear_readonly_and_retry)
+        except OSError as cleanup_error:
+            logger.warning("Could not remove the partial clone at %s: %s", target_path, cleanup_error)
         raise
 
 

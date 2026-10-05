@@ -1496,7 +1496,7 @@ class TestSubmodules:
         run_git(origin, "commit", "-m", "add second submodule")
         extra.rename(temp_dir / "unreachable")
 
-        with pytest.raises(GitPullError, match="could not fetch its submodules"):
+        with pytest.raises(GitPullError, match="could not fetch or check out its submodules"):
             update_library_git(clone)
 
         (temp_dir / "unreachable").rename(extra)
@@ -1513,6 +1513,17 @@ class TestSubmodules:
 
         with pytest.raises(GitPullError, match="uncommitted changes"):
             update_library_git(clone)
+
+    def test_update_leaves_a_submodule_on_a_local_commit_for_the_user_to_confirm(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        local_sha = self.commit_file(clone / "vendor" / "upstream", "code.py", "local work")
+
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            update_library_git(clone)
+
+        assert head_sha(clone / "vendor" / "upstream") == local_sha
 
     def test_untracked_files_inside_a_submodule_are_not_uncommitted_changes(self, temp_dir: Path) -> None:
         origin = self.make_origin_with_submodule(temp_dir)
