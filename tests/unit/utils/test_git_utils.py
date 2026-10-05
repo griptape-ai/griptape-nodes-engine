@@ -1469,7 +1469,8 @@ class TestSubmodules:
         assert head_sha(clone / "vendor" / "upstream") == new_sha
         assert has_uncommitted_changes(clone) is False
 
-    def test_update_heals_a_submodule_left_behind_by_an_earlier_update(self, temp_dir: Path) -> None:
+    def test_update_realigns_a_submodule_left_behind_without_overwrite(self, temp_dir: Path) -> None:
+        """An install updated before submodules were synced has a stale submodule tree."""
         origin = self.make_origin_with_submodule(temp_dir)
         upstream = temp_dir / "upstream"
         clone = temp_dir / "clone"
@@ -1477,12 +1478,60 @@ class TestSubmodules:
         new_sha = self.bump_submodule(origin, upstream)
         run_git(clone, "fetch", "origin")
         run_git(clone, "reset", "--hard", "origin/main")
-        assert has_uncommitted_changes(clone) is True
 
-        update_library_git(clone, overwrite_existing=True)
+        update_library_git(clone)
 
         assert head_sha(clone / "vendor" / "upstream") == new_sha
         assert has_uncommitted_changes(clone) is False
+
+    def test_update_after_a_failed_submodule_fetch_succeeds_without_overwrite(self, temp_dir: Path) -> None:
+        """A submodule added upstream is fetched only after HEAD moves, so it can fail mid-update."""
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        extra = temp_dir / "extra"
+        extra.mkdir()
+        run_git(extra, "init", "-b", "main")
+        extra_sha = self.commit_file(extra, "extra.py", "v1")
+        run_git(origin, "submodule", "add", str(extra), "vendor/extra")
+        run_git(origin, "commit", "-m", "add second submodule")
+        extra.rename(temp_dir / "unreachable")
+
+        with pytest.raises(GitPullError, match="could not fetch its submodules"):
+            update_library_git(clone)
+
+        (temp_dir / "unreachable").rename(extra)
+        update_library_git(clone)
+
+        assert head_sha(clone / "vendor" / "extra") == extra_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_still_refuses_edits_inside_a_submodule(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        (clone / "vendor" / "upstream" / "code.py").write_text("edited", encoding="utf-8")
+
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            update_library_git(clone)
+
+    def test_untracked_files_inside_a_submodule_are_not_uncommitted_changes(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        (clone / "vendor" / "upstream" / "build_output.txt").write_text("x", encoding="utf-8")
+
+        assert has_uncommitted_changes(clone) is False
+
+    def test_clone_repository_removes_the_clone_when_submodules_fail(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        (temp_dir / "upstream").rename(temp_dir / "unreachable")
+        target = temp_dir / "clone"
+
+        with pytest.raises(GitCloneError, match="Failed to fetch submodules"):
+            clone_repository(str(origin), target)
+
+        assert not target.exists()
 
     def test_switch_branch_or_tag_moves_submodules_to_the_ref_pointer(self, temp_dir: Path) -> None:
         origin = self.make_origin_with_submodule(temp_dir)

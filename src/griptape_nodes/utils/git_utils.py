@@ -7,14 +7,18 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlparse
 
 from griptape_nodes.utils.file_utils import find_file_in_directory
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -715,8 +719,10 @@ def has_uncommitted_changes(library_path: Path) -> bool:
         msg = f"Cannot check status: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
+    # Untracked files inside a submodule (build output from installing vendored code) are not
+    # edits, and reset --hard would not remove them, so they would block every update.
     status = _run_git(
-        ["status", "--porcelain"],
+        ["status", "--porcelain", "--ignore-submodules=untracked"],
         error_msg=f"Failed to check git status at {library_path}",
         cwd=library_path,
         error_cls=GitRepositoryError,
@@ -740,6 +746,19 @@ def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[Gi
         error_cls=error_cls,
         allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
     )
+
+
+def _realign_submodules(library_path: Path) -> None:
+    """Move submodules to the commits HEAD records, if that needs no discarding.
+
+    Runs before the uncommitted-changes check, so a submodule left behind by an earlier failed
+    sync, or by an engine that did not sync them, does not read as a local edit. Failure is left
+    for that check to report.
+    """
+    try:
+        _update_submodules(library_path, error_msg="Could not realign submodules", error_cls=GitError)
+    except GitError as e:
+        logger.debug("Leaving submodules at %s as they are: %s", library_path, e)
 
 
 def _resolve_update_upstream(library_path: Path) -> str:
@@ -794,6 +813,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     """
     upstream = _resolve_update_upstream(library_path)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -804,7 +824,12 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     error_msg = f"Git error during update at {library_path}"
     _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
-    _update_submodules(library_path, error_msg=error_msg, error_cls=GitPullError, force=overwrite_existing)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} but could not fetch its submodules. Updating again retries",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream)
 
@@ -837,6 +862,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         msg = f"No origin remote found for repository at {library_path}"
         raise GitPullError(msg)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -859,7 +885,12 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
-    _update_submodules(library_path, error_msg=error_msg, error_cls=GitPullError, force=overwrite_existing)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch its submodules. Updating again retries",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -1043,6 +1074,16 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         error_cls=GitCloneError,
     )
 
+    # A partial clone left in place would block a retry with "already exists".
+    try:
+        _finish_clone(git_url, target_path, branch_tag_commit)
+    except GitError:
+        shutil.rmtree(target_path, onexc=_clear_readonly_and_retry)
+        raise
+
+
+def _finish_clone(git_url: str, target_path: Path, branch_tag_commit: str | None) -> None:
+    """Check out the requested ref in a fresh clone, then its submodules."""
     if branch_tag_commit:
         # A single checkout covers all three: a remote branch name becomes a local
         # tracking branch, a tag or commit lands on a detached HEAD.
@@ -1060,6 +1101,13 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         error_msg=f"Failed to fetch submodules of {git_url} in {target_path}",
         error_cls=GitCloneError,
     )
+
+
+def _clear_readonly_and_retry(func: Callable[[str], object], target: str, _exc: BaseException) -> None:
+    """Let rmtree delete git's read-only object files, which Windows refuses to unlink."""
+    target_path = Path(target)
+    target_path.chmod(target_path.stat().st_mode | stat.S_IWRITE)
+    func(target)
 
 
 def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
