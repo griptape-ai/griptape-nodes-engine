@@ -557,11 +557,23 @@ def _last_checked_out_tag(library_path: Path, candidate_tags: list[str]) -> str 
     return None
 
 
+def _tracked_tag(library_path: Path) -> str | None:
+    """The tag recorded by ``_remember_tracked_tag``, or None when none is recorded or it no longer exists."""
+    tracked_tag = _try_git(["config", "--get", _TRACKED_TAG_CONFIG_KEY], library_path)
+    if not tracked_tag or not _ref_exists(library_path, f"refs/tags/{tracked_tag}"):
+        return None
+    return tracked_tag
+
+
 def _remember_tracked_tag(library_path: Path, tag_name: str, error_cls: type[GitError]) -> None:
     """Record tag_name as the tag this checkout follows, so updates keep following it.
 
     The reflog alone can't hold this: a checkout that doesn't move HEAD writes no entry,
     and entries expire, so a library that rarely changes would lose its channel.
+
+    Call before the checkout, not after: a failed write then leaves the working tree untouched
+    instead of failing an operation that already moved it, and a failed checkout still leaves
+    the requested tag recorded for the next update to follow.
     """
     _run_git(
         ["config", _TRACKED_TAG_CONFIG_KEY, tag_name],
@@ -879,11 +891,11 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         msg = f"Tag {tag_name} not found at {library_path}"
         raise GitPullError(msg)
 
+    _remember_tracked_tag(library_path, tag_name, GitPullError)
     checkout = ["checkout", "--detach", tag_ref]
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
-    _remember_tracked_tag(library_path, tag_name, GitPullError)
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -912,8 +924,10 @@ def update_library_git(library_path: Path, *, overwrite_existing: bool = False) 
         raise GitRepositoryError(msg)
 
     if _current_branch(library_path) is None:
-        # Detached HEAD - likely on a tag
-        tag_name = get_current_tag(library_path)
+        # Detached HEAD - likely on a tag. The recorded tag wins even when it no longer points at
+        # HEAD: a fetch that moved it followed by a failed checkout leaves HEAD behind, and only
+        # unrelated tags (or none) at the old commit.
+        tag_name = _tracked_tag(library_path) or get_current_tag(library_path)
         if tag_name is None:
             msg = f"Repository at {library_path} is in detached HEAD state but not on a known tag. Cannot auto-update."
             raise GitPullError(msg)
@@ -1002,13 +1016,13 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
 
     remote_branch_name = f"origin/{ref_name}"
     if _ref_exists(library_path, f"refs/tags/{ref_name}"):
+        _remember_tracked_tag(library_path, ref_name, GitRefError)
         _run_git(
             ["checkout", "--detach", f"refs/tags/{ref_name}"],
             error_msg=error_msg,
             cwd=library_path,
             error_cls=GitRefError,
         )
-        _remember_tracked_tag(library_path, ref_name, GitRefError)
     elif _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
         # -B resets an existing local branch onto the freshly fetched remote tip.
         _run_git(
@@ -1066,6 +1080,11 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
     )
 
     if branch_tag_commit:
+        # git checks out a local branch over a tag of the same name, and a tag otherwise.
+        if _ref_exists(target_path, f"refs/tags/{branch_tag_commit}") and not _ref_exists(
+            target_path, f"refs/heads/{branch_tag_commit}"
+        ):
+            _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         # A single checkout covers all three: a remote branch name becomes a local
         # tracking branch, a tag or commit lands on a detached HEAD.
         _run_git(
@@ -1074,8 +1093,6 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
             cwd=target_path,
             error_cls=GitCloneError,
         )
-        if _current_branch(target_path) is None and _ref_exists(target_path, f"refs/tags/{branch_tag_commit}"):
-            _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
 
 
