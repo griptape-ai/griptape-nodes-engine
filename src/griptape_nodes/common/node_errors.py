@@ -12,10 +12,10 @@ from griptape_nodes.retained_mode.events.node_error_details import (
     RESPONSE_DROPPED_FIELD,
     ErrorAttachments,
     NodeErrorDetails,
-    exception_display_message,
     qualified_type_name,
     sanitize_attachments,
 )
+from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def _exception_type(exc: BaseException) -> str | None:
 def _message(node_name: str, exc: BaseException) -> str:
     if isinstance(exc, ForwardedException):
         return _strip_node_name(node_name, _forwarded_message(exc))
-    return _strip_node_name(node_name, exception_display_message(exc))
+    return _strip_node_name(node_name, readable_exception_message(exc))
 
 
 def _forwarded_message(exc: ForwardedException) -> str:

@@ -70,21 +70,6 @@ def sanitize_attachments(fields: Any, response: Any, links: Any) -> ErrorAttachm
     return ErrorAttachments(fields=clean_fields, response=clean_response, links=_sanitize_links(links))
 
 
-def exception_display_message(exc: BaseException) -> str:
-    """Return the exception's message the way a person would write it.
-
-    ``KeyError.__str__`` returns the repr of its argument, so ``str(KeyError("x"))`` is ``'x'``
-    with quotes. Every other built-in returns the argument as written.
-
-    Only an exact ``KeyError`` is unquoted. A subclass may define its own ``__str__``, and the worker
-    path can only recognize ``builtins.KeyError`` by name, so matching subclasses here would make
-    the two paths disagree.
-    """
-    if type(exc) is KeyError and len(exc.args) == 1 and isinstance(exc.args[0], str):
-        return exc.args[0]
-    return str(exc)
-
-
 def qualified_type_name(exc: BaseException) -> str:
     """Return the exception's type as ``module.QualName``, e.g. ``builtins.KeyError``."""
     return f"{type(exc).__module__}.{type(exc).__qualname__}"

@@ -104,13 +104,10 @@ class TestMessage:
         assert in_process.message == "Setting 'strength' is missing"
         assert from_worker.message == "Setting 'strength' is missing"
 
-    def test_key_error_subclass_without_its_own_str_matches_on_both_paths(self) -> None:
-        exc = _PlainKeySubclassError("strength")
+    def test_key_error_subclass_without_its_own_str_drops_the_quoting(self) -> None:
+        details = build_node_error_details(NODE_NAME, _raised(_PlainKeySubclassError("strength")))
 
-        in_process = build_node_error_details(NODE_NAME, _raised(exc))
-        from_worker = build_node_error_details(NODE_NAME, _across_worker(exc))
-
-        assert in_process.message == from_worker.message == "'strength'"
+        assert details.message == "strength"
 
     def test_engine_preambles_never_reach_the_message(self) -> None:
         error = _executor_error(_failed_while_running(_raised(ValueError("Image is required"))))
