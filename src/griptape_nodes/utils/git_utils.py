@@ -763,7 +763,7 @@ def _realign_submodules(library_path: Path) -> None:
 
     try:
         _run_git(
-            ["submodule", "update", "--recursive", "--", *stale_paths],
+            ["--literal-pathspecs", "submodule", "update", "--recursive", "--", *stale_paths],
             error_msg="Could not realign submodules",
             cwd=root,
             allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
@@ -999,7 +999,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
 
     if _ref_exists(library_path, f"refs/heads/{branch_name}"):
         _run_git(["checkout", branch_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
-        _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
+        _update_submodules(
+            library_path,
+            error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
+            error_cls=GitRefError,
+        )
         logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
         return
 
@@ -1014,7 +1018,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
         cwd=library_path,
         error_cls=GitRefError,
     )
-    _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
+        error_cls=GitRefError,
+    )
     logger.debug(
         "Created and checked out tracking branch %s from %s at %s", branch_name, remote_branch_name, library_path
     )
@@ -1068,7 +1076,11 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
         msg = f"Ref {ref_name} not found at {library_path}"
         raise GitRefError(msg)
 
-    _update_submodules(library_path, error_msg=error_msg, error_cls=GitRefError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {ref_name} but could not fetch or check out its submodules",
+        error_cls=GitRefError,
+    )
     logger.debug("Checked out %s at %s", ref_name, library_path)
 
 
