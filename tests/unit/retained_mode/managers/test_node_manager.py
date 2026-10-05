@@ -5,7 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.core_types import (
+    ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
+    Parameter,
+    ParameterMode,
+    ParameterTypeBuiltin,
+)
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.node_library.library_registry import LibraryRegistryError
 from griptape_nodes.retained_mode.engine import Engine
@@ -17,7 +24,12 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultFailure,
+    AddParameterToNodeResultSuccess,
+    AlterParameterDetailsRequest,
+)
 
 
 class TestNodeManagerBatchSetNodeMetadata:
@@ -56,6 +68,191 @@ class TestNodeManagerBatchSetNodeMetadata:
         assert "Failed to update any nodes" in result_str
         assert "nonexistent_node1" in result_str
         assert "nonexistent_node2" in result_str
+
+
+class TestNodeManagerAddControlParameter:
+    """Control parameter requests must preserve the generic control shape and request options."""
+
+    def test_recreates_generic_control_parameter_with_request_options(self, engine: Engine) -> None:
+        """A two-way control request uses ControlParameter and keeps its serialized options."""
+        node = BaseNode(name="ControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="bridge",
+                tooltip="A control bridge",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                ui_options={"display_name": "Bridge", "custom_option": "kept"},
+                mode_allowed_input=True,
+                mode_allowed_property=True,
+                mode_allowed_output=True,
+                settable=False,
+                allow_variable_substitution=False,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("bridge")
+        assert isinstance(parameter, ControlParameter)
+        assert not isinstance(parameter, (ControlParameterInput, ControlParameterOutput))
+        assert parameter.allowed_modes == {ParameterMode.INPUT, ParameterMode.PROPERTY, ParameterMode.OUTPUT}
+        assert parameter.ui_options["display_name"] == "Bridge"
+        assert parameter.ui_options["custom_option"] == "kept"
+        assert parameter.ui_options["parameter_render_location"] == "top"
+        assert parameter.settable is False
+        assert parameter.allow_variable_substitution is False
+
+    @pytest.mark.parametrize(
+        ("mode_allowed_input", "mode_allowed_output", "expected_type"),
+        [
+            (True, False, ControlParameterInput),
+            (False, True, ControlParameterOutput),
+        ],
+    )
+    def test_reconstructs_legacy_directional_control_parameter(
+        self,
+        engine: Engine,
+        *,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+    ) -> None:
+        """Legacy saves put the control type on both sides but retain directional mode flags."""
+        node = BaseNode(name="LegacyControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="legacy_control",
+                tooltip="Legacy control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=[ParameterTypeBuiltin.CONTROL_TYPE.value],
+                output_type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("legacy_control")
+        assert isinstance(parameter, expected_type)
+
+    @pytest.mark.parametrize(
+        ("input_types", "output_type", "mode_allowed_input", "mode_allowed_output", "expected_type", "display_name"),
+        [
+            (
+                [ParameterTypeBuiltin.CONTROL_TYPE.value],
+                None,
+                True,
+                False,
+                ControlParameterInput,
+                "Flow In",
+            ),
+            (
+                None,
+                ParameterTypeBuiltin.CONTROL_TYPE.value,
+                False,
+                True,
+                ControlParameterOutput,
+                "Flow Out",
+            ),
+        ],
+    )
+    def test_reconstructs_directional_control_parameter_with_serialized_ui_options(  # noqa: PLR0913
+        self,
+        engine: Engine,
+        *,
+        input_types: list[str] | None,
+        output_type: str | None,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+        display_name: str,
+    ) -> None:
+        """Current directional saves retain both the control shape and UI display name."""
+        node = BaseNode(name="DirectionalControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="directional_control",
+                tooltip="Directional control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=input_types,
+                output_type=output_type,
+                ui_options={"display_name": display_name, "custom_option": "kept"},
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("directional_control")
+        assert isinstance(parameter, expected_type)
+        assert parameter.display_name == display_name
+        assert parameter.ui_options["custom_option"] == "kept"
+
+    @pytest.mark.parametrize(
+        ("mode_allowed_input", "mode_allowed_output", "expected_type"),
+        [
+            (True, False, ControlParameterInput),
+            (False, True, ControlParameterOutput),
+        ],
+    )
+    def test_reconstructs_directional_control_without_serialized_sides(
+        self,
+        engine: Engine,
+        *,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+    ) -> None:
+        """A legacy request with only mode flags still keeps its directional control shape."""
+        node = BaseNode(name="ModeOnlyControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="mode_only_control",
+                tooltip="Mode-only control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("mode_only_control")
+        assert isinstance(parameter, expected_type)
+
+    def test_rejects_control_parameter_mixed_with_data_type(self, engine: Engine) -> None:
+        """Control ports cannot silently accept a non-control type during reconstruction."""
+        node = BaseNode(name="MixedControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="mixed_control",
+                tooltip="Mixed control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=[ParameterTypeBuiltin.STR.value],
+                mode_allowed_input=True,
+                mode_allowed_property=False,
+                mode_allowed_output=False,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultFailure)
+        assert "ParameterControlType" in str(result.result_details)
 
 
 class TestNodeManagerResolutionStateSerialization:
