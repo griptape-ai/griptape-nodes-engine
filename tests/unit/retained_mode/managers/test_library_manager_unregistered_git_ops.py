@@ -31,7 +31,8 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
-LIBRARY_DIR = Path("/var/lib/test_lib")
+# Absolute so it matches the handler's resolved library_dir, which gains a drive letter on Windows.
+LIBRARY_DIR = Path("/var/lib/test_lib").absolute()
 MANIFEST_PATH = LIBRARY_DIR / "griptape_nodes_library.json"
 
 
