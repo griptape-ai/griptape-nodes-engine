@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -89,7 +89,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultSuccess,
@@ -247,6 +246,8 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.serialization.converter import converter, safe_unstructure
+from griptape_nodes.serialization.values import UndecodedValue, Unencodable, try_encode
 from griptape_nodes.traits.trait_resolver import resolve_trait
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefusal, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
@@ -280,18 +281,6 @@ class _FlowCancelOutcome:
 
     failure: ResultPayload | None = None
     cancelled_for_node_name: str | None = None
-
-
-class SerializedParameterValues(NamedTuple):
-    """Result of serializing parameter output values.
-
-    Attributes:
-        parameter_output_values: Either raw values or UUID references if pickling was used
-        unique_parameter_uuid_to_values: Dictionary of pickled values (None if no pickling needed)
-    """
-
-    parameter_output_values: dict[str, Any]
-    unique_parameter_uuid_to_values: dict[Any, Any] | None
 
 
 class CanResetResult(NamedTuple):
@@ -3466,6 +3455,13 @@ class NodeManager(EngineScoped):
         (NodeExecutor.execute) so the write path is identical for local and
         worker routes.
         """
+        unsendable = self._unencodable_value_names(request.parameter_values)
+        if unsendable:
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"its input {', '.join(unsendable)} cannot be sent there."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
         worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
@@ -3630,9 +3626,8 @@ class NodeManager(EngineScoped):
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
         with self.engine.event_manager.node_execution_scope():
-            # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
-            parameter_values = hydrate_parameter_values(request.parameter_values)
-            hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
+            hydrated_values = hydrate_parameter_values(request.parameter_values)
+            hydration_failure = self._apply_hydrated_values(node, node_name, hydrated_values)
             if hydration_failure is not None:
                 return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
@@ -3682,12 +3677,28 @@ class NodeManager(EngineScoped):
         # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
         # dict the node just wrote its object into.
         if self.engine.library_manager.is_worker:
-            output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
-        else:
-            output_values = dict(node.parameter_output_values)
+            return self._worker_execution_result(node)
+        return ExecuteNodeResultSuccess(
+            parameter_output_values=dict(node.parameter_output_values),
+            result_details=f"Node '{node_name}' executed successfully.",
+        )
+
+    def _worker_execution_result(self, node: BaseNode) -> ResultPayload:
+        """The result a worker sends back: outputs with cached objects swapped for their keys."""
+        output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
+        unsendable = self._unencodable_value_names(output_values)
+        if unsendable:
+            library_name = node.metadata.get("library", "its library")
+            details = (
+                f"Attempted to send node '{node.name}' output {', '.join(unsendable)} out of "
+                f"'{library_name}'s isolated process. Failed because it has no plain-data form. Give "
+                f"the value a plain-data form, or declare its parameter serializable=False so the value "
+                f"stays in that process and the next node receives a reference to it."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
-            result_details=f"Node '{node_name}' executed successfully.",
+            result_details=f"Node '{node.name}' executed successfully.",
         )
 
     def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
@@ -3807,6 +3818,15 @@ class NodeManager(EngineScoped):
                 current = node.parameter_values.get(param_name, _PARAM_MISSING)
                 if current is value or current == value:
                     continue
+                if type(value) is UndecodedValue:
+                    # Still set: nodes that read artifact-shaped dicts can use it.
+                    logger.warning(
+                        "Node '%s' received a value for parameter '%s' that this process cannot "
+                        "rebuild, so it arrives as plain data instead of its type. %s",
+                        node_name,
+                        param_name,
+                        value.reason,
+                    )
                 try:
                     node.set_parameter_value(param_name, value)
                 except Exception as e:
@@ -3826,6 +3846,16 @@ class NodeManager(EngineScoped):
                 param_name,
             )
         return None
+
+    @staticmethod
+    def _unencodable_value_names(values: dict[str, Any]) -> list[str]:
+        """Name each value that has no plain-data form, with the reason."""
+        names = []
+        for name, value in values.items():
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                names.append(f"'{name}' ({encoded.reason})")
+        return names
 
     @handles(ValidateNodeDependenciesRequest)
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
@@ -5127,186 +5157,30 @@ class NodeManager(EngineScoped):
         return None
 
     @staticmethod
-    def serialize_parameter_output_values(
-        node: BaseNode, *, workflow_manager: WorkflowManager, use_pickling: bool = False
-    ) -> SerializedParameterValues:
-        """Serialize parameter output values with optional pickling for complex objects.
+    def result_parameter_values(node: BaseNode) -> dict[str, Any]:
+        """Each parameter's result value, preferring its output value, for the flow's result event.
 
-        Args:
-            node: The node whose parameter output values should be serialized
-            workflow_manager: Used to pickle values when use_pickling is True
-            use_pickling: If True, use pickle-based serialization; if False, use safe_unstructure
-
-        Returns:
-            SerializedParameterValues containing:
-            - parameter_output_values: Either raw values or UUID references if pickling was used
-            - unique_parameter_uuid_to_values: Dictionary of pickled values (None if no pickling needed)
+        A value with no plain-data form becomes None, so one such value cannot keep the others
+        from reaching whoever runs the flow.
         """
-        if not node.parameters:
-            return SerializedParameterValues({}, None)
-
-        if not use_pickling:
-            return NodeManager._serialize_without_pickling(node)
-
-        return NodeManager._serialize_with_pickling(node, workflow_manager=workflow_manager)
-
-    @staticmethod
-    def _serialize_without_pickling(node: BaseNode) -> SerializedParameterValues:
-        """Serialize parameter values using safe_unstructure.
-
-        Args:
-            node: The node whose parameter values should be serialized
-
-        Returns:
-            SerializedParameterValues with no pickling
-        """
-        param_values = {}
-        for param in node.parameters:
-            if param.name in node.parameter_output_values:
-                param_values[param.name] = node.parameter_output_values[param.name]
-            else:
-                param_values[param.name] = node._get_raw_parameter_value(param.name)
-        simple_values = safe_unstructure(param_values)
-        return SerializedParameterValues(simple_values, None)
-
-    @staticmethod
-    def _serialize_with_pickling(
-        node: BaseNode,
-        *,
-        workflow_manager: WorkflowManager,
-    ) -> SerializedParameterValues:
-        """Serialize parameter values using pickle-based serialization with UUID references.
-
-        Args:
-            node: The node whose parameter values should be serialized
-            workflow_manager: Used to pickle values
-
-        Returns:
-            SerializedParameterValues with pickled values
-        """
-        unique_parameter_uuid_to_values = {}
-        serialized_parameter_value_tracker = SerializedParameterValueTracker()
-        uuid_referenced_values = {}
-
+        values = {}
         for parameter in node.parameters:
-            param_name = parameter.name
-            param_value = NodeManager._get_parameter_value_for_serialization(node, param_name)
-
-            unique_uuid = NodeManager._process_parameter_for_pickling(
-                param_value,
-                param_name,
-                serialized_parameter_value_tracker,
-                unique_parameter_uuid_to_values,
-                uuid_referenced_values,
-                workflow_manager=workflow_manager,
-            )
-
-            uuid_referenced_values[param_name] = unique_uuid
-
-        return SerializedParameterValues(uuid_referenced_values, unique_parameter_uuid_to_values or None)
-
-    @staticmethod
-    def _get_parameter_value_for_serialization(node: BaseNode, param_name: str) -> Any:
-        """Get parameter value for serialization, checking output values first.
-
-        Args:
-            node: The node to get the parameter value from
-            param_name: The parameter name
-
-        Returns:
-            The parameter value
-        """
-        if param_name in node.parameter_output_values:
-            return node.parameter_output_values[param_name]
-        return node._get_raw_parameter_value(param_name)
-
-    @staticmethod
-    def _process_parameter_for_pickling(  # noqa: PLR0913
-        param_value: Any,
-        param_name: str,
-        tracker: SerializedParameterValueTracker,
-        unique_parameter_uuid_to_values: dict,
-        uuid_referenced_values: dict,
-        *,
-        workflow_manager: WorkflowManager,
-    ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
-        """Process a parameter value for pickle-based serialization.
-
-        Args:
-            param_value: The value to serialize
-            param_name: Parameter name for tracking
-            tracker: Tracker for managing serialization state
-            unique_parameter_uuid_to_values: Dictionary to store pickled values
-            uuid_referenced_values: Dictionary to store UUID references
-            workflow_manager: Used to pickle newly seen values
-
-        Returns:
-            UUID reference for the value, or None if not serializable
-        """
-        try:
-            hash(param_value)
-            value_id = param_value
-        except TypeError:
-            value_id = id(param_value)
-
-        tracker_status = tracker.get_tracker_state(value_id)
-
-        match tracker_status:
-            case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                return tracker.get_uuid_for_value_hash(value_id)
-            case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
-                uuid_referenced_values[param_name] = None
-                return None
-            case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                return NodeManager._handle_new_value_for_pickling(
-                    param_value,
-                    param_name,
-                    tracker,
-                    unique_parameter_uuid_to_values,
-                    uuid_referenced_values,
-                    workflow_manager=workflow_manager,
+            if parameter.name in node.parameter_output_values:
+                value = node.parameter_output_values[parameter.name]
+            else:
+                value = node._get_raw_parameter_value(parameter.name)
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                logger.warning(
+                    "Node '%s' finished its flow with a '%s' value that cannot be sent on. Whoever ran "
+                    "the flow receives no value for it. %s",
+                    node.name,
+                    parameter.name,
+                    encoded.reason,
                 )
-
-    @staticmethod
-    def _handle_new_value_for_pickling(  # noqa: PLR0913
-        param_value: Any,
-        param_name: str,
-        tracker: SerializedParameterValueTracker,
-        unique_parameter_uuid_to_values: dict,
-        uuid_referenced_values: dict,
-        *,
-        workflow_manager: WorkflowManager,
-    ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
-        """Handle a new value that hasn't been seen before in pickling serialization.
-
-        Args:
-            param_value: The value to pickle
-            param_name: Parameter name for tracking
-            tracker: Tracker for managing serialization state
-            unique_parameter_uuid_to_values: Dictionary to store pickled values
-            uuid_referenced_values: Dictionary to store UUID references
-            workflow_manager: Used to pickle the value
-
-        Returns:
-            UUID reference for the value, or None if not serializable
-        """
-        try:
-            hash(param_value)
-            value_id = param_value
-        except TypeError:
-            value_id = id(param_value)
-
-        try:
-            pickled_bytes = workflow_manager._patch_and_pickle_object(param_value)
-        except Exception:
-            tracker.add_as_not_serializable(value_id)
-            uuid_referenced_values[param_name] = None
-            return None
-
-        unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-        unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
-        tracker.add_as_serializable(value_id, unique_uuid)
-        return unique_uuid
+                value = None
+            values[parameter.name] = value
+        return values
 
     @handles(RenameParameterRequest)
     def on_rename_parameter_request(self, request: RenameParameterRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912

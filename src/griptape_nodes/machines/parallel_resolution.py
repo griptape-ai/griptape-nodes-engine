@@ -22,7 +22,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
 )
-from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -35,6 +34,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
+from griptape_nodes.serialization.converter import safe_unstructure
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph

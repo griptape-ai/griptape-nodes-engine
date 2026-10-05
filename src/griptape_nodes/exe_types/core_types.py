@@ -36,6 +36,7 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.trait import Trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
+from griptape_nodes.serialization.values import SavesState, register_value_codec
 
 __all__ = [
     "VALID_BADGE_VARIANTS",
@@ -65,6 +66,8 @@ __all__ = [
     "ParameterRenderLocation",
     "ParameterType",
     "ParameterTypeBuiltin",
+    "SavesState",
     "Trait",
     "UIOptionsMixin",
+    "register_value_codec",
 ]

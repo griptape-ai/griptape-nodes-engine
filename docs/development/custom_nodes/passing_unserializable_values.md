@@ -59,23 +59,16 @@ Three consequences worth internalising:
 
 ## What `serializable=False` means
 
-It keeps a value out of saved workflow files. On an output, it also keeps a non-data
-value in the process that made it and sends a key across a process boundary. **Plain
-data on a declared parameter is still sent as data**:
+It has two effects:
 
-| Value on a `serializable=False` output | What crosses                 | Why                                                                        |
-| -------------------------------------- | ---------------------------- | -------------------------------------------------------------------------- |
-| a pipeline, a tensor, a driver         | a key; the object stays here | there is no data form of it                                                |
-| an API key string                      | the string                   | it travels perfectly well, and a key would be unresolvable on the far side |
-| a `dict` of numbers, a list of strings | the value                    | already data                                                               |
-| an `ImageUrlArtifact`                  | a key; the object stays here | see below                                                                  |
+- **The value isn't saved.** It's left out of saved workflow files, so its node runs again when the
+    workflow reopens.
+- **The value stays in the process that made it.** On an output of a node in an isolated library,
+    the engine holds the value and sends a key in its place. Plain data, such as text, numbers, and
+    lists and dicts of them, is still sent as-is.
 
-That last row surprises people. An artifact a library defines itself unstructures
-into a dict of its fields and loses its payload on the way, so the engine will not
-gamble on a round trip: if you declared the parameter, your object is held. If you
-want an artifact to travel as data — which is usually what you want for anything
-with a URL in it — **do not declare the parameter**. Undeclared artifacts serialize
-and rehydrate exactly as they always have.
+Only mark an output `serializable=False` when its value can't be serialized, like a pipeline, a
+tensor, or a driver.
 
 ## Reusing an expensive resource across runs
 
@@ -207,8 +200,7 @@ not have to do anything for this; it is the same declaration doing the work.
     releasing it takes more than dropping a reference.
 - Consuming parameter declares nothing.
 - Producer and consumer run in the same worker, which is automatic within one library.
-- Anything with a URL in it (`ImageUrlArtifact` and friends) is left undeclared so
-    it travels as data.
+- Only outputs whose value can't be serialized are marked `serializable=False`.
 - If your nodes can run in Shared mode, do not rely on the release hook: nothing is
     cached there, so nothing is released.
 - Batches go on an ordinary parameter, not a `ParameterList` output.

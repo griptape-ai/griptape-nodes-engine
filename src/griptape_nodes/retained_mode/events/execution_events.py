@@ -12,8 +12,8 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import Value
 
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
@@ -78,7 +78,7 @@ class StartFlowRequest(RequestPayload):
     flow_name: str | None = None
     flow_node_name: str | None = None
     debug_mode: bool = False
-    # If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess.
+    # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
 
 
@@ -113,9 +113,7 @@ class StartLocalSubflowRequest(RequestPayload):
     Args:
         flow_name: Name of the flow to start as a subflow
         start_node: The node to start execution from (None to auto-detect start node)
-        pickle_control_flow_result: Ignored. Pickling happens while broadcasting
-            ControlFlowResolvedEvent, and a local subflow always runs isolated, which does not
-            broadcast that event -- so there is no result to pickle for this request.
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartLocalSubflowResultSuccess | StartLocalSubflowResultFailure
     """
@@ -149,7 +147,7 @@ class StartFlowFromNodeRequest(RequestPayload):
         flow_name: Name of the flow to start (deprecated)
         node_name: Name of the node to start execution from
         debug_mode: Whether to run in debug mode (default: False)
-        pickle_control_flow_result: If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartFlowFromNodeResultSuccess | StartFlowFromNodeResultFailure (with validation exceptions)
     """
@@ -389,11 +387,7 @@ class ParameterSpotlightEvent(ExecutionPayload):
 @PayloadRegistry.register
 class ControlFlowResolvedEvent(ExecutionPayload):
     end_node_name: str
-    parameter_output_values: dict
-    # Optional field for pickled parameter values - when present, parameter_output_values contains UUID references
-    unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, bytes] | None = field(
-        default=None
-    )
+    parameter_output_values: dict[str, Value]
 
 
 @dataclass
@@ -536,7 +530,7 @@ class ExecuteNodeRequest(RequestPayload):
     """
 
     node_name: str
-    parameter_values: dict[str, Any] = field(default_factory=dict)
+    parameter_values: dict[str, Value] = field(default_factory=dict)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
@@ -554,7 +548,7 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
         parameter_output_values: Output parameter values from the node.
     """
 
-    parameter_output_values: dict[str, Any] = field(default_factory=dict)
+    parameter_output_values: dict[str, Value] = field(default_factory=dict)
 
 
 @dataclass

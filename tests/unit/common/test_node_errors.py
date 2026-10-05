@@ -13,13 +13,13 @@ from griptape_nodes.common.node_errors import NodeExecutionError, build_node_err
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ForwardedNodeError
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultFailure, NodeErrorEvent
 from griptape_nodes.retained_mode.events.node_error_details import (
     MAX_RESPONSE_BYTES,
     RESPONSE_DROPPED_FIELD,
 )
 from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.serialization.converter import converter
 
 NODE_NAME = "Get Dictionary Value by Key"
 
