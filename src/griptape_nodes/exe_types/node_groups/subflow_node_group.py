@@ -1338,8 +1338,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     msg = f"Failed to delete subflow {subflow_name} when deleting node {self.name}"
                     raise ValueError(msg)
             else:
-                msg = f"Node {self.name} has a subflow name of {subflow_name} but {subflow_name} doesn't exist. Removing from metadata."
-                logger.warning(msg)
+                # Deleting a parent flow removes child flows before child nodes, so the subflow is
+                # already gone by the time its group node is deleted.
+                logger.debug(
+                    "Node %s has a subflow name of %s but %s doesn't exist. Removing from metadata.",
+                    self.name,
+                    subflow_name,
+                    subflow_name,
+                )
             # Delete the subflow name since now there is no subflow attached.
             self.metadata.pop("subflow_name")
 
