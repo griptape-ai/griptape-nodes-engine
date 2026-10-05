@@ -55,6 +55,10 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- A flow with two independent control chains, where the first node of one chain feeds data to the
+  first node of the other, now runs both chains to the end. Before, the chain whose first node
+  supplied the data stopped after that node and the rest of it never ran, with no error.
+  [#5559](https://github.com/griptape-ai/griptape-nodes-engine/issues/5559)
 
 ## [0.103.0] - 2026-09-29
 
