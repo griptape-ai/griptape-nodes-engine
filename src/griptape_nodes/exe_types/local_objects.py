@@ -573,8 +573,7 @@ def cache_outputs_for_egress(values: Mapping[str, Any], *, node: BaseNode) -> di
     is in the sending process while the node runs elsewhere.
 
     A declared output goes in the cache unless the value is already plain data -- a key for an API token
-    would be unresolvable over there. Everything else passes through exactly as it did before the cache
-    existed, including a value the transport can only manage by stringifying.
+    would be unresolvable over there. Everything else passes through unchanged for the transport to encode.
     """
     cached: dict[str, Any] = {}
     # A copy, because node bodies write their outputs from worker threads and a dict that changes size

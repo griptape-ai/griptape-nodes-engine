@@ -49,7 +49,6 @@ class ControlFlowContext(EngineScoped):
     selected_output: Parameter | None
     paused: bool = False
     flow_name: str
-    pickle_control_flow_result: bool
     end_node: BaseNode | None = None
     is_isolated: bool
 
@@ -58,7 +57,6 @@ class ControlFlowContext(EngineScoped):
         flow_name: str,
         max_nodes_in_parallel: int,
         *,
-        pickle_control_flow_result: bool = False,
         is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
@@ -79,7 +77,6 @@ class ControlFlowContext(EngineScoped):
             flow_name, max_nodes_in_parallel, dag_builder=dag_builder, engine=self.engine
         )
         self.current_nodes = []
-        self.pickle_control_flow_result = pickle_control_flow_result
         self.is_isolated = is_isolated
 
     def reset(self, *, cancel: bool = False) -> None:
@@ -161,20 +158,12 @@ class CompleteState(State):
 
         # Broadcast completion events for any remaining current nodes
         for current_node in context.current_nodes:
-            # Use pickle-based serialization for complex parameter output values
-
-            parameter_output_values, unique_uuid_to_values = NodeManager.serialize_parameter_output_values(
-                current_node,
-                workflow_manager=context.engine.workflow_manager,
-                use_pickling=context.pickle_control_flow_result,
-            )
             context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(
                         payload=ControlFlowResolvedEvent(
                             end_node_name=current_node.name,
-                            parameter_output_values=parameter_output_values,
-                            unique_parameter_uuid_to_values=unique_uuid_to_values or None,
+                            parameter_output_values=NodeManager.result_parameter_values(current_node),
                         )
                     )
                 )
@@ -193,7 +182,6 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         self,
         flow_name: str,
         *,
-        pickle_control_flow_result: bool = False,
         is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
@@ -213,7 +201,6 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         context = ControlFlowContext(
             flow_name,
             max_nodes_in_parallel,
-            pickle_control_flow_result=pickle_control_flow_result,
             is_isolated=is_isolated,
             engine=resolved_engine,
         )

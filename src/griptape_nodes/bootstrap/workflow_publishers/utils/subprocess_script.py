@@ -21,7 +21,6 @@ class PublishWorkflowArgs:
     workflow_path: str
     publisher_name: str
     published_workflow_file_name: str
-    pickle_control_flow_result: bool
     session_id: str | None = None
 
 
@@ -38,7 +37,6 @@ async def _main(args: PublishWorkflowArgs) -> None:
             workflow_path=args.workflow_path,
             publisher_name=args.publisher_name,
             published_workflow_file_name=args.published_workflow_file_name,
-            pickle_control_flow_result=args.pickle_control_flow_result,
         )
 
     msg = f"Published workflow to file: {args.published_workflow_file_name}"
@@ -66,12 +64,6 @@ if __name__ == "__main__":
         "--published-workflow-file-name", help="Name to use for the published workflow file", required=True
     )
     parser.add_argument(
-        "--pickle-control-flow-result",
-        action="store_true",
-        default=False,
-        help="Whether to pickle control flow results",
-    )
-    parser.add_argument(
         "--session-id",
         default=None,
         help="Session ID for WebSocket event emission",
@@ -83,7 +75,6 @@ if __name__ == "__main__":
         workflow_path=parsed_args.workflow_path,
         publisher_name=parsed_args.publisher_name,
         published_workflow_file_name=parsed_args.published_workflow_file_name,
-        pickle_control_flow_result=parsed_args.pickle_control_flow_result,
         session_id=parsed_args.session_id,
     )
     asyncio.run(_main(publish_args))

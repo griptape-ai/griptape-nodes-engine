@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import base64
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -19,6 +18,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
+from griptape_nodes.serialization.converter import safe_unstructure
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine

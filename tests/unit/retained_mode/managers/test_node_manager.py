@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+from griptape_nodes.serialization.values import UndecodedValue
 
 
 class TestNodeManagerBatchSetNodeMetadata:
@@ -1152,3 +1153,22 @@ class TestNodeCreationFailureDescription:
         )
 
         assert description == "boom"
+
+
+class TestApplyHydratedValues:
+    """Values a worker receives are set on its copy of the node."""
+
+    def test_value_this_process_cannot_rebuild_is_set_and_warned(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = MagicMock(spec=BaseNode)
+        node.parameter_values = {}
+        undecoded = UndecodedValue({"$type": "other_library.mod:Thing"}, "its library is not loaded here")
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            failure = engine.node_manager._apply_hydrated_values(node, "Worker Node", {"image": undecoded})
+
+        assert failure is None
+        node.set_parameter_value.assert_called_once_with("image", undecoded)
+        assert "'image'" in caplog.text
+        assert "its library is not loaded here" in caplog.text
