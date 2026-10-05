@@ -131,11 +131,21 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
 
 `CHANGELOG.md` follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). It is the record people read to learn what changed between versions, and each version's section is its GitHub release notes. Its readers are artists using the editor, node library authors, and clients of the request API.
 
-**Add an entry for every user-facing change** - In the same PR, add a bullet under `## [Unreleased]`. User-facing means anything a user notices after upgrading: node behavior, editor-visible behavior, saved workflow files, the node library API (`exe_types/core_types.py`, `GriptapeNodes`), request/response events, settings, CLI commands, and supported platforms or Python versions. After adding one, tell the user so they can review the wording. Machines draft, humans curate.
+**Add an entry for every user-facing change** - In the same PR, add a file to `changelog.d/` holding the entry. User-facing means anything a user notices after upgrading: node behavior, editor-visible behavior, saved workflow files, the node library API (`exe_types/core_types.py`, `GriptapeNodes`), request/response events, settings, CLI commands, and supported platforms or Python versions. After adding one, tell the user so they can review the wording. Machines draft, humans curate.
+
+**One file per entry, named for its type** - Never edit `## [Unreleased]` in `CHANGELOG.md` directly; two PRs doing that conflict on the same lines, and `make check/changelog` rejects it. Create `changelog.d/<type>-<slug>.md`, where `<slug>` is a few lowercase words joined by hyphens. The whole file is the bullet, with no heading and no filename banner. `changelog.d/fixed-license-permission-dropdowns.md` holds exactly this:
+
+```markdown
+- Model dropdowns no longer mark every model "Not permitted by your license" when two installed
+  libraries provide a node with the same name.
+  [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
+```
+
+`make changelog` prints `[Unreleased]` as the release will show it, these files folded in. `make check/changelog` checks both it and these files. `changelog.d/README.md` is the same contract for humans.
 
 **Skip what users never see** - Refactors, tests, CI, comments, docs-only changes, and dev dependency bumps get no entry. Neither does a fix for a bug that never shipped in a release: edit or delete the entry that introduced it. A runtime dependency bump gets an entry only if users feel it, and the entry describes that effect, not the bump.
 
-**Pick one of the six types** - Use `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, or `### Security`, in that order, adding the heading if the section lacks it. No other headings; `make check/changelog` rejects them.
+**Pick one of the six types** - The filename's prefix is one of `added`, `changed`, `deprecated`, `removed`, `fixed`, or `security`. Nothing else; `make check/changelog` rejects it. The roll puts the types in that order under their `###` headings, so an entry file never carries one.
 
 - `Added`: a new capability.
 - `Changed`: the old behavior was intentional and now differs. Performance work goes here.
@@ -156,7 +166,7 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
 - Plain words. No "improved", "enhanced", or "better"; say what changed.
 - One entry per change. When a later PR extends an unreleased change, edit its entry instead of adding another.
 - Link the GitHub issue on its own last line when there is one: `[#1234](https://github.com/griptape-ai/griptape-nodes-engine/issues/1234)`. Issues carry the background and lead on to the PRs. Leave out PR numbers, commit hashes, and `@handles`; they record the implementation, not why it changed.
-- Wrap lines at about 100 characters and indent continuation lines two spaces. mdformat skips this file.
+- Wrap lines at about 100 characters and indent continuation lines two spaces. mdformat skips `CHANGELOG.md` and `changelog.d/`, so the wrapping you write is the wrapping that ships.
 
 ```markdown
 <!-- Bad: the code change, no context -->
@@ -176,14 +186,14 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
   [#5563](https://github.com/griptape-ai/griptape-nodes-engine/issues/5563)
 ```
 
-**Mark breaking changes** - A change that makes a saved workflow, node library, or request API client stop working without edits starts with `**Breaking:**`, stays under its type (usually `Changed` or `Removed`), and comes first in that list. Say what breaks and what to do. Long upgrade steps go in `MIGRATION.md`; link the section.
+**Mark breaking changes** - A change that makes a saved workflow, node library, or request API client stop working without edits starts with `**Breaking:**` and keeps its type (usually `changed` or `removed`). The roll lists it first within that type. Say what breaks and what to do. Long upgrade steps go in `MIGRATION.md`; link the section.
 
 ```markdown
 - **Breaking:** `AgentStreamEvent` and the other agent streaming events now require a `thread_id`.
   See [MIGRATION.md](MIGRATION.md#agent-streaming-payloads-carry-thread_id).
 ```
 
-**Leave released sections alone** - Do not add, rename, or reorder version headings or the link definitions at the bottom. `make version/publish` rolls `[Unreleased]` into the released version. Fixing a mistake in a released entry is fine.
+**Leave `CHANGELOG.md` to the release** - Do not add, rename, or reorder version headings or the link definitions at the bottom. `make version/publish` folds the `changelog.d/` entries into a new version section and deletes them. Fixing a mistake in a released entry is fine.
 
 ## Architecture
 
