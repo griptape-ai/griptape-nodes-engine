@@ -151,7 +151,7 @@ class TestEagerLoading:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=False
         )
 
@@ -170,7 +170,7 @@ class TestLazyLoading:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
@@ -195,7 +195,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", True),
             patch.object(config_mgr, "get_config_value", return_value=True),
         ):
-            assert manager._should_lazy_load_nodes() is False
+            assert manager.module_loading.should_lazy_load_nodes() is False
 
     def test_orchestrator_honors_setting_enabled(self, engine: Engine) -> None:
         manager = engine.library_manager
@@ -204,7 +204,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=True),
         ):
-            assert manager._should_lazy_load_nodes() is True
+            assert manager.module_loading.should_lazy_load_nodes() is True
 
     def test_orchestrator_honors_setting_disabled(self, engine: Engine) -> None:
         manager = engine.library_manager
@@ -213,7 +213,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=False),
         ):
-            assert manager._should_lazy_load_nodes() is False
+            assert manager.module_loading.should_lazy_load_nodes() is False
 
 
 class TestMultipleNodesPerFile:
@@ -231,7 +231,7 @@ class TestMultipleNodesPerFile:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
@@ -255,11 +255,11 @@ class TestDescribeNodeTypeWithLazyImportFailure:
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
-        result = manager.describe_node_type_request(
+        result = manager.catalog.describe_node_type_request(
             DescribeNodeTypeRequest(node_type="BrokenNode", library=schema.name)
         )
 
@@ -301,7 +301,7 @@ class TestStableNamespaceImportUnderLazyLoading:
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
         return manager, schema
@@ -345,7 +345,7 @@ class TestStableNamespaceImportUnderLazyLoading:
     def test_unregistered_library_is_no_longer_importable(self, engine: Engine, tmp_path: Path) -> None:
         manager, schema = self._register_lazy_library(engine, tmp_path)
 
-        manager._unregister_all_stable_module_aliases_for_library(schema.name)
+        manager.module_loading.unregister_all_stable_module_aliases_for_library(schema.name)
 
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(self.GOOD_STABLE_NAMESPACE)
@@ -363,7 +363,7 @@ class TestStableNamespaceImportUnderLazyLoading:
         )
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 

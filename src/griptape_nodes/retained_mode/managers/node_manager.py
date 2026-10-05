@@ -659,18 +659,18 @@ class NodeManager(EngineScoped):
 
         resolved_library_name = library_name
         if resolved_library_name is None:
-            resolved_library_name = self.engine.library_manager.get_library_name_for_node_type(node_type)
+            resolved_library_name = self.engine.library_manager.catalog.get_library_name_for_node_type(node_type)
         if resolved_library_name is None:
             return message
 
         library_manager = self.engine.library_manager
         parts = [message]
 
-        problems = library_manager.get_collated_problems_for_library(resolved_library_name)
+        problems = library_manager.catalog.get_collated_problems_for_library(resolved_library_name)
         if problems is not None:
             parts.append(f"Library '{resolved_library_name}' reported problems when it loaded:\n{problems}")
 
-        stale_module_explanation = library_manager.explain_stale_module_failure(resolved_library_name)
+        stale_module_explanation = library_manager.catalog.explain_stale_module_failure(resolved_library_name)
         if stale_module_explanation is not None:
             parts.append(stale_module_explanation)
 
@@ -3304,7 +3304,7 @@ class NodeManager(EngineScoped):
             try:
                 if library_name:
                     await self.engine.worker_manager.wait_until_executable(library_name)
-                worker = library_manager.get_worker_for_library(library_name) if library_name else None
+                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
             wm = self.engine.worker_manager
@@ -3437,7 +3437,7 @@ class NodeManager(EngineScoped):
         # a failed dependency install is EVALUATED, not FAILURE, so this cannot test for FAILURE.
         if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
             return None
-        return library_manager.get_collated_problems_for_library(library_name)
+        return library_manager.catalog.get_collated_problems_for_library(library_name)
 
     async def _execute_node_via_worker(
         self,
@@ -4016,7 +4016,7 @@ class NodeManager(EngineScoped):
                 if execution_env not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
                     # Get library details for the execution environment library
                     exec_env_metadata_request = GetLibraryMetadataRequest(library=execution_env)
-                    exec_env_metadata_result = self.engine.library_manager.get_library_metadata_request(
+                    exec_env_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                         exec_env_metadata_request
                     )
                     if isinstance(exec_env_metadata_result, GetLibraryMetadataResultSuccess):
@@ -4028,7 +4028,9 @@ class NodeManager(EngineScoped):
             library_metadata_request = GetLibraryMetadataRequest(library=library_used)
             # Call LibraryManager directly to avoid error toasts when library is unavailable (expected for ErrorProxyNode)
             # Per https://github.com/griptape-ai/griptape-nodes/issues/1940
-            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
+                library_metadata_request
+            )
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 if isinstance(node, ErrorProxyNode):
@@ -4749,7 +4751,9 @@ class NodeManager(EngineScoped):
             data = json.loads(text)
         except json.JSONDecodeError:
             try:
-                return read_legacy_clipboard_commands(text, self.engine.library_manager.stable_module_names())
+                return read_legacy_clipboard_commands(
+                    text, self.engine.library_manager.module_loading.stable_module_names()
+                )
             except LegacyPickleError as error:
                 raise CopiedNodesError(str(error)) from error
         try:
@@ -4763,7 +4767,7 @@ class NodeManager(EngineScoped):
         A value that cannot be read is left out, so its parameter pastes with its default.
         """
         values: dict[str, JsonValue] = {}
-        library_modules = self.engine.library_manager.stable_module_names()
+        library_modules = self.engine.library_manager.module_loading.stable_module_names()
         for uuid, text in texts.items():
             try:
                 values[uuid] = json.loads(text)
@@ -4809,9 +4813,9 @@ class NodeManager(EngineScoped):
             trait_module = entry.get("trait_module")
             if trait_module is None:
                 continue
-            if not library_manager.is_dynamic_module(trait_module):
+            if not library_manager.module_loading.is_dynamic_module(trait_module):
                 continue
-            stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
+            stable_namespace = library_manager.module_loading.get_stable_namespace_for_dynamic_module(trait_module)
             if stable_namespace is None:
                 entry["trait_module"] = None
                 logger.warning(

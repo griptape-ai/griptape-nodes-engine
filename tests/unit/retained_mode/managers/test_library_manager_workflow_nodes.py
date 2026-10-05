@@ -93,7 +93,7 @@ class TestRegisterWorkflowNode:
         library = _library([_definition(workflow_path.name)])
         library_info = _library_info()
 
-        registered = engine.library_manager._register_workflow_node(
+        registered = engine.library_manager.module_loading._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -111,7 +111,7 @@ class TestRegisterWorkflowNode:
         workflow_path = _write_workflow(tmp_path, shape=_SHAPE)
         library = _library([_definition(workflow_path.name)])
 
-        engine.library_manager._register_workflow_node(
+        engine.library_manager.module_loading._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -124,7 +124,7 @@ class TestRegisterWorkflowNode:
         library = _library([_definition("absent_workflow.py")])
         library_info = _library_info()
 
-        registered = engine.library_manager._register_workflow_node(
+        registered = engine.library_manager.module_loading._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -140,7 +140,7 @@ class TestRegisterWorkflowNode:
         library = _library([_definition(workflow_path.name)])
         library_info = _library_info()
 
-        registered = engine.library_manager._register_workflow_node(
+        registered = engine.library_manager.module_loading._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,

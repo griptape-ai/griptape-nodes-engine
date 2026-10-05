@@ -93,7 +93,7 @@ class TestLegacyPayloads:
     def test_image_commands_come_back_with_their_value_pool_encoded(self, engine: Engine) -> None:
         text = Image.open(FIXTURES / "pickle_era_image_library_values.png").info[FLOW_COMMANDS_KEY]
 
-        commands = read_legacy_image_flow_commands(text, engine.library_manager.stable_module_names())
+        commands = read_legacy_image_flow_commands(text, engine.library_manager.module_loading.stable_module_names())
 
         assert commands.unique_parameter_uuid_to_values
         assert all(is_plain_data(value) for value in commands.unique_parameter_uuid_to_values.values())

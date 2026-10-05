@@ -4638,7 +4638,9 @@ class FlowManager(EngineScoped):
             data = json.loads(text)
         except json.JSONDecodeError:
             try:
-                return read_legacy_image_flow_commands(text, self.engine.library_manager.stable_module_names())
+                return read_legacy_image_flow_commands(
+                    text, self.engine.library_manager.module_loading.stable_module_names()
+                )
             except LegacyPickleError as error:
                 raise ImageFlowCommandsError(str(error)) from error
         try:

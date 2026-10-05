@@ -58,8 +58,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.library.environment import LibraryVenvInitResult
+from griptape_nodes.retained_mode.managers.library.provisioning import registration_satisfied_by_installed
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
-from griptape_nodes.retained_mode.managers.library_manager import LibraryVenvInitResult
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
@@ -76,7 +77,7 @@ def _config_value_dispatcher(
 ) -> Callable[..., object]:
     """A `get_config_value` side_effect that dispatches by key.
 
-    `_discover_library_files` reads `libraries_to_register` and
+    `discover_library_files` reads `libraries_to_register` and
     `libraries_to_download`; `libraries_directory` is also served so callers that
     touch all three keys share one mock. `downloads` defaults to an empty list so
     discovery's download-sourcing pass finds nothing unless a test opts in.
@@ -160,12 +161,14 @@ class TestLibraryManagerLoadLibraries:
         mock_library.name = "SomeLib"
         with (
             patch.object(library_manager, "_library_file_path_to_info", {"some_lib": mock_lib_info}),
-            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("some_lib")])),
+            patch.object(
+                library_manager.discovery, "discover_library_files", AsyncMock(return_value=[_discovered("some_lib")])
+            ),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
             patch.object(LibraryRegistry, "get_library", return_value=mock_library),
         ):
             request = LoadLibrariesRequest()
-            result = await library_manager.load_libraries_request(request)
+            result = await library_manager.discovery.load_libraries_request(request)
 
             assert isinstance(result, LoadLibrariesResultSuccess)
             assert isinstance(result.result_details, ResultDetails)
@@ -183,11 +186,13 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock()
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
+            patch.object(
+                library_manager.discovery, "discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])
+            ),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
-            result = await library_manager.load_libraries_request(request)
+            result = await library_manager.discovery.load_libraries_request(request)
 
             # Can be success or failure depending on whether sandbox library exists
             # In CI without sandbox: failure (no libraries loaded)
@@ -208,11 +213,13 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock(side_effect=Exception("Config error"))
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
+            patch.object(
+                library_manager.discovery, "discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])
+            ),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
-            result = await library_manager.load_libraries_request(request)
+            result = await library_manager.discovery.load_libraries_request(request)
 
             # Can be success or failure depending on whether sandbox library exists
             # In CI without sandbox: failure (no libraries loaded)
@@ -252,7 +259,7 @@ class TestLibraryManagerDisabledEntries:
         ]
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config)):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
         by_path = {
             Path(entry.registration.path): entry.registration.enabled
@@ -273,7 +280,7 @@ class TestLibraryManagerDisabledEntries:
         with patch.object(
             engine.config_manager, "get_config_value", side_effect=_register_only_config([str(enabled_lib)])
         ):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
         assert len(result) == 1
         assert result[0].registration.enabled is True
@@ -294,7 +301,9 @@ class TestLibraryManagerDisabledEntries:
         library_manager._library_file_path_to_info = {}
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config)):
-            result = await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            result = await library_manager.discovery.discover_libraries_request(
+                DiscoverLibrariesRequest(include_sandbox=False)
+            )
 
         from griptape_nodes.retained_mode.events.library_events import DiscoverLibrariesResultSuccess
 
@@ -323,7 +332,7 @@ class TestLibraryManagerDisabledEntries:
             patch.object(engine.config_manager, "get_config_value", return_value=config),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
         assert result == []
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
@@ -351,7 +360,7 @@ class TestLibraryManagerDisabledEntries:
         # Initial discovery: first_lib enabled, second_lib disabled.
         initial_config = [str(first_lib), {"path": str(second_lib), "enabled": False}]
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(initial_config)):
-            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            await library_manager.discovery.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
@@ -361,7 +370,7 @@ class TestLibraryManagerDisabledEntries:
         # User flips the config: first_lib disabled, second_lib enabled, then triggers refresh.
         toggled_config = [{"path": str(first_lib), "enabled": False}, str(second_lib)]
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(toggled_config)):
-            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            await library_manager.discovery.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state_after = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state_after = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
@@ -370,7 +379,7 @@ class TestLibraryManagerDisabledEntries:
 
 
 class TestLibraryManagerMigrateOldXdgPaths:
-    """Test the _migrate_old_xdg_library_paths functionality in LibraryManager."""
+    """Test the migrate_old_xdg_library_paths functionality in LibraryManager."""
 
     def test_removes_old_xdg_paths_and_preserves_valid_paths(self, engine: Engine) -> None:
         """Test that old XDG paths are removed while valid paths are preserved."""
@@ -397,7 +406,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify both configs were updated
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -421,7 +430,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify config was NOT updated (no old paths to remove)
             mock_config_manager.set_config_value.assert_not_called()
@@ -434,7 +443,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         mock_config_manager.get_config_value.return_value = []
 
         with patch.object(engine, "_config_manager", mock_config_manager):
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify config was NOT updated (empty config)
             mock_config_manager.set_config_value.assert_not_called()
@@ -447,7 +456,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         mock_config_manager.get_config_value.return_value = None
 
         with patch.object(engine, "_config_manager", mock_config_manager):
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify config was NOT updated (None config)
             mock_config_manager.set_config_value.assert_not_called()
@@ -482,7 +491,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify all old paths removed, only valid path remains
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -517,7 +526,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify only old XDG path removed, custom and git URL preserved
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -550,7 +559,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify both configs were updated
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -589,7 +598,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify only register was updated, downloads unchanged (no duplicate)
             assert mock_config_manager.set_config_value.call_count == 1
@@ -626,7 +635,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify both configs were updated
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -668,7 +677,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
-            library_manager._migrate_old_xdg_library_paths()
+            library_manager.discovery.migrate_old_xdg_library_paths()
 
             # Verify both configs were updated
             assert mock_config_manager.set_config_value.call_count == 2  # noqa: PLR2004
@@ -698,12 +707,12 @@ class TestLibraryManagerRegisterLibraryFromFile:
         schema.advanced_library_path = None
 
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.Path") as mock_path,
-            patch.object(library_manager, "load_library_metadata_from_file_request") as mock_load,
+            patch("griptape_nodes.retained_mode.managers.library.registration.Path") as mock_path,
+            patch.object(library_manager.metadata_loading, "load_library_metadata_from_file_request") as mock_load,
             # Mock that venv already exists (old code would skip installation)
-            patch.object(library_manager, "_get_library_venv_path") as mock_venv,
-            patch.object(library_manager, "install_library_dependencies_request") as mock_install,
-            patch("griptape_nodes.retained_mode.managers.library_manager.logger"),
+            patch.object(library_manager.environment, "get_library_venv_path") as mock_venv,
+            patch.object(library_manager.dependencies, "install_library_dependencies_request") as mock_install,
+            patch("griptape_nodes.retained_mode.managers.library.registration.logger"),
         ):
             mock_path.return_value.exists.return_value = True
             mock_load.return_value = LoadLibraryMetadataFromFileResultSuccess(
@@ -721,7 +730,7 @@ class TestLibraryManagerRegisterLibraryFromFile:
                 library_name="test_lib", dependencies_installed=2, result_details=ResultDetails(message="OK", level=20)
             )
 
-            await library_manager.register_library_from_file_request(
+            await library_manager.registration.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/mock.json")
             )
 
@@ -740,11 +749,11 @@ class TestLibraryManagerRegisterLibraryFromFile:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.Path",
+                "griptape_nodes.retained_mode.managers.library.registration.Path",
                 return_value=MagicMock(exists=MagicMock(return_value=True)),
             ),
             patch.object(
-                mgr,
+                mgr.metadata_loading,
                 "load_library_metadata_from_file_request",
                 return_value=LoadLibraryMetadataFromFileResultSuccess(
                     library_schema=schema,
@@ -756,15 +765,19 @@ class TestLibraryManagerRegisterLibraryFromFile:
                     result_details=ResultDetails(message="OK", level=20),
                 ),
             ),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))),
+            patch.object(
+                mgr.environment, "get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))
+            ),
             # Mock failed dependency installation
             patch.object(
-                mgr,
+                mgr.dependencies,
                 "install_library_dependencies_request",
                 return_value=InstallLibraryDependenciesResultFailure(result_details="Install failed"),
             ),
         ):
-            result = await mgr.register_library_from_file_request(RegisterLibraryFromFileRequest(file_path="/f"))
+            result = await mgr.registration.register_library_from_file_request(
+                RegisterLibraryFromFileRequest(file_path="/f")
+            )
 
             # Verify failure result with expected error message
             assert isinstance(result, RegisterLibraryFromFileResultFailure)
@@ -803,22 +816,26 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ) as mock_init_venv,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", return_value=5.0),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -836,22 +853,26 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ) as mock_init_venv,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", return_value=5.0),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -875,27 +896,33 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            # Reports as present so the removal is attempted, unlike _ABSENT_VENV_PATH.
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            # Reports as present so the removal is attempted, unlike _ABSENT_VENV_PATH.
+            patch.object(
+                mgr.environment, "get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))
+            ),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ),
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", return_value=5.0),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
+                "griptape_nodes.retained_mode.managers.library.dependencies.shutil.rmtree",
                 side_effect=OSError("in use by another process"),
             ) as mock_rmtree,
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -914,11 +941,17 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, side_effect=RuntimeError("disk full")),
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment, "init_library_venv", new_callable=AsyncMock, side_effect=RuntimeError("disk full")
+            ),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -937,17 +970,21 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ),
-            patch.object(mgr, "_can_write_to_venv_location", return_value=False),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=False),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -965,26 +1002,30 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ),
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=False,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.format_disk_space_error",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.format_disk_space_error",
                 return_value="not enough space",
             ),
             patch.object(engine.config_manager, "get_config_value", return_value=5.0),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1002,27 +1043,31 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
             ),
-            patch.object(mgr, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.dependencies, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 new_callable=AsyncMock,
             ) as mock_subprocess,
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1046,24 +1091,28 @@ class TestLibraryManagerInstallLibraryDependencies:
         expected_uv_runs = 3
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
             ),
             patch.object(
-                mgr, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
+                mgr.dependencies, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
             ) as mock_reset,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 new_callable=AsyncMock,
                 side_effect=[
                     subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
@@ -1073,7 +1122,7 @@ class TestLibraryManagerInstallLibraryDependencies:
             ) as mock_subprocess,
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1094,28 +1143,32 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ),
-            patch.object(mgr, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.dependencies, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 new_callable=AsyncMock,
                 side_effect=subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="bad package"),
             ) as mock_subprocess,
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1140,24 +1193,28 @@ class TestLibraryManagerInstallLibraryDependencies:
         expected_uv_runs = 4
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
-                mgr,
-                "_init_library_venv",
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(
+                mgr.environment,
+                "init_library_venv",
                 new_callable=AsyncMock,
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
             ),
             patch.object(
-                mgr, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
+                mgr.dependencies, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
             ) as mock_reset,
-            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch.object(mgr.environment, "can_write_to_venv_location", return_value=True),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 new_callable=AsyncMock,
                 side_effect=[
                     subprocess.CalledProcessError(returncode=2, cmd=["uv"], stderr="corrupt METADATA"),
@@ -1168,7 +1225,7 @@ class TestLibraryManagerInstallLibraryDependencies:
             ) as mock_subprocess,
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1211,13 +1268,19 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema = self._schema_without_its_own_execution_set(mgr)
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]),
-            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(
+                mgr.dependencies, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]
+            ),
+            patch.object(mgr.dependencies, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr.dependencies, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
+            patch.object(mgr.dependencies, "_this_process_owns_the_edit_venv", return_value=False),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1235,13 +1298,17 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema = self._schema_without_its_own_execution_set(mgr)
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=[]),
-            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.dependencies, "_execution_dependencies_of_declared_libraries", return_value=[]),
+            patch.object(mgr.dependencies, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr.dependencies, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr.dependencies, "_this_process_owns_the_edit_venv", return_value=False),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1301,15 +1368,15 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         with (
             patch.object(
-                mgr,
+                mgr.metadata_loading,
                 "load_library_metadata_from_file_request",
                 side_effect=lambda request: self._metadata_result(schemas[request.file_path]),
             ),
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
-            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+            patch.object(mgr.dependencies, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
+            patch.object(mgr.dependencies, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(mgr.environment, "get_library_venv_path", return_value=_ABSENT_VENV_PATH),
         ):
-            result = await mgr.install_library_dependencies_request(
+            result = await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path=consumer_path)
             )
 
@@ -1329,7 +1396,7 @@ def _fake_config_value(key: str, **_: object) -> object:
 
 
 class TestLibraryManagerVenvHealth:
-    """Tests for broken-venv recovery in _init_library_venv."""
+    """Tests for broken-venv recovery in init_library_venv."""
 
     @staticmethod
     def _make_functional_venv(venv_path: Path) -> Path:
@@ -1354,12 +1421,12 @@ class TestLibraryManagerVenvHealth:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.environment.subprocess_run",
                 new_callable=AsyncMock,
             ) as mock_subprocess,
-            patch("griptape_nodes.retained_mode.managers.library_manager.find_uv_bin") as mock_find_uv,
+            patch("griptape_nodes.retained_mode.managers.library.environment.find_uv_bin") as mock_find_uv,
         ):
-            python_path = await mgr._init_library_venv(venv_path)
+            python_path = await mgr.environment.init_library_venv(venv_path)
 
         assert python_path.python_path == expected_python
         assert python_path.reused is True
@@ -1386,20 +1453,20 @@ class TestLibraryManagerVenvHealth:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.environment.subprocess_run",
                 side_effect=fake_subprocess_run,
             ) as mock_subprocess,
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.find_uv_bin",
+                "griptape_nodes.retained_mode.managers.library.environment.find_uv_bin",
                 return_value="/fake/uv",
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.environment.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            python_path = await mgr._init_library_venv(venv_path)
+            python_path = await mgr.environment.init_library_venv(venv_path)
 
         mock_subprocess.assert_called_once()
         assert python_path.python_path == recreated_python_path["path"]
@@ -1417,20 +1484,20 @@ class TestLibraryManagerVenvHealth:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.environment.subprocess_run",
                 side_effect=fake_subprocess_run,
             ) as mock_subprocess,
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.find_uv_bin",
+                "griptape_nodes.retained_mode.managers.library.environment.find_uv_bin",
                 return_value="/fake/uv",
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.environment.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            python_path = await mgr._init_library_venv(venv_path)
+            python_path = await mgr.environment.init_library_venv(venv_path)
 
         mock_subprocess.assert_called_once()
         assert python_path.python_path.exists()
@@ -1439,11 +1506,11 @@ class TestLibraryManagerVenvHealth:
 
     @pytest.mark.asyncio
     async def test_reset_wipes_functional_venv_and_recreates_it(self, engine: Engine, tmp_path: Path) -> None:
-        """_reset_and_init_library_venv wipes even a functional venv, unlike _init_library_venv."""
+        """_reset_and_init_library_venv wipes even a functional venv, unlike init_library_venv."""
         mgr = engine.library_manager
         venv_path = tmp_path / ".venv"
         self._make_functional_venv(venv_path)
-        # A functional venv would be reused by _init_library_venv; prove reset wipes it anyway.
+        # A functional venv would be reused by init_library_venv; prove reset wipes it anyway.
         (venv_path / "stray.txt").write_text("old")
 
         recreated_python_path: dict[str, Path] = {}
@@ -1454,20 +1521,20 @@ class TestLibraryManagerVenvHealth:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.environment.subprocess_run",
                 side_effect=fake_subprocess_run,
             ) as mock_subprocess,
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.find_uv_bin",
+                "griptape_nodes.retained_mode.managers.library.environment.find_uv_bin",
                 return_value="/fake/uv",
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.environment.OSManager.check_available_disk_space",
                 return_value=True,
             ),
             patch.object(engine.config_manager, "get_config_value", side_effect=_fake_config_value),
         ):
-            python_path = await mgr._reset_and_init_library_venv(venv_path)
+            python_path = await mgr.dependencies._reset_and_init_library_venv(venv_path)
 
         mock_subprocess.assert_called_once()
         assert python_path == recreated_python_path["path"]
@@ -1482,12 +1549,12 @@ class TestLibraryManagerVenvHealth:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
+                "griptape_nodes.retained_mode.managers.library.dependencies.shutil.rmtree",
                 side_effect=OSError("permission denied"),
             ),
             pytest.raises(RuntimeError, match="could not be removed"),
         ):
-            await mgr._reset_and_init_library_venv(venv_path)
+            await mgr.dependencies._reset_and_init_library_venv(venv_path)
 
 
 class TestListRegisteredLibraries:
@@ -1505,7 +1572,7 @@ class TestListRegisteredLibraries:
 
         with patch.object(LibraryRegistry, "list_libraries", return_value=mock_libraries):
             request = ListRegisteredLibrariesRequest()
-            task = asyncio.create_task(library_manager.on_list_registered_libraries_request(request))
+            task = asyncio.create_task(library_manager.catalog.on_list_registered_libraries_request(request))
 
             # Yield control so the task can start and block on the event
             await asyncio.sleep(0)
@@ -1533,7 +1600,7 @@ class TestListRegisteredLibraries:
 
         with patch.object(LibraryRegistry, "list_libraries", return_value=mock_libraries):
             request = ListRegisteredLibrariesRequest()
-            result = await library_manager.on_list_registered_libraries_request(request)
+            result = await library_manager.catalog.on_list_registered_libraries_request(request)
 
         assert isinstance(result, ListRegisteredLibrariesResultSuccess)
         assert result.libraries == mock_libraries
@@ -1548,7 +1615,7 @@ class TestListRegisteredLibraries:
 
         with patch.object(LibraryRegistry, "list_libraries", return_value=mock_libraries):
             request = ListRegisteredLibrariesRequest()
-            result = await library_manager.on_list_registered_libraries_request(request)
+            result = await library_manager.catalog.on_list_registered_libraries_request(request)
 
         assert isinstance(result, ListRegisteredLibrariesResultSuccess)
         # Mutating the result should not affect the original list
@@ -1566,10 +1633,10 @@ class TestGetAllInfoForAllLibraries:
 
         with (
             patch.object(LibraryRegistry, "list_libraries", return_value=[]) as mock_list,
-            patch.object(library_manager, "on_list_registered_libraries_request") as mock_handler,
+            patch.object(library_manager.catalog, "on_list_registered_libraries_request") as mock_handler,
         ):
             request = GetAllInfoForAllLibrariesRequest()
-            result = await library_manager.get_all_info_for_all_libraries_request(request)
+            result = await library_manager.catalog.get_all_info_for_all_libraries_request(request)
 
         mock_list.assert_called_once()
         mock_handler.assert_not_called()
@@ -1585,10 +1652,12 @@ class TestGetAllInfoForAllLibraries:
 
         with (
             patch.object(LibraryRegistry, "list_libraries", return_value=["BadLib"]),
-            patch.object(library_manager, "get_all_info_for_library_request", AsyncMock(return_value=mock_failure)),
+            patch.object(
+                library_manager.catalog, "get_all_info_for_library_request", AsyncMock(return_value=mock_failure)
+            ),
         ):
             request = GetAllInfoForAllLibrariesRequest()
-            result = await library_manager.get_all_info_for_all_libraries_request(request)
+            result = await library_manager.catalog.get_all_info_for_all_libraries_request(request)
 
         assert isinstance(result, GetAllInfoForAllLibrariesResultFailure)
         assert "BadLib" in str(result.result_details)
@@ -1612,16 +1681,18 @@ class TestGetAllInfoForAllLibraries:
 
         with (
             patch.object(LibraryRegistry, "list_libraries", return_value=["LibA", "LibB", "LibC"]),
-            patch.object(library_manager, "get_all_info_for_library_request", slow_success),
+            patch.object(library_manager.catalog, "get_all_info_for_library_request", slow_success),
         ):
-            result = await library_manager.get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
+            result = await library_manager.catalog.get_all_info_for_all_libraries_request(
+                GetAllInfoForAllLibrariesRequest()
+            )
 
         assert isinstance(result, GetAllInfoForAllLibrariesResultSuccess)
         assert peak_in_flight > 1, "libraries were walked one at a time instead of gathered"
 
 
 class TestAddLibraryPathsToSysPath:
-    """Test the _add_library_paths_to_sys_path helper method."""
+    """Test the add_library_paths_to_sys_path helper method."""
 
     @pytest.mark.asyncio
     async def test_adds_base_dir_to_sys_path(self, engine: Engine) -> None:
@@ -1635,10 +1706,10 @@ class TestAddLibraryPathsToSysPath:
         original_sys_path = sys.path.copy()
         try:
             with (
-                patch.object(library_manager, "_get_library_venv_path", return_value=Path("/fake/venv")),
-                patch("griptape_nodes.retained_mode.managers.library_manager.anyio.Path", mock_anyio_path),
+                patch.object(library_manager.environment, "get_library_venv_path", return_value=Path("/fake/venv")),
+                patch("griptape_nodes.retained_mode.managers.library.environment.anyio.Path", mock_anyio_path),
             ):
-                await library_manager._add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
+                await library_manager.environment.add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
 
             assert str(base_dir) in sys.path
         finally:
@@ -1658,14 +1729,14 @@ class TestAddLibraryPathsToSysPath:
         original_sys_path = sys.path.copy()
         try:
             with (
-                patch.object(library_manager, "_get_library_venv_path", return_value=venv_path),
-                patch("griptape_nodes.retained_mode.managers.library_manager.anyio.Path", mock_anyio_path),
+                patch.object(library_manager.environment, "get_library_venv_path", return_value=venv_path),
+                patch("griptape_nodes.retained_mode.managers.library.environment.anyio.Path", mock_anyio_path),
                 patch(
-                    "griptape_nodes.retained_mode.managers.library_manager.sysconfig.get_path",
+                    "griptape_nodes.retained_mode.managers.library.environment.sysconfig.get_path",
                     return_value=fake_site_packages,
                 ),
             ):
-                await library_manager._add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
+                await library_manager.environment.add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
 
             assert fake_site_packages in sys.path
             assert str(base_dir) in sys.path
@@ -1685,11 +1756,11 @@ class TestAddLibraryPathsToSysPath:
         original_sys_path = sys.path.copy()
         try:
             with (
-                patch.object(library_manager, "_get_library_venv_path", return_value=venv_path),
-                patch("griptape_nodes.retained_mode.managers.library_manager.anyio.Path", mock_anyio_path),
-                patch("griptape_nodes.retained_mode.managers.library_manager.sysconfig.get_path") as mock_get_path,
+                patch.object(library_manager.environment, "get_library_venv_path", return_value=venv_path),
+                patch("griptape_nodes.retained_mode.managers.library.environment.anyio.Path", mock_anyio_path),
+                patch("griptape_nodes.retained_mode.managers.library.environment.sysconfig.get_path") as mock_get_path,
             ):
-                await library_manager._add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
+                await library_manager.environment.add_library_paths_to_sys_path("test_lib", "/fake/lib.json", base_dir)
 
             # sysconfig.get_path should not have been called since venv doesn't exist
             mock_get_path.assert_not_called()
@@ -1723,7 +1794,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         The Sandbox Library is normally created during engine startup. Our tests start from a
         bare engine, so we recreate the minimal state the handler expects.
 
-        We stub `_get_sandbox_directory` rather than round-tripping `set_config_value`, which
+        We stub `get_sandbox_directory` rather than round-tripping `set_config_value`, which
         calls `load_configs` and reads the on-disk USER_CONFIG_PATH. The conftest patches
         USER_CONFIG_PATH to an empty file, so config-layer writes get clobbered between the
         fixture and the handler call. Stubbing the resolver keeps the test focused on handler
@@ -1777,7 +1848,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         library_manager = engine.library_manager
         # Default: return the tmp sandbox. Individual tests that need the "not configured"
         # branch override via their own patch.
-        with patch.object(library_manager, "_get_sandbox_directory", return_value=sandbox_dir):
+        with patch.object(library_manager.sandbox, "get_sandbox_directory", return_value=sandbox_dir):
             try:
                 yield sandbox_dir
             finally:
@@ -1798,7 +1869,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         source_file = sandbox_dir / self._FILE_NAME
         source_file.write_text(self._SOURCE_OK)
 
-        result = library_manager.register_sandbox_node_from_source_request(
+        result = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path=str(source_file))
         )
 
@@ -1824,7 +1895,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         (sandbox_dir / self._FILE_NAME).write_text(self._SOURCE_OK)
 
         # Bare filename, no directory component: must resolve under the sandbox dir.
-        result = library_manager.register_sandbox_node_from_source_request(
+        result = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path=self._FILE_NAME)
         )
 
@@ -1847,14 +1918,14 @@ class TestRegisterSandboxNodeFromSourceRequest:
         source_file.write_text(self._SOURCE_OK)
 
         # First registration: baseline.
-        first = library_manager.register_sandbox_node_from_source_request(
+        first = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path=str(source_file), replace_if_exists=True)
         )
         assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess)
         assert first.replaced_class_names == []
 
         # Second registration of the same class name should report the prior was replaced.
-        second = library_manager.register_sandbox_node_from_source_request(
+        second = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path=str(source_file), replace_if_exists=True)
         )
         assert isinstance(second, RegisterSandboxNodeFromSourceResultSuccess)
@@ -1875,8 +1946,8 @@ class TestRegisterSandboxNodeFromSourceRequest:
         library_manager = engine.library_manager
         # Override the fixture's default stub so the resolver returns None, simulating the
         # "no sandbox configured" case.
-        with patch.object(library_manager, "_get_sandbox_directory", return_value=None):
-            result = library_manager.register_sandbox_node_from_source_request(
+        with patch.object(library_manager.sandbox, "get_sandbox_directory", return_value=None):
+            result = library_manager.sandbox.register_sandbox_node_from_source_request(
                 RegisterSandboxNodeFromSourceRequest(file_path=self._FILE_NAME)
             )
 
@@ -1913,7 +1984,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
 
         bad_paths = [str(outside), str(wrong_ext), "../escape.py"]
         for bad_path in bad_paths:
-            result = library_manager.register_sandbox_node_from_source_request(
+            result = library_manager.sandbox.register_sandbox_node_from_source_request(
                 RegisterSandboxNodeFromSourceRequest(file_path=bad_path)
             )
             assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure), bad_path
@@ -1930,7 +2001,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
 
         library_manager = engine.library_manager
 
-        result = library_manager.register_sandbox_node_from_source_request(
+        result = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path="never_written.py")
         )
 
@@ -1952,7 +2023,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         no_node_file = sandbox_dir / "no_node.py"
         no_node_file.write_text("x = 1\n")
 
-        result = library_manager.register_sandbox_node_from_source_request(
+        result = library_manager.sandbox.register_sandbox_node_from_source_request(
             RegisterSandboxNodeFromSourceRequest(file_path=str(no_node_file))
         )
 
@@ -2102,7 +2173,7 @@ class TestDescribeNodeTypeRequest:
             ),
         )
 
-        result = library_manager.describe_node_type_request(
+        result = library_manager.catalog.describe_node_type_request(
             DescribeNodeTypeRequest(node_type=_CatalogProbe.__name__, library=self._LIBRARY_NAME),
         )
 
@@ -2120,7 +2191,7 @@ class TestDescribeNodeTypeRequest:
             library=self._LIBRARY_NAME,
         )
 
-        result = library_manager.describe_node_type_request(request)
+        result = library_manager.catalog.describe_node_type_request(request)
 
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         assert result.library == self._LIBRARY_NAME
@@ -2161,7 +2232,7 @@ class TestDescribeNodeTypeRequest:
 
         request = DescribeNodeTypeRequest(node_type=_DescribeNodeTypeProbe.__name__)
 
-        result = library_manager.describe_node_type_request(request)
+        result = library_manager.catalog.describe_node_type_request(request)
 
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         assert result.library == self._LIBRARY_NAME
@@ -2172,7 +2243,7 @@ class TestDescribeNodeTypeRequest:
 
         request = DescribeNodeTypeRequest(node_type="NotARealNode", library=self._LIBRARY_NAME)
 
-        result = library_manager.describe_node_type_request(request)
+        result = library_manager.catalog.describe_node_type_request(request)
 
         assert isinstance(result, DescribeNodeTypeResultFailure)
 
@@ -2205,7 +2276,7 @@ class TestDescribeNodeTypeRequest:
 
         request = DescribeNodeTypeRequest(node_type=_RaisingProbe.__name__, library=self._LIBRARY_NAME)
 
-        result = library_manager.describe_node_type_request(request)
+        result = library_manager.catalog.describe_node_type_request(request)
 
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         # Library-level metadata still surfaces so callers can at least show the node.
@@ -2338,7 +2409,7 @@ class TestLibraryManagerEngineVersionCheck:
             patch.object(engine, "_config_manager", self._config_manager_returning(">=0.5,<1.0")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            assert library_manager._check_engine_version() is None
+            assert library_manager.provisioning._check_engine_version() is None
 
     def test_unsatisfied_returns_detail_naming_running_version(self, engine: Engine) -> None:
         library_manager = engine.library_manager
@@ -2346,7 +2417,7 @@ class TestLibraryManagerEngineVersionCheck:
             patch.object(engine, "_config_manager", self._config_manager_returning(">=2.0,<3.0")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            detail = library_manager._check_engine_version()
+            detail = library_manager.provisioning._check_engine_version()
 
         assert detail is not None
         assert "0.5.3" in detail
@@ -2357,7 +2428,7 @@ class TestLibraryManagerEngineVersionCheck:
             patch.object(engine, "_config_manager", self._config_manager_returning("not-a-specifier")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            detail = library_manager._check_engine_version()
+            detail = library_manager.provisioning._check_engine_version()
 
         assert detail is not None
         assert "not a valid" in detail.lower()
@@ -2365,7 +2436,7 @@ class TestLibraryManagerEngineVersionCheck:
     def test_no_key_returns_none(self, engine: Engine) -> None:
         library_manager = engine.library_manager
         with patch.object(engine, "_config_manager", self._config_manager_returning(None)):
-            assert library_manager._check_engine_version() is None
+            assert library_manager.provisioning._check_engine_version() is None
 
 
 class TestLibraryManagerProvisioningPlan:
@@ -2377,8 +2448,10 @@ class TestLibraryManagerProvisioningPlan:
 
         library_manager = engine.library_manager
         download = LibraryDownload(name="git-lib", version=">=2.0,<3", git_url="griptape-ai/git-lib@v2")
-        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="2.1.0")):
-            action = await library_manager._plan_one_library_provisioning(download)
+        with patch.object(
+            library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value="2.1.0")
+        ):
+            action = await library_manager.provisioning._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.SKIP
         assert action.destructive is False
@@ -2389,8 +2462,10 @@ class TestLibraryManagerProvisioningPlan:
 
         library_manager = engine.library_manager
         download = LibraryDownload(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value=None)):
-            action = await library_manager._plan_one_library_provisioning(download)
+        with patch.object(
+            library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value=None)
+        ):
+            action = await library_manager.provisioning._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.INSTALL
         assert action.destructive is False
@@ -2401,8 +2476,10 @@ class TestLibraryManagerProvisioningPlan:
 
         library_manager = engine.library_manager
         download = LibraryDownload(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")):
-            action = await library_manager._plan_one_library_provisioning(download)
+        with patch.object(
+            library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value="1.0.0")
+        ):
+            action = await library_manager.provisioning._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.OVERWRITE
         # A git overwrite deletes the local library directory before re-cloning.
@@ -2417,8 +2494,10 @@ class TestLibraryManagerProvisioningPlan:
 
         library_manager = engine.library_manager
         download = LibraryDownload(version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")):
-            action = await library_manager._plan_one_library_provisioning(download)
+        with patch.object(
+            library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value="1.0.0")
+        ):
+            action = await library_manager.provisioning._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.OVERWRITE
         assert action.destructive is True
@@ -2450,7 +2529,10 @@ class TestInstalledLibraryVersion:
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
         with patch.object(engine, "_config_manager", self._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) == "0.78.0"
+            assert (
+                await library_manager.provisioning._installed_library_version("Griptape Nodes Library", libraries_dir)
+                == "0.78.0"
+            )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_manifest_matches(self, engine: Engine, tmp_path: Path) -> None:
@@ -2458,14 +2540,20 @@ class TestInstalledLibraryVersion:
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
         with patch.object(engine, "_config_manager", self._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
+            assert (
+                await library_manager.provisioning._installed_library_version("Griptape Nodes Library", libraries_dir)
+                is None
+            )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_libraries_root_empty(self, engine: Engine, tmp_path: Path) -> None:
         library_manager = engine.library_manager
         libraries_dir = tmp_path / "empty-libraries"
         with patch.object(engine, "_config_manager", self._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
+            assert (
+                await library_manager.provisioning._installed_library_version("Griptape Nodes Library", libraries_dir)
+                is None
+            )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_manifest_has_no_version(self, engine: Engine, tmp_path: Path) -> None:
@@ -2473,14 +2561,17 @@ class TestInstalledLibraryVersion:
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", None)
         with patch.object(engine, "_config_manager", self._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
+            assert (
+                await library_manager.provisioning._installed_library_version("Griptape Nodes Library", libraries_dir)
+                is None
+            )
 
 
 class TestInstalledLibraryManifestPath:
     """The shared resolver behind both planner and loader.
 
     `_installed_library_manifest_path` backs both the provisioning planner
-    (`_installed_library_version`) and the loader (`_discover_library_files`), so the
+    (`_installed_library_version`) and the loader (`discover_library_files`), so the
     file the planner reasons about is exactly the file discovery loads.
     """
 
@@ -2490,7 +2581,9 @@ class TestInstalledLibraryManifestPath:
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
         with patch.object(engine, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)):
-            result = await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir)
+            result = await library_manager.provisioning._installed_library_manifest_path(
+                "Griptape Nodes Library", libraries_dir
+            )
         assert result == libraries_dir / "git-lib" / "griptape_nodes_library.json"
 
     @pytest.mark.asyncio
@@ -2500,7 +2593,10 @@ class TestInstalledLibraryManifestPath:
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
         with patch.object(engine, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)):
             assert (
-                await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir) is None
+                await library_manager.provisioning._installed_library_manifest_path(
+                    "Griptape Nodes Library", libraries_dir
+                )
+                is None
             )
 
     @pytest.mark.asyncio
@@ -2513,7 +2609,10 @@ class TestInstalledLibraryManifestPath:
             TestInstalledLibraryVersion._config_manager_for(libraries_dir),
         ):
             assert (
-                await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir) is None
+                await library_manager.provisioning._installed_library_manifest_path(
+                    "Griptape Nodes Library", libraries_dir
+                )
+                is None
             )
 
 
@@ -2535,7 +2634,7 @@ class TestInstalledDownloadVersion:
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "1.2.3")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch.object(engine, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_download_version(download, libraries_dir) == "1.2.3"
+            assert await library_manager.provisioning._installed_download_version(download, libraries_dir) == "1.2.3"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_repo_directory_absent(self, engine: Engine, tmp_path: Path) -> None:
@@ -2544,7 +2643,7 @@ class TestInstalledDownloadVersion:
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other-lib", "Other", "1.0.0")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch.object(engine, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_download_version(download, libraries_dir) is None
+            assert await library_manager.provisioning._installed_download_version(download, libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_name_overrides_directory_match(self, engine: Engine, tmp_path: Path) -> None:
@@ -2555,7 +2654,7 @@ class TestInstalledDownloadVersion:
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "legacy-dir", "Griptape Nodes Library", "0.9.0")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0", name="Griptape Nodes Library")
         with patch.object(engine, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)):
-            assert await library_manager._installed_download_version(download, libraries_dir) == "0.9.0"
+            assert await library_manager.provisioning._installed_download_version(download, libraries_dir) == "0.9.0"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_libraries_root_empty(self, engine: Engine, tmp_path: Path) -> None:
@@ -2567,7 +2666,7 @@ class TestInstalledDownloadVersion:
             "_config_manager",
             TestInstalledLibraryVersion._config_manager_for(libraries_dir),
         ):
-            assert await library_manager._installed_download_version(download, libraries_dir) is None
+            assert await library_manager.provisioning._installed_download_version(download, libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_explicit_libraries_path_probes_target_not_live(self, engine: Engine, tmp_path: Path) -> None:
@@ -2584,7 +2683,7 @@ class TestInstalledDownloadVersion:
         live_config.workspace_path = str(tmp_path / "live")
         live_config.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
         with patch.object(engine, "_config_manager", live_config):
-            assert await library_manager._installed_download_version(download, target_libs) == "3.3.0"
+            assert await library_manager.provisioning._installed_download_version(download, target_libs) == "3.3.0"
         live_config.get_config_value.assert_not_called()
 
 
@@ -2613,7 +2712,7 @@ class TestDiscoverProvisionedManifestPaths:
         config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
         config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
         with patch.object(engine, "_config_manager", config_manager):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
         discovered_paths = [Path(entry.registration.path) for entry in result if entry.registration.path is not None]
         assert expected_manifest in discovered_paths
@@ -2630,7 +2729,7 @@ class TestDiscoverProvisionedManifestPaths:
         config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
         config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
         with patch.object(engine, "_config_manager", config_manager):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
         assert result == []
 
@@ -2640,23 +2739,23 @@ class TestRegistrationSatisfiedByInstalled:
 
     def test_nothing_installed_is_never_satisfied(self) -> None:
         download = LibraryDownload(name="lib", version=">=2.0", git_url="griptape-ai/lib@v2")
-        assert _LibraryManager._registration_satisfied_by_installed(download, None) is False
+        assert registration_satisfied_by_installed(download, None) is False
 
     def test_source_only_entry_satisfied_by_any_installed(self) -> None:
         download = LibraryDownload(name="lib", git_url="griptape-ai/lib@v2")
-        assert _LibraryManager._registration_satisfied_by_installed(download, "1.0.0") is True
+        assert registration_satisfied_by_installed(download, "1.0.0") is True
 
     def test_version_within_specifier_is_satisfied(self) -> None:
         download = LibraryDownload(name="lib", version=">=2.0,<3", git_url="griptape-ai/lib@v2")
-        assert _LibraryManager._registration_satisfied_by_installed(download, "2.5.0") is True
+        assert registration_satisfied_by_installed(download, "2.5.0") is True
 
     def test_version_outside_specifier_is_unsatisfied(self) -> None:
         download = LibraryDownload(name="lib", version=">=2.0,<3", git_url="griptape-ai/lib@v2")
-        assert _LibraryManager._registration_satisfied_by_installed(download, "1.0.0") is False
+        assert registration_satisfied_by_installed(download, "1.0.0") is False
 
     def test_malformed_spec_is_unsatisfied_so_provisioning_reruns(self) -> None:
         download = LibraryDownload(name="lib", version="not-a-spec", git_url="griptape-ai/lib@v2")
-        assert _LibraryManager._registration_satisfied_by_installed(download, "2.0.0") is False
+        assert registration_satisfied_by_installed(download, "2.0.0") is False
 
 
 class TestReconcileLibrariesFromConfig:
@@ -2685,10 +2784,10 @@ class TestReconcileLibrariesFromConfig:
     async def test_engine_version_failure_blocks_provisioning(self, engine: Engine) -> None:
         library_manager = engine.library_manager
         with (
-            patch.object(library_manager, "_check_engine_version", return_value="engine too old"),
-            patch.object(library_manager, "_provision_one_library", new=AsyncMock()) as mock_provision,
+            patch.object(library_manager.provisioning, "_check_engine_version", return_value="engine too old"),
+            patch.object(library_manager.provisioning, "_provision_one_library", new=AsyncMock()) as mock_provision,
         ):
-            failures = await library_manager._reconcile_libraries_from_config()
+            failures = await library_manager.provisioning.reconcile_libraries_from_config()
 
         assert failures == ["engine too old"]
         # The gate runs before any disk mutation.
@@ -2707,10 +2806,12 @@ class TestReconcileLibrariesFromConfig:
         config_manager = self._config_manager_for_keys(downloads=download_config, register=register_config)
         with (
             patch.object(engine, "_config_manager", config_manager),
-            patch.object(library_manager, "_check_engine_version", return_value=None),
-            patch.object(library_manager, "_provision_one_library", new=AsyncMock(return_value=None)) as mock_provision,
+            patch.object(library_manager.provisioning, "_check_engine_version", return_value=None),
+            patch.object(
+                library_manager.provisioning, "_provision_one_library", new=AsyncMock(return_value=None)
+            ) as mock_provision,
         ):
-            failures = await library_manager._reconcile_libraries_from_config()
+            failures = await library_manager.provisioning.reconcile_libraries_from_config()
 
         assert failures == []
         # Only the two download entries reach provisioning; nothing from the register list does.
@@ -2723,10 +2824,12 @@ class TestReconcileLibrariesFromConfig:
         config_manager = self._config_manager_for_keys(downloads=download_config)
         with (
             patch.object(engine, "_config_manager", config_manager),
-            patch.object(library_manager, "_check_engine_version", return_value=None),
-            patch.object(library_manager, "_provision_one_library", new=AsyncMock(return_value="clone failed")),
+            patch.object(library_manager.provisioning, "_check_engine_version", return_value=None),
+            patch.object(
+                library_manager.provisioning, "_provision_one_library", new=AsyncMock(return_value="clone failed")
+            ),
         ):
-            failures = await library_manager._reconcile_libraries_from_config()
+            failures = await library_manager.provisioning.reconcile_libraries_from_config()
 
         assert failures == ["clone failed"]
 
@@ -2829,7 +2932,7 @@ class TestPreviewProjectProvisioning:
         mock_project_manager = MagicMock()
         mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=None)
         with patch.object(engine, "_project_manager", mock_project_manager):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id="/nope/project.yml")
             )
 
@@ -2845,7 +2948,7 @@ class TestPreviewProjectProvisioning:
         library_manager = engine.library_manager
         merged = self._merged_config([])
         with self._patch_managers(engine, dirs=MagicMock(), merged=merged):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2873,12 +2976,12 @@ class TestPreviewProjectProvisioning:
         with (
             self._patch_managers(engine, dirs=MagicMock(), merged=merged),
             patch.object(
-                library_manager,
+                library_manager.provisioning,
                 "_installed_download_version",
                 new=AsyncMock(side_effect=lambda download, _libraries_path=None: installed[download.name]),
             ),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2919,9 +3022,9 @@ class TestPreviewProjectProvisioning:
                 _mock_project_manager,
                 mock_config_manager,
             ),
-            patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value=None)),
+            patch.object(library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value=None)),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2974,7 +3077,7 @@ class TestPreviewProjectProvisioning:
             patch.object(engine, "_project_manager", mock_project_manager),
             patch.object(engine, "_config_manager", live_config),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -3012,7 +3115,7 @@ class TestPreviewProjectProvisioning:
             libraries_directory="libraries",
         )
         with self._patch_managers(engine, dirs=MagicMock(), merged=merged, libraries_root=resolved_root):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -3034,7 +3137,7 @@ class TestPreviewProjectProvisioning:
             self._patch_managers(engine, dirs=MagicMock(), merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -3056,7 +3159,7 @@ class TestPreviewProjectProvisioning:
             self._patch_managers(engine, dirs=MagicMock(), merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -3083,9 +3186,11 @@ class TestPreviewProjectProvisioning:
         merged = self._merged_config([{"name": "user-pin", "git_url": "griptape-ai/user-pin@v2", "version": "==2.0.0"}])
         with (
             self._patch_system_defaults(engine, merged=merged) as (mock_project_manager, _mock_config_manager),
-            patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")),
+            patch.object(
+                library_manager.provisioning, "_installed_download_version", new=AsyncMock(return_value="1.0.0")
+            ),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -3109,7 +3214,7 @@ class TestPreviewProjectProvisioning:
             self._patch_system_defaults(engine, merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -3128,7 +3233,7 @@ class TestPreviewProjectProvisioning:
         library_manager = engine.library_manager
         merged = self._merged_config([])
         with self._patch_system_defaults(engine, merged=merged):
-            result = await library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.provisioning.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -3167,10 +3272,12 @@ class TestProvisionGitLibraryOverwriteDir:
         with (
             patch.object(engine, "ahandle_request", ahandle),
             patch.object(
-                library_manager, "_installed_library_manifest_path", new=AsyncMock(return_value=manifest_path)
+                library_manager.provisioning,
+                "_installed_library_manifest_path",
+                new=AsyncMock(return_value=manifest_path),
             ),
         ):
-            failure = await library_manager._provision_git_library(
+            failure = await library_manager.provisioning._provision_git_library(
                 download, git_url="griptape-ai/repo-name@v2.0", installed_version="1.0.0"
             )
 
@@ -3203,9 +3310,11 @@ class TestProvisionGitLibraryOverwriteDir:
         ahandle = AsyncMock(return_value=success)
         with (
             patch.object(engine, "ahandle_request", ahandle),
-            patch.object(library_manager, "_installed_library_manifest_path", new=AsyncMock()) as mock_resolve,
+            patch.object(
+                library_manager.provisioning, "_installed_library_manifest_path", new=AsyncMock()
+            ) as mock_resolve,
         ):
-            failure = await library_manager._provision_git_library(
+            failure = await library_manager.provisioning._provision_git_library(
                 download, git_url="griptape-ai/repo-name@v2.0", installed_version=None
             )
 
@@ -3303,10 +3412,10 @@ class TestDownloadLibraryRegisterPersistence:
         before = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
 
         with patch(
-            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+            "griptape_nodes.retained_mode.managers.library.git_operations.clone_repository",
             side_effect=self._make_clone("provisioned_lib"),
         ):
-            result = await library_manager.download_library_request(
+            result = await library_manager.git_operations.download_library_request(
                 DownloadLibraryRequest(
                     git_url="owner/provisioned_lib",
                     download_directory=str(tmp_path / "libs"),
@@ -3340,7 +3449,7 @@ class TestDownloadLibraryRegisterPersistence:
         )
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+                "griptape_nodes.retained_mode.managers.library.git_operations.clone_repository",
                 side_effect=self._make_clone("explicit_lib"),
             ),
             patch.object(
@@ -3349,7 +3458,7 @@ class TestDownloadLibraryRegisterPersistence:
                 new=AsyncMock(return_value=mock_register_result),
             ),
         ):
-            result = await library_manager.download_library_request(
+            result = await library_manager.git_operations.download_library_request(
                 DownloadLibraryRequest(
                     git_url="owner/explicit_lib",
                     download_directory=str(tmp_path / "libs"),
@@ -3407,7 +3516,7 @@ class TestDiscoverDownloadedLibraries:
             return None
 
         with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):
-            entries = await library_manager._discover_library_files()
+            entries = await library_manager.discovery.discover_library_files()
 
         discovered_paths = {Path(entry.registration.path) for entry in entries}
         assert manifest_path in discovered_paths
@@ -3477,7 +3586,7 @@ class TestPersistLibrarySettings:
             "app_events.on_app_initialization_complete",
             {"secrets_to_register": {"MY_LIB_KEY": ""}},
         )
-        problems = library_manager._persist_library_settings(library)
+        problems = library_manager.registration._persist_library_settings(library)
 
         assert problems == []
         # The library's own declared setting persisted globally...
@@ -3495,7 +3604,7 @@ class TestPersistLibrarySettings:
             "my_library_category",
             {"some_setting": "value"},
         )
-        problems = library_manager._persist_library_settings(library)
+        problems = library_manager.registration._persist_library_settings(library)
 
         assert problems == []
         global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
@@ -3676,7 +3785,7 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         )
         library_manager._library_file_path_to_info = {file_path: library_info}
 
-        result = await library_manager._progress_library_through_lifecycle(
+        result = await library_manager.registration._progress_library_through_lifecycle(
             library_info, file_path, RegisterLibraryFromFileRequest(file_path=file_path)
         )
 
@@ -3692,7 +3801,7 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         # Problems are recorded, so status output shows the real error instead of
         # "No problems detected."
         assert stored.problems
-        assert library_manager.collate_problems_for_lib_info(stored) is not None
+        assert library_manager.catalog.collate_problems_for_lib_info(stored) is not None
 
     @pytest.mark.asyncio
     async def test_missing_file_surfaces_missing_fitness(self, engine: Engine, tmp_path: Path) -> None:
@@ -3709,7 +3818,7 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         )
         library_manager._library_file_path_to_info = {file_path: library_info}
 
-        result = await library_manager._progress_library_through_lifecycle(
+        result = await library_manager.registration._progress_library_through_lifecycle(
             library_info, file_path, RegisterLibraryFromFileRequest(file_path=file_path)
         )
 
@@ -3826,7 +3935,7 @@ class TestLibraryFitnessAuthorizationCheckpoint:
             "griptape_nodes.retained_mode.managers.version_compatibility_manager.VersionCompatibilityManager.check_library_version_compatibility",
             return_value=[],
         ):
-            result = engine.library_manager.evaluate_library_fitness_request(
+            result = engine.library_manager.discovery.evaluate_library_fitness_request(
                 EvaluateLibraryFitnessRequest(schema=self._schema("blocked-lib", LifecycleStage.LABS))
             )
 
@@ -3848,7 +3957,7 @@ class TestLibraryFitnessAuthorizationCheckpoint:
             "griptape_nodes.retained_mode.managers.version_compatibility_manager.VersionCompatibilityManager.check_library_version_compatibility",
             return_value=[],
         ):
-            result = engine.library_manager.evaluate_library_fitness_request(
+            result = engine.library_manager.discovery.evaluate_library_fitness_request(
                 EvaluateLibraryFitnessRequest(schema=self._schema("ok-lib"))
             )
         assert isinstance(result, EvaluateLibraryFitnessResultSuccess)
@@ -3888,7 +3997,7 @@ class TestLibraryFitnessAuthorizationCheckpoint:
             "griptape_nodes.retained_mode.managers.version_compatibility_manager.VersionCompatibilityManager.check_library_version_compatibility",
             return_value=[],
         ):
-            result = engine.library_manager.evaluate_library_fitness_request(
+            result = engine.library_manager.discovery.evaluate_library_fitness_request(
                 EvaluateLibraryFitnessRequest(schema=schema)
             )
 
@@ -3946,9 +4055,9 @@ class TestLibraryManagerDuplicateEntryHygiene:
         with (
             patch.object(library_manager, "_library_file_path_to_info", entries),
             patch.object(LibraryRegistry, "unregister_library"),
-            patch.object(library_manager, "_unregister_all_stable_module_aliases_for_library"),
+            patch.object(library_manager.module_loading, "unregister_all_stable_module_aliases_for_library"),
         ):
-            result = library_manager.unload_library_from_registry_request(
+            result = library_manager.registration.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name="MyLib")
             )
 
@@ -3983,7 +4092,7 @@ class TestLibraryManagerDuplicateEntryHygiene:
                 return_value=UnloadLibraryFromRegistryResultSuccess(result_details="ok"),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.find_file_in_directory",
+                "griptape_nodes.retained_mode.managers.library.git_operations.find_file_in_directory",
                 return_value=Path(new_path),
             ),
             patch.object(
@@ -3994,7 +4103,7 @@ class TestLibraryManagerDuplicateEntryHygiene:
             patch.object(LibraryRegistry, "get_library", return_value=mock_library),
         ):
             result = asyncio.run(
-                library_manager._reload_library_after_git_operation(
+                library_manager.git_operations._reload_library_after_git_operation(
                     library_name="MyLib",
                     library_file_path=old_path,
                     failure_result_class=RegisterLibraryFromFileResultFailure,

@@ -42,7 +42,7 @@ class TestGetLibrarySourceInfoRequest:
             library_manager, "get_library_info_by_library_name", return_value=mock_lib_info, autospec=True
         ) as get_library_info_by_library_name:
             request = GetLibrarySourceInfoRequest(library="Test Library")
-            result = await library_manager.on_get_library_source_info_request(request)
+            result = await library_manager.catalog.on_get_library_source_info_request(request)
 
         get_library_info_by_library_name.assert_called_once_with("Test Library")
         assert isinstance(result, GetLibrarySourceInfoResultSuccess)
@@ -69,7 +69,7 @@ class TestGetLibrarySourceInfoRequest:
             library_manager, "get_library_info_by_library_name", return_value=mock_lib_info, autospec=True
         ) as get_library_info_by_library_name:
             request = GetLibrarySourceInfoRequest(library="My Lib")
-            result = await library_manager.on_get_library_source_info_request(request)
+            result = await library_manager.catalog.on_get_library_source_info_request(request)
 
         get_library_info_by_library_name.assert_called_once_with("My Lib")
         assert isinstance(result, GetLibrarySourceInfoResultSuccess)
@@ -83,7 +83,7 @@ class TestGetLibrarySourceInfoRequest:
             library_manager, "get_library_info_by_library_name", return_value=None, autospec=True
         ) as get_library_info_by_library_name:
             request = GetLibrarySourceInfoRequest(library="NonexistentLib")
-            result = await library_manager.on_get_library_source_info_request(request)
+            result = await library_manager.catalog.on_get_library_source_info_request(request)
 
         get_library_info_by_library_name.assert_called_once_with("NonexistentLib")
         assert isinstance(result, GetLibrarySourceInfoResultFailure)
@@ -113,7 +113,7 @@ class TestGetLibrarySourceInfoRequest:
             ) as get_library_info_by_library_name,
         ):
             request = GetLibrarySourceInfoRequest(library="Test Library")
-            task = asyncio.create_task(library_manager.on_get_library_source_info_request(request))
+            task = asyncio.create_task(library_manager.catalog.on_get_library_source_info_request(request))
 
             await asyncio.sleep(0)
             assert not task.done()
@@ -130,7 +130,7 @@ class TestGetEngineSourceInfoRequest:
         library_manager = engine.library_manager
 
         request = GetEngineSourceInfoRequest()
-        result = library_manager.on_get_engine_source_info_request(request)
+        result = library_manager.catalog.on_get_engine_source_info_request(request)
 
         assert isinstance(result, GetEngineSourceInfoResultSuccess)
         assert Path(result.package_directory).is_dir()
@@ -139,7 +139,7 @@ class TestGetEngineSourceInfoRequest:
         library_manager = engine.library_manager
 
         request = GetEngineSourceInfoRequest()
-        result = library_manager.on_get_engine_source_info_request(request)
+        result = library_manager.catalog.on_get_engine_source_info_request(request)
 
         assert isinstance(result, GetEngineSourceInfoResultSuccess)
         assert (Path(result.package_directory) / "__init__.py").exists()
@@ -148,7 +148,7 @@ class TestGetEngineSourceInfoRequest:
         library_manager = engine.library_manager
 
         request = GetEngineSourceInfoRequest()
-        result = library_manager.on_get_engine_source_info_request(request)
+        result = library_manager.catalog.on_get_engine_source_info_request(request)
 
         assert isinstance(result, GetEngineSourceInfoResultSuccess)
         assert (Path(result.package_directory) / "exe_types" / "node_types.py").exists()
@@ -158,7 +158,7 @@ class TestGetEngineSourceInfoRequest:
 
         with patch("importlib.util.find_spec", return_value=None):
             request = GetEngineSourceInfoRequest()
-            result = library_manager.on_get_engine_source_info_request(request)
+            result = library_manager.catalog.on_get_engine_source_info_request(request)
 
         assert isinstance(result, GetEngineSourceInfoResultFailure)
 
@@ -169,6 +169,6 @@ class TestGetEngineSourceInfoRequest:
 
         with patch("importlib.util.find_spec", return_value=spec_without_origin):
             request = GetEngineSourceInfoRequest()
-            result = library_manager.on_get_engine_source_info_request(request)
+            result = library_manager.catalog.on_get_engine_source_info_request(request)
 
         assert isinstance(result, GetEngineSourceInfoResultFailure)

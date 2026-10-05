@@ -2066,7 +2066,9 @@ class WorkflowManager(EngineScoped):
 
             # Get library metadata (we know library is registered, so no error logging)
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
+                library_metadata_request
+            )
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library is registered, but handle gracefully.
@@ -3437,7 +3439,7 @@ class WorkflowManager(EngineScoped):
         metadata_name = display_name if display_name is not None else str(file_name)
 
         direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
-        all_libs = self.engine.library_manager.resolve_transitive_library_deps(direct_libs)
+        all_libs = self.engine.library_manager.dependencies.resolve_transitive_library_deps(direct_libs)
 
         return WorkflowMetadata(
             name=metadata_name,

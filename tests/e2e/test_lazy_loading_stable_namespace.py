@@ -48,7 +48,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.library.module_loading import LibraryModuleLoading
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -144,7 +144,7 @@ def _generate_payload_workflow_source(engine: Engine, library_json: Path, *, laz
     _purge_stable_namespace_modules()
 
     # Pin the loading mode for this registration regardless of the developer's ambient config.
-    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=lazy_save):
+    with patch.object(LibraryModuleLoading, "should_lazy_load_nodes", return_value=lazy_save):
         register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
@@ -331,7 +331,7 @@ def test_stable_namespace_import_tracks_library_lifecycle(tmp_path: Path, engine
     node_file.write_text(FIXTURE_NODE_FILE.read_text() + '\nLIFECYCLE_MARKER = "initial"\n')
 
     # Register: the namespace becomes importable without any node class having resolved.
-    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=True):
+    with patch.object(LibraryModuleLoading, "should_lazy_load_nodes", return_value=True):
         register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
     assert stable_namespace not in sys.modules, "Sanity: lazy registration must not import the node module"
@@ -348,7 +348,7 @@ def test_stable_namespace_import_tracks_library_lifecycle(tmp_path: Path, engine
 
     # Re-register after a source edit: the import must serve the fresh code, not a stale module.
     node_file.write_text(FIXTURE_NODE_FILE.read_text() + '\nLIFECYCLE_MARKER = "reloaded"\n')
-    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=True):
+    with patch.object(LibraryModuleLoading, "should_lazy_load_nodes", return_value=True):
         reregister_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(reregister_result, RegisterLibraryFromFileResultSuccess), reregister_result
 

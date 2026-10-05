@@ -472,7 +472,7 @@ class WorkerManager(EngineScoped):
             # PYTHONPATH precedes site-packages, making this library-first with the engine's own
             # environment as the fallback. It must be the environment rather than a later sys.path
             # splice: sys.modules never reconsiders a module this process has already imported.
-            execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
+            execution_site_packages = self.engine.library_manager.environment.execution_site_packages(worker_key)
             if execution_site_packages is not None:
                 # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
                 # is part of the environment the engine itself booted with, and dropping it only in
