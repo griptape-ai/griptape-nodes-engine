@@ -59,6 +59,9 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- The "Conflicting values" warning for a parameter's `ui_options` now names the node, its type, and
+  the library that defined it, so it is clear which library author to contact.
+  [#5742](https://github.com/griptape-ai/griptape-nodes-engine/issues/5742)
 
 ## [0.103.0] - 2026-09-29
 
