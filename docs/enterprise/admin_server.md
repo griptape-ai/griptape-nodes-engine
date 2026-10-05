@@ -170,17 +170,17 @@ forwarding:
     - "/api/proxy/*"
 ```
 
-For the most restricted posture, use `allow` mode and list only the routes the application needs at runtime. Nothing else egresses. These are the required routes — the Admin Server refuses to start if `allow` mode omits any of them:
+For the most restricted posture, use `allow` mode and list only the routes the application needs at runtime. Nothing else egresses. These are the required routes — the Admin Server refuses to start if `allow` mode omits any of them. Each one must be written as a prefix rule ending in `/*`; an exact rule such as `"/api/users"` or `"/api/users/"` does not count:
 
 ```yaml
 forwarding:
   mode: "allow"
   rules:
-    - "/api/sessions/*"     # session allocation and lifecycle, including /api/sessions/{id}
-    - "/api/session-renew"  # keep a session alive
-    - "/api/session-release" # end a session
-    - "/api/users"          # fetched on startup and on every heartbeat
-    - "/api/organizations"  # fetched on startup and on every heartbeat
+    - "/api/sessions/*"        # session allocation and lifecycle, including /api/sessions/{id}
+    - "/api/session-renew/*"   # keep a session alive
+    - "/api/session-release/*" # end a session
+    - "/api/users/*"           # fetched on startup and on every heartbeat
+    - "/api/organizations/*"   # fetched on startup and on every heartbeat
 ```
 
 This is the minimal set the product cannot run without. Add further rules only for Cloud features you want to permit (for example, `/api/proxy/*` for the model proxy).
