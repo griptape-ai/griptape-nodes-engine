@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, cast
 
+import httpx
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -33,6 +34,13 @@ from griptape_nodes.drivers.cloud_models import (
 
 if TYPE_CHECKING:
     from pydantic_ai.settings import ModelSettings
+
+# The read timeout matches the OpenAI SDK's default. The connect timeout covers
+# the TLS handshake, which a TLS-inspecting proxy can hold for tens of seconds
+# on a fresh connection; the SDK's 5s default fails every attempt there.
+# `ModelSettings.timeout` is typed against the legacy httpx `Timeout`;
+# pydantic-ai converts it for the SDK.
+DEFAULT_REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=60.0)
 
 
 def build_griptape_cloud_model(
@@ -80,7 +88,7 @@ def build_griptape_cloud_model(
     return OpenAIChatModel(
         model_name,
         provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
-        settings=resolved_settings,
+        settings=_with_request_timeout(resolved_settings),
     )
 
 
@@ -128,7 +136,7 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
-                settings=settings,
+                settings=_with_request_timeout(settings),
             )
         case ProviderID.LMSTUDIO:
             resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
@@ -136,7 +144,7 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
-                settings=settings,
+                settings=_with_request_timeout(settings),
             )
         case _:
             # "custom" or any future provider: caller must supply both url and key.
@@ -149,5 +157,17 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
-                settings=settings,
+                settings=_with_request_timeout(settings),
             )
+
+
+def _with_request_timeout(settings: ModelSettings | None) -> ModelSettings:
+    """Return ``settings`` with :data:`DEFAULT_REQUEST_TIMEOUT` unless it sets its own ``timeout``.
+
+    The timeout is client-side only and never reaches the wire, so it applies to
+    every provider, including those that otherwise send no settings.
+    """
+    resolved: ModelSettings = {"timeout": DEFAULT_REQUEST_TIMEOUT}
+    if settings is not None:
+        resolved.update(settings)
+    return resolved
