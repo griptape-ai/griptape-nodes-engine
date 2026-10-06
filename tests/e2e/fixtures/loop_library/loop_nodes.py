@@ -19,11 +19,22 @@ from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
 
 
 class StartFlow(StartNode):
-    """The packaged body's entry node."""
+    """The packaged body's entry node. Publishes the per-iteration values set on it as outputs."""
+
+    def process(self) -> None:
+        for param in self.parameters:
+            if param.name in self.parameter_values:
+                self.parameter_output_values[param.name] = self.parameter_values[param.name]
 
 
 class EndFlow(EndNode):
-    """The packaged body's exit node."""
+    """The packaged body's exit node. Publishes its inputs as outputs so loop results can be collected."""
+
+    def process(self) -> None:
+        super().process()
+        for param in self.parameters:
+            if param.name in self.parameter_values:
+                self.parameter_output_values[param.name] = self.parameter_values[param.name]
 
 
 class LoopBodyNode(DataNode):
@@ -69,6 +80,26 @@ class LoopStartNode(BaseIterativeStartNode):
     """Iterates a fixed three-item list, so no input wiring is needed to have a total."""
 
     ITEMS = ("first", "second", "third")
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="current_item",
+                tooltip="The item for the current pass",
+                type="str",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="run_in_order",
+                tooltip="Run passes one at a time instead of all at once",
+                type="bool",
+                default_value=False,
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
 
     @classmethod
     def _get_compatible_end_classes(cls) -> set[type]:
