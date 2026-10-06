@@ -1574,6 +1574,66 @@ class TestWorkflowManager:
         # Sanity check: a regular file in the same directory still reaches the processor.
         assert good_path.name in scanned_names
 
+    @pytest.mark.asyncio
+    async def test_refresh_reresolves_library_templates_against_new_workspace(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A library template registered under one workspace must still resolve after a project switch.
+
+        Templates under the workspace are keyed workspace-relative. If a refresh kept the old entry,
+        its relative path would resolve against the new workspace, where the file does not exist.
+        """
+        workflow_manager = engine.workflow_manager
+        startup_workspace = tmp_path / "startup_project"
+        other_workspace = tmp_path / "other_project"
+        other_workspace.mkdir()
+        template_dir = startup_workspace / "libraries" / "some_library" / "workflows"
+        template_dir.mkdir(parents=True)
+        template_path = template_dir / "template.py"
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        template_path.write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "template"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    "# node_libraries_referenced = []",
+                    "# is_griptape_provided = true",
+                    "# is_template = true",
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        engine.library_manager._libraries_loading_complete.set()
+
+        with patch.object(
+            engine.library_manager,
+            "_collect_library_workflow_files",
+            AsyncMock(return_value=[str(template_path)]),
+        ):
+            # Startup: library templates register, then the workspace scan runs.
+            engine.config_manager.workspace_path = startup_workspace
+            await workflow_manager.register_list_of_workflows([str(template_path)])
+            await workflow_manager.refresh_workflow_registry()
+
+            # Project switch.
+            engine.config_manager.workspace_path = other_workspace
+            await workflow_manager.refresh_workflow_registry()
+
+        templates = [
+            workflow
+            for workflow in engine.workflow_registry._workflows.values()
+            if workflow.metadata.is_griptape_provided
+        ]
+        assert len(templates) == 1
+        assert templates[0].file_path is not None
+        resolved = Path(engine.workflow_registry.get_complete_file_path(templates[0].file_path))
+        assert resolved == template_path
+
     # --- Metadata header parse failures ---
 
     @pytest.mark.asyncio

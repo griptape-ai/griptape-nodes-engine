@@ -498,13 +498,8 @@ class LibraryManager(EngineScoped):
         # Register all secrets now that libraries are loaded and settings are merged
         self.engine.secrets_manager.register_all_secrets()
 
-        # We have to load all libraries before we attempt to load workflows.
-
-        # This will (attempts to) load all workflows specified by LIBRARIES. User workflows are loaded later.
-        library_workflow_files_to_register = await self._collect_library_workflow_files()
-        await self.engine.workflow_manager.register_list_of_workflows(library_workflow_files_to_register)
-
-        # Go tell the Workflow Manager that it's turn is now.
+        # We have to load all libraries before we attempt to load workflows. The refresh registers
+        # library-declared workflows first, then user workflows.
         await self.engine.workflow_manager.refresh_workflow_registry()
 
         # Signal readiness so the application layer can render its library status
@@ -547,7 +542,11 @@ class LibraryManager(EngineScoped):
                 if library_info.library_name == library_name:
                     library_path = Path(library_info.library_path)
                     base_dir = library_path.parent.absolute()
-                    # Add the directory to the Python path to allow for relative imports.
+                    # Put the directory first on the Python path to allow for relative imports.
+                    # Every registry refresh collects again, so drop an earlier entry rather
+                    # than stacking duplicates.
+                    if str(base_dir) in sys.path:
+                        sys.path.remove(str(base_dir))
                     sys.path.insert(0, str(base_dir))
                     workflow_files.extend(str(base_dir / workflow) for workflow in library_data.workflows)
                     break
