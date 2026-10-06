@@ -92,7 +92,7 @@ def worker_manager() -> WorkerManager:
     # Registration answers from the committed pair; a bare MagicMock cannot be unpacked.
     gtn.project_manager.committed_project.return_value = ("<system-defaults>", 0)
     # A MagicMock reads as a truthy failure reason and would refuse every spawn.
-    gtn.library_manager.execution_env_failure_reason.return_value = None
+    gtn.library_manager.environment.execution_env_failure_reason.return_value = None
     # Spawn awaits the library's execution environment before starting the process; a bare
     # MagicMock is not awaitable.
     gtn.library_manager.wait_for_execution_env = AsyncMock()
@@ -872,7 +872,7 @@ class TestSpawnWorker:
         process would then be untracked, holding its library's dependencies until its own
         heartbeat lapsed.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
 
         async def _suspend_then_answer() -> None:
             # Yields inside the window between the duplicate check and the registry write.
@@ -897,7 +897,7 @@ class TestSpawnWorker:
         The claim outliving a failed fork would silently refuse every later attempt for that
         library, which reads as a worker that never starts and never says why.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
 
         with (
             patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")),
@@ -922,7 +922,7 @@ class TestSpawnWorker:
         it resuming to find the key claimed by the reload's spawn. Releasing by name alone frees
         that one, and the library is admitted for a third fork while a spawn is genuinely in flight.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
         released = asyncio.Event()
 
         async def _park_until_released() -> None:
@@ -1138,7 +1138,7 @@ class TestResetWorkers:
         The refusal records nothing -- a worker is normally on its way when a key is claimed -- so
         the next run would wait out the whole startup grace and then blame the library load.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
         worker_manager._spawns_in_flight["My Library"] = object()
 
         await worker_manager.reset_workers()
@@ -1976,7 +1976,8 @@ class TestWorkerExecutionPath:
 
     @pytest.mark.asyncio
     async def test_spawn_hands_the_worker_its_execution_path(self, worker_manager: WorkerManager) -> None:
-        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+        environment = worker_manager.engine.library_manager.environment
+        environment.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
             await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
@@ -1992,7 +1993,8 @@ class TestWorkerExecutionPath:
         the engine itself booted with. Assigning over it would lose those modules in exactly one
         process kind, so an import that resolves in the orchestrator would fail in its worker.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+        environment = worker_manager.engine.library_manager.environment
+        environment.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
         worker_manager.engine.project_manager.get_pre_project_environ.return_value = {"PYTHONPATH": "/host/libs"}  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
@@ -2010,7 +2012,7 @@ class TestWorkerExecutionPath:
         Pointing PYTHONPATH at a directory that does not exist would be silently ignored by Python,
         so an absent entry and a wrong one look identical from inside the worker. Leave it unset.
         """
-        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[attr-defined]
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
             await worker_manager.spawn_worker([sys.executable, "-c", ""], "Light Library")

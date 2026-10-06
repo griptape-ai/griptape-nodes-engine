@@ -1071,7 +1071,7 @@ class DiagnosticsManager(EngineScoped):
 
     def _collated_problems(self, lib_info: LibraryManager.LibraryInfo, redactor: Redactor) -> str | None:
         """Return a library's problems as the engine already formats them, redacted."""
-        collated = self.engine.library_manager.collate_problems_for_lib_info(lib_info)
+        collated = self.engine.library_manager.catalog.collate_problems_for_lib_info(lib_info)
         if collated is None:
             return None
         return redactor.redact_text(collated)

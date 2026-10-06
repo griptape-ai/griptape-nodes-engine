@@ -74,7 +74,7 @@ class TestExecuteNodeStrictMode:
         m = MagicMock()
         m.is_worker = is_worker
         m._is_worker = is_worker
-        m.get_worker_for_library.return_value = None
+        m.workers.get_worker_for_library.return_value = None
         # Awaited on the orchestrator route before a node is routed, so it has to be a coroutine
         # rather than a plain MagicMock attribute.
         return m

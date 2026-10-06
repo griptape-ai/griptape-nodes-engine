@@ -1,22 +1,35 @@
 from __future__ import annotations
 
+import json
 import logging
 import traceback
 import types
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
 
-from cattrs.gen import make_dict_structure_fn, make_dict_unstructure_fn, override
+from cattrs.gen import make_dict_structure_fn, make_dict_unstructure_fn, make_hetero_tuple_unstructure_fn, override
 from cattrs.preconf.json import make_converter
 from cattrs.strategies import include_subclasses, use_class_methods
 from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
-from griptape_nodes.serialization.values import Value, decode_value, encode_value
+from griptape_nodes.serialization.type_names import resolve_type_name, type_name
+from griptape_nodes.serialization.values import (
+    DisplayValue,
+    Value,
+    ValueEncodeError,
+    decode_value,
+    encode_for_display,
+    encode_value,
+)
+
+if TYPE_CHECKING:
+    from cattrs import Converter
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +40,21 @@ converter = make_converter()
 
 # Fields annotated `Value` carry any parameter value, as tagged plain data.
 converter.register_unstructure_hook(Value, encode_value)
+converter.register_unstructure_hook(DisplayValue, encode_for_display)
 
-# SerializableMixin subclasses (BaseArtifact, BaseTool, Structure, etc.)
+
+# Griptape objects (artifacts, rulesets, drivers) are parameter values, so they cross only in fields
+# typed `Value` or `DisplayValue`. Anywhere else cattrs would walk their attrs fields and fail on a
+# type hint griptape imports only for type checking, with an error that names neither the object
+# nor the field.
+def _refuse_griptape_object(obj: SerializableMixin) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value is sent only in a field that carries parameter values."
+    raise ValueEncodeError(msg)
+
+
 converter.register_unstructure_hook_func(
     lambda cls: isinstance(cls, type) and issubclass(cls, SerializableMixin),
-    lambda obj: obj.to_dict(),
+    _refuse_griptape_object,
 )
 
 # Pydantic BaseModel subclasses (WorkflowMetadata, WorkflowShape, etc.)
@@ -78,8 +101,46 @@ converter.register_unstructure_hook_func(
     _unstructure_exception,
 )
 
-# Bare `type` references (e.g. provider_class: type)
-converter.register_unstructure_hook(type, lambda t: f"{t.__module__}.{t.__qualname__}")
+type ElementDocument = dict[str, Any]
+"""A node element and its children, as the editor sees them. Parameter values sit under
+``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
+
+_ELEMENT_VALUE_KEYS = frozenset({"value", "default_value"})
+
+
+def _unstructure_element_document(document: dict[str, Any]) -> dict[str, Any]:
+    return {key: _unstructure_element_entry(key, item) for key, item in document.items()}
+
+
+def _unstructure_element_entry(key: str, item: Any) -> Any:
+    if key in _ELEMENT_VALUE_KEYS:
+        return encode_for_display(item)
+    if key == "element_id_to_value":
+        return {element_id: encode_for_display(value) for element_id, value in item.items()}
+    if key == "children" and isinstance(item, list):
+        return [_unstructure_element_document(child) for child in item]
+    return converter.unstructure(item)
+
+
+def _structure_element_document(document: dict[str, Any], _cls: Any) -> dict[str, Any]:
+    return {key: _structure_element_entry(key, item) for key, item in document.items()}
+
+
+def _structure_element_entry(key: str, item: Any) -> Any:
+    if key in _ELEMENT_VALUE_KEYS:
+        return decode_value(item)
+    if key == "element_id_to_value":
+        return {element_id: decode_value(value) for element_id, value in item.items()}
+    if key == "children" and isinstance(item, list):
+        return [_structure_element_document(child, None) for child in item]
+    return item
+
+
+converter.register_unstructure_hook(ElementDocument, _unstructure_element_document)
+converter.register_structure_hook(ElementDocument, _structure_element_document)
+
+# Bare `type` references (e.g. provider_class: type), named the way the value codec names classes.
+converter.register_unstructure_hook(type, type_name)
 
 # ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
 # never set by a caller, so the template is the entire value: sending the segments would send a
@@ -91,8 +152,11 @@ converter.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
 # --- Structure hooks (deserialization) ---
 
 converter.register_structure_hook(Value, lambda data, _: decode_value(data))
+converter.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
 
 converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
+
+converter.register_structure_hook(type, lambda name, _: resolve_type_name(name))
 
 # The JSON preset strict mode rejects ints for float fields, but JSON has
 # no distinction between int and float, so coerce int -> float on input.
@@ -121,6 +185,33 @@ converter.register_structure_hook_func(
     _is_json_primitive_union,
     lambda v, _: v,
 )
+
+
+# Unions of enums (e.g. `SequenceScanFailureReason | FileIOFailureReason`) arrive as a bare member
+# value, which cattrs cannot attribute to one enum. The first enum with that value claims it.
+def _enum_union_members(cls: Any) -> list[type[Enum]] | None:
+    origin = get_origin(cls)
+    if origin is not Union and origin is not types.UnionType:
+        return None
+    args = [arg for arg in get_args(cls) if arg is not type(None)]
+    if not args or not all(isinstance(arg, type) and issubclass(arg, Enum) for arg in args):
+        return None
+    return args
+
+
+def _structure_enum_union(value: Any, cls: Any) -> Enum | None:
+    if value is None and type(None) in get_args(cls):
+        return None
+    for enum_cls in _enum_union_members(cls) or []:
+        try:
+            return enum_cls(value)
+        except ValueError:
+            continue
+    msg = f"{value!r} is not a member of any of {cls}."
+    raise ValueError(msg)
+
+
+converter.register_structure_hook_func(lambda cls: _enum_union_members(cls) is not None, _structure_enum_union)
 
 # Pydantic BaseModel subclasses
 converter.register_structure_hook_func(
@@ -159,30 +250,24 @@ converter.register_structure_hook_func(
 )
 
 
-# --- Hook factories for dataclasses ---
+# --- Hook factories for dataclasses and NamedTuples ---
+#
+# Each factory takes the converter it builds a hook for, so a copy of this converter builds hooks
+# that recurse through the copy.
 #
 # Some event dataclasses have circular imports that force TYPE_CHECKING-only imports
-# (e.g. flow_events <-> workflow_events). With `from __future__ import annotations`,
+# (e.g. library_events -> library_manager -> library_events). With `from __future__ import annotations`,
 # cattrs' `get_type_hints()` can fail with NameError for those forward references.
-# The factories below catch this and fall back to a simpler field-iteration approach.
+# The dataclass factories catch this and fall back to a simpler field-iteration approach.
 
 
-def _fallback_unstructure(obj: Any) -> dict[str, Any]:
-    """Fallback unstructure for dataclasses where get_type_hints() fails."""
-    result = {}
-    for f in dc_fields(obj):
-        value = getattr(obj, f.name)
-        try:
-            result[f.name] = converter.unstructure(value)
-        except Exception:
-            logger.debug(
-                "Failed to unstructure field '%s' (type=%s), using raw value",
-                f.name,
-                type(value).__name__,
-                exc_info=True,
-            )
-            result[f.name] = value
-    return result
+def _make_fallback_unstructure_fn(conv: Converter) -> Any:
+    """Fallback unstructure for dataclasses where get_type_hints() fails: each field by its runtime type."""
+
+    def unstructure_fn(obj: Any) -> dict[str, Any]:
+        return {f.name: conv.unstructure(getattr(obj, f.name)) for f in dc_fields(obj)}
+
+    return unstructure_fn
 
 
 def _make_fallback_structure_fn(cls: type) -> Any:
@@ -196,23 +281,29 @@ def _make_fallback_structure_fn(cls: type) -> Any:
     return structure_fn
 
 
-def _make_dataclass_unstructure_fn(cls: type) -> Any:
+def _make_dataclass_unstructure_fn(cls: type, conv: Converter) -> Any:
     """Generate an unstructure function that includes init=False fields."""
     try:
-        return make_dict_unstructure_fn(cls, converter, _cattrs_include_init_false=True)
+        return make_dict_unstructure_fn(cls, conv, _cattrs_include_init_false=True)
     except NameError:
-        return _fallback_unstructure
+        return _make_fallback_unstructure_fn(conv)
 
 
-def _make_dataclass_structure_fn(cls: type) -> Any:
+def _make_dataclass_structure_fn(cls: type, conv: Converter) -> Any:
     """Generate a structure function that omits init=False fields."""
     try:
         overrides = {}
         for f in dc_fields(cls):
             if not f.init:
                 overrides[f.name] = override(omit=True)
-        return make_dict_structure_fn(cls, converter, **overrides)
-    except NameError:
+        return make_dict_structure_fn(cls, conv, **overrides)
+    except NameError as error:
+        # Without field types, nested payloads and Value fields read back as plain dicts.
+        logger.warning(
+            "Reading '%s' from JSON leaves its fields as plain data, because a field's type cannot be resolved: %s",
+            cls.__qualname__,
+            error,
+        )
         return _make_fallback_structure_fn(cls)
 
 
@@ -225,6 +316,34 @@ converter.register_structure_hook_factory(
     lambda cls: is_dataclass(cls) and isinstance(cls, type),
     _make_dataclass_structure_fn,
 )
+
+
+# NamedTuples, by their resolved field types. cattrs' own hooks read the raw annotations, which
+# `from __future__ import annotations` leaves as text, so a field typed `str` fails to structure.
+def _is_namedtuple(cls: Any) -> bool:
+    return isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_fields")
+
+
+# Like the dataclass factories, a NamedTuple whose hints cannot resolve falls back to its runtime values.
+def _make_namedtuple_unstructure_fn(cls: type, conv: Converter) -> Any:
+    try:
+        field_types = tuple(get_type_hints(cls).values())
+    except NameError:
+        return lambda obj: tuple(conv.unstructure(item) for item in obj)
+    return make_hetero_tuple_unstructure_fn(cls, conv, unstructure_to=tuple, type_args=field_types)
+
+
+def _make_namedtuple_structure_fn(cls: type, conv: Converter) -> Any:
+    try:
+        fields_tuple = tuple[tuple(get_type_hints(cls).values())]
+    except NameError:
+        return lambda data, _: cls(*data)
+    structure_fields = conv.get_structure_hook(fields_tuple)
+    return lambda data, _: cls(*structure_fields(data, fields_tuple))
+
+
+converter.register_unstructure_hook_factory(_is_namedtuple, _make_namedtuple_unstructure_fn)
+converter.register_structure_hook_factory(_is_namedtuple, _make_namedtuple_structure_fn)
 
 # --- Class-specific (un)structuring methods ---
 #
@@ -251,17 +370,18 @@ def register_polymorphic_dataclass(cls: type) -> None:
     include_subclasses(cls, converter)
 
 
-def safe_unstructure(obj: Any) -> Any:
-    """Unstructure an arbitrary object into a JSON-serializable form.
+def dump_json(data: Any, **kwargs: Any) -> str:
+    """Write the converter's output as JSON text.
 
-    Wraps the cattrs converter with a fallback for dataclasses that tries
-    each field individually, so a single bad field doesn't lose the entire
-    object. Falls back to str() only as a last resort.
+    Raises:
+        ValueEncodeError: ``data`` holds a value with no JSON form. The converter passes objects it
+            has no hook for through unchanged, so this is where they surface.
     """
-    try:
-        return converter.unstructure(obj)
-    except Exception:
-        logger.debug("Failed to unstructure object (type=%s), using fallback", type(obj).__name__, exc_info=True)
-        if is_dataclass(obj) and not isinstance(obj, type):
-            return _fallback_unstructure(obj)
-        return str(obj)
+    return json.dumps(data, default=_refuse_json_value, **kwargs)
+
+
+# Passed explicitly: griptape swaps `JSONEncoder.default` process-wide for one that sends any object
+# with a `to_dict()` through it, and fails on the rest without naming their type.
+def _refuse_json_value(obj: Any) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value has no plain-data form."
+    raise ValueEncodeError(msg)

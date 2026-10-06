@@ -5,6 +5,7 @@ from types import ModuleType
 
 import pytest
 
+import griptape_nodes
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.traits.options import Options
@@ -333,14 +334,14 @@ class TestBuildingFromState:
         self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # A module that raises on import is not cached, so each resolve runs it again.
-        (tmp_path / "exploding_pairing_module.py").write_text('raise RuntimeError("library blew up on import")')
-        monkeypatch.syspath_prepend(str(tmp_path))
+        (tmp_path / "_exploding_pairing_module.py").write_text('raise RuntimeError("library blew up on import")')
+        monkeypatch.setattr(griptape_nodes, "__path__", [*griptape_nodes.__path__, str(tmp_path)])
         parameter = Parameter(name="p", tooltip="t", traits=set())
         caplog.set_level("WARNING", logger="griptape_nodes")
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Slider", "trait_module": "exploding_pairing_module", "trait_state": {}}],
+            [{"trait_name": "Slider", "trait_module": "griptape_nodes._exploding_pairing_module", "trait_state": {}}],
         )
 
         assert caplog.text.count("library blew up on import") == 1

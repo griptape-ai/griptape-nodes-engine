@@ -178,7 +178,7 @@ class TestParameterMutationDetector:
     def test_no_violation_when_add_parameter_called_from_init_under_load_probe(self) -> None:
         """__init__ calls to add_parameter during a LOAD_PROBE scope are not violations.
 
-        LibraryManager._serialize_library_node_schemas instantiates every node
+        LibraryWorkers.serialize_library_node_schemas instantiates every node
         class inside a LOAD_PROBE scope. Nodes legitimately declare their
         parameters by calling self.add_parameter(...) from __init__, so those
         calls must not report parameter-mutation-during-aprocess. The

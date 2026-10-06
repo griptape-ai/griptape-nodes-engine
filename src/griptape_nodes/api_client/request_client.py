@@ -207,14 +207,14 @@ class RequestClient:
             event_request.request_id = str(uuid.uuid4())
         request_id = event_request.request_id
         event_request.response_topic = worker_response_topic
+        # Before tracking, so a request that cannot be sent leaves no pending response behind.
+        payload_dict = json.loads(event_request.json())
 
         response_future = await self._track_request(request_id)
 
         if worker_response_topic not in self._subscribed_response_topics:
             await self.client.subscribe(worker_response_topic)
             self._subscribed_response_topics.add(worker_response_topic)
-
-        payload_dict = json.loads(event_request.json())
 
         logger.debug("Forwarding request %s to orchestrator on %s", request_id, orchestrator_request_topic)
 

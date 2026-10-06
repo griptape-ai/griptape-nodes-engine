@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -11,6 +10,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind, VariableScope
+from griptape_nodes.serialization.values import DisplayValue
 
 
 # Variable Events
@@ -32,7 +32,7 @@ class CreateVariableRequest(RequestPayload):
     name: str
     type: str
     is_global: bool = False
-    value: Any = None
+    value: DisplayValue = None
     owning_flow: str | None = None
     initial_setup: bool = False
 
@@ -108,7 +108,7 @@ class GetVariableValueRequest(RequestPayload):
 class GetVariableValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Variable value retrieved successfully."""
 
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -132,7 +132,7 @@ class SetVariableValueRequest(RequestPayload):
         project_id: Which project's variable layer to consult (None = current project)
     """
 
-    value: Any
+    value: DisplayValue
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
@@ -529,7 +529,7 @@ class ResolveSubstitutionRequest(RequestPayload):
 class ResolveSubstitutionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Substitution values resolved successfully."""
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
 
 
 @dataclass
@@ -542,7 +542,7 @@ class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
         unresolved: Names that could not be found.
     """
 
-    resolved: dict[str, Any] = field(default_factory=dict)
+    resolved: dict[str, DisplayValue] = field(default_factory=dict)
     unresolved: list[str] = field(default_factory=list)
 
 
@@ -583,7 +583,7 @@ class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         unresolved: probed names that did not resolve. Empty when all names hit.
     """
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
     unresolved: list[str] = field(default_factory=list)
 
 
@@ -614,7 +614,7 @@ class SetVariablesRequest(RequestPayload):
         project_id: Which project's variable layer to consult (None = current project)
     """
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
     project_id: str | None = None

@@ -1,11 +1,10 @@
 """Copy/paste (selected nodes) serialization tests.
 
 ``on_serialize_selected_nodes_to_commands`` packages a selection of nodes into a
-``SerializedSelectedNodesCommands`` object, pickles it, and hands back the pickle bytes
-(latin-1 decoded into a ``str`` so the payload can travel inside a JSON envelope alongside
-the rest of an ``EventResult``). ``on_deserialize_selected_nodes_from_commands`` reverses
-that to rebuild the nodes, their parameter values, their lock state, and the connections
-between them.
+``SerializedSelectedNodesCommands`` object and hands it back as JSON text, with each pooled
+parameter value as JSON text of its own. ``on_deserialize_selected_nodes_from_commands``
+reverses that to rebuild the nodes, their parameter values, their lock state, and the
+connections between them.
 
 Node types come from a library registered in-process for this module (``LibraryRegistry``
 is process-global; nothing here assumes a real Griptape Nodes standard library is installed
@@ -14,7 +13,7 @@ on the host running the suite).
 
 from __future__ import annotations
 
-import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -51,6 +50,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueResultSuccess,
     SetParameterValueRequest,
 )
+from griptape_nodes.serialization.commands import decode_commands
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -188,8 +188,7 @@ def _serialize(
 
 
 def _decode_commands(serialized: str) -> SerializedSelectedNodesCommands:
-    """Mirror the deserialize handler's own decoding: latin-1 bytes, then unpickle."""
-    return pickle.loads(serialized.encode("latin1"))  # noqa: S301 test-only, mirrors production decode path
+    return decode_commands(json.loads(serialized), SerializedSelectedNodesCommands)
 
 
 def _deserialize(
@@ -221,14 +220,7 @@ def _set_value(engine: Engine, node_name: str, value: str) -> None:
 
 @pytest.mark.usefixtures("flow_name")
 class TestSerializedCommandsWireFormat:
-    """The wire payload is a pickle blob transported as a latin-1 string, not JSON text.
-
-    ``SerializedNodeCommands`` holds request dataclasses and enum-valued fields that are not
-    all cattrs/JSON friendly, so the multi-node copy/paste path pickles the whole command tree
-    instead of using the JSON path that single-node serialization uses. The ``str`` type on the
-    dataclass field describes the wire shape (a string that survives inside a JSON envelope),
-    not the payload's internal structure.
-    """
+    """The wire payload is the command tree as JSON text, which the editor stores in its own JSON envelope."""
 
     def test_result_field_decodes_into_the_commands_dataclass(self, engine: Engine) -> None:
         node_name = _create_node(engine, "NodeA")
