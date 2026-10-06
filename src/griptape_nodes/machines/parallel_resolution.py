@@ -534,10 +534,9 @@ class ExecuteDagState(State):
         return NodeStatesResult(canceled_nodes=canceled_nodes, leaf_nodes=leaf_nodes)
 
     @staticmethod
-    async def pop_done_states(context: ParallelResolutionContext) -> None:  # noqa: C901 (one over, from tolerating a deleted node)
+    async def pop_done_states(context: ParallelResolutionContext) -> None:
         generation = context.generation
         networks = context.networks
-        handled_nodes = set()  # Track nodes we've already processed to avoid duplicates
 
         # Create a copy of items to avoid "dictionary changed size during iteration" error
         # This is necessary because handle_done_nodes can add new networks via the DAG builder
@@ -560,27 +559,19 @@ class ExecuteDagState(State):
                 if node_reference.node_reference.lock or node_state == NodeState.DONE:
                     node_reference.node_state = NodeState.DONE
 
-                    # Initialize successors set with data successors from this network
-                    successors = set()
-                    for other_node in network.nodes():
-                        if node in network._predecessors.get(other_node, set()):
-                            successors.add(other_node)
+                    # Set initial data successors (control successors will be added in handle_done_nodes).
+                    # Releasing the node from every network also means no later network in this
+                    # pass, or any later pass, can see it again, so it is handled exactly once.
+                    context.node_priority_queue._last_resolved_successors = ExecuteDagState._release_from_all_networks(
+                        context, node
+                    )
 
-                    # Set initial data successors (control successors will be added in handle_done_nodes)
-                    context.node_priority_queue._last_resolved_successors = successors
-
-                    network.remove_node(node)
-
-                    # Only call handle_done_nodes once per node (first network that processes it)
-                    if node not in handled_nodes:
-                        handled_nodes.add(node)
-                        # handle_done_nodes will append control successors to the set
-                        await ExecuteDagState.handle_done_nodes(context, node_reference, network_name)
-                        if context.was_reset_since(generation):
-                            # `networks` is a snapshot, so its graphs still name
-                            # nodes a teardown dropped from node_to_reference.
-                            ExecuteDagState._log_abandoned(context)
-                            return
+                    await ExecuteDagState.handle_done_nodes(context, node_reference, network_name)
+                    if context.was_reset_since(generation):
+                        # `networks` is a snapshot, so its graphs still name
+                        # nodes a teardown dropped from node_to_reference.
+                        ExecuteDagState._log_abandoned(context)
+                        return
 
             # After processing completions in this network, check if any remaining leaf nodes can now be queued
             remaining_leaf_nodes = [n for n in network.nodes() if network.in_degree(n) == 0]
@@ -589,6 +580,24 @@ class ExecuteDagState(State):
                 if leaf_node in context.node_to_reference:
                     node_state = context.node_to_reference[leaf_node].node_state
                 ExecuteDagState._try_queue_waiting_node(context, leaf_node)
+
+    @staticmethod
+    def _release_from_all_networks(context: ParallelResolutionContext, node_name: str) -> set[str]:
+        """Remove a finished node from every network it appears in. Returns its data successors.
+
+        A node another resolve adopted as a data dependency also sits in that resolve's network.
+        It is done in all of them, so it has to leave all of them at once: finishing can empty the
+        network it belongs to, and emptying a network drops its nodes from node_to_reference
+        (``DagBuilder.cleanup_empty_graph_nodes``). After that the other network can no longer see
+        the node as done, and its successors there would wait on it forever.
+        """
+        successors = set()
+        for network in context.networks.values():
+            for other_node in network.nodes():
+                if node_name in network._predecessors.get(other_node, set()):
+                    successors.add(other_node)
+            network.remove_node(node_name)
+        return successors
 
     @staticmethod
     async def execute_node(engine: Engine, current_node: DagNode) -> None:
