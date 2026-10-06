@@ -1,4 +1,4 @@
-- Locking a node that has never run no longer marks it resolved when a downstream node runs. The
-  run skips it with a warning, and unlocking it marks its downstream nodes for re-running, so the
-  next downstream run executes it.
+- Unlocking a node that was locked before it ever ran now lets the next downstream run execute it.
+  A run passing through a locked node marks it resolved without running it, and that state used
+  to outlive the unlock, so the node was skipped until it was run directly.
   [#5766](https://github.com/griptape-ai/griptape-nodes-engine/issues/5766)

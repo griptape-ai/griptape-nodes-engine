@@ -36,31 +36,50 @@ class TestRetainedModeLock:
         assert "Failed to update any nodes" in details
 
 
-class TestUnlockUnresolvesConsumers:
-    """Unlocking a node without resolved outputs must unresolve its consumers.
+class TestUnlockUnresolvesNodeLeftUnexecuted:
+    """Unlocking a node that has not resolved by executing must unresolve it and its consumers.
 
-    While locked, the node is skipped and its consumers resolve on missing results. If they stay
-    RESOLVED, a later run stops at them and never reaches the unlocked node.
+    While locked, a run passes through the node and marks it RESOLVED without executing it, and its
+    consumers resolve on whatever it held. If either stays RESOLVED, a later run stops there and
+    never executes the unlocked node.
     """
 
     @staticmethod
     def _patch_node(
-        engine: Engine, monkeypatch: pytest.MonkeyPatch, state: NodeResolutionState
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        state: NodeResolutionState,
+        *,
+        resolved_while_locked: bool,
     ) -> tuple[MagicMock, MagicMock]:
         node = MagicMock(spec=BaseNode)
         node.name = "locked"
         node.lock = True
         node.state = state
+        node.resolved_while_locked = resolved_while_locked
         connections = MagicMock()
         monkeypatch.setattr(engine.node_manager, "get_node_by_name", lambda _name: node)
         monkeypatch.setattr(engine.flow_manager, "get_connections", lambda: connections)
         return node, connections
 
     @pytest.mark.parametrize("batch", [False, True])
-    def test_unlocking_unresolved_node_unresolves_consumers(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, batch: bool
+    @pytest.mark.parametrize(
+        ("state", "resolved_while_locked"),
+        [
+            pytest.param(NodeResolutionState.RESOLVED, True, id="resolved-by-passing-through"),
+            pytest.param(NodeResolutionState.UNRESOLVED, False, id="unresolved"),
+        ],
+    )
+    def test_unlocking_unresolves_node_and_consumers(
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        state: NodeResolutionState,
+        *,
+        resolved_while_locked: bool,
+        batch: bool,
     ) -> None:
-        node, connections = self._patch_node(engine, monkeypatch, NodeResolutionState.UNRESOLVED)
+        node, connections = self._patch_node(engine, monkeypatch, state, resolved_while_locked=resolved_while_locked)
 
         if batch:
             engine.handle_request(BatchSetNodeLockStateRequest(node_names=["locked"], lock=False))
@@ -68,18 +87,28 @@ class TestUnlockUnresolvesConsumers:
             engine.handle_request(SetLockNodeStateRequest(node_name="locked", lock=False))
 
         assert node.lock is False
+        assert node.resolved_while_locked is False
+        node.make_node_unresolved.assert_called_once()
         connections.unresolve_future_nodes.assert_called_once_with(node)
 
-    def test_unlocking_resolved_node_keeps_consumers(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        _, connections = self._patch_node(engine, monkeypatch, NodeResolutionState.RESOLVED)
+    def test_unlocking_node_that_executed_keeps_it_resolved(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node, connections = self._patch_node(
+            engine, monkeypatch, NodeResolutionState.RESOLVED, resolved_while_locked=False
+        )
 
         engine.handle_request(SetLockNodeStateRequest(node_name="locked", lock=False))
 
+        node.make_node_unresolved.assert_not_called()
         connections.unresolve_future_nodes.assert_not_called()
 
-    def test_locking_node_keeps_consumers(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        _, connections = self._patch_node(engine, monkeypatch, NodeResolutionState.UNRESOLVED)
+    def test_locking_node_keeps_it_resolved(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        node, connections = self._patch_node(
+            engine, monkeypatch, NodeResolutionState.RESOLVED, resolved_while_locked=True
+        )
 
         engine.handle_request(SetLockNodeStateRequest(node_name="locked", lock=True))
 
+        node.make_node_unresolved.assert_not_called()
         connections.unresolve_future_nodes.assert_not_called()

@@ -5297,7 +5297,7 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to lock node '{request.node_name}'. Failed because the Node could not be found. Error: {err}"
                 return SetLockNodeStateResultFailure(result_details=details)
         node.lock = request.lock
-        self._unresolve_consumers_of_unlocked_unresolved_node(node)
+        self._unresolve_unlocked_node_left_unexecuted(node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
@@ -5315,7 +5315,7 @@ class NodeManager(EngineScoped):
                 failed[name] = f"Node not found. Error: {err}"
                 continue
             node.lock = request.lock
-            self._unresolve_consumers_of_unlocked_unresolved_node(node)
+            self._unresolve_unlocked_node_left_unexecuted(node)
             updated.append(name)
 
         if not updated:
@@ -5330,17 +5330,20 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
-    def _unresolve_consumers_of_unlocked_unresolved_node(self, node: BaseNode) -> None:
-        """Unresolve everything downstream of a node that was unlocked without resolved outputs.
+    def _unresolve_unlocked_node_left_unexecuted(self, node: BaseNode) -> None:
+        """Unresolve an unlocked node, and everything downstream, unless it resolved by executing.
 
-        While locked, such a node is skipped, so its consumers resolve on missing results. Once it
-        is unlocked they must run again, or the run stops at them and never reaches the node.
+        While locked, a node is passed through without running, and that pass marks it RESOLVED even
+        if it never ran. Its consumers resolve on whatever it held. Once it is unlocked, both must run
+        again, or the next run stops at them and never reaches it.
         """
         if node.lock:
             return
-        if node.state == NodeResolutionState.RESOLVED:
+        if node.state == NodeResolutionState.RESOLVED and not node.resolved_while_locked:
             return
 
+        node.resolved_while_locked = False
+        node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
         self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
 
     @handles(SendNodeMessageRequest)
