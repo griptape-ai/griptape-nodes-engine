@@ -189,8 +189,20 @@ def _split_printed_response(message: str) -> _PrintedResponse | None:
             continue
         # The first "{" that reads as a dict is the outermost one. A dict inside it is part of the
         # response, never the response itself.
+        if not _introduces_response(message[:start]):
+            return None
         return _printed_response(message[:start], response)
     return None
+
+
+def _introduces_response(text: str) -> bool:
+    """Whether the text before a dict hands off to it with ":", "-", or a line break.
+
+    A dict right after a word is part of something else, such as a model config that prints as
+    ``CLIPTextConfig {...}``, so it stays in the message.
+    """
+    before = text.rstrip(" \t")
+    return before.endswith((":", "-", "\n"))
 
 
 def _printed_response(text: str, response: dict[str, Any]) -> _PrintedResponse | None:

@@ -454,6 +454,24 @@ class TestPrintedResponse:
 
         assert details.message == "Upload failed.\nProvider error"
 
+    def test_a_dict_right_after_a_word_stays_in_the_message(self) -> None:
+        # transformers prints a model config as its class name and then JSON, which can read as a dict.
+        message = 'head_dim could not be found in the config:\nCLIPTextConfig {\n  "hidden_size": 512\n}'
+
+        details = build_node_error_details(NODE_NAME, ValueError(message))
+
+        assert details.message == message
+        assert details.response is None
+
+    def test_a_provider_response_from_a_dependency_moves_to_response(self) -> None:
+        # Raised by huggingface_hub's fal provider, which the diffusers library calls.
+        exc = ValueError("Response from fal ai image-segmentation API does not contain an image: {'masks': []}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Response from fal ai image-segmentation API does not contain an image"
+        assert details.response == {"masks": []}
+
     def test_a_line_ending_in_a_colon_that_is_not_a_label_is_kept(self) -> None:
         exc = RuntimeError("Generation failed.\nThe provider said for prompt 'cat':\n{'status': 'ERRORED'}")
 
