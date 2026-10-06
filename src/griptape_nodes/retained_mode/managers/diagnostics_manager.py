@@ -92,6 +92,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     SECRETS_TO_REGISTER_KEY,
     SESSION_LOG_BUFFER_LINES_KEY,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
 from griptape_nodes.utils.version_utils import get_install_source
 
@@ -172,12 +173,9 @@ class DiagnosticsManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
-        event_manager.assign_manager_to_request_type(
-            GetDiagnosticsReportRequest, self.on_get_diagnostics_report_request
-        )
-        event_manager.assign_manager_to_request_type(CollectDiagnosticsRequest, self.on_collect_diagnostics_request)
-        event_manager.assign_manager_to_request_type(RunHealthChecksRequest, self.on_run_health_checks_request)
+        event_manager.register_request_handlers(self)
 
+    @handles(GetDiagnosticsReportRequest)
     async def on_get_diagnostics_report_request(
         self, request: GetDiagnosticsReportRequest
     ) -> GetDiagnosticsReportResultSuccess | GetDiagnosticsReportResultFailure:
@@ -204,6 +202,7 @@ class DiagnosticsManager(EngineScoped):
             ),
         )
 
+    @handles(RunHealthChecksRequest)
     async def on_run_health_checks_request(
         self,
         request: RunHealthChecksRequest,  # noqa: ARG002 - the checks take no options yet
@@ -236,6 +235,7 @@ class DiagnosticsManager(EngineScoped):
             ),
         )
 
+    @handles(CollectDiagnosticsRequest)
     async def on_collect_diagnostics_request(
         self, request: CollectDiagnosticsRequest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
@@ -1071,7 +1071,7 @@ class DiagnosticsManager(EngineScoped):
 
     def _collated_problems(self, lib_info: LibraryManager.LibraryInfo, redactor: Redactor) -> str | None:
         """Return a library's problems as the engine already formats them, redacted."""
-        collated = self.engine.library_manager.collate_problems_for_lib_info(lib_info)
+        collated = self.engine.library_manager.catalog.collate_problems_for_lib_info(lib_info)
         if collated is None:
             return None
         return redactor.redact_text(collated)

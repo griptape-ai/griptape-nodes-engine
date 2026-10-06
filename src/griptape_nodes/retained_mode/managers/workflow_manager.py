@@ -5,7 +5,6 @@ import asyncio
 import contextvars
 import json
 import logging
-import pickle
 import re
 import sys
 from collections import defaultdict
@@ -13,7 +12,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from inspect import getmodule, isclass, iscoroutinefunction
+from inspect import isclass, iscoroutinefunction
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
@@ -68,6 +67,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
     SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
@@ -129,7 +129,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowRunCommandRequest,
     GetWorkflowRunCommandResultFailure,
     GetWorkflowRunCommandResultSuccess,
-    ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
@@ -223,6 +222,8 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.serialization.values import is_plain_data
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
@@ -516,127 +517,7 @@ class WorkflowManager(EngineScoped):
         # build_workflow() and therefore survives both editor loads and direct script execution.
         self._variable_substitution_enabled: dict[str, bool] = {}
 
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowFromScratchRequest, self.on_run_workflow_from_scratch_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowWithCurrentStateRequest,
-            self.on_run_workflow_with_current_state_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RunWorkflowFromRegistryRequest,
-            self.on_run_workflow_from_registry_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterWorkflowRequest,
-            self.on_register_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListAllWorkflowsRequest,
-            self.on_list_all_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListCallableWorkflowsRequest,
-            self.on_list_callable_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            DeleteWorkflowRequest,
-            self.on_delete_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RenameWorkflowRequest,
-            self.on_rename_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            MoveWorkflowRequest,
-            self.on_move_workflow_request,
-        )
-
-        event_manager.assign_manager_to_request_type(
-            SaveWorkflowRequest,
-            self.on_save_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SaveWorkflowFileFromSerializedFlowRequest,
-            self.on_save_workflow_file_from_serialized_flow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SaveSubflowToWorkflowRequest,
-            self.on_save_subflow_to_workflow,
-        )
-        event_manager.assign_manager_to_request_type(LoadWorkflowMetadata, self.on_load_workflow_metadata_request)
-        event_manager.assign_manager_to_request_type(
-            PublishWorkflowRequest,
-            self.on_publish_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetPublishOptionsRequest,
-            self.on_get_publish_options_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SetWorkflowMetadataRequest,
-            self.on_set_workflow_metadata_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetVariableSubstitutionEnabledRequest,
-            self.on_get_variable_substitution_enabled_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            SetVariableSubstitutionEnabledRequest,
-            self.on_set_variable_substitution_enabled_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowInfoRequest,
-            self.on_get_workflow_info_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ListAllWorkflowInfoRequest,
-            self.on_list_all_workflow_info_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowMetadataRequest,
-            self.on_get_workflow_metadata_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            GetWorkflowRunCommandRequest,
-            self.on_get_workflow_run_command_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ImportWorkflowAsReferencedSubFlowRequest,
-            self.on_import_workflow_as_referenced_sub_flow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ImportWorkflowRequest,
-            self.on_import_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            BranchWorkflowRequest,
-            self.on_branch_workflow_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            CreateWorkflowFromTemplateRequest,
-            self.on_create_workflow_from_template_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            MergeWorkflowBranchRequest,
-            self.on_merge_workflow_branch_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            ResetWorkflowBranchRequest,
-            self.on_reset_workflow_branch_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            CompareWorkflowsRequest,
-            self.on_compare_workflows_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RefreshWorkflowRegistryRequest,
-            self.on_refresh_workflow_registry_request,
-        )
-        event_manager.assign_manager_to_request_type(
-            RegisterWorkflowsFromConfigRequest,
-            self.on_register_workflows_from_config_request,
-        )
+        event_manager.register_request_handlers(self)
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
@@ -677,6 +558,7 @@ class WorkflowManager(EngineScoped):
         # Return the stored value, or True if this workflow has never set the flag.
         return self._variable_substitution_enabled.get(workflow_name, True)
 
+    @handles(GetVariableSubstitutionEnabledRequest)
     def on_get_variable_substitution_enabled_request(
         self,
         request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
@@ -693,6 +575,7 @@ class WorkflowManager(EngineScoped):
             enabled=enabled,
         )
 
+    @handles(SetVariableSubstitutionEnabledRequest)
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest
     ) -> ResultPayload:
@@ -1128,6 +1011,7 @@ class WorkflowManager(EngineScoped):
         details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
         return details
 
+    @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with WorkflowManager.WorkflowSquelchContext(self):
@@ -1162,6 +1046,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
             )
 
+    @handles(RunWorkflowWithCurrentStateRequest)
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
@@ -1194,6 +1079,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
         )
 
+    @handles(RunWorkflowFromRegistryRequest)
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1282,6 +1168,7 @@ class WorkflowManager(EngineScoped):
                 existing_workflows.append(full_path)
             config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
 
+    @handles(RegisterWorkflowRequest)
     def on_register_workflow_request(self, request: RegisterWorkflowRequest) -> ResultPayload:
         # The registry key is derived from the file path (minus extension), independent of the display name.
         registry_key = derive_registry_key(request.file_name)
@@ -1340,6 +1227,7 @@ class WorkflowManager(EngineScoped):
         )
         return repaired_name
 
+    @handles(ImportWorkflowRequest)
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
         load_metadata_request = LoadWorkflowMetadata(file_name=request.file_path)
@@ -1377,6 +1265,7 @@ class WorkflowManager(EngineScoped):
             ),
         )
 
+    @handles(ListAllWorkflowsRequest)
     async def on_list_all_workflows_request(self, _request: ListAllWorkflowsRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1389,6 +1278,7 @@ class WorkflowManager(EngineScoped):
             workflows=workflows, result_details=f"Successfully retrieved {len(workflows)} workflows."
         )
 
+    @handles(ListCallableWorkflowsRequest)
     async def on_list_callable_workflows_request(self, _request: ListCallableWorkflowsRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1406,6 +1296,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved {len(workflow_names)} callable workflows.",
         )
 
+    @handles(DeleteWorkflowRequest)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
         # If the deleted workflow is the active one, tear down its flows/nodes and
         # pop the context stack BEFORE removing the registry entry, so downstream
@@ -1455,6 +1346,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
 
+    @handles(RenameWorkflowRequest)
     async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
         # Sanitize to a Python module-friendly name for the file stem (registry key).
         sanitized_stem = normalize_display_name(request.requested_name)
@@ -1654,6 +1546,7 @@ class WorkflowManager(EngineScoped):
             workflow_dependencies=wf_info.workflow_dependencies,
         )
 
+    @handles(GetWorkflowInfoRequest)
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
@@ -1692,6 +1585,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved workflow info for '{workflow_file_path}'.",
         )
 
+    @handles(ListAllWorkflowInfoRequest)
     def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
@@ -1719,6 +1613,7 @@ class WorkflowManager(EngineScoped):
             result_details=f"Successfully retrieved workflow info for {len(workflow_infos)} workflows.",
         )
 
+    @handles(GetWorkflowMetadataRequest)
     def on_get_workflow_metadata_request(self, request: GetWorkflowMetadataRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
@@ -1731,6 +1626,7 @@ class WorkflowManager(EngineScoped):
             result_details="Successfully retrieved workflow metadata.",
         )
 
+    @handles(GetWorkflowRunCommandRequest)
     async def on_get_workflow_run_command_request(self, request: GetWorkflowRunCommandRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         workflow_name = request.workflow_name
         file_path = request.file_path
@@ -1911,6 +1807,7 @@ class WorkflowManager(EngineScoped):
             return write_result.error_details
         return None
 
+    @handles(SetWorkflowMetadataRequest)
     async def on_set_workflow_metadata_request(self, request: SetWorkflowMetadataRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
 
@@ -1984,6 +1881,7 @@ class WorkflowManager(EngineScoped):
             msg = f"Invalid workflow_metadata: {e!s}"
             raise ValueError(msg) from e
 
+    @handles(MoveWorkflowRequest)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0915
         try:
             # Validate source workflow exists
@@ -2098,6 +1996,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
+    @handles(LoadWorkflowMetadata)
     async def on_load_workflow_metadata_request(  # noqa: C901, PLR0912, PLR0915
         self, request: LoadWorkflowMetadata
     ) -> ResultPayload:
@@ -2192,7 +2091,9 @@ class WorkflowManager(EngineScoped):
 
             # Get library metadata (we know library is registered, so no error logging)
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
+                library_metadata_request
+            )
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library is registered, but handle gracefully.
@@ -2673,6 +2574,7 @@ class WorkflowManager(EngineScoped):
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
 
+    @handles(SaveWorkflowRequest)
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
         context_manager = self.engine.context_manager
@@ -2801,9 +2703,6 @@ class WorkflowManager(EngineScoped):
             is_template=existing.is_template,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
-            pickle_control_flow_result=(
-                request.pickle_control_flow_result if request.pickle_control_flow_result is not None else False
-            ),
         )
         # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
         # (its native result family). on_save_workflow_request's public contract
@@ -3328,6 +3227,7 @@ class WorkflowManager(EngineScoped):
                 situation_name,
             )
 
+    @handles(SaveWorkflowFileFromSerializedFlowRequest)
     async def on_save_workflow_file_from_serialized_flow_request(
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
@@ -3357,7 +3257,6 @@ class WorkflowManager(EngineScoped):
             is_template=request.is_template,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
-            pickle_control_flow_result=request.pickle_control_flow_result,
         )
 
     def _save_workflow_file_inline(  # noqa: PLR0913
@@ -3373,7 +3272,6 @@ class WorkflowManager(EngineScoped):
         is_template: bool | None,
         branched_from: str | None,
         workflow_shape: WorkflowShape | None,
-        pickle_control_flow_result: bool,
     ) -> ResultPayload:
         """Generate the workflow file content and write it to ``destination``.
 
@@ -3405,7 +3303,6 @@ class WorkflowManager(EngineScoped):
             final_code_output = self._generate_workflow_file_content(
                 serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
-                pickle_control_flow_result=pickle_control_flow_result,
             )
         except Exception as err:
             details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"
@@ -3445,6 +3342,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(SaveSubflowToWorkflowRequest)
     async def on_save_subflow_to_workflow(self, request: SaveSubflowToWorkflowRequest) -> ResultPayload:
         """Save a subflow back to its original workflow file."""
         registry_key = request.workflow_name
@@ -3570,7 +3468,7 @@ class WorkflowManager(EngineScoped):
         metadata_name = display_name if display_name is not None else str(file_name)
 
         direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
-        all_libs = self.engine.library_manager.resolve_transitive_library_deps(direct_libs)
+        all_libs = self.engine.library_manager.dependencies.resolve_transitive_library_deps(direct_libs)
 
         return WorkflowMetadata(
             name=metadata_name,
@@ -3592,8 +3490,6 @@ class WorkflowManager(EngineScoped):
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
-        *,
-        pickle_control_flow_result: bool = False,
     ) -> str:
         """Generate workflow file content from serialized commands and metadata."""
         metadata_block = self._generate_workflow_metadata_header(workflow_metadata=workflow_metadata)
@@ -3634,21 +3530,11 @@ class WorkflowManager(EngineScoped):
         )
         main_body.extend(cast("ast.stmt", node) for node in prereq_code)
 
-        # Collect library-derived imports separately so they can be emitted inside
-        # build_workflow() after the RegisterLibraryFromFileRequest calls — those calls
-        # are what add the library directory and venv site-packages to sys.path, so the
-        # imports must come after them, not at module top level.
-        deferred_imports: dict[str, set[str]] = {}
-
         # Generate unique values code AST node
         unique_values_node = self._generate_unique_values_code(
             unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
             prefix="top_level",
-            import_recorder=import_recorder,
-            deferred_imports=deferred_imports,
         )
-        # Emit deferred library imports inside build_workflow(), after sys.path is set up.
-        main_body.extend(self._build_deferred_import_statements(deferred_imports))
         # Helper returns an ast.Module; unpack its body into statements.
         main_body.extend(cast("ast.stmt", stmt) for stmt in unique_values_node.body)
 
@@ -3697,7 +3583,6 @@ class WorkflowManager(EngineScoped):
         workflow_execution_code = self._generate_workflow_execution(
             import_recorder=import_recorder,
             workflow_metadata=workflow_metadata,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
         if workflow_execution_code is not None:
             for node in workflow_execution_code:
@@ -3771,8 +3656,6 @@ class WorkflowManager(EngineScoped):
         self,
         import_recorder: ImportRecorder,
         workflow_metadata: WorkflowMetadata,
-        *,
-        pickle_control_flow_result: bool = False,
     ) -> list[ast.AST] | None:
         """Generates execute_workflow(...) and the __main__ guard."""
         # Use workflow shape from metadata if available, otherwise skip execution block
@@ -3834,25 +3717,9 @@ class WorkflowManager(EngineScoped):
         ensure_context_call = self._generate_ensure_flow_context_call()
 
         # Construct a default LocalWorkflowExecutor only when the caller did not supply one.
-        # Inside the `if`, seed `kwargs["pickle_control_flow_result"]` with the save-time
-        # default via `setdefault` so direct importers who don't pass it explicitly inherit
-        # the publisher's choice. `**kwargs` is then splatted into the constructor; a typo'd
-        # kwarg surfaces as a TypeError from LocalWorkflowExecutor.__init__.
+        # `**kwargs` is splatted into the constructor; a typo'd kwarg surfaces as a TypeError
+        # from LocalWorkflowExecutor.__init__.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
-        pickle_setdefault_stmt = ast.Expr(
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="kwargs", ctx=ast.Load()),
-                    attr="setdefault",
-                    ctx=ast.Load(),
-                ),
-                args=[
-                    ast.Constant(value="pickle_control_flow_result"),
-                    ast.Constant(value=pickle_control_flow_result),
-                ],
-                keywords=[],
-            )
-        )
         executor_assign = ast.If(
             test=ast.Compare(
                 left=ast.Name(id="workflow_executor", ctx=ast.Load()),
@@ -3860,7 +3727,6 @@ class WorkflowManager(EngineScoped):
                 comparators=[ast.Constant(value=None)],
             ),
             body=[
-                pickle_setdefault_stmt,
                 ast.Assign(
                     targets=[ast.Name(id="workflow_executor", ctx=ast.Store())],
                     value=ast.Call(
@@ -3880,8 +3746,7 @@ class WorkflowManager(EngineScoped):
             orelse=[],
         )
         # Use async context manager for workflow execution. Any leftover `**kwargs` flow
-        # through to `arun` (e.g. `pickle_control_flow_result` if the caller wants to
-        # override the executor's instance default for this run only).
+        # through to `arun`.
         with_stmt = ast.AsyncWith(
             items=[
                 ast.withitem(
@@ -3985,14 +3850,14 @@ class WorkflowManager(EngineScoped):
         ast.fix_missing_locations(sync_func_def)
 
         # === 2) build the `if __name__ == "__main__":` block ===
-        if_node = self._generate_main_block(workflow_shape, pickle_control_flow_result=pickle_control_flow_result)
+        if_node = self._generate_main_block(workflow_shape)
 
         # Generate the ensure flow context function
         ensure_context_func = self._generate_ensure_flow_context_function(import_recorder)
 
         return [ensure_context_func, sync_func_def, async_func_def, if_node]
 
-    def _generate_main_block(self, workflow_shape: dict, *, pickle_control_flow_result: bool = False) -> ast.If:
+    def _generate_main_block(self, workflow_shape: dict) -> ast.If:
         """Generates the `if __name__ == '__main__':` block for the serialized workflow file."""
         main_test = ast.Compare(
             left=ast.Name(id="__name__", ctx=ast.Load()),
@@ -4029,12 +3894,7 @@ class WorkflowManager(EngineScoped):
                         ctx=ast.Load(),
                     ),
                     args=[ast.Name(id="parser", ctx=ast.Load())],
-                    keywords=[
-                        ast.keyword(
-                            arg="pickle_control_flow_result_default",
-                            value=ast.Constant(value=pickle_control_flow_result),
-                        ),
-                    ],
+                    keywords=[],
                 )
             )
         )
@@ -4793,83 +4653,30 @@ class WorkflowManager(EngineScoped):
         self,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         prefix: str,
-        import_recorder: ImportRecorder,
-        deferred_imports: dict[str, set[str]] | None = None,
     ) -> ast.Module:
+        """Write the pool of encoded values as a dict literal, keyed by content hash.
+
+        Each use wraps its lookup in ``decode_value``, so every parameter gets its own object and no
+        value is imported or built until the libraries it needs are registered.
+        """
         if len(unique_parameter_uuid_to_values) == 0:
             return ast.Module(body=[], type_ignores=[])
-
-        import_recorder.add_import("pickle")
-
-        # Get the list of manually-curated, globally available modules
-        global_modules_set = {"builtins", "__main__"}
-
-        # Serialize the unique values as pickled strings.
-        # IMPORTANT: We patch dynamic module names to stable namespaces before pickling
-        # to ensure generated workflows can reliably import the required classes.
-        unique_parameter_dict = {}
-
-        for uuid, unique_parameter_value in unique_parameter_uuid_to_values.items():
-            # Dynamic Module Patching Strategy:
-            # When we pickle objects from dynamically loaded modules (like VideoUrlArtifact),
-            # pickle stores the class's __module__ attribute in the binary data. If we don't
-            # patch this, the pickle data would contain something like:
-            #   "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            #
-            # When the workflow runs later, Python tries to import this module name, which
-            # fails because dynamic modules don't exist in fresh Python processes.
-            #
-            # Our solution: Temporarily patch the class's __module__ to use the stable namespace
-            # before pickling, so the pickle data contains:
-            #   "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
-            #
-            # This includes recursive patching for nested objects in containers (lists, tuples, dicts)
-
-            # Apply recursive dynamic module patching, pickle, then restore
-            unique_parameter_bytes = self._patch_and_pickle_object(unique_parameter_value)
-
-            # Encode the bytes as a string using latin1
-            unique_parameter_byte_str = unique_parameter_bytes.decode("latin1")
-            unique_parameter_dict[uuid] = unique_parameter_byte_str
-
-            # Collect import statements for all classes in the object tree
-            self._collect_object_imports(unique_parameter_value, import_recorder, global_modules_set, deferred_imports)
 
         # Comment lines explaining what we're doing. Each line is emitted as its own bare-string
         # statement so that it unparses onto a single source line. A post-process pass in
         # _generate_workflow_file_content (via rewrite_string_comments) then strips the surrounding
         # quotes to turn each line into a real Python `#` comment.
         comment_lines = [
-            "# 1. We've collated all of the unique parameter values into a dictionary so that we do not have to duplicate them.",
-            "#    This minimizes the size of the code, especially for large objects like serialized image files.",
-            "# 2. We're using a prefix so that it's clear which Flow these values are associated with.",
-            "# 3. The values are serialized using pickle, which is a binary format. This makes them harder to read, but makes",
-            "#    them consistently save and load. It allows us to serialize complex objects like custom classes, which otherwise",
-            "#    would be difficult to serialize.",
+            "# Every unique parameter value, stored once and keyed by a hash of its content.",
+            "# Values that aren't plain data carry a '$type' naming their class; decode_value rebuilds them.",
         ]
 
-        # Generate the dictionary of unique values
         unique_values_dict_name = f"{prefix}_unique_values_dict"
         unique_values_ast = ast.Assign(
             targets=[ast.Name(id=unique_values_dict_name, ctx=ast.Store(), lineno=1, col_offset=0)],
             value=ast.Dict(
-                keys=[ast.Constant(value=str(uuid), lineno=1, col_offset=0) for uuid in unique_parameter_dict],
-                values=[
-                    ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="pickle", ctx=ast.Load(), lineno=1, col_offset=0),
-                            attr="loads",
-                            ctx=ast.Load(),
-                            lineno=1,
-                            col_offset=0,
-                        ),
-                        args=[ast.Constant(value=byte_str.encode("latin1"), lineno=1, col_offset=0)],
-                        keywords=[],
-                        lineno=1,
-                        col_offset=0,
-                    )
-                    for byte_str in unique_parameter_dict.values()
-                ],
+                keys=[ast.Constant(value=str(key), lineno=1, col_offset=0) for key in unique_parameter_uuid_to_values],
+                values=[self._plain_data_literal(value) for value in unique_parameter_uuid_to_values.values()],
                 lineno=1,
                 col_offset=0,
             ),
@@ -4877,30 +4684,44 @@ class WorkflowManager(EngineScoped):
             col_offset=0,
         )
 
-        # Create the final AST with comment lines followed by the dict assignment.
         comment_exprs = [
             ast.Expr(value=ast.Constant(value=line, lineno=1, col_offset=0), lineno=1, col_offset=0)
             for line in comment_lines
         ]
         module_body: list[ast.stmt] = [*comment_exprs, unique_values_ast]
-        full_ast = ast.Module(body=module_body, type_ignores=[])
-        return full_ast
+        return ast.Module(body=module_body, type_ignores=[])
 
-    def _build_deferred_import_statements(self, deferred_imports: dict[str, set[str]]) -> list[ast.stmt]:
-        """Convert deferred library imports into ast.ImportFrom statements for insertion into build_workflow().
+    @staticmethod
+    def _plain_data_literal(value: Any) -> ast.expr:
+        """The Python literal for an encoded value, whose repr is valid Python because it is plain data."""
+        if not is_plain_data(value):
+            msg = f"Attempted to write a saved value into a workflow file. Failed because a '{type(value).__name__}' value was not encoded first."
+            raise ValueError(msg)
+        return ast.parse(repr(value), mode="eval").body
 
-        Sorted by module name (and class names within each module) for deterministic output.
-        """
-        stmts: list[ast.stmt] = []
-        for module, classes in sorted(deferred_imports.items()):
-            node = ast.ImportFrom(
-                module=module,
-                names=[ast.alias(name=cls) for cls in sorted(classes)],
-                level=0,
-            )
-            ast.fix_missing_locations(node)
-            stmts.append(node)
-        return stmts
+    @staticmethod
+    def _decoded_value_lookup(
+        unique_values_dict_name: str,
+        key: SerializedNodeCommands.UniqueParameterValueUUID,
+        import_recorder: ImportRecorder,
+    ) -> ast.expr:
+        """``decode_value(<dict>[<key>])``, rebuilding a fresh object at each use."""
+        import_recorder.add_from_import("griptape_nodes.serialization.values", "decode_value")
+        return ast.Call(
+            func=ast.Name(id="decode_value", ctx=ast.Load(), lineno=1, col_offset=0),
+            args=[
+                ast.Subscript(
+                    value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                    slice=ast.Constant(value=str(key), lineno=1, col_offset=0),
+                    ctx=ast.Load(),
+                    lineno=1,
+                    col_offset=0,
+                )
+            ],
+            keywords=[],
+            lineno=1,
+            col_offset=0,
+        )
 
     def _generate_create_flow(
         self,
@@ -5011,7 +4832,7 @@ class WorkflowManager(EngineScoped):
             ))).created_flow_name
         """
         import_recorder.add_from_import(
-            "griptape_nodes.retained_mode.events.workflow_events", "ImportWorkflowAsReferencedSubFlowRequest"
+            "griptape_nodes.retained_mode.events.flow_events", "ImportWorkflowAsReferencedSubFlowRequest"
         )
 
         # Prepare arguments for ImportWorkflowAsReferencedSubFlowRequest
@@ -5687,12 +5508,8 @@ class WorkflowManager(EngineScoped):
         create_variable_asts: list[ast.stmt] = []
         for serialized_command in serialized_variable_commands:
             create_variable_request = serialized_command.create_variable_command
-            value_lookup = ast.Subscript(
-                value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
-                slice=ast.Constant(value=str(serialized_command.unique_value_uuid), lineno=1, col_offset=0),
-                ctx=ast.Load(),
-                lineno=1,
-                col_offset=0,
+            value_lookup = self._decoded_value_lookup(
+                unique_values_dict_name, serialized_command.unique_value_uuid, import_recorder
             )
 
             create_variable_call = ast.Expr(
@@ -5763,7 +5580,7 @@ class WorkflowManager(EngineScoped):
             set_parameter_value_commands: Value commands for the nodes of one Flow, keyed by node
             lock_commands: Lock-state commands for those same nodes
             node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
-            unique_values_dict_name: Name of the generated dict holding the pickled values
+            unique_values_dict_name: Name of the generated dict holding the encoded values
             import_recorder: Import recorder for tracking imports
 
         Returns:
@@ -5842,12 +5659,8 @@ class WorkflowManager(EngineScoped):
         )
 
         for command in indirect_set_parameter_value_commands:
-            value_lookup = ast.Subscript(
-                value=ast.Name(id=unique_values_dict_name, ctx=ast.Load(), lineno=1, col_offset=0),
-                slice=ast.Constant(value=str(command.unique_value_uuid), lineno=1, col_offset=0),
-                ctx=ast.Load(),
-                lineno=1,
-                col_offset=0,
+            value_lookup = self._decoded_value_lookup(
+                unique_values_dict_name, command.unique_value_uuid, import_recorder
             )
 
             set_parameter_value_request_call = ast.Expr(
@@ -6121,6 +5934,7 @@ class WorkflowManager(EngineScoped):
         """
         return WorkflowShape(inputs=input_node_params, outputs=output_node_params)
 
+    @handles(GetPublishOptionsRequest)
     def on_get_publish_options_request(self, request: GetPublishOptionsRequest) -> ResultPayload:
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
@@ -6139,6 +5953,7 @@ class WorkflowManager(EngineScoped):
             result_details="No custom publish options for this publisher.",
         )
 
+    @handles(PublishWorkflowRequest)
     async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
         try:
             publisher_name = request.publisher_name
@@ -6241,6 +6056,7 @@ class WorkflowManager(EngineScoped):
 
         return final_result
 
+    @handles(ImportWorkflowAsReferencedSubFlowRequest)
     async def on_import_workflow_as_referenced_sub_flow_request(
         self, request: ImportWorkflowAsReferencedSubFlowRequest
     ) -> ResultPayload:
@@ -6437,6 +6253,7 @@ class WorkflowManager(EngineScoped):
         )
         return selected
 
+    @handles(BranchWorkflowRequest)
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a branch (copy) of an existing workflow with branch tracking."""
         try:
@@ -6638,6 +6455,7 @@ class WorkflowManager(EngineScoped):
             source_label = PurePosixPath(source_registry_key).name
         return f"{source_label} (branch {branch_counter})"
 
+    @handles(CreateWorkflowFromTemplateRequest)
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
         try:
@@ -6723,6 +6541,7 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(MergeWorkflowBranchRequest)
     def on_merge_workflow_branch_request(self, request: MergeWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Merge a branch back into its source workflow, removing the branch when complete."""
         try:
@@ -6825,6 +6644,7 @@ class WorkflowManager(EngineScoped):
             details = f"Failed to merge branch workflow '{request.workflow_name}' into source workflow '{source_workflow_name}': {e!s}"
             return MergeWorkflowBranchResultFailure(result_details=details)
 
+    @handles(ResetWorkflowBranchRequest)
     def on_reset_workflow_branch_request(self, request: ResetWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Reset a branch to match its source workflow, discarding branch changes."""
         try:
@@ -6909,6 +6729,7 @@ class WorkflowManager(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
+    @handles(CompareWorkflowsRequest)
     def on_compare_workflows_request(self, request: CompareWorkflowsRequest) -> ResultPayload:
         """Compare two workflows to determine if one is ahead, behind, or up-to-date relative to the other."""
         try:
@@ -7026,124 +6847,7 @@ class WorkflowManager(EngineScoped):
             for attr_value in obj.__dict__.values():
                 self._walk_object_tree(attr_value, process_class_fn, visited)
 
-    def _patch_and_pickle_object(self, obj: Any) -> bytes:
-        """Patch dynamic module references to stable namespaces, pickle object, then restore.
-
-        This solves the "pickle data was truncated" error that occurs when workflows containing
-        objects from dynamically loaded modules (like VideoUrlArtifact, ReferenceImageArtifact)
-        are serialized and later reloaded in a fresh Python process.
-
-        The Problem:
-            Dynamic modules get names like "gtn_dynamic_module_image_to_video_py_123456789"
-            When pickle serializes objects, it embeds these module names in the binary data
-            When workflows run later, Python can't import these non-existent module names
-
-        The Solution:
-            1. Recursively find all objects from dynamic modules (even nested in containers)
-            2. Temporarily patch their __module__ and module_name to stable namespaces
-            3. Pickle with stable references like "griptape_nodes.node_libraries.runwayml_library.image_to_video"
-            4. Restore original names to avoid side effects
-
-        Args:
-            obj: Object to patch and pickle (may contain nested structures)
-
-        Returns:
-            Pickled bytes with stable module references
-
-        Example:
-            Before: pickle contains "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            After:  pickle contains "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
-        """
-        patched_classes: list[tuple[type, str]] = []
-        patched_instances: list[tuple[Any, str]] = []
-
-        def patch_class(class_type: type, instance: Any) -> None:
-            """Patch a single class instance to use stable namespace."""
-            module = getmodule(class_type)
-            if module and self.engine.library_manager.is_dynamic_module(module.__name__):
-                stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(module.__name__)
-                if stable_namespace:
-                    # Patch class __module__ (affects pickle class reference)
-                    if class_type.__module__ != stable_namespace:
-                        patched_classes.append((class_type, class_type.__module__))
-                        class_type.__module__ = stable_namespace
-
-                    # Patch instance module_name field (affects SerializableMixin serialization)
-                    if hasattr(instance, "module_name") and instance.module_name != stable_namespace:
-                        patched_instances.append((instance, instance.module_name))
-                        instance.module_name = stable_namespace
-
-        try:
-            # Apply patches to entire object tree
-            self._walk_object_tree(obj, patch_class)
-            return pickle.dumps(obj)
-        finally:
-            # Always restore original names to avoid affecting other code
-            for class_obj, original_name in patched_classes:
-                class_obj.__module__ = original_name
-            for instance_obj, original_name in patched_instances:
-                instance_obj.module_name = original_name
-
-    def _collect_object_imports(
-        self,
-        obj: Any,
-        import_recorder: Any,
-        global_modules_set: set[str],
-        deferred_imports: dict[str, set[str]] | None = None,
-    ) -> None:
-        """Recursively collect import statements needed for all classes in object tree.
-
-        This ensures that generated workflows have all necessary import statements,
-        including for classes nested deep within containers like ParameterArrays.
-
-        The Process:
-            1. Walk through entire object tree (lists, dicts, object attributes)
-            2. For each class found, determine the correct import statement
-            3. For dynamic modules, use stable namespace imports
-            4. For regular modules, use standard imports
-            5. Record all imports for workflow generation
-
-        Args:
-            obj: Object tree to analyze for required imports
-            import_recorder: Collector that will generate the import statements
-            global_modules_set: Built-in modules that don't need explicit imports
-            deferred_imports: If provided, dynamic library imports are collected here instead
-                of import_recorder so the caller can emit them inside build_workflow() after
-                sys.path has been set up by RegisterLibraryFromFileRequest.
-
-        Example:
-            Input object tree: [ReferenceImageArtifact(), {"data": ImageUrlArtifact()}]
-            Generated imports:
-                from griptape_nodes.node_libraries.runwayml_library.create_reference_image import ReferenceImageArtifact
-                from griptape.artifacts.image_url_artifact import ImageUrlArtifact
-        """
-
-        def collect_class_import(class_type: type, _instance: Any) -> None:
-            """Collect import statement for a single class."""
-            module = getmodule(class_type)
-            if module and module.__name__ not in global_modules_set:
-                if self.engine.library_manager.is_dynamic_module(module.__name__):
-                    # Use stable namespace for dynamic modules. Route into deferred_imports
-                    # so the caller can emit these inside build_workflow() after
-                    # RegisterLibraryFromFileRequest has added the library to sys.path.
-                    stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(
-                        module.__name__
-                    )
-                    if stable_namespace:
-                        if deferred_imports is not None:
-                            deferred_imports.setdefault(stable_namespace, set()).add(class_type.__name__)
-                        else:
-                            import_recorder.add_from_import(stable_namespace, class_type.__name__)
-                    else:
-                        msg = f"Missing stable namespace for {module.__name__} type {class_type.__name__}"
-                        logger.error(msg)
-                        raise RuntimeError(msg)
-                else:
-                    # Use regular module name for standard modules
-                    import_recorder.add_from_import(module.__name__, class_type.__name__)
-
-        self._walk_object_tree(obj, collect_class_import)
-
+    @handles(RefreshWorkflowRegistryRequest)
     async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
         try:
             await self.refresh_workflow_registry()
@@ -7151,6 +6855,7 @@ class WorkflowManager(EngineScoped):
             return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
         return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
+    @handles(RegisterWorkflowsFromConfigRequest)
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
     ) -> ResultPayload:

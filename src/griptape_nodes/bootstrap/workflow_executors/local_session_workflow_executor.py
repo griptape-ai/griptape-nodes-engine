@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
+    ControlFlowResolvedEvent,
     GriptapeEvent,
     StartFlowRequest,
     StartFlowResultFailure,
@@ -46,13 +47,12 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         save_on_failure_path: str | None = None,
         *,
         project_file_path: Path | None = None,
-        pickle_control_flow_result: bool = False,
+        pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
     ):
         super().__init__(
             storage_backend=storage_backend,
             project_file_path=project_file_path,
             save_on_failure_path=save_on_failure_path,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
         self._init_websocket_sender(session_id)
         self._on_start_flow_result = on_start_flow_result
@@ -85,14 +85,14 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def _process_execution_event_async(self, event: ExecutionGriptapeNodeEvent) -> None:
         """Process execution events asynchronously for real-time websocket emission."""
         logger.debug("REAL-TIME: Processing execution event for session %s", self._session_id)
-        self.send_event("execution_event", event.wrapped_event.json())
+        self._send_event("execution_event", event.wrapped_event)
 
     async def arun(
         self,
         flow_input: Any,
         storage_backend: StorageBackend | None = None,
         *,
-        pickle_control_flow_result: bool | None = None,
+        pickle_control_flow_result: bool | None = None,  # noqa: ARG002 deprecated and ignored
         **kwargs: Any,
     ) -> None:
         """Executes a local workflow.
@@ -105,8 +105,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             storage_backend: Accepted for compatibility with the base-class run path,
                 but ignored here: the storage backend is applied once at construction
                 via `_set_storage_backend`. Passing it to the run path has no effect.
-            pickle_control_flow_result: Per-call override for the executor's
-                save-time default. None means "use the instance default".
+            pickle_control_flow_result: Deprecated and ignored.
 
         Returns:
             None
@@ -115,7 +114,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             await self._arun(
                 flow_input=flow_input,
                 storage_backend=storage_backend,
-                pickle_control_flow_result=pickle_control_flow_result,
                 **kwargs,
             )
         except Exception as e:
@@ -126,7 +124,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 exception=e,
             )
             execution_event = ExecutionEvent(payload=control_flow_cancelled_event)
-            self.send_event("execution_event", execution_event.json())
+            self._send_event("execution_event", execution_event)
             await self._wait_for_websocket_queue_flush()
             await asyncio.sleep(1)
             raise LocalExecutorError(msg) from e
@@ -137,8 +135,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         self,
         flow_input: Any,
         storage_backend: StorageBackend | None = None,  # noqa: ARG002
-        *,
-        pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
     ) -> None:
         """Internal async run method with detailed event handling and websocket integration.
@@ -152,10 +148,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         )
 
         # Send the run command to actually execute it (fire and forget)
-        effective_pickle = (
-            pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
-        )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(flow_name=flow_name)
         start_flow_task = asyncio.create_task(GriptapeNodes.ahandle_request(start_flow_request))
 
         is_flow_finished = False
@@ -171,11 +164,11 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                     msg = f"Failed to start flow {flow_name}"
                     logger.error(msg)
                     event_result_failure = EventResultFailure(request=start_flow_request, result=start_flow_result)
-                    self.send_event("failure_result", event_result_failure.json())
+                    self._send_result("failure_result", event_result_failure)
                     raise LocalExecutorError(msg) from start_flow_result.exception  # noqa: TRY301
 
                 event_result_success = EventResultSuccess(request=start_flow_request, result=start_flow_result)
-                self.send_event("success_result", event_result_success.json())
+                self._send_result("success_result", event_result_success)
 
             except Exception as e:
                 msg = "Error starting workflow"
@@ -215,17 +208,20 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 logger.debug("Processing event: %s", type(event).__name__)
 
                 if isinstance(event, EventRequest):
-                    self.send_event("event_request", event.json())
+                    self._send_event("event_request", event)
                     task = asyncio.create_task(self._handle_event_request(event))
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
                 elif isinstance(event, ExecutionGriptapeNodeEvent):
                     # Emit execution event via WebSocket
-                    self.send_event("execution_event", event.wrapped_event.json())
+                    result_send_failure = self._send_execution_event(event)
                     task = asyncio.create_task(self._process_execution_event_async(event))
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
                     is_flow_finished, error = await self._handle_execution_event(event, flow_name)
+                    # The flow's own error, if any, is the cause worth reporting.
+                    if result_send_failure is not None and error is None:
+                        error = result_send_failure
                 elif isinstance(event, ProgressEvent):
                     # Convert ProgressEvent to GriptapeEvent and emit via WebSocket
                     payload = GriptapeEvent(
@@ -235,7 +231,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                         value=event.value,
                     )
                     execution_event = ExecutionEvent(payload=payload)
-                    self.send_event("execution_event", execution_event.json())
+                    self._send_event("execution_event", execution_event)
 
                 event_queue.task_done()
 
@@ -253,6 +249,17 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         if error is not None:
             raise error
+
+    def _send_execution_event(self, event: ExecutionGriptapeNodeEvent) -> LocalExecutorError | None:
+        """Send an execution event, and fail the run if it carries the run's result and could not be sent.
+
+        Any other event is skipped on failure. Skipping ControlFlowResolvedEvent would leave the parent
+        reporting success with no output.
+        """
+        send_error = self._send_event("execution_event", event.wrapped_event)
+        if send_error is None or not isinstance(event.wrapped_event.payload, ControlFlowResolvedEvent):
+            return None
+        return LocalExecutorError(f"Attempted to send the workflow's result. Failed because: {send_error}")
 
     @classmethod
     def add_cli_arguments(

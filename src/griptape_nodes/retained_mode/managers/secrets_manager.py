@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
 
 logger = logging.getLogger("griptape_nodes")
@@ -64,7 +65,7 @@ class SecretsManager:
         self._load_env_files_into_environ()
 
         if event_manager is not None:
-            self._register_handlers(event_manager)
+            event_manager.register_request_handlers(self)
 
     def refresh_from_env_file(self) -> None:
         """Re-read the .env files into os.environ for keys this manager owns.
@@ -147,6 +148,7 @@ class SecretsManager:
             if self.get_secret(secret_name, should_error_on_not_found=False) is None:
                 self.set_secret(secret_name, default_value)
 
+    @handles(GetSecretValueRequest)
     def on_handle_get_secret_request(self, request: GetSecretValueRequest) -> ResultPayload:
         secret_key = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = self.get_secret(secret_key, should_error_on_not_found=request.should_error_on_not_found)
@@ -160,6 +162,7 @@ class SecretsManager:
             value=secret_value, result_details=f"Successfully retrieved secret value for key: {secret_key}"
         )
 
+    @handles(SetSecretValueRequest)
     def on_handle_set_secret_request(self, request: SetSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = request.value
@@ -183,6 +186,7 @@ class SecretsManager:
 
         return SetSecretValueResultSuccess(result_details=f"Successfully set secret value for key: {secret_name}")
 
+    @handles(GetAllSecretValuesRequest)
     def on_handle_get_all_secret_values_request(self, request: GetAllSecretValuesRequest) -> ResultPayload:  # noqa: ARG002
         # An unreadable file fails; a missing one is a real "no secrets yet" and succeeds
         # empty, so callers replacing content with this result cannot delete credentials
@@ -201,6 +205,7 @@ class SecretsManager:
             values=secret_values, result_details=f"Successfully retrieved {len(secret_values)} secret values"
         )
 
+    @handles(DeleteSecretValueRequest)
     def on_handle_delete_secret_value_request(self, request: DeleteSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
 
@@ -324,17 +329,6 @@ class SecretsManager:
         if not path.exists():
             return {}
         return {key: value for key, value in dotenv_values(path).items() if value is not None}
-
-    def _register_handlers(self, event_manager: EventManager) -> None:
-        """Wire request types to their handlers."""
-        event_manager.assign_manager_to_request_type(GetSecretValueRequest, self.on_handle_get_secret_request)
-        event_manager.assign_manager_to_request_type(SetSecretValueRequest, self.on_handle_set_secret_request)
-        event_manager.assign_manager_to_request_type(
-            GetAllSecretValuesRequest, self.on_handle_get_all_secret_values_request
-        )
-        event_manager.assign_manager_to_request_type(
-            DeleteSecretValueRequest, self.on_handle_delete_secret_value_request
-        )
 
     def _install_managed(self, key: str, value: str) -> None:
         """Write ``key`` to ``os.environ`` and claim it as manager-owned.

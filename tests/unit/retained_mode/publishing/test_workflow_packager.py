@@ -80,12 +80,12 @@ def _make_workflow_mock(library_names: list[str]) -> MagicMock:
 
 
 def _make_lib_manager_mock(resolved: list[LibraryNameAndVersion]) -> MagicMock:
-    """Return a LibraryManager mock whose resolve_transitive_library_deps returns `resolved`."""
-    return MagicMock(resolve_transitive_library_deps=lambda _initial: resolved)
+    """Return a LibraryManager mock whose dependencies part resolves transitive library deps to `resolved`."""
+    return MagicMock(dependencies=MagicMock(resolve_transitive_library_deps=lambda _initial: resolved))
 
 
 class TestResolveAllLibraryDeps:
-    """_resolve_all_library_deps delegates to LibraryManager.resolve_transitive_library_deps."""
+    """_resolve_all_library_deps delegates to LibraryDependencies.resolve_transitive_library_deps."""
 
     def test_delegates_to_library_manager(self) -> None:
         """_resolve_all_library_deps returns whatever resolve_transitive_library_deps returns."""
@@ -113,7 +113,7 @@ class TestResolveAllLibraryDeps:
 
         with patch(
             "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
-            return_value=MagicMock(resolve_transitive_library_deps=capture_and_return),
+            return_value=MagicMock(dependencies=MagicMock(resolve_transitive_library_deps=capture_and_return)),
         ):
             packager._resolve_all_library_deps(initial)
 

@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.events.arbitrary_python_events import (
     RunArbitraryPythonStringResultFailure,
     RunArbitraryPythonStringResultSuccess,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -32,10 +33,9 @@ def strip_ansi_codes(text: str) -> str:
 
 class ArbitraryCodeExecManager:
     def __init__(self, event_manager: EventManager) -> None:
-        event_manager.assign_manager_to_request_type(
-            RunArbitraryPythonStringRequest, self.on_run_arbitrary_python_string_request
-        )
+        event_manager.register_request_handlers(self)
 
+    @handles(RunArbitraryPythonStringRequest)
     def on_run_arbitrary_python_string_request(self, request: RunArbitraryPythonStringRequest) -> ResultPayload:
 
         try:

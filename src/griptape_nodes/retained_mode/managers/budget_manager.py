@@ -1,7 +1,9 @@
 """BudgetManager - Describes which project an outbound call should be attributed to.
 
 Holds no state: the project chain is read from the project manager per request, so a project
-switch between two calls shows up on the second. No network call, no credential, no enforcement.
+switch between two calls shows up on the second. This module makes no network call and reads no
+credential; it labels a call, it does not decide whether the call is allowed. Cloud decides that,
+and `griptape_nodes.utils.budget_refusal` turns its refusal into something an artist can act on.
 
 Project ids travel exactly as stored -- unstripped, uncut, never repaired.
 
@@ -26,6 +28,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -77,10 +80,9 @@ class BudgetManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
-        event_manager.assign_manager_to_request_type(
-            GetAttributionContextRequest, self.on_get_attribution_context_request
-        )
+        event_manager.register_request_handlers(self)
 
+    @handles(GetAttributionContextRequest)
     def on_get_attribution_context_request(
         self,
         request: GetAttributionContextRequest,  # noqa: ARG002
@@ -88,8 +90,10 @@ class BudgetManager(EngineScoped):
         """Describe the current project as an encoded attribution header.
 
         Both failures send no header rather than a bare `{"v": 1}`, so the caller gets a Failure
-        it can act on instead of a Success carrying an empty chain. Neither blocks the call: it is
-        about to spend money, and an unattributed call beats a blocked one.
+        it can act on instead of a Success carrying an empty chain. Neither blocks the call. Not
+        knowing which project to bill is not a reason to refuse work: the spend is legitimate, it
+        just lands unattributed. A budget refusal is the opposite case -- Cloud has already
+        declined the call -- and that one fails the node.
 
         Both log at WARNING rather than the ERROR a bare `result_details` string would default to.
         Neither condition clears on its own, so an ERROR would repeat once per metered call for

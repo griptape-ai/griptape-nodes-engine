@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Required, TypedDict
+from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
@@ -11,8 +11,8 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue, Value
 
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
@@ -66,11 +66,9 @@ class StartFlowRequest(RequestPayload):
         flow_name: Name of the flow to start (deprecated, use flow_node_name)
         flow_node_name: Name of the flow node to start
         debug_mode: Whether to run in debug mode (default: False)
-        wait_for_completion: When True, the handler polls until the flow resolves before
-            returning. Converts the fire-and-forget kickoff into a synchronous run so callers
-            can read output values immediately afterwards without polling node state themselves.
-        completion_timeout_ms: Only meaningful when wait_for_completion=True. Maximum time to
-            wait for the flow to resolve. None means wait indefinitely.
+
+    Answers once the run ends. To run in the background, wrap the call in a task. To bound it,
+    use `asyncio.wait_for` and send `CancelFlowRequest` on timeout.
 
     Results: StartFlowResultSuccess | StartFlowResultFailure (with validation exceptions)
     """
@@ -79,16 +77,14 @@ class StartFlowRequest(RequestPayload):
     flow_name: str | None = None
     flow_node_name: str | None = None
     debug_mode: bool = False
-    # If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess.
+    # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
-    wait_for_completion: bool = False
-    completion_timeout_ms: int | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class StartFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Flow started successfully. Execution is now running."""
+    """Flow ran to completion."""
 
 
 @dataclass
@@ -116,9 +112,7 @@ class StartLocalSubflowRequest(RequestPayload):
     Args:
         flow_name: Name of the flow to start as a subflow
         start_node: The node to start execution from (None to auto-detect start node)
-        pickle_control_flow_result: Ignored. Pickling happens while broadcasting
-            ControlFlowResolvedEvent, and a local subflow always runs isolated, which does not
-            broadcast that event -- so there is no result to pickle for this request.
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartLocalSubflowResultSuccess | StartLocalSubflowResultFailure
     """
@@ -152,7 +146,7 @@ class StartFlowFromNodeRequest(RequestPayload):
         flow_name: Name of the flow to start (deprecated)
         node_name: Name of the node to start execution from
         debug_mode: Whether to run in debug mode (default: False)
-        pickle_control_flow_result: If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartFlowFromNodeResultSuccess | StartFlowFromNodeResultFailure (with validation exceptions)
     """
@@ -392,11 +386,7 @@ class ParameterSpotlightEvent(ExecutionPayload):
 @PayloadRegistry.register
 class ControlFlowResolvedEvent(ExecutionPayload):
     end_node_name: str
-    parameter_output_values: dict
-    # Optional field for pickled parameter values - when present, parameter_output_values contains UUID references
-    unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, bytes] | None = field(
-        default=None
-    )
+    parameter_output_values: dict[str, Value]
 
 
 @dataclass
@@ -410,7 +400,7 @@ class ControlFlowCancelledEvent(ExecutionPayload):
 @PayloadRegistry.register
 class NodeResolvedEvent(ExecutionPayload):
     node_name: str
-    parameter_output_values: dict
+    parameter_output_values: dict[str, DisplayValue]
     node_type: str
     specific_library_name: str | None = None
 
@@ -421,7 +411,7 @@ class ParameterValueUpdateEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -467,7 +457,7 @@ class GriptapeEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     type: str
-    value: Any
+    value: DisplayValue
 
 
 class NodeMetadata(TypedDict, total=False):
@@ -529,7 +519,10 @@ class ExecuteNodeRequest(RequestPayload):
     """
 
     node_name: str
-    parameter_values: dict[str, Any] = field(default_factory=dict)
+    parameter_values: dict[str, Value] = field(default_factory=dict)
+    # Plumbing between the flow and wherever the node runs, so no client needs the result. Values
+    # cross strictly here, so broadcasting one the node holds in memory would fail to send.
+    broadcast_result: bool = field(default=False, kw_only=True)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
@@ -547,7 +540,7 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
         parameter_output_values: Output parameter values from the node.
     """
 
-    parameter_output_values: dict[str, Any] = field(default_factory=dict)
+    parameter_output_values: dict[str, Value] = field(default_factory=dict)
 
 
 @dataclass

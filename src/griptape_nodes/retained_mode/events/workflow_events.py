@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -15,12 +15,13 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import ExecutionPayload
+from griptape_nodes.retained_mode.events.flow_events import (
+    # Re-exported: saved workflows and node libraries import it from here.
+    ImportWorkflowAsReferencedSubFlowRequest as ImportWorkflowAsReferencedSubFlowRequest,  # noqa: PLC0414
+)
+from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-
-if TYPE_CHECKING:
-    # Circular import: flow_events <-> workflow_events
-    from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 
 
 class WorkflowStatus(StrEnum):
@@ -413,7 +414,7 @@ class SaveWorkflowRequest(RequestPayload):
     Args:
         file_name: Name of the file to save the workflow to (None for auto-generated)
         image_path: Path to save workflow image/thumbnail (None for no image)
-        pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
         overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
@@ -427,23 +428,6 @@ class SaveWorkflowRequest(RequestPayload):
     display_name: str | None = None
     create_versioned: bool = False
     overwrite_existing: bool = True
-
-
-@dataclass
-@PayloadRegistry.register
-class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
-    """Import a workflow as a referenced sub-flow.
-
-    Use when: Reusing workflows as components, creating modular workflows,
-    importing workflow templates, building composite workflows.
-
-    Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
-    """
-
-    workflow_name: str
-    flow_name: str | None = None  # If None, import into current context flow
-    imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
-    track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
 
 
 @dataclass
@@ -689,6 +673,7 @@ class PublishWorkflowRequest(RequestPayload):
     # This can be removed after GUI release
     execute_on_publish: bool | None = None
     published_workflow_file_name: str | None = None
+    # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
     metadata: dict | None = None
 
@@ -1210,12 +1195,12 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
         branched_from: Optional branched from information to preserve workflow lineage
         workflow_shape: Optional workflow shape defining inputs and outputs for external callers
         file_path: Optional specific file path to use (defaults to workspace path if not provided)
-        pickle_control_flow_result: Whether to pickle control flow results in generated execution code (defaults to False)
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: SaveWorkflowFileFromSerializedFlowResultSuccess (with file path) | SaveWorkflowFileFromSerializedFlowResultFailure (save error)
     """
 
-    serialized_flow_commands: "SerializedFlowCommands"
+    serialized_flow_commands: SerializedFlowCommands
     file_name: str
     file_path: str | None = None
     creation_date: datetime | None = None

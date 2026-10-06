@@ -31,6 +31,9 @@ prefixed onto each tool, so the request `CreateNodeRequest` is reachable as
 - **`CreateNodeRequest` does not take parameter values.** Setting a parameter is
     always a separate `SetParameterValueRequest` after the node exists. There is no
     `parameter_values` / `inputs` shortcut on create.
+- **Values that aren't plain JSON carry a `$type` tag**, for example
+    `{"$type": "builtins:tuple", "$value": [1, 2]}`. To keep a value's type, send it back
+    unchanged. Don't unwrap `$value`.
 - **`EventRequestBatch` is the only fan-out primitive.** It is a synthetic tool
     (no matching `RequestPayload` class) that ships an ordered list of inner
     requests in one transport frame. Reach for it whenever you already know the
@@ -138,8 +141,8 @@ Behavior:
     inner request gets on its own — `30000` ms for most, `300000` ms for
     `RunWorkflowFromRegistryRequest`, which replays a whole saved file — clamped at
     `300000` ms (5 min). Pass an explicit override when the last slot is
-    `StartFlowRequest(wait_for_completion=True)` or any other long-running call;
-    otherwise the synchronous run can eat the budget meant for the rest of the batch.
+    `StartFlowRequest` or any other long-running call; otherwise the synchronous run can
+    eat the budget meant for the rest of the batch.
     `bool` is rejected explicitly so `True` cannot silently become 1ms.
 - **A timeout does not cancel anything.** The engine runs each request to completion on
     its own loop, so a timeout only ends your wait. Read the state back rather than
@@ -218,9 +221,9 @@ workspace survey above has confirmed the relevant library exposes those node typ
       the graph and assigns column-and-row positions. Omit `flow_name` to lay out
       the current-context flow.
 
-12. griptape_nodes_StartFlowRequest(wait_for_completion=True, completion_timeout_ms=60000)
+12. griptape_nodes_StartFlowRequest()
     → omit flow_name; the handler uses the current-context flow.
-      wait_for_completion blocks until the flow resolves or times out.
+      Returns once the run ends.
 
 13. griptape_nodes_GetParameterValueRequest(node_name="DisplayText_1", parameter_name="text")
     → the terminal node's output.
@@ -255,7 +258,7 @@ usually kept out of the build batch so its long timeout does not gate the rest:
                              target_node_name="DisplayText_1", target_parameter_name="text"),
      AutoLayoutFlowRequest(),
    ])
-4. StartFlowRequest(wait_for_completion=True, completion_timeout_ms=60000)
+4. StartFlowRequest()
    + GetParameterValueRequest("DisplayText_1", "text")            (2 calls)
 ```
 
@@ -290,10 +293,8 @@ against stale state.
 - **Always run AutoLayout after a multi-node build.** Without it nodes land at
     (0, 0) and stack on top of each other. `AutoLayoutFlowRequest` is one round trip
     and idempotent; treat it as the closing step of any build phase.
-- **Use `wait_for_completion=True` on `StartFlowRequest`.** For workflows that touch
-    LLMs, image generators, or long I/O, set `completion_timeout_ms` generously
-    (60000+ ms). Otherwise the call returns the instant the flow is kicked off and
-    you have to poll `GetNodeResolutionStateRequest` yourself.
+- **`StartFlowRequest` returns when the run ends.** Read outputs straight after it;
+    no polling needed.
 - **Omit `flow_name` on `StartFlowRequest`** when you just finished building a
     single flow. The handler defaults to the current-context flow.
 - **Read the response, don't assume names.** `CreateNodeResultSuccess.node_name` is
@@ -417,9 +418,7 @@ under it. Three things to know about it:
 
 ### Agents cannot be interrupted mid-run
 
-There is no pause/cancel for a running flow today. Use `completion_timeout_ms` to
-bound the wait; if the timeout fires, `StartFlowRequest` returns a failure but the
-flow keeps running in the engine until it finishes or errors. A subsequent
+`StartFlowRequest` holds the call until the run finishes or errors. A subsequent
 `StartFlowRequest` will fail with "Flow is already running" until it does.
 
 ## Tool Cheat Sheet
@@ -439,7 +438,7 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 | Set a parameter value                                           | `SetParameterValueRequest`                                                                                                                                |
 | Read a parameter value                                          | `GetParameterValueRequest`                                                                                                                                |
 | Inspect a parameter's schema/details on a live node             | `GetParameterDetailsRequest`, `ListParametersOnNodeRequest`                                                                                               |
-| Run synchronously                                               | `StartFlowRequest(wait_for_completion=True, completion_timeout_ms=...)`                                                                                   |
+| Run synchronously                                               | `StartFlowRequest`                                                                                                                                        |
 | Run from a specific node                                        | `StartFlowFromNodeRequest`                                                                                                                                |
 | Resolve a single node without firing the control flow           | `ResolveNodeRequest`                                                                                                                                      |
 | Execute a single node directly                                  | `ExecuteNodeRequest`                                                                                                                                      |
@@ -485,7 +484,7 @@ Goal: run an `Agent` on a one-line prompt and read the output.
 1. `CreateConnectionRequest(TextInput_1.text → Agent_1.prompt)`
 1. `CreateConnectionRequest(Agent_1.output → DisplayText_1.text)`
 1. `AutoLayoutFlowRequest()` → arrange the 3 nodes across columns
-1. `StartFlowRequest(wait_for_completion=True, completion_timeout_ms=60000)`
+1. `StartFlowRequest()`
 1. `GetParameterValueRequest(node_name="DisplayText_1", parameter_name="text")`
 
 Total: 13 MCP calls from empty engine to rendered output.
@@ -495,7 +494,7 @@ Total: 13 MCP calls from empty engine to rendered output.
 1. `EnsureWorkflowAndFlowRequest()`
 1. `EventRequestBatch([DescribeNodeTypeRequest × 3])`
 1. `EventRequestBatch([CreateNodeRequest × 3 (with explicit node_name), SetParameterValueRequest, CreateConnectionRequest × 2, AutoLayoutFlowRequest])`
-1. `StartFlowRequest(wait_for_completion=True, completion_timeout_ms=60000)` then `GetParameterValueRequest("DisplayText_1", "text")`
+1. `StartFlowRequest()` then `GetParameterValueRequest("DisplayText_1", "text")`
 
 The build batch in step 3 only works because every `CreateNodeRequest` carries an
 explicit `node_name`; the later `SetParameterValueRequest` and

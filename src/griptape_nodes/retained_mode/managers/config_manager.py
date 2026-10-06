@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LogLevel,
     Settings,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
@@ -377,29 +378,7 @@ class ConfigManager(EngineScoped):
 
         if event_manager is not None:
             # Register all our listeners.
-            event_manager.assign_manager_to_request_type(
-                GetConfigCategoryRequest, self.on_handle_get_config_category_request
-            )
-            event_manager.assign_manager_to_request_type(
-                SetConfigCategoryRequest, self.on_handle_set_config_category_request
-            )
-            event_manager.assign_manager_to_request_type(GetConfigValueRequest, self.on_handle_get_config_value_request)
-            event_manager.assign_manager_to_request_type(SetConfigValueRequest, self.on_handle_set_config_value_request)
-            event_manager.assign_manager_to_request_type(GetConfigPathRequest, self.on_handle_get_config_path_request)
-            event_manager.assign_manager_to_request_type(
-                GetConfigLayersRequest, self.on_handle_get_config_layers_request
-            )
-            event_manager.assign_manager_to_request_type(GetWorkspaceRequest, self.on_handle_get_workspace_request)
-            event_manager.assign_manager_to_request_type(
-                GetConfigSchemaRequest, self.on_handle_get_config_schema_request
-            )
-            event_manager.assign_manager_to_request_type(ResetConfigRequest, self.on_handle_reset_config_request)
-            event_manager.assign_manager_to_request_type(
-                ListBetaFeaturesRequest, self.on_handle_list_beta_features_request
-            )
-            event_manager.assign_manager_to_request_type(
-                IsBetaFeatureEnabledRequest, self.on_handle_is_beta_feature_enabled_request
-            )
+            event_manager.register_request_handlers(self)
 
     @property
     def workspace_path(self) -> Path:
@@ -1509,6 +1488,7 @@ class ConfigManager(EngineScoped):
 
         return write_succeeded
 
+    @handles(GetConfigCategoryRequest)
     def on_handle_get_config_category_request(self, request: GetConfigCategoryRequest) -> ResultPayload:
         if request.category is None or request.category == "":
             # Return the whole shebang. Start with the defaults and then layer on the user config.
@@ -1535,6 +1515,7 @@ class ConfigManager(EngineScoped):
             result_details=result_details,
         )
 
+    @handles(SetConfigCategoryRequest)
     def on_handle_set_config_category_request(self, request: SetConfigCategoryRequest) -> ResultPayload:
         # Validate the value is a dict
         if not isinstance(request.contents, dict):
@@ -1596,6 +1577,7 @@ class ConfigManager(EngineScoped):
             reason=outcome.reason,
         )
 
+    @handles(GetConfigValueRequest)
     def on_handle_get_config_value_request(self, request: GetConfigValueRequest) -> ResultPayload:
         if request.category_and_key == "":
             result_details = "Attempted to get config value but no category or key was specified."
@@ -1616,18 +1598,22 @@ class ConfigManager(EngineScoped):
             result_details=result_details,
         )
 
+    @handles(GetConfigPathRequest)
     def on_handle_get_config_path_request(self, request: GetConfigPathRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the config path."
         return GetConfigPathResultSuccess(config_path=str(USER_CONFIG_PATH), result_details=result_details)
 
+    @handles(GetConfigLayersRequest)
     def on_handle_get_config_layers_request(self, request: GetConfigLayersRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the config layer stack."
         return GetConfigLayersResultSuccess(layers=self.config_layers(), result_details=result_details)
 
+    @handles(GetWorkspaceRequest)
     def on_handle_get_workspace_request(self, request: GetWorkspaceRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the absolute workspace path."
         return GetWorkspaceResultSuccess(workspace_path=str(self.workspace_path), result_details=result_details)
 
+    @handles(ListBetaFeaturesRequest)
     def on_handle_list_beta_features_request(self, request: ListBetaFeaturesRequest) -> ResultPayload:  # noqa: ARG002
         all_features = list(list_beta_features())
         for library_name in LibraryRegistry.list_libraries():
@@ -1637,6 +1623,7 @@ class ConfigManager(EngineScoped):
         result_details = f"Successfully listed {len(features)} beta feature(s)."
         return ListBetaFeaturesResultSuccess(features=features, result_details=result_details)
 
+    @handles(IsBetaFeatureEnabledRequest)
     def on_handle_is_beta_feature_enabled_request(self, request: IsBetaFeatureEnabledRequest) -> ResultPayload:
         feature: BetaFeature | None = None
         if request.library_name is None:
@@ -1673,6 +1660,7 @@ class ConfigManager(EngineScoped):
         result_details = f"Beta feature '{request.feature_id}' is {state}."
         return IsBetaFeatureEnabledResultSuccess(enabled=enabled, result_details=result_details)
 
+    @handles(GetConfigSchemaRequest)
     def on_handle_get_config_schema_request(self, request: GetConfigSchemaRequest) -> ResultPayload:  # noqa: ARG002
         """Handle request to get the configuration schema with current values and library settings.
 
@@ -1718,6 +1706,7 @@ class ConfigManager(EngineScoped):
             result_details = f"Failed to generate configuration schema: {e}"
             return GetConfigSchemaResultFailure(result_details=result_details)
 
+    @handles(ResetConfigRequest)
     def on_handle_reset_config_request(self, request: ResetConfigRequest) -> ResultPayload:  # noqa: ARG002
         try:
             # Reloads, which reapplies the log level and sinks from the reset config.
@@ -2053,6 +2042,7 @@ class ConfigManager(EngineScoped):
             "configuration and fell back to built-in defaults for every setting until it is fixed."
         )
 
+    @handles(SetConfigValueRequest)
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
         if request.category_and_key == "":
             result_details = "Attempted to set config value but no category or key was specified."

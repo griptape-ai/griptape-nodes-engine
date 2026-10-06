@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,10 +76,7 @@ class SessionManager:
         self._sessions_data = self._load_sessions_data()
         self._active_session_id = self._get_or_initialize_active_session()
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(AppStartSessionRequest, self.handle_session_start_request)
-            event_manager.assign_manager_to_request_type(AppEndSessionRequest, self.handle_session_end_request)
-            event_manager.assign_manager_to_request_type(AppGetSessionRequest, self.handle_get_session_request)
-            event_manager.assign_manager_to_request_type(SessionHeartbeatRequest, self.handle_session_heartbeat_request)
+            event_manager.register_request_handlers(self)
 
     @property
     def active_session_id(self) -> str | None:
@@ -266,6 +264,7 @@ class SessionManager:
         # Update in-memory copy
         self._sessions_data = sessions_data
 
+    @handles(AppStartSessionRequest)
     async def handle_session_start_request(self, request: AppStartSessionRequest) -> ResultPayload:  # noqa: ARG002
         current_session_id = self.active_session_id
         if current_session_id is None:
@@ -279,6 +278,7 @@ class SessionManager:
 
         return AppStartSessionResultSuccess(current_session_id, result_details="Session started successfully.")
 
+    @handles(AppEndSessionRequest)
     async def handle_session_end_request(self, _: AppEndSessionRequest) -> ResultPayload:
         try:
             previous_session_id = self.active_session_id
@@ -298,12 +298,14 @@ class SessionManager:
             logger.error(details)
             return AppEndSessionResultFailure(result_details=details)
 
+    @handles(AppGetSessionRequest)
     def handle_get_session_request(self, _: AppGetSessionRequest) -> ResultPayload:
         return AppGetSessionResultSuccess(
             session_id=self.active_session_id,
             result_details="Session ID retrieved successfully.",
         )
 
+    @handles(SessionHeartbeatRequest)
     def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
         """Handle session heartbeat requests.
 

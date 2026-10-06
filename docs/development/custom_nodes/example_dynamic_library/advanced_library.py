@@ -39,7 +39,7 @@ def load_operation_specs() -> list[dict[str, Any]]:
     `generated_nodes.py` reads the same file with its own copy of this function rather
     than importing it from here. The engine loads each library file as a standalone
     module under a mangled name, so importing a sibling by module name would produce a
-    second module object for the same file, which breaks `isinstance` checks and pickling.
+    second module object for the same file, which breaks `isinstance` checks and saved values.
     """
     return json.loads(SPEC_FILE.read_text())["operations"]
 

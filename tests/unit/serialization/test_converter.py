@@ -1,15 +1,72 @@
-"""Tests for event_converter structure/unstructure hooks."""
+"""Tests for the cattrs converter's structure/unstructure hooks."""
 
-from typing import Any
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
-from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException
-from griptape_nodes.retained_mode.events.event_converter import (
+from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException, RequestPayload
+from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
+from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
+from griptape_nodes.serialization.converter import (
     _is_json_primitive_union,
     converter,
+    dump_json,
 )
-from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from griptape_nodes.serialization.values import Value, ValueEncodeError
+
+
+class _UnresolvableHints(NamedTuple):
+    """Like a NamedTuple naming a type imported only under TYPE_CHECKING."""
+
+    message: str
+    problem: "_NotImported | None"  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+
+
+@dataclass
+class _RequestsPayload:
+    requests: "list[RequestPayload]" = field(default_factory=list)
+
+
+@dataclass
+class _UnregisteredRequest(RequestPayload):
+    pass
+
+
+@dataclass
+class _ValuePayload:
+    """String annotations, as in event modules that use ``from __future__ import annotations``."""
+
+    value: "Value" = None
+    by_name: "dict[str, Value]" = field(default_factory=dict)
+    items: "list[Value]" = field(default_factory=list)
+    maybe: "Value | None" = None
+
+
+class TestValueFields:
+    """Fields annotated ``Value`` cross the wire as tagged plain data and come back as values."""
+
+    def test_value_fields_round_trip_through_json(self) -> None:
+        artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
+        payload = _ValuePayload(value=(1, 2), by_name={"image": artifact}, items=[b"x"], maybe={1: "one"})
+
+        wire = json.loads(json.dumps(converter.unstructure(payload)))
+        restored = converter.structure(wire, _ValuePayload)
+
+        assert restored.value == (1, 2)
+        assert type(restored.by_name["image"]) is ImageUrlArtifact
+        assert restored.by_name["image"].to_dict() == artifact.to_dict()
+        assert restored.items == [b"x"]
+        assert restored.maybe == {1: "one"}
+
+    def test_value_fields_are_tagged_on_the_wire(self) -> None:
+        wire = converter.unstructure(_ValuePayload(value=(1, 2)))
+
+        assert wire["value"] == {"$type": "builtins:tuple", "$value": [1, 2]}
 
 
 class TestIsJsonPrimitiveUnion:
@@ -205,3 +262,77 @@ class TestExceptionWireForm:
         assert str(rebuilt) == "legacy stringified error"
         assert rebuilt.original_type is None
         assert rebuilt.original_traceback is None
+
+
+class TestDeprecatedSafeUnstructure:
+    """Node libraries still import ``safe_unstructure`` from the old module path."""
+
+    def test_warns_and_unstructures(self) -> None:
+        with pytest.warns(DeprecationWarning, match="encode_value"):
+            assert safe_unstructure({"a": [1]}) == {"a": [1]}
+
+
+class TestDumpJson:
+    """Converter output with an object the converter passed through unchanged."""
+
+    def test_names_the_type_json_has_no_form_for(self) -> None:
+        with pytest.raises(ValueEncodeError, match="'_Handle' value has no plain-data form"):
+            dump_json({"handle": _Handle()})
+
+    def test_ignores_to_dict(self) -> None:
+        """Griptape's process-wide ``JSONEncoder.default`` would send this through its ``to_dict()``."""
+        with pytest.raises(ValueEncodeError, match="'_HasToDict' value has no plain-data form"):
+            dump_json({"thing": _HasToDict()})
+
+
+class _Handle:
+    pass
+
+
+class _HasToDict:
+    def to_dict(self) -> dict[str, Any]:
+        return {"lossy": True}
+
+
+class TestNamedTupleFields:
+    """NamedTuples in modules using ``from __future__ import annotations`` structure by their field types."""
+
+    def test_fields_structure_as_their_types(self) -> None:
+        library = DiscoveredLibrary(path=Path("/libraries/one.json"), is_sandbox=False)
+
+        restored = converter.structure(json.loads(json.dumps(converter.unstructure(library))), DiscoveredLibrary)
+
+        assert restored == library
+        assert type(restored.path) is type(library.path)
+
+    def test_unresolvable_hints_fall_back_to_runtime_values(self) -> None:
+        issue = _UnresolvableHints("m", None)
+
+        data = converter.unstructure(issue)
+
+        assert data == ("m", None)
+        assert converter.structure(list(data), _UnresolvableHints) == issue
+
+
+class TestRequestFields:
+    """A field typed ``RequestPayload`` carries each request with its registered name."""
+
+    def test_each_request_comes_back_as_its_own_type(self) -> None:
+        payload = _RequestsPayload(
+            requests=[
+                AddParameterToNodeRequest(parameter_name="speed", node_name="A"),
+                SetParameterValueRequest(parameter_name="speed", node_name="A", value=(1, "b")),
+            ]
+        )
+
+        data = json.loads(json.dumps(converter.unstructure(payload)))
+
+        assert [item["request_type"] for item in data["requests"]] == [
+            "AddParameterToNodeRequest",
+            "SetParameterValueRequest",
+        ]
+        assert converter.structure(data, _RequestsPayload) == payload
+
+    def test_unregistered_request_fails_to_send(self) -> None:
+        with pytest.raises(ValueEncodeError, match="not registered"):
+            converter.unstructure(_RequestsPayload(requests=[_UnregisteredRequest()]))

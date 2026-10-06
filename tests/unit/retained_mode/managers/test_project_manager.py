@@ -12085,7 +12085,6 @@ class TestImportProject:
         resolvable too), so the exception is gone. The handler still coerces at
         the boundary, which keeps it safe for any payload that arrives unconverted.
         """
-        from griptape_nodes.retained_mode.events.event_converter import converter
         from griptape_nodes.retained_mode.events.project_events import (
             ExportProjectRequest,
             ExportProjectResultSuccess,
@@ -12096,6 +12095,7 @@ class TestImportProject:
             PreviewImportProjectRequest,
             PreviewImportProjectResultSuccess,
         )
+        from griptape_nodes.serialization.converter import converter
 
         pm = engine.project_manager
         project_yaml = _write_project_base_dir(tmp_path / "proj")
@@ -12581,13 +12581,13 @@ class TestProjectVariableResolution:
 
     def test_resolved_snapshot_serializes_cleanly(self) -> None:
         """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
-        from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+        from griptape_nodes.serialization.converter import converter
 
         pm = self._pm()
         synthetic_ws = Path("/synthetic/ws")
         pm._config_manager.workspace_path = synthetic_ws
         variable = pm.resolve_project_variable("workspace_dir", project_id=None)
-        serialized = safe_unstructure(variable)
+        serialized = converter.unstructure(variable)
         assert serialized["name"] == "workspace_dir"
         # Compare via str(Path): Windows stringifies with backslash separators.
         assert serialized["value"] == str(synthetic_ws)

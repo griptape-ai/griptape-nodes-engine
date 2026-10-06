@@ -269,7 +269,6 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return f"{file_stem}.py"
@@ -290,7 +289,6 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(saved, SaveWorkflowFileFromSerializedFlowResultSuccess), saved
     return f"{file_stem}.py"
@@ -350,7 +348,7 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
     engine = _restart_engine(tmp_path)
     _register(engine, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
     if disabled:
-        engine.library_manager._create_library_info_entry(
+        engine.library_manager.discovery._create_library_info_entry(
             str(tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json"),
             is_sandbox=False,
             enabled=False,

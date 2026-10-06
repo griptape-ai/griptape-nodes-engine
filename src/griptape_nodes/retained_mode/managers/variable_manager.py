@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     VariableDetails,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
     VariableLayer,
@@ -133,25 +134,7 @@ class VariablesManager(EngineScoped):
         # (builtins + directories) are NOT stored here — pulled from ProjectManager on demand.
         self._project_layers: dict[str, VariableLayer] = {}
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(CreateVariableRequest, self.on_create_variable_request)
-            event_manager.assign_manager_to_request_type(GetVariableRequest, self.on_get_variable_request)
-            event_manager.assign_manager_to_request_type(GetVariableValueRequest, self.on_get_variable_value_request)
-            event_manager.assign_manager_to_request_type(SetVariableValueRequest, self.on_set_variable_value_request)
-            event_manager.assign_manager_to_request_type(GetVariableTypeRequest, self.on_get_variable_type_request)
-            event_manager.assign_manager_to_request_type(SetVariableTypeRequest, self.on_set_variable_type_request)
-            event_manager.assign_manager_to_request_type(DeleteVariableRequest, self.on_delete_variable_request)
-            event_manager.assign_manager_to_request_type(RenameVariableRequest, self.on_rename_variable_request)
-            event_manager.assign_manager_to_request_type(HasVariableRequest, self.on_has_variable_request)
-            event_manager.assign_manager_to_request_type(ListVariablesRequest, self.on_list_variables_request)
-            event_manager.assign_manager_to_request_type(
-                GetVariableDetailsRequest, self.on_get_variable_details_request
-            )
-            event_manager.assign_manager_to_request_type(GetVariablesRequest, self.on_get_variables_request)
-            event_manager.assign_manager_to_request_type(
-                ResolveSubstitutionRequest, self.on_resolve_substitution_request
-            )
-            event_manager.assign_manager_to_request_type(ListSubstitutablesRequest, self.on_list_substitutables_request)
-            event_manager.assign_manager_to_request_type(SetVariablesRequest, self.on_set_variables_request)
+            event_manager.register_request_handlers(self)
 
     def clear_object_state(self) -> None:
         """Clear all flow and global variables.
@@ -522,6 +505,7 @@ class VariablesManager(EngineScoped):
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
+    @handles(CreateVariableRequest)
     def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:
         """Create a new variable.
 
@@ -606,6 +590,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully created variable '{request.name}' in flow '{target_flow}'."
         )
 
+    @handles(GetVariableRequest)
     def on_get_variable_request(self, request: GetVariableRequest) -> ResultPayload:
         """Get a full variable by name."""
         try:
@@ -626,6 +611,7 @@ class VariablesManager(EngineScoped):
             variable=result.variable, result_details=f"Successfully retrieved variable '{request.name}'."
         )
 
+    @handles(GetVariableValueRequest)
     def on_get_variable_value_request(self, request: GetVariableValueRequest) -> ResultPayload:
         """Get the value of a variable."""
         try:
@@ -646,6 +632,7 @@ class VariablesManager(EngineScoped):
             value=result.variable.value, result_details=f"Successfully retrieved value for variable '{request.name}'."
         )
 
+    @handles(SetVariableValueRequest)
     def on_set_variable_value_request(self, request: SetVariableValueRequest) -> ResultPayload:
         """Set the value of an existing variable.
 
@@ -692,6 +679,7 @@ class VariablesManager(EngineScoped):
         self._unresolve_nodes_referencing_variables([request.name])
         return SetVariableValueResultSuccess(result_details=f"Successfully set value for variable '{request.name}'.")
 
+    @handles(GetVariableTypeRequest)
     def on_get_variable_type_request(self, request: GetVariableTypeRequest) -> ResultPayload:
         """Get the type of a variable."""
         try:
@@ -712,6 +700,7 @@ class VariablesManager(EngineScoped):
             type=result.variable.type, result_details=f"Successfully retrieved type for variable '{request.name}'."
         )
 
+    @handles(SetVariableTypeRequest)
     def on_set_variable_type_request(self, request: SetVariableTypeRequest) -> ResultPayload:
         """Set the type of an existing variable.
 
@@ -757,6 +746,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully set type for variable '{request.name}' to '{request.type}'."
         )
 
+    @handles(DeleteVariableRequest)
     def on_delete_variable_request(self, request: DeleteVariableRequest) -> ResultPayload:
         """Delete a variable.
 
@@ -798,6 +788,7 @@ class VariablesManager(EngineScoped):
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
+    @handles(RenameVariableRequest)
     def on_rename_variable_request(self, request: RenameVariableRequest) -> ResultPayload:  # noqa: PLR0911
         """Rename a variable.
 
@@ -880,6 +871,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
         )
 
+    @handles(HasVariableRequest)
     def on_has_variable_request(self, request: HasVariableRequest) -> ResultPayload:
         """Check if a variable exists."""
         try:
@@ -999,6 +991,7 @@ class VariablesManager(EngineScoped):
 
         return variables
 
+    @handles(ListVariablesRequest)
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
@@ -1019,6 +1012,7 @@ class VariablesManager(EngineScoped):
             variables=variables, layers=layers, result_details=f"Successfully listed {len(variables)} variables."
         )
 
+    @handles(ListSubstitutablesRequest)
     def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:
         """DEPRECATED shim: list all values available for {VAR} substitution.
 
@@ -1066,6 +1060,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
         )
 
+    @handles(GetVariablesRequest)
     def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
         """Probe specific names in scope; report which resolved and which didn't.
 
@@ -1103,6 +1098,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Probed {len(request.names)} variable name(s): {len(resolved)} resolved, {len(unresolved)} unresolved.",
         )
 
+    @handles(ResolveSubstitutionRequest)
     def on_resolve_substitution_request(self, request: ResolveSubstitutionRequest) -> ResultPayload:
         """DEPRECATED shim: resolve every {VAR}-substitutable value visible from the starting flow.
 
@@ -1145,6 +1141,7 @@ class VariablesManager(EngineScoped):
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
+    @handles(SetVariablesRequest)
     def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
         """DEPRECATED shim: set multiple variable values atomically (all-or-nothing).
 
@@ -1198,6 +1195,7 @@ class VariablesManager(EngineScoped):
         self._unresolve_nodes_referencing_variables(list(request.variables.keys()))
         return SetVariablesResultSuccess(result_details=f"Successfully set {len(request.variables)} variable(s).")
 
+    @handles(GetVariableDetailsRequest)
     def on_get_variable_details_request(self, request: GetVariableDetailsRequest) -> ResultPayload:
         """Get variable details (metadata only, no heavy values)."""
         try:

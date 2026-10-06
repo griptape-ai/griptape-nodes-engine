@@ -201,7 +201,7 @@ class TestSerializeThenReplay:
         node.discover()
         monkeypatch.setattr(Options, "__module__", "gtn_dynamic_module_options_test")
         monkeypatch.setattr(
-            engine.library_manager,
+            engine.library_manager.module_loading,
             "get_stable_namespace_for_dynamic_module",
             lambda _module: "stable_library.options",
         )
@@ -220,7 +220,9 @@ class TestSerializeThenReplay:
         node = _add_node(engine, "picker")
         node.discover()
         monkeypatch.setattr(Options, "__module__", "gtn_dynamic_module_options_test")
-        monkeypatch.setattr(engine.library_manager, "get_stable_namespace_for_dynamic_module", lambda _module: None)
+        monkeypatch.setattr(
+            engine.library_manager.module_loading, "get_stable_namespace_for_dynamic_module", lambda _module: None
+        )
 
         result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
 
