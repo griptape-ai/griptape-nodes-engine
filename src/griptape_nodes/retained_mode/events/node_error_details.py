@@ -7,6 +7,7 @@ node runs in one, and ride back on ``ExecuteNodeResultFailure.error`` like any o
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from dataclasses import dataclass, field
@@ -25,6 +26,12 @@ ALLOWED_LINK_SCHEMES = ("http://", "https://")
 # A link starting with "#" opens a place in the editor, such as "#settings-secrets?filter=MY_KEY".
 EDITOR_LINK_PREFIX = "#"
 RESPONSE_DROPPED_FIELD = "response_dropped"
+# Longer messages are left as they are, so reading a printed response stays cheap.
+MAX_PRINTED_RESPONSE_MESSAGE_CHARS = 2 * MAX_RESPONSE_BYTES
+# How many "{" in a message are tried as the start of a printed response before giving up.
+MAX_PRINTED_RESPONSE_STARTS = 8
+# A line ending like this introduces a printed response, as in "Full API response:" or "Error details:".
+RESPONSE_LABEL_ENDINGS = ("response:", "details:")
 
 
 @dataclass
@@ -55,6 +62,14 @@ class ErrorAttachments:
     fields: dict[str, str]
     response: dict[str, Any] | None
     links: list[NodeErrorLink]
+
+
+@dataclass
+class _PrintedResponse:
+    """A response dict a node printed at the end of its message, split from the text before it."""
+
+    message: str
+    response: dict[str, Any]
 
 
 def build_node_error_details(node_name: str, error: BaseException | list[Exception]) -> NodeErrorDetails:
@@ -132,12 +147,83 @@ def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDe
 def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
     details = NodeErrorDetails(message=_message(node_name, exc), exception_type=_exception_type(exc))
     attachments = _attachments(exc)
-    if attachments is None:
+    if attachments is not None:
+        details.fields = attachments.fields
+        details.response = attachments.response
+        details.links = attachments.links
+    # A response the node attached wins, even one dropped for its size.
+    if details.response is not None or RESPONSE_DROPPED_FIELD in details.fields:
         return details
-    details.fields = attachments.fields
-    details.response = attachments.response
-    details.links = attachments.links
+    printed = _split_printed_response(details.message)
+    if printed is not None:
+        details.message = printed.message
+        details.response = printed.response
     return details
+
+
+def _split_printed_response(message: str) -> _PrintedResponse | None:
+    r"""Split off a response dict printed at the end of a message, with the label in front of it.
+
+    Many nodes put the provider's response in their message with an f-string, which prints a Python
+    dict, not JSON. ``ast.literal_eval`` reads that back exactly and only evaluates literals, so it
+    is safe on error text.
+
+    Returns None, so the message is kept as it is, when no dict runs to the end of the message, when
+    the dict is empty or has nothing in front of it, or when it isn't a response ``NodeError`` could
+    attach.
+
+    Examples:
+        "Processing failed.\n\nFull API response:\n{'status': 'ERRORED'}" splits into
+        "Processing failed." and {"status": "ERRORED"}.
+
+        "Error code: 400 - {'error': {'code': 'unsupported_value'}}" splits into "Error code: 400"
+        and {"error": {"code": "unsupported_value"}}.
+    """
+    if len(message) > MAX_PRINTED_RESPONSE_MESSAGE_CHARS:
+        return None
+    starts = [index for index, char in enumerate(message) if char == "{"]
+    for start in starts[:MAX_PRINTED_RESPONSE_STARTS]:
+        response = _literal_dict(message[start:])
+        if response is None:
+            continue
+        # The first "{" that reads as a dict is the outermost one. A dict inside it is part of the
+        # response, never the response itself.
+        return _printed_response(message[:start], response)
+    return None
+
+
+def _printed_response(text: str, response: dict[str, Any]) -> _PrintedResponse | None:
+    message = _strip_response_label(text)
+    if not message:
+        return None
+    if _sanitize_response(response) is None:
+        return None
+    return _PrintedResponse(message=message, response=response)
+
+
+def _literal_dict(text: str) -> dict[str, Any] | None:
+    source = text.strip()
+    try:
+        expression = ast.parse(source, mode="eval").body
+        value = ast.literal_eval(expression)
+    # What parse and literal_eval raise for text that isn't a literal, or is one too deep to read.
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    # The parser skips a trailing "# ..." as a comment. That text belongs to the message, so the
+    # dict doesn't run to the end of it.
+    if ast.get_source_segment(source, expression) != source:
+        return None
+    if not isinstance(value, dict) or not value:
+        return None
+    return value
+
+
+def _strip_response_label(text: str) -> str:
+    """Remove what introduced the response: a label line like "Full API response:", or ": " or " - "."""
+    head, newline, last_line = text.rstrip().rpartition("\n")
+    if newline and last_line.lower().endswith(RESPONSE_LABEL_ENDINGS):
+        text = head
+    return text.rstrip().rstrip(":-").rstrip()
 
 
 def _attachments(exc: BaseException) -> ErrorAttachments | None:
