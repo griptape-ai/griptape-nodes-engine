@@ -2536,7 +2536,7 @@ class ProjectManager(EngineScoped):
         workspace config layer can re-point the final workspace_path; a forced override
         would mask that. Both _activate_project (live) and the provisioning preview drive
         off this one decision, so the previewed library/engine_version plan and what
-        _reconcile_libraries_from_config actually does cannot drift.
+        reconcile_libraries_from_config actually does cannot drift.
 
         Branches 1-3 and 4-result/5 are factored into _decide_workspace_pre_inheritance and
         _decide_workspace_post_inheritance so resolve_workspace_dir_for_project_id (which resolves an

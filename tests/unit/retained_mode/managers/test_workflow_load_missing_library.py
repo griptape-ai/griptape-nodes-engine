@@ -348,7 +348,7 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
     engine = _restart_engine(tmp_path)
     _register(engine, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
     if disabled:
-        engine.library_manager._create_library_info_entry(
+        engine.library_manager.discovery._create_library_info_entry(
             str(tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json"),
             is_sandbox=False,
             enabled=False,

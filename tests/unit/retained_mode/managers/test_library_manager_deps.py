@@ -43,11 +43,12 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     LibraryDependencyProblem,
     ShadowedEnginePackagesProblem,
 )
-from griptape_nodes.retained_mode.managers.library_manager import (
+from griptape_nodes.retained_mode.managers.library.dependencies import (
     DependencyInstallCounts,
     DependencyInstallError,
-    LibraryManager,
+    describe_dependency_install,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
 from griptape_nodes.utils.version_utils import ShadowedPackage
 
@@ -193,13 +194,15 @@ class TestLibraryDependencyResolution:
 
         with (
             patch.object(
-                mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(_make_schema_mock(None))
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(_make_schema_mock(None)),
             ),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -215,13 +218,15 @@ class TestLibraryDependencyResolution:
 
         with (
             patch.object(
-                mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(_make_schema_mock([]))
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(_make_schema_mock([])),
             ),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -251,12 +256,14 @@ class TestLibraryDependencyResolution:
         }
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", existing_paths),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -272,10 +279,12 @@ class TestLibraryDependencyResolution:
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(
-                mgr,
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(
+                mgr.git_operations,
                 "download_library_request",
                 new_callable=AsyncMock,
                 return_value=DownloadLibraryResultSuccess(
@@ -286,7 +295,7 @@ class TestLibraryDependencyResolution:
             ) as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -307,17 +316,19 @@ class TestLibraryDependencyResolution:
         schema = _make_schema_mock(["griptape-ai/nodes-bad@v1.0.0"])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request") as mock_install,
             patch.object(
-                mgr,
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request") as mock_install,
+            patch.object(
+                mgr.git_operations,
                 "download_library_request",
                 new_callable=AsyncMock,
                 return_value=DownloadLibraryResultFailure(result_details="Clone failed"),
             ),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            result = await mgr._progress_library_through_lifecycle(
+            result = await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -352,12 +363,14 @@ class TestLibraryDependencyResolution:
             return _INSTALL_STOP
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", side_effect=mock_install),
-            patch.object(mgr, "download_library_request", side_effect=mock_download),
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", side_effect=mock_install),
+            patch.object(mgr.git_operations, "download_library_request", side_effect=mock_download),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -378,13 +391,15 @@ class TestLibraryDependencyResolution:
         config_mock.get_config_value.return_value = LibraryDependencyInstallBehavior.NEVER
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
             patch.object(engine, "_config_manager", config_mock),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -407,13 +422,15 @@ class TestLibraryDependencyResolution:
         config_mock.get_config_value.return_value = LibraryDependencyInstallBehavior.NEVER
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
             patch.object(engine, "_config_manager", config_mock),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -437,17 +454,21 @@ class TestLibraryDependencyResolution:
         schema = _make_schema_mock(["griptape-ai/nodes-optional@v1.0.0"], optional=True)
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP) as mock_install,
             patch.object(
-                mgr,
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(
+                mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP
+            ) as mock_install,
+            patch.object(
+                mgr.git_operations,
                 "download_library_request",
                 new_callable=AsyncMock,
                 return_value=DownloadLibraryResultFailure(result_details="Clone failed"),
             ),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -467,10 +488,12 @@ class TestLibraryDependencyResolution:
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request") as mock_install,
             patch.object(
-                mgr,
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request") as mock_install,
+            patch.object(
+                mgr.git_operations,
                 "download_library_request",
                 new_callable=AsyncMock,
                 return_value=DownloadLibraryResultFailure(
@@ -479,7 +502,7 @@ class TestLibraryDependencyResolution:
             ),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            result = await mgr._progress_library_through_lifecycle(
+            result = await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -513,10 +536,12 @@ class TestLibraryDependencyResolution:
         }
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(
-                mgr,
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(
+                mgr.git_operations,
                 "download_library_request",
                 new_callable=AsyncMock,
                 return_value=DownloadLibraryResultSuccess(
@@ -527,7 +552,7 @@ class TestLibraryDependencyResolution:
             ) as mock_download,
             patch.object(mgr, "_library_file_path_to_info", existing_paths),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -558,12 +583,14 @@ class TestLibraryDependencyResolution:
         }
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
-            patch.object(mgr, "download_library_request") as mock_download,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr.git_operations, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", existing_paths),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -605,7 +632,7 @@ class TestResolveTransitiveLibraryDeps:
             "griptape_nodes.node_library.library_registry.LibraryRegistry.get_library",
             side_effect=lambda name: lib_a if name == "lib-a" else (_ for _ in ()).throw(KeyError(name)),
         ):
-            result = mgr.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
+            result = mgr.dependencies.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
 
         assert [r.library_name for r in result] == ["lib-a"]
 
@@ -626,7 +653,7 @@ class TestResolveTransitiveLibraryDeps:
                 mgr, "get_library_info_by_library_name", side_effect=lambda n: info_b if n == "lib-b" else None
             ),
         ):
-            result = mgr.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
+            result = mgr.dependencies.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
 
         names = {r.library_name for r in result}
         assert "lib-a" in names
@@ -650,7 +677,7 @@ class TestResolveTransitiveLibraryDeps:
             ),
             patch.object(mgr, "get_library_info_by_library_name", side_effect={"lib-b": info_b, "lib-c": info_c}.get),
         ):
-            result = mgr.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
+            result = mgr.dependencies.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
 
         assert {r.library_name for r in result} == {"lib-a", "lib-b", "lib-c"}
 
@@ -671,7 +698,7 @@ class TestResolveTransitiveLibraryDeps:
             ),
             patch.object(mgr, "get_library_info_by_library_name", side_effect={"lib-a": info_a, "lib-b": info_b}.get),
         ):
-            result = mgr.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
+            result = mgr.dependencies.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
 
         assert {r.library_name for r in result} == {"lib-a", "lib-b"}
 
@@ -688,7 +715,7 @@ class TestResolveTransitiveLibraryDeps:
             ),
             patch.object(mgr, "get_library_info_by_library_name", return_value=None),
         ):
-            result = mgr.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
+            result = mgr.dependencies.resolve_transitive_library_deps([LibraryNameAndVersion("lib-a", "1.0.0")])
 
         assert [r.library_name for r in result] == ["lib-a"]
 
@@ -726,11 +753,11 @@ class TestDownloadLibraryRequestAutoRegister:
 
             with (
                 patch(
-                    "griptape_nodes.retained_mode.managers.library_manager.anyio.Path",
+                    "griptape_nodes.retained_mode.managers.library.git_operations.anyio.Path",
                     return_value=mock_path_instance,
                 ),
                 patch(
-                    "griptape_nodes.retained_mode.managers.library_manager.find_file_in_directory",
+                    "griptape_nodes.retained_mode.managers.library.git_operations.find_file_in_directory",
                     return_value=fake_json_path,
                 ),
                 patch.object(
@@ -741,7 +768,7 @@ class TestDownloadLibraryRequestAutoRegister:
                 ),
                 patch.object(mgr, "_library_file_path_to_info", tracked),
             ):
-                result = await mgr.download_library_request(
+                result = await mgr.git_operations.download_library_request(
                     DownloadLibraryRequest(
                         git_url="https://github.com/griptape-ai/fake-library.git",
                         download_directory=tmpdir,
@@ -796,16 +823,18 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         schema = self._make_schema(advanced_library_path="lib_advanced.py")
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "_add_library_paths_to_sys_path", new=AsyncMock()),
-            patch.object(mgr, "_load_advanced_library_module") as mock_advanced,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.environment, "add_library_paths_to_sys_path", new=AsyncMock()),
+            patch.object(mgr.module_loading, "load_advanced_library_module") as mock_advanced,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry.generate_new_library",
+                "griptape_nodes.retained_mode.managers.library.registration.LibraryRegistry.generate_new_library",
                 return_value=MagicMock(),
             ) as mock_generate,
         ):
-            result = await mgr._progress_library_through_lifecycle(
+            result = await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -829,17 +858,21 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         advanced_instance = MagicMock()
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "_add_library_paths_to_sys_path", new=AsyncMock()),
-            patch.object(mgr, "_load_advanced_library_module", return_value=advanced_instance) as mock_advanced,
-            patch.object(mgr, "_attempt_load_nodes_from_library"),
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.environment, "add_library_paths_to_sys_path", new=AsyncMock()),
+            patch.object(
+                mgr.module_loading, "load_advanced_library_module", return_value=advanced_instance
+            ) as mock_advanced,
+            patch.object(mgr.module_loading, "attempt_load_nodes_from_library"),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry.generate_new_library",
+                "griptape_nodes.retained_mode.managers.library.registration.LibraryRegistry.generate_new_library",
                 return_value=MagicMock(),
             ) as mock_generate,
         ):
-            result = await mgr._progress_library_through_lifecycle(
+            result = await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -890,13 +923,13 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
         with (
             patch.object(
-                mgr,
+                mgr.metadata_loading,
                 "load_library_metadata_from_file_request",
                 return_value=_metadata_success(self._worker_mode_schema()),
             ),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            result = await mgr._establish_register_library_prerequisites(self._request())
+            result = await mgr.registration._establish_register_library_prerequisites(self._request())
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info is lib_info
@@ -911,13 +944,13 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
         with (
             patch.object(
-                mgr,
+                mgr.metadata_loading,
                 "load_library_metadata_from_file_request",
                 return_value=_metadata_success(self._worker_mode_schema()),
             ),
             patch.object(mgr, "_library_file_path_to_info", {}),
         ):
-            result = await mgr._establish_register_library_prerequisites(self._request())
+            result = await mgr.registration._establish_register_library_prerequisites(self._request())
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info.requires_worker is True
@@ -931,10 +964,12 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
         schema.metadata.declarations = []
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
             patch.object(mgr, "_library_file_path_to_info", {}),
         ):
-            result = await mgr._establish_register_library_prerequisites(self._request())
+            result = await mgr.registration._establish_register_library_prerequisites(self._request())
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info.requires_worker is False
@@ -959,11 +994,13 @@ class TestPipInstallFailureIsRecordedOnTheLibrary:
             result_details="No solution found when resolving dependencies: nonexistent-package"
         )
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=failure),
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=failure),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -973,7 +1010,7 @@ class TestPipInstallFailureIsRecordedOnTheLibrary:
         assert len(install_problems) == 1
         assert "nonexistent-package" in install_problems[0].error_details
         # Readable by the collator the settings panel and the worker both go through.
-        collated = mgr.collate_problems_for_lib_info(lib_info)
+        collated = mgr.catalog.collate_problems_for_lib_info(lib_info)
         assert collated is not None
         assert "nonexistent-package" in collated
 
@@ -990,11 +1027,13 @@ class TestPipInstallFailureIsRecordedOnTheLibrary:
         schema = _make_schema_mock([])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
-            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr.dependencies, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -1041,11 +1080,15 @@ class TestExecutionEnvironmentResolvesBothSets:
         schema = self._orchestrator_schema(mgr, ["faketorch"])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
-            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.dependencies, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(mgr.dependencies, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
         ):
-            await mgr.install_library_dependencies_request(
+            await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1065,21 +1108,25 @@ class TestExecutionEnvironmentResolvesBothSets:
         schema = self._orchestrator_schema(mgr, ["faketorch"])
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
             patch.object(
-                mgr,
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=self._metadata_result(schema),
+            ),
+            patch.object(mgr.dependencies, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(
+                mgr.dependencies,
                 "_install_dependency_set",
                 new=AsyncMock(side_effect=DependencyInstallError("no solution found")),
             ),
         ):
-            await mgr.install_library_dependencies_request(
+            await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
         # Read by the spawn refusal, and deliberately not execution_unavailable_reason, which
         # _start_workers clears before every attempt.
-        reason = mgr.execution_env_failure_reason("test_lib")
+        reason = mgr.environment.execution_env_failure_reason("test_lib")
         assert reason is not None
         assert "no solution found" in reason
 
@@ -1129,7 +1176,7 @@ class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
         mgr._is_worker = False
         mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
 
-        assert mgr._this_process_owns_the_edit_venv("/mock.json") is False
+        assert mgr.dependencies._this_process_owns_the_edit_venv("/mock.json") is False
 
     def test_the_orchestrator_still_owns_the_edit_venv_for_an_exec_deps_library(self, engine: Engine) -> None:
         """Guards the guard: the change above must not stop the ordinary case building."""
@@ -1137,7 +1184,7 @@ class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
         mgr._is_worker = False
         mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
 
-        assert mgr._this_process_owns_the_edit_venv("/mock.json") is True
+        assert mgr.dependencies._this_process_owns_the_edit_venv("/mock.json") is True
 
     @pytest.mark.asyncio
     async def test_the_orchestrator_builds_its_execution_environment(self, engine: Engine) -> None:
@@ -1145,10 +1192,12 @@ class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
         schema = self._schema(mgr)
 
         with (
-            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_for_mock(schema)),
-            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_for_mock(schema)
+            ),
+            patch.object(mgr.dependencies, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
         ):
-            await mgr.install_library_dependencies_request(
+            await mgr.dependencies.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
@@ -1161,7 +1210,7 @@ class TestTheInstallMessageDescribesWhatHappened:
     """The execution build is awaited, so the message can report an outcome rather than a plan."""
 
     def test_a_finished_build_is_reported_as_installed(self) -> None:
-        details = LibraryManager._describe_dependency_install(
+        details = describe_dependency_install(
             "test_lib",
             DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=2),
             None,
@@ -1172,7 +1221,7 @@ class TestTheInstallMessageDescribesWhatHappened:
 
     def test_a_failed_build_reports_the_failure(self) -> None:
         """Without this the message fell through and promised the heavy set was still coming."""
-        details = LibraryManager._describe_dependency_install(
+        details = describe_dependency_install(
             "test_lib",
             DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
             "its execution dependencies could not be installed (no solution found).",
@@ -1182,7 +1231,7 @@ class TestTheInstallMessageDescribesWhatHappened:
         assert "belong to the execution environment" not in details
 
     def test_an_environment_someone_else_builds_says_so(self) -> None:
-        details = LibraryManager._describe_dependency_install(
+        details = describe_dependency_install(
             "test_lib",
             DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
             None,
@@ -1210,10 +1259,10 @@ class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
         info.library_path = str(library_json)
         mgr._library_file_path_to_info[str(library_json)] = info
         for execution in (False, True):
-            venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=execution)
+            venv = mgr.environment.get_library_venv_path("test_lib", str(library_json), execution=execution)
             site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
             site_packages.mkdir(parents=True, exist_ok=True)
-        exec_site_packages = mgr.execution_site_packages("test_lib")
+        exec_site_packages = mgr.environment.execution_site_packages("test_lib")
         assert exec_site_packages is not None, "guard: the fixture must build a usable .venv-exec"
         return exec_site_packages
 
@@ -1228,7 +1277,7 @@ class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
         # Stands in for PYTHONPATH, which the engine sets before the worker imports anything.
         monkeypatch.setattr(sys, "path", [exec_site_packages, *sys.path])
 
-        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+        await mgr.environment._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
 
         assert sys.path[0] == exec_site_packages
 
@@ -1243,7 +1292,7 @@ class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
         assert info is not None
         monkeypatch.setattr(sys, "path", list(sys.path))
 
-        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+        await mgr.environment._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
 
         assert "\\.venv-exec" not in sys.path[0]
         assert ".venv" in sys.path[0]
@@ -1273,15 +1322,17 @@ class TestEveryLibraryInstallIsConstrainedToVersionsTheEngineCanImport:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("griptape>=1.13.0", "pydantic>=2.13.5"),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._capture_constraints(seen),
             ),
         ):
-            await engine.library_manager._run_uv_pip_install(tmp_path / "python", ["torch"], [], capture_output=True)
+            await engine.library_manager.dependencies._run_uv_pip_install(
+                tmp_path / "python", ["torch"], [], capture_output=True
+            )
 
         assert seen["contents"] == "griptape>=1.13.0\npydantic>=2.13.5\n"
 
@@ -1293,23 +1344,23 @@ class TestEveryLibraryInstallIsConstrainedToVersionsTheEngineCanImport:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("griptape>=1.13.0",),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._capture_constraints(seen),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.registration.OSManager.check_available_disk_space",
                 return_value=True,
             ),
-            patch("griptape_nodes.retained_mode.managers.library_manager.files"),
-            patch.object(engine.library_manager, "_init_library_venv", AsyncMock(return_value=venv_init)),
-            patch.object(engine.library_manager, "_can_write_to_venv_location", return_value=True),
+            patch("griptape_nodes.retained_mode.managers.library.registration.files"),
+            patch.object(engine.library_manager.environment, "init_library_venv", AsyncMock(return_value=venv_init)),
+            patch.object(engine.library_manager.environment, "can_write_to_venv_location", return_value=True),
             patch.object(engine, "ahandle_request", AsyncMock(return_value=MagicMock())),
         ):
-            await engine.library_manager.register_library_from_requirement_specifier_request(
+            await engine.library_manager.registration.register_library_from_requirement_specifier_request(
                 RegisterLibraryFromRequirementSpecifierRequest(requirement_specifier="some-lib")
             )
 
@@ -1340,15 +1391,17 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("numpy>=2.3.4",),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._fails_only_under_the_floors(calls),
             ),
         ):
-            await engine.library_manager._run_uv_pip_install(tmp_path / "python", ["numpy<2"], [], capture_output=True)
+            await engine.library_manager.dependencies._run_uv_pip_install(
+                tmp_path / "python", ["numpy<2"], [], capture_output=True
+            )
 
         assert len(calls) == expected_uv_runs
         assert "--constraint" not in calls[1]
@@ -1361,16 +1414,18 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
         """Without uv's explanation nobody can tell which requirement conflicted."""
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("numpy>=2.3.4",),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._fails_only_under_the_floors([]),
             ),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            await engine.library_manager._run_uv_pip_install(tmp_path / "python", ["numpy<2"], [], capture_output=True)
+            await engine.library_manager.dependencies._run_uv_pip_install(
+                tmp_path / "python", ["numpy<2"], [], capture_output=True
+            )
 
         assert "No solution found" in caplog.text
 
@@ -1384,23 +1439,23 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("griptape>=1.13.0",),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._fails_only_under_the_floors(calls),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                "griptape_nodes.retained_mode.managers.library.registration.OSManager.check_available_disk_space",
                 return_value=True,
             ),
-            patch("griptape_nodes.retained_mode.managers.library_manager.files"),
-            patch.object(engine.library_manager, "_init_library_venv", AsyncMock(return_value=venv_init)),
-            patch.object(engine.library_manager, "_can_write_to_venv_location", return_value=True),
+            patch("griptape_nodes.retained_mode.managers.library.registration.files"),
+            patch.object(engine.library_manager.environment, "init_library_venv", AsyncMock(return_value=venv_init)),
+            patch.object(engine.library_manager.environment, "can_write_to_venv_location", return_value=True),
             patch.object(engine, "ahandle_request", AsyncMock(return_value=MagicMock())),
         ):
-            result = await engine.library_manager.register_library_from_requirement_specifier_request(
+            result = await engine.library_manager.registration.register_library_from_requirement_specifier_request(
                 RegisterLibraryFromRequirementSpecifierRequest(requirement_specifier="some-lib==1.0.0")
             )
 
@@ -1419,16 +1474,16 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
         """
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("numpy>=2.3.4",),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._fails_only_under_the_floors([]),
             ),
-            patch.object(engine.library_manager, "_reset_and_init_library_venv", AsyncMock()) as rebuild,
+            patch.object(engine.library_manager.dependencies, "_reset_and_init_library_venv", AsyncMock()) as rebuild,
         ):
-            await engine.library_manager._install_deps_with_recovery(
+            await engine.library_manager.dependencies._install_deps_with_recovery(
                 venv_path=tmp_path / ".venv",
                 library_venv_python_path=tmp_path / "python",
                 pip_dependencies=["numpy<2"],
@@ -1451,13 +1506,15 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
 
         with (
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.engine_package_floors",
+                "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",
                 return_value=("numpy>=2.3.4",),
             ),
-            patch("griptape_nodes.retained_mode.managers.library_manager.subprocess_run", side_effect=always_fails),
+            patch(
+                "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run", side_effect=always_fails
+            ),
             pytest.raises(subprocess.CalledProcessError) as install_error,
         ):
-            await engine.library_manager._run_uv_pip_install(
+            await engine.library_manager.dependencies._run_uv_pip_install(
                 tmp_path / "python", ["nonexistent-package"], [], capture_output=True
             )
 
@@ -1490,13 +1547,17 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
 
         with (
             patch.object(
-                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                self._metadata_until_the_install_is_done(lib_info),
             ),
-            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
-            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=shadowed)),
+            patch.object(
+                mgr.dependencies, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)
+            ),
+            patch.object(mgr.dependencies, "shadowed_engine_packages", AsyncMock(return_value=shadowed)),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -1506,7 +1567,7 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
         assert len(problems) == 1
         assert problems[0].packages == shadowed
         # Named in the message the settings panel shows, with both versions.
-        collated = mgr.collate_problems_for_lib_info(lib_info)
+        collated = mgr.catalog.collate_problems_for_lib_info(lib_info)
         assert collated is not None
         assert "numpy 1.26.4 instead of 2.3.4" in collated
 
@@ -1517,13 +1578,17 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
 
         with (
             patch.object(
-                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                self._metadata_until_the_install_is_done(lib_info),
             ),
-            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
-            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=[])),
+            patch.object(
+                mgr.dependencies, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)
+            ),
+            patch.object(mgr.dependencies, "shadowed_engine_packages", AsyncMock(return_value=[])),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
@@ -1539,14 +1604,14 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
         library_json.parent.mkdir(parents=True)
         library_json.write_text("{}")
         for execution, version in ((False, "1.9.4"), (True, "1.12.0")):
-            venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=execution)
+            venv = mgr.environment.get_library_venv_path("test_lib", str(library_json), execution=execution)
             site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
             dist_info = site_packages / f"griptape-{version}.dist-info"
             dist_info.mkdir(parents=True)
             (dist_info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: griptape\nVersion: {version}\n")
 
         with patch("griptape_nodes.utils.version_utils.engine_package_versions", return_value={"griptape": "1.13.0"}):
-            shadowed = await mgr._shadowed_engine_packages("test_lib", str(library_json))
+            shadowed = await mgr.dependencies.shadowed_engine_packages("test_lib", str(library_json))
 
         assert shadowed == [ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0")]
 
@@ -1557,14 +1622,14 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
         library_json = tmp_path / "lib" / "library.json"
         library_json.parent.mkdir(parents=True)
         library_json.write_text("{}")
-        venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=True)
+        venv = mgr.environment.get_library_venv_path("test_lib", str(library_json), execution=True)
         site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
         dist_info = site_packages / "griptape-1.9.4.dist-info"
         dist_info.mkdir(parents=True)
         (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: griptape\nVersion: 1.9.4\n")
 
         with patch("griptape_nodes.utils.version_utils.engine_package_versions", return_value={"griptape": "1.13.0"}):
-            shadowed = await mgr._shadowed_engine_packages("test_lib", str(library_json))
+            shadowed = await mgr.dependencies.shadowed_engine_packages("test_lib", str(library_json))
 
         assert shadowed == [ShadowedPackage(name="griptape", library_version="1.9.4", engine_version="1.13.0")]
 
@@ -1579,13 +1644,17 @@ class TestShadowedComponentsAreRecordedOnTheLibrary:
 
         with (
             patch.object(
-                mgr, "load_library_metadata_from_file_request", self._metadata_until_the_install_is_done(lib_info)
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                self._metadata_until_the_install_is_done(lib_info),
             ),
-            patch.object(mgr, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)),
-            patch.object(mgr, "_shadowed_engine_packages", AsyncMock(return_value=current)),
+            patch.object(
+                mgr.dependencies, "install_library_dependencies_request", AsyncMock(return_value=_INSTALL_DONE)
+            ),
+            patch.object(mgr.dependencies, "shadowed_engine_packages", AsyncMock(return_value=current)),
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            await mgr.registration._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),

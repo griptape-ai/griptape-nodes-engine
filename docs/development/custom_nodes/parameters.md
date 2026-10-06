@@ -30,9 +30,15 @@ All Parameter attributes:
 
 ## Parameter Values
 
-Parameter values are serialized when a node runs in its library's own process (see
-[Node Isolation with Workers](node_isolation_with_workers.md)), and when a loop or subflow group
-runs with an **Execution Environment** other than **Local Execution**. These types serialize as-is:
+Parameter values are serialized when:
+
+- a workflow is saved
+- nodes are copied
+- a workflow is embedded in an exported image
+- a node runs in its library's own process (see [Node Isolation with Workers](node_isolation_with_workers.md))
+- a loop or subflow group runs with an **Execution Environment** other than **Local Execution**
+
+These types serialize as-is:
 
 - `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
 - tuples, named tuples, sets, `bytes`, and dicts with non-string keys
@@ -81,6 +87,10 @@ class MyLibrary(AdvancedNodeLibrary):
             from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
         )
 ```
+
+A value of any other class is left out when a workflow is saved and when nodes are copied or
+pasted, with a warning in the log that names the node and parameter. Set `serializable=False` on a
+parameter whose value is never meant to be saved, and it is left out without a warning.
 
 ## Traits
 

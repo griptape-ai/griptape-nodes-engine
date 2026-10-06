@@ -105,7 +105,9 @@ class TestQueriesDuringLibraryReload:
         self._enter_reload_window(engine)
 
         pending = asyncio.create_task(
-            library_manager.check_library_update_request(CheckLibraryUpdateRequest(library_name=LIBRARY_NAME))
+            library_manager.git_operations.check_library_update_request(
+                CheckLibraryUpdateRequest(library_name=LIBRARY_NAME)
+            )
         )
         await asyncio.sleep(0)
         assert not pending.done(), "the update check should wait on the loading gate, not fail"
@@ -133,10 +135,12 @@ class TestQueriesDuringLibraryReload:
         self._enter_reload_window(engine)
 
         singular = asyncio.create_task(
-            library_manager.on_get_all_info_for_library_request(GetAllInfoForLibraryRequest(library=LIBRARY_NAME))
+            library_manager.catalog.on_get_all_info_for_library_request(
+                GetAllInfoForLibraryRequest(library=LIBRARY_NAME)
+            )
         )
         plural = asyncio.create_task(
-            library_manager.on_get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
+            library_manager.catalog.on_get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
         )
         await asyncio.sleep(0)
         assert not singular.done(), "the per-library handler is expected to wait on the loading gate"
@@ -176,8 +180,8 @@ class TestQueriesDuringLibraryReload:
             patch.object(
                 library_manager, "load_all_libraries_from_config", side_effect=spy_load_all_libraries_from_config
             ),
-            patch.object(library_manager, "_maybe_start_workers_for_existing_session", AsyncMock()),
-            patch.object(library_manager, "_await_pending_workers", AsyncMock()),
+            patch.object(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock()),
+            patch.object(library_manager.workers, "await_pending_workers", AsyncMock()),
         ):
             await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
 
@@ -200,7 +204,7 @@ class TestQueriesDuringLibraryReload:
             raise failure
 
         with (
-            patch.object(library_manager, "_reconcile_libraries_from_config", side_effect=boom),
+            patch.object(library_manager.provisioning, "reconcile_libraries_from_config", side_effect=boom),
             pytest.raises(RuntimeError, match="discovery blew up"),
         ):
             await library_manager.load_all_libraries_from_config()
@@ -248,7 +252,7 @@ class TestQueriesDuringLibraryReload:
         self._enter_reload_window(engine)
 
         pending = asyncio.create_task(
-            library_manager.on_get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
+            library_manager.catalog.on_get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
         )
         await asyncio.sleep(0)
         assert not pending.done()

@@ -31,6 +31,7 @@ from griptape_nodes.serialization.values import (
     Unencodable,
     ValueEncodeError,
     decode_value,
+    encode_for_display,
     encode_value,
     register_value_codec,
     try_encode,
@@ -548,3 +549,6 @@ class TestTryEncode:
 
     def test_finds_an_unencodable_value_inside_a_container(self) -> None:
         assert isinstance(try_encode({"a": [object()]}), Unencodable)
+
+    def test_display_encoding_falls_back_to_text(self) -> None:
+        assert isinstance(encode_for_display(object()), str)

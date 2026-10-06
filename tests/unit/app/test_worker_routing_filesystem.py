@@ -1,15 +1,13 @@
 """Filesystem requests must not cross the worker boundary.
 
 Forwarding-by-default made "every request a node can issue survives a cattrs round trip" a
-requirement, and the filesystem family does not meet it. Three separate ways:
+requirement, and the filesystem family does not meet it in two ways:
 
 - `content` is `str | bytes`. The wire form base64s bytes into a JSON string and cattrs resolves
   the union back to `str`, so a worker's write landed on disk as mojibake with no error raised
   anywhere. Silent data corruption.
 - A path carrying macro variables is a `MacroPath` wrapping a `ParsedMacro`, which will not
   serialize at all. The worker blocked until the forward timed out.
-- Four failure results declare `SequenceScanFailureReason | FileIOFailureReason`, which cattrs
-  cannot disambiguate, so even the error could not travel.
 
 None of that is a reason to make the wire smarter: the workspace is shared on disk, so a worker's
 own answer was already the correct one. These tests pin the routing decision and the mechanism
@@ -213,36 +211,6 @@ class TestTheWireCannotCarryThese:
         assert round_tripped != original, "if bytes now survive, revisit whether writes may forward"
         assert isinstance(round_tripped, str)
 
-    def test_the_sequence_failure_union_cannot_be_structured(self) -> None:
-        """So a worker could not even receive the error, let alone the result."""
-        failure = os_events.ScanSequencesResultFailure(
-            failure_reason=os_events.SequenceScanFailureReason.INVALID_TEMPLATE,
-            result_details="no",
-        )
-        wire = json.loads(json.dumps(converter.unstructure(failure)))
-
-        with pytest.raises(Exception):  # noqa: B017, PT011 - any failure to serialize is the point
-            converter.structure(wire, os_events.ScanSequencesResultFailure)
-
-    def test_the_ambiguous_union_is_still_declared_where_we_think(self) -> None:
-        """If these are ever given a structure hook, the test above stops meaning anything."""
-        annotated = [
-            cls.__name__
-            for cls in vars(os_events).values()
-            if isinstance(cls, type)
-            and dataclasses.is_dataclass(cls)
-            and any(
-                isinstance(f.type, str) and "SequenceScanFailureReason | FileIOFailureReason" in f.type
-                for f in dataclasses.fields(cls)
-            )
-        ]
-        assert sorted(annotated) == [
-            "DeduceSequencesFromFileListResultFailure",
-            "ListDirectoryResultFailure",
-            "ListDirectorySequencesResultFailure",
-            "ScanSequencesResultFailure",
-        ]
-
 
 class TestTheDerivedMembershipIsReviewed:
     """What the derivation decided, enumerated, because it decides for requests nobody listed.
@@ -273,8 +241,8 @@ class TestTheDerivedMembershipIsReviewed:
             # os_events sequence scanning: these two read the same shared directories.
             "ListDirectorySequencesRequest",
             "ScanSequencesRequest",
-            # No filesystem I/O at all -- it groups a caller-supplied path list. Local only because
-            # its failure union cannot be structured; see category 3 in worker_routing.
+            # No filesystem I/O at all -- it groups a caller-supplied path list, so any process
+            # gives the same answer and forwarding would only add a round trip.
             "DeduceSequencesFromFileListRequest",
             # artifact_events: resolve a provider from a process-local registry while writing into
             # the project's previews directory.

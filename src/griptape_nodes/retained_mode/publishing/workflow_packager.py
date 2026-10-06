@@ -230,7 +230,7 @@ class WorkflowPackager:
         initial: list[LibraryNameAndVersion],
     ) -> list[LibraryNameAndVersion]:
         """Expand the initial library set to include all transitive library_dependencies."""
-        return GriptapeNodes.LibraryManager().resolve_transitive_library_deps(initial)
+        return GriptapeNodes.LibraryManager().dependencies.resolve_transitive_library_deps(initial)
 
     def copy_libraries(
         self,
