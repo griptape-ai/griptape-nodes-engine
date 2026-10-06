@@ -308,7 +308,22 @@ class LibraryProvisioning(EngineScoped):
                 }
             }
 
+        When the environment provides the libraries nothing is cloned: every URL fails with the
+        reason, so callers report it the way they report any failed download.
         """
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return {
+                git_url_with_ref: {
+                    "success": False,
+                    "library_name": None,
+                    "error": managed.environment_provides_libraries_message(
+                        f"download the library at '{git_url_with_ref}'"
+                    ),
+                }
+                for git_url_with_ref in git_urls_with_refs
+            }
+
         config_mgr = self.engine.config_manager
         libraries_path = config_mgr.resolved_libraries_root()
 

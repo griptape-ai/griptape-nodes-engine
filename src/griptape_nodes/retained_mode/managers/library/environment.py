@@ -134,7 +134,10 @@ class LibraryEnvironment(EngineScoped):
 
         Raises:
             RuntimeError: If the virtual environment cannot be created.
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries (a
+                RuntimeError, so callers turn it into their normal failure).
         """
+        self.engine.library_manager.managed_environment.ensure_engine_provisions("build a library environment")
         python_version = platform.python_version()
 
         if is_venv_functional(library_venv_path):

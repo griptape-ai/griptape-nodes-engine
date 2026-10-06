@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     LibraryDependencyProblem,
     LibraryNotProvidedByEnvironmentProblem,
 )
+from griptape_nodes.retained_mode.managers.library.managed_environment import LibrariesProvidedByEnvironmentError
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY, LIBRARIES_TO_REGISTER_KEY
 
@@ -416,6 +417,80 @@ class TestEnvironmentModeNeverDownloadsOrBuilds:
         result = await engine.ahandle_request(request_payload)  # type: ignore[arg-type]
 
         assert isinstance(result, failure_type)
+        assert "environment" in str(result.result_details)
+
+
+class TestSharedHelpersRefuseInEnvironmentMode:
+    """The helpers every download, build, install, and git path goes through refuse on their own.
+
+    Each handler has its own environment-mode check; these guard the work itself, so a caller that
+    forgets its check still cannot reach uv, pip, or git. Every side effect behind a guard is
+    replaced with one that fails the test if it runs.
+    """
+
+    @staticmethod
+    def _must_not_run(*_: object, **__: object) -> None:
+        msg = "an environment-mode guard let the work through"
+        raise AssertionError(msg)
+
+    @pytest.mark.asyncio
+    async def test_building_a_library_environment_is_refused(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        monkeypatch.setattr(
+            "griptape_nodes.retained_mode.managers.library.environment.subprocess_run", self._must_not_run
+        )
+
+        with pytest.raises(LibrariesProvidedByEnvironmentError, match="build a library environment"):
+            await engine.library_manager.environment.init_library_venv(tmp_path / ".venv")
+
+        assert not (tmp_path / ".venv").exists()
+
+    @pytest.mark.asyncio
+    async def test_installing_library_packages_is_refused(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        monkeypatch.setattr(
+            "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run", self._must_not_run
+        )
+
+        with pytest.raises(LibrariesProvidedByEnvironmentError, match="install library packages"):
+            await engine.library_manager.dependencies.install_under_engine_floors(
+                ["uv", "pip", "install", "some-dep"], tmp_path / "python", capture_output=True
+            )
+
+    @pytest.mark.asyncio
+    async def test_downloading_a_library_is_refused_for_every_url(
+        self, engine: Engine, configure: Configure, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        monkeypatch.setattr(engine, "ahandle_request", self._must_not_run)
+        urls = ["https://github.com/example/one", "https://github.com/example/two@main"]
+
+        results = await engine.library_manager.provisioning.download_libraries_from_git_urls(urls)
+
+        assert set(results) == set(urls)
+        for url, result in results.items():
+            assert result["success"] is False
+            assert result["library_name"] is None
+            assert url in result["error"]
+            assert "environment" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_git_operation_on_a_library_is_refused(
+        self, engine: Engine, configure: Configure, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        monkeypatch.setattr(LibraryRegistry, "get_library", self._must_not_run)
+
+        result = await engine.library_manager.git_operations._validate_and_prepare_library_for_git_operation(
+            library_name="B Library", failure_result_class=UpdateLibraryResultFailure, operation_description="update"
+        )
+
+        assert isinstance(result, UpdateLibraryResultFailure)
+        assert "B Library" in str(result.result_details)
         assert "environment" in str(result.result_details)
 
 

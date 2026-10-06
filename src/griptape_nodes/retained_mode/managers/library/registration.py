@@ -71,6 +71,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library.common import LibraryFitness, LibraryInfo, LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.library.dependencies import parse_dependency_url
 from griptape_nodes.retained_mode.managers.library.environment import describe_unmet_requirements
+from griptape_nodes.retained_mode.managers.library.managed_environment import LibrariesProvidedByEnvironmentError
 from griptape_nodes.retained_mode.managers.library.workers import resolve_executes_in_worker
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import (
@@ -257,6 +258,8 @@ class LibraryRegistrar(EngineScoped):
         except subprocess.CalledProcessError as e:
             details = f"Attempted to install library '{request.requirement_specifier}'. Failed: return code={e.returncode}, stdout={e.stdout}, stderr={e.stderr}"
             return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
+        except LibrariesProvidedByEnvironmentError as e:
+            return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=str(e))
         except InvalidRequirement as e:
             details = f"Attempted to install library '{request.requirement_specifier}'. Failed due to invalid requirement specifier: {e}"
             return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)

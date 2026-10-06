@@ -3,7 +3,8 @@
 When `library.provisioned_by` is 'environment', the environment the engine was started in decides
 which libraries load (`GTN_LIBRARY_PATHS`) and holds their packages. The engine then loads nothing
 else and downloads, updates, and builds nothing. The request handlers refuse those changes with an
-artist-readable message.
+artist-readable message; `ensure_engine_provisions` backs that up at the shared helpers that do the
+work, so a handler that forgets its own check still cannot download, build, or install.
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.library.discovery import DiscoveredLibraryEntry
 
 
+class LibrariesProvidedByEnvironmentError(RuntimeError):
+    """Raised by a shared download, build, or install helper when the environment provides the libraries."""
+
+
 class LibraryManagedEnvironment(EngineScoped):
     def __init__(self, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -41,6 +46,18 @@ class LibraryManagedEnvironment(EngineScoped):
     def provisioned_by_environment(self) -> bool:
         """Whether library.provisioned_by is 'environment'."""
         return provisioned_by_environment(self.engine.config_manager)
+
+    def ensure_engine_provisions(self, attempted: str) -> None:
+        """Refuse a download, build, or install when the environment provides the libraries.
+
+        Called at the top of the shared helpers that do that work, so the rule holds for every
+        caller, including one added later that has no environment-mode check of its own.
+
+        Raises:
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries.
+        """
+        if self.provisioned_by_environment():
+            raise LibrariesProvidedByEnvironmentError(self.environment_provides_libraries_message(attempted))
 
     async def is_provided_by_environment(self, library_path: str) -> bool:
         """Whether `library_path` is one of the manifests GTN_LIBRARY_PATHS provides.

@@ -869,6 +869,16 @@ class LibraryGitOperations(EngineScoped):
             On success: LibraryGitOperationContext with library info
             On failure: ResultPayloadFailure instance
         """
+        # Every git operation on an installed library comes through here, so environment mode is
+        # enforced here too, not only by each handler's own check.
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return failure_result_class(
+                result_details=managed.environment_provides_libraries_message(
+                    f"{operation_description} Library '{library_name}'"
+                )
+            )
+
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None:
             details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no Library with that name was found."

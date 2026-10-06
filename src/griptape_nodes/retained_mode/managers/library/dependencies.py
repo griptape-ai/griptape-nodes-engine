@@ -403,7 +403,9 @@ class LibraryDependencies(EngineScoped):
 
         Raises:
             subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries.
         """
+        self.engine.library_manager.managed_environment.ensure_engine_provisions("install library packages")
         async with engine_version_constraints() as constraint_flags:
             try:
                 await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
