@@ -428,6 +428,32 @@ class TestPrintedResponse:
         assert details.message == "Processing failed."
         assert details.response == {"status": "ERRORED"}
 
+    @pytest.mark.parametrize("label", ["Full API response:", "Full error details:", "Full response:"])
+    def test_label_lines_libraries_use_are_removed(self, label: str) -> None:
+        details = build_node_error_details(NODE_NAME, RuntimeError(f"Upload failed.\n\n{label}\n{{'code': 7}}"))
+
+        assert details.message == "Upload failed."
+        assert details.response == {"code": 7}
+
+    def test_a_label_of_any_wording_is_removed(self) -> None:
+        exc = RuntimeError("Upload failed.\nRaw provider reply:\n{'code': 7}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Upload failed."
+
+    def test_a_short_line_without_a_colon_is_kept(self) -> None:
+        exc = RuntimeError("Upload failed.\nSee below\n{'code': 7}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Upload failed.\nSee below"
+
+    def test_a_short_line_ending_in_a_colon_on_the_same_line_as_the_response_is_kept(self) -> None:
+        details = build_node_error_details(NODE_NAME, RuntimeError("Upload failed.\nProvider error: {'code': 7}"))
+
+        assert details.message == "Upload failed.\nProvider error"
+
     def test_a_line_ending_in_a_colon_that_is_not_a_label_is_kept(self) -> None:
         exc = RuntimeError("Generation failed.\nThe provider said for prompt 'cat':\n{'status': 'ERRORED'}")
 

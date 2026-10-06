@@ -30,19 +30,9 @@ RESPONSE_DROPPED_FIELD = "response_dropped"
 MAX_PRINTED_RESPONSE_MESSAGE_CHARS = 2 * MAX_RESPONSE_BYTES
 # How many "{" in a message are tried as the start of a printed response before giving up.
 MAX_PRINTED_RESPONSE_STARTS = 8
-# A last line that is exactly one of these, ignoring case, introduces a printed response. Any other
-# line before the response is part of the message, even one ending in "response:".
-RESPONSE_LABELS = frozenset(
-    {
-        "response:",
-        "api response:",
-        "full response:",
-        "full api response:",
-        "details:",
-        "error details:",
-        "response details:",
-    }
-)
+# A line above a printed response is its label, and is dropped, only when it ends in ":" and is at
+# most this many words, like "Full API response:". A longer line is a sentence and stays.
+MAX_RESPONSE_LABEL_WORDS = 4
 
 
 @dataclass
@@ -231,10 +221,22 @@ def _literal_dict(text: str) -> dict[str, Any] | None:
 
 def _strip_response_label(text: str) -> str:
     """Remove what introduced the response: a label line like "Full API response:", or ": " or " - "."""
-    head, newline, last_line = text.rstrip().rpartition("\n")
-    if newline and last_line.strip().lower() in RESPONSE_LABELS:
-        text = head
+    if _ends_with_response_label(text):
+        text = text.rstrip().rpartition("\n")[0]
     return text.rstrip().rstrip(":-").rstrip()
+
+
+def _ends_with_response_label(text: str) -> bool:
+    """Whether the response starts on its own line under a short line ending in ":", with text above."""
+    if not text.rstrip(" \t").endswith("\n"):
+        return False
+    head, newline, last_line = text.rstrip().rpartition("\n")
+    if not newline or not head.strip():
+        return False
+    label = last_line.strip()
+    if not label.endswith(":"):
+        return False
+    return len(label.split()) <= MAX_RESPONSE_LABEL_WORDS
 
 
 def _attachments(exc: BaseException) -> ErrorAttachments | None:
