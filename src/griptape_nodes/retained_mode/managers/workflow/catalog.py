@@ -11,6 +11,8 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
+    WorkflowMetadataError,
+    read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
@@ -168,8 +170,13 @@ class WorkflowCatalog(EngineScoped):
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
-            details = f"Failed to get metadata. Workflow '{request.workflow_name}' not found."
-            return GetWorkflowMetadataResultFailure(result_details=details)
+            file_metadata = self._read_open_workflow_file_metadata(request.workflow_name)
+            if isinstance(file_metadata, GetWorkflowMetadataResultFailure):
+                return file_metadata
+            return GetWorkflowMetadataResultSuccess(
+                workflow_metadata=file_metadata,
+                result_details="Successfully retrieved workflow metadata from the open workflow's file.",
+            )
 
         return GetWorkflowMetadataResultSuccess(
             workflow_metadata=workflow.metadata,
@@ -226,6 +233,31 @@ class WorkflowCatalog(EngineScoped):
                 message=f"Successfully updated metadata for workflow '{request.workflow_name}'.", level=logging.INFO
             )
         )
+
+    def _read_open_workflow_file_metadata(
+        self, workflow_name: str
+    ) -> WorkflowMetadata | GetWorkflowMetadataResultFailure:
+        """Read the metadata header of the open workflow's file, when the registry has no entry for it.
+
+        Running a workflow file pushes its context by file path, so a file the registry doesn't
+        know (one outside the workspace, run directly) is open under a key no registry lookup
+        finds. Its metadata is still in the file header.
+        """
+        not_found = GetWorkflowMetadataResultFailure(
+            result_details=f"Failed to get metadata. Workflow '{workflow_name}' not found."
+        )
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return not_found
+        if context_manager.get_current_workflow_name() != workflow_name:
+            return not_found
+        file_path = context_manager.get_current_workflow_file_path()
+        if file_path is None:
+            return not_found
+        try:
+            return read_workflow_metadata(Path(file_path))
+        except WorkflowMetadataError as err:
+            return GetWorkflowMetadataResultFailure(result_details=str(err))
 
     def _build_workflow_info_key(self, file_path: str) -> str:
         """Build the key used to look up a workflow's load record.

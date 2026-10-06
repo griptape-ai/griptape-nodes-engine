@@ -100,6 +100,25 @@ from griptape_nodes.retained_mode.managers.workflow_manager import (
 )
 
 
+def _write_minimal_workflow_header(workflow_file: Path) -> None:
+    workflow_file.write_text(
+        "\n".join(
+            [
+                f"# /// {WorkflowManager.WORKFLOW_METADATA_HEADER}",
+                "# [tool.griptape-nodes]",
+                '# name = "Outside Workspace"',
+                '# description = "run directly"',
+                '# schema_version = "0.21.0"',
+                '# engine_version_created_with = "0.0.0"',
+                "# node_libraries_referenced = []",
+                "# ///",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _register_unsaved_workflow(key: str, name: str) -> None:
     metadata = WorkflowMetadata(
         name=name,
@@ -307,6 +326,61 @@ class TestWorkflowManager:
             result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
 
         assert isinstance(result, GetWorkflowMetadataResultFailure)
+
+    def test_get_workflow_metadata_reads_file_of_open_unregistered_workflow(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A workflow run from a file the registry doesn't know answers with its file header."""
+        workflow_file = tmp_path / "outside_workspace.py"
+        _write_minimal_workflow_header(workflow_file)
+        context_manager = engine.context_manager
+        workflow_name = context_manager.push_workflow(file_path=str(workflow_file))
+        try:
+            result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
+                GetWorkflowMetadataRequest(workflow_name=workflow_name)
+            )
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowMetadataResultSuccess)
+        assert result.workflow_metadata.name == "Outside Workspace"
+        assert result.workflow_metadata.description == "run directly"
+
+    def test_get_workflow_metadata_not_found_when_name_is_not_open_workflow(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """The file fallback answers only for the open workflow, not for any unregistered name."""
+        workflow_file = tmp_path / "open_workflow.py"
+        _write_minimal_workflow_header(workflow_file)
+        context_manager = engine.context_manager
+        context_manager.push_workflow(file_path=str(workflow_file))
+        try:
+            result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
+                GetWorkflowMetadataRequest(workflow_name="some_other_workflow")
+            )
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowMetadataResultFailure)
+
+    def test_get_workflow_metadata_reports_unreadable_header_of_open_workflow(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A bad header on the open workflow's file is reported as such, not as "not found"."""
+        workflow_file = tmp_path / "no_header.py"
+        workflow_file.write_text("print('no header')\n", encoding="utf-8")
+        context_manager = engine.context_manager
+        workflow_name = context_manager.push_workflow(file_path=str(workflow_file))
+        try:
+            result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
+                GetWorkflowMetadataRequest(workflow_name=workflow_name)
+            )
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowMetadataResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert "metadata section" in result.result_details.result_details[0].message
 
     def test_set_workflow_metadata_success(self, engine: Engine) -> None:
         """Ensure SetWorkflowMetadataRequest replaces metadata and persists header."""
