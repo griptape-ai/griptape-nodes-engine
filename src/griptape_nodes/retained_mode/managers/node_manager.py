@@ -5297,6 +5297,7 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to lock node '{request.node_name}'. Failed because the Node could not be found. Error: {err}"
                 return SetLockNodeStateResultFailure(result_details=details)
         node.lock = request.lock
+        self._unresolve_consumers_of_unlocked_unresolved_node(node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
@@ -5314,6 +5315,7 @@ class NodeManager(EngineScoped):
                 failed[name] = f"Node not found. Error: {err}"
                 continue
             node.lock = request.lock
+            self._unresolve_consumers_of_unlocked_unresolved_node(node)
             updated.append(name)
 
         if not updated:
@@ -5327,6 +5329,19 @@ class NodeManager(EngineScoped):
             failed_nodes=failed,
             result_details=details,
         )
+
+    def _unresolve_consumers_of_unlocked_unresolved_node(self, node: BaseNode) -> None:
+        """Unresolve everything downstream of a node that was unlocked without resolved outputs.
+
+        While locked, such a node is skipped, so its consumers resolve on missing results. Once it
+        is unlocked they must run again, or the run stops at them and never reaches the node.
+        """
+        if node.lock:
+            return
+        if node.state == NodeResolutionState.RESOLVED:
+            return
+
+        self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
 
     @handles(SendNodeMessageRequest)
     def on_send_node_message_request(self, request: SendNodeMessageRequest) -> ResultPayload:

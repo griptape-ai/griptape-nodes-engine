@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
-from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
@@ -197,7 +197,7 @@ class ExecuteDagState(State):
                         ExecuteDagState._try_queue_waiting_node(context, added_node.name)
 
     @staticmethod
-    async def handle_done_nodes(context: ParallelResolutionContext, done_node: DagNode, network_name: str) -> None:
+    async def handle_done_nodes(context: ParallelResolutionContext, done_node: DagNode, network_name: str) -> None:  # noqa: C901 (one over, from skipping locked nodes without outputs)
         current_node = done_node.node_reference
 
         # Remove the node from the priority queue now that it's done
@@ -210,6 +210,18 @@ class ExecuteDagState(State):
                 current_node.name,
                 network_name,
             )
+            return
+
+        # A locked node that has never produced outputs has nothing frozen to hand downstream.
+        # Skip it without marking it RESOLVED, so that once unlocked the next run executes it
+        # instead of treating it as already resolved.
+        if ExecuteDagState._is_locked_without_outputs(current_node):
+            logger.warning(
+                "Skipped locked node '%s': it is locked but has no results from an earlier run to pass downstream. Unlock it to run it.",
+                current_node.name,
+            )
+            ExecuteDagState.get_next_control_graph(context, current_node, network_name)
+            ExecuteDagState.check_for_new_start_nodes(context, current_node.name, network_name)
             return
 
         # Special handling for BaseIterativeStartNode
@@ -298,6 +310,29 @@ class ExecuteDagState(State):
         # Now the final thing to do, is to take their directed graph and update it.
         ExecuteDagState.get_next_control_graph(context, current_node, network_name)
         ExecuteDagState.check_for_new_start_nodes(context, current_node.name, network_name)
+
+    @staticmethod
+    def _is_locked_without_outputs(node: BaseNode) -> bool:
+        """Whether a node is locked but has no outputs from an earlier run to keep frozen.
+
+        A node that declares no data outputs has nothing to freeze, so it never counts. Neither does
+        a loop start node, which must still be cleared out of the loop's networks when it is done.
+        """
+        if not node.lock:
+            return False
+        if isinstance(node, BaseIterativeStartNode):
+            return False
+        if node.state == NodeResolutionState.RESOLVED:
+            return False
+        output_names = [
+            parameter.name
+            for parameter in node.parameters
+            if ParameterMode.OUTPUT in parameter.allowed_modes
+            and parameter.output_type != ParameterTypeBuiltin.CONTROL_TYPE.value
+        ]
+        if not output_names:
+            return False
+        return not any(name in node.parameter_output_values for name in output_names)
 
     @staticmethod
     def _unresolve_if_an_input_was_torn_down(node: BaseNode) -> None:
