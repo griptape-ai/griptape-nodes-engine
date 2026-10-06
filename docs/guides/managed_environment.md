@@ -12,13 +12,15 @@ In a managed environment:
 - The environment decides which libraries load, and at which versions.
 - The engine never downloads, updates, or installs a library, and never builds a Python
     environment.
+- Each library's worker process can be started inside the environment that library needs.
 
-## The two settings
+## The three settings
 
-| What                     | How you set it                                               | Purpose                                                                 |
-| ------------------------ | ------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `GTN_LIBRARY_PATHS`      | Environment variable                                         | The libraries the environment provides.                                 |
-| `library.provisioned_by` | Setting, or `GTN_CONFIG_LIBRARY__PROVISIONED_BY=environment` | Tells the engine the environment provides libraries and their packages. |
+| What                     | How you set it                                                | Purpose                                                                 |
+| ------------------------ | ------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `GTN_LIBRARY_PATHS`      | Environment variable                                          | The libraries the environment provides.                                 |
+| `library.provisioned_by` | Setting, or `GTN_CONFIG_LIBRARY__PROVISIONED_BY=environment`  | Tells the engine the environment provides libraries and their packages. |
+| `worker.command_prefix`  | Setting, or `GTN_CONFIG_WORKER__COMMAND_PREFIX` (a JSON list) | Starts each library's worker inside that library's environment.         |
 
 ### `GTN_LIBRARY_PATHS`
 
@@ -72,6 +74,63 @@ With `environment`:
 - The artist's own config file is left alone: entries for libraries that didn't load are not
     removed.
 
+### `worker.command_prefix`
+
+Libraries that run in their own worker process are started with the engine's own Python
+interpreter, by its full path: `/path/to/python -m griptape_nodes_app engine --library-name "Foo Library" ...`.
+`worker.command_prefix` is a list of words placed in front of that command, so your tool can
+prepare the environment first and then run the worker inside it:
+
+```bash
+export GTN_CONFIG_WORKER__COMMAND_PREFIX='["env-tool", "run", "engine=={engine_version}", "python-{python_version}", "{library_request}", "--"]'
+```
+
+These placeholders are filled for each worker:
+
+| Placeholder         | Filled with                                                       |
+| ------------------- | ----------------------------------------------------------------- |
+| `{library_request}` | The library's entry in `GTN_LIBRARY_WORKER_REQUESTS` (see below). |
+| `{library_name}`    | The library's name, as written in its manifest.                   |
+| `{engine_version}`  | The running engine's version, such as `0.103.0`.                  |
+| `{python_version}`  | The Python the engine runs on, as major.minor, such as `3.12`.    |
+
+A word that is exactly `{library_request}` becomes one word per space-separated part of the entry,
+so one entry can name several packages. Inside a longer word it's replaced as text.
+
+The prefix can't change which Python runs the worker: it is always the engine's own interpreter.
+Prepare each worker's environment for that Python, for example by asking your tool for
+`python-{python_version}`. Otherwise packages with compiled parts may be built for a different
+Python and fail to import. Start the engine itself from the prepared environment rather than from
+a virtual environment, so the worker doesn't pick up packages from that virtual environment.
+
+`GTN_LIBRARY_WORKER_REQUESTS` says what each library's worker needs. Entries are
+`<library name>=<request>`, separated like `PATH` entries, where the library name is the `name` in
+the library's manifest:
+
+```bash
+export GTN_LIBRARY_WORKER_REQUESTS="Foo Library=lib_foo==1.4.2:Bar Library=lib_bar==2.0.1"
+```
+
+Because entries are separated like `PATH` entries, a request can't contain `:` on macOS and Linux,
+or `;` on Windows. Like `GTN_LIBRARY_PATHS`, set it in the environment the engine starts in: a
+project's environment settings don't change it.
+
+If the prefix uses `{library_request}` and a library has no entry:
+
+- With `library.provisioned_by` set to `environment`, that library's worker is not started. Its
+    nodes stay editable, and running one says the environment does not say which packages its
+    worker needs. The worker is never started without the prefix, because the engine's own
+    environment was not prepared for it.
+- With `engine`, the worker starts without the prefix, as if none were configured.
+
+The worker receives the engine's environment as it was when the engine started, plus a few
+variables the engine sets by name (`GTN_ENGINE_ID`, `GTN_ORCHESTRATOR_ENGINE_ID`,
+`PYTHONUNBUFFERED`, and the static file server address). The engine copies no other variables and
+changes none of your tool's, so your tool decides what the worker's environment contains.
+
+Keep the prefix free of quoted arguments if Windows machines use it: some shells on Windows drop
+double quotes inside arguments.
+
 ## Example launcher
 
 A launcher only needs to set the variables and start the engine inside the prepared environment:
@@ -79,12 +138,15 @@ A launcher only needs to set the variables and start the engine inside the prepa
 ```bash
 #!/bin/sh
 export GTN_LIBRARY_PATHS="/studio/libs/lib_foo/griptape_nodes_library.json:/studio/libs/lib_bar/griptape_nodes_library.json"
+export GTN_LIBRARY_WORKER_REQUESTS="Foo Library=lib_foo==1.4.2:Bar Library=lib_bar==2.0.1"
 export GTN_CONFIG_LIBRARY__PROVISIONED_BY=environment
+export GTN_CONFIG_WORKER__COMMAND_PREFIX='["env-tool", "run", "engine=={engine_version}", "{library_request}", "--"]'
 exec gtn
 ```
 
 Most package managers can set these variables for you: each library's package adds itself to
-`GTN_LIBRARY_PATHS`, and a launch package sets `library.provisioned_by`.
+`GTN_LIBRARY_PATHS` and `GTN_LIBRARY_WORKER_REQUESTS`, and a launch package sets `library.provisioned_by`
+and `worker.command_prefix`.
 
 ## What artists see
 
@@ -93,6 +155,9 @@ Most package managers can set these variables for you: each library's package ad
     environment doesn't provide it. Ask whoever manages your studio's setup to add it.
 - Installing, updating, or switching a library's version from the editor doesn't work; those
     changes come from the studio's environment.
+- If running a node says its worker couldn't start because the environment doesn't say which
+    packages it needs, the environment is missing an entry for that library. Editing the node and
+    saving the workflow still work.
 
 For every setting and its environment variable, see the
 [Configuration Reference](../reference/configuration_reference.md).

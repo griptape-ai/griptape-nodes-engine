@@ -127,7 +127,7 @@ plugins:
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
           - guides/libraries.md: Installing and managing node libraries
-          - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by)
+          - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by, worker command prefix)
         Project system:
           - guides/projects/index.md: Project system overview
           - guides/projects/gui_guide.md: Managing projects from the GUI
