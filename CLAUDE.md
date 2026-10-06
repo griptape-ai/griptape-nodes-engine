@@ -57,7 +57,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Attach structure with `NodeError`, don't inline it** - When a failure has a provider response, a request or generation ID, or a documentation page, raise `NodeError(message, fields=..., response=..., links=...)` from `exe_types/core_types.py` instead of putting `repr(response)` in the message. The engine sends these parts in `NodeErrorEvent.error`. See `docs/development/custom_nodes/error_handling.md`.
 
-**Emit `NodeErrorEvent` with both forms** - A new emit site sets `error_message` to the flattened string, as today, and `error=build_node_error_details(node_name, exc)` from `common/node_errors.py`. Don't build `NodeErrorDetails` by hand: the builder unwraps `NodeExecutionError`, removes `KeyError` quotes and the name prefix, and enforces the size and link limits.
+**Build `NodeErrorDetails` where the node fails** - The details for `NodeErrorEvent.error` are built from the node's own exception, where it still exists, with `build_node_error_details(node_name, exc)` from `retained_mode/events/node_error_details.py`. `NodeManager` does this and puts them on `ExecuteNodeResultFailure.error`, which crosses the worker boundary like any other dataclass field, and `NodeExecutor` raises them on `ExecuteNodeFailedError.details`. A new emit site sets `error_message` to the flattened string, as today, and reads `error` from `ExecuteNodeFailedError.details`, building from the exception only for engine failures that never became a result. Don't build `NodeErrorDetails` by hand: the builder removes `KeyError` quotes and the name prefix and enforces the size and link limits.
 
 ## Path Handling
 

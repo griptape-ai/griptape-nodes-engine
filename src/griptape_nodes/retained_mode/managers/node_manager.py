@@ -109,6 +109,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
     AddNodesToNodeGroupResultFailure,
@@ -3661,6 +3662,7 @@ class NodeManager(EngineScoped):
                         f"{'; '.join(str(exception) for exception in validation_exceptions)}"
                     ),
                     validation_exceptions=validation_exceptions,
+                    error=build_node_error_details(node_name, validation_exceptions),
                 )
 
             try:
@@ -3705,13 +3707,14 @@ class NodeManager(EngineScoped):
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
-            # The engine words the halt, so it is not the node's message.
+            # The engine words the halt, so it carries no node-built details.
             return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
-        # The raised exception itself, so its traceback crosses the worker boundary.
+        # The raised exception itself, so its traceback crosses the worker boundary. The details are
+        # built here, where the real exception and anything it attached still exist.
         return ExecuteNodeResultFailure(
             result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
             exception=exc,
-            exception_from_node=True,
+            error=build_node_error_details(node_name, exc),
         )
 
     def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:

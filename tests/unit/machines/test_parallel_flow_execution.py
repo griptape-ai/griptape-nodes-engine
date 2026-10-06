@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
-from griptape_nodes.common.node_errors import NodeExecutionError
+from griptape_nodes.common.node_executor import ExecuteNodeFailedError
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.control_flow import ControlFlowMachine
@@ -23,6 +23,7 @@ from griptape_nodes.machines.parallel_resolution import (
     ParallelResolutionMachine,
 )
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
@@ -688,9 +689,8 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         flattened = "Node 'n' execution failed: Attempted to execute node 'n'. Failed with error: \"n: Key 'b'\""
 
         async def _boom() -> None:
-            raise NodeExecutionError(
-                flattened, result_details="unused", exception=raised, exception_from_node=True
-            ) from raised
+            details = NodeErrorDetails(message="Key 'b' not found", exception_type="builtins.KeyError")
+            raise ExecuteNodeFailedError(flattened, details=details) from raised
 
         task = asyncio.ensure_future(_boom())
         await asyncio.sleep(0)

@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import anyio
 
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
-from griptape_nodes.common.node_errors import NodeExecutionError
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -83,6 +82,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails, build_engine_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultFailure,
     CreateNodeResultSuccess,
@@ -268,6 +268,19 @@ class LoopBodyNodes(NamedTuple):
     node_group_name: str | None
 
 
+class ExecuteNodeFailedError(RuntimeError):
+    """Raised by ``NodeExecutor`` when an ``ExecuteNodeRequest`` fails.
+
+    The message is the flattened text that ends up in ``NodeErrorEvent.error_message``, and
+    ``details`` is what goes in ``NodeErrorEvent.error``. The node's exception, if any, is chained
+    as ``__cause__``.
+    """
+
+    def __init__(self, message: str, *, details: NodeErrorDetails) -> None:
+        super().__init__(message)
+        self.details = details
+
+
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
@@ -343,19 +356,7 @@ class NodeExecutor(EngineScoped):
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
                 exc = getattr(result, "exception", None)
-                msg = self._format_node_failure_message(node.name, result, exc)
-                validation_exceptions = None
-                exception_from_node = False
-                if isinstance(result, ExecuteNodeResultFailure):
-                    validation_exceptions = result.validation_exceptions
-                    exception_from_node = result.exception_from_node
-                raise NodeExecutionError(
-                    msg,
-                    result_details=str(getattr(result, "result_details", result)),
-                    exception=exc,
-                    exception_from_node=exception_from_node,
-                    validation_exceptions=validation_exceptions,
-                ) from exc
+                raise self._execute_node_failed_error(node.name, result, exc) from exc
             # Copy outputs back onto the in-memory node. Write directly into
             # parameter_output_values (not through set_parameter_value, which
             # targets parameter_values and re-fires before/after_value_set and
@@ -373,6 +374,17 @@ class NodeExecutor(EngineScoped):
             # A connection torn down while this node was running left its input value in place so the
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
+
+    def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
+        message = self._format_node_failure_message(node_name, result, exc)
+        details = None
+        if isinstance(result, ExecuteNodeResultFailure):
+            details = result.error
+        if details is None:
+            # No node-built details means the engine wrote result_details, so its words are kept.
+            result_details = str(getattr(result, "result_details", result))
+            details = build_engine_error_details(node_name, result_details, exc)
+        return ExecuteNodeFailedError(message, details=details)
 
     def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.

@@ -1,8 +1,6 @@
 """The exception a node raises to send its failure to the editor in parts.
 
 Node libraries import ``NodeError`` and ``NodeErrorLink`` from ``griptape_nodes.exe_types.core_types``.
-This module imports only the standard library: ``event_converter`` imports it to serialize a
-``NodeError`` across the worker boundary, and ``base_events`` imports ``event_converter``.
 """
 
 from __future__ import annotations
