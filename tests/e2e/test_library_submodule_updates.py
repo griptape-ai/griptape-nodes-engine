@@ -166,7 +166,7 @@ def test_library_with_submodule_stays_clean_across_download_and_updates(tmp_path
     download = asyncio.run(
         engine.ahandle_request(
             DownloadLibraryRequest(
-                git_url=str(origin), branch_tag_commit=ref, download_directory=str(tmp_path / "libraries")
+                git_url=origin.as_posix(), branch_tag_commit=ref, download_directory=str(tmp_path / "libraries")
             )
         )
     )
