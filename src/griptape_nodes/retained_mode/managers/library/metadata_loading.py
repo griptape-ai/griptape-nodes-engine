@@ -233,6 +233,7 @@ class LibraryMetadataLoading(EngineScoped):
 
         # Discover library files for metadata loading
         library_files = await self.engine.library_manager.discovery.discover_library_files()
+        environment_mode = self.engine.library_manager.managed_environment.provisioned_by_environment()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
@@ -245,12 +246,20 @@ class LibraryMetadataLoading(EngineScoped):
                 # can map this metadata back to the matching `libraries_to_register` row
                 # without re-implementing the engine's path resolution logic.
                 metadata_result.registered_path = discovered.registered_path
+                # is_registered is answered by library name, so a configured copy the environment
+                # refused would read as loaded whenever the environment provides a library of the
+                # same name. Only the environment's own entry can be the one that loaded.
+                if environment_mode and not discovered.from_environment:
+                    metadata_result.is_registered = False
                 successful_libraries.append(metadata_result)
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
 
-        # Generate sandbox library metadata if configured
-        sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
+        # Generate sandbox library metadata if configured. Not when the environment provides the
+        # libraries: the sandbox never loads then, and scanning it writes its manifest.
+        sandbox_library_dir = None
+        if not environment_mode:
+            sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
         if sandbox_library_dir:
             # Try to load existing JSON first - only scan if load fails
             sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME

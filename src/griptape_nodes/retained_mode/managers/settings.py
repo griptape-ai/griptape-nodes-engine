@@ -29,6 +29,7 @@ DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+LIBRARY_PROVISIONED_BY_KEY = "library.provisioned_by"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 LOG_TO_FILE_KEY = "logging.log_to_file"
@@ -36,9 +37,10 @@ LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
 SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
-# are always strings, so under this flag beta feature entries are converted to booleans, and one
-# that can't be converted fails validation so the variable is reported as a bad value.
-BETA_FEATURES_FROM_ENV_CONTEXT = "beta_features_from_env"
+# are always strings, so validators that need a typed value convert under this flag, and a value
+# that can't be converted fails validation so the variable is reported as a bad value instead of
+# silently becoming a default. Beta feature entries and `library.provisioned_by` read it.
+FROM_ENV_CONTEXT = "from_env"
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -96,7 +98,7 @@ def _env_value_to_bool(config_key: str, value: Any) -> bool:
 
 
 def _warn_once(report_key: tuple[str, str], message: str) -> None:
-    """Log a beta feature warning the first time this (config key, value) pair is seen."""
+    """Log a settings warning the first time this (config key, value) pair is seen."""
     if report_key in _reported_invalid_beta_features:
         return
 
@@ -374,7 +376,25 @@ class LibraryDependencyInstallBehavior(StrEnum):
     NEVER = "never"
 
 
+class LibraryProvisioner(StrEnum):
+    ENGINE = "engine"
+    ENVIRONMENT = "environment"
+
+
 class LibrarySettings(BaseModel):
+    provisioned_by: LibraryProvisioner = Field(
+        default=LibraryProvisioner.ENGINE,
+        description=(
+            "What provides libraries and their Python dependencies. 'engine' (the default) has the engine "
+            "download libraries, build a virtual environment for each one, and install its dependencies. "
+            "'environment' is for an engine started inside an environment another tool has already "
+            "prepared: the engine loads only the libraries listed in the GTN_LIBRARY_PATHS environment "
+            "variable, never builds virtual environments, never downloads, updates, or installs "
+            "libraries, and marks every other configured library (libraries_to_register entries and the "
+            "sandbox library) as not provided by the environment. A library dependency is then "
+            "satisfied only by a library the environment provides."
+        ),
+    )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
         default=LibraryDependencyInstallBehavior.ALWAYS,
         description=(
@@ -411,6 +431,35 @@ class LibrarySettings(BaseModel):
             "time."
         ),
     )
+
+    @field_validator("provisioned_by", mode="before")
+    @classmethod
+    def validate_provisioned_by(cls, v: Any, info: ValidationInfo) -> LibraryProvisioner:
+        """Accept any letter case, and keep an unknown value from resetting the whole config.
+
+        A GTN_CONFIG_LIBRARY__PROVISIONED_BY variable is validated under
+        `FROM_ENV_CONTEXT`, where an unknown value raises so the env loader reports the
+        variable and ignores it: silently turning a misspelled 'environment' into 'engine' would have the
+        engine download and build what the environment was meant to provide. From a config file the
+        value falls back to 'engine' with a warning, like the other settings in this model.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if isinstance(v, LibraryProvisioner):
+            return v
+        if isinstance(v, str):
+            try:
+                return LibraryProvisioner(v.strip().lower())
+            except ValueError:
+                pass
+        allowed = ", ".join(f"'{source.value}'" for source in LibraryProvisioner)
+        if from_env:
+            msg = f"{LIBRARY_PROVISIONED_BY_KEY} must be one of {allowed}, got {v!r}"
+            raise ValueError(msg)
+        _warn_once(
+            (LIBRARY_PROVISIONED_BY_KEY, repr(v)),
+            f"Ignoring {LIBRARY_PROVISIONED_BY_KEY}: expected one of {allowed}, got {v!r}. Using 'engine'.",
+        )
+        return LibraryProvisioner.ENGINE
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod
@@ -657,17 +706,17 @@ class Settings(BaseModel):
         because the merged config keeps raw values and readers would treat it as unset anyway.
 
         A `GTN_CONFIG_BETA_FEATURES__<ID>` variable is the exception. It is validated under
-        `BETA_FEATURES_FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
+        `FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
         it can't, so the env loader reports the variable as having an invalid value.
         """
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         return _validate_beta_feature_map(BETA_FEATURES_KEY, v, from_env=from_env)
 
     @field_validator("library_beta_features", mode="before")
     @classmethod
     def validate_library_beta_features(cls, v: Any, info: ValidationInfo) -> dict[str, dict[str, bool]]:
         """Apply the `beta_features` rules to each library's map, one library at a time."""
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         if not isinstance(v, dict) and from_env:
             msg = f"{LIBRARY_BETA_FEATURES_KEY} must be a map of library names to feature maps, got {v!r}"
             raise ValueError(msg)

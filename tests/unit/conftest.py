@@ -18,6 +18,7 @@ for _engine_dir_env_var in ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN
 from griptape_nodes.common import log_capture  # noqa: E402
 from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine  # noqa: E402
 from griptape_nodes.retained_mode.managers import settings as settings_module  # noqa: E402
+from griptape_nodes.retained_mode.managers.external_environment import LIBRARY_PATHS_ENV_VAR  # noqa: E402
 from griptape_nodes.utils import engine_dirs  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
@@ -100,6 +101,32 @@ def isolate_user_config() -> Generator[Path, None, None]:
 
             # Drop it again so the next test doesn't inherit this one's object graph.
             reset_root_engine()
+
+
+_EXTERNAL_ENVIRONMENT_VARS = (
+    LIBRARY_PATHS_ENV_VAR,
+    "GTN_CONFIG_LIBRARY__PROVISIONED_BY",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_external_environment() -> Generator[None, None, None]:
+    """Clear the variables an externally managed environment sets for the engine.
+
+    Library discovery reads them, so a suite run from inside such an environment (a studio launcher,
+    a package manager's shell) would otherwise load that environment's libraries. Tests that
+    exercise these hooks set the variables themselves.
+
+    This saves and restores the variables itself instead of using `monkeypatch`: an autouse fixture
+    that requests `monkeypatch` creates it before the test's own fixtures, so it is torn down after
+    them. A test that combines `monkeypatch.chdir` with a temporary-directory fixture would then
+    still be inside that directory when it is removed, which Windows refuses.
+    """
+    saved = {name: os.environ.pop(name) for name in _EXTERNAL_ENVIRONMENT_VARS if name in os.environ}
+    yield
+    for name in _EXTERNAL_ENVIRONMENT_VARS:
+        os.environ.pop(name, None)
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)

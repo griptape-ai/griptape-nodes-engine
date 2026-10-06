@@ -106,6 +106,10 @@ class LibraryEnvironment(EngineScoped):
         Returns None when the directory does not exist. A failed build leaves it behind, so
         callers must consult `execution_env_failure_reason` before treating a path as usable.
         """
+        # The environment provides the worker's packages; a .venv-exec left from an earlier run
+        # when the engine provisioned libraries must not front them.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            return None
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None:
             return None
@@ -383,6 +387,10 @@ class LibraryEnvironment(EngineScoped):
         execution directory is not on the path, so its edit-time venv is still spliced.
         """
         if self._execution_env_is_already_on_sys_path(library_name):
+            return
+
+        # The environment already put every package on the path before the engine started.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
             return
 
         venv_path = self.get_library_venv_path(library_name, library_file_path, execution=False)

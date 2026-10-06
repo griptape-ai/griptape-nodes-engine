@@ -174,7 +174,7 @@ class LibrarySandbox(EngineScoped):
         )
 
     @handles(RegisterSandboxNodeFromSourceRequest)
-    def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911
+    def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911, PLR0912
         self, request: RegisterSandboxNodeFromSourceRequest
     ) -> ResultPayload:
         """Register node types from a `.py` file in the sandbox dir.
@@ -197,6 +197,15 @@ class LibrarySandbox(EngineScoped):
         discovers files that exist on disk but are absent from the manifest, and the loader
         resolves their class names and writes the manifest back for us.
         """
+        # The environment decides every node type that exists, so none is added from a loose file.
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return RegisterSandboxNodeFromSourceResultFailure(
+                result_details=managed.environment_provides_libraries_message(
+                    f"add the sandbox node in '{request.file_path}'"
+                )
+            )
+
         # Resolve and validate the sandbox directory. Agents cannot register nodes on a
         # system that has not opted in to a sandbox.
         sandbox_dir = self.get_sandbox_directory()

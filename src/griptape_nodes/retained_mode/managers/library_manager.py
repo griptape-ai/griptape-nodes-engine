@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.managers.library.discovery import (
 )
 from griptape_nodes.retained_mode.managers.library.environment import LibraryEnvironment
 from griptape_nodes.retained_mode.managers.library.git_operations import LibraryGitOperations
+from griptape_nodes.retained_mode.managers.library.managed_environment import LibraryManagedEnvironment
 from griptape_nodes.retained_mode.managers.library.metadata_loading import LibraryMetadataLoading
 from griptape_nodes.retained_mode.managers.library.module_loading import STABLE_NAMESPACE_PREFIX, LibraryModuleLoading
 from griptape_nodes.retained_mode.managers.library.provisioning import LibraryProvisioning
@@ -156,6 +157,7 @@ class LibraryManager(EngineScoped):
         self.git_operations = LibraryGitOperations(event_manager, engine=engine)
         self.sync = LibrarySync(event_manager, engine=engine)
         self.discovery = LibraryDiscovery(event_manager, engine=engine)
+        self.managed_environment = LibraryManagedEnvironment(engine)
         event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
@@ -218,6 +220,11 @@ class LibraryManager(EngineScoped):
         matches = [info for info in self._library_file_path_to_info.values() if info.library_name == library_name]
         if not matches:
             return None
+        # A configured copy the environment does not provide is never the one to act on while the
+        # environment's own copy of the same library is known.
+        provided = [info for info in matches if not self.managed_environment.is_not_provided_by_environment(info)]
+        if provided:
+            matches = provided
         for library_info in matches:
             if library_info.lifecycle_state == LibraryLifecycleState.LOADED:
                 return library_info
@@ -316,9 +323,12 @@ class LibraryManager(EngineScoped):
 
                 await self._load_and_track_library(lib_path, current_library_index, total_libraries)
 
-            # Remove any missing libraries AFTER we've loaded them for the user.
-            user_libraries_section = LIBRARIES_TO_REGISTER_KEY
-            self.discovery.remove_missing_libraries_from_config(config_category=user_libraries_section)
+            # Remove any missing libraries AFTER we've loaded them for the user. Not when the
+            # environment provides the libraries: the config's entries were not what loaded, and a
+            # studio launch must leave the artist's own settings as it found them.
+            if not self.managed_environment.provisioned_by_environment():
+                user_libraries_section = LIBRARIES_TO_REGISTER_KEY
+                self.discovery.remove_missing_libraries_from_config(config_category=user_libraries_section)
 
             return reconcile_failures
         finally:

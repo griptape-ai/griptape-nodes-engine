@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultFailure,
     UnloadLibraryFromRegistryResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.external_environment import LIBRARY_PATHS_ENV_VAR
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     BetaFeatureSettingsCollisionProblem,
@@ -129,6 +130,21 @@ class LibraryRegistrar(EngineScoped):
         library_info = prereq_result.library_info
         file_path = prereq_result.file_path
 
+        # Checked here rather than only at discovery, so a library registered by path from the
+        # editor or a script is held to the same rule as one found at startup.
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment() and not await managed.is_provided_by_environment(
+            library_info.library_path
+        ):
+            managed.mark_not_provided_by_environment(library_info)
+            self.engine.library_manager._library_file_path_to_info[library_info.library_path] = library_info
+            details = (
+                f"Attempted to load the library at '{library_info.library_path}'. Failed because the engine is "
+                f"running in an environment that provides its libraries, and this library is not listed in "
+                f"{LIBRARY_PATHS_ENV_VAR}."
+            )
+            return RegisterLibraryFromFileResultFailure(result_details=details)
+
         # Phase 2: Progress through lifecycle phases
         progression_result = await self._progress_library_through_lifecycle(
             library_info=library_info, file_path=file_path, request=request
@@ -177,9 +193,16 @@ class LibraryRegistrar(EngineScoped):
                 return RegisterLibraryFromFileResultFailure(result_details=details)
 
     @handles(RegisterLibraryFromRequirementSpecifierRequest)
-    async def register_library_from_requirement_specifier_request(
+    async def register_library_from_requirement_specifier_request(  # noqa: PLR0911 (each failure returns its own result)
         self, request: RegisterLibraryFromRequirementSpecifierRequest
     ) -> ResultPayload:
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return RegisterLibraryFromRequirementSpecifierResultFailure(
+                result_details=managed.environment_provides_libraries_message(
+                    f"install library '{request.requirement_specifier}'"
+                )
+            )
         try:
             package_name = Requirement(request.requirement_specifier).name
             # Determine venv path for dependency installation
@@ -582,11 +605,23 @@ class LibraryRegistrar(EngineScoped):
                                 default=LibraryDependencyInstallBehavior.ALWAYS,
                                 cast_type=str,
                             )
+                            managed = self.engine.library_manager.managed_environment
+                            environment_mode = managed.provisioned_by_environment()
                             for dep in griptape_library_deps:
                                 parsed_dep = parse_dependency_url(dep.url)
                                 repo_name = parsed_dep.repo_name
+                                # In environment mode only a library the environment provides can
+                                # satisfy it; a configured copy (even a disabled one) never loads.
                                 already_registered = any(
-                                    (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
+                                    (
+                                        info.library_name == repo_name
+                                        or managed.library_path_names_repo(
+                                            info.library_path, repo_name, environment_mode=environment_mode
+                                        )
+                                    )
+                                    and (
+                                        not environment_mode or managed.is_known_environment_library(info.library_path)
+                                    )
                                     and info.lifecycle_state != LibraryLifecycleState.FAILURE
                                     and info.fitness
                                     not in (
@@ -598,6 +633,27 @@ class LibraryRegistrar(EngineScoped):
                                 if already_registered:
                                     logger.debug(
                                         "Library dependency '%s' is already registered, skipping download",
+                                        dep.url,
+                                    )
+                                    continue
+                                # Only a library the environment provides can satisfy a dependency
+                                # then; a download would be a library nobody put in the environment.
+                                if environment_mode:
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message=(
+                                                    "The environment this engine runs in does not provide it, and "
+                                                    "libraries are not downloaded in that case. Ask whoever set up "
+                                                    "this environment to add it."
+                                                ),
+                                            )
+                                        )
+                                        library_info.fitness = LibraryFitness.FLAWED
+                                    logger.info(
+                                        "Library '%s' depends on '%s', which the environment does not provide.",
+                                        library_info.library_name,
                                         dep.url,
                                     )
                                     continue
