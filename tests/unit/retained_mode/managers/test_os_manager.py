@@ -1985,6 +1985,76 @@ class TestDiskSpaceProbe:
         assert "Could not determine disk space" not in message
 
 
+class TestGetDirectorySizeGb:
+    """_get_directory_size_gb totals every file in the directory tree."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_nested_tree_totals_every_level(self, temp_dir: Path) -> None:
+        """Files at the root and in subdirectories all count toward the total."""
+        # Distinct sizes per level, so a dropped level changes the total rather
+        # than cancelling out against another file's bytes.
+        (temp_dir / "root.bin").write_bytes(b"x" * 100)
+        nested = temp_dir / "sub"
+        nested.mkdir()
+        (nested / "nested.bin").write_bytes(b"x" * 2000)
+        deeper = nested / "deeper"
+        deeper.mkdir()
+        (deeper / "deeper.bin").write_bytes(b"x" * 30000)
+
+        size_gb = OSManager._get_directory_size_gb(temp_dir)
+
+        # Byte sums over a power-of-two divisor are exact in float64, so this
+        # compares equal without an approx tolerance.
+        assert size_gb == (100 + 2000 + 30000) / (1024**3)
+
+    def test_same_filename_at_two_levels_counts_both(self, temp_dir: Path) -> None:
+        """A nested file sharing a root file's name is counted as itself, not the root file."""
+        (temp_dir / "same.bin").write_bytes(b"x" * 100)
+        nested = temp_dir / "sub"
+        nested.mkdir()
+        (nested / "same.bin").write_bytes(b"x" * 5000)
+
+        size_gb = OSManager._get_directory_size_gb(temp_dir)
+
+        # Double-counting the root file would yield 200 bytes, not 5100.
+        assert size_gb == (100 + 5000) / (1024**3)
+
+    def test_flat_directory_totals_its_files(self, temp_dir: Path) -> None:
+        """Files in a flat directory are totalled."""
+        (temp_dir / "a.bin").write_bytes(b"x" * 1000)
+        (temp_dir / "b.bin").write_bytes(b"x" * 2000)
+
+        size_gb = OSManager._get_directory_size_gb(temp_dir)
+
+        assert size_gb == 3000 / (1024**3)
+
+    def test_empty_directory_is_zero(self, temp_dir: Path) -> None:
+        """An existing but empty directory totals nothing."""
+        assert OSManager._get_directory_size_gb(temp_dir) == 0.0
+
+    def test_missing_directory_is_zero(self, temp_dir: Path) -> None:
+        """A path that does not exist returns 0.0 rather than raising."""
+        assert OSManager._get_directory_size_gb(temp_dir / "not_here") == 0.0
+
+    @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
+    def test_symlinked_files_are_excluded(self, temp_dir: Path) -> None:
+        """Symlinks are skipped so their target's bytes are not counted twice."""
+        real = temp_dir / "real.bin"
+        real.write_bytes(b"x" * 4096)
+        nested = temp_dir / "sub"
+        nested.mkdir()
+        (nested / "link.bin").symlink_to(real)
+
+        size_gb = OSManager._get_directory_size_gb(temp_dir)
+
+        # Only the real file counts; the symlink in the subdirectory does not.
+        assert size_gb == 4096 / (1024**3)
+
+
 class TestGetNextUnusedFilenameRequest:
     """Test GetNextUnusedFilenameRequest preview behavior."""
 
