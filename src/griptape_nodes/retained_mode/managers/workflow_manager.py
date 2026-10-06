@@ -266,6 +266,13 @@ _load_problem_frames: contextvars.ContextVar[tuple[list[WorkflowProblem], ...]] 
     "workflow_load_problem_frames", default=()
 )
 
+# WorkflowManager.ReferencedWorkflowContext writes this; FlowManager reads the top to tag each flow
+# it creates with the workflow being imported. Scoped to the current context so concurrent imports
+# (Workflow nodes running in PARALLEL mode) tag their flows with their own workflow, not a sibling's.
+_referenced_workflow_stack: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "referenced_workflow_stack", default=()
+)
+
 
 class WorkflowRegistrationResult(NamedTuple):
     """Result of processing workflows for registration."""
@@ -379,9 +386,10 @@ class WorkflowManager(EngineScoped):
         def __init__(self, manager: WorkflowManager, workflow_name: str):
             self.manager = manager
             self.workflow_name = workflow_name
+            self._tokens: list[contextvars.Token[tuple[str, ...]]] = []
 
         def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            self.manager._referenced_workflow_stack.append(self.workflow_name)
+            self._tokens.append(_referenced_workflow_stack.set((*_referenced_workflow_stack.get(), self.workflow_name)))
             return self
 
         def __exit__(
@@ -390,9 +398,8 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._referenced_workflow_stack.pop()
-
-    _referenced_workflow_stack: list[str] = field(default_factory=list)
+            if self._tokens:
+                _referenced_workflow_stack.reset(self._tokens.pop())
 
     class LoadProblemFrame:
         """Collects one workflow load's problems, bubbling them into the enclosing load on exit.
@@ -503,7 +510,6 @@ class WorkflowManager(EngineScoped):
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
         self._squelch_workflow_altered_count = 0
-        self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -521,7 +527,7 @@ class WorkflowManager(EngineScoped):
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
-        return len(self._referenced_workflow_stack) > 0
+        return len(_referenced_workflow_stack.get()) > 0
 
     def get_current_referenced_workflow(self) -> str:
         """Get the current workflow source path from the context stack.
@@ -529,7 +535,7 @@ class WorkflowManager(EngineScoped):
         Raises:
             IndexError: If no referenced workflow context is active.
         """
-        return self._referenced_workflow_stack[-1]
+        return _referenced_workflow_stack.get()[-1]
 
     def _drop_substitution_flag(self, workflow_key: str) -> None:
         """Remove the substitution flag when a workflow is permanently deleted."""
@@ -6094,7 +6100,52 @@ class WorkflowManager(EngineScoped):
                 details = f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. Failed because target flow does not exist"
                 return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
+        # A workflow that ends up importing itself, directly or through other workflows, would
+        # re-run its own file forever. The saved references catch that before anything is
+        # created; the flow ancestry catches it when those references are missing or stale.
+        if flow_name is None:
+            flow_name = self.engine.context_manager.get_current_flow().name
+        if self._references_itself(request.workflow_name) or self._is_flow_inside_import_of(
+            flow_name, request.workflow_name
+        ):
+            details = (
+                f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. "
+                f"Failed because '{request.workflow_name}' contains itself: a Workflow node inside it "
+                "points back to it, directly or through another workflow. Change that Workflow node to a "
+                "different workflow."
+            )
+            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+
         return None
+
+    def _references_itself(self, workflow_name: str) -> bool:
+        """Whether `workflow_name` reaches itself through the workflows its metadata references."""
+        to_visit = [workflow_name]
+        visited: set[str] = set()
+        while to_visit:
+            current = to_visit.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            if not self.engine.workflow_registry.has_workflow_with_name(current):
+                continue
+            for referenced in self._get_workflow_by_name(current).metadata.workflows_referenced or []:
+                if referenced == workflow_name:
+                    return True
+                to_visit.append(referenced)
+        return False
+
+    def _is_flow_inside_import_of(self, flow_name: str, workflow_name: str) -> bool:
+        """Whether `flow_name`, or any flow above it, was created by importing `workflow_name`."""
+        flow_manager = self.engine.flow_manager
+        object_manager = self.engine.object_manager
+        current: str | None = flow_name
+        while current is not None:
+            flow = object_manager.attempt_get_object_by_name_as_type(current, ControlFlow)
+            if flow is not None and flow_manager.get_referenced_workflow_name(flow) == workflow_name:
+                return True
+            current = flow_manager.get_parent_flow(current)
+        return False
 
     def _get_workflow_by_name(self, workflow_name: str) -> Workflow:
         """Get workflow by name from the registry."""
