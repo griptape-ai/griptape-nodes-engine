@@ -436,6 +436,14 @@ class TestPrintedResponse:
         assert details.message == "Generation failed.\nThe provider said for prompt 'cat'"
         assert details.response == {"status": "ERRORED"}
 
+    def test_a_sentence_ending_in_response_is_kept(self) -> None:
+        exc = RuntimeError("Generation failed.\nThe provider returned an unexpected response:\n{'status': 'x'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Generation failed.\nThe provider returned an unexpected response"
+        assert details.response == {"status": "x"}
+
     def test_a_message_that_is_only_a_label_keeps_the_label(self) -> None:
         details = build_node_error_details(NODE_NAME, RuntimeError("Full API response: {'status': 'ERRORED'}"))
 

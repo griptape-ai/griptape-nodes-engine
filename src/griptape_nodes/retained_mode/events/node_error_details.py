@@ -30,8 +30,19 @@ RESPONSE_DROPPED_FIELD = "response_dropped"
 MAX_PRINTED_RESPONSE_MESSAGE_CHARS = 2 * MAX_RESPONSE_BYTES
 # How many "{" in a message are tried as the start of a printed response before giving up.
 MAX_PRINTED_RESPONSE_STARTS = 8
-# A line ending like this introduces a printed response, as in "Full API response:" or "Error details:".
-RESPONSE_LABEL_ENDINGS = ("response:", "details:")
+# A last line that is exactly one of these, ignoring case, introduces a printed response. Any other
+# line before the response is part of the message, even one ending in "response:".
+RESPONSE_LABELS = frozenset(
+    {
+        "response:",
+        "api response:",
+        "full response:",
+        "full api response:",
+        "details:",
+        "error details:",
+        "response details:",
+    }
+)
 
 
 @dataclass
@@ -221,7 +232,7 @@ def _literal_dict(text: str) -> dict[str, Any] | None:
 def _strip_response_label(text: str) -> str:
     """Remove what introduced the response: a label line like "Full API response:", or ": " or " - "."""
     head, newline, last_line = text.rstrip().rpartition("\n")
-    if newline and last_line.lower().endswith(RESPONSE_LABEL_ENDINGS):
+    if newline and last_line.strip().lower() in RESPONSE_LABELS:
         text = head
     return text.rstrip().rstrip(":-").rstrip()
 
