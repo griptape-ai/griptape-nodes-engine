@@ -1016,6 +1016,32 @@ def resolve_file_path(path_str: str, base_dir: Path) -> Path:
     return resolve_path_safely(base_dir / path_str)
 
 
+def is_absolute_path_from_other_platform(path_str: str) -> bool:
+    r"""Return True if a path is absolute on the other OS family but not on this host.
+
+    A client on another OS sends its own absolute paths: `/Volumes/share/blur.py` from
+    macOS reaches a Windows engine with no drive, and `\\host\share\blur.py` or
+    `C:\share\blur.py` reaches a POSIX engine as a relative filename. Either way,
+    joining it onto the workspace yields a path that names nothing.
+
+    A path both families read as absolute (`//host/share` is UNC on Windows and a root
+    path on POSIX) is native here, not foreign. `/C:/share/blur.py` on Windows is not
+    foreign either: it is the path part of a `file:///C:/...` URL, a Windows path in URL
+    form, which this check does not resolve.
+
+    Args:
+        path_str: The path string as received.
+
+    Returns:
+        True if the path is only absolute on a different OS family.
+    """
+    if is_windows():
+        if re.match(r"^/[A-Za-z]:", path_str):
+            return False
+        return PurePosixPath(path_str).is_absolute() and not PureWindowsPath(path_str).is_absolute()
+    return PureWindowsPath(path_str).is_absolute() and not PurePosixPath(path_str).is_absolute()
+
+
 def resolve_workspace_path(path: Path, base_directory: Path) -> Path:
     """Resolve a path, treating relative paths as relative to a base directory.
 

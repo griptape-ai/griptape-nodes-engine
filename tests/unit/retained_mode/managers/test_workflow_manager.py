@@ -283,6 +283,39 @@ class TestWorkflowManager:
             assert isinstance(result.result_details, ResultDetails)
             assert result.result_details.result_details[0].message == "Registration failed"
 
+    @pytest.mark.parametrize(
+        ("host_is_windows", "file_path"),
+        [
+            (True, "/Volumes/share/blur.py"),
+            (False, r"\\host\share\blur.py"),
+            (False, r"C:\share\blur.py"),
+        ],
+    )
+    def test_path_from_other_platform_is_rejected(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, host_is_windows: bool, file_path: str
+    ) -> None:
+        """A foreign absolute path fails both requests instead of being joined onto the workspace."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: host_is_windows)
+        workflow_manager = engine.workflow_manager
+
+        with patch.object(workflow_manager, "on_register_workflow_request") as mock_register:
+            metadata_result = asyncio.run(
+                workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_path))
+            )
+            import_result = asyncio.run(
+                workflow_manager.on_import_workflow_request(ImportWorkflowRequest(file_path=file_path))
+            )
+
+        assert isinstance(metadata_result, LoadWorkflowMetadataResultFailure)
+        assert isinstance(import_result, ImportWorkflowResultFailure)
+        for result in (metadata_result, import_result):
+            assert isinstance(result.result_details, ResultDetails)
+            message = result.result_details.result_details[0].message
+            assert file_path in message
+            assert "different operating system" in message
+            assert f"workspace folder '{engine.config_manager.workspace_path}'" in message
+        mock_register.assert_not_called()
+
     def test_get_workflow_metadata_success(self, engine: Engine) -> None:
         """Ensure GetWorkflowMetadataRequest returns workflow.metadata directly."""
         workflow_manager = engine.workflow_manager
