@@ -2,47 +2,53 @@
 
 ## What is it?
 
-The StartFlow is a special building block that marks the beginning of your workflow. Think of it as the "Go" sign that tells the system where to start running your flow.
+The Start Flow node marks the beginning of your workflow and defines its **inputs**. Every parameter you add to it becomes an input of the workflow: a value the caller supplies when the workflow runs from the terminal, as a node in another workflow, or after it's published.
 
 ## When would I use it?
 
 Use this node when you want to:
 
-- Create a clear starting point for your workflow
-- Begin a sequence of connected nodes
-- Define the entry point for your flow
+- Mark where your workflow starts
+- Give your workflow inputs that a caller fills in
+- Make the workflow callable: running it from the terminal with inputs, using it as a node, or publishing it all need a Start Flow and an [End Flow](end_flow.md)
 
 ## How to use it
 
 ### Basic Setup
 
-1. Add the StartFlow to your workflow
-1. Connect it to the first action node in your flow
+1. Add the Start Flow node to your workflow
+1. Connect **Flow Out** to the first node in your flow
+1. Add a parameter for each value the workflow should take as input (**Add Parameter** in the node's menu or the Properties panel), and connect each one to the nodes that use it
+1. Save the workflow. The inputs are recorded in the workflow file when you save
 
 ### Parameters
 
+- **Your own parameters** - each one becomes a workflow input with the same name. The value you set on the parameter in the editor becomes the input's default
+
 ### Outputs
 
-- **exec_out** - use this pin to pass control to the next node in the flow
+- **exec_out** (Flow Out) - passes control to the next node in the flow
+- **Your own parameters** - pass the input values to the nodes they're connected to
 
 ## Example
 
-Imagine you're creating a workflow that generates and saves text:
+Imagine a workflow that writes text about a topic you choose:
 
-1. Create a StartFlow node
-1. Connect the top, white "exec chain" pins to an Agent that will generate text
-1. Connect that to a SaveText to save the generated text
-1. Connect that to an EndFlowNode to complete the flow
+1. Create a Start Flow node and add a text parameter named `topic`
+1. Connect **Flow Out** and `topic` to an Agent that writes about the topic
+1. Connect the Agent's output to an [End Flow](end_flow.md) parameter named `text`
+1. Save the workflow
 
-The StartFlow tells the system "start here and follow the exec chain in order."
+Running it from the terminal now takes `--topic` and returns `text`. **Publish Workflow → Run Workflow from the terminal** in the editor header shows the exact command.
 
 ## Important Notes
 
-- Every workflow needs exactly one StartFlow
-- The StartFlow doesn't take any inputs - it's just a starting point
-- You can only have one StartFlow per contiguous workflow
+- A workflow can run in the editor without a Start Flow. You need one, plus an [End Flow](end_flow.md), for the workflow to have inputs and outputs
+- A workflow can have more than one Start Flow; all their parameters become inputs
+- Control parameters such as **Flow Out** don't become inputs
+- Library authors can ship a workflow as a node whose inputs are its Start Flow parameters; see [Nodes From Workflow Files](../../development/custom_nodes/authoring_libraries.md#nodes-from-workflow-files)
 
 ## Common Issues
 
-- **Flow Doesn't Run**: Make sure your StartFlow is properly connected to the next node
-- **Multiple Start Points**: Ensure you only have one StartFlow in your workflow
+- **Flow Doesn't Run**: Make sure **Flow Out** is connected to the next node
+- **An input is missing**: Save the workflow after adding the parameter; inputs are read from the saved file
