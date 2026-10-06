@@ -311,6 +311,65 @@ class TestSubflowNodeGroupProxyLifecycle:
         assert delete_connection.call_count == _UNMAP_DELETED_EDGE_COUNT
 
     @pytest.mark.parametrize("is_incoming", [True, False])
+    def test_unmap_does_not_delete_a_wall_edge_replaced_by_direct_connection(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, is_incoming: bool
+    ) -> None:
+        group = _MiniSubflowGroup(name="replaced_wall_group")
+        node = BaseNode(name="inside")
+        node.parent_group = group
+        endpoint = BaseNode(name="endpoint")
+        proxy = Parameter(name="proxy", tooltip="")
+        endpoint_parameter = Parameter(name="endpoint_param", tooltip="")
+        internal_parameter = Parameter(name="internal_in" if is_incoming else "internal_out", tooltip="")
+        internal_connection = (
+            Connection(group, proxy, node, internal_parameter)
+            if is_incoming
+            else Connection(node, internal_parameter, group, proxy)
+        )
+        wall_connection = (
+            Connection(endpoint, endpoint_parameter, group, proxy)
+            if is_incoming
+            else Connection(group, proxy, endpoint, endpoint_parameter)
+        )
+        direct_connection = (
+            Connection(endpoint, endpoint_parameter, node, internal_parameter)
+            if is_incoming
+            else Connection(node, internal_parameter, endpoint, endpoint_parameter)
+        )
+        connections = MagicMock()
+        connections.get_outgoing_connections_to_node.return_value = (
+            {} if is_incoming else {"internal_out": [internal_connection]}
+        )
+        connections.get_outgoing_connections_from_parameter.return_value = [wall_connection]
+        connections.get_incoming_connections_from_node.return_value = (
+            {"internal_in": [internal_connection]} if is_incoming else {}
+        )
+        connections.get_incoming_connections_to_parameter.return_value = [wall_connection]
+        connections.connections = {1: wall_connection}
+
+        success = MagicMock()
+        success.failed.return_value = False
+        delete_connection = MagicMock(return_value=success)
+
+        def create_direct_connection(*_args: Any, **_kwargs: Any) -> MagicMock:
+            # The flow manager replaces the wall edge when the destination accepts one input.
+            assert node.parent_group is None
+            connections.connections.clear()
+            connections.connections[2] = direct_connection
+            return success
+
+        create_connection = MagicMock(side_effect=create_direct_connection)
+        monkeypatch.setattr(engine.flow_manager, "on_delete_connection_request", delete_connection)
+        monkeypatch.setattr(engine.flow_manager, "on_create_connection_request", create_connection)
+
+        group.unmap_node_connections(node, connections)
+
+        assert create_connection.call_count == 1
+        delete_connection.assert_called_once()
+        assert connections.connections == {2: direct_connection}
+        assert node.parent_group is group
+
+    @pytest.mark.parametrize("is_incoming", [True, False])
     def test_unmap_reports_a_failed_direct_connection_and_restores_parent_group(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, is_incoming: bool
     ) -> None:
