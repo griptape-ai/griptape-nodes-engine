@@ -21,6 +21,7 @@ from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
+    ParameterList,
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
