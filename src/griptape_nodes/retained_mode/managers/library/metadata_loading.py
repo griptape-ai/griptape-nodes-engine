@@ -255,10 +255,10 @@ class LibraryMetadataLoading(EngineScoped):
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
 
-        # Generate sandbox library metadata if configured. Not when the environment provides the
-        # libraries: the sandbox never loads then, and scanning it writes its manifest.
+        # Generate sandbox library metadata if configured. Not when the sandbox is turned off: it
+        # never loads then, and scanning it writes its manifest.
         sandbox_library_dir = None
-        if not environment_mode:
+        if self.engine.library_manager.managed_environment.sandbox_enabled():
             sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
         if sandbox_library_dir:
             # Try to load existing JSON first - only scan if load fails

@@ -18,7 +18,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileRequest,
     LoadLibraryMetadataFromFileResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.external_environment import provisioned_by_environment
+from griptape_nodes.retained_mode.managers.external_environment import (
+    provisioned_by_environment,
+    sandbox_enabled,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import LibraryNotProvidedByEnvironmentProblem
 from griptape_nodes.retained_mode.managers.library.common import (
     LibraryFitness,
@@ -26,6 +29,7 @@ from griptape_nodes.retained_mode.managers.library.common import (
     LibraryLifecycleState,
 )
 from griptape_nodes.retained_mode.managers.library.sandbox import SANDBOX_LIBRARY_NAME
+from griptape_nodes.retained_mode.managers.settings import LIBRARY_SANDBOX_ENABLED_KEY
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -46,6 +50,35 @@ class LibraryManagedEnvironment(EngineScoped):
     def provisioned_by_environment(self) -> bool:
         """Whether library.provisioned_by is 'environment'."""
         return provisioned_by_environment(self.engine.config_manager)
+
+    def sandbox_enabled(self) -> bool:
+        """Whether the sandbox library loads (library.sandbox_enabled, or the mode's default)."""
+        return sandbox_enabled(self.engine.config_manager)
+
+    def sandbox_off_message(self, attempted: str) -> str:
+        """Why a sandbox action was refused, for the mode the engine runs in."""
+        if (
+            self.provisioned_by_environment()
+            and self.engine.config_manager.get_config_value(LIBRARY_SANDBOX_ENABLED_KEY, default=None) is None
+        ):
+            return (
+                f"Attempted to {attempted}. Failed because the engine is running in an environment that provides "
+                f"its libraries, and this environment does not include a sandbox library. Set "
+                f"{LIBRARY_SANDBOX_ENABLED_KEY} to true to allow one."
+            )
+        return (
+            f"Attempted to {attempted}. Failed because the sandbox library is turned off "
+            f"({LIBRARY_SANDBOX_ENABLED_KEY} is false)."
+        )
+
+    async def is_allowed_in_environment(self, library_info: LibraryInfo) -> bool:
+        """Whether `library_info` may load when the environment provides the libraries.
+
+        A library the environment lists always may; the sandbox library may when it is enabled.
+        """
+        if await self.is_provided_by_environment(library_info.library_path):
+            return True
+        return library_info.is_sandbox and self.sandbox_enabled()
 
     def ensure_engine_provisions(self, attempted: str) -> None:
         """Refuse a download, build, or install when the environment provides the libraries.

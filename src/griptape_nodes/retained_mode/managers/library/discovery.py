@@ -241,7 +241,7 @@ class LibraryDiscovery(EngineScoped):
                 urls_added,
             )
 
-    async def discover_libraries_request(  # noqa: C901 (sandbox, environment, and config sources each branch)
+    async def discover_libraries_request(
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
@@ -263,9 +263,10 @@ class LibraryDiscovery(EngineScoped):
         environment_mode = managed.provisioned_by_environment()
         managed.environment_library_paths = managed.environment_paths_from(config_library_entries)
 
-        # The environment decides every library that loads, so the sandbox is reported rather
-        # than scanned: scanning writes its manifest into the workspace.
-        if request.include_sandbox and environment_mode:
+        # A sandbox that is turned off is never scanned: scanning writes its manifest into the
+        # workspace. In environment mode it is reported as not provided rather than vanishing.
+        sandbox_on = managed.sandbox_enabled()
+        if request.include_sandbox and not sandbox_on and environment_mode:
             sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
             if sandbox_library_dir:
                 managed.create_not_provided_library_info_entry(
@@ -276,38 +277,11 @@ class LibraryDiscovery(EngineScoped):
                 )
 
         # Process sandbox library first if requested
-        if request.include_sandbox and not environment_mode:
-            sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
-            if sandbox_library_dir:
-                # Generate/update the sandbox library JSON file
-                metadata_result = self.engine.library_manager.sandbox.scan_sandbox_directory_request(
-                    ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
-                )
-
-                # If generation succeeded, write JSON and add the sandbox library
-                if isinstance(metadata_result, ScanSandboxDirectoryResultSuccess):
-                    sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME
-                    sandbox_json_path_str = str(sandbox_json_path)
-
-                    # Write the schema to JSON so it exists for lifecycle phases
-                    write_succeeded = self.engine.library_manager.sandbox.write_library_schema_to_json(
-                        metadata_result.library_schema, sandbox_json_path
-                    )
-                    if write_succeeded:
-                        logger.debug(
-                            "Wrote sandbox library schema with %d nodes to '%s' during discovery",
-                            len(metadata_result.library_schema.nodes),
-                            sandbox_json_path,
-                        )
-                    # Continue anyway if write failed - lifecycle will fail gracefully
-
-                    # Add to discovered libraries with is_sandbox=True
-                    if sandbox_json_path not in seen_libraries:
-                        seen_libraries.add(sandbox_json_path)
-                        discovered_libraries.append(DiscoveredLibrary(path=sandbox_json_path, is_sandbox=True))
-
-                    # Create LibraryInfo entry for the sandbox library
-                    self._create_library_info_entry(sandbox_json_path_str, is_sandbox=True)
+        if request.include_sandbox and sandbox_on:
+            sandbox_json_path = self.discover_sandbox_library()
+            if sandbox_json_path is not None and sandbox_json_path not in seen_libraries:
+                seen_libraries.add(sandbox_json_path)
+                discovered_libraries.append(DiscoveredLibrary(path=sandbox_json_path, is_sandbox=True))
 
         # Add all regular libraries from config
         for discovered in config_library_entries:
@@ -734,6 +708,48 @@ class LibraryDiscovery(EngineScoped):
                 current_repo_names.add(repo_name)
 
         return new_downloads
+
+    def discover_sandbox_library(self) -> Path | None:
+        """Scan the sandbox directory, write its manifest, and record it. Returns the manifest path.
+
+        None when no sandbox directory is configured or the scan fails. Once the scan succeeds, a
+        record left from a discovery that refused the sandbox is replaced, so enabling the sandbox
+        takes effect without a restart.
+        """
+        sandbox = self.engine.library_manager.sandbox
+        sandbox_library_dir = sandbox.get_sandbox_directory()
+        if sandbox_library_dir is None:
+            return None
+
+        # Generate/update the sandbox library JSON file
+        metadata_result = sandbox.scan_sandbox_directory_request(
+            ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
+        )
+        if not isinstance(metadata_result, ScanSandboxDirectoryResultSuccess):
+            return None
+
+        sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME
+        sandbox_json_path_str = str(sandbox_json_path)
+
+        # Write the schema to JSON so it exists for lifecycle phases
+        write_succeeded = sandbox.write_library_schema_to_json(metadata_result.library_schema, sandbox_json_path)
+        if write_succeeded:
+            logger.debug(
+                "Wrote sandbox library schema with %d nodes to '%s' during discovery",
+                len(metadata_result.library_schema.nodes),
+                sandbox_json_path,
+            )
+        # Continue anyway if write failed - lifecycle will fail gracefully
+
+        library_infos = self.engine.library_manager._library_file_path_to_info
+        existing = library_infos.get(sandbox_json_path_str)
+        managed = self.engine.library_manager.managed_environment
+        if existing is not None and managed.is_not_provided_by_environment(existing):
+            del library_infos[sandbox_json_path_str]
+
+        # Create LibraryInfo entry for the sandbox library
+        self._create_library_info_entry(sandbox_json_path_str, is_sandbox=True)
+        return sandbox_json_path
 
     def _create_library_info_entry(
         self,

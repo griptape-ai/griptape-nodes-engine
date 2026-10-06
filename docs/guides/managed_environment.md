@@ -62,7 +62,8 @@ With `environment`:
 - Checking a library for updates reports no update and says updates come from the environment,
     without contacting its git remote.
 - The Sandbox Library is neither scanned nor loaded, and adding a sandbox node from a file fails
-    with a message saying the environment manages libraries.
+    with a message saying the environment manages libraries, unless the environment allows a
+    sandbox (see [`library.sandbox_enabled`](#librarysandbox_enabled)).
 - No `.venv` or `.venv-exec` folder is created, and none left from an earlier run is used.
 - A library that declares another library as a dependency is satisfied only by a library in
     `GTN_LIBRARY_PATHS`. If the environment doesn't provide it, the library reports the missing
@@ -73,6 +74,44 @@ With `environment`:
     `griptape-nodes-library-openexr`).
 - The artist's own config file is left alone: entries for libraries that didn't load are not
     removed.
+
+### `library.sandbox_enabled`
+
+Some studios want artists to develop their own nodes while everything else stays under the
+environment's control. `library.sandbox_enabled` (or `GTN_CONFIG_LIBRARY__SANDBOX_ENABLED`) turns
+the Sandbox Library (the folder in **Settings → Library → Sandbox Settings**) on or off:
+
+| Value           | When the engine provisions libraries | In environment mode |
+| --------------- | ------------------------------------ | ------------------- |
+| unset (default) | On                                   | Off                 |
+| `true`          | On                                   | On                  |
+| `false`         | Off                                  | Off                 |
+
+To let artists keep a sandbox in environment mode:
+
+```bash
+export GTN_CONFIG_LIBRARY__PROVISIONED_BY=environment
+export GTN_CONFIG_LIBRARY__SANDBOX_ENABLED=true
+```
+
+Then:
+
+- The Sandbox Library is scanned and loaded, and sandbox nodes can be added.
+- No virtual environment is built for it. Everything a sandbox node imports must already be in
+    the environment; a node that imports something missing reports the import error.
+- Only the sandbox is let in. Every other library the environment doesn't list is still refused.
+
+When the sandbox is off, it isn't scanned or loaded, and adding a sandbox node fails with a message
+saying why. The setting accepts `true` or `false` in any letter case; any other value from the
+environment variable is reported in the engine log and ignored, so the default applies.
+
+`ReloadSandboxLibraryRequest` reloads only the sandbox library, so new or changed node files show
+up without restarting the engine. Other libraries stay loaded and their workers keep running. In
+the editor, **Refresh Sandbox** sends it (see
+[griptape-vsl-gui#3130](https://github.com/griptape-ai/griptape-vsl-gui/pull/3130)). Nodes already
+in a workflow keep the version they were created with until you recreate them. If the reload fails
+partway, for example because of a typo in one node file, the sandbox stays unloaded until a reload
+succeeds. When the sandbox is off, the request fails with a message saying why.
 
 ### `worker.command_prefix`
 
@@ -160,6 +199,8 @@ and `worker.command_prefix`.
     environment doesn't provide it. Ask whoever manages your studio's setup to add it.
 - Installing, updating, or switching a library's version from the editor doesn't work; those
     changes come from the studio's environment.
+- The Sandbox Library works only if your studio allows it. When it does, refreshing reloads just
+    the sandbox; picking up changes to the studio's own libraries needs a relaunch.
 - If running a node says its worker couldn't start because the environment doesn't say which
     packages it needs, the environment is missing an entry for that library. Editing the node and
     saving the workflow still work.

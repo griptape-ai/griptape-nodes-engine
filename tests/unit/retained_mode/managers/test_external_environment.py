@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+
+import pytest
+from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.external_environment import (
@@ -18,6 +20,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     read_provisioned_by,
     read_worker_command_prefix,
     resolve_worker_command,
+    sandbox_enabled,
     worker_requests_from_environment,
 )
 from griptape_nodes.retained_mode.managers.settings import (
@@ -28,9 +31,6 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibrarySettings,
     WorkerSettings,
 )
-
-if TYPE_CHECKING:
-    import pytest
 
 # The context the env loader validates GTN_CONFIG_* overrides under.
 _FROM_ENV = {FROM_ENV_CONTEXT: True}
@@ -263,6 +263,28 @@ class TestReadingTheSettings:
 
         assert read_provisioned_by(config) is LibraryProvisioner.ENGINE
 
+    @pytest.mark.parametrize(
+        ("provisioner", "raw", "expected"),
+        [
+            # Unset, or anything that is not true/false: the mode's default.
+            ("engine", None, True),
+            ("environment", None, False),
+            ("engine", 1, True),
+            ("environment", "maybe", False),
+            # Set: wins in either mode, in any letter case.
+            ("environment", " TRUE ", True),
+            ("environment", True, True),
+            ("engine", "false", False),
+            ("engine", False, False),
+        ],
+    )
+    def test_sandbox_enabled_defaults_by_mode_and_a_set_value_wins(
+        self, provisioner: str, raw: object, *, expected: bool
+    ) -> None:
+        config = _config_returning({LIBRARY_SECTION_KEY: {"provisioned_by": provisioner, "sandbox_enabled": raw}})
+
+        assert sandbox_enabled(config) is expected
+
     def test_a_prefix_that_is_not_a_list_is_reported_not_used(self) -> None:
         config = _config_returning({WORKER_COMMAND_PREFIX_KEY: "tool env --"})
 
@@ -365,6 +387,54 @@ class TestSettingsValidation:
 
         assert settings.provisioned_by is LibraryProvisioner.ENVIRONMENT
 
+    def test_the_sandbox_setting_is_unset_by_default(self) -> None:
+        assert LibrarySettings().sandbox_enabled is None
+
+    def test_a_typed_sandbox_setting_is_kept(self) -> None:
+        settings = LibrarySettings.model_validate({"sandbox_enabled": True})
+
+        assert settings.sandbox_enabled is True
+
+    def test_a_bad_sandbox_setting_in_a_config_file_falls_back_to_the_default(self) -> None:
+        settings = LibrarySettings.model_validate({"sandbox_enabled": "maybe"})
+
+        assert settings.sandbox_enabled is None
+
+    def test_a_bad_sandbox_setting_from_the_environment_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be true or false"):
+            LibrarySettings.model_validate({"sandbox_enabled": "maybe"}, context=_FROM_ENV)
+
+
+class TestSandboxEnabledFromTheEnvironment:
+    @pytest.mark.parametrize(("raw", "expected"), [("TRUE", True), ("true", True), ("False", False)])
+    def test_true_or_false_in_any_letter_case(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, *, expected: bool
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__PROVISIONED_BY", "environment")
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", raw)
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert sandbox_enabled(manager) is expected
+
+    def test_a_bad_value_is_reported_and_the_mode_default_applies(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "maybe")
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__PROVISIONED_BY", "environment")
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert sandbox_enabled(manager) is False
+        assert "GTN_CONFIG_LIBRARY__SANDBOX_ENABLED" in caplog.text
+
+    def test_engine_mode_can_turn_the_sandbox_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "false")
+        manager = ConfigManager()
+        manager.load_configs()
+
+        assert sandbox_enabled(manager) is False
+
 
 class TestSuiteIsolation:
     def test_the_environment_the_suite_runs_in_is_not_read(self) -> None:
@@ -378,5 +448,6 @@ class TestSuiteIsolation:
             LIBRARY_WORKER_REQUESTS_ENV_VAR,
             "GTN_CONFIG_LIBRARY__PROVISIONED_BY",
             "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+            "GTN_CONFIG_LIBRARY__SANDBOX_ENABLED",
         ):
             assert name not in os.environ

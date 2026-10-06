@@ -32,6 +32,7 @@ LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_PROVISIONED_BY_KEY = "library.provisioned_by"
+LIBRARY_SANDBOX_ENABLED_KEY = "library.sandbox_enabled"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 LOG_TO_FILE_KEY = "logging.log_to_file"
@@ -41,8 +42,8 @@ SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so validators that need a typed value convert under this flag, and a value
 # that can't be converted fails validation so the variable is reported as a bad value instead of
-# silently becoming a default. Beta feature entries, `worker.command_prefix`, and
-# `library.provisioned_by` read it.
+# silently becoming a default. Beta feature entries, `worker.command_prefix`,
+# `library.provisioned_by`, and `library.sandbox_enabled` read it.
 FROM_ENV_CONTEXT = "from_env"
 
 logger = logging.getLogger("griptape_nodes")
@@ -439,10 +440,22 @@ class LibrarySettings(BaseModel):
             "'environment' is for an engine started inside an environment another tool has already "
             "prepared: the engine loads only the libraries listed in the GTN_LIBRARY_PATHS environment "
             "variable, never builds virtual environments, never downloads, updates, or installs "
-            "libraries, and marks every other configured library (libraries_to_register entries and the "
-            "sandbox library) as not provided by the environment. A library dependency is then "
-            "satisfied only by a library the environment provides. Any other value is treated as "
-            "'environment' and reported as an error, so a misspelled value never downloads or builds."
+            "libraries, and marks every other configured library (libraries_to_register entries, and the "
+            "sandbox library unless library.sandbox_enabled is true) as not provided by the environment. "
+            "A library dependency is then satisfied only by a library the environment provides. Any other "
+            "value is treated as 'environment' and reported as an error, so a misspelled value never "
+            "downloads or builds."
+        ),
+    )
+    sandbox_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the sandbox library (sandbox_library_directory) is scanned and loaded, and sandbox "
+            "nodes can be added. Unset (the default) means on when library.provisioned_by is 'engine' "
+            "and off when it is 'environment'. True turns it on in either mode: in environment mode no "
+            "virtual environment is built for it, so everything its nodes import must already be in "
+            "the environment, and every other library the environment does not provide is still "
+            "refused. False turns it off in either mode."
         ),
     )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
@@ -508,6 +521,29 @@ class LibrarySettings(BaseModel):
             level=logging.ERROR,
         )
         return LibraryProvisioner.ENVIRONMENT
+
+    @field_validator("sandbox_enabled", mode="before")
+    @classmethod
+    def validate_sandbox_enabled(cls, v: Any, info: ValidationInfo) -> bool | None:
+        """Accept true or false in any letter case, and keep a bad value from resetting the whole config.
+
+        From a GTN_CONFIG_LIBRARY__SANDBOX_ENABLED variable an unrecognized value raises, so the env
+        loader reports the variable and ignores it. From a config file it falls back to unset (the
+        mode's default) with a warning.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if v is None or isinstance(v, bool):
+            return v
+        if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            return v.strip().lower() == "true"
+        if from_env:
+            msg = f"{LIBRARY_SANDBOX_ENABLED_KEY} must be true or false, got {v!r}"
+            raise ValueError(msg)
+        _warn_once(
+            (LIBRARY_SANDBOX_ENABLED_KEY, repr(v)),
+            f"Ignoring {LIBRARY_SANDBOX_ENABLED_KEY}: expected true or false, got {v!r}. Using the default.",
+        )
+        return None
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod
