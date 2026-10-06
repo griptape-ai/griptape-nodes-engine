@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
-
-import pytest
-from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.external_environment import (
     LIBRARY_PATHS_ENV_VAR,
+    LIBRARY_SECTION_KEY,
     library_paths_from_environment,
     read_provisioned_by,
 )
@@ -20,6 +19,9 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryProvisioner,
     LibrarySettings,
 )
+
+if TYPE_CHECKING:
+    import pytest
 
 # The context the env loader validates GTN_CONFIG_* overrides under.
 _FROM_ENV = {FROM_ENV_CONTEXT: True}
@@ -51,12 +53,20 @@ class TestReadingTheSettings:
         assert read_provisioned_by(_config_returning({})) is LibraryProvisioner.ENGINE
 
     def test_provisioned_by_accepts_any_letter_case(self) -> None:
-        config = _config_returning({LIBRARY_PROVISIONED_BY_KEY: "Environment"})
+        config = _config_returning({LIBRARY_SECTION_KEY: {"provisioned_by": "Environment"}})
 
         assert read_provisioned_by(config) is LibraryProvisioner.ENVIRONMENT
 
-    def test_an_unknown_provisioner_reads_as_engine(self) -> None:
-        config = _config_returning({LIBRARY_PROVISIONED_BY_KEY: "somewhere"})
+    def test_an_unknown_provisioner_fails_closed_to_environment(self, caplog: pytest.LogCaptureFixture) -> None:
+        config = _config_returning({LIBRARY_SECTION_KEY: {"provisioned_by": "somewhere"}})
+
+        assert read_provisioned_by(config) is LibraryProvisioner.ENVIRONMENT
+        assert any(
+            record.levelname == "ERROR" and LIBRARY_PROVISIONED_BY_KEY in record.message for record in caplog.records
+        )
+
+    def test_a_bad_value_in_another_library_setting_leaves_the_provisioner_alone(self) -> None:
+        config = _config_returning({LIBRARY_SECTION_KEY: {"minimum_release_age": "not-a-number"}})
 
         assert read_provisioned_by(config) is LibraryProvisioner.ENGINE
 
@@ -71,15 +81,15 @@ class TestEnvironmentOverrides:
 
         assert read_provisioned_by(manager) is LibraryProvisioner.ENVIRONMENT
 
-    def test_a_misspelled_provisioner_is_reported_not_turned_into_engine_silently(
+    def test_a_misspelled_provisioner_fails_closed_to_environment_with_an_error(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.setenv("GTN_CONFIG_LIBRARY__PROVISIONED_BY", "env-provided")
         manager = ConfigManager()
         manager.load_configs()
 
-        assert read_provisioned_by(manager) is LibraryProvisioner.ENGINE
-        assert "GTN_CONFIG_LIBRARY__PROVISIONED_BY" in caplog.text
+        assert read_provisioned_by(manager) is LibraryProvisioner.ENVIRONMENT
+        assert any(record.levelname == "ERROR" and "'env-provided'" in record.message for record in caplog.records)
 
 
 class TestSettingsValidation:
@@ -90,14 +100,15 @@ class TestSettingsValidation:
 
         assert settings.provisioned_by is LibraryProvisioner.ENVIRONMENT
 
-    def test_an_unknown_provisioner_in_a_config_file_falls_back_to_engine(self) -> None:
+    def test_an_unknown_provisioner_in_a_config_file_fails_closed_to_environment(self) -> None:
         settings = LibrarySettings.model_validate({"provisioned_by": "somewhere"})
 
-        assert settings.provisioned_by is LibraryProvisioner.ENGINE
+        assert settings.provisioned_by is LibraryProvisioner.ENVIRONMENT
 
-    def test_an_unknown_provisioner_from_the_environment_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="must be one of"):
-            LibrarySettings.model_validate({"provisioned_by": "somewhere"}, context=_FROM_ENV)
+    def test_an_unknown_provisioner_from_the_environment_fails_closed_to_environment(self) -> None:
+        settings = LibrarySettings.model_validate({"provisioned_by": "somewhere"}, context=_FROM_ENV)
+
+        assert settings.provisioned_by is LibraryProvisioner.ENVIRONMENT
 
 
 class TestSuiteIsolation:

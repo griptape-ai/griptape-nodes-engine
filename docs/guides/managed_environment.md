@@ -44,6 +44,10 @@ and package it needs:
 export GTN_CONFIG_LIBRARY__PROVISIONED_BY=environment
 ```
 
+Any value other than `engine` or `environment` is treated as `environment` and logged as an
+error, so a misspelled value never downloads, builds, or installs anything. Fix the value to get
+the engine's own provisioning back.
+
 With `environment`:
 
 - Only the libraries in `GTN_LIBRARY_PATHS` load. Every other configured library (entries in

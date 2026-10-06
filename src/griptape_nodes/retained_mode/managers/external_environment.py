@@ -17,8 +17,8 @@ import os
 from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.settings import (
-    LIBRARY_PROVISIONED_BY_KEY,
     LibraryProvisioner,
+    LibrarySettings,
 )
 
 if TYPE_CHECKING:
@@ -27,23 +27,20 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 LIBRARY_PATHS_ENV_VAR = "GTN_LIBRARY_PATHS"
+LIBRARY_SECTION_KEY = "library"
 
 
 def read_provisioned_by(config_manager: ConfigManager) -> LibraryProvisioner:
-    """The configured `library.provisioned_by`, in any letter case.
+    """The configured `library.provisioned_by`, read through the Settings validator.
 
-    The merged config keeps the raw value a config file carries, so it is normalized here. A value
-    that is not a known value reads as 'engine'; the Settings validator has already warned about it.
+    Running the field's own validator, rather than re-parsing the raw value, keeps this reader and
+    the validator from drifting: an unrecognized value fails closed to 'environment' in both. Only
+    this field is validated, so a bad value in another library setting does not change it.
     """
-    raw_value = config_manager.get_config_value(LIBRARY_PROVISIONED_BY_KEY, default=LibraryProvisioner.ENGINE.value)
-    if isinstance(raw_value, LibraryProvisioner):
-        return raw_value
-    if not isinstance(raw_value, str):
-        return LibraryProvisioner.ENGINE
-    try:
-        return LibraryProvisioner(raw_value.strip().lower())
-    except ValueError:
-        return LibraryProvisioner.ENGINE
+    library_section = config_manager.get_config_value(LIBRARY_SECTION_KEY, default={}) or {}
+    if not isinstance(library_section, dict) or "provisioned_by" not in library_section:
+        return LibrarySettings().provisioned_by
+    return LibrarySettings.model_validate({"provisioned_by": library_section["provisioned_by"]}).provisioned_by
 
 
 def provisioned_by_environment(config_manager: ConfigManager) -> bool:

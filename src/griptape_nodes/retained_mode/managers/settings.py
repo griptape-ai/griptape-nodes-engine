@@ -97,13 +97,13 @@ def _env_value_to_bool(config_key: str, value: Any) -> bool:
         raise ValueError(msg) from e
 
 
-def _warn_once(report_key: tuple[str, str], message: str) -> None:
+def _warn_once(report_key: tuple[str, str], message: str, *, level: int = logging.WARNING) -> None:
     """Log a settings warning the first time this (config key, value) pair is seen."""
     if report_key in _reported_invalid_beta_features:
         return
 
     _reported_invalid_beta_features.add(report_key)
-    logger.warning(message)
+    logger.log(level, message)
 
 
 class Category(BaseModel):
@@ -392,7 +392,8 @@ class LibrarySettings(BaseModel):
             "variable, never builds virtual environments, never downloads, updates, or installs "
             "libraries, and marks every other configured library (libraries_to_register entries and the "
             "sandbox library) as not provided by the environment. A library dependency is then "
-            "satisfied only by a library the environment provides."
+            "satisfied only by a library the environment provides. Any other value is treated as "
+            "'environment' and reported as an error, so a misspelled value never downloads or builds."
         ),
     )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
@@ -434,16 +435,15 @@ class LibrarySettings(BaseModel):
 
     @field_validator("provisioned_by", mode="before")
     @classmethod
-    def validate_provisioned_by(cls, v: Any, info: ValidationInfo) -> LibraryProvisioner:
-        """Accept any letter case, and keep an unknown value from resetting the whole config.
+    def validate_provisioned_by(cls, v: Any, info: ValidationInfo) -> LibraryProvisioner:  # noqa: ARG003 (both sources fail closed the same way)
+        """Accept any letter case, and fail closed on anything else.
 
-        A GTN_CONFIG_LIBRARY__PROVISIONED_BY variable is validated under
-        `FROM_ENV_CONTEXT`, where an unknown value raises so the env loader reports the
-        variable and ignores it: silently turning a misspelled 'environment' into 'engine' would have the
-        engine download and build what the environment was meant to provide. From a config file the
-        value falls back to 'engine' with a warning, like the other settings in this model.
+        A value that is neither 'engine' nor 'environment', from a config file or a
+        GTN_CONFIG_LIBRARY__PROVISIONED_BY variable, is treated as 'environment' and reported as an
+        error. Falling back to 'engine' instead would have a launcher's misspelled 'environment'
+        download, build, and prune exactly what the environment was meant to provide, after one
+        warning that is easy to miss because GTN_LIBRARY_PATHS libraries still load either way.
         """
-        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         if isinstance(v, LibraryProvisioner):
             return v
         if isinstance(v, str):
@@ -451,15 +451,14 @@ class LibrarySettings(BaseModel):
                 return LibraryProvisioner(v.strip().lower())
             except ValueError:
                 pass
-        allowed = ", ".join(f"'{source.value}'" for source in LibraryProvisioner)
-        if from_env:
-            msg = f"{LIBRARY_PROVISIONED_BY_KEY} must be one of {allowed}, got {v!r}"
-            raise ValueError(msg)
         _warn_once(
             (LIBRARY_PROVISIONED_BY_KEY, repr(v)),
-            f"Ignoring {LIBRARY_PROVISIONED_BY_KEY}: expected one of {allowed}, got {v!r}. Using 'engine'.",
+            f"{LIBRARY_PROVISIONED_BY_KEY} is {v!r}, which is neither 'engine' nor 'environment'. Treating it as "
+            "'environment' so nothing is downloaded, built, or installed: only libraries listed in GTN_LIBRARY_PATHS "
+            "load. Fix the value to use the engine's own provisioning.",
+            level=logging.ERROR,
         )
-        return LibraryProvisioner.ENGINE
+        return LibraryProvisioner.ENVIRONMENT
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod
