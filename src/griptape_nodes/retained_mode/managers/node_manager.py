@@ -2840,7 +2840,7 @@ class NodeManager(EngineScoped):
         if output_snapshot is not None and modified:
             for output_param_name, new_value in node.parameter_output_values.items():
                 old_value = output_snapshot.get(output_param_name)
-                if old_value is new_value or old_value == new_value:
+                if not _values_differ(old_value, new_value):
                     continue
                 output_param = node.get_parameter_by_name(output_param_name)
                 if output_param is None:

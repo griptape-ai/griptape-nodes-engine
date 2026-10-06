@@ -2304,16 +2304,20 @@ def _same_content(old_value: Any, new_value: Any) -> bool:
     the same input compare unequal. A converter that builds a fresh artifact on every set would then
     read as an edit and unresolve everything downstream.
     """
+    # Checked at every level, as list and dict `==` do, so a shared element whose `==` is not a
+    # reflexive bool (a numpy array, nan) still reads as unchanged.
+    if old_value is new_value:
+        return True
     if isinstance(old_value, BaseArtifact) and isinstance(new_value, BaseArtifact):
         return _same_artifact_content(old_value, new_value)
     if isinstance(old_value, list | tuple) and type(new_value) is type(old_value):
-        if len(old_value) != len(new_value):
-            return False
-        return all(_same_content(old_item, new_item) for old_item, new_item in zip(old_value, new_value, strict=True))
+        return len(old_value) == len(new_value) and all(
+            _same_content(old_item, new_item) for old_item, new_item in zip(old_value, new_value, strict=True)
+        )
     if isinstance(old_value, dict) and isinstance(new_value, dict):
-        if old_value.keys() != new_value.keys():
-            return False
-        return all(_same_content(old_value[key], new_value[key]) for key in old_value)
+        return old_value.keys() == new_value.keys() and all(
+            _same_content(old_value[key], new_value[key]) for key in old_value
+        )
     return bool(old_value == new_value)
 
 

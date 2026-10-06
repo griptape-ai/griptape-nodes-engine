@@ -406,6 +406,10 @@ class TestOutputValueChangeDetection:
 
         __hash__ = None  # type: ignore[assignment]
 
+        def __eq__(self, other: object) -> bool:
+            message = "The truth value of an array with more than one element is ambiguous."
+            raise ValueError(message)
+
         def __ne__(self, other: object) -> bool:
             message = "The truth value of an array with more than one element is ambiguous."
             raise ValueError(message)
@@ -464,6 +468,16 @@ class TestArtifactChangeDetection:
 
         assert _values_differ(old, new) is False
         assert _values_differ(old, {"images": [ImageUrlArtifact("https://b.png")]}) is True
+
+    def test_a_shared_element_with_an_irreflexive_eq_is_not_a_change(self) -> None:
+        """Containers rebuilt around the same elements, as `ParameterList` reads are, must read as unchanged."""
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        nan = float("nan")
+        element = TestOutputValueChangeDetection._ArrayLike()
+
+        assert _values_differ([nan], [nan]) is False
+        assert _values_differ({"k": element}, {"k": element}) is False
 
 
 class TestParameterVisibilityKeepsTraitStateLive:
