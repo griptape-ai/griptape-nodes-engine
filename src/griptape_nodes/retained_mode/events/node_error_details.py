@@ -222,21 +222,58 @@ def _provider_reason(response: dict[str, Any]) -> str | None:
 
     The explanation is often the only part that says what to fix, such as which parameter the
     provider rejected, so it is kept in the message as well as in the response. These are the field
-    names JSON APIs use for error text: ``error.message`` (OpenAI, Anthropic), ``message``,
-    ``detail`` (FastAPI), and ``error`` as a plain string. Griptape Cloud's proxy puts its
-    user-facing reason in ``status_detail.details``, or ``status_detail.error`` without one.
+    names JSON APIs use for error text, checked in this order:
+
+    * ``error.message`` (OpenAI, Anthropic, Google)
+    * ``message``
+    * ``detail.message`` (ElevenLabs), or ``detail`` as text (FastAPI)
+    * ``detail[].msg``, FastAPI's list of validation errors, joined into one line
+    * ``errors[].message``, joined into one line
+    * ``error`` as text
+    * ``status_detail.details``, or ``status_detail.error`` (Griptape Cloud's proxy)
     """
     error = response.get("error")
-    candidates = [response.get("message"), response.get("detail"), error]
-    if isinstance(error, dict):
-        candidates.insert(0, error.get("message"))
+    detail = response.get("detail")
     status_detail = response.get("status_detail")
+    candidates: list[Any] = []
+    if isinstance(error, dict):
+        candidates.append(error.get("message"))
+    candidates.append(response.get("message"))
+    if isinstance(detail, dict):
+        candidates.append(detail.get("message"))
+    candidates.append(detail)
+    candidates.append(_joined_messages(detail, "msg"))
+    candidates.append(_joined_messages(response.get("errors"), "message"))
+    candidates.append(error)
     if isinstance(status_detail, dict):
-        candidates.extend([status_detail.get("details"), status_detail.get("error")])
+        candidates.append(status_detail.get("details"))
+        candidates.append(status_detail.get("error"))
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+def _joined_messages(items: Any, key: str) -> str | None:
+    """Join the text under ``key`` in a list of error objects, such as FastAPI's validation errors."""
+    if not isinstance(items, list):
+        return None
+    texts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = item.get(key)
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    if not texts:
+        return None
+    joined = texts[0]
+    for text in texts[1:]:
+        if joined.endswith((".", "!", "?")):
+            joined = f"{joined} {text}"
+        else:
+            joined = f"{joined}; {text}"
+    return joined
 
 
 def _join_sentences(first: str, second: str) -> str:
@@ -246,7 +283,18 @@ def _join_sentences(first: str, second: str) -> str:
 
 
 def _literal_dict(text: str) -> dict[str, Any] | None:
+    """Read a dict printed with ``str()`` (a Python dict), or a response body printed as JSON text."""
     source = text.strip()
+    value = _python_literal(source)
+    if value is None:
+        # JSON's true, false, and null aren't Python, so a raw response body needs its own parser.
+        value = _json_value(source)
+    if not isinstance(value, dict) or not value:
+        return None
+    return value
+
+
+def _python_literal(source: str) -> Any:
     try:
         expression = ast.parse(source, mode="eval").body
         value = ast.literal_eval(expression)
@@ -257,9 +305,16 @@ def _literal_dict(text: str) -> dict[str, Any] | None:
     # dict doesn't run to the end of it.
     if ast.get_source_segment(source, expression) != source:
         return None
-    if not isinstance(value, dict) or not value:
-        return None
     return value
+
+
+def _json_value(source: str) -> Any:
+    try:
+        return json.loads(source)
+    # JSONDecodeError is a ValueError, raised for text after the value too. RecursionError for one
+    # nested too deep.
+    except (ValueError, RecursionError):
+        return None
 
 
 def _strip_response_label(text: str) -> str:

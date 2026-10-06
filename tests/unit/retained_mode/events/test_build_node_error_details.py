@@ -421,6 +421,62 @@ class TestPrintedResponse:
         assert details.message == "Request failed. Temperature is not supported."
         assert details.response == response
 
+    def test_elevenlabs_detail_message_stays_in_the_message(self) -> None:
+        # The body ElevenLabs returned through the Griptape proxy for empty text.
+        response = {
+            "detail": {
+                "type": "validation_error",
+                "code": "invalid_parameters",
+                "message": "Input at position 0 has empty text.",
+                "status": "input_text_empty",
+                "request_id": "8ed4bb7b",
+                "param": "text",
+            }
+        }
+        exc = RuntimeError(f"{NODE_NAME} generation failed.\n\nFull API response:\n{response}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == f"{NODE_NAME} generation failed. Input at position 0 has empty text."
+        assert details.response == response
+
+    def test_a_response_printed_as_json_text_moves_to_response(self) -> None:
+        # Seedance prints the raw body, so it arrives as JSON with false and null, not a Python dict.
+        body = '{"error": {"code": "InvalidParameter", "message": "The image format is not supported.", "retryable": false, "param": null}}'
+        exc = RuntimeError(f"failed to create private asset: HTTP 400 - {body}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "failed to create private asset: HTTP 400. The image format is not supported."
+        assert details.response == json.loads(body)
+
+    def test_json_text_with_more_text_after_it_is_kept(self) -> None:
+        message = 'Request failed: {"retryable": false} after 3 retries'
+
+        details = build_node_error_details(NODE_NAME, ValueError(message))
+
+        assert details.message == message
+        assert details.response is None
+
+    def test_fastapi_validation_errors_are_joined_into_the_message(self) -> None:
+        response = {
+            "detail": [
+                {"loc": ["body", "prompt"], "msg": "Field required", "type": "missing"},
+                {"loc": ["body", "steps"], "msg": "Input should be less than 50", "type": "less_than"},
+            ]
+        }
+
+        details = build_node_error_details(NODE_NAME, ValueError(f"generation failed: {response}"))
+
+        assert details.message == "generation failed. Field required; Input should be less than 50"
+
+    def test_an_errors_list_is_joined_into_the_message(self) -> None:
+        response = {"errors": [{"message": "Prompt is too long."}, {"code": "x"}, {"message": "Seed is invalid."}]}
+
+        details = build_node_error_details(NODE_NAME, ValueError(f"Request failed: {response}"))
+
+        assert details.message == "Request failed. Prompt is too long. Seed is invalid."
+
     def test_a_response_without_an_explanation_leaves_the_message_short(self) -> None:
         details = build_node_error_details(NODE_NAME, ValueError("Request failed.\nResponse:\n{'status': 'ERRORED'}"))
 
