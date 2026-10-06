@@ -28,6 +28,9 @@ class StartFlow(StartNode):
 class EndFlow(EndNode):
     """The packaged body's exit node."""
 
+    def process(self) -> None:
+        return None
+
 
 class LoopBodyNode(DataNode):
     """One node's worth of loop body: copies ``text`` to ``result``."""
