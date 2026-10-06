@@ -401,6 +401,10 @@ class _WorkflowRegistry:
         for key in keys_to_remove:
             del self._workflows[key]
 
+    def clear_all_workflows(self) -> None:
+        """Remove every workflow from the registry, library-provided ones included."""
+        self._workflows.clear()
+
     def rekey_workflow(self, old_key: str, new_key: str) -> None:
         """Re-key a workflow in the registry from old_key to new_key."""
         if old_key not in self._workflows:
