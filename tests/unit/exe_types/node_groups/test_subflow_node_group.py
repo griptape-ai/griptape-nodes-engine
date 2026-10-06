@@ -272,6 +272,18 @@ class TestCreateProxyParameterForConnection:
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
         assert len(group.metadata[RIGHT_PARAMETERS_KEY]) == len(expected_right)
 
+    @pytest.mark.parametrize("serializable", [True, False])
+    def test_proxy_saves_its_value_on_the_mirrored_parameters_terms(
+        self, group: _MiniSubflowGroup, mock_handle_request: Mock, *, serializable: bool
+    ) -> None:
+        """A proxy holds the value of the parameter it mirrors, so it must not save what that parameter won't."""
+        group._create_proxy_parameter_for_connection(
+            Parameter(name=self.PROXY_NAME, tooltip="", serializable=serializable), is_incoming=False
+        )
+
+        (request,), _ = mock_handle_request.call_args
+        assert request.serializable is serializable
+
 
 class _MiniSubflowGroup(SubflowNodeGroup):
     """Minimal concrete SubflowNodeGroup exercising only _create_subflow."""

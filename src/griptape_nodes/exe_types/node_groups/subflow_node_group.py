@@ -343,6 +343,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             traits=traits_set,
             parent_container_name=param.parent_container_name,
             parent_element_name=param.parent_element_name,
+            serializable=param.serializable,
         )
 
         # Add the parameter to this node
@@ -377,6 +378,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             tooltip="",
             mode_allowed_input=True,
             mode_allowed_output=True,
+            # Carries the value the mirrored parameter holds, so saves it on the same terms.
+            serializable=original_param.serializable,
         )
         # Add with a request, because this will handle naming for us.
         result = self.engine.handle_request(request)

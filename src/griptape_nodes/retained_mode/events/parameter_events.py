@@ -50,6 +50,7 @@ class AddParameterToNodeRequest(RequestPayload):
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
+        serializable: Whether the parameter's value is saved with the workflow
 
     Results: AddParameterToNodeResultSuccess (with parameter name) | AddParameterToNodeResultFailure
     """
@@ -72,6 +73,7 @@ class AddParameterToNodeRequest(RequestPayload):
     is_user_defined: bool = field(default=True)
     settable: bool = field(default=True)
     allow_variable_substitution: bool = field(default=True)
+    serializable: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
     traits: list[dict[str, Any]] | None = None
