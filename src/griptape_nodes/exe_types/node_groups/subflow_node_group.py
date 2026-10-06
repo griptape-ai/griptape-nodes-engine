@@ -715,6 +715,22 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self._remap_outgoing_connections(node, connections)
             self._remap_incoming_connections(node, connections)
 
+    def after_incoming_connection(
+        self, source_node: BaseNode, source_parameter: Parameter, target_parameter: Parameter
+    ) -> None:
+        super().after_incoming_connection(source_node, source_parameter, target_parameter)
+        if source_node.parent_group is self:
+            # An inner node feeding a right-rail proxy.
+            self._mirror_serializable(target_parameter, source_parameter)
+
+    def after_outgoing_connection(
+        self, source_parameter: Parameter, target_node: BaseNode, target_parameter: Parameter
+    ) -> None:
+        super().after_outgoing_connection(source_parameter, target_node, target_parameter)
+        if target_node.parent_group is self:
+            # A left-rail proxy feeding an inner node.
+            self._mirror_serializable(source_parameter, target_parameter)
+
     def after_outgoing_connection_removed(
         self, source_parameter: Parameter, target_node: BaseNode, target_parameter: Parameter
     ) -> None:
@@ -1363,3 +1379,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     def subflow_execution_component(self) -> SubflowExecutionComponent:
         """Get the subflow execution component for real-time status updates."""
         return self._subflow_execution_component
+
+    @staticmethod
+    def _mirror_serializable(proxy_parameter: Parameter, mirrored_parameter: Parameter) -> None:
+        """Keep a proxy from saving a value its mirrored parameter won't.
+
+        Runs on every internal connection, including those replayed when a workflow opens, so a proxy
+        saved before proxies carried `serializable` still picks it up.
+        """
+        if not mirrored_parameter.serializable:
+            proxy_parameter.serializable = False

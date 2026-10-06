@@ -16,6 +16,7 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
+from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -283,6 +284,49 @@ class TestCreateProxyParameterForConnection:
 
         (request,), _ = mock_handle_request.call_args
         assert request.serializable is serializable
+
+
+class TestProxySerializableOnReload:
+    """A workflow saved before proxies carried `serializable` replays them as serializable.
+
+    Its internal connections replay after the group exists, so they are where the flag is restored.
+    """
+
+    @pytest.fixture
+    def group(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> _MiniSubflowGroup:
+        return _MiniSubflowGroup(name="G")
+
+    def _inner_node(self, group: _MiniSubflowGroup) -> MockNode:
+        node = MockNode("inner")
+        node.parent_group = group
+        return node
+
+    def test_right_rail_proxy_takes_the_inner_outputs_setting(self, group: _MiniSubflowGroup) -> None:
+        proxy = Parameter(name="blob", tooltip="")
+        inner_output = Parameter(name="blob", tooltip="", serializable=False)
+
+        group.after_incoming_connection(self._inner_node(group), inner_output, proxy)
+
+        assert proxy.serializable is False
+
+    def test_left_rail_proxy_takes_the_inner_inputs_setting(self, group: _MiniSubflowGroup) -> None:
+        proxy = Parameter(name="blob", tooltip="")
+        inner_input = Parameter(name="blob", tooltip="", serializable=False)
+
+        group.after_outgoing_connection(proxy, self._inner_node(group), inner_input)
+
+        assert proxy.serializable is False
+
+    def test_an_outside_connection_leaves_the_proxy_alone(self, group: _MiniSubflowGroup) -> None:
+        proxy = Parameter(name="blob", tooltip="")
+        outside_output = Parameter(name="blob", tooltip="", serializable=False)
+
+        group.after_incoming_connection(MockNode("outside"), outside_output, proxy)
+
+        assert proxy.serializable is True
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
