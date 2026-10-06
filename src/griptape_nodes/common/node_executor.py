@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import anyio
 
+from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketUnavailableError
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
@@ -3450,6 +3451,8 @@ class NodeExecutor(EngineScoped):
                             node=subflow_node,
                         )
                         iteration_outputs.append((iteration_index, True, subprocess_result))
+                    except SubprocessWebSocketUnavailableError:
+                        raise
                     except Exception:
                         logger.exception("Iteration %d failed for loop '%s'", iteration_index, end_loop_node.name)
                         iteration_outputs.append((iteration_index, False, None))
@@ -3474,6 +3477,8 @@ class NodeExecutor(EngineScoped):
                             flow_input=flow_input,
                             node=subflow_node,
                         )
+                    except SubprocessWebSocketUnavailableError:
+                        raise
                     except Exception:
                         logger.exception("Iteration %d failed for loop '%s'", iteration_index, end_loop_node.name)
                         return iteration_index, False, None

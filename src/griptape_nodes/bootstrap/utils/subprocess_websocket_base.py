@@ -12,13 +12,41 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import TypeAdapter, ValidationError
+
 from griptape_nodes.api_client import Client
+from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
     from typing import Any
 
 logger = logging.getLogger(__name__)
+
+RELAY_TRANSPORT_CONFIG_KEY = "transports.websocket_api"
+_ATTEMPTED_SUBPROCESS_RUN = (
+    "Attempted to run a node group with Private Execution or in a library execution environment."
+)
+_BOOL_ADAPTER = TypeAdapter(bool)
+
+
+def _is_relay_disabled(relay_config: object) -> bool:
+    """Return whether a `transports.websocket_api` value turns the relay off.
+
+    Mirrors the app's validation of the setting: an `enabled` it cannot read as a bool disables the
+    relay, and an absent one leaves it at its default, which the API key check decides.
+    """
+    if not isinstance(relay_config, dict) or "enabled" not in relay_config:
+        return False
+    try:
+        return not _BOOL_ADAPTER.validate_python(relay_config["enabled"])
+    except ValidationError:
+        return True
+
+
+class SubprocessWebSocketUnavailableError(RuntimeError):
+    """Raised when the subprocess WebSocket connection cannot be opened with the current configuration."""
 
 
 @dataclass
@@ -64,11 +92,42 @@ class SubprocessWebSocketBaseMixin:
 
         Creates and connects the WebSocket client.
         Subclasses should call this, then perform additional setup (subscribe, etc.).
+
+        Raises:
+            SubprocessWebSocketUnavailableError: If there is no API key or the relay transport is disabled.
         """
+        api_key = self._require_websocket_api_key()
         logger.info("Starting WebSocket client for session %s", self._session_id)
-        self._ws_client = Client()
+        self._ws_client = Client(api_key=api_key)
         await self._ws_client.connect()
         logger.info("WebSocket client connected for session %s", self._session_id)
+
+    def _require_websocket_api_key(self) -> str:
+        """Return the API key the subprocess WebSocket connects with, or raise if it cannot connect.
+
+        Running a workflow in a subprocess carries its events over the Nodes API relay, which
+        authenticates with GT_CLOUD_API_KEY. Checking up front turns a connection that would be
+        rejected or time out into an error that says what is missing.
+        """
+        relay_config = GriptapeNodes.ConfigManager().get_config_value(
+            RELAY_TRANSPORT_CONFIG_KEY, default=None, should_load_env_var_if_detected=False
+        )
+        if _is_relay_disabled(relay_config):
+            msg = (
+                f"{_ATTEMPTED_SUBPROCESS_RUN} Failed due to the Nodes API relay transport being disabled "
+                f"('{RELAY_TRANSPORT_CONFIG_KEY}.enabled'). Enable it, or run the group without Private Execution."
+            )
+            raise SubprocessWebSocketUnavailableError(msg)
+
+        api_key = GriptapeNodes.SecretsManager().get_secret(API_KEY_SECRET_NAME, should_error_on_not_found=False)
+        if not api_key:
+            msg = (
+                f"{_ATTEMPTED_SUBPROCESS_RUN} Failed due to no {API_KEY_SECRET_NAME} being set. "
+                f"Run 'gtn init' or set {API_KEY_SECRET_NAME}."
+            )
+            raise SubprocessWebSocketUnavailableError(msg)
+
+        return api_key
 
     def _create_websocket_task(self, coro: Coroutine[Any, Any, None]) -> None:
         """Create a background task for WebSocket operations.
