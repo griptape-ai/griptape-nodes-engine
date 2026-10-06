@@ -1,10 +1,12 @@
 import asyncio
 import json
+import socket
 import threading
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+import uvicorn
 from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
@@ -23,6 +25,7 @@ from griptape_nodes.servers.mcp import (
     _trim_response,
     call_tool,
     list_tools,
+    start_mcp_server,
 )
 
 if TYPE_CHECKING:
@@ -446,3 +449,25 @@ class TestDispatchToEngineShield:
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+class TestStartMcpServer:
+    def test_serves_on_selector_loop_when_platform_default_differs(self) -> None:
+        # Stands in for Windows, whose default loop is the proactor loop (#5745).
+        class PlatformDefaultLoop(asyncio.SelectorEventLoop):
+            pass
+
+        serving_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def fake_serve(_server: uvicorn.Server, sockets: list[socket.socket] | None = None) -> None:  # noqa: ARG001
+            serving_loops.append(asyncio.get_running_loop())
+
+        with (
+            socket.socket() as sock,
+            patch.object(asyncio.events, "new_event_loop", PlatformDefaultLoop),
+            patch.object(uvicorn.Server, "serve", fake_serve),
+        ):
+            sock.bind(("127.0.0.1", 0))
+            start_mcp_server(sock)
+
+        assert type(serving_loops[0]) is asyncio.SelectorEventLoop

@@ -521,7 +521,12 @@ def start_mcp_server(sock: socket.socket) -> None:
     try:
         config = uvicorn.Config(mcp_server_app, log_config=None, log_level=GTN_MCP_SERVER_LOG_LEVEL)
         server = uvicorn.Server(config)
-        asyncio.run(server.serve(sockets=[sock]))
+        # Windows' default proactor loop calls shutdown() on each closing socket, which raises
+        # ConnectionResetError when the peer has already reset it, and asyncio logs that as an
+        # ERROR traceback (#5745). The selector loop closes without it. This loop only serves HTTP
+        # and hands requests to the engine loop, so it needs no proactor-only feature such as
+        # subprocesses. On macOS and Linux the selector loop is already the default.
+        asyncio.run(server.serve(sockets=[sock]), loop_factory=asyncio.SelectorEventLoop)
     except Exception as e:
         mcp_server_logger.error("MCP server failed: %s", e)
         raise
