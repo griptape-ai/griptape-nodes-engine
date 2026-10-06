@@ -23,6 +23,13 @@ if TYPE_CHECKING:
     from websockets.http11 import Request, Response
 
 
+def _closed_port() -> int:
+    """Bind and close a socket so the port is known to be closed."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 class TestClientLargePayloadWarning:
     @pytest.fixture
     def client(self) -> Client:
@@ -111,11 +118,7 @@ class TestClientConnectFailures:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(client_module, "CONNECT_TIMEOUT_SECONDS", 0.5)
-        # Bind and close a socket so the port is known to be closed.
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        client = Client(api_key="key", url=f"ws://127.0.0.1:{port}/")
+        client = Client(api_key="key", url=f"ws://127.0.0.1:{_closed_port()}/")
 
         with pytest.raises(ConnectionError) as exc_info:
             await client.connect()
@@ -143,3 +146,37 @@ class TestClientConnectFailures:
 
         assert client._receiving_task is not None
         assert client._receiving_task.done()
+
+
+class TestClientProxy:
+    """A proxy named in the environment applies by default, and proxy=None connects directly."""
+
+    @pytest.fixture
+    def unreachable_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        proxy_url = f"http://127.0.0.1:{_closed_port()}"
+        monkeypatch.setenv("HTTPS_PROXY", proxy_url)
+        monkeypatch.setenv("HTTP_PROXY", proxy_url)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("unreachable_proxy")
+    async def test_connects_through_the_environment_proxy_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(client_module, "CONNECT_TIMEOUT_SECONDS", 0.5)
+
+        async with serve(lambda ws: ws.wait_closed(), "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = Client(api_key="key", url=f"ws://127.0.0.1:{port}/")
+
+            with pytest.raises(ConnectionError):
+                await client.connect()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("unreachable_proxy")
+    async def test_proxy_none_connects_directly(self) -> None:
+        async with serve(lambda ws: ws.wait_closed(), "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = Client(api_key="key", url=f"ws://127.0.0.1:{port}/", proxy=None)
+
+            await client.connect()
+            await client.disconnect()

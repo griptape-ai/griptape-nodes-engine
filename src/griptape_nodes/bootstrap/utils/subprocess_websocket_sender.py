@@ -83,7 +83,9 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
 
         logger.info("Connecting to parent event server for session %s", self._session_id)
         # Passing the token as the API key keeps the Griptape Cloud key out of this connection.
-        self._ws_client = Client(url=self._events_url, api_key=token)
+        # The parent listens on loopback, which a configured HTTP(S) proxy cannot reach, so connect
+        # directly rather than through the proxy the environment names.
+        self._ws_client = Client(url=self._events_url, api_key=token, proxy=None)
         try:
             await self._ws_client.connect()
         except ConnectionError as e:

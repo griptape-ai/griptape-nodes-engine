@@ -9,7 +9,7 @@ import logging
 import os
 import ssl
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import urljoin
 
 # websockets.asyncio.client is the only module that defines process_exception on every websockets
@@ -58,14 +58,19 @@ class Client:
         self,
         api_key: str | None = None,
         url: str | None = None,
+        *,
+        proxy: str | Literal[True] | None = True,
     ):
         """Initialize Nodes API client.
 
         Args:
             api_key: API key for authentication (defaults to GT_CLOUD_API_KEY from SecretsManager)
             url: WebSocket URL to connect to (defaults to Nodes API endpoint)
+            proxy: Proxy to connect through. True (the default) uses the proxy configured in the
+                environment, None connects directly, and a URL uses that proxy.
         """
         self.url = url if url is not None else get_default_websocket_url()
+        self.proxy: str | Literal[True] | None = proxy
 
         # Get API key from SecretsManager if not provided
         if api_key is None:
@@ -242,6 +247,7 @@ class Client:
             async for websocket in connect(
                 self.url,
                 additional_headers=self.headers,
+                proxy=self.proxy,
                 process_exception=self._process_connection_exception,
             ):
                 should_reconnect = await self._handle_websocket_session(websocket)

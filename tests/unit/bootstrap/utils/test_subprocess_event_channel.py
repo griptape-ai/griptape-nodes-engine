@@ -147,6 +147,27 @@ class TestSender:
         ]
 
     @pytest.mark.asyncio
+    async def test_reaches_the_parent_when_the_environment_names_a_proxy(
+        self, listener: _Listener, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A proxy cannot reach the parent's loopback listener, so a dial routed through one fails.
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        for name, value in listener._get_events_env().items():
+            monkeypatch.setenv(name, value)
+        sender = _Sender(listener._get_events_url())
+
+        await sender._start_websocket_connection()
+        sender.send_event("success_result", json.dumps({"result": "ok"}))
+        await sender._wait_for_websocket_queue_flush()
+        await sender._stop_websocket_connection()
+        await listener._wait_for_subprocess_events()
+
+        assert [event["type"] for event in listener.handled] == ["success_result"]
+
+    @pytest.mark.asyncio
     async def test_never_sends_the_griptape_cloud_key_to_the_parent(
         self, listener: _Listener, monkeypatch: pytest.MonkeyPatch
     ) -> None:
