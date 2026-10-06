@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import socket
 import threading
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+import uvicorn
 from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
@@ -457,11 +459,12 @@ class TestServe:
             def _call_connection_lost(self, exc: BaseException | None) -> None:  # noqa: ARG002
                 raise ConnectionResetError
 
-        class _FakeServer:
-            async def serve(self, sockets: list[Any]) -> None:  # noqa: ARG002
-                asyncio.get_running_loop().call_soon(_ResetTransport()._call_connection_lost, None)
-                await asyncio.sleep(0)
+        async def fake_serve(_self: uvicorn.Server, sockets: list[Any]) -> None:  # noqa: ARG001
+            asyncio.get_running_loop().call_soon(_ResetTransport()._call_connection_lost, None)
+            await asyncio.sleep(0)
 
-        asyncio.run(mcp_module._serve(cast("Any", _FakeServer()), MagicMock()))
+        with socket.socket() as sock, patch.object(uvicorn.Server, "serve", fake_serve):
+            sock.bind(("127.0.0.1", 0))
+            mcp_module.start_mcp_server(sock)
 
         assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
