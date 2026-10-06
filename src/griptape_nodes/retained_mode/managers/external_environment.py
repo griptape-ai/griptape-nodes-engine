@@ -21,10 +21,14 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from griptape_nodes.retained_mode.managers.settings import (
+    FROM_ENV_CONTEXT,
     WORKER_COMMAND_PREFIX_KEY,
     LibraryProvisioner,
     LibrarySettings,
+    WorkerSettings,
 )
 
 if TYPE_CHECKING:
@@ -37,6 +41,7 @@ logger = logging.getLogger("griptape_nodes")
 LIBRARY_PATHS_ENV_VAR = "GTN_LIBRARY_PATHS"
 LIBRARY_SECTION_KEY = "library"
 LIBRARY_WORKER_REQUESTS_ENV_VAR = "GTN_LIBRARY_WORKER_REQUESTS"
+WORKER_COMMAND_PREFIX_ENV_VAR = "GTN_CONFIG_WORKER__COMMAND_PREFIX"
 
 LIBRARY_REQUEST_PLACEHOLDER = "{library_request}"
 LIBRARY_NAME_PLACEHOLDER = "{library_name}"
@@ -53,6 +58,19 @@ class WorkerCommand:
     """The full argument list to start a worker with."""
 
     args: list[str]
+
+
+@dataclass(frozen=True)
+class WorkerCommandPrefix:
+    """The configured `worker.command_prefix`, and why it cannot be used when it is configured but broken.
+
+    `problem` is None when the prefix is usable, including when none is configured. When set,
+    `words` holds whatever prefix still applies (none, or a config file's when the variable was
+    rejected), and environment mode refuses workers instead of starting them with it.
+    """
+
+    words: list[str]
+    problem: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,19 +98,39 @@ def provisioned_by_environment(config_manager: ConfigManager) -> bool:
     return read_provisioned_by(config_manager) is LibraryProvisioner.ENVIRONMENT
 
 
-def read_worker_command_prefix(config_manager: ConfigManager) -> list[str]:
-    """The configured `worker.command_prefix`, or an empty list when it is unset or unusable."""
+def read_worker_command_prefix(
+    config_manager: ConfigManager, startup_environ: Mapping[str, str]
+) -> WorkerCommandPrefix:
+    """The configured `worker.command_prefix`, read through the Settings validator.
+
+    Two ways a configured prefix can be unusable, both reported as `problem` rather than turning
+    silently into "no prefix": the GTN_CONFIG_WORKER__COMMAND_PREFIX variable in the engine's
+    startup environment is not a JSON list of words (the config loader then drops it, so the
+    prefix would quietly fall back to the config file's or to none), or the merged config value is
+    not a list of words.
+    """
+    problem = None
+    raw_variable = startup_environ.get(WORKER_COMMAND_PREFIX_ENV_VAR, "")
+    if raw_variable.strip():
+        try:
+            WorkerSettings.model_validate({"command_prefix": raw_variable}, context={FROM_ENV_CONTEXT: True})
+        except ValidationError:
+            problem = (
+                f"{WORKER_COMMAND_PREFIX_ENV_VAR} is set, but it is not a JSON list of words "
+                f'(for example \'["tool", "run", "{{library_request}}", "--"]\')'
+            )
+
     raw_value = config_manager.get_config_value(WORKER_COMMAND_PREFIX_KEY, default=[])
-    if not isinstance(raw_value, list):
-        return []
-    if not all(isinstance(word, str) for word in raw_value):
-        logger.warning(
-            "Ignoring %s: every entry must be text, got %r. Workers start without a prefix.",
-            WORKER_COMMAND_PREFIX_KEY,
-            raw_value,
-        )
-        return []
-    return list(raw_value)
+    try:
+        words = WorkerSettings.model_validate({"command_prefix": raw_value}).command_prefix
+    except ValidationError:
+        words = []
+        if problem is None:
+            problem = f"{WORKER_COMMAND_PREFIX_KEY} is set, but it is not a list of words (got {raw_value!r})"
+
+    if problem is not None:
+        logger.warning("%s.", problem)
+    return WorkerCommandPrefix(words=list(words), problem=problem)
 
 
 def library_paths_from_environment(environ: Mapping[str, str]) -> list[str]:
@@ -147,7 +185,7 @@ def worker_requests_from_environment(environ: Mapping[str, str]) -> dict[str, st
 def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact about this worker)
     *,
     command: list[str],
-    prefix: list[str],
+    prefix: WorkerCommandPrefix,
     library_name: str,
     worker_requests: Mapping[str, str],
     engine_version: str,
@@ -166,23 +204,37 @@ def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact abou
     library against whatever packages happen to be there. When the engine provisions libraries, the
     library runs without the prefix, as it would with no prefix configured, and a warning says so.
 
+    A prefix that is configured but unusable (`prefix.problem`) also refuses the worker in
+    environment mode, for the same reason: starting it without the prefix the studio meant to use
+    would run the library on the editor's own environment. When the engine provisions libraries,
+    the worker starts with whatever prefix still applies, as before.
+
     The worker's command starts with the engine's own interpreter (an absolute path), so the
     prefix cannot swap in another Python. `{python_version}` lets the tool resolve the worker's
     environment for that same Python, so its compiled packages match the interpreter that runs.
 
     Args:
         command: The worker command the prefix goes in front of.
-        prefix: The configured `worker.command_prefix`.
+        prefix: The configured `worker.command_prefix`, from `read_worker_command_prefix`.
         library_name: The library the worker serves (its manifest `name`).
         worker_requests: Worker requests by library name, from `GTN_LIBRARY_WORKER_REQUESTS`.
         engine_version: This engine's version, for `{engine_version}`.
         python_version: The engine's Python as `major.minor`, for `{python_version}`.
         environment_mode: Whether `library.provisioned_by` is 'environment'.
     """
-    if not prefix:
+    if prefix.problem is not None and environment_mode:
+        return WorkerCommandRefusal(
+            reason=(
+                f"its worker process is meant to start inside the environment the worker command prefix "
+                f"prepares, and that prefix cannot be used: {prefix.problem}. The worker was not started. "
+                f"Ask whoever set up this environment to fix it."
+            )
+        )
+    words = prefix.words
+    if not words:
         return WorkerCommand(args=list(command))
 
-    needs_request = any(LIBRARY_REQUEST_PLACEHOLDER in word for word in prefix)
+    needs_request = any(LIBRARY_REQUEST_PLACEHOLDER in word for word in words)
     request = worker_requests.get(library_name)
 
     if needs_request and request is None and environment_mode:
@@ -207,7 +259,7 @@ def resolve_worker_command(  # noqa: PLR0913 (each input is a separate fact abou
 
     request_text = request or ""
     expanded: list[str] = []
-    for word in prefix:
+    for word in words:
         if word == LIBRARY_REQUEST_PLACEHOLDER:
             expanded.extend(request_text.split())
             continue

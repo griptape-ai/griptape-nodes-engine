@@ -173,6 +173,41 @@ class TestPrefixedWorkerCommand:
         assert "lib_foo==9.9.9" not in recorded["argv"]
 
     @pytest.mark.asyncio
+    async def test_environment_mode_refuses_a_worker_when_the_prefix_variable_is_broken(self) -> None:
+        # The config loader drops a variable it cannot parse, so the prefix itself reads as empty;
+        # starting the worker without it would run the library on the editor's own environment.
+        manager = _worker_manager(
+            {LIBRARY_PROVISIONED_BY_KEY: "environment"},
+            baseline={
+                "GTN_CONFIG_WORKER__COMMAND_PREFIX": "rez env {library_request} --",
+                LIBRARY_WORKER_REQUESTS_ENV_VAR: f"{_LIBRARY}=lib_foo==1.4.2",
+            },
+        )
+        manager.expect_worker(_LIBRARY)
+
+        create = await _spawn(manager)
+
+        create.assert_not_called()
+        reason = manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert "GTN_CONFIG_WORKER__COMMAND_PREFIX" in reason
+
+    @pytest.mark.asyncio
+    async def test_environment_mode_refuses_a_worker_when_the_configured_prefix_is_not_words(self) -> None:
+        manager = _worker_manager(
+            {LIBRARY_PROVISIONED_BY_KEY: "environment", WORKER_COMMAND_PREFIX_KEY: ["rez", 3]},
+            baseline={LIBRARY_WORKER_REQUESTS_ENV_VAR: f"{_LIBRARY}=lib_foo==1.4.2"},
+        )
+        manager.expect_worker(_LIBRARY)
+
+        create = await _spawn(manager)
+
+        create.assert_not_called()
+        reason = manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert WORKER_COMMAND_PREFIX_KEY in reason
+
+    @pytest.mark.asyncio
     async def test_engine_mode_starts_a_worker_with_no_request_unprefixed(self, probe: Path, tmp_path: Path) -> None:
         manager = _worker_manager({WORKER_COMMAND_PREFIX_KEY: _probe_prefix(probe, tmp_path)}, baseline={})
 

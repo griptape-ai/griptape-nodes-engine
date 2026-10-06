@@ -123,6 +123,11 @@ If the prefix uses `{library_request}` and a library has no entry:
     environment was not prepared for it.
 - With `engine`, the worker starts without the prefix, as if none were configured.
 
+A prefix that is set but can't be used, such as a `GTN_CONFIG_WORKER__COMMAND_PREFIX` that isn't a
+JSON list of words, is reported in the engine log. With `library.provisioned_by` set to
+`environment`, every worker is then refused with that reason rather than started without the
+prefix.
+
 The worker receives the engine's environment as it was when the engine started, plus a few
 variables the engine sets by name (`GTN_ENGINE_ID`, `GTN_ORCHESTRATOR_ENGINE_ID`,
 `PYTHONUNBUFFERED`, and the static file server address). The engine copies no other variables and

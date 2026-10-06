@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     LIBRARY_SECTION_KEY,
     LIBRARY_WORKER_REQUESTS_ENV_VAR,
     WorkerCommand,
+    WorkerCommandPrefix,
     WorkerCommandRefusal,
     library_paths_from_environment,
     read_provisioned_by,
@@ -87,7 +88,7 @@ class TestResolveWorkerCommand:
     def test_no_prefix_leaves_the_command_alone(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=[],
+            prefix=WorkerCommandPrefix(words=[]),
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
@@ -100,7 +101,7 @@ class TestResolveWorkerCommand:
     def test_python_version_is_filled(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["tool", "env", "python-{python_version}", "{library_request}", "--"],
+            prefix=WorkerCommandPrefix(words=["tool", "env", "python-{python_version}", "{library_request}", "--"]),
             library_name="Foo Library",
             worker_requests={"Foo Library": "lib_foo==1.4.2"},
             engine_version="0.103.0",
@@ -113,7 +114,9 @@ class TestResolveWorkerCommand:
     def test_placeholders_are_filled_and_the_prefix_goes_first(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["tool", "env", "engine=={engine_version}", "{library_request}", "--name={library_name}", "--"],
+            prefix=WorkerCommandPrefix(
+                words=["tool", "env", "engine=={engine_version}", "{library_request}", "--name={library_name}", "--"]
+            ),
             library_name="Foo Library",
             worker_requests={"Foo Library": "lib_foo==1.4.2"},
             engine_version="0.103.0",
@@ -128,7 +131,7 @@ class TestResolveWorkerCommand:
     def test_a_whole_word_request_becomes_one_word_per_part(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["tool", "{library_request}", "--"],
+            prefix=WorkerCommandPrefix(words=["tool", "{library_request}", "--"]),
             library_name="Foo Library",
             worker_requests={"Foo Library": "lib_foo==1.4.2  extra_pkg"},
             engine_version="0.103.0",
@@ -141,7 +144,7 @@ class TestResolveWorkerCommand:
     def test_a_request_inside_a_word_is_replaced_as_text(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["--packages={library_request}"],
+            prefix=WorkerCommandPrefix(words=["--packages={library_request}"]),
             library_name="Foo Library",
             worker_requests={"Foo Library": "a b"},
             engine_version="0.103.0",
@@ -154,7 +157,7 @@ class TestResolveWorkerCommand:
     def test_placeholder_text_inside_a_request_is_not_expanded(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["--packages={library_request}"],
+            prefix=WorkerCommandPrefix(words=["--packages={library_request}"]),
             library_name="Foo Library",
             worker_requests={"Foo Library": "{library_name}"},
             engine_version="0.103.0",
@@ -168,7 +171,7 @@ class TestResolveWorkerCommand:
         """Starting it unprefixed would run the library against whatever the engine's environment holds."""
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["tool", "{library_request}", "--"],
+            prefix=WorkerCommandPrefix(words=["tool", "{library_request}", "--"]),
             library_name="Foo Library",
             worker_requests={"Other Library": "lib_other"},
             engine_version="0.103.0",
@@ -183,7 +186,7 @@ class TestResolveWorkerCommand:
     def test_engine_mode_runs_a_library_with_no_request_unprefixed(self, caplog: pytest.LogCaptureFixture) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["tool", "{library_request}", "--"],
+            prefix=WorkerCommandPrefix(words=["tool", "{library_request}", "--"]),
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
@@ -198,7 +201,7 @@ class TestResolveWorkerCommand:
     def test_a_prefix_that_needs_no_request_applies_without_one(self) -> None:
         result = resolve_worker_command(
             command=_COMMAND,
-            prefix=["wrapper", "--engine={engine_version}"],
+            prefix=WorkerCommandPrefix(words=["wrapper", "--engine={engine_version}"]),
             library_name="Foo Library",
             worker_requests={},
             engine_version="0.103.0",
@@ -207,6 +210,35 @@ class TestResolveWorkerCommand:
         )
 
         assert result == WorkerCommand(args=["wrapper", "--engine=0.103.0", *_COMMAND])
+
+
+class TestUnusablePrefix:
+    def test_environment_mode_refuses_a_worker_when_the_prefix_cannot_be_used(self) -> None:
+        result = resolve_worker_command(
+            command=_COMMAND,
+            prefix=WorkerCommandPrefix(words=[], problem="GTN_CONFIG_WORKER__COMMAND_PREFIX is set, but broken"),
+            library_name="Foo Library",
+            worker_requests={"Foo Library": "lib_foo==1.4.2"},
+            engine_version="0.103.0",
+            python_version="3.12",
+            environment_mode=True,
+        )
+
+        assert isinstance(result, WorkerCommandRefusal)
+        assert "GTN_CONFIG_WORKER__COMMAND_PREFIX" in result.reason
+
+    def test_engine_mode_still_starts_the_worker_with_what_applies(self) -> None:
+        result = resolve_worker_command(
+            command=_COMMAND,
+            prefix=WorkerCommandPrefix(words=[], problem="GTN_CONFIG_WORKER__COMMAND_PREFIX is set, but broken"),
+            library_name="Foo Library",
+            worker_requests={},
+            engine_version="0.103.0",
+            python_version="3.12",
+            environment_mode=False,
+        )
+
+        assert result == WorkerCommand(args=_COMMAND)
 
 
 class TestReadingTheSettings:
@@ -231,15 +263,39 @@ class TestReadingTheSettings:
 
         assert read_provisioned_by(config) is LibraryProvisioner.ENGINE
 
-    def test_a_prefix_that_is_not_a_list_is_not_used(self) -> None:
+    def test_a_prefix_that_is_not_a_list_is_reported_not_used(self) -> None:
         config = _config_returning({WORKER_COMMAND_PREFIX_KEY: "tool env --"})
 
-        assert read_worker_command_prefix(config) == []
+        prefix = read_worker_command_prefix(config, {})
 
-    def test_a_prefix_with_a_non_text_entry_is_not_used(self) -> None:
+        assert prefix.words == []
+        assert prefix.problem is not None
+        assert WORKER_COMMAND_PREFIX_KEY in prefix.problem
+
+    def test_a_prefix_with_a_non_text_entry_is_reported_not_used(self) -> None:
         config = _config_returning({WORKER_COMMAND_PREFIX_KEY: ["tool", 3]})
 
-        assert read_worker_command_prefix(config) == []
+        prefix = read_worker_command_prefix(config, {})
+
+        assert prefix.words == []
+        assert prefix.problem is not None
+
+    def test_an_unset_prefix_is_usable(self) -> None:
+        assert read_worker_command_prefix(_config_returning({}), {}) == WorkerCommandPrefix(words=[])
+
+    def test_an_explicitly_empty_prefix_variable_is_usable(self) -> None:
+        prefix = read_worker_command_prefix(_config_returning({}), {"GTN_CONFIG_WORKER__COMMAND_PREFIX": "[]"})
+
+        assert prefix == WorkerCommandPrefix(words=[])
+
+    def test_a_variable_that_is_not_json_is_reported(self) -> None:
+        prefix = read_worker_command_prefix(
+            _config_returning({}), {"GTN_CONFIG_WORKER__COMMAND_PREFIX": "tool env {library_request} --"}
+        )
+
+        assert prefix.words == []
+        assert prefix.problem is not None
+        assert "GTN_CONFIG_WORKER__COMMAND_PREFIX" in prefix.problem
 
 
 class TestEnvironmentOverrides:
@@ -251,7 +307,9 @@ class TestEnvironmentOverrides:
         manager.load_configs()
 
         assert manager.get_config_value(WORKER_COMMAND_PREFIX_KEY) == ["tool", "env", "{library_request}", "--"]
-        assert read_worker_command_prefix(manager) == ["tool", "env", "{library_request}", "--"]
+        assert read_worker_command_prefix(manager, dict(os.environ)) == WorkerCommandPrefix(
+            words=["tool", "env", "{library_request}", "--"]
+        )
 
     def test_a_command_prefix_that_is_not_json_is_ignored(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -260,7 +318,10 @@ class TestEnvironmentOverrides:
         manager = ConfigManager()
         manager.load_configs()
 
-        assert read_worker_command_prefix(manager) == []
+        prefix = read_worker_command_prefix(manager, dict(os.environ))
+
+        assert prefix.words == []
+        assert prefix.problem is not None
         assert "GTN_CONFIG_WORKER__COMMAND_PREFIX" in caplog.text
 
     def test_provisioned_by_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:

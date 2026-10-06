@@ -889,13 +889,14 @@ class WorkerManager(EngineScoped):
         ]
         # A configured prefix starts the worker inside an environment another tool prepares for
         # this library. Read per spawn, like the request list, so a reload picks up a change.
+        # The engine's startup environment, not a project's: a project template must not change
+        # which packages a library's worker resolves or how it is started.
+        startup_environ = self.engine.project_manager.get_pre_project_environ()
         resolved = resolve_worker_command(
             command=command,
-            prefix=read_worker_command_prefix(self.engine.config_manager),
+            prefix=read_worker_command_prefix(self.engine.config_manager, startup_environ),
             library_name=library_name,
-            # The engine's startup environment, not a project's: a project template must not
-            # change which packages a library's worker resolves.
-            worker_requests=worker_requests_from_environment(self.engine.project_manager.get_pre_project_environ()),
+            worker_requests=worker_requests_from_environment(startup_environ),
             engine_version=engine_version,
             python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
             environment_mode=provisioned_by_environment(self.engine.config_manager),
