@@ -509,6 +509,9 @@ class TestPrintedResponse:
             "Request failed: {'data': b'raw'}",
             f"Request failed: {{'image': '{'A' * MAX_RESPONSE_BYTES}'}}",
             f"{'x' * MAX_PRINTED_RESPONSE_MESSAGE_CHARS} {{'status': 'ERRORED'}}",
+            "Missing required keys: {'factor'}",
+            "Keyword arguments {'foo': 1} are not expected by FluxPipeline and will be ignored.",
+            "CUDA out of memory. Tried to allocate 2.00 GiB",
         ],
         ids=[
             "nothing before it",
@@ -523,6 +526,9 @@ class TestPrintedResponse:
             "not JSON",
             "over the size cap",
             "message too long",
+            "a set from transformers",
+            "a dict mid-sentence from diffusers",
+            "no dict",
         ],
     )
     def test_message_is_kept_when_there_is_no_response_to_move(self, message: str) -> None:
