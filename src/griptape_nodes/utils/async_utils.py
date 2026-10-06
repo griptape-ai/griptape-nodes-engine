@@ -14,6 +14,49 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The transport callback asyncio schedules to finish closing a socket. On Windows the proactor
+# loop's version calls socket.shutdown(), which raises ConnectionResetError when the peer has
+# already sent RST. The connection was dead already, so the log line gives no one anything to act
+# on. The rest of that cleanup is skipped either way: the socket is left for garbage collection
+# to close, and the server never drops it from its active count, so a graceful wait_closed() on
+# that server can hang.
+_CONNECTION_LOST_CALLBACK_NAME = "_call_connection_lost"
+
+
+def install_connection_reset_handler(loop: asyncio.AbstractEventLoop) -> None:
+    """Log a peer reset on an already-closing transport at debug instead of as an ERROR traceback.
+
+    asyncio's default exception handler logs it as "Exception in callback
+    _ProactorBasePipeTransport._call_connection_lost(None)" with a full traceback, which reads
+    like a crash. Every other context goes to the handler that was installed before this one,
+    or to the loop's default handler, so real callback errors still surface.
+    """
+    previous_handler = loop.get_exception_handler()
+
+    def handle_exception(handler_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if _is_peer_reset_on_close(context):
+            logger.debug("Peer reset a connection that was already closing: %s", context.get("exception"))
+            return
+        if previous_handler is not None:
+            previous_handler(handler_loop, context)
+            return
+        handler_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_exception)
+
+
+def _is_peer_reset_on_close(context: dict[str, Any]) -> bool:
+    exception = context.get("exception")
+    if not isinstance(exception, ConnectionResetError):
+        return False
+    # shutdown() runs in a finally after protocol.connection_lost(), so a reset raised there can
+    # be hiding the protocol's own error. That one has to surface.
+    if exception.__context__ is not None:
+        return False
+    # Handle keeps the scheduled callable on a private attribute; there is no public accessor.
+    callback = getattr(context.get("handle"), "_callback", None)
+    return getattr(callback, "__name__", None) == _CONNECTION_LOST_CALLBACK_NAME
+
 
 async def call_function(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Call a function, handling both sync and async cases.

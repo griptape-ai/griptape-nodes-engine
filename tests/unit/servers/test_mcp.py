@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
@@ -446,3 +447,21 @@ class TestDispatchToEngineShield:
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+class TestServe:
+    def test_peer_reset_on_the_server_loop_is_not_logged_as_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Polling MCP clients that reset closing connections must not produce ERROR tracebacks."""
+
+        class _ResetTransport:
+            def _call_connection_lost(self, exc: BaseException | None) -> None:  # noqa: ARG002
+                raise ConnectionResetError
+
+        class _FakeServer:
+            async def serve(self, sockets: list[Any]) -> None:  # noqa: ARG002
+                asyncio.get_running_loop().call_soon(_ResetTransport()._call_connection_lost, None)
+                await asyncio.sleep(0)
+
+        asyncio.run(mcp_module._serve(cast("Any", _FakeServer()), MagicMock()))
+
+        assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []

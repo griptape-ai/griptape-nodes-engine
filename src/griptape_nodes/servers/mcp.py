@@ -94,6 +94,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.utils.async_utils import install_connection_reset_handler
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
@@ -479,6 +480,11 @@ async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], tim
     return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
 
 
+async def _serve(server: uvicorn.Server, sock: socket.socket) -> None:
+    install_connection_reset_handler(asyncio.get_running_loop())
+    await server.serve(sockets=[sock])
+
+
 def start_mcp_server(sock: socket.socket) -> None:
     """Synchronous version of main entry point for the Griptape Nodes MCP server.
 
@@ -521,7 +527,7 @@ def start_mcp_server(sock: socket.socket) -> None:
     try:
         config = uvicorn.Config(mcp_server_app, log_config=None, log_level=GTN_MCP_SERVER_LOG_LEVEL)
         server = uvicorn.Server(config)
-        asyncio.run(server.serve(sockets=[sock]))
+        asyncio.run(_serve(server, sock))
     except Exception as e:
         mcp_server_logger.error("MCP server failed: %s", e)
         raise
