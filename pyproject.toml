@@ -168,7 +168,7 @@ ignore = [
 "tests/unit/serialization/test_legacy_pickle.py" = ["TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
-# Example libraries shipped with the Advanced Libraries doc. Authors copy these files
+# Example libraries and nodes shipped with the custom node docs. Authors copy these files
 # verbatim, so the exemptions live here rather than as noqa noise in the examples.
 # INP001: a docs folder is not an importable package.
 # N807: the dunder-named locals are the point -- module-level `__getattr__` is PEP 562,
@@ -180,6 +180,7 @@ ignore = [
   "INP001",
   "TID251",
 ]
+"docs/development/custom_nodes/example_node_error_node.py" = ["INP001", "TID251"]
 
 # The one reader of pickle-era data. Delete it, and this entry, to drop that support.
 "src/griptape_nodes/serialization/legacy_pickle.py" = ["TID251"]

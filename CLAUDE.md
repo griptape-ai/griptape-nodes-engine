@@ -51,7 +51,13 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Use specific, narrow exception blocks** - Catch only the specific exception types that can be raised. Keep try blocks as small as possible — wrap only the exact lines that raise. Never use bare `except:` or catch `Exception` unless explicitly required.
 
-**Write artist-comprehensible, user-facing error messages** - User-facing error messages must be understandable by artists, not just engineers. Avoid stack-trace jargon, internal type names, and implementation details. Use the format: "Attempted to do X to Y. Failed due to Z." Include `{self.name}` when available. Include relevant parameter names and operation context.
+**Write artist-comprehensible, user-facing error messages** - User-facing error messages must be understandable by artists, not just engineers. Avoid stack-trace jargon, internal type names, and implementation details. Use the format: "Attempted to do X to Y. Failed due to Z." In engine `result_details`, include the name of the object the request was about. Include relevant parameter names and operation context.
+
+**Node exceptions don't name their node** - An exception raised from a node reaches the editor on a `NodeErrorEvent`, which already carries `node_name`. Don't prefix the message with `f"{self.name}: "`; the engine strips an exact leading prefix only for the libraries that still add it. Don't re-wrap a node's exception in `RuntimeError(f"...: {e}")` either: the editor shows the exception type, and wrapping replaces it.
+
+**Attach structure with `NodeError`, don't inline it** - When a failure has a provider response, a request or generation ID, or a documentation page, raise `NodeError(message, fields=..., response=..., links=...)` from `exe_types/core_types.py` instead of putting `repr(response)` in the message. The engine sends these parts in `NodeErrorEvent.error`. See `docs/development/custom_nodes/error_handling.md`.
+
+**Build `NodeErrorDetails` where the node fails** - The details for `NodeErrorEvent.error` are built from the node's own exception, where it still exists, with `build_node_error_details(node_name, exc)` from `retained_mode/events/node_error_details.py`. `NodeManager` does this and puts them on `ExecuteNodeResultFailure.error`, which crosses the worker boundary like any other dataclass field, and `NodeExecutor` raises them on `ExecuteNodeFailedError.details`. A new emit site sets `error_message` to the flattened string, as today, and reads `error` from `ExecuteNodeFailedError.details`, building from the exception only for engine failures that never became a result. Don't build `NodeErrorDetails` by hand: the builder removes `KeyError` quotes and the name prefix and enforces the size and link limits.
 
 ## Path Handling
 

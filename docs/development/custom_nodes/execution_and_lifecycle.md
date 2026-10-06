@@ -67,7 +67,7 @@ class MyAsyncNode(ControlNode):
         except Exception as e:
             self._set_safe_defaults()
             self._log(f"Processing failed: {e}")
-            raise RuntimeError(f"{self.name}: {e}") from e
+            raise
 
     async def _submit_task(self, client: httpx.AsyncClient, api_key: str) -> str:
         response = await client.post(
@@ -141,7 +141,7 @@ class MyBlockingNode(ControlNode):
         except Exception as e:
             self._set_safe_defaults()
             self._log(f"Processing failed: {e}")
-            raise RuntimeError(f"{self.name}: {str(e)}") from e
+            raise
 ```
 
 **Key Points:**
@@ -390,7 +390,7 @@ def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, para
         # Validate size
         size_mb = len(image_bytes) / (1024 * 1024)
         if size_mb >= 20:
-            exceptions.append(ValueError(f"{self.name}: {param_name} size must be < 20MB (current: {size_mb:.1f}MB)"))
+            exceptions.append(ValueError(f"{param_name} size must be < 20MB (current: {size_mb:.1f}MB)"))
 
         # Validate format and dimensions
         try:
@@ -400,16 +400,12 @@ def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, para
             img = Image.open(BytesIO(image_bytes))
 
             if img.format not in ["JPEG", "PNG", "WEBP"]:
-                exceptions.append(
-                    ValueError(f"{self.name}: {param_name} format must be JPG, PNG, or WebP (current: {img.format})")
-                )
+                exceptions.append(ValueError(f"{param_name} format must be JPG, PNG, or WebP (current: {img.format})"))
 
             width, height = img.size
             short_edge = min(width, height)
             if short_edge <= 300:
-                exceptions.append(
-                    ValueError(f"{self.name}: {param_name} short edge must be > 300px (current: {short_edge}px)")
-                )
+                exceptions.append(ValueError(f"{param_name} short edge must be > 300px (current: {short_edge}px)"))
         except ImportError:
             self._log("PIL not available for validation")
         except Exception as e:
@@ -490,15 +486,15 @@ def validate_before_node_run(self) -> list[Exception] | None:
     # Example: 10s only for specific model/resolution
     if duration == 10:
         if model != "AdvancedModel":
-            exceptions.append(ValueError(f"{self.name}: 10s duration only supported by AdvancedModel"))
+            exceptions.append(ValueError("10s duration only supported by AdvancedModel"))
         elif resolution == "4K":
-            exceptions.append(ValueError(f"{self.name}: 10s duration not supported with 4K resolution"))
+            exceptions.append(ValueError("10s duration not supported with 4K resolution"))
 
     # Model-specific parameter requirements
     if model in ["ModelB", "ModelC"]:
         required_param = self.get_parameter_value("required_for_model_b_c")
         if not required_param:
-            exceptions.append(ValueError(f"{self.name}: Parameter required for {model}"))
+            exceptions.append(ValueError(f"Parameter required for {model}"))
 
     return exceptions if exceptions else None
 ```

@@ -125,7 +125,7 @@ class TestPickleEraFormats:
         _run_workflow_source(workflow_path.read_text(), str(workflow_path))
         serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name="ControlFlow_1"))
         assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
-        resaved_source = engine.workflow_manager._generate_workflow_file_content(
+        resaved_source = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=serialized.serialized_flow_commands,
             workflow_metadata=WorkflowMetadata(
                 name="resaved",

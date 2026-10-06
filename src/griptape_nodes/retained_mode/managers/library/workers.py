@@ -158,7 +158,7 @@ class LibraryWorkers(EngineScoped):
 
     # Per-node timeout for the schema probe. Node __init__ methods that make
     # synchronous handle_request calls can deadlock against async handlers that
-    # await init-time events (e.g. WorkflowManager._workflows_loading_complete),
+    # await init-time events (e.g. WorkflowManager.wait_for_workflows_loaded),
     # so each probe runs in a worker thread with this ceiling.
     _SCHEMA_PROBE_TIMEOUT_S: float = 10.0
     # Sentinel name passed to the throwaway node instance built for schema

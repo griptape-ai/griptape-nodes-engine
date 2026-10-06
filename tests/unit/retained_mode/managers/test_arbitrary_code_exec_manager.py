@@ -76,8 +76,8 @@ class TestArbitraryCodeExecManager:
         result = engine.handle_request(request)
 
         assert isinstance(result, RunArbitraryPythonStringResultFailure)
-        assert "ERROR:" in result.python_output
-        assert "boom" in result.python_output
+        assert result.python_output == "ValueError: boom"
+        assert str(result.result_details) == "ValueError: boom"
 
     def test_syntax_error_returns_failure(self, engine: Engine) -> None:
         """A syntax error in the submitted code must return a failure, not raise inside the manager."""
@@ -85,7 +85,7 @@ class TestArbitraryCodeExecManager:
         result = engine.handle_request(request)
 
         assert isinstance(result, RunArbitraryPythonStringResultFailure)
-        assert "ERROR:" in result.python_output
+        assert result.python_output.startswith("SyntaxError: ")
 
     def test_recursive_function_works(self, engine: Engine) -> None:
         """Recursive functions defined in exec'd code must be able to call themselves."""

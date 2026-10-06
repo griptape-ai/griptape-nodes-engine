@@ -27,7 +27,11 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
 from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
 from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowRequest
-from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder, WorkflowCodegenState, WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow.codegen import (
+    ImportRecorder,
+    WorkflowCodeGenerator,
+    WorkflowCodegenState,
+)
 from griptape_nodes.serialization.values import encode_value, value_key
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 
@@ -116,11 +120,11 @@ class TestFlowHasContentToGenerate:
     """`_flow_has_content_to_generate` decides whether a Flow is worth a context block at all."""
 
     def test_fully_empty_flow_has_no_content(self) -> None:
-        assert WorkflowManager._flow_has_content_to_generate(_empty_flow_commands()) is False
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(_empty_flow_commands()) is False
 
     def test_node_commands_count_as_content(self) -> None:
         flow = _empty_flow_commands(serialized_node_commands=[_node_command("node_a")])
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
     def test_connections_count_as_content(self) -> None:
         connection = SerializedFlowCommands.IndirectConnectionSerialization(
@@ -130,15 +134,15 @@ class TestFlowHasContentToGenerate:
             target_parameter_name="in",
         )
         flow = _empty_flow_commands(serialized_connections=[connection])
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
     def test_set_parameter_value_commands_count_as_content(self) -> None:
         flow = _empty_flow_commands(set_parameter_value_commands={SerializedNodeCommands.NodeUUID("a"): []})
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
     def test_sub_flows_count_as_content(self) -> None:
         flow = _empty_flow_commands(sub_flows_commands=[_empty_flow_commands()])
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
     def test_lock_commands_count_as_content(self) -> None:
         flow = _empty_flow_commands(
@@ -146,7 +150,7 @@ class TestFlowHasContentToGenerate:
                 SerializedNodeCommands.NodeUUID("a"): SetLockNodeStateRequest(node_name=None, lock=True)
             }
         )
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
     def test_variable_commands_count_as_content(self) -> None:
         variable_command = SerializedFlowCommands.SerializedVariableCommand(
@@ -156,14 +160,14 @@ class TestFlowHasContentToGenerate:
             unique_value_uuid=SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4())),
         )
         flow = _empty_flow_commands(serialized_variable_commands=[variable_command])
-        assert WorkflowManager._flow_has_content_to_generate(flow) is True
+        assert WorkflowCodeGenerator._flow_has_content_to_generate(flow) is True
 
 
 class TestGenerateFlowInitializationCode:
     """The statements that bring one Flow into existence, dispatched by initialization command type."""
 
     def test_none_command_emits_nothing(self, engine: Engine) -> None:
-        statements = engine.workflow_manager._generate_flow_initialization_code(
+        statements = engine.workflow_manager.codegen._generate_flow_initialization_code(
             flow_initialization_command=None,
             import_recorder=ImportRecorder(),
             codegen_state=WorkflowCodegenState(),
@@ -175,7 +179,7 @@ class TestGenerateFlowInitializationCode:
     def test_create_flow_command_registers_subflow_name_variable(self, engine: Engine) -> None:
         codegen_state = WorkflowCodegenState()
         command = CreateFlowRequest(parent_flow_name=None, flow_name="named_flow")
-        statements = engine.workflow_manager._generate_flow_initialization_code(
+        statements = engine.workflow_manager.codegen._generate_flow_initialization_code(
             flow_initialization_command=command,
             import_recorder=ImportRecorder(),
             codegen_state=codegen_state,
@@ -187,7 +191,7 @@ class TestGenerateFlowInitializationCode:
 
     def test_import_workflow_command_emits_statements(self, engine: Engine) -> None:
         command = ImportWorkflowAsReferencedSubFlowRequest(workflow_name="referenced_workflow")
-        statements = engine.workflow_manager._generate_flow_initialization_code(
+        statements = engine.workflow_manager.codegen._generate_flow_initialization_code(
             flow_initialization_command=command,
             import_recorder=ImportRecorder(),
             codegen_state=WorkflowCodegenState(),
@@ -204,7 +208,7 @@ class TestGenerateFlowInitializationCode:
         without complaint. That is worse than a save the artist knows did not happen.
         """
         with pytest.raises(TypeError):
-            engine.workflow_manager._generate_flow_initialization_code(
+            engine.workflow_manager.codegen._generate_flow_initialization_code(
                 flow_initialization_command=object(),  # type: ignore[arg-type]
                 import_recorder=ImportRecorder(),
                 codegen_state=WorkflowCodegenState(),
@@ -217,7 +221,7 @@ class TestGenerateAssignFlowContext:
     """The `with` block that scopes graph-building calls into the right Flow."""
 
     def test_none_command_looks_up_the_current_flow_by_name(self, engine: Engine) -> None:
-        with_stmt = engine.workflow_manager._generate_assign_flow_context(
+        with_stmt = engine.workflow_manager.codegen._generate_assign_flow_context(
             flow_initialization_command=None, flow_creation_index=0
         )
         source = ast.unparse(with_stmt)
@@ -225,7 +229,7 @@ class TestGenerateAssignFlowContext:
 
     def test_create_flow_command_references_its_own_flow_variable(self, engine: Engine) -> None:
         command = CreateFlowRequest(parent_flow_name=None, flow_name="my_flow")
-        with_stmt = engine.workflow_manager._generate_assign_flow_context(
+        with_stmt = engine.workflow_manager.codegen._generate_assign_flow_context(
             flow_initialization_command=command, flow_creation_index=3
         )
         source = ast.unparse(with_stmt)
@@ -238,7 +242,7 @@ class TestGenerateCreateFlow:
     def test_emits_awaited_call_assigned_to_flow_name_variable(self, engine: Engine) -> None:
         command = CreateFlowRequest(parent_flow_name=None, flow_name="root_flow", set_as_new_context=False)
         import_recorder = ImportRecorder()
-        module = engine.workflow_manager._generate_create_flow(command, import_recorder, flow_creation_index=0)
+        module = engine.workflow_manager.codegen._generate_create_flow(command, import_recorder, flow_creation_index=0)
         source = ast.unparse(module)
         assert "flow0_name = (await GriptapeNodes.ahandle_request(CreateFlowRequest(" in source
         assert ").flow_name" in source
@@ -248,7 +252,7 @@ class TestGenerateCreateFlow:
 
     def test_parent_flow_name_becomes_a_variable_reference_not_a_string(self, engine: Engine) -> None:
         command = CreateFlowRequest(parent_flow_name="parent_flow", flow_name="child_flow")
-        module = engine.workflow_manager._generate_create_flow(
+        module = engine.workflow_manager.codegen._generate_create_flow(
             command, ImportRecorder(), flow_creation_index=1, parent_flow_creation_index=0
         )
         call = _calls_named(module, "CreateFlowRequest")[0]
@@ -258,7 +262,7 @@ class TestGenerateCreateFlow:
 
     def test_omits_optional_fields_left_at_their_default(self, engine: Engine) -> None:
         command = CreateFlowRequest(parent_flow_name=None, flow_name="root_flow")
-        module = engine.workflow_manager._generate_create_flow(command, ImportRecorder(), flow_creation_index=0)
+        module = engine.workflow_manager.codegen._generate_create_flow(command, ImportRecorder(), flow_creation_index=0)
         call = _calls_named(module, "CreateFlowRequest")[0]
         kwargs = _kwargs_of(call)
         assert "set_as_new_context" not in kwargs
@@ -275,7 +279,9 @@ class TestGenerateImportWorkflow:
     def test_emits_awaited_call_using_created_flow_name_attribute(self, engine: Engine) -> None:
         command = ImportWorkflowAsReferencedSubFlowRequest(workflow_name="referenced_workflow")
         import_recorder = ImportRecorder()
-        module = engine.workflow_manager._generate_import_workflow(command, import_recorder, flow_creation_index=2)
+        module = engine.workflow_manager.codegen._generate_import_workflow(
+            command, import_recorder, flow_creation_index=2
+        )
         source = ast.unparse(module)
         assert "flow2_name = (await GriptapeNodes.ahandle_request(ImportWorkflowAsReferencedSubFlowRequest(" in source
         assert ").created_flow_name" in source
@@ -291,7 +297,7 @@ class TestGenerateNodeCreationCode:
         node_command = _node_command(
             "node_a", node_type="FakeType", library="Fake Library", metadata={"position": {"x": 10, "y": 20}}
         )
-        statements = engine.workflow_manager._generate_node_creation_code(
+        statements = engine.workflow_manager.codegen._generate_node_creation_code(
             node_command,
             node_index=0,
             import_recorder=ImportRecorder(),
@@ -308,7 +314,7 @@ class TestGenerateNodeCreationCode:
     def test_registers_node_variable_name_for_downstream_references(self, engine: Engine) -> None:
         node_command = _node_command("node_a", node_uuid="uuid-a")
         node_uuid_to_node_variable_name: dict = {}
-        engine.workflow_manager._generate_node_creation_code(
+        engine.workflow_manager.codegen._generate_node_creation_code(
             node_command,
             node_index=7,
             import_recorder=ImportRecorder(),
@@ -319,7 +325,7 @@ class TestGenerateNodeCreationCode:
 
     def test_no_element_modification_commands_omits_with_block(self, engine: Engine) -> None:
         node_command = _node_command("node_a")
-        statements = engine.workflow_manager._generate_node_creation_code(
+        statements = engine.workflow_manager.codegen._generate_node_creation_code(
             node_command,
             node_index=0,
             import_recorder=ImportRecorder(),
@@ -331,7 +337,7 @@ class TestGenerateNodeCreationCode:
     def test_element_modification_commands_run_inside_node_context_and_skip_defaults(self, engine: Engine) -> None:
         add_parameter_command = AddParameterToNodeRequest(parameter_name="extra", default_value="hi", type="str")
         node_command = _node_command("node_a", element_modification_commands=[add_parameter_command])
-        statements = engine.workflow_manager._generate_node_creation_code(
+        statements = engine.workflow_manager.codegen._generate_node_creation_code(
             node_command,
             node_index=0,
             import_recorder=ImportRecorder(),
@@ -362,7 +368,7 @@ class TestGenerateConnectionsCode:
             target_node_uuid=SerializedNodeCommands.NodeUUID("b"),
             target_parameter_name="in",
         )
-        statements = engine.workflow_manager._generate_connections_code(
+        statements = engine.workflow_manager.codegen._generate_connections_code(
             serialized_connections=[connection],
             node_uuid_to_node_variable_name={
                 SerializedNodeCommands.NodeUUID("a"): "node0_name",
@@ -395,7 +401,7 @@ class TestGenerateConnectionsCode:
             target_parameter_name="in",
         )
         with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
-            statements = engine.workflow_manager._generate_connections_code(
+            statements = engine.workflow_manager.codegen._generate_connections_code(
                 serialized_connections=[connection],
                 node_uuid_to_node_variable_name={SerializedNodeCommands.NodeUUID("b"): "node1_name"},
                 import_recorder=ImportRecorder(),
@@ -432,7 +438,7 @@ class TestGenerateUniqueValuesCode:
     """The pool of encoded values shared by every SetParameterValueRequest in the file."""
 
     def test_empty_dict_returns_empty_module(self, engine: Engine) -> None:
-        module = engine.workflow_manager._generate_unique_values_code(
+        module = engine.workflow_manager.codegen._generate_unique_values_code(
             unique_parameter_uuid_to_values={}, prefix="top_level"
         )
         assert module.body == []
@@ -443,7 +449,7 @@ class TestGenerateUniqueValuesCode:
             SerializedNodeCommands.UniqueParameterValueUUID(value_key("value-a")): "value-a",
             SerializedNodeCommands.UniqueParameterValueUUID(value_key(pair)): pair,
         }
-        module = engine.workflow_manager._generate_unique_values_code(
+        module = engine.workflow_manager.codegen._generate_unique_values_code(
             unique_parameter_uuid_to_values=pool, prefix="top_level"
         )
 
@@ -456,7 +462,7 @@ class TestGenerateUniqueValuesCode:
         pool = {SerializedNodeCommands.UniqueParameterValueUUID("key"): (1, 2)}
 
         with pytest.raises(ValueError, match="not encoded"):
-            engine.workflow_manager._generate_unique_values_code(
+            engine.workflow_manager.codegen._generate_unique_values_code(
                 unique_parameter_uuid_to_values=pool, prefix="top_level"
             )
 
@@ -465,7 +471,7 @@ class TestGenerateUniqueValuesCode:
 
         rewrite_string_comments unwraps them afterward, same as the save pipeline does.
         """
-        module = engine.workflow_manager._generate_unique_values_code(
+        module = engine.workflow_manager.codegen._generate_unique_values_code(
             unique_parameter_uuid_to_values={SerializedNodeCommands.UniqueParameterValueUUID("key"): "value"},
             prefix="top_level",
         )
@@ -481,14 +487,14 @@ class TestGenerateSetParameterValueForNode:
     """The per-node `with` block that restores saved values and lock state."""
 
     def test_no_values_and_no_lock_emits_nothing(self, engine: Engine) -> None:
-        statements = engine.workflow_manager._generate_set_parameter_value_for_node(
+        statements = engine.workflow_manager.codegen._generate_set_parameter_value_for_node(
             "node0_name", [], "top_level_unique_values_dict", ImportRecorder(), lock_node_command=None
         )
         assert statements == []
 
     def test_lock_only_node_still_gets_a_context_block(self, engine: Engine) -> None:
         lock_command = SetLockNodeStateRequest(node_name=None, lock=True)
-        statements = engine.workflow_manager._generate_set_parameter_value_for_node(
+        statements = engine.workflow_manager.codegen._generate_set_parameter_value_for_node(
             "node0_name", [], "top_level_unique_values_dict", ImportRecorder(), lock_node_command=lock_command
         )
         assert len(statements) == 1
@@ -504,7 +510,7 @@ class TestGenerateSetParameterValueForNode:
             unique_value_uuid=SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4())),
         )
         lock_command = SetLockNodeStateRequest(node_name=None, lock=False)
-        statements = engine.workflow_manager._generate_set_parameter_value_for_node(
+        statements = engine.workflow_manager.codegen._generate_set_parameter_value_for_node(
             "node0_name",
             [indirect_command],
             "top_level_unique_values_dict",
@@ -531,7 +537,7 @@ class TestGenerateSetParameterValueCode:
             unique_value_uuid=SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4())),
         )
         with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
-            statements = engine.workflow_manager._generate_set_parameter_value_code(
+            statements = engine.workflow_manager.codegen._generate_set_parameter_value_code(
                 set_parameter_value_commands={missing_uuid: [indirect_command]},
                 lock_commands={},
                 node_uuid_to_node_variable_name={},
@@ -585,14 +591,14 @@ class TestGenerateWorkflowFileContentIntegration:
         )
 
     def test_composite_shape_generates_valid_python(self, engine: Engine) -> None:
-        content = engine.workflow_manager._generate_workflow_file_content(
+        content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
         )
         ast.parse(content)  # raises SyntaxError if codegen left invalid source behind
 
     def test_parent_flow_is_created_before_its_child_flow(self, engine: Engine) -> None:
-        content = engine.workflow_manager._generate_workflow_file_content(
+        content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
         )
@@ -600,7 +606,7 @@ class TestGenerateWorkflowFileContentIntegration:
         assert "parent_flow_name=flow0_name" in content
 
     def test_shared_value_is_stored_once_and_decoded_at_each_use(self, engine: Engine) -> None:
-        content = engine.workflow_manager._generate_workflow_file_content(
+        content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
         )
@@ -621,10 +627,10 @@ class TestGenerateWorkflowFileContentIntegration:
         """Re-saving an unchanged graph must not churn the diff."""
         flow_commands = self._composite_flow_commands()
         metadata = _minimal_metadata()
-        first = engine.workflow_manager._generate_workflow_file_content(
+        first = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=flow_commands, workflow_metadata=metadata
         )
-        second = engine.workflow_manager._generate_workflow_file_content(
+        second = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=flow_commands, workflow_metadata=metadata
         )
         assert first == second

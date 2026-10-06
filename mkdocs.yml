@@ -561,6 +561,7 @@ nav:
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py
+          - Example NodeError Node: development/custom_nodes/example_node_error_node.py
       - For Agents: for_agents.md
   - Reference:
       - Command Line Interface: reference/command_line_interface.md
