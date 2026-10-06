@@ -27,6 +27,7 @@ Griptape Nodes employs a specific search order to load settings from environment
 
     - The primary `.env` file is loaded from the system-wide user configuration directory: `xdg_config_home() / "griptape_nodes" / ".env"` (commonly `~/.config/griptape_nodes/.env`).
     - This file is intended for secrets like `GT_CLOUD_API_KEY`, `OPENAI_API_KEY`.
+    - To move the engine's own directories without changing `XDG_*` for every program the engine starts, set `GTN_CONFIG_DIR`, `GTN_DATA_DIR`, or `GTN_STATE_DIR` to an absolute path before the engine starts. Each one replaces the whole `griptape_nodes` directory it names (configuration, data, or state), so nothing is appended to it. Relative values are ignored.
 
     > You shouldn't interact with these files directly. Griptape Nodes manages your environment variables through its Settings dialog.
 

@@ -418,7 +418,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -442,7 +442,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -503,7 +503,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -538,7 +538,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -571,7 +571,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -610,7 +610,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -647,7 +647,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -689,7 +689,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 

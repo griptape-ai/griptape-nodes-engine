@@ -7,7 +7,6 @@ from typing import Literal, overload
 
 from dotenv import dotenv_values, get_key, set_key, unset_key
 from dotenv.main import DotEnv
-from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.retained_mode.events.app_events import SecretChanged
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -29,10 +28,11 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 
 logger = logging.getLogger("griptape_nodes")
 
-ENV_VAR_PATH = xdg_config_home() / "griptape_nodes" / ".env"
+ENV_VAR_PATH = engine_config_dir() / ".env"
 
 
 def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values: Mapping[str, str]) -> dict[str, str]:

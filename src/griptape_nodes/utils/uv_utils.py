@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 import uv
-from xdg_base_dirs import xdg_data_home
+
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 
 def find_uv_bin() -> str:
@@ -14,7 +15,7 @@ def find_uv_bin() -> str:
         Path to the uv binary to use
     """
     # Check for dedicated Griptape uv installation first
-    dedicated_uv_path = xdg_data_home() / "griptape_nodes" / "bin" / "uv"
+    dedicated_uv_path = engine_data_dir() / "bin" / "uv"
     if dedicated_uv_path.exists():
         return str(dedicated_uv_path)
 

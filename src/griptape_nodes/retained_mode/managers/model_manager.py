@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 from huggingface_hub import list_models, scan_cache_dir, snapshot_download
 from huggingface_hub import model_info as hf_model_info
 from huggingface_hub.utils.tqdm import tqdm
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.file import File, FileWriteError
@@ -61,6 +60,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import cancel_subprocess
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.model_download_errors import (
     RETRYABLE_KINDS,
     DownloadErrorKind,
@@ -456,7 +456,7 @@ class ModelManager(EngineScoped):
         Returns:
             Path: Path to the status directory, creating it if needed
         """
-        status_dir = xdg_data_home() / "griptape_nodes" / "model_downloads"
+        status_dir = engine_data_dir() / "model_downloads"
         status_dir.mkdir(parents=True, exist_ok=True)
         return status_dir
 

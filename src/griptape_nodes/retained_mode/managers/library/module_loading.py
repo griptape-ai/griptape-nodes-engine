@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from xdg_base_dirs import xdg_data_home
-
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
@@ -49,6 +47,7 @@ from griptape_nodes.serialization.type_names import (
     is_dynamic_module_name,
     register_stable_module_name,
 )
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -445,7 +444,7 @@ class LibraryModuleLoading(EngineScoped):
         any_nodes_loaded_successfully = False
 
         # Check if library is in old XDG location
-        old_xdg_libraries_path = xdg_data_home() / "griptape_nodes" / "libraries"
+        old_xdg_libraries_path = engine_data_dir() / "libraries"
         library_path_obj = Path(library_info.library_path)
         try:
             # Check if the library path is relative to the old XDG location
