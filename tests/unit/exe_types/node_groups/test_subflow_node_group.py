@@ -286,10 +286,11 @@ class TestCreateProxyParameterForConnection:
         assert request.serializable is serializable
 
 
-class TestProxySerializableOnReload:
-    """A workflow saved before proxies carried `serializable` replays them as serializable.
+class TestProxySerializable:
+    """A proxy saves its value only if every inner parameter it is connected to saves its own.
 
-    Its internal connections replay after the group exists, so they are where the flag is restored.
+    Recomputed on every connect and disconnect, including the internal connections replayed when a
+    workflow opens, which is how a proxy saved before proxies carried `serializable` gets it back.
     """
 
     @pytest.fixture
@@ -299,34 +300,62 @@ class TestProxySerializableOnReload:
     ) -> _MiniSubflowGroup:
         return _MiniSubflowGroup(name="G")
 
-    def _inner_node(self, group: _MiniSubflowGroup) -> MockNode:
-        node = MockNode("inner")
+    @pytest.fixture
+    def connections(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Connections on the proxy, which each test fills in."""
+        connections = Mock()
+        connections.get_incoming_connections_to_parameter.return_value = []
+        connections.get_outgoing_connections_from_parameter.return_value = []
+        monkeypatch.setattr(engine.flow_manager, "get_connections", lambda: connections)
+        return connections
+
+    @staticmethod
+    def _inner_input(group: _MiniSubflowGroup, *, serializable: bool) -> Mock:
+        node = MockNode(f"inner_{serializable}")
         node.parent_group = group
-        return node
+        return Mock(target_node=node, target_parameter=Parameter(name="x", tooltip="", serializable=serializable))
 
-    def test_right_rail_proxy_takes_the_inner_outputs_setting(self, group: _MiniSubflowGroup) -> None:
+    def test_right_rail_proxy_takes_the_inner_outputs_setting(
+        self, group: _MiniSubflowGroup, connections: Mock
+    ) -> None:
         proxy = Parameter(name="blob", tooltip="")
+        inner = MockNode("inner")
+        inner.parent_group = group
         inner_output = Parameter(name="blob", tooltip="", serializable=False)
+        connections.get_incoming_connections_to_parameter.return_value = [
+            Mock(source_node=inner, source_parameter=inner_output)
+        ]
 
-        group.after_incoming_connection(self._inner_node(group), inner_output, proxy)
-
-        assert proxy.serializable is False
-
-    def test_left_rail_proxy_takes_the_inner_inputs_setting(self, group: _MiniSubflowGroup) -> None:
-        proxy = Parameter(name="blob", tooltip="")
-        inner_input = Parameter(name="blob", tooltip="", serializable=False)
-
-        group.after_outgoing_connection(proxy, self._inner_node(group), inner_input)
+        group.after_incoming_connection(inner, inner_output, proxy)
 
         assert proxy.serializable is False
 
-    def test_an_outside_connection_leaves_the_proxy_alone(self, group: _MiniSubflowGroup) -> None:
+    def test_left_rail_proxy_follows_its_inner_inputs_through_a_disconnect(
+        self, group: _MiniSubflowGroup, connections: Mock
+    ) -> None:
         proxy = Parameter(name="blob", tooltip="")
-        outside_output = Parameter(name="blob", tooltip="", serializable=False)
+        saved = self._inner_input(group, serializable=True)
+        unsaved = self._inner_input(group, serializable=False)
+        connections.get_outgoing_connections_from_parameter.return_value = [saved, unsaved]
 
-        group.after_incoming_connection(MockNode("outside"), outside_output, proxy)
+        group.after_outgoing_connection(proxy, unsaved.target_node, unsaved.target_parameter)
+        assert proxy.serializable is False
 
+        connections.get_outgoing_connections_from_parameter.return_value = [saved]
+        group.after_outgoing_connection_removed(proxy, unsaved.target_node, unsaved.target_parameter)
         assert proxy.serializable is True
+
+    def test_an_outside_connection_leaves_the_proxy_alone(self, group: _MiniSubflowGroup, connections: Mock) -> None:
+        proxy = Parameter(name="blob", tooltip="", serializable=False)
+        outside = MockNode("outside")
+        outside_output = Parameter(name="blob", tooltip="")
+        connections.get_incoming_connections_to_parameter.return_value = [
+            Mock(source_node=outside, source_parameter=outside_output)
+        ]
+
+        group.after_incoming_connection(outside, outside_output, proxy)
+
+        assert proxy.serializable is False
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
