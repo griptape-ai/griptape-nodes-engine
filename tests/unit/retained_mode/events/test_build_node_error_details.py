@@ -388,7 +388,7 @@ class TestPrintedResponse:
         result = failed_while_running(exc)
 
         for details in _both_paths(result):
-            assert details.message == "Processing failed."
+            assert details.message == "Processing failed. proxy client error"
             assert details.response == response_json
         assert str(exc) in str(_executor_error(result))
 
@@ -410,8 +410,10 @@ class TestPrintedResponse:
             {"message": "Temperature is not supported."},
             {"detail": "Temperature is not supported."},
             {"error": "Temperature is not supported."},
+            {"status_detail": {"details": "Temperature is not supported.", "error": "bad_request"}},
+            {"status_detail": {"error": "Temperature is not supported."}},
         ],
-        ids=["error.message", "message", "detail", "error as text"],
+        ids=["error.message", "message", "detail", "error as text", "status_detail.details", "status_detail.error"],
     )
     def test_the_providers_explanation_stays_in_the_message(self, response: dict[str, Any]) -> None:
         details = build_node_error_details(NODE_NAME, ValueError(f"Request failed: {response}"))

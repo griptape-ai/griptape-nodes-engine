@@ -223,12 +223,16 @@ def _provider_reason(response: dict[str, Any]) -> str | None:
     The explanation is often the only part that says what to fix, such as which parameter the
     provider rejected, so it is kept in the message as well as in the response. These are the field
     names JSON APIs use for error text: ``error.message`` (OpenAI, Anthropic), ``message``,
-    ``detail`` (FastAPI), and ``error`` as a plain string.
+    ``detail`` (FastAPI), and ``error`` as a plain string. Griptape Cloud's proxy puts its
+    user-facing reason in ``status_detail.details``, or ``status_detail.error`` without one.
     """
     error = response.get("error")
     candidates = [response.get("message"), response.get("detail"), error]
     if isinstance(error, dict):
         candidates.insert(0, error.get("message"))
+    status_detail = response.get("status_detail")
+    if isinstance(status_detail, dict):
+        candidates.extend([status_detail.get("details"), status_detail.get("error")])
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
