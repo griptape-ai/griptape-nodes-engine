@@ -211,7 +211,34 @@ def _printed_response(text: str, response: dict[str, Any]) -> _PrintedResponse |
         return None
     if _sanitize_response(response) is None:
         return None
+    reason = _provider_reason(response)
+    if reason is not None and reason not in message:
+        message = _join_sentences(message, reason)
     return _PrintedResponse(message=message, response=response)
+
+
+def _provider_reason(response: dict[str, Any]) -> str | None:
+    """Return the provider's own explanation from the standard error fields, if the response has one.
+
+    The explanation is often the only part that says what to fix, such as which parameter the
+    provider rejected, so it is kept in the message as well as in the response. These are the field
+    names JSON APIs use for error text: ``error.message`` (OpenAI, Anthropic), ``message``,
+    ``detail`` (FastAPI), and ``error`` as a plain string.
+    """
+    error = response.get("error")
+    candidates = [response.get("message"), response.get("detail"), error]
+    if isinstance(error, dict):
+        candidates.insert(0, error.get("message"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _join_sentences(first: str, second: str) -> str:
+    if first.endswith((".", "!", "?")):
+        return f"{first} {second}"
+    return f"{first}. {second}"
 
 
 def _literal_dict(text: str) -> dict[str, Any] | None:

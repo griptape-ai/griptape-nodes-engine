@@ -5,6 +5,7 @@
   responding, `error.message` is the engine's text. `ExecuteNodeResultFailure.error` carries the
   same parts back from the process the node ran in. A provider response a node printed at the end
   of its message, such as "Full API response:" followed by a dict, is sent as `error.response`
-  and left out of `error.message`. `error_message` is unchanged.
+  and left out of `error.message`, except for the provider's own explanation, which stays in the
+  message. `error_message` is unchanged.
   [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733),
   [#5811](https://github.com/griptape-ai/griptape-nodes-engine/issues/5811)

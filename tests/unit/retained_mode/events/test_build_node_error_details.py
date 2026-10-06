@@ -398,8 +398,38 @@ class TestPrintedResponse:
 
         details = build_node_error_details(NODE_NAME, exc)
 
-        assert details.message == "Agent run failed because of an exception: Error code: 400"
+        assert details.message == (
+            "Agent run failed because of an exception: Error code: 400. Unsupported value: 'temperature'"
+        )
         assert details.response == body
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"error": {"message": "Temperature is not supported.", "code": "x"}},
+            {"message": "Temperature is not supported."},
+            {"detail": "Temperature is not supported."},
+            {"error": "Temperature is not supported."},
+        ],
+        ids=["error.message", "message", "detail", "error as text"],
+    )
+    def test_the_providers_explanation_stays_in_the_message(self, response: dict[str, Any]) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError(f"Request failed: {response}"))
+
+        assert details.message == "Request failed. Temperature is not supported."
+        assert details.response == response
+
+    def test_a_response_without_an_explanation_leaves_the_message_short(self) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError("Request failed.\nResponse:\n{'status': 'ERRORED'}"))
+
+        assert details.message == "Request failed."
+
+    def test_an_explanation_already_in_the_message_is_not_repeated(self) -> None:
+        exc = ValueError("Temperature is not supported: {'message': 'Temperature is not supported'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Temperature is not supported"
 
     def test_response_after_a_colon_moves_to_response(self) -> None:
         details = build_node_error_details(NODE_NAME, ValueError("Request failed: {'status': 'ERRORED'}"))
