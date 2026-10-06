@@ -2776,6 +2776,17 @@ class NodeManager(EngineScoped):
             result = SetParameterValueResultFailure(result_details=details)
             return result
 
+        # A node reads an unconnected list from its rows, so a whole list set by request has to become rows.
+        if (
+            isinstance(parameter, ParameterList)
+            and isinstance(request.value, list)
+            and not request.initial_setup
+            and not request.is_output
+            and not incoming_node_set
+            and not node._param_has_incoming_connection(param_name)
+        ):
+            return self._set_parameter_list_as_rows(node, parameter, request.value)
+
         try:
             parent_flow_name = self.get_node_parent_flow_by_name(node.name)
         except KeyError:
@@ -2873,6 +2884,84 @@ class NodeManager(EngineScoped):
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
         )
         return result
+
+    def _set_parameter_list_as_rows(
+        self, node: BaseNode, parameter_list: ParameterList, items: list[Any]
+    ) -> SetParameterValueResultSuccess | SetParameterValueResultFailure:
+        """Replace a ParameterList's rows with one row per item, the way the editor fills a list.
+
+        Each row is added and set by request, so the node's hooks for its rows fire and the rows are
+        what the editor shows and a saved workflow keeps.
+        """
+        list_label = f"'{node.name}.{parameter_list.name}'"
+        max_items = parameter_list.max_items
+        if max_items is not None and len(items) > max_items:
+            details = f"Attempted to set list {list_label} to {len(items)} items. Failed because the list holds at most {max_items} items."
+            return SetParameterValueResultFailure(result_details=details)
+
+        rows = parameter_list.get_child_parameters()
+        connected_row_names = self._connected_parameter_names(node, {row.name for row in rows})
+        if connected_row_names is None:
+            details = f"Attempted to set list {list_label}. Failed because its items' connections could not be listed."
+            return SetParameterValueResultFailure(result_details=details)
+        if connected_row_names:
+            details = f"Attempted to set list {list_label}. Failed because some of its items are connected to other nodes, and replacing the items would remove those connections. Disconnect them first."
+            return SetParameterValueResultFailure(result_details=details)
+
+        old_value = node._get_raw_parameter_value(parameter_list.name)
+        failure = self._replace_list_rows(node, parameter_list, rows, items)
+        finalized_value = node._get_raw_parameter_value(parameter_list.name)
+        # Row sets only unresolve when a row's own value changed, which misses removed rows. A failure
+        # partway through has changed the list too.
+        if old_value != finalized_value:
+            self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
+            node.make_node_unresolved(current_states_to_trigger_change_event=set({NodeResolutionState.RESOLVED}))
+
+        if failure is not None:
+            details = f"Attempted to set list {list_label}. Failed because {failure} The list was left partly replaced."
+            return SetParameterValueResultFailure(result_details=details)
+
+        details = f"Successfully set list {list_label} to {len(items)} items."
+        return SetParameterValueResultSuccess(
+            finalized_value=finalized_value, data_type=parameter_list.type, result_details=details
+        )
+
+    def _replace_list_rows(
+        self, node: BaseNode, parameter_list: ParameterList, rows: list[Parameter], items: list[Any]
+    ) -> str | None:
+        """Remove `rows`, then add and set one row per item. Returns why it stopped, or None when done."""
+        for row in rows:
+            remove_result = self.engine.handle_request(
+                RemoveParameterFromNodeRequest(node_name=node.name, parameter_name=row.name)
+            )
+            if not isinstance(remove_result, RemoveParameterFromNodeResultSuccess):
+                return f"its existing item '{row.name}' could not be removed."
+
+        for index, item in enumerate(items):
+            add_result = self.engine.handle_request(
+                AddParameterToNodeRequest(node_name=node.name, parent_container_name=parameter_list.name)
+            )
+            if not isinstance(add_result, AddParameterToNodeResultSuccess):
+                return f"item {index + 1} could not be added."
+            set_result = self.engine.handle_request(
+                SetParameterValueRequest(node_name=node.name, parameter_name=add_result.parameter_name, value=item)
+            )
+            if not isinstance(set_result, SetParameterValueResultSuccess):
+                return f"item {index + 1} could not be set: {set_result.result_details}"
+
+        if not items:
+            # No row was set to refresh the list's own entry, which still holds the removed rows' values.
+            node.set_parameter_value(parameter_list.name, [])
+        return None
+
+    def _connected_parameter_names(self, node: BaseNode, parameter_names: set[str]) -> set[str] | None:
+        """Which of `parameter_names` on `node` have a connection in either direction, or None if unknown."""
+        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=node.name, broadcast_result=False))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
+            return None
+        connected = {connection.target_parameter_name for connection in result.incoming_connections}
+        connected.update(connection.source_parameter_name for connection in result.outgoing_connections)
+        return connected & parameter_names
 
     def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
         """Discard the output value that the set we just applied has invalidated.
