@@ -44,6 +44,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterSandboxNodeFromSourceRequest,
     RegisterSandboxNodeFromSourceResultFailure,
     RegisterSandboxNodeFromSourceResultSuccess,
+    ReloadAllLibrariesRequest,
+    ReloadAllLibrariesResultSuccess,
     ReloadSandboxLibraryRequest,
     ReloadSandboxLibraryResultFailure,
     ReloadSandboxLibraryResultSuccess,
@@ -1040,6 +1042,20 @@ class TestSandboxTurnedOff:
         assert expected in str(result.result_details)
 
     @pytest.mark.asyncio
+    async def test_an_unreadable_setting_in_a_config_file_says_how_to_allow_it(
+        self, engine: Engine, configure: Configure
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        # The validator reads "yes" as unset, so environment mode keeps the sandbox off; the reason
+        # must say so rather than claim the setting is false.
+        engine.config_manager.set_config_value("library.sandbox_enabled", "yes")
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "does not include a sandbox library. Set library.sandbox_enabled to true" in str(result.result_details)
+
+    @pytest.mark.asyncio
     async def test_overlapping_reloads_run_one_at_a_time(
         self, engine: Engine, configure: Configure, tmp_path: Path
     ) -> None:
@@ -1054,4 +1070,65 @@ class TestSandboxTurnedOff:
 
         assert isinstance(first, ReloadSandboxLibraryResultSuccess), first.result_details
         assert isinstance(second, ReloadSandboxLibraryResultSuccess), second.result_details
+        assert LibraryManager.SANDBOX_LIBRARY_NAME in LibraryRegistry.list_libraries()
+
+
+class TestSandboxReloadAndFullReload:
+    """A sandbox reload and a reload of every library never run at the same time."""
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_reload_waits_for_a_running_full_reload(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        # Stand in for a full reload in progress.
+        library_manager._close_libraries_loading_gate()
+        gate = library_manager._libraries_loading_complete
+
+        reload = asyncio.create_task(engine.ahandle_request(ReloadSandboxLibraryRequest()))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not reload.done()
+
+        gate.set()
+        result = await reload
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess), result.result_details
+        assert library_manager._libraries_loading_complete.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_full_reload_waits_for_a_sandbox_reload(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [])
+        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock())
+        registration = library_manager.registration
+        register = registration.register_library_from_file_request
+        full_reload: list[asyncio.Task] = []
+
+        async def register_while_a_full_reload_starts(request: RegisterLibraryFromFileRequest) -> object:
+            # Only the sandbox reload's own register runs here; the full reload below must wait.
+            monkeypatch.setattr(registration, "register_library_from_file_request", register)
+            assert not library_manager._libraries_loading_complete.is_set()
+            full_reload.append(asyncio.create_task(engine.ahandle_request(ReloadAllLibrariesRequest())))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not full_reload[0].done()
+            assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+            return await register(request)
+
+        monkeypatch.setattr(registration, "register_library_from_file_request", register_while_a_full_reload_starts)
+
+        sandbox_result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+        full_result = await full_reload[0]
+
+        assert isinstance(sandbox_result, ReloadSandboxLibraryResultSuccess), sandbox_result.result_details
+        assert isinstance(full_result, ReloadAllLibrariesResultSuccess), full_result.result_details
         assert LibraryManager.SANDBOX_LIBRARY_NAME in LibraryRegistry.list_libraries()

@@ -876,7 +876,8 @@ class ReloadSandboxLibraryRequest(RequestPayload):
     Unregisters the sandbox library, rescans `sandbox_library_directory`, and registers it again.
     Every other library stays loaded and no worker process is restarted, so unlike
     ReloadAllLibrariesRequest this does not clear workflow state. Nodes already in a workflow keep
-    the class they were created with until they are recreated.
+    the class they were created with until they are recreated. It never runs alongside
+    ReloadAllLibrariesRequest: whichever starts second waits for the first to finish.
 
     It fails when the sandbox is off (`library.sandbox_enabled`; off by default when
     `library.provisioned_by` is 'environment').

@@ -111,7 +111,8 @@ the editor, **Refresh Sandbox** sends it (see
 [griptape-vsl-gui#3130](https://github.com/griptape-ai/griptape-vsl-gui/pull/3130)). Nodes already
 in a workflow keep the version they were created with until you recreate them. If the reload fails
 partway, for example because of a typo in one node file, the sandbox stays unloaded until a reload
-succeeds. When the sandbox is off, the request fails with a message saying why.
+succeeds. A sandbox reload and a reload of every library never overlap: whichever starts second
+waits for the first to finish. When the sandbox is off, the request fails with a message saying why.
 
 ### `worker.command_prefix`
 

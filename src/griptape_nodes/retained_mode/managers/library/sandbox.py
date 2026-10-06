@@ -354,8 +354,9 @@ class LibrarySandbox(EngineScoped):
         Every other library stays loaded and no worker is restarted, which is what lets an artist
         pick up a new sandbox node in a studio environment without relaunching. Workflow state is
         not cleared; nodes already in a workflow keep the class they were created with. Reloads run
-        one at a time. If the rescan or register fails after the unload, the sandbox stays unloaded
-        until a reload succeeds, as with ReloadAllLibrariesRequest.
+        one at a time, and never alongside a reload of every library. If the rescan or register
+        fails after the unload, the sandbox stays unloaded until a reload succeeds, as with
+        ReloadAllLibrariesRequest.
         """
         managed = self.engine.library_manager.managed_environment
         if not managed.sandbox_enabled():
@@ -373,7 +374,7 @@ class LibrarySandbox(EngineScoped):
             )
 
         async with self._sandbox_reload_lock:
-            return await self._reload_sandbox_library()
+            return await self._reload_sandbox_library_behind_gate()
 
     async def attempt_generate_sandbox_library_from_schema(  # noqa: C901
         self,
@@ -547,10 +548,27 @@ class LibrarySandbox(EngineScoped):
 
         return True
 
-    async def _reload_sandbox_library(self) -> ResultPayload:
-        # A reload of everything may be rebuilding the registry; unloading mid-rebuild would race it.
-        await self.engine.library_manager._libraries_loading_complete.wait()
+    async def _reload_sandbox_library_behind_gate(self) -> ResultPayload:
+        """Run the reload with the libraries-loading gate closed, as a reload of every library does.
 
+        Waiting for the gate to open lets a running reload of every library finish first. Closing
+        it then keeps a new one out until this reload is done: ReloadAllLibrariesRequest lists the
+        registered libraries through a gated query before it unloads anything, so it waits here
+        instead of unloading the sandbox mid-register. Library queries wait too, rather than
+        seeing the sandbox missing.
+        """
+        library_manager = self.engine.library_manager
+        # Loop because another coroutine may close the gate between it opening and this resuming.
+        while not library_manager._libraries_loading_complete.is_set():
+            await library_manager._libraries_loading_complete.wait()
+        library_manager._close_libraries_loading_gate()
+        gate = library_manager._libraries_loading_complete
+        try:
+            return await self._reload_sandbox_library()
+        finally:
+            gate.set()
+
+    async def _reload_sandbox_library(self) -> ResultPayload:
         registration = self.engine.library_manager.registration
         if is_library_name_registered(SANDBOX_LIBRARY_NAME):
             unload_result = registration.unload_library_from_registry_request(

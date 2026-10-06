@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.managers.external_environment import (
     provisioned_by_environment,
+    read_sandbox_enabled,
     sandbox_enabled,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import LibraryNotProvidedByEnvironmentProblem
@@ -56,11 +57,12 @@ class LibraryManagedEnvironment(EngineScoped):
         return sandbox_enabled(self.engine.config_manager)
 
     def sandbox_off_message(self, attempted: str) -> str:
-        """Why a sandbox action was refused, for the mode the engine runs in."""
-        if (
-            self.provisioned_by_environment()
-            and self.engine.config_manager.get_config_value(LIBRARY_SANDBOX_ENABLED_KEY, default=None) is None
-        ):
+        """Why a sandbox action was refused, for the mode the engine runs in.
+
+        Reads the setting the same way `sandbox_enabled` does, so a value the validator could not
+        read counts as unset here too.
+        """
+        if self.provisioned_by_environment() and read_sandbox_enabled(self.engine.config_manager) is None:
             return (
                 f"Attempted to {attempted}. Failed because the engine is running in an environment that provides "
                 f"its libraries, and this environment does not include a sandbox library. Set "
