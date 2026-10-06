@@ -33,7 +33,7 @@ Use this node when you want to:
 
 - **Your own parameters** - returned to the caller as the workflow's outputs
 
-**was_successful** (in the **Status** group) is a read-only property, not a pin: `true` if the flow arrived through **Succeeded**, `false` if through **Failed**. It's returned to a caller alongside your own outputs when the workflow runs from the terminal.
+**was_successful** (in the **Status** group) is a read-only property, not a pin: `true` if the flow arrived through **Succeeded**, `false` if through **Failed**. When the workflow runs from the terminal, its output also carries `was_successful`, `result_details`, and the control input the flow arrived through.
 
 ## Example
 

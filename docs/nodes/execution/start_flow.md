@@ -45,7 +45,7 @@ Running it from the terminal now takes `--topic` and returns `text`. **Publish W
 
 - A workflow can run in the editor without a Start Flow. You need one, plus an [End Flow](end_flow.md), for the workflow to have inputs and outputs
 - A workflow can have more than one Start Flow; all their parameters become inputs
-- Control parameters such as **Flow Out** don't become inputs
+- Control parameters such as **Flow Out** aren't inputs of a workflow used as a node. The terminal command still lists them (`--exec_out`); leave them unset
 - Library authors can ship a workflow as a node whose inputs are its Start Flow parameters; see [Nodes From Workflow Files](../../development/custom_nodes/authoring_libraries.md#nodes-from-workflow-files)
 
 ## Common Issues
