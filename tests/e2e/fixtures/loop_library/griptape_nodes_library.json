@@ -50,6 +50,24 @@
       }
     },
     {
+      "class_name": "LoopJoinNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Joins its `prefix` and `item` inputs into its `result` output",
+        "display_name": "Loop Join"
+      }
+    },
+    {
+      "class_name": "LoopResultsNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Copies its `items` list input to its `result` output",
+        "display_name": "Loop Results"
+      }
+    },
+    {
       "class_name": "LoopStartNode",
       "file_path": "loop_nodes.py",
       "metadata": {
