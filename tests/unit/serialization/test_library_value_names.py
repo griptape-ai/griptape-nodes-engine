@@ -59,7 +59,7 @@ class TestLibraryValueNames:
         monkeypatch.setattr(importlib.machinery.SourceFileLoader, "exec_module", fail)
 
         with pytest.raises(ImportError):
-            engine.library_manager._load_module_from_file(file_path, library_name)
+            engine.library_manager.module_loading.load_module_from_file(file_path, library_name)
 
         assert encode_value(library_module.FixtureMode.SLOW) == {
             TYPE_KEY: f"{_STABLE_MODULE}:FixtureMode",

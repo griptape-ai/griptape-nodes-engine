@@ -21,8 +21,8 @@ came from, so it passes through to a process that can build it.
 
 A value with no plain-data form is handled by where it is going:
 
-- Read back later (workflow save, copy and paste, packaged loop and group flows): leave it out and
-  log a warning. Never save its text in its place.
+- Read back later (workflow save, copy and paste, exported images, packaged loop and group flows):
+  leave it out and log a warning. Never save its text in its place.
 - Needed live (a node's inputs and outputs across a process boundary): fail with an error naming
   the parameter.
 - Sent to a caller (a flow's result values, flow variables): send ``None`` and log a warning.
@@ -36,6 +36,7 @@ import dataclasses
 import datetime
 import decimal
 import enum
+import hashlib
 import inspect
 import json
 import logging
@@ -67,6 +68,10 @@ VALUE_KEY = "$value"
 
 type Value = Any
 """Any parameter value. Payload fields annotated with it cross the wire as tagged plain data."""
+
+type DisplayValue = Any
+"""A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
+that a value with no plain-data form is sent as its text instead of failing."""
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
@@ -114,6 +119,29 @@ def try_encode(value: Any) -> JsonValue | Unencodable:
         return Unencodable(str(error))
 
 
+def encodable_default(default_value: Any, node_name: str | None, parameter_name: str | None) -> Any:
+    """Return ``default_value``, or None with a logged warning if it has no plain-data form."""
+    encoded = try_encode(default_value)
+    if not isinstance(encoded, Unencodable):
+        return default_value
+    logger.warning(
+        "Attempted to save the default value of parameter '%s' on node '%s'. Failed because %s "
+        "The parameter will reopen without that default.",
+        parameter_name,
+        node_name,
+        encoded.reason,
+    )
+    return None
+
+
+def encode_for_display(value: Any) -> JsonValue:
+    """Return ``value`` encoded, or as its text if it has no plain-data form, for showing to a person."""
+    encoded = try_encode(value)
+    if isinstance(encoded, Unencodable):
+        return str(value)
+    return encoded
+
+
 def decode_value(data: Any) -> Any:
     """Rebuild the value ``encode_value`` produced ``data`` from.
 
@@ -127,6 +155,29 @@ def decode_value(data: Any) -> Any:
     if TYPE_KEY not in data:
         return {key: decode_value(item) for key, item in data.items()}
     return _decode_tagged(data)
+
+
+def is_plain_data(value: Any) -> bool:
+    """Whether ``value`` is already in the form ``encode_value`` returns: JSON types only."""
+    if value is None or type(value) in (bool, int, str):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(is_plain_data(item) for item in value)
+    if type(value) is dict:
+        return all(type(key) is str and is_plain_data(item) for key, item in value.items())
+    return False
+
+
+def value_key(encoded: JsonValue) -> str:
+    """A key that is the same for every encoding of equal content, for pooling saved values."""
+    return hashlib.sha256(_canonical_json(encoded).encode("utf-8")).hexdigest()[:32]
+
+
+def has_plain_data_form(cls: type) -> bool:
+    """Whether instances of ``cls`` encode to plain data that decodes back to ``cls``."""
+    return cls in _PLAIN_TYPES or cls in _BUILTIN_DECODERS or _codec_for(cls) is not None
 
 
 class SavesState(Protocol):
@@ -486,6 +537,8 @@ class _Registration:
 
 
 _LIBRARY_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
+
+_PLAIN_TYPES: frozenset[type] = frozenset({type(None), bool, int, str, list, dict})
 
 _BUILTIN_DECODERS: dict[type, Any] = {
     tuple: tuple,

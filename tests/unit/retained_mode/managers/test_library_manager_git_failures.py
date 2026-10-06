@@ -20,15 +20,13 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryRequest,
     UpdateLibraryResultFailure,
 )
-from griptape_nodes.retained_mode.managers.library_manager import (
-    LibraryGitOperationContext,
-)
+from griptape_nodes.retained_mode.managers.library.git_operations import LibraryGitOperationContext
 from griptape_nodes.utils.git_utils import GitError, GitNotFoundError
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
-LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
+LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library.git_operations"
 LIBRARY_DIR = Path("/var/lib/test_lib")
 
 
@@ -69,7 +67,7 @@ class TestCheckLibraryUpdateRequestGitFailures:
             patch.object(library_manager, "get_library_info_by_library_name", return_value=_library_info()),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", side_effect=GitNotFoundError("git was not found on PATH")),
         ):
-            result = await library_manager.check_library_update_request(
+            result = await library_manager.git_operations.check_library_update_request(
                 CheckLibraryUpdateRequest(library_name="test_lib")
             )
 
@@ -89,7 +87,7 @@ class TestCheckLibraryUpdateRequestGitFailures:
             patch(f"{LIBRARY_MANAGER_MODULE}.get_current_ref", return_value="main"),
             patch(f"{LIBRARY_MANAGER_MODULE}.get_local_commit_sha", side_effect=GitError("boom")),
         ):
-            result = await library_manager.check_library_update_request(
+            result = await library_manager.git_operations.check_library_update_request(
                 CheckLibraryUpdateRequest(library_name="test_lib")
             )
 
@@ -111,7 +109,7 @@ class TestCheckLibraryUpdateRequestGitFailures:
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=True),
             patch(f"{LIBRARY_MANAGER_MODULE}.get_git_info", return_value=(None, None)),
         ):
-            result = await library_manager.check_library_update_request(
+            result = await library_manager.git_operations.check_library_update_request(
                 CheckLibraryUpdateRequest(library_name="test_lib")
             )
 
@@ -131,14 +129,14 @@ class TestUpdateLibraryRequestGitFailures:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=_validation_context()),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", side_effect=GitNotFoundError("git was not found on PATH")),
             patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git") as mock_update_git,
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 

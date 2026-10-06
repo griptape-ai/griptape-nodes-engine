@@ -1,4 +1,4 @@
-"""Tests for get_post_dispatch_hooks() registration in _attempt_load_nodes_from_library."""
+"""Tests for get_post_dispatch_hooks() registration in attempt_load_nodes_from_library."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _make_library(advanced_library: AdvancedNodeLibrary | None = None) -> Librar
 
 
 def _load(lm: LibraryManager, library: Library, library_info: LibraryManager.LibraryInfo) -> None:
-    lm._attempt_load_nodes_from_library(
+    lm.module_loading.attempt_load_nodes_from_library(
         library_data=library._library_data,
         library=library,
         base_dir=Path("/fake"),

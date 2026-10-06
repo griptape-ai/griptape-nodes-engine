@@ -406,9 +406,9 @@ class TestLibraryUnloadClears:
 
         with (
             patch.object(LibraryRegistry, "unregister_library"),
-            patch.object(engine.library_manager, "_unregister_all_stable_module_aliases_for_library"),
+            patch.object(engine.library_manager.module_loading, "unregister_all_stable_module_aliases_for_library"),
         ):
-            result = engine.library_manager.unload_library_from_registry_request(
+            result = engine.library_manager.registration.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name="MyLib")
             )
 
