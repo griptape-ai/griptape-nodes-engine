@@ -64,7 +64,7 @@ def _generate(engine: Engine, serialized_flow_commands: SerializedFlowCommands) 
         node_libraries_referenced=[],
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata
     )
 

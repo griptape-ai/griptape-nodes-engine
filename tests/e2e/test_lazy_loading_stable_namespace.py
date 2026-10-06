@@ -192,7 +192,7 @@ def _generate_payload_workflow_source(engine: Engine, library_json: Path, *, laz
         # Skip the executable wrapper; we only need build_workflow to run end-to-end.
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )

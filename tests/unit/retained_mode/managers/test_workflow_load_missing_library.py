@@ -82,7 +82,8 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     MissingCreationDateProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
-from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
+from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -258,7 +259,7 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
     serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=_FLOW_NAME))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
-    save_result = engine.workflow_manager._save_workflow_file_inline(
+    save_result = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -278,7 +279,7 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
     """Serialize `flow_name` and write it to `tmp_path` the way SaveWorkflowRequest does."""
     serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
-    saved = engine.workflow_manager._save_workflow_file_inline(
+    saved = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialized.serialized_flow_commands,
         file_name=file_stem,
@@ -357,7 +358,7 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path=relative_file_path))
+    return asyncio.run(engine.workflow_manager.runner.run_workflow(relative_file_path=relative_file_path))
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:
@@ -486,7 +487,7 @@ class TestEveryLibraryUnavailable:
         # One problem per library, not one per node...
         assert {problem.library_name for problem in result.problems} == {_AVAILABLE_LIBRARY, _UNAVAILABLE_LIBRARY}
         # ...and both collate into a single warning, because they are the same problem type.
-        assert len(reopened.workflow_manager.collate_problems_by_type(result.problems)) == 1
+        assert len(collate_problems_by_type(result.problems)) == 1
         assert isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
         # The flow itself is engine-owned, so it is there to hold them.
@@ -870,7 +871,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         result = _run(reopened, host_path)
 
         assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
-        collated = reopened.workflow_manager.collate_problems_by_type(result.problems)
+        collated = collate_problems_by_type(result.problems)
         assert len(collated) == 1
         assert "2 libraries" not in collated[0]
 
@@ -906,8 +907,8 @@ class TestConcurrentLoadsDoNotCrossContaminate:
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
-                reopened.workflow_manager.run_workflow(relative_file_path=host_path),
-                reopened.workflow_manager.run_workflow(relative_file_path=inner_path),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path),
             )
 
         host_result, sibling_result = asyncio.run(load_both())
@@ -930,16 +931,16 @@ class TestConcurrentLoadsDoNotCrossContaminate:
             return [p.library_name for p in problems if isinstance(p, LibraryNotRegisteredProblem)]
 
         async def load_with_subflow() -> list[str]:
-            with WorkflowManager.LoadProblemFrame() as outer:
+            with LoadProblemFrame() as outer:
                 outer.problems.append(LibraryNotRegisteredProblem(library_name="Outer Library"))
                 await asyncio.sleep(0)  # let the sibling open its frame beneath this one
-                with WorkflowManager.LoadProblemFrame() as inner:
+                with LoadProblemFrame() as inner:
                     inner.problems.append(LibraryNotRegisteredProblem(library_name="Subflow Library"))
                     await asyncio.sleep(0)
                 return _library_names(outer.problems)
 
         async def sibling_load() -> list[str]:
-            with WorkflowManager.LoadProblemFrame() as frame:
+            with LoadProblemFrame() as frame:
                 frame.problems.append(LibraryNotRegisteredProblem(library_name="Sibling Library"))
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
@@ -1025,7 +1026,7 @@ class TestSuppressionIsKeyedToLibraryProblems:
         # Stand in for a future problem type: present, but not about library registration.
         other_problem = MissingCreationDateProblem(default_date="1970-01-01")
         with patch.object(
-            reopened.workflow_manager,
+            reopened.workflow_manager.runner,
             "_ensure_libraries_for_workflow",
             AsyncMock(return_value=[other_problem]),
         ):

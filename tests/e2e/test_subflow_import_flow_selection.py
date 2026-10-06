@@ -2,7 +2,7 @@
 
 A workflow that contains a node group (ForEach, etc.) serializes as MORE THAN ONE flow — its
 top-level ``ControlFlow`` plus the group's body flow. When such a workflow is imported as a
-referenced sub-flow, ``WorkflowManager._execute_workflow_import`` must bind to the TOP-LEVEL
+referenced sub-flow, ``ReferencedWorkflowImport._execute_workflow_import`` must bind to the TOP-LEVEL
 imported flow (the one that holds the Start/End nodes), because that is what the Workflow node
 records as its ``subflow_name`` and routes I/O through.
 """
@@ -100,7 +100,7 @@ def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_pa
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    content = engine.workflow_manager._generate_workflow_file_content(
+    content = engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
