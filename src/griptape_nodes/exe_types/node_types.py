@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+import attrs
+from griptape.artifacts import BaseArtifact
+
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
@@ -2289,9 +2292,45 @@ def _values_differ(old_value: Any, new_value: Any) -> bool:
     if old_value is new_value:
         return False
     try:
-        return bool(old_value != new_value)
+        return not _same_content(old_value, new_value)
     except (ValueError, TypeError):
         return True
+
+
+def _same_content(old_value: Any, new_value: Any) -> bool:
+    """`==`, except that artifacts compare by content.
+
+    `BaseArtifact.id` defaults to a random hex and takes part in `__eq__`, so two artifacts built from
+    the same input compare unequal. A converter that builds a fresh artifact on every set would then
+    read as an edit and unresolve everything downstream.
+    """
+    if isinstance(old_value, BaseArtifact) and isinstance(new_value, BaseArtifact):
+        return _same_artifact_content(old_value, new_value)
+    if isinstance(old_value, list | tuple) and type(new_value) is type(old_value):
+        if len(old_value) != len(new_value):
+            return False
+        return all(_same_content(old_item, new_item) for old_item, new_item in zip(old_value, new_value, strict=True))
+    if isinstance(old_value, dict) and isinstance(new_value, dict):
+        if old_value.keys() != new_value.keys():
+            return False
+        return all(_same_content(old_value[key], new_value[key]) for key in old_value)
+    return bool(old_value == new_value)
+
+
+def _same_artifact_content(old_artifact: BaseArtifact, new_artifact: BaseArtifact) -> bool:
+    if type(old_artifact) is not type(new_artifact):
+        return False
+    for attribute in attrs.fields(type(old_artifact)):
+        if not attribute.eq or attribute.name == "id":
+            continue
+        old_field = getattr(old_artifact, attribute.name)
+        new_field = getattr(new_artifact, attribute.name)
+        # `name` defaults to the id, so a defaulted name is as random as the id.
+        if attribute.name == "name" and old_field == old_artifact.id and new_field == new_artifact.id:
+            continue
+        if not _same_content(old_field, new_field):
+            return False
+    return True
 
 
 class TrackedParameterOutputValues(dict[str, Any]):

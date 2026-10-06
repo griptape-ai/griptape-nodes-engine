@@ -2907,9 +2907,8 @@ class NodeManager(EngineScoped):
         # If the value should be set on the output dictionary:
         if request.is_output:
             # set it to output values
-            if (
-                request.parameter_name in node.parameter_output_values
-                and node.parameter_output_values[request.parameter_name] != object_created
+            if request.parameter_name in node.parameter_output_values and _values_differ(
+                node.parameter_output_values[request.parameter_name], object_created
             ):
                 modified = True
             node.parameter_output_values[request.parameter_name] = object_created
@@ -2922,7 +2921,7 @@ class NodeManager(EngineScoped):
         )
         # Get the "converted" value here.
         finalized_value = node._get_raw_parameter_value(request.parameter_name)
-        if old_value != finalized_value:
+        if _values_differ(old_value, finalized_value):
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
         return NodeManager.ModifiedReturnValue(finalized_value, modified)
