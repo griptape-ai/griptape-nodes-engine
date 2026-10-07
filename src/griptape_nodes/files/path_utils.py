@@ -51,9 +51,6 @@ _STATIC_SERVER_WORKSPACE_SEGMENT = "/workspace/"
 # the file's absolute path without its leading slash.
 _STATIC_SERVER_EXTERNAL_PREFIX = "/external/"
 
-# A Windows drive at the start of an external URL path (`C:/Users/...`).
-_WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:/")
-
 # A `file://` netloc that is actually a drive letter, from a hand-written or legacy URI
 # (`file://C:/Users/...`, `file://c|/Users/...`). This names a local Windows path, not a
 # UNC host, and is folded into the local-path branch of parse_file_uri.
@@ -451,7 +448,8 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     # Strip the version/cachebuster query (`?v=...`) before parsing: it is addressing
     # metadata for the HTTP server, not part of the filename.
     url_without_query = location.split("?", maxsplit=1)[0]
-    parsed = urlparse(url_without_query)
+    # These URLs are not percent-encoded, so a `#` is part of the filename, not a fragment.
+    parsed = urlparse(url_without_query, allow_fragments=False)
 
     # Checked before the workspace segment, which an external file's own path may contain.
     if parsed.path.startswith(_STATIC_SERVER_EXTERNAL_PREFIX):

@@ -195,9 +195,8 @@ def normalize_artifact_input(
         if isinstance(inner, str) and inner:
             normalized = _normalize_string_input(inner, artifact_type)
             # That branch hands back its own input when a path cannot be resolved, such as a
-            # macro path or a missing file. The dict already
-            # declared the artifact type, so build it from the value instead of letting a
-            # dict degrade into a bare string.
+            # macro path or a missing file. The dict already declared the artifact type, so
+            # build it from the value instead of letting a dict degrade into a bare string.
             if isinstance(normalized, str):
                 return artifact_type(normalized)
             return normalized

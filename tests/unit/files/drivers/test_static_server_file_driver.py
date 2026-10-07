@@ -61,7 +61,6 @@ class TestStaticServerFileDriver:
         assert driver.can_handle("http://localhost:3000/workspace/static_files/test.png") is True
 
     def test_can_handle_localhost_external(self, driver: StaticServerFileDriver) -> None:
-        """Test that driver handles localhost URLs for files outside the workspace."""
         assert driver.can_handle("http://localhost:8124/external/Users/artist/cat.png") is True
 
     def test_cannot_handle_localhost_without_workspace(self, driver: StaticServerFileDriver) -> None:
@@ -106,7 +105,6 @@ class TestStaticServerFileDriver:
         mock_config_manager: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Test that an /external/ URL reads the file from disk, with no server running."""
         external_file = tmp_path / "outside" / "cat.png"
         external_file.parent.mkdir()
         external_file.write_bytes(b"cat")

@@ -194,7 +194,8 @@ def test_workspace_path_becomes_its_absolute_path(workspace: Path, relative: boo
     assert result.value == str(file_path)
 
 
-def test_external_path_is_kept(workspace: Path, tmp_path_factory: pytest.TempPathFactory) -> None:  # noqa: ARG001
+@pytest.mark.usefixtures("workspace")
+def test_external_path_is_kept(tmp_path_factory: pytest.TempPathFactory) -> None:
     """A file outside the workspace keeps its own path."""
     file_path = tmp_path_factory.mktemp("external") / "image.jpg"
     file_path.write_bytes(b"data")
@@ -219,10 +220,8 @@ def test_workspace_static_server_url_becomes_its_path(workspace: Path) -> None:
     assert result.value == str(file_path)
 
 
-def test_external_static_server_url_becomes_its_path(
-    workspace: Path,  # noqa: ARG001
-    tmp_path_factory: pytest.TempPathFactory,
-) -> None:
+@pytest.mark.usefixtures("workspace")
+def test_external_static_server_url_becomes_its_path(tmp_path_factory: pytest.TempPathFactory) -> None:
     """An `/external/` URL becomes the path of the file outside the workspace it serves."""
     file_path = tmp_path_factory.mktemp("external") / "image.jpg"
     file_path.write_bytes(b"data")
@@ -243,7 +242,8 @@ def test_external_static_server_url_becomes_its_path(
         pytest.param("https://example.com/image.jpg", id="remote"),
     ],
 )
-def test_url_that_names_no_local_file_is_wrapped_as_is(workspace: Path, url: str) -> None:  # noqa: ARG001
+@pytest.mark.usefixtures("workspace")
+def test_url_that_names_no_local_file_is_wrapped_as_is(url: str) -> None:
     """A URL with no local file behind it is kept verbatim."""
     result = normalize_artifact_input(url, ImageUrlArtifact)
 
@@ -251,6 +251,7 @@ def test_url_that_names_no_local_file_is_wrapped_as_is(workspace: Path, url: str
     assert result.value == url
 
 
-def test_missing_path_is_returned_unchanged(workspace: Path) -> None:  # noqa: ARG001
+@pytest.mark.usefixtures("workspace")
+def test_missing_path_is_returned_unchanged() -> None:
     """A path to nothing is handed back for the node's own validation to report."""
     assert normalize_artifact_input("missing.jpg", ImageUrlArtifact) == "missing.jpg"

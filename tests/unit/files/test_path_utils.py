@@ -1068,8 +1068,22 @@ class TestParseStaticServerUrl:
         )
         assert result == Path("C:/Users/artist/cat.png")
 
+    def test_maps_external_url_to_unc_path(self) -> None:
+        """`LocalStorageDriver` builds a UNC path's URL as `/external//server/share/...`."""
+        result = parse_static_server_url(
+            "http://localhost:8124/external//server/share/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("//server/share/cat.png")
+
+    def test_keeps_hash_in_external_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/shot#1.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/shot#1.png")
+
     def test_external_path_containing_workspace_segment(self) -> None:
-        """An external file whose own path holds `/workspace/` is not read as a workspace file."""
         result = parse_static_server_url(
             "http://localhost:8124/external/mnt/workspace/cat.png",
             self.WORKSPACE,
