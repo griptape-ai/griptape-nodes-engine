@@ -571,27 +571,18 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 self.metadata[metadata_key].remove(proxy_parameter.name)
 
     def _refresh_proxy_serializable(self, proxy_parameter: Parameter) -> None:
-        """Save a proxy's value only if every inner parameter it is connected to saves its own.
+        """Save a proxy's value only if every inner parameter connected to it saves its own.
 
-        Runs on every connect and disconnect, including the connections replayed when a workflow
-        opens, so a proxy saved before proxies carried `serializable` still picks it up.
+        Runs on every connect and disconnect, including those replayed when a workflow opens.
         """
-        if isinstance(proxy_parameter, ControlParameter):
-            return
         connections = self.engine.flow_manager.get_connections()
-        inner_parameters = [
-            connection.source_parameter
-            for connection in connections.get_incoming_connections_to_parameter(self, proxy_parameter)
-            if connection.source_node.parent_group is self
+        incoming = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
+        outgoing = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
+        inner_parameters = [c.source_parameter for c in incoming if c.source_node.parent_group is self] + [
+            c.target_parameter for c in outgoing if c.target_node.parent_group is self
         ]
-        inner_parameters += [
-            connection.target_parameter
-            for connection in connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
-            if connection.target_node.parent_group is self
-        ]
-        if not inner_parameters:
-            return
-        proxy_parameter.serializable = all(parameter.serializable for parameter in inner_parameters)
+        if inner_parameters and not isinstance(proxy_parameter, ControlParameter):
+            proxy_parameter.serializable = all(p.serializable for p in inner_parameters)
 
     def _remap_outgoing_connections(self, node: BaseNode, connections: Connections) -> None:
         """Remap outgoing connections that go through proxy parameters.
