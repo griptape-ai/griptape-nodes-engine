@@ -13,12 +13,17 @@ from PIL import Image, ImageFile
 from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultFailure,
+    CreateConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
@@ -32,6 +37,10 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.serialization.commands import encode_commands
 
@@ -983,3 +992,76 @@ class TestReparentFlow:
         # The rejected move must leave the hierarchy untouched.
         assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
         assert flow_manager.get_parent_flow(outer.flow_name) is None
+
+
+class _ImageSource(DataNode):
+    """Outputs a single image, the element type of `_ImageCollector.items`."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(
+            Parameter(name="image", type="ImageUrlArtifact", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        )
+
+    def process(self) -> None:
+        pass
+
+
+class _ImageCollector(DataNode):
+    """Collects images into a ParameterList that starts with no slots, like CreateImageList."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(ParameterList(name="items", type="ImageUrlArtifact", tooltip=""))
+
+    def process(self) -> None:
+        pass
+
+
+class TestConnectingToParameterList:
+    """A ParameterList is filled through child slots, so connections target a slot, not the list."""
+
+    @pytest.fixture
+    def flow_name(self, engine: Engine) -> Generator[str, None, None]:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow("param_list_wf")
+        result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
+        assert isinstance(result, CreateFlowResultSuccess)
+        for node in (_ImageSource(name="Source"), _ImageCollector(name="Collector")):
+            engine.flow_manager.get_flow_by_name(result.flow_name).add_node(node)
+            engine.object_manager.add_object_by_name(node.name, node)
+            engine.node_manager._name_to_parent_flow_name[node.name] = result.flow_name
+        yield result.flow_name
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    def test_connecting_to_the_list_points_at_adding_a_slot(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        result = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="image",
+                target_node_name="Collector",
+                target_parameter_name="items",
+            )
+        )
+
+        assert isinstance(result, CreateConnectionResultFailure)
+        details = str(result.result_details)
+        assert "AddParameterToNodeRequest" in details
+        assert 'parent_container_name="items"' in details
+
+    def test_connecting_to_an_added_slot_succeeds(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        slot = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+        assert isinstance(slot, AddParameterToNodeResultSuccess)
+
+        result = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="image",
+                target_node_name="Collector",
+                target_parameter_name=slot.parameter_name,
+            )
+        )
+
+        assert isinstance(result, CreateConnectionResultSuccess)

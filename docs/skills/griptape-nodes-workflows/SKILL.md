@@ -365,6 +365,39 @@ read the returned `node_name` from `CreateNodeResultSuccess` and reuse it verbat
 A typo here surfaces as an opaque validation error from pydantic, not a friendly
 "unknown field" message.
 
+### ParameterList inputs start empty: add a slot per item
+
+Some inputs are `ParameterList` containers that hold N same-typed child slots:
+`items` on `CreateImageList` / `CreateTextList` / `CreateList` and their siblings,
+`input_images` on image generators, and similar multi-input parameters. They show
+up in `GetAllNodeInfoRequest` with `element_type: "ParameterList"` and a
+`list[<Element>]` type. The node's value is built from its child slots, and most
+start with none.
+
+You cannot target the container itself. Connecting a single `ImageUrlArtifact`
+output to `items` fails on a type mismatch (`list[ImageUrlArtifact]` vs.
+`ImageUrlArtifact`), and child names like `items_0` or `items[0]` do not exist.
+Add a slot per item instead:
+
+```
+1. AddParameterToNodeRequest(node_name="Create Image List_1", parent_container_name="items")
+   → returns parameter_name="items_ParameterListUniqueParamID_<hex>".
+     The slot copies its type and modes from the container; no other fields needed.
+2. CreateConnectionRequest(source_node_name="Load Image_1", source_parameter_name="image",
+       target_node_name="Create Image List_1",
+       target_parameter_name="items_ParameterListUniqueParamID_<hex>")
+   or SetParameterValueRequest(node_name="Create Image List_1",
+       parameter_name="items_ParameterListUniqueParamID_<hex>", value=...)
+```
+
+Repeat for every item; each connection or value needs its own slot. Existing
+slots may already be occupied, so add a fresh one unless you mean to overwrite.
+
+The slot name is engine-generated and only known after the add returns, so the
+`AddParameterToNodeRequest` calls and the requests that use their names cannot share
+an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
+`parameter_name`, then batch the connects/sets in the next.
+
 ### Only one workflow in context at a time
 
 `SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
@@ -386,6 +419,7 @@ EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today
 | Inspect a node type's parameters                                | `DescribeNodeTypeRequest`                                                                                                                                 |
 | Create a node                                                   | `CreateNodeRequest`                                                                                                                                       |
 | Wire a single edge                                              | `CreateConnectionRequest`                                                                                                                                 |
+| Add an item slot to a ParameterList input                       | `AddParameterToNodeRequest(parent_container_name=...)` (returns the slot name to target)                                                                  |
 | Lay out the canvas after a multi-node build                     | `AutoLayoutFlowRequest`                                                                                                                                   |
 | Move a single node to an explicit position                      | `SetNodeMetadataRequest` (set `metadata.position`)                                                                                                        |
 | Set a parameter value                                           | `SetParameterValueRequest`                                                                                                                                |
