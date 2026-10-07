@@ -778,7 +778,6 @@ class TestUpdateLibraryRequestExistingPath:
         library_dir = Path("/var/lib/test_lib")
 
         validation_context = LibraryGitOperationContext(
-            library=MagicMock(),
             old_version="1.0.0",
             library_file_path=str(library_dir / "griptape_nodes_library.json"),
             library_dir=library_dir,
