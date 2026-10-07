@@ -443,7 +443,7 @@ class LibraryModuleLoading(EngineScoped):
         """
         any_nodes_loaded_successfully = False
 
-        # Check if library is in old XDG location
+        # Check if library is in old engine data location
         old_xdg_libraries_path = engine_data_dir() / "libraries"
         library_path_obj = Path(library_info.library_path)
         try:

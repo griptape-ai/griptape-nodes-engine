@@ -10,10 +10,15 @@ from unittest.mock import patch
 import pytest
 from xdg_base_dirs import xdg_state_home
 
-from griptape_nodes.common import log_capture
-from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
-from griptape_nodes.retained_mode.managers import settings as settings_module
-from griptape_nodes.utils import engine_dirs
+# Engine dir overrides bypass the `xdg_*_home` patches tests rely on, and some paths
+# (`USER_CONFIG_PATH`) are built at import, so drop them before importing `griptape_nodes`.
+for _engine_dir_env_var in ("GTN_CONFIG_DIR", "GTN_DATA_DIR", "GTN_STATE_DIR"):
+    os.environ.pop(_engine_dir_env_var, None)
+
+from griptape_nodes.common import log_capture  # noqa: E402
+from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine  # noqa: E402
+from griptape_nodes.retained_mode.managers import settings as settings_module  # noqa: E402
+from griptape_nodes.utils import engine_dirs  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module

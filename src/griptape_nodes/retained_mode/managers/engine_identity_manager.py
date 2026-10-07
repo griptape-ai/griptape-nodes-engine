@@ -271,7 +271,7 @@ class EngineIdentityManager:
 
     @staticmethod
     def _get_engine_data_dir() -> Path:
-        """Get the XDG data directory for engine identity storage."""
+        """Get the engine data directory for engine identity storage."""
         return engine_data_dir()
 
     @staticmethod
