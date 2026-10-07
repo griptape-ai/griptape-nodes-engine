@@ -569,6 +569,7 @@ class OSManager(EngineScoped):
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
                 failure_log_level=failure_log_level,
+                broadcast_result=False,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):

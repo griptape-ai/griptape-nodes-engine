@@ -138,6 +138,13 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 # node, and on that node the value is an ordinary authored one, not something it produced.
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
 
+# True while building a node no client sees: the serializer's reference copy or a type probe.
+# Saving an image serializes the whole flow into its metadata, one reference node per node, so
+# their element events scaled with nodes times saved images.
+_constructing_unbroadcast_node: ContextVar[bool] = ContextVar(
+    "_node_types_constructing_unbroadcast_node", default=False
+)
+
 
 class _PreservedTemplate(NamedTuple):
     """A stored {VAR} template that must survive a resolved output value.
@@ -172,6 +179,16 @@ def _differs(raw_value: Any, output_value: Any) -> bool:
         return bool(raw_value != output_value)
     except Exception:
         return False
+
+
+@contextmanager
+def constructing_unbroadcast_node() -> Iterator[None]:
+    """Build the nodes constructed inside this block without broadcasting their element events."""
+    token = _constructing_unbroadcast_node.set(True)
+    try:
+        yield
+    finally:
+        _constructing_unbroadcast_node.reset(token)
 
 
 @contextmanager
@@ -343,6 +360,8 @@ class BaseNode(ABC):
     parameter_output_values: TrackedParameterOutputValues
     _local_objects: LocalObjectScope | None
     stop_flow: bool = False
+    # False for a node built under constructing_unbroadcast_node().
+    broadcasts_events: bool = True
     root_ui_element: BaseNodeElement
     _state: NodeResolutionState
     _tracked_parameters: list[BaseNodeElement]
@@ -415,6 +434,7 @@ class BaseNode(ABC):
         self._engine = engine
         self.name = name
         self._state = state
+        self.broadcasts_events = not _constructing_unbroadcast_node.get()
         if metadata is None:
             self.metadata = {}
         else:
@@ -2119,6 +2139,8 @@ class BaseNode(ABC):
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
+        if not self.broadcasts_events:
+            return
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
@@ -2363,6 +2385,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
 
     def _emit_parameter_change_event(self, parameter_name: str, value: Any, *, deleted: bool = False) -> None:
         """Emit an AlterElementEvent for parameter output value changes."""
+        if not self._node.broadcasts_events:
+            return
         parameter = self._node.get_parameter_by_name(parameter_name)
         if parameter is not None:
             from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
