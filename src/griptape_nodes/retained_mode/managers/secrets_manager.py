@@ -170,7 +170,7 @@ class SecretsManager:
         # We don't want to echo the secret value back to the user, but we can at least tell them it changed.
         old_value = self.get_secret(secret_name, should_error_on_not_found=False)
         if old_value == secret_value:
-            logger.debug("Attempted to update secret '%s' but no change detected.", secret_name)
+            logger.info("Attempted to update secret '%s' but no change detected.", secret_name)
         elif old_value:
             logger.info("Secret '%s' changed.", secret_name)
         else:
