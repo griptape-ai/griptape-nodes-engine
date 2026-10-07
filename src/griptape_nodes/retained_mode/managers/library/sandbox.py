@@ -767,7 +767,9 @@ class LibrarySandbox(EngineScoped):
 
             engine_version = self.engine.handle_engine_version_request(request=GetEngineVersionRequest())
             if not isinstance(engine_version, GetEngineVersionResultSuccess):
-                details = "Could not get engine version for sandbox library generation."
+                details = (
+                    f"Could not get engine version for sandbox library generation: {engine_version.result_details}"
+                )
                 return LoadLibraryMetadataFromFileResultFailure(
                     library_path=sandbox_library_dir_as_posix,
                     library_name=SANDBOX_LIBRARY_NAME,

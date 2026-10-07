@@ -5928,7 +5928,7 @@ class NodeManager(EngineScoped):
         )
         rename_result = self.engine.object_manager.on_rename_object_request(rename_request)
         if not isinstance(rename_result, RenameObjectResultSuccess):
-            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name."
+            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name: {rename_result.result_details}"
             return ResetNodeToDefaultsResultFailure(result_details=details)
 
         # SUCCESS PATH
