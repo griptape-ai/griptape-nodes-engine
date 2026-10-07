@@ -9,10 +9,13 @@ import logging
 import os
 import ssl
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import urljoin
 
-from websockets.asyncio.client import connect
+# websockets.asyncio.client is the only module that defines process_exception on every websockets
+# version this package supports. 17.x moved it to websockets.client and re-imports it here, which
+# pyright reports as a private import.
+from websockets.asyncio.client import connect, process_exception  # pyright: ignore[reportPrivateImportUsage]
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -27,6 +30,9 @@ logger = logging.getLogger("griptape_nodes_client")
 # Messages above this threshold can saturate the WebSocket send buffer and cause
 # connected clients (e.g. the editor) to stall or disconnect.
 LARGE_PAYLOAD_WARNING_THRESHOLD = 100_000
+
+# How long connect() waits for the first connection before giving up.
+CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 def get_default_websocket_url() -> str:
@@ -52,14 +58,19 @@ class Client:
         self,
         api_key: str | None = None,
         url: str | None = None,
+        *,
+        proxy: str | Literal[True] | None = True,
     ):
         """Initialize Nodes API client.
 
         Args:
             api_key: API key for authentication (defaults to GT_CLOUD_API_KEY from SecretsManager)
             url: WebSocket URL to connect to (defaults to Nodes API endpoint)
+            proxy: Proxy to connect through. True (the default) uses the proxy configured in the
+                environment, None connects directly, and a URL uses that proxy.
         """
         self.url = url if url is not None else get_default_websocket_url()
+        self.proxy: str | Literal[True] | None = proxy
 
         # Get API key from SecretsManager if not provided
         if api_key is None:
@@ -77,6 +88,8 @@ class Client:
         self._sending_task: asyncio.Task | None = None
         self._websocket: Any = None
         self._connection_ready = asyncio.Event()
+        # The most recent reason a connection attempt failed, so connect() can report it.
+        self._last_connection_error: BaseException | None = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: connect to WebSocket server."""
@@ -180,20 +193,31 @@ class Client:
         This method starts the connection manager task.
         It returns once the initial connection is established.
 
+        Returns as soon as the connection is established, or raises as soon as it fails
+        with an error that retrying will not fix, instead of always waiting out the timeout.
+
         Raises:
-            ConnectionError: If connection fails
+            ConnectionError: If connection fails, naming the reason
         """
         # Start connection manager task
         self._receiving_task = asyncio.create_task(self._manage_connection())
+        ready_task = asyncio.create_task(self._connection_ready.wait())
 
-        # Wait for initial connection to be established
-        try:
-            await asyncio.wait_for(self._connection_ready.wait(), timeout=10.0)
-            logger.debug("WebSocket client connected")
-        except TimeoutError as e:
-            logger.error("Failed to connect WebSocket client: timeout")
-            msg = "Connection timeout - failed to connect to Nodes API."
-            raise ConnectionError(msg) from e
+        await asyncio.wait(
+            {ready_task, self._receiving_task},
+            timeout=CONNECT_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not ready_task.done():
+            ready_task.cancel()
+            # Stop the connection manager so it does not keep redialing after connect() gave up.
+            await self.disconnect()
+            msg = f"Failed to connect to {self.url}: {self._describe_connection_failure()}"
+            logger.error(msg)
+            raise ConnectionError(msg) from self._last_connection_error
+
+        logger.debug("WebSocket client connected")
 
     async def disconnect(self) -> None:
         """Disconnect from the WebSocket server and clean up tasks."""
@@ -220,42 +244,67 @@ class Client:
         automatically reconnecting on failures.
         """
         try:
-            async for websocket in connect(self.url, additional_headers=self.headers):
+            async for websocket in connect(
+                self.url,
+                additional_headers=self.headers,
+                proxy=self.proxy,
+                process_exception=self._process_connection_exception,
+            ):
                 should_reconnect = await self._handle_websocket_session(websocket)
                 if not should_reconnect:
                     break
         except InvalidStatus as e:
             if e.response.status_code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
                 logger.error(
-                    "Nodes API rejected connection with HTTP %d. "
-                    "This indicates an invalid or missing GT_CLOUD_API_KEY.",
+                    "%s rejected the connection with HTTP %d. The credentials sent were missing or invalid.",
+                    self.url,
                     e.response.status_code,
                 )
             else:
                 logger.error(
-                    "Nodes API rejected WebSocket connection: HTTP %d.",
+                    "%s rejected the WebSocket connection: HTTP %d.",
+                    self.url,
                     e.response.status_code,
                 )
         except InvalidURI as e:
-            logger.error(
-                "Invalid WebSocket URL: %s. Check GRIPTAPE_NODES_API_BASE_URL configuration.",
-                e,
-            )
+            logger.error("Invalid WebSocket URL: %s.", e)
         except ssl.SSLError as e:
             logger.error(
-                "SSL error while connecting to Nodes API: %s. "
+                "SSL error while connecting to %s: %s. "
                 "This may indicate a certificate verification failure. "
                 "Check that your system's CA certificates are up to date.",
+                self.url,
                 e,
             )
         except OSError as e:
             logger.error(
-                "Network error while connecting to Nodes API: %s. "
-                "Check your network connection and that the API endpoint is reachable.",
+                "Network error while connecting to %s: %s. Check that the server is reachable.",
+                self.url,
                 e,
             )
         except asyncio.CancelledError:
             logger.debug("Connection manager task cancelled")
+
+    def _process_connection_exception(self, exc: Exception) -> Exception | None:
+        """Record why a connection attempt failed, and decide whether to retry it.
+
+        Keeps websockets' default retry rules, except that an SSL error is fatal: a failed
+        certificate check fails the same way on every attempt. websockets would otherwise retry
+        it forever, because ``ssl.SSLError`` is an ``OSError``.
+
+        Returns:
+            None to retry, or the exception to stop reconnecting and raise it.
+        """
+        self._last_connection_error = exc
+        if isinstance(exc, ssl.SSLError):
+            return exc
+        return process_exception(exc)
+
+    def _describe_connection_failure(self) -> str:
+        """Describe the most recent connection failure for an error message."""
+        if self._last_connection_error is None:
+            return f"no response within {CONNECT_TIMEOUT_SECONDS:g} seconds"
+        return str(self._last_connection_error) or type(self._last_connection_error).__name__
 
     async def _handle_websocket_session(self, websocket: Any) -> bool:
         """Handle a single WebSocket session: log, resubscribe, and receive messages.

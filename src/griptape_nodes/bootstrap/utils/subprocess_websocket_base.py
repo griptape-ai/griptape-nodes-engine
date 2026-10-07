@@ -1,7 +1,11 @@
 """Base WebSocket mixin for subprocess communication.
 
-This module provides a reusable base mixin with shared WebSocket client
-and background task lifecycle management used by both listener and sender mixins.
+This module provides a reusable base mixin with shared session and background
+task lifecycle management used by both listener and sender mixins.
+
+The parent process (listener) runs a WebSocket server on the loopback interface and
+the child process (sender) connects to it directly. Nothing leaves the machine, so
+Private Execution works without Griptape Cloud.
 """
 
 from __future__ import annotations
@@ -12,13 +16,20 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from griptape_nodes.api_client import Client
-
 if TYPE_CHECKING:
     from collections.abc import Coroutine
     from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Environment variable carrying the token the child presents to the parent's event server.
+# It travels in the environment rather than on the command line because other local users
+# can read a process's command line.
+SUBPROCESS_EVENTS_TOKEN_ENV_VAR = "GTN_SUBPROCESS_EVENTS_TOKEN"  # noqa: S105
+
+
+class SubprocessEventChannelError(Exception):
+    """Raised when the channel between a parent engine and its subprocess cannot be used."""
 
 
 @dataclass
@@ -31,18 +42,16 @@ class WebSocketMessage:
 
 
 class SubprocessWebSocketBaseMixin:
-    """Base mixin providing shared WebSocket client and task lifecycle management.
+    """Base mixin providing shared session and task lifecycle management.
 
     This mixin handles:
     - Session ID management
-    - WebSocket client creation and cleanup
     - Background task lifecycle (creation, cancellation, cleanup)
 
     Subclasses should use the protected methods to build their specific functionality.
     """
 
     _session_id: str
-    _ws_client: Client | None
     _ws_task: asyncio.Task | None
 
     def _init_websocket_base(self, session_id: str) -> None:
@@ -52,23 +61,11 @@ class SubprocessWebSocketBaseMixin:
             session_id: Unique session ID for WebSocket topic.
         """
         self._session_id = session_id
-        self._ws_client = None
         self._ws_task = None
 
     def _get_session_id(self) -> str:
         """Get the session ID used for WebSocket communication."""
         return self._session_id
-
-    async def _start_websocket_client(self) -> None:
-        """Start the WebSocket client connection.
-
-        Creates and connects the WebSocket client.
-        Subclasses should call this, then perform additional setup (subscribe, etc.).
-        """
-        logger.info("Starting WebSocket client for session %s", self._session_id)
-        self._ws_client = Client()
-        await self._ws_client.connect()
-        logger.info("WebSocket client connected for session %s", self._session_id)
 
     def _create_websocket_task(self, coro: Coroutine[Any, Any, None]) -> None:
         """Create a background task for WebSocket operations.
@@ -87,12 +84,3 @@ class SubprocessWebSocketBaseMixin:
         with contextlib.suppress(asyncio.CancelledError):
             await self._ws_task
         self._ws_task = None
-
-    async def _stop_websocket_client(self) -> None:
-        """Close the WebSocket client connection."""
-        if self._ws_client is None:
-            return
-
-        await self._ws_client.disconnect()
-        self._ws_client = None
-        logger.info("WebSocket client disconnected for session %s", self._session_id)

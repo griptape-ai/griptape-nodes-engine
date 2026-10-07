@@ -88,15 +88,22 @@ class SubprocessWorkflowPublisher(LocalWorkflowPublisher, PythonSubprocessExecut
                 published_workflow_file_name,
                 "--session-id",
                 self._session_id,
+                "--events-url",
+                self._get_events_url(),
             ]
-            await self.execute_python_script(
-                script_path=tmp_script_path,
-                args=args,
-                cwd=Path(tmpdir),
-                env={
-                    "GTN_CONFIG_ENABLE_WORKSPACE_FILE_WATCHING": "false",
-                },
-            )
+            try:
+                await self.execute_python_script(
+                    script_path=tmp_script_path,
+                    args=args,
+                    cwd=Path(tmpdir),
+                    env={
+                        "GTN_CONFIG_ENABLE_WORKSPACE_FILE_WATCHING": "false",
+                        **self._get_events_env(),
+                    },
+                )
+            finally:
+                # Let the last progress events land before the caller moves on.
+                await self._wait_for_subprocess_events()
 
     async def _handle_subprocess_event(self, event: dict) -> None:
         """Handle publisher-specific events from the subprocess.

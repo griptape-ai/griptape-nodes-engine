@@ -8,12 +8,16 @@ round-trip intact.
 This guards the serialization/deserialization path exercised by
 NodeExecutor._extract_parameter_output_values and
 NodeExecutor._apply_parameter_values_to_node - the code fixed in
-fix/subprocess-cattrs-bytes-deserialization - without requiring the cloud
-WebSocket relay that the Private Execution (SubprocessWorkflowExecutor) path needs.
+fix/subprocess-cattrs-bytes-deserialization.
+
+test_private_execution_returns_result_without_griptape_cloud covers the Private
+Execution (SubprocessWorkflowExecutor) path: the result must come back from the
+child process with Griptape Cloud unreachable.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -50,8 +54,13 @@ FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.js
 _EXPECTED_TEXT = "hello from subflow"
 
 
-def _generate_subflow_workflow_source(engine: Engine, library_json: Path) -> str:
-    """Build a flow with a SubflowGroupNode containing an EchoNode and serialize it."""
+def _generate_subflow_workflow_source(
+    engine: Engine, library_json: Path, workflow_shape: WorkflowShape | None = None
+) -> str:
+    """Build a flow with a SubflowGroupNode containing an EchoNode and serialize it.
+
+    A workflow_shape makes the file define execute_workflow(), which is how a subprocess runs it.
+    """
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
@@ -106,7 +115,7 @@ def _generate_subflow_workflow_source(engine: Engine, library_json: Path) -> str
         schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
         engine_version_created_with="0.0.0",
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
-        workflow_shape=None,
+        workflow_shape=workflow_shape,
     )
     return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
@@ -229,3 +238,83 @@ def test_subflow_node_group_propagates_output_values(
     assert "SUBFLOW_TEXT_OK" in result.stdout, diagnostic
     assert "E2E_FAIL" not in result.stdout, diagnostic
     assert "E2E_FAIL" not in result.stderr, diagnostic
+
+
+# Runs as the parent engine: starts SubprocessWorkflowExecutor, the Private Execution path,
+# which runs the workflow in a child process and reads its result back over the event channel.
+_PRIVATE_EXECUTION_DRIVER = """
+import asyncio
+import json
+import sys
+
+from griptape_nodes.bootstrap.workflow_executors.subprocess_workflow_executor import SubprocessWorkflowExecutor
+
+
+async def _main() -> None:
+    executor = SubprocessWorkflowExecutor(workflow_path=sys.argv[1])
+    async with executor:
+        await executor.arun(flow_input={})
+    print("PRIVATE_EXECUTION_OUTPUT=" + json.dumps(executor.output, default=str), flush=True)
+
+
+asyncio.run(_main())
+"""
+
+
+@pytest.mark.skipif(
+    not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
+    reason=f"Subflow Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
+)
+def test_private_execution_returns_result_without_griptape_cloud(
+    tmp_path: Path,
+    engine: Engine,
+    engine_subprocess_env: Callable[..., dict[str, str]],
+    materialize_library: Callable[..., Path],
+    write_isolated_config: Callable[..., None],
+) -> None:
+    """A Private Execution run must hand its result back to the parent with no Griptape Cloud.
+
+    The Cloud API URL points at a closed local port, so any attempt to reach Griptape Cloud
+    fails. The result has to travel over a channel the parent owns.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    config_root = tmp_path / "xdg_config"
+    library_json = materialize_library(
+        tmp_path / "library",
+        template=FIXTURE_LIBRARY_JSON_TEMPLATE,
+        node_file=FIXTURE_LIBRARY_DIR / "subflow_echo_node.py",
+    )
+    write_isolated_config(config_root, workspace=workspace, library_path=library_json)
+
+    workflow_path = tmp_path / "subflow_workflow.py"
+    workflow_path.write_text(
+        _generate_subflow_workflow_source(engine, library_json, WorkflowShape(inputs={}, outputs={}))
+    )
+    driver_path = tmp_path / "private_execution_driver.py"
+    driver_path.write_text(_PRIVATE_EXECUTION_DRIVER)
+
+    env = engine_subprocess_env(
+        XDG_CONFIG_HOME=str(config_root),
+        GRIPTAPE_NODES_API_BASE_URL="http://127.0.0.1:9",
+    )
+
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(driver_path), str(workflow_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    diagnostic = (
+        f"driver exit code: {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    )
+    assert result.returncode == 0, diagnostic
+    output_lines = [line for line in result.stdout.splitlines() if line.startswith("PRIVATE_EXECUTION_OUTPUT=")]
+    assert output_lines, diagnostic
+    # executor.output is only ever set from the result event the child sends over the channel.
+    output = json.loads(output_lines[-1].removeprefix("PRIVATE_EXECUTION_OUTPUT="))
+    assert output is not None, diagnostic
+    assert output["SubflowGroup_1"]["execution_environment"] == "Local Execution", diagnostic
