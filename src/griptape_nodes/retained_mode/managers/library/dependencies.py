@@ -346,7 +346,7 @@ class LibraryDependencies(EngineScoped):
             ),
             execution_failure,
         )
-        logger.info(details)
+        logger.debug(details)
         return InstallLibraryDependenciesResultSuccess(
             library_name=library_name, dependencies_installed=installed_count, result_details=details
         )
@@ -403,7 +403,8 @@ class LibraryDependencies(EngineScoped):
                 reason = (constrained_error.stderr or "").strip()
                 if not reason:
                     reason = f"the installer exited with code {constrained_error.returncode}"
-                logger.warning(
+                # The library report names any components this leaves older than the engine's own.
+                logger.debug(
                     "Attempted to install dependencies into the environment at %s under the versions this engine runs "
                     "on. Installing without them; the result may hold components older than the engine's own. "
                     "Failed due to: %s",
@@ -675,7 +676,7 @@ class LibraryDependencies(EngineScoped):
         if not pip_dependencies:
             return
 
-        logger.info("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
+        logger.debug("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:

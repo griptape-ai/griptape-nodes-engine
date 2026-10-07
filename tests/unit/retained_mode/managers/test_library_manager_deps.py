@@ -1408,7 +1408,7 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
         assert "numpy<2" in calls[1]
 
     @pytest.mark.asyncio
-    async def test_the_warning_carries_the_resolver_reason(
+    async def test_the_debug_log_carries_the_resolver_reason(
         self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Without uv's explanation nobody can tell which requirement conflicted."""
@@ -1421,7 +1421,7 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
                 "griptape_nodes.retained_mode.managers.library.dependencies.subprocess_run",
                 side_effect=self._fails_only_under_the_floors([]),
             ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+            caplog.at_level(logging.DEBUG, logger="griptape_nodes"),
         ):
             await engine.library_manager.dependencies._run_uv_pip_install(
                 tmp_path / "python", ["numpy<2"], [], capture_output=True

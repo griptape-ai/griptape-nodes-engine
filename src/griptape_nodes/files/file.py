@@ -639,6 +639,8 @@ class File:
             file_path=_resolve_file_path(self._file_path),
             encoding=encoding,
             should_transform_image_content_to_thumbnail=False,
+            # The failure is raised as FileLoadError for the caller to report.
+            failure_log_level=logging.DEBUG,
         )
         result = GriptapeNodes.handle_request(request)
 
@@ -669,6 +671,7 @@ class File:
             file_path=await _aresolve_file_path(self._file_path),
             encoding=encoding,
             should_transform_image_content_to_thumbnail=False,
+            failure_log_level=logging.DEBUG,
         )
         result = await GriptapeNodes.ahandle_request(request)
 

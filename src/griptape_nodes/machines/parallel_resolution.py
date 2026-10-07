@@ -832,7 +832,8 @@ class ExecuteDagState(State):
                     node_name = dag_node.node_reference.name
                     dag_node.node_state = NodeState.ERRORED
 
-                    logger.error("Error processing node '%s'", node_name, exc_info=exc)
+                    logger.error("Node '%s' failed: %s", node_name, exc)
+                    logger.debug("Traceback for node '%s' failure", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(

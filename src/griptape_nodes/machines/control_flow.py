@@ -106,7 +106,7 @@ class ResolveNodeState(State):
                     wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=current_node.name))
                 )
             )
-            logger.info("Resolving %s", current_node.name)
+            logger.debug("Resolving %s", current_node.name)
         if not context.paused:
             # Call the update. Otherwise wait
             return ResolveNodeState
@@ -158,7 +158,7 @@ class CompleteState(State):
                     )
                 )
             )
-        logger.info("Flow is complete.")
+        logger.debug("Flow is complete.")
         return None
 
     @staticmethod
