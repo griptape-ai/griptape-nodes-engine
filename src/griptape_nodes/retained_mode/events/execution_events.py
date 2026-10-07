@@ -419,7 +419,10 @@ class NodeResolvedEvent(ExecutionPayload):
         parameter_output_values: The node's output values, as displayed.
         node_type: The node's class name.
         specific_library_name: The library the node type came from, when only one provides it.
-        run_seconds: Wall-clock seconds the node took to run, or None when it did not run (a locked node).
+        run_seconds: Wall-clock seconds the node took to run, or None when it did not run (a locked node,
+            or a Start Loop node). An End Loop node or a group node runs the nodes inside it, so its time
+            covers theirs, and they also report their own. Summing every node's time counts loop and
+            group bodies twice.
     """
 
     node_name: str
@@ -467,7 +470,8 @@ class NodeErrorEvent(ExecutionPayload):
         error: The same failure in parts, without engine preambles or the node name prefix.
             Optional so events from older engines still parse.
         run_seconds: Wall-clock seconds the node ran before failing, or None when it failed before
-            it started running.
+            it started running. For an End Loop node or a group node, this includes the nodes inside
+            it, as on `NodeResolvedEvent`.
     """
 
     node_name: str
