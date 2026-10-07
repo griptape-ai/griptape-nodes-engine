@@ -497,7 +497,6 @@ class StaticFilesManager(EngineScoped):
             parsed = ParsedMacro(file_path)
         except MacroSyntaxError as e:
             msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because the path has invalid macro syntax: {e}"
-            logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         # Keep the original macro form alongside the resolved path: preview metadata

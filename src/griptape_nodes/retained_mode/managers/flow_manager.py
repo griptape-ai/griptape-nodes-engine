@@ -1878,7 +1878,6 @@ class FlowManager(EngineScoped):
 
             if serialized_node is None:
                 error_msg = f"Data integrity error: Could not find serialized node for package node '{package_node.name}'. This indicates a logic error in the serialization process."
-                logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
             package_alter_parameter_commands = []

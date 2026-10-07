@@ -155,7 +155,6 @@ class SecretsManager:
 
         if secret_value is None and request.should_error_on_not_found:
             details = f"Secret '{secret_key}' not found."
-            logger.error(details)
             return GetSecretValueResultFailure(result_details=details)
 
         return GetSecretValueResultSuccess(
@@ -196,7 +195,6 @@ class SecretsManager:
                 secret_values = dotenv_values(ENV_VAR_PATH)
             except OSError as err:
                 details = f"Attempted to read stored secrets from '{ENV_VAR_PATH}'. Failed because the file could not be read: {err}"
-                logger.error(details)
                 return GetAllSecretValuesResultFailure(result_details=details)
         else:
             secret_values = {}
@@ -211,12 +209,10 @@ class SecretsManager:
 
         if not ENV_VAR_PATH.exists():
             details = f"Secret file does not exist: '{ENV_VAR_PATH}'"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         if get_key(ENV_VAR_PATH, secret_name) is None:
             details = f"Secret {secret_name} not found in {ENV_VAR_PATH}"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         unset_key(ENV_VAR_PATH, secret_name)

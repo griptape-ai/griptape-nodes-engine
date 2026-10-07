@@ -684,7 +684,6 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return GetThreadMetadataResultFailure(result_details=details)
 
             thread = self._thread_storage.get_thread_metadata(request.thread_id)
@@ -713,7 +712,6 @@ class AgentManager(EngineScoped):
             return DeleteThreadResultSuccess(thread_id=request.thread_id, result_details="Thread deleted successfully.")
         except ValueError as e:
             details = str(e)
-            logger.error(details)
             return DeleteThreadResultFailure(result_details=details)
         except Exception as e:
             details = f"Error deleting thread: {e}"
@@ -725,7 +723,6 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return RenameThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, title=request.new_title)
@@ -745,12 +742,10 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
             if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=True)
@@ -769,12 +764,10 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
             if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=False)

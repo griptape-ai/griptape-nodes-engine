@@ -3213,7 +3213,6 @@ class NodeManager(EngineScoped):
 
         # Check if the node is already in the DAG - if so, skip this resolution. It's already queued or has been resolved.
         if node.name in flow_mgr._global_dag_builder.node_to_reference:
-            logger.error("Node %s is already executing. Cannot start execution.", node.name)
             return ResolveNodeResultFailure(
                 validation_exceptions=[],
                 result_details=f"Node {node.name} is already executing. Cannot start execution.",
@@ -3493,7 +3492,6 @@ class NodeManager(EngineScoped):
                 f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
                 f"{err} Editing the node still works and your workflow keeps it."
             )
-            logger.error(details)
             return ExecuteNodeResultFailure(result_details=details, exception=err)
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation

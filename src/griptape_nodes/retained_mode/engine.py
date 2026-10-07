@@ -614,7 +614,6 @@ class Engine:
             )
         except Exception as err:
             details = f"Attempted to get engine version. Failed due to '{err}'."
-            logger.error(details)
             return GetEngineVersionResultFailure(result_details=details)
 
     @handles(EngineHeartbeatRequest)
@@ -657,7 +656,6 @@ class Engine:
             )
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
-            logger.error(details)
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
 
     def _get_instance_info(self) -> dict[str, str | None]:

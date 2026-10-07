@@ -157,7 +157,6 @@ class SyncManager(EngineScoped):
             sync_thread.start()
         except Exception as e:
             details = f"Failed to start cloud workflow sync: {e!s}"
-            logger.error(details)
             return StartSyncAllCloudWorkflowsResultFailure(result_details=details)
         else:
             details = f"Started background sync for {len(workflow_files)} workflow files"

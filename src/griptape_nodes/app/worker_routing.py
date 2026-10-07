@@ -498,7 +498,6 @@ async def _handle_drop_all_local_objects(
         details = (
             f"Attempted to release objects held for this worker's libraries. Failed because of {type(e).__name__}: {e}."
         )
-        logger.error(details)
         return DropAllLocalObjectsResultFailure(result_details=details)
     return DropAllLocalObjectsResultSuccess(result_details=f"Released {dropped} held object(s).")
 
@@ -531,7 +530,6 @@ async def _handle_drop_local_objects(
         dropped = await to_thread(release_all)
     except Exception as e:
         details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
-        logger.error(details)
         return DropLocalObjectsResultFailure(result_details=details)
     return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
 
@@ -568,7 +566,6 @@ def register_broadcast_handlers(
             config_manager.load_configs()
         except Exception as e:
             details = f"Attempted to reload config from disk. Failed because of {type(e).__name__}: {e}."
-            logger.error(details)
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
 
@@ -577,7 +574,6 @@ def register_broadcast_handlers(
             secrets_manager.refresh_from_env_file()
         except Exception as e:
             details = f"Attempted to refresh secrets from shared .env file. Failed because of {type(e).__name__}: {e}."
-            logger.error(details)
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
@@ -616,7 +612,6 @@ def register_broadcast_handlers(
                     f"Failed because the id is absent from the worker's registry even after "
                     f"reloading config and re-running registered-project discovery."
                 )
-                logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
 
             set_result = await project_manager.on_set_current_project_request(
@@ -627,7 +622,6 @@ def register_broadcast_handlers(
                     f"Attempted to adopt orchestrator project '{request.project_id}'. "
                     f"Failed with result: {set_result.result_details}"
                 )
-                logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
             project_manager.record_adopted_generation(request.generation)
             worker_settled.set()
