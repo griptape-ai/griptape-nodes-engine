@@ -1440,7 +1440,7 @@ class OSManager(EngineScoped):
             os.execvp(args[0], args)  # noqa: S606
 
     @handles(OpenAssociatedFileRequest)
-    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         # Validate that exactly one of path_to_file or file_entry is provided
         if request.path_to_file is None and request.file_entry is None:
             msg = "Either path_to_file or file_entry must be provided"
@@ -1477,19 +1477,17 @@ class OSManager(EngineScoped):
             path = self._resolve_file_path(file_path_str, workspace_only=False)
         except (ValueError, RuntimeError):
             details = f"Invalid file path: '{file_path_str}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
             )
 
         if not path.exists():
             details = f"Path does not exist: '{path}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
             )
 
-        logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
+        logger.debug("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
             raw_platform = sys.platform
@@ -1503,7 +1501,7 @@ class OSManager(EngineScoped):
                 # Windows -- a prefixed path makes ShellExecute fail to open the file. The
                 # path is already validated to exist above, so hand it over unprefixed.
                 os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
-                logger.info("Opened path on Windows: %s", path)
+                logger.debug("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location
                 subprocess.run(  # noqa: S603
@@ -1512,7 +1510,7 @@ class OSManager(EngineScoped):
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on macOS: %s", path)
+                logger.debug("Opened path on macOS: %s", path)
             elif self.is_linux():
                 # Use full path to xdg-open to satisfy linter
                 # Common locations for xdg-open:
@@ -1521,7 +1519,6 @@ class OSManager(EngineScoped):
                 xdg_path = next((p for p in xdg_paths if Path(p).exists()), None)
                 if not xdg_path:
                     details = "xdg-open not found in standard locations"
-                    logger.info(details)
                     return OpenAssociatedFileResultFailure(
                         failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                     )
@@ -1532,10 +1529,9 @@ class OSManager(EngineScoped):
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on Linux: %s", path)
+                logger.debug("Opened path on Linux: %s", path)
             else:
                 details = f"Unsupported platform: '{raw_platform}'"
-                logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                 )
@@ -3851,15 +3847,15 @@ class OSManager(EngineScoped):
         try:
             if request.is_directory:
                 file_path.mkdir()
-                logger.info("Created directory: %s", file_path)
+                logger.debug("Created directory: %s", file_path)
             # Create file with optional content
             elif request.content is not None:
                 with file_path.open("w", encoding=request.encoding) as f:
                     f.write(request.content)
-                logger.info("Created file with content: %s", file_path)
+                logger.debug("Created file with content: %s", file_path)
             else:
                 file_path.touch()
-                logger.info("Created empty file: %s", file_path)
+                logger.debug("Created empty file: %s", file_path)
         except PermissionError as e:
             msg = f"Permission denied creating {file_path}: {e}"
             logger.error(msg)

@@ -3524,7 +3524,7 @@ class ProjectManager(EngineScoped):
         for that case.
         """
         if generation <= self._last_adopted_generation:
-            logger.info(
+            logger.debug(
                 "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
                 project_id,
                 generation,

@@ -23,7 +23,6 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowShape,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
@@ -458,7 +457,7 @@ class WorkflowSaver(EngineScoped):
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_name=registry_key,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=details,
         )
 
     def generate_unique_filename(self, base_name: str) -> str:
@@ -637,7 +636,7 @@ class WorkflowSaver(EngineScoped):
         return SaveSubflowToWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_metadata=workflow_metadata,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=details,
         )
 
     def _build_workflow_save_path(
@@ -1156,7 +1155,7 @@ class WorkflowSaver(EngineScoped):
         return SaveWorkflowFileFromSerializedFlowResultSuccess(
             file_path=final_file_path,
             workflow_metadata=workflow_metadata,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=details,
         )
 
     @staticmethod

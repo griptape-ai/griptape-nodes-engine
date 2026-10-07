@@ -366,7 +366,8 @@ class LibrarySandbox(EngineScoped):
                     )
                 )
                 details = f"Attempted to load module in sandbox library '{candidate_path}'. Failed because an exception occurred: {err}."
-                logger.warning(details)
+                # The library report lists this problem; logging it too repeats it.
+                logger.debug(details)
                 continue  # SKIP IT
 
             # Peek inside for any BaseNodes.

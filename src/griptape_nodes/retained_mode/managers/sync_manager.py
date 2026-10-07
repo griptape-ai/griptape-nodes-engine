@@ -274,7 +274,7 @@ class SyncManager(EngineScoped):
 
             local_file_path.write_bytes(file_content)
 
-            logger.info("Successfully downloaded cloud workflow to sync directory: %s", filename)
+            logger.debug("Successfully downloaded cloud workflow to sync directory: %s", filename)
         except Exception as e:
             logger.error("Failed to download cloud workflow '%s': %s", filename, str(e))
             return False
@@ -303,7 +303,7 @@ class SyncManager(EngineScoped):
             filename = file_path.name
             storage_driver.upload_file(Path(filename), file_content)
 
-            logger.info("Successfully uploaded workflow file to cloud: %s", filename)
+            logger.debug("Successfully uploaded workflow file to cloud: %s", filename)
 
         except Exception as e:
             logger.error("Failed to upload workflow file '%s': %s", file_path.name, str(e))
@@ -320,7 +320,7 @@ class SyncManager(EngineScoped):
 
             # Use the storage driver's delete method
             storage_driver.delete_file(Path(filename))
-            logger.info("Successfully deleted workflow file from cloud: %s", filename)
+            logger.debug("Successfully deleted workflow file from cloud: %s", filename)
 
         except Exception as e:
             logger.error("Failed to delete workflow file '%s' from cloud: %s", file_path.name, str(e))
@@ -382,13 +382,13 @@ class SyncManager(EngineScoped):
     def _handle_file_change(self, change: Change, path: Path, path_str: str) -> None:
         """Handle a file system change event."""
         if change == Change.added:
-            logger.info("Detected external creation of workflow file: %s", path_str)
+            logger.debug("Detected external creation of workflow file: %s", path_str)
             self._upload_workflow_file(path)
         elif change == Change.modified:
-            logger.info("Detected external modification of workflow file: %s", path_str)
+            logger.debug("Detected external modification of workflow file: %s", path_str)
             self._upload_workflow_file(path)
         elif change == Change.deleted:
-            logger.info("Detected deletion of workflow file: %s", path_str)
+            logger.debug("Detected deletion of workflow file: %s", path_str)
             self._delete_workflow_file(path)
 
     def _download_single_workflow(
@@ -436,7 +436,7 @@ class SyncManager(EngineScoped):
 
         except Exception as e:
             error_msg = str(e)
-            logger.warning("Failed to sync workflow '%s': %s", file_name, error_msg)
+            logger.debug("Failed to sync workflow '%s': %s", file_name, error_msg)
             return file_name, False, error_msg
         else:
             logger.debug("Successfully synced workflow: %s", local_filename)
@@ -450,7 +450,7 @@ class SyncManager(EngineScoped):
         failed_downloads = []
         total_workflows = len(workflow_files)
 
-        logger.info("Starting background sync of %d workflows (sync_id: %s)", total_workflows, sync_id)
+        logger.debug("Starting background sync of %d workflows (sync_id: %s)", total_workflows, sync_id)
 
         # Use thread pool for concurrent downloads
         with ThreadPoolExecutor() as executor:
@@ -491,13 +491,13 @@ class SyncManager(EngineScoped):
 
         # Register workflows from the synced directory
         if synced_workflows:
-            logger.info("Registering %d synced workflows from configuration", len(synced_workflows))
+            logger.debug("Registering %d synced workflows from configuration", len(synced_workflows))
             try:
                 register_request = RegisterWorkflowsFromConfigRequest(config_section=WORKFLOWS_TO_REGISTER_KEY)
                 register_result = self.engine.handle_request(register_request)
 
                 if isinstance(register_result, RegisterWorkflowsFromConfigResultSuccess):
-                    logger.info(
+                    logger.debug(
                         "Successfully registered %d workflows after sync completion: %s",
                         len(register_result.succeeded_workflows),
                         register_result.succeeded_workflows,

@@ -588,7 +588,7 @@ class LibraryWorkers(EngineScoped):
                     for problem in library_info.problems
                 )
                 if has_unmet_requirement and not library_info.requires_worker:
-                    logger.info(
+                    logger.debug(
                         "Not starting a worker for library '%s': %s",
                         library_info.library_name,
                         library_info.execution_unavailable_reason,
@@ -620,7 +620,7 @@ class LibraryWorkers(EngineScoped):
                     library_info.library_name
                 )
                 if build_failure is not None:
-                    logger.error(
+                    logger.debug(
                         "Not requesting a worker for library '%s': %s", library_info.library_name, build_failure
                     )
                     self.engine.library_manager._worker_manager.note_worker_unavailable(

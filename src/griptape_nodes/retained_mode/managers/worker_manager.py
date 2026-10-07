@@ -279,9 +279,9 @@ class WorkerManager(EngineScoped):
         self._workers[wid] = WorkerRegistration(request_topic=request_topic, worker_key=request.library_name)
 
         if request.library_name:
-            logger.info("Worker registered: %s → library '%s'", wid, request.library_name)
+            logger.debug("Worker registered: %s → library '%s'", wid, request.library_name)
         else:
-            logger.info("Worker registered: %s (general-purpose)", wid)
+            logger.debug("Worker registered: %s (general-purpose)", wid)
 
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.subscribe_to_topic(response_topic)
@@ -353,7 +353,7 @@ class WorkerManager(EngineScoped):
             # unregisters too, but with its gate already set, so has_settled keeps it out.
             if not self.has_settled(worker_key):
                 self.note_worker_unavailable(worker_key, "the worker process that runs it shut down before loading it.")
-        logger.info("Worker unregistered: %s", wid)
+        logger.debug("Worker unregistered: %s", wid)
         return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
 
     async def orchestrator_heartbeat_loop(self) -> None:
@@ -521,7 +521,7 @@ class WorkerManager(EngineScoped):
             # find the key belonging to the reload's spawn, and freeing that admits a third fork.
             if self._spawns_in_flight.get(worker_key) is claim:
                 del self._spawns_in_flight[worker_key]
-        logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
+        logger.debug("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
     async def reset_workers(self) -> None:
         """Terminate all managed worker processes, unsubscribe response topics, clear state.
@@ -781,7 +781,7 @@ class WorkerManager(EngineScoped):
         except ProcessLookupError:
             logger.debug("Worker for key '%s' already exited before termination", library_name)
             return
-        logger.info("Terminated worker for key '%s' (pid %s)", library_name, proc.pid)
+        logger.debug("Terminated worker for key '%s' (pid %s)", library_name, proc.pid)
         try:
             await asyncio.wait_for(proc.wait(), timeout=WorkerManager.DEFAULT_TERMINATE_GRACE_S)
         except TimeoutError:
@@ -855,7 +855,7 @@ class WorkerManager(EngineScoped):
                 library_name,
             )
             await self._session_ready_event.wait()
-            logger.info("Session started; spawning worker for library '%s'.", library_name)
+            logger.debug("Session started; spawning worker for library '%s'.", library_name)
         session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
