@@ -282,8 +282,8 @@ class TestFailedRequestLogging:
     """A request that fails outside its handler is logged by type and ID, never by its contents.
 
     A handler that raises is caught by the event manager. The engine's own ``except`` runs when
-    dispatch or the result broadcast fails, and it used to log the request's repr, which for a
-    ``SetSecretValueRequest`` includes the secret value. See #5739.
+    dispatch or the result broadcast fails, and a request's repr can carry a secret value, as a
+    ``SetSecretValueRequest`` does.
     """
 
     SECRET_VALUE = "sk-test-0123456789abcdef"  # noqa: S105 - a fake value the test proves is not logged

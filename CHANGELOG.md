@@ -12,13 +12,6 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
-### Security
-
-- A request that fails outside its handler is now logged by type and request ID only. The engine
-  used to log the whole request, so a failed `SetSecretValueRequest` wrote the secret value to the
-  engine log in plain text.
-  [#5739](https://github.com/griptape-ai/griptape-nodes-engine/issues/5739)
-
 ## [0.103.0] - 2026-09-29
 
 ### Changed
