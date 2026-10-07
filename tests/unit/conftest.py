@@ -12,7 +12,7 @@ from xdg_base_dirs import xdg_state_home
 
 # Engine dir overrides bypass the `xdg_*_home` patches tests rely on, and some paths
 # (`USER_CONFIG_PATH`) are built at import, so drop them before importing `griptape_nodes`.
-for _engine_dir_env_var in ("GTN_CONFIG_DIR", "GTN_DATA_DIR", "GTN_STATE_DIR"):
+for _engine_dir_env_var in ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR"):
     os.environ.pop(_engine_dir_env_var, None)
 
 from griptape_nodes.common import log_capture  # noqa: E402

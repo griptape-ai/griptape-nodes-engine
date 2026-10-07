@@ -16,9 +16,9 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_config_home, xdg_data_home, xdg_state_home
 
-CONFIG_DIR_ENV_VAR = "GTN_CONFIG_DIR"
-DATA_DIR_ENV_VAR = "GTN_DATA_DIR"
-STATE_DIR_ENV_VAR = "GTN_STATE_DIR"
+CONFIG_DIR_ENV_VAR = "GTN_ENGINE_CONFIG_DIR"
+DATA_DIR_ENV_VAR = "GTN_ENGINE_DATA_DIR"
+STATE_DIR_ENV_VAR = "GTN_ENGINE_STATE_DIR"
 
 _ENGINE_DIR_NAME = "griptape_nodes"
 

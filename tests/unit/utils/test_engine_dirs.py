@@ -1,8 +1,11 @@
+import os
 from pathlib import Path
 from typing import NamedTuple
+from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.utils import engine_dirs
 from griptape_nodes.utils.engine_dirs import engine_config_dir, engine_data_dir, engine_state_dir
 
@@ -13,7 +16,7 @@ class XdgHomes(NamedTuple):
     state: Path
 
 
-_ENV_VARS = ("GTN_CONFIG_DIR", "GTN_DATA_DIR", "GTN_STATE_DIR")
+_ENV_VARS = ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR")
 
 
 @pytest.fixture
@@ -36,9 +39,9 @@ class TestEngineDirs:
         assert engine_state_dir() == xdg_homes.state / "griptape_nodes"
 
     def test_absolute_override_is_used_as_is(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("GTN_CONFIG_DIR", str(tmp_path / "config"))
-        monkeypatch.setenv("GTN_DATA_DIR", str(tmp_path / "data"))
-        monkeypatch.setenv("GTN_STATE_DIR", str(tmp_path / "state"))
+        monkeypatch.setenv("GTN_ENGINE_CONFIG_DIR", str(tmp_path / "config"))
+        monkeypatch.setenv("GTN_ENGINE_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("GTN_ENGINE_STATE_DIR", str(tmp_path / "state"))
 
         assert engine_config_dir() == tmp_path / "config"
         assert engine_data_dir() == tmp_path / "data"
@@ -48,9 +51,9 @@ class TestEngineDirs:
     def test_relative_or_empty_override_is_ignored(
         self, xdg_homes: XdgHomes, monkeypatch: pytest.MonkeyPatch, relative_value: str
     ) -> None:
-        monkeypatch.setenv("GTN_CONFIG_DIR", relative_value)
-        monkeypatch.setenv("GTN_DATA_DIR", relative_value)
-        monkeypatch.setenv("GTN_STATE_DIR", relative_value)
+        monkeypatch.setenv("GTN_ENGINE_CONFIG_DIR", relative_value)
+        monkeypatch.setenv("GTN_ENGINE_DATA_DIR", relative_value)
+        monkeypatch.setenv("GTN_ENGINE_STATE_DIR", relative_value)
 
         assert engine_config_dir() == xdg_homes.config / "griptape_nodes"
         assert engine_data_dir() == xdg_homes.data / "griptape_nodes"
@@ -59,7 +62,7 @@ class TestEngineDirs:
     def test_each_variable_only_affects_its_own_directory(
         self, xdg_homes: XdgHomes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("GTN_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("GTN_ENGINE_DATA_DIR", str(tmp_path))
 
         assert engine_data_dir() == tmp_path
         assert engine_config_dir() == xdg_homes.config / "griptape_nodes"
@@ -68,7 +71,17 @@ class TestEngineDirs:
     @pytest.mark.usefixtures("xdg_homes")
     def test_override_is_read_at_call_time(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         before = engine_data_dir()
-        monkeypatch.setenv("GTN_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("GTN_ENGINE_DATA_DIR", str(tmp_path))
 
         assert engine_data_dir() == tmp_path
         assert before != tmp_path
+
+    @pytest.mark.parametrize(
+        "env_var",
+        [engine_dirs.CONFIG_DIR_ENV_VAR, engine_dirs.DATA_DIR_ENV_VAR, engine_dirs.STATE_DIR_ENV_VAR],
+    )
+    def test_override_is_not_read_as_a_setting(self, env_var: str, tmp_path: Path) -> None:
+        with patch.dict(os.environ, {env_var: str(tmp_path)}, clear=True):
+            layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
+
+        assert layers["env"].env_vars == {}
