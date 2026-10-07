@@ -200,7 +200,6 @@ class TestUpdateLibraryRequestAgeGate:
 
     def _validation_context(self, library_dir: Path) -> LibraryGitOperationContext:
         return LibraryGitOperationContext(
-            library=MagicMock(),
             old_version="1.0.0",
             library_file_path=str(library_dir / "griptape_nodes_library.json"),
             library_dir=library_dir,
