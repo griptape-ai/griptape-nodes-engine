@@ -837,6 +837,12 @@ class LibraryGitOperations(EngineScoped):
             details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no Library with that name was found."
             return failure_result_class(result_details=details)
 
+        # The reload re-registers the library from a fresh DISCOVERED entry, which never consults
+        # libraries_to_register, so a disabled library would come back enabled for the session.
+        if library_info.lifecycle_state == LibraryLifecycleState.DISABLED:
+            details = f"Attempted to {operation_description} Library '{library_name}'. Failed because the Library is disabled. Enable it in Library Management and try again."
+            return failure_result_class(result_details=details)
+
         # Set once metadata loads, which happens before the engine-compatibility gate, so an
         # engine-incompatible library still reports the version it is pinned at.
         old_version = library_info.library_version

@@ -10,6 +10,7 @@ libraries that need it.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -47,6 +48,16 @@ def _unregistered_info(*, version: str | None = "0.88.0") -> LibraryManager.Libr
         is_sandbox=False,
         library_name="test_lib",
         library_version=version,
+    )
+
+
+def _disabled_info() -> LibraryManager.LibraryInfo:
+    """Build the info discovery records for a library turned off in libraries_to_register."""
+    return replace(
+        _unregistered_info(),
+        lifecycle_state=LibraryManager.LibraryLifecycleState.DISABLED,
+        fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+        enabled=False,
     )
 
 
@@ -127,6 +138,21 @@ class TestGitOperationValidationWithoutRegistration:
             )
 
         assert isinstance(result, SwitchLibraryRefResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_validation_fails_for_a_disabled_library(self, engine: Engine) -> None:
+        """A disabled library is refused, since the reload would register it and turn it back on."""
+        library_manager = engine.library_manager
+
+        with patch.object(library_manager, "get_library_info_by_library_name", return_value=_disabled_info()):
+            result = await library_manager.git_operations._validate_and_prepare_library_for_git_operation(
+                library_name="test_lib",
+                failure_result_class=SwitchLibraryRefResultFailure,
+                operation_description="switch branch/tag for",
+            )
+
+        assert isinstance(result, SwitchLibraryRefResultFailure)
+        assert "disabled" in str(result.result_details)
 
 
 class TestSwitchLibraryRefWithoutRegistration:
