@@ -1097,6 +1097,10 @@ class TestParseStaticServerUrl:
         )
         assert result == Path("/mnt/workspace/cat.png")
 
+    def test_external_posix_dir_with_colon_is_not_a_drive(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/x:foo/bar.png", self.WORKSPACE)
+        assert result == Path("/x:foo/bar.png")
+
     def test_rejects_localhost_url_with_empty_external_remainder(self) -> None:
         result = parse_static_server_url("http://localhost:8124/external/", self.WORKSPACE)
         assert result is None

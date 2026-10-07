@@ -51,6 +51,9 @@ _STATIC_SERVER_WORKSPACE_SEGMENT = "/workspace/"
 # the file's absolute path without its leading slash.
 _STATIC_SERVER_EXTERNAL_PREFIX = "/external/"
 
+# A drive path as `LocalStorageDriver` writes it after `/external/` (`C:/Users/...`).
+_EXTERNAL_WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:/")
+
 # A `file://` netloc that is actually a drive letter, from a hand-written or legacy URI
 # (`file://C:/Users/...`, `file://c|/Users/...`). This names a local Windows path, not a
 # UNC host, and is folded into the local-path branch of parse_file_uri.
@@ -481,7 +484,7 @@ def _parse_external_static_server_path(url_path: str) -> Path | None:
     external_path = url_path.removeprefix(_STATIC_SERVER_EXTERNAL_PREFIX)
     if not external_path:
         return None
-    if _WINDOWS_DRIVE_PATTERN.match(external_path):
+    if _EXTERNAL_WINDOWS_DRIVE_PATTERN.match(external_path):
         return Path(external_path)
     return Path("/" + external_path)
 
