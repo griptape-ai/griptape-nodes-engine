@@ -860,9 +860,14 @@ def _anchor_and_resolve(expanded: Path, base: Path | None) -> Path:
     ``canonicalize_expanded_for_identity``: the two differ only in whether they
     sanitize and expand first, and must not drift in what they do afterwards.
     """
+    return _anchor(expanded, base).resolve(strict=False)
+
+
+def _anchor(expanded: Path, base: Path | None) -> Path:
+    """Anchor a relative path to ``base`` (default CWD) and normalize it, following no symlinks."""
     if not expanded.is_absolute():
         expanded = (base if base is not None else Path.cwd()) / expanded
-    return resolve_path_safely(expanded).resolve(strict=False)
+    return resolve_path_safely(expanded)
 
 
 def canonicalize_expanded_for_identity(expanded: Path, *, base: Path | None = None) -> Path:
@@ -911,6 +916,26 @@ def canonicalize_for_identity(path: str | Path, *, base: Path | None = None) -> 
     return _anchor_and_resolve(expand_path(sanitize_path_string(path)), base)
 
 
+def canonicalize_for_identity_preserving_symlinks(path: str | Path, *, base: Path | None = None) -> Path:
+    """Produce a path identity that names a symlink by the link rather than by its target.
+
+    Everything ``canonicalize_for_identity`` does except the final symlink resolution (and, like it,
+    without the Windows long-path prefix), so the result is still fit to be a key.
+
+    Use only where the link is the identity the engine already uses: directory scans report a
+    linked file by the link's path, so resolving it would place the file where no scan looked.
+
+    Args:
+        path: Raw path string or Path object (may contain ~, env vars, quotes,
+            shell escapes, or relative segments).
+        base: Base directory for relative paths. Defaults to ``Path.cwd()``.
+
+    Returns:
+        Absolute, normalized Path with any symlinks along it left intact.
+    """
+    return _anchor(expand_path(sanitize_path_string(path)), base)
+
+
 def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     r"""Produce a path suitable for handing to the filesystem.
 
@@ -943,6 +968,42 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     if prefixed == normalized_str:
         return normalized
     return Path(prefixed)
+
+
+def relative_to_keeping_or_following_links(
+    path: str | Path, root: str | Path, *, base: Path | None = None
+) -> Path | None:
+    """Return ``path`` relative to ``root`` if it is inside it, else None.
+
+    Tried twice, because links can sit in two places:
+
+    - Links kept: a scan names a file in a linked subfolder by the link, so ``<root>/link/f.py`` is
+      inside even when ``link`` points elsewhere.
+    - Links followed: a link above the file can hide one that is really inside, and a root reached
+      through a link has its real location accepted too.
+
+    Safe because paths are normalized as text first: ``link/../x.py`` becomes ``<root>/x.py``
+    before any link is followed, so a ``..`` never reaches past a link.
+
+    Args:
+        path: Path to test (may be relative to ``base``).
+        root: Directory the path should be inside.
+        base: Base directory for a relative ``path``. Defaults to ``Path.cwd()``.
+
+    Returns:
+        The path relative to ``root``, or None if it is outside ``root``.
+    """
+    kept_root = canonicalize_for_identity_preserving_symlinks(root)
+    kept_path = canonicalize_for_identity_preserving_symlinks(path, base=base)
+    if kept_path.is_relative_to(kept_root):
+        return kept_path.relative_to(kept_root)
+
+    followed_root = canonicalize_for_identity(root)
+    followed_path = canonicalize_for_identity(path, base=base)
+    if followed_path.is_relative_to(followed_root):
+        return followed_path.relative_to(followed_root)
+
+    return None
 
 
 def canonicalize_to_posix(path: str | Path) -> str:

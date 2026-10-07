@@ -24,6 +24,10 @@ engine picks up `.py` node files from that directory, and what you
 see in the editor's Sandbox category depends on what's actually in
 it.
 
+The Sandbox Library can also turn your own saved workflows into
+nodes. See [Turning a workflow into a node](#turning-a-workflow-into-a-node)
+below.
+
 During `gtn init`, you're offered the **Advanced Media Library**
 (diffusion, image generation, video). You can register it then or
 re-run `gtn init` later to add it. See the
@@ -302,6 +306,50 @@ engines, or just preference — the editor's library actions have
 
 See [Command Line Interface](../reference/command_line_interface.md) for the
 full reference.
+
+## Turning a workflow into a node
+
+Any saved workflow you put in your sandbox folder (the **Sandbox
+Library Directory** under **Settings → Library → Sandbox Settings**)
+shows up in the node chooser as a node. You'll find it in the
+**Sandbox Library**, under the **Sandbox** heading, next to any
+custom nodes you're developing there. Treat it like any other node
+in development: once it's settled, it can move into a library of
+its own.
+
+To qualify, the workflow needs a **Start Flow** node and an **End
+Flow** node. The Start Flow node's parameters become the node's
+inputs and the End Flow node's parameters become its outputs, so
+what you wire into the node is what the workflow receives, and what
+the workflow finishes with is what the node hands on.
+
+The node's name comes from the workflow's name: `shout_workflow`
+becomes **ShoutWorkflow**. Its display name and description in the
+node chooser come from the workflow's own name and description.
+
+A few things worth knowing:
+
+- **Changes show up when libraries load.** The sandbox folder is
+    read when the engine starts and each time you choose **Refresh
+    Libraries**. A workflow you add, edit, or remove in between isn't
+    picked up until then.
+- **Renaming a workflow gives you a different node.** Because the
+    node's name comes from the workflow's name, changing the
+    workflow's name turns it into a new node. Workflows that were
+    already using the old node won't find it any more.
+- **Publishing doesn't take the workflow with it.** A workflow that
+    uses one of these nodes won't run on another installation unless
+    the workflow behind the node is there too.
+- **Problems show up in the Libraries panel.** If a workflow can't
+    become a node (it has no Start Flow or End Flow node, or its
+    saved details can't be read), the **Sandbox Library** entry in
+    the **Libraries** panel says why. Fix it, save it, then choose
+    **Refresh Libraries**.
+- **A workflow and a custom node can't share a name.** If a
+    workflow's node name matches a custom node in the sandbox, the
+    workflow's node takes the name and the custom node is left out.
+    The **Sandbox Library** entry shows a duplicate-name problem.
+    Rename one of them, then choose **Refresh Libraries**.
 
 ## Where libraries are stored on disk
 
