@@ -11,7 +11,6 @@ import anyio
 from semver import Version
 
 from griptape_nodes.node_library.library_registry import (
-    Library,
     LibraryRegistry,
     LibrarySchema,
 )
@@ -84,7 +83,6 @@ logger = logging.getLogger("griptape_nodes")
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
-    library: Library
     old_version: str
     library_file_path: str
     library_dir: Path
@@ -817,6 +815,14 @@ class LibraryGitOperations(EngineScoped):
     ) -> LibraryGitOperationContext | ResultPayloadFailure:
         """Validate library exists and prepare for git operation.
 
+        Resolution goes through `get_library_info_by_library_name`, not the LibraryRegistry,
+        which holds only libraries that finished loading. A library that failed to load is
+        exactly the one a user needs to switch or update away from, so gating these operations
+        on registration would put the repair out of reach of the libraries that need it.
+        Routing through the shared resolver also keeps this path and
+        check_library_update_request from disagreeing about which on-disk copy a duplicately
+        registered library maps to.
+
         Args:
             library_name: Name of the library to validate
             failure_result_class: Class to use for failure results (e.g., UpdateLibraryResultFailure)
@@ -826,33 +832,30 @@ class LibraryGitOperations(EngineScoped):
             On success: LibraryGitOperationContext with library info
             On failure: ResultPayloadFailure instance
         """
-        # Check if the library exists
-        try:
-            library = LibraryRegistry.get_library(name=library_name)
-        except KeyError:
-            details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no Library with that name was registered."
+        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no Library with that name was found."
             return failure_result_class(result_details=details)
 
-        # Get current version
-        old_version = library.get_metadata().library_version
+        # The reload re-registers the library from a fresh DISCOVERED entry, which never consults
+        # libraries_to_register, so a disabled library would come back enabled for the session.
+        if library_info.lifecycle_state == LibraryLifecycleState.DISABLED:
+            details = f"Attempted to {operation_description} Library '{library_name}'. Failed because the Library is disabled. Enable it in Library Management and try again."
+            return failure_result_class(result_details=details)
+
+        # Set once metadata loads, which happens before the engine-compatibility gate, so an
+        # engine-incompatible library still reports the version it is pinned at.
+        old_version = library_info.library_version
         if old_version is None:
             details = f"Library '{library_name}' has no version information."
             return failure_result_class(result_details=details)
 
-        # Find the library file path. Route through the shared resolver so this update path
-        # and check_library_update_request can never disagree about which on-disk copy a
-        # duplicately-registered library maps to.
-        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
-        if library_info is None:
-            details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no file path could be found for this library."
-            return failure_result_class(result_details=details)
         library_file_path = library_info.library_path
 
         # Get the library directory (parent of the JSON file)
         library_dir = Path(library_file_path).parent.absolute()
 
         return LibraryGitOperationContext(
-            library=library,
             old_version=old_version,
             library_file_path=library_file_path,
             library_dir=library_dir,
@@ -876,11 +879,14 @@ class LibraryGitOperations(EngineScoped):
             On success: new_version (str, may be "unknown")
             On failure: ResultPayloadFailure instance
         """
-        # Unload the library
-        unload_result = self.engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
-        if not unload_result.succeeded():
-            details = f"Failed to unload Library '{library_name}' after git operation."
-            return failure_result_class(result_details=details)
+        # Unload the library. Only libraries that finished loading are in the registry, and
+        # unregistering one that never got there raises, so skip the unload for a library the
+        # git operation was meant to repair.
+        if library_name in LibraryRegistry.list_libraries():
+            unload_result = self.engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
+            if not unload_result.succeeded():
+                details = f"Failed to unload Library '{library_name}' after git operation."
+                return failure_result_class(result_details=details)
 
         # Search for the library JSON file using flexible pattern to handle filename variations
         # (after git operations, the filename might change between griptape-nodes-library.json and griptape_nodes_library.json)
