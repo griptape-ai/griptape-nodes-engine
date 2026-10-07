@@ -257,10 +257,12 @@ _LOCAL_ONLY_ARTIFACT_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
 )
 
 
-# OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
-# the OS to open in the user's default application, and that side effect belongs where the user is,
-# not in a headless subprocess.
-_FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
+# The filesystem requests deliberately NOT local: each hands a path to an application on the user's
+# desktop (the OS default one, or the viewer they configured), and that side effect belongs where the
+# user is, not in a headless subprocess.
+_FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
+    {os_events.OpenAssociatedFileRequest, os_events.LaunchExternalViewerRequest}
+)
 
 
 # Swept wholesale, minus _FORWARDING_FILESYSTEM_REQUESTS: the workspace is shared on disk, so the

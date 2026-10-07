@@ -1,9 +1,10 @@
 import os
 import platform
+import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
@@ -37,6 +38,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetNextVersionIndexRequest,
     GetNextVersionIndexResultFailure,
     GetNextVersionIndexResultSuccess,
+    LaunchExternalViewerRequest,
+    LaunchExternalViewerResultFailure,
+    LaunchExternalViewerResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
@@ -45,6 +49,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     MakeDirectoryRequest,
     MakeDirectoryResultFailure,
     MakeDirectoryResultSuccess,
+    OpenAssociatedFileRequest,
+    OpenAssociatedFileResultFailure,
+    OpenAssociatedFileResultSuccess,
     ReadFileRequest,
     ReadFileResultFailure,
     ReadFileResultSuccess,
@@ -2409,3 +2416,181 @@ class TestPlatformName:
         # Reporting something beats reporting nothing, so the result is never empty.
         monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "freebsd14")
         assert OSManager.platform_name() == "freebsd14"
+
+
+class TestLaunchExternalViewerRequest:
+    """LaunchExternalViewerRequest launches the configured viewer detached, or opts into the OS default."""
+
+    _POPEN = "griptape_nodes.retained_mode.managers.os_manager.subprocess.Popen"
+
+    @pytest.fixture
+    def image_file(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "render.exr"
+            path.write_bytes(b"exr")
+            yield path
+
+    @pytest.fixture
+    def set_viewer(self, engine: Engine) -> Generator[MagicMock, None, None]:
+        """Returns a setter for `openexr.viewer_executable`; other keys read the real config."""
+        real_get = engine.config_manager.get_config_value
+        configured: dict[str, str] = {}
+
+        def fake_get(key: str, **kwargs: object) -> object:
+            if key in configured:
+                return configured[key]
+            return real_get(key, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        setter = MagicMock(side_effect=lambda value: configured.__setitem__("openexr.viewer_executable", value))
+        with patch.object(engine.config_manager, "get_config_value", side_effect=fake_get):
+            yield setter
+
+    def test_configured_viewer_launches_detached_on_posix(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock
+    ) -> None:
+        set_viewer("/opt/viewer/bin/viewer --single")
+
+        with patch.object(OSManager, "is_windows", return_value=False), patch(self._POPEN) as popen:
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultSuccess)
+        assert result.used_fallback is False
+        popen.assert_called_once_with(
+            ["/opt/viewer/bin/viewer", "--single", os.fspath(image_file)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def test_configured_viewer_launches_detached_on_windows(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The flags only exist on Windows, so they are planted for hosts that lack them.
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+        set_viewer(r'"C:\Program Files\Viewer\viewer.exe" --title "My Render"')
+
+        with patch.object(OSManager, "is_windows", return_value=True), patch(self._POPEN) as popen:
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultSuccess)
+        argv = popen.call_args.args[0]
+        assert argv[:3] == [r"C:\Program Files\Viewer\viewer.exe", "--title", "My Render"]
+        assert popen.call_args.kwargs["creationflags"] == 0x8 | 0x200
+        assert "start_new_session" not in popen.call_args.kwargs
+
+    def test_quoted_posix_viewer_path_with_spaces_splits_into_one_argument(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock
+    ) -> None:
+        set_viewer("'/Applications/My Viewer.app/Contents/MacOS/viewer' -a 'two words'")
+
+        with patch.object(OSManager, "is_windows", return_value=False), patch(self._POPEN) as popen:
+            engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        argv = popen.call_args.args[0]
+        assert argv[:3] == ["/Applications/My Viewer.app/Contents/MacOS/viewer", "-a", "two words"]
+
+    def test_unconfigured_viewer_fails_without_fallback(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock
+    ) -> None:
+        set_viewer("   ")
+
+        with patch(self._POPEN) as popen:
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultFailure)
+        assert result.failure_reason == FileIOFailureReason.NOT_CONFIGURED
+        assert "openexr.viewer_executable" in str(result.result_details)
+        popen.assert_not_called()
+
+    def test_unconfigured_viewer_opens_with_os_default_when_fallback_requested(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock
+    ) -> None:
+        set_viewer("")
+
+        with (
+            patch.object(
+                engine.os_manager,
+                "on_open_associated_file_request",
+                return_value=OpenAssociatedFileResultSuccess(result_details="opened"),
+            ) as open_associated,
+            patch(self._POPEN) as popen,
+        ):
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(
+                    path_to_file=str(image_file), config_category="openexr", fallback_to_os_default=True
+                )
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultSuccess)
+        assert result.used_fallback is True
+        open_associated.assert_called_once_with(OpenAssociatedFileRequest(path_to_file=os.fspath(image_file)))
+        popen.assert_not_called()
+
+    def test_fallback_failure_is_reported_as_a_launch_failure(
+        self, engine: Engine, image_file: Path, set_viewer: MagicMock
+    ) -> None:
+        set_viewer("")
+
+        with patch.object(
+            engine.os_manager,
+            "on_open_associated_file_request",
+            return_value=OpenAssociatedFileResultFailure(
+                failure_reason=FileIOFailureReason.IO_ERROR, result_details="no association"
+            ),
+        ):
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(
+                    path_to_file=str(image_file), config_category="openexr", fallback_to_os_default=True
+                )
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IO_ERROR
+
+    def test_missing_file_fails_before_launching(self, engine: Engine, image_file: Path, set_viewer: MagicMock) -> None:
+        set_viewer("/opt/viewer/bin/viewer")
+
+        with patch(self._POPEN) as popen:
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(
+                    path_to_file=str(image_file.with_name("missing.exr")), config_category="openexr"
+                )
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
+        popen.assert_not_called()
+
+    def test_viewer_not_found_fails(self, engine: Engine, image_file: Path, set_viewer: MagicMock) -> None:
+        set_viewer("/opt/viewer/bin/viewer")
+
+        with patch(self._POPEN, side_effect=FileNotFoundError("viewer")):
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
+        assert "/opt/viewer/bin/viewer" in str(result.result_details)
+
+    def test_unbalanced_quotes_in_setting_fail(self, engine: Engine, image_file: Path, set_viewer: MagicMock) -> None:
+        set_viewer('"/opt/viewer/bin/viewer')
+
+        with patch.object(OSManager, "is_windows", return_value=False), patch(self._POPEN) as popen:
+            result = engine.os_manager.on_launch_external_viewer_request(
+                LaunchExternalViewerRequest(path_to_file=str(image_file), config_category="openexr")
+            )
+
+        assert isinstance(result, LaunchExternalViewerResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+        popen.assert_not_called()

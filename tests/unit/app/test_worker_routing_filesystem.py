@@ -123,13 +123,16 @@ class TestEveryFilesystemRequestHasARoutingDecision:
         else:
             assert request_type in LOCAL_ONLY_REQUEST_TYPES
 
-    def test_opening_a_file_in_the_users_app_is_the_only_forwarded_one(self) -> None:
+    def test_opening_a_file_in_the_users_app_is_the_only_forwarded_kind(self) -> None:
         """It is a side effect, not a filesystem read: it belongs where the user is.
 
         A headless worker subprocess launching a desktop application would be either invisible or
-        wrong, so this one goes to the process sitting next to the person.
+        wrong, so these go to the process sitting next to the person.
         """
-        assert {os_events.OpenAssociatedFileRequest} == _FORWARDING_FILESYSTEM_REQUESTS
+        assert {
+            os_events.OpenAssociatedFileRequest,
+            os_events.LaunchExternalViewerRequest,
+        } == _FORWARDING_FILESYSTEM_REQUESTS
 
 
 class TestEveryMacroPathCarrierSurvivesTheWire:
