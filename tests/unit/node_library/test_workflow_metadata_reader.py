@@ -89,6 +89,13 @@ class TestReadWorkflowMetadata:
         with pytest.raises(WorkflowMetadataFileError, match="could not be read"):
             read_workflow_metadata(tmp_path / "absent.py")
 
+    def test_file_that_is_not_utf8(self, tmp_path: Path) -> None:
+        workflow_path = tmp_path / "latin1.py"
+        workflow_path.write_bytes(b"# caf\xe9\n")  # spellchecker:disable-line
+
+        with pytest.raises(WorkflowMetadataFileError, match="could not be read"):
+            read_workflow_metadata(workflow_path)
+
     def test_no_header(self, tmp_path: Path) -> None:
         with pytest.raises(WorkflowMetadataSectionCountError, match="0 'script' metadata sections") as excinfo:
             read_workflow_metadata(_write(tmp_path, "print('hello')\n"))
