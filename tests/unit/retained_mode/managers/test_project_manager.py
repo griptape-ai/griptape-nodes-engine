@@ -926,7 +926,7 @@ class TestProjectManagerBuiltinVariables:
         mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = mock_context_manager
 
-        mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
+        mock_workflow_registry.has_workflow_with_name.return_value = False
 
         parsed_macro = ParsedMacro(macro)
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -13374,7 +13374,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         """
         pm = self._project_manager("{workspace_dir}/workflows/{sub_dirs?:/}{file_name_base}.{file_extension}")
         if not registered:
-            cast("MagicMock", pm._engine).workflow_registry.get_workflow_by_name.side_effect = KeyError("unsaved:abc")
+            cast("MagicMock", pm._engine).workflow_registry.has_workflow_with_name.return_value = False
 
         assert self._resolve_workflow_dir(pm) == self._expected_dir("workflows")
 

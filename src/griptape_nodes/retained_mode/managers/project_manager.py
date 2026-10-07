@@ -5032,10 +5032,9 @@ class ProjectManager(EngineScoped):
 
         workflow_name = context_manager.get_current_workflow_name()
         working_directory = context_manager.get_current_workflow_working_directory()
-        try:
+        workflow = None
+        if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
             workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
-        except KeyError:
-            workflow = None
 
         if workflow is None or workflow.file_path is None:
             if working_directory is not None:
