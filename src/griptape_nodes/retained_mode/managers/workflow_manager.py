@@ -17,6 +17,7 @@ from rich.text import Text
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     derive_registry_key,
+    is_absolute_path_from_other_platform,
 )
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
@@ -545,6 +546,14 @@ class WorkflowManager(EngineScoped):
     async def on_load_workflow_metadata_request(  # noqa: C901, PLR0912, PLR0915
         self, request: LoadWorkflowMetadata
     ) -> ResultPayload:
+        if is_absolute_path_from_other_platform(request.file_name):
+            details = (
+                f"Attempted to load workflow metadata for a file at '{request.file_name}'. "
+                f"Failed because that path comes from a different operating system than the one this engine "
+                f"runs on, so it names no location here. Use a path relative to the project's workspace folder "
+                f"'{self.engine.config_manager.workspace_path}' instead, for example 'shots/blur.py'."
+            )
+            return LoadWorkflowMetadataResultFailure(result_details=details)
         # The editor can send LoadWorkflowMetadata before library registration finishes
         # (observed on Windows, engine cold start). Without this gate, the dependency
         # check below would race LibraryRegistry and return LibraryNotRegisteredProblem
