@@ -664,7 +664,7 @@ requires-dist = [
     { name = "fileseq", specifier = ">=3.2.0" },
     { name = "griptape", specifier = ">=1.10.2" },
     { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
-    { name = "huggingface-hub", specifier = ">=1.9.0" },
+    { name = "huggingface-hub", specifier = ">=1.9.0,<2" },
     { name = "json-repair", specifier = ">=0.46.1" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "packaging", specifier = ">=25.0" },

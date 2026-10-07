@@ -28,7 +28,9 @@ dependencies = [
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
   "typer>=0.15.0",
-  "huggingface-hub>=1.9.0",
+  # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library
+  # installs floor at the engine's version, so 2.x here fails them and marks them FLAWED (issue 5752).
+  "huggingface-hub>=1.9.0,<2",
   "rich>=14.1.0",
   "semver>=3.0.4",
   "anyio>=4.0",
