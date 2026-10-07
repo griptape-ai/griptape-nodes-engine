@@ -205,7 +205,7 @@ class VariableResolver:
         and tripped `reentrant-bus-in-init`. Fixing it properly means resolving the answer once
         per execution and carrying it, rather than asking per value.
         """
-        return engine.workflow_manager.is_variable_substitution_enabled()
+        return engine.workflow_manager.variable_substitution.is_enabled()
 
     @staticmethod
     def get_variables_if_enabled(engine: Engine, node_name: str) -> dict[str, str | int] | None:
@@ -228,7 +228,7 @@ class VariableResolver:
         """
         # Same local read as is_substitution_enabled, and the same worker limitation applies;
         # see the note there.
-        if not engine.workflow_manager.is_variable_substitution_enabled():
+        if not engine.workflow_manager.variable_substitution.is_enabled():
             return None
 
         cached = _aprocess_variable_cache.get()

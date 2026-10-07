@@ -77,7 +77,9 @@ class ArbitraryCodeExecManager:
                 result_details="Successfully executed Python string",
             )
         except Exception as e:
-            error_output = f"ERROR: {e}"
+            # The type is the most useful word in the message ("ZeroDivisionError: division by zero"),
+            # and the caller only gets this string back, not the exception.
+            error_output = f"{type(e).__name__}: {e}"
             result = RunArbitraryPythonStringResultFailure(python_output=error_output, result_details=error_output)
 
         return result

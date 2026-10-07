@@ -520,11 +520,11 @@ class TestGeneratedWorkflowCode:
 
     def test_generated_code_uses_file_path_not_workflow_name(self, engine: Engine) -> None:
         """_generate_workflow_run_prerequisite_code emits push_workflow(file_path=__file__)."""
-        from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
+        from griptape_nodes.retained_mode.managers.workflow.codegen import ImportRecorder
 
         workflow_manager = engine.workflow_manager
         import_recorder = ImportRecorder()
-        code_blocks = workflow_manager._generate_workflow_run_prerequisite_code(
+        code_blocks = workflow_manager.codegen._generate_workflow_run_prerequisite_code(
             import_recorder=import_recorder,
             library_names=[],
         )
