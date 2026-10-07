@@ -55,7 +55,6 @@ from griptape_nodes.exe_types.node_types import (
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
-    constructing_unbroadcast_node,
     sanctioned_parameter_mutation,
 )
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
@@ -4118,7 +4117,7 @@ class NodeManager(EngineScoped):
             if isinstance(node, ErrorProxyNode):
                 reference_node = None
             else:
-                with LibraryRegistry.constructing_node(), constructing_unbroadcast_node():
+                with LibraryRegistry.constructing_node(throwaway=True):
                     reference_node = type(node)(
                         name="REFERENCE NODE",
                         metadata={

@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 _constructing_node: ContextVar[bool] = ContextVar("_library_registry_constructing_node", default=False)
+# Set by ``constructing_node(throwaway=True)``; see there.
+_constructing_throwaway_node: ContextVar[bool] = ContextVar(
+    "_library_registry_constructing_throwaway_node", default=False
+)
 
 
 class LibraryRegistryError(KeyError):
@@ -501,7 +505,7 @@ class LibraryRegistry:
 
     @classmethod
     @contextmanager
-    def constructing_node(cls) -> Iterator[None]:
+    def constructing_node(cls, *, throwaway: bool = False) -> Iterator[None]:
         """Mark the enclosed block as a node ``__init__`` running on the calling task.
 
         Sets the same task-local flag that ``create_node`` sets. Use at
@@ -516,11 +520,20 @@ class LibraryRegistry:
         - the reentrant-bus-in-init detector still fires for the
           right reason if the constructed node's ``__init__`` issues
           a bus request.
+
+        Pass ``throwaway=True`` for a node no client ever sees, such as the
+        serializer's reference copy or a type probe. It sends no element
+        events: saving an image serializes the whole flow into its metadata,
+        one reference copy per node, so those events grew with nodes times
+        saved images.
         """
         token = _constructing_node.set(True)
+        throwaway_token = _constructing_throwaway_node.set(True) if throwaway else None
         try:
             yield
         finally:
+            if throwaway_token is not None:
+                _constructing_throwaway_node.reset(throwaway_token)
             _constructing_node.reset(token)
 
     @classmethod
@@ -533,6 +546,11 @@ class LibraryRegistry:
         flag is set by ``create_node`` and by ``constructing_node()``.
         """
         return _constructing_node.get()
+
+    @classmethod
+    def is_constructing_throwaway_node(cls) -> bool:
+        """Return True inside ``constructing_node(throwaway=True)``."""
+        return _constructing_throwaway_node.get()
 
     @classmethod
     def get_all_library_schemas(cls) -> dict[str, dict]:
