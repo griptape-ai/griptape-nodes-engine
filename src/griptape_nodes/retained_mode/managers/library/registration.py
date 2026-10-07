@@ -101,11 +101,13 @@ class LibraryRegistrar(EngineScoped):
         event_manager.register_request_handlers(self)
 
     @handles(RegisterLibraryFromFileRequest)
-    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
+    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:
         """Register a library by name or path, progressing through all lifecycle phases.
 
         Supports loading by library_name OR file_path (mutually exclusive), with optional
         discovery integration. Creates LibraryInfo if not already tracked.
+
+        A library that newly arrived also gets its declared workflow templates registered.
 
         Args:
             request: RegisterLibraryFromFileRequest containing library_name OR file_path,
@@ -133,33 +135,45 @@ class LibraryRegistrar(EngineScoped):
         progression_result = await self._progress_library_through_lifecycle(
             library_info=library_info, file_path=file_path, request=request
         )
+        # Even a library that failed partway may have reached the registry.
+        self.engine.workflow_manager.note_library_set_changed()
 
         # FAILURE CHECK
         if isinstance(progression_result, RegisterLibraryFromFileResultFailure):
             return progression_result
 
-        # Phase 3: Return appropriate result based on fitness
+        # Phase 3: Build the result from the library's fitness, and register what it ships.
         # At this point, library_name must be set (it's set during METADATA_LOADED phase)
-        if library_info.library_name is None:
+        library_name = library_info.library_name
+        if library_name is None:
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
 
+        result = self._build_register_library_result(library_info, library_name=library_name, file_path=file_path)
+        if isinstance(result, RegisterLibraryFromFileResultSuccess):
+            await self.engine.library_manager.register_workflows_for_library(library_info)
+        return result
+
+    def _build_register_library_result(
+        self, library_info: LibraryInfo, *, library_name: str, file_path: str
+    ) -> RegisterLibraryFromFileResultSuccess | RegisterLibraryFromFileResultFailure:
+        """Turn a loaded library's fitness into the result its registration reports."""
         match library_info.fitness:
             case LibraryFitness.GOOD:
-                details = f"Successfully loaded Library '{library_info.library_name}' from JSON file at {file_path}"
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
+                details = f"Successfully loaded Library '{library_name}' from JSON file at {file_path}"
+                result = RegisterLibraryFromFileResultSuccess(
+                    library_name=library_name,
                     result_details=ResultDetails(message=details, level=logging.INFO),
                 )
             case LibraryFitness.FLAWED:
                 details = f"Successfully loaded Library JSON file from '{file_path}', but one or more nodes failed to load. Check the log for more details."
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
+                result = RegisterLibraryFromFileResultSuccess(
+                    library_name=library_name,
                     result_details=ResultDetails(message=details, level=logging.WARNING),
                 )
             case LibraryFitness.UNUSABLE:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because no nodes were loaded. Check the log for more details."
-                return RegisterLibraryFromFileResultFailure(result_details=details)
+                result = RegisterLibraryFromFileResultFailure(result_details=details)
             case LibraryFitness.NOT_EVALUATED:
                 # Worker-delegated libraries on the orchestrator: node imports are skipped
                 # and fitness will be updated once the worker reports back via
@@ -167,14 +181,15 @@ class LibraryRegistrar(EngineScoped):
                 # AppStartSessionRequest or by maybe_start_workers_for_existing_session)
                 # so we must NOT block here -- doing so would prevent the orchestrator from
                 # sending heartbeats to the worker process, causing it to self-terminate.
-                details = f"Successfully registered Library '{library_info.library_name}' from '{file_path}'. Node loading is delegated to a worker process."
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
+                details = f"Successfully registered Library '{library_name}' from '{file_path}'. Node loading is delegated to a worker process."
+                result = RegisterLibraryFromFileResultSuccess(
+                    library_name=library_name,
                     result_details=ResultDetails(message=details, level=logging.INFO),
                 )
             case _:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
-                return RegisterLibraryFromFileResultFailure(result_details=details)
+                result = RegisterLibraryFromFileResultFailure(result_details=details)
+        return result
 
     @handles(RegisterLibraryFromRequirementSpecifierRequest)
     async def register_library_from_requirement_specifier_request(
@@ -281,6 +296,10 @@ class LibraryRegistrar(EngineScoped):
         self.engine.library_manager.module_loading.unregister_all_stable_module_aliases_for_library(
             request.library_name
         )
+
+        # Nothing else takes a library's workflows out: the workspace rescan spares them.
+        self.engine.workflow_manager.remove_library_workflows(request.library_name)
+        self.engine.workflow_manager.note_library_set_changed()
 
         # Remove the library from our library info list. This prevents it from still showing
         # up in the table of attempted library loads. Remove ALL entries for this name, not

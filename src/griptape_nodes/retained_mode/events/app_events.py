@@ -306,6 +306,18 @@ class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
+class WorkflowRegistryChanged(AppPayload):
+    """Notification that the workflow registry changed without a client asking it to.
+
+    Emitted when a library's workflows are added or removed, and when the workspace is rescanned.
+    A client showing the workflow list refetches it on this.
+
+    Enqueued with `put_event`, so in-process `add_listener_to_app_event` subscribers do not see it.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
 class ConfigChanged(AppPayload):
     """Configuration value changed notification.
 

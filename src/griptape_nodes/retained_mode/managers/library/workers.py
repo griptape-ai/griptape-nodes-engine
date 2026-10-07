@@ -248,6 +248,8 @@ class LibraryWorkers(EngineScoped):
         # traits and hooks.
         if request.node_schemas and library_info.requires_worker:
             self._register_nodes_from_worker_schemas(request.library_name, request.node_schemas)
+            # Which node types a library has is part of what a workflow's verdict checks.
+            self.engine.workflow_manager.note_library_set_changed()
         # Whoever is waiting to route execution here is waiting on WorkerManager, which owns
         # whether a process is available; this is only the news that it loaded.
         self.engine.library_manager._worker_manager.note_library_loaded(request.library_name)

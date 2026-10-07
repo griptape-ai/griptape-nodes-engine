@@ -97,7 +97,7 @@ class WorkflowCatalog(EngineScoped):
         )
 
     @handles(GetWorkflowInfoRequest)
-    def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
+    async def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
@@ -116,9 +116,8 @@ class WorkflowCatalog(EngineScoped):
                 result_details=f"Workflow '{request.workflow_name}' is unsaved; returning empty info stub.",
             )
 
-        workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-
-        wf_info = self.engine.workflow_manager.find_workflow_info_for_attempted_load(workflow_file_path)
+        workflow_file_path = self.engine.workflow_manager.build_workflow_info_key(workflow.file_path)
+        wf_info = await self.engine.workflow_manager.get_current_workflow_info(workflow.file_path)
         if wf_info is None:
             details = (
                 f"Attempted to get workflow info. Failed because no info was found for path '{workflow_file_path}'."
@@ -136,7 +135,7 @@ class WorkflowCatalog(EngineScoped):
         )
 
     @handles(ListAllWorkflowInfoRequest)
-    def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
+    async def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
         except Exception as e:
@@ -152,8 +151,7 @@ class WorkflowCatalog(EngineScoped):
             # Unsaved workflows are registry-only (no on-disk metadata to summarize).
             if workflow.file_path is None:
                 continue
-            workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-            wf_info = self.engine.workflow_manager.find_workflow_info_for_attempted_load(workflow_file_path)
+            wf_info = await self.engine.workflow_manager.get_current_workflow_info(workflow.file_path)
             if wf_info is None:
                 continue
             workflow_infos[registry_key] = self._build_workflow_info_payload(wf_info)
@@ -226,14 +224,6 @@ class WorkflowCatalog(EngineScoped):
                 message=f"Successfully updated metadata for workflow '{request.workflow_name}'.", level=logging.INFO
             )
         )
-
-    def _build_workflow_info_key(self, file_path: str) -> str:
-        """Build the key used to look up a workflow's load record.
-
-        Matches the key construction in on_load_workflow_metadata_request, which uses
-        workspace_path.joinpath() without resolving symlinks.
-        """
-        return str(self.engine.config_manager.workspace_path.joinpath(file_path))
 
     def _build_workflow_info_payload(self, wf_info: WorkflowManager.WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
