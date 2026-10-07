@@ -303,6 +303,25 @@ async def test_run_captures_generate_image_urls(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_sends_extra_headers_on_model_calls(tmp_path: Path) -> None:
+    """Per-run headers, such as budget attribution, reach every model call of the run."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+    seen: list[Any] = []
+
+    async def stream(_messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+        seen.append((info.model_settings or {}).get("extra_headers"))
+        yield "ok"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+    await runner.run("Hi", extra_headers={"X-Griptape-Attribution": "abc"})
+    await runner.run("Again")
+
+    assert seen == [{"X-Griptape-Attribution": "abc"}, None]
+
+
+@pytest.mark.asyncio
 async def test_event_sink_receives_text_tool_call_and_tool_result(tmp_path: Path) -> None:
     """The structured event sink sees text deltas, tool calls, and tool results.
 

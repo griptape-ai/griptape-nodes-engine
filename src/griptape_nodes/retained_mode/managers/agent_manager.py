@@ -37,7 +37,7 @@ from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapt
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
+from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     MCPToolsetCache,
@@ -53,10 +53,13 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolResult,
 )
 from griptape_nodes.drivers.cloud_credentials import (
+    BASE_URL_SETTING_NAME,
+    DEFAULT_CLOUD_BASE_URL,
     MISSING_CREDENTIAL_MESSAGE,
     POLICY_DENIED_HINT,
     is_license_credential,
     resolve_cloud_credential,
+    resolve_cloud_host,
 )
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -133,6 +136,10 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
+    GetAttributionContextResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
@@ -142,6 +149,10 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -474,22 +485,36 @@ class AgentManager(EngineScoped):
             return await self._run_agent(request)
         except Exception as e:
             message = self._explain_agent_run_error(e, request.provider_name)
-            err_msg = f"Error running agent: {message}"
+            # Keep a budget halt's opening words, which the editor recognizes.
+            if message.startswith(BUDGET_REPLY_HALT_PREFIX):
+                err_msg = message
+            else:
+                err_msg = f"Error running agent: {message}"
             logger.exception(err_msg)
             return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
 
     def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
         """Return the user-facing text for a failed agent run.
 
-        A Griptape Cloud request authenticated with a License can authenticate
-        successfully and still be refused: Cloud evaluates an entitlement policy
-        per request and answers HTTP 403. On its own that surfaces as a bare
-        "Forbidden", which reads like a bug rather than a licensing decision, so
-        name the cause. Every other error keeps its original text.
+        A Cloud 403 is either a budget refusal, recognized from its body, or an
+        entitlement refusal. Both get a readable message instead of "Forbidden";
+        every other error keeps its text. A halt a tool already worded is
+        returned as is.
         """
+        halt = budget_halt_message(exc)
+        if halt is not None:
+            return halt
+
         if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
             return str(exc)
-        cloud_host = urlsplit(os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL).hostname or ""
+
+        cloud_host = resolve_cloud_host(secrets_manager)
+
+        refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+        if refusal is not None:
+            logger.error(budget_log_line(refusal))
+            return describe_budget_refusal(refusal)
+
         if _cloud_http_status_of(exc, cloud_host) != HTTPStatus.FORBIDDEN:
             return str(exc)
         if not is_license_credential(resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)):
@@ -505,6 +530,7 @@ class AgentManager(EngineScoped):
             model_name=request.model_name,
         )
         composed = await _compose_prompt(request.input, request.url_artifacts)
+        attribution_headers = await self._attribution_headers(request.provider_name)
 
         event_manager = self.engine.event_manager
 
@@ -534,6 +560,7 @@ class AgentManager(EngineScoped):
                     history_rehydrator=_rehydrate_history,
                     extra_toolsets=mcp.lease.toolsets,
                     extra_instructions=mcp.instructions,
+                    extra_headers=attribution_headers,
                 )
         finally:
             # Only drop our own entry; a newer run for the same thread may have
@@ -889,6 +916,22 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return GetConversationMemoryResultFailure(result_details=details)
 
+    async def _attribution_headers(self, provider_name: str | None) -> dict[str, str]:
+        """Return the budget attribution header for a Griptape Cloud run, or ``{}``.
+
+        Cloud checks project budgets against this header, so without it a chat reply is
+        never charged to the open project. Only Griptape Cloud reads it; other providers get
+        nothing. A failure sends no header rather than failing the turn: not knowing which
+        project to bill is not a reason to refuse the reply, and the handler has already
+        logged why.
+        """
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return {}
+        result = await self.engine.ahandle_request(GetAttributionContextRequest())
+        if not isinstance(result, GetAttributionContextResultSuccess):
+            return {}
+        return {result.header_name: result.header_value}
+
     def _build_runner(
         self,
         provider_name: str | None = None,
@@ -915,7 +958,7 @@ class AgentManager(EngineScoped):
             # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
             # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
             # malformed endpoint, so the chat and image paths agree.
-            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
+            cloud_base_url = os.environ.get(BASE_URL_SETTING_NAME) or DEFAULT_CLOUD_BASE_URL
             model_base_url: str | None = cloud_base_url
             image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url

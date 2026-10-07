@@ -312,7 +312,9 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Get library metadata to get version
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
+                library_metadata_request
+            )
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library exists, but handle gracefully
@@ -329,7 +331,7 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Check if node type exists in library (silent check - no error logging)
             list_node_types_request = ListNodeTypesInLibraryRequest(library=library_name)
-            list_node_types_result = self.engine.library_manager.on_list_node_types_in_library_request(
+            list_node_types_result = self.engine.library_manager.catalog.on_list_node_types_in_library_request(
                 list_node_types_request
             )
 
@@ -354,7 +356,7 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Get node metadata from library (we know the node exists now)
             node_metadata_request = GetNodeMetadataFromLibraryRequest(library=library_name, node_type=node_type)
-            node_metadata_result = self.engine.library_manager.get_node_metadata_from_library_request(
+            node_metadata_result = self.engine.library_manager.catalog.get_node_metadata_from_library_request(
                 node_metadata_request
             )
 

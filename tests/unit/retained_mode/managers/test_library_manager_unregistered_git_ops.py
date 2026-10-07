@@ -22,15 +22,13 @@ from griptape_nodes.retained_mode.events.library_events import (
     SwitchLibraryRefResultSuccess,
     UnloadLibraryFromRegistryRequest,
 )
-from griptape_nodes.retained_mode.managers.library_manager import (
-    LibraryGitOperationContext,
-    LibraryManager,
-)
+from griptape_nodes.retained_mode.managers.library.git_operations import LibraryGitOperationContext
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
-LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
+GIT_OPERATIONS_MODULE = "griptape_nodes.retained_mode.managers.library.git_operations"
 # Absolute so it matches the handler's resolved library_dir, which gains a drive letter on Windows.
 LIBRARY_DIR = Path("/var/lib/test_lib").absolute()
 MANIFEST_PATH = LIBRARY_DIR / "griptape_nodes_library.json"
@@ -57,7 +55,7 @@ class TestGitOperationValidationWithoutRegistration:
         library_manager = engine.library_manager
 
         with patch.object(library_manager, "get_library_info_by_library_name", return_value=_unregistered_info()):
-            result = await library_manager._validate_and_prepare_library_for_git_operation(
+            result = await library_manager.git_operations._validate_and_prepare_library_for_git_operation(
                 library_name="test_lib",
                 failure_result_class=SwitchLibraryRefResultFailure,
                 operation_description="switch branch/tag for",
@@ -74,7 +72,7 @@ class TestGitOperationValidationWithoutRegistration:
         library_manager = engine.library_manager
 
         with patch.object(library_manager, "get_library_info_by_library_name", return_value=None):
-            result = await library_manager._validate_and_prepare_library_for_git_operation(
+            result = await library_manager.git_operations._validate_and_prepare_library_for_git_operation(
                 library_name="test_lib",
                 failure_result_class=SwitchLibraryRefResultFailure,
                 operation_description="switch branch/tag for",
@@ -91,7 +89,7 @@ class TestGitOperationValidationWithoutRegistration:
         with patch.object(
             library_manager, "get_library_info_by_library_name", return_value=_unregistered_info(version=None)
         ):
-            result = await library_manager._validate_and_prepare_library_for_git_operation(
+            result = await library_manager.git_operations._validate_and_prepare_library_for_git_operation(
                 library_name="test_lib",
                 failure_result_class=SwitchLibraryRefResultFailure,
                 operation_description="switch branch/tag for",
@@ -115,9 +113,9 @@ class TestSwitchLibraryRefWithoutRegistration:
 
         with (
             patch.object(library_manager, "get_library_info_by_library_name", return_value=_unregistered_info()),
-            patch(f"{LIBRARY_MANAGER_MODULE}.get_current_ref", side_effect=["stable", "v0.87.0"]),
-            patch(f"{LIBRARY_MANAGER_MODULE}.switch_branch_or_tag") as mock_switch,
-            patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=MANIFEST_PATH),
+            patch(f"{GIT_OPERATIONS_MODULE}.get_current_ref", side_effect=["stable", "v0.87.0"]),
+            patch(f"{GIT_OPERATIONS_MODULE}.switch_branch_or_tag") as mock_switch,
+            patch(f"{GIT_OPERATIONS_MODULE}.find_file_in_directory", return_value=MANIFEST_PATH),
             patch.object(library_manager.engine, "handle_request", new=handle_request),
             patch.object(
                 library_manager.engine,
@@ -125,7 +123,7 @@ class TestSwitchLibraryRefWithoutRegistration:
                 new=AsyncMock(return_value=MagicMock(spec=RegisterLibraryFromFileResultSuccess)),
             ),
         ):
-            result = await library_manager.switch_library_ref_request(
+            result = await library_manager.git_operations.switch_library_ref_request(
                 SwitchLibraryRefRequest(library_name="test_lib", ref_name="v0.87.0")
             )
 

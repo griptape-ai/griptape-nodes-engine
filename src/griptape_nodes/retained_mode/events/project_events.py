@@ -20,8 +20,8 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.converter import converter
 
 if TYPE_CHECKING:
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
@@ -48,8 +48,8 @@ class MacroPath(NamedTuple):
     variables: MacroVariables
 
 
-# Registered here rather than in event_converter because that module cannot import this one:
-# project_events -> base_events -> event_converter. A NamedTuple has no hook in the JSON preset, so
+# Registered here rather than in serialization.converter because that module cannot import this one:
+# project_events -> base_events -> serialization.converter. A NamedTuple has no hook in the JSON preset, so
 # without this cattrs hands the instance back untouched and the ParsedMacro inside it is never
 # reached, leaving the failure to surface from json.dumps.
 converter.register_unstructure_hook(

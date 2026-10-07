@@ -1,4 +1,4 @@
-"""Tests for get_request_handlers() registration in _attempt_load_nodes_from_library (#4744)."""
+"""Tests for get_request_handlers() registration in attempt_load_nodes_from_library (#4744)."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -93,7 +93,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -118,7 +118,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -136,7 +136,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -157,7 +157,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -180,7 +180,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),
@@ -204,7 +204,7 @@ class TestRequestHandlerRegistration:
         lm = engine.library_manager
         event_manager = MagicMock()
         with patch.object(engine, "_event_manager", event_manager):
-            lm._attempt_load_nodes_from_library(
+            lm.module_loading.attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
                 base_dir=Path("/fake"),

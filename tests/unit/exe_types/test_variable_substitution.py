@@ -96,7 +96,7 @@ def _engine_mock(
         if isinstance(req, ListConnectionsForNodeRequest)
         else MagicMock()
     )
-    engine.workflow_manager.is_variable_substitution_enabled.return_value = substitution_enabled
+    engine.workflow_manager.variable_substitution.is_enabled.return_value = substitution_enabled
     engine.node_manager.get_node_parent_flow_by_name.return_value = "test_flow"
     if captured is not None:
         engine.event_manager.put_event.side_effect = captured.append
@@ -118,7 +118,7 @@ def _mock_gn(
     """Put a stand-in engine under the nodes these tests build.
 
     connected_params: parameter names on "mock_node" that have incoming connections.
-    substitution_enabled: value returned by is_variable_substitution_enabled().
+    substitution_enabled: value returned by VariableSubstitution.is_enabled().
     """
     if connected_params is None:
         connected_params = set()
