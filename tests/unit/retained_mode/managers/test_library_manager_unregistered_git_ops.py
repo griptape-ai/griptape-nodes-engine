@@ -9,12 +9,14 @@ libraries that need it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
     SwitchLibraryRefRequest,
@@ -26,6 +28,8 @@ from griptape_nodes.retained_mode.managers.library.git_operations import Library
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
 
 GIT_OPERATIONS_MODULE = "griptape_nodes.retained_mode.managers.library.git_operations"
@@ -44,6 +48,33 @@ def _unregistered_info(*, version: str | None = "0.88.0") -> LibraryManager.Libr
         library_name="test_lib",
         library_version=version,
     )
+
+
+@contextmanager
+def _patched_switch(library_manager: LibraryManager, handle_request: MagicMock) -> Iterator[MagicMock]:
+    """Patch everything a ref switch reaches outside the handler, yielding the git switch mock."""
+    with (
+        patch.object(library_manager, "get_library_info_by_library_name", return_value=_unregistered_info()),
+        patch(f"{GIT_OPERATIONS_MODULE}.get_current_ref", side_effect=["stable", "v0.87.0"]),
+        patch(f"{GIT_OPERATIONS_MODULE}.switch_branch_or_tag") as mock_switch,
+        patch(f"{GIT_OPERATIONS_MODULE}.find_file_in_directory", return_value=MANIFEST_PATH),
+        patch.object(library_manager.engine, "handle_request", new=handle_request),
+        patch.object(
+            library_manager.engine,
+            "ahandle_request",
+            new=AsyncMock(return_value=MagicMock(spec=RegisterLibraryFromFileResultSuccess)),
+        ),
+    ):
+        yield mock_switch
+
+
+def _unload_requests(handle_request: MagicMock) -> list[UnloadLibraryFromRegistryRequest]:
+    """Every unload the handler dispatched through the engine."""
+    return [
+        call.args[0]
+        for call in handle_request.call_args_list
+        if isinstance(call.args[0], UnloadLibraryFromRegistryRequest)
+    ]
 
 
 class TestGitOperationValidationWithoutRegistration:
@@ -112,16 +143,8 @@ class TestSwitchLibraryRefWithoutRegistration:
         handle_request = MagicMock()
 
         with (
-            patch.object(library_manager, "get_library_info_by_library_name", return_value=_unregistered_info()),
-            patch(f"{GIT_OPERATIONS_MODULE}.get_current_ref", side_effect=["stable", "v0.87.0"]),
-            patch(f"{GIT_OPERATIONS_MODULE}.switch_branch_or_tag") as mock_switch,
-            patch(f"{GIT_OPERATIONS_MODULE}.find_file_in_directory", return_value=MANIFEST_PATH),
-            patch.object(library_manager.engine, "handle_request", new=handle_request),
-            patch.object(
-                library_manager.engine,
-                "ahandle_request",
-                new=AsyncMock(return_value=MagicMock(spec=RegisterLibraryFromFileResultSuccess)),
-            ),
+            _patched_switch(library_manager, handle_request) as mock_switch,
+            patch.object(LibraryRegistry, "list_libraries", return_value=[]),
         ):
             result = await library_manager.git_operations.switch_library_ref_request(
                 SwitchLibraryRefRequest(library_name="test_lib", ref_name="v0.87.0")
@@ -132,6 +155,40 @@ class TestSwitchLibraryRefWithoutRegistration:
         assert result.new_ref == "v0.87.0"
         assert result.old_version == "0.88.0"
         mock_switch.assert_called_once_with(LIBRARY_DIR, "v0.87.0")
-        assert not any(
-            isinstance(call.args[0], UnloadLibraryFromRegistryRequest) for call in handle_request.call_args_list
-        )
+        assert _unload_requests(handle_request) == []
+
+    @pytest.mark.asyncio
+    async def test_switch_still_unloads_a_library_that_did_load(self, engine: Engine) -> None:
+        """A loaded library is unloaded before the reload, so the registry drops the old module."""
+        library_manager = engine.library_manager
+        handle_request = MagicMock()
+
+        with (
+            _patched_switch(library_manager, handle_request),
+            patch.object(LibraryRegistry, "list_libraries", return_value=["test_lib"]),
+        ):
+            result = await library_manager.git_operations.switch_library_ref_request(
+                SwitchLibraryRefRequest(library_name="test_lib", ref_name="v0.87.0")
+            )
+
+        assert isinstance(result, SwitchLibraryRefResultSuccess)
+        assert [request.library_name for request in _unload_requests(handle_request)] == ["test_lib"]
+
+    @pytest.mark.asyncio
+    async def test_switch_fails_when_unloading_a_loaded_library_fails(self, engine: Engine) -> None:
+        """An unload that fails stops the switch rather than reloading over a live library."""
+        library_manager = engine.library_manager
+        failed_unload = MagicMock()
+        failed_unload.succeeded.return_value = False
+        handle_request = MagicMock(return_value=failed_unload)
+
+        with (
+            _patched_switch(library_manager, handle_request),
+            patch.object(LibraryRegistry, "list_libraries", return_value=["test_lib"]),
+        ):
+            result = await library_manager.git_operations.switch_library_ref_request(
+                SwitchLibraryRefRequest(library_name="test_lib", ref_name="v0.87.0")
+            )
+
+        assert isinstance(result, SwitchLibraryRefResultFailure)
+        assert "test_lib" in str(result.result_details)
