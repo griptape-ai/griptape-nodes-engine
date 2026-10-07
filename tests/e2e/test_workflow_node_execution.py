@@ -125,8 +125,6 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="Shout It",
-            wait_for_completion=True,
-            completion_timeout_ms=60000,
         )
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
@@ -178,8 +176,6 @@ async def test_two_workflow_nodes_run_independently(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="First",
-            wait_for_completion=True,
-            completion_timeout_ms=60000,
         )
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result

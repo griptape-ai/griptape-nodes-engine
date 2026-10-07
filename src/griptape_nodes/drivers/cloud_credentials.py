@@ -35,12 +35,23 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 LICENSE_SECRET_NAME = "GRIPTAPE_NODES_LICENSE"  # noqa: S105  # a secret's name, not a secret
 """Secret holding the Griptape Nodes License JWT. Written by the desktop app."""
+
+BASE_URL_SETTING_NAME = "GT_CLOUD_BASE_URL"
+"""Setting naming the Griptape Cloud deployment to talk to.
+
+Read through ``SecretsManager`` because that is what searches the workspace and
+global ``.env`` files, not because a deployment URL is a secret.
+"""
+
+DEFAULT_CLOUD_BASE_URL = "https://cloud.griptape.ai"
+"""Griptape Cloud's production deployment, used when nothing overrides it."""
 
 API_KEY_SECRET_NAME = "GT_CLOUD_API_KEY"  # noqa: S105  # a secret's name, not a secret
 """Secret holding the Griptape Cloud API key."""
@@ -112,6 +123,28 @@ def resolve_cloud_credential(
         return license_token
 
     return secrets_manager.get_secret(secret_name, should_error_on_not_found=False)
+
+
+def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:
+    """Return the hostname of the Griptape Cloud deployment in use.
+
+    Used to tell Cloud's HTTP failures apart from those of MCP servers and
+    third-party APIs.
+
+    Args:
+        secrets_manager: Reads the override from the workspace and global
+            ``.env`` files as well as the environment. Pass it whenever one is
+            available; without it a workspace ``.env`` override is missed.
+
+    Returns:
+        The hostname, or an empty string if the configured URL has none.
+    """
+    if secrets_manager is None:
+        base_url = os.getenv(BASE_URL_SETTING_NAME)
+    else:
+        base_url = secrets_manager.get_secret(BASE_URL_SETTING_NAME, should_error_on_not_found=False)
+
+    return urlsplit(base_url or DEFAULT_CLOUD_BASE_URL).hostname or ""
 
 
 def is_license_credential(credential: str | None) -> bool:

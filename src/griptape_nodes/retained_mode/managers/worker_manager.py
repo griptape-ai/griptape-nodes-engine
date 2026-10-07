@@ -19,12 +19,13 @@ from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriv
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -186,16 +187,7 @@ class WorkerManager(EngineScoped):
             cast_type=float,
         )
 
-        event_manager.assign_manager_to_request_type(
-            worker_events.RegisterWorkerRequest, self.handle_register_worker_request
-        )
-        event_manager.assign_manager_to_request_type(
-            worker_events.WorkerHeartbeatRequest, self.handle_worker_heartbeat_request
-        )
-        event_manager.assign_manager_to_request_type(
-            worker_events.UnregisterWorkerRequest, self.handle_unregister_worker_request
-        )
-        event_manager.assign_manager_to_request_type(worker_events.StartWorkerRequest, self.handle_start_worker_request)
+        event_manager.register_request_handlers(self)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -265,6 +257,7 @@ class WorkerManager(EngineScoped):
             request_client=request_client,
         )
 
+    @handles(worker_events.RegisterWorkerRequest)
     async def handle_register_worker_request(
         self,
         request: worker_events.RegisterWorkerRequest,
@@ -324,6 +317,7 @@ class WorkerManager(EngineScoped):
             worker_request_topic=worker_request_topic,
         )
 
+    @handles(worker_events.WorkerHeartbeatRequest)
     def handle_worker_heartbeat_request(
         self,
         request: worker_events.WorkerHeartbeatRequest,
@@ -335,6 +329,7 @@ class WorkerManager(EngineScoped):
             result_details="Worker alive.",
         )
 
+    @handles(worker_events.UnregisterWorkerRequest)
     async def handle_unregister_worker_request(
         self,
         request: worker_events.UnregisterWorkerRequest,
@@ -477,7 +472,7 @@ class WorkerManager(EngineScoped):
             # PYTHONPATH precedes site-packages, making this library-first with the engine's own
             # environment as the fallback. It must be the environment rather than a later sys.path
             # splice: sys.modules never reconsiders a module this process has already imported.
-            execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
+            execution_site_packages = self.engine.library_manager.environment.execution_site_packages(worker_key)
             if execution_site_packages is not None:
                 # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
                 # is part of the environment the engine itself booted with, and dropping it only in
@@ -838,6 +833,7 @@ class WorkerManager(EngineScoped):
         """Clear the session-ready gate so future worker spawns wait for a new session."""
         self._session_ready_event.clear()
 
+    @handles(worker_events.StartWorkerRequest)
     async def handle_start_worker_request(
         self, request: worker_events.StartWorkerRequest
     ) -> worker_events.StartWorkerResultSuccess | worker_events.StartWorkerResultFailure:
@@ -1339,16 +1335,20 @@ class WorkerManager(EngineScoped):
         act on locally (e.g. reload config, refresh secrets). The request is
         sent to each worker's dedicated request topic; no response is awaited.
 
-        Safe to call with zero registered workers -- it is a no-op.
+        Safe to call with zero registered workers -- it is a no-op. An event that cannot be
+        serialized is logged and sent to no worker.
         """
         if not self._workers:
             return
-        for wid, registration in list(self._workers.items()):
-            await self.forward_event_to_worker(
-                event,
-                worker_engine_id=wid,
-                worker_request_topic=registration.request_topic,
-            )
+        try:
+            for wid, registration in list(self._workers.items()):
+                await self.forward_event_to_worker(
+                    event,
+                    worker_engine_id=wid,
+                    worker_request_topic=registration.request_topic,
+                )
+        except EventSerializationError:
+            logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
 
     async def relay_worker_result(self, payload: dict) -> None:
         """Relay an unmatched worker result to the GUI session response topic.

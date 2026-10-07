@@ -11,7 +11,6 @@ connection goes and can still run with what it has.
 """
 
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -408,7 +407,6 @@ class TestSaving:
             unique_parameter_uuid_to_values=uuid_to_values,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None
@@ -430,7 +428,6 @@ class TestSaving:
             create_node_request=CreateNodeRequest(
                 node_type="_Producer", node_name="Producer", resolution=NodeResolutionState.RESOLVED.value
             ),
-            workflow_manager=MagicMock(),
         )
 
         assert saved is not None
@@ -828,7 +825,6 @@ class TestSavingAndPublishing:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
             serialize_all_parameter_values=publishing,
         )
 
@@ -866,18 +862,17 @@ class TestAKeyThatReachedASerializableParameter:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None
         assert captured == {}
         assert request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_the_serializer_reads_the_stored_key(self, engine: Engine, flow_name: str) -> None:
-        """The serialization helper reads values to hash them; it must see keys, never objects.
+    def test_the_flow_result_reads_the_stored_key(self, engine: Engine, flow_name: str) -> None:
+        """A finished flow's result carries keys, never objects.
 
-        Through an input value specifically: the helper takes output values from the dict directly, so only
-        the input path goes through an accessor and can translate.
+        Through an input value specifically: output values come from the dict directly, so only the input
+        path goes through an accessor and can translate.
         """
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
@@ -885,7 +880,7 @@ class TestAKeyThatReachedASerializableParameter:
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         consumer.set_parameter_value("latent", key)
 
-        read = engine.node_manager._get_parameter_value_for_serialization(consumer, "latent")
+        read = engine.node_manager.result_parameter_values(consumer)["latent"]
 
         assert read == key
 

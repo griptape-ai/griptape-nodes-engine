@@ -155,6 +155,12 @@ class TestRegistry:
         with pytest.raises(ValueError, match="sample_feature"):
             register_beta_feature(_make_feature())
 
+    def test_global_switch_id_is_reserved(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            register_beta_feature(_make_feature("enabled"))
+
+        assert list_beta_features() == []
+
     @pytest.mark.parametrize(
         "bad_id", ["CamelCase", "1starts_with_digit", "has-dash", "has space", "", "double__underscore", "trailing_"]
     )
@@ -224,6 +230,63 @@ class TestIsBetaEnabled:
         feature = parse_library_beta_features(LIBRARY_NAME, [_library_entry()]).features["fast_upscale"]
 
         assert is_beta_enabled(feature, manager) is True
+
+    @pytest.mark.parametrize("default", [True, False])
+    @pytest.mark.parametrize("expired", [True, False])
+    def test_global_switch_off_turns_off_engine_feature(
+        self, isolate_user_config: Path, *, default: bool, expired: bool
+    ) -> None:
+        manager = self._manager_with_user_config(
+            isolate_user_config, {"beta_features": {"enabled": False, "sample_feature": True}}
+        )
+        remove_by = _in_days(30)
+        if expired:
+            remove_by = _in_days(-1)
+
+        assert is_beta_enabled(_make_feature(default=default, remove_by=remove_by), manager) is False
+
+    @pytest.mark.parametrize("default", [True, False])
+    def test_global_switch_off_turns_off_library_feature(self, isolate_user_config: Path, *, default: bool) -> None:
+        manager = self._manager_with_user_config(
+            isolate_user_config,
+            {"beta_features": {"enabled": False}, "library_beta_features": {LIBRARY_SLUG: {"fast_upscale": True}}},
+        )
+        entry = _library_entry(default=default)
+        feature = parse_library_beta_features(LIBRARY_NAME, [entry]).features["fast_upscale"]
+
+        assert is_beta_enabled(feature, manager) is False
+
+    @pytest.mark.parametrize("configured", [True, False])
+    @pytest.mark.parametrize("global_switch", [True, "false", 0, None])
+    def test_global_switch_that_is_not_false_changes_nothing(
+        self, isolate_user_config: Path, global_switch: object, *, configured: bool
+    ) -> None:
+        manager = self._manager_with_user_config(
+            isolate_user_config, {"beta_features": {"enabled": global_switch, "sample_feature": configured}}
+        )
+
+        assert is_beta_enabled(_make_feature(default=not configured), manager) is configured
+
+    def test_missing_global_switch_changes_nothing(self, isolate_user_config: Path) -> None:
+        manager = self._manager_with_user_config(isolate_user_config, {"beta_features": {"sample_feature": True}})
+
+        assert is_beta_enabled(_make_feature(), manager) is True
+
+    def test_global_switch_off_from_env_turns_off_features(
+        self, isolate_user_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GTN_CONFIG_BETA_FEATURES__ENABLED", "false")
+        manager = self._manager_with_user_config(
+            isolate_user_config,
+            {
+                "beta_features": {"sample_feature": True},
+                "library_beta_features": {LIBRARY_SLUG: {"fast_upscale": True}},
+            },
+        )
+        library_feature = parse_library_beta_features(LIBRARY_NAME, [_library_entry()]).features["fast_upscale"]
+
+        assert is_beta_enabled(_make_feature(), manager) is False
+        assert is_beta_enabled(library_feature, manager) is False
 
 
 class TestLibraryBetaFeatures:
@@ -338,7 +401,7 @@ class TestLibraryBetaFeatures:
         _register_library(entries_by_flag[other_features], name="My Library")
         _register_library(entries_by_flag[new_features], name="my-library")
 
-        problems = engine.library_manager._check_beta_feature_settings_collision(
+        problems = engine.library_manager.registration._check_beta_feature_settings_collision(
             "my-library", LibraryRegistry.get_library("my-library")
         )
 

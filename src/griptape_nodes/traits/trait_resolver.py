@@ -6,6 +6,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.serialization.type_names import may_import_for_decoding
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -27,7 +28,18 @@ def resolve_trait(trait_name: str, trait_module: str) -> type[Trait] | None:
 
 
 def _import_trait_module(trait_module: str, trait_name: str) -> ModuleType | None:
-    """Import a trait module without failing the workflow load."""
+    """Import a trait module without failing the workflow load.
+
+    Saved data names the module, so only modules decoding may import are imported, as for values.
+    """
+    if not may_import_for_decoding(trait_module):
+        logger.warning(
+            "Attempted to restore the '%s' trait from '%s'. That module is not loaded and is not part "
+            "of Griptape Nodes or a registered library, so the parameter will load without that trait.",
+            trait_name,
+            trait_module,
+        )
+        return None
     try:
         return importlib.import_module(trait_module)
     except Exception as error:

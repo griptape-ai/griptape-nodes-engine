@@ -146,6 +146,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -748,46 +749,7 @@ class ProjectManager(EngineScoped):
         self._boot_id_index_built: bool = False
 
         # Register event handlers
-        event_manager.assign_manager_to_request_type(LoadProjectTemplateRequest, self.on_load_project_template_request)
-        event_manager.assign_manager_to_request_type(GetProjectTemplateRequest, self.on_get_project_template_request)
-        event_manager.assign_manager_to_request_type(
-            ResolveProjectWorkspaceRequest, self.on_resolve_project_workspace_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListProjectTemplatesRequest, self.on_list_project_templates_request
-        )
-        event_manager.assign_manager_to_request_type(GetSituationRequest, self.on_get_situation_request)
-        event_manager.assign_manager_to_request_type(GetPathForMacroRequest, self.on_get_path_for_macro_request)
-        event_manager.assign_manager_to_request_type(SetCurrentProjectRequest, self.on_set_current_project_request)
-        event_manager.assign_manager_to_request_type(GetCurrentProjectRequest, self.on_get_current_project_request)
-        event_manager.assign_manager_to_request_type(SaveProjectTemplateRequest, self.on_save_project_template_request)
-        event_manager.assign_manager_to_request_type(
-            UpgradeProjectSchemaRequest, self.on_upgrade_project_schema_request
-        )
-        event_manager.assign_manager_to_request_type(
-            AttemptMatchPathAgainstMacroRequest, self.on_match_path_against_macro_request
-        )
-        event_manager.assign_manager_to_request_type(GetStateForMacroRequest, self.on_get_state_for_macro_request)
-        event_manager.assign_manager_to_request_type(
-            GetAllSituationsForProjectRequest, self.on_get_all_situations_for_project_request
-        )
-        event_manager.assign_manager_to_request_type(
-            AttemptMapAbsolutePathToProjectRequest, self.on_attempt_map_absolute_path_to_project_request
-        )
-        event_manager.assign_manager_to_request_type(
-            UnregisterProjectTemplateRequest, self.on_unregister_project_template_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ValidateProjectTemplateRequest, self.on_validate_project_template_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ActivateWorkspaceProjectRequest, self.on_activate_workspace_project_request
-        )
-        event_manager.assign_manager_to_request_type(ExportProjectRequest, self.on_export_project_request)
-        event_manager.assign_manager_to_request_type(
-            PreviewImportProjectRequest, self.on_preview_import_project_request
-        )
-        event_manager.assign_manager_to_request_type(ImportProjectRequest, self.on_import_project_request)
+        event_manager.register_request_handlers(self)
 
         # Register app initialization listener
         event_manager.add_listener_to_app_event(
@@ -801,6 +763,7 @@ class ProjectManager(EngineScoped):
         self._load_system_defaults()
         self._current_project_id = SYSTEM_DEFAULTS_KEY
 
+    @handles(LoadProjectTemplateRequest)
     async def on_load_project_template_request(
         self, request: LoadProjectTemplateRequest
     ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
@@ -1448,6 +1411,7 @@ class ProjectManager(EngineScoped):
             return existing.project_file_path
         return self._boot_id_to_file_path.get(parent_project_id)
 
+    @handles(GetProjectTemplateRequest)
     def on_get_project_template_request(
         self, request: GetProjectTemplateRequest
     ) -> GetProjectTemplateResultSuccess | GetProjectTemplateResultFailure:
@@ -1465,6 +1429,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved project template for '{request.project_id}'. Status: {project_info.validation.status}",
         )
 
+    @handles(ResolveProjectWorkspaceRequest)
     async def on_resolve_project_workspace_request(
         self, request: ResolveProjectWorkspaceRequest
     ) -> ResolveProjectWorkspaceResultSuccess:
@@ -1480,6 +1445,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
         )
 
+    @handles(ListProjectTemplatesRequest)
     async def on_list_project_templates_request(
         self, request: ListProjectTemplatesRequest
     ) -> ListProjectTemplatesResultSuccess:
@@ -1609,6 +1575,7 @@ class ProjectManager(EngineScoped):
             libraries_root=libraries_root,
         )
 
+    @handles(GetSituationRequest)
     def on_get_situation_request(
         self, request: GetSituationRequest
     ) -> GetSituationResultSuccess | GetSituationResultFailure:
@@ -1641,6 +1608,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved situation '{request.situation_name}'. Macro: {situation.macro}, Policy: create_dirs={situation.policy.create_dirs}, on_collision={situation.policy.on_collision}",
         )
 
+    @handles(GetPathForMacroRequest)
     def on_get_path_for_macro_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: GetPathForMacroRequest
     ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
@@ -2568,7 +2536,7 @@ class ProjectManager(EngineScoped):
         workspace config layer can re-point the final workspace_path; a forced override
         would mask that. Both _activate_project (live) and the provisioning preview drive
         off this one decision, so the previewed library/engine_version plan and what
-        _reconcile_libraries_from_config actually does cannot drift.
+        reconcile_libraries_from_config actually does cannot drift.
 
         Branches 1-3 and 4-result/5 are factored into _decide_workspace_pre_inheritance and
         _decide_workspace_post_inheritance so resolve_workspace_dir_for_project_id (which resolves an
@@ -3141,6 +3109,7 @@ class ProjectManager(EngineScoped):
             current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
         return chain
 
+    @handles(SetCurrentProjectRequest)
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -3568,6 +3537,7 @@ class ProjectManager(EngineScoped):
         """Mark `generation` as adopted, once its activation has fully succeeded."""
         self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
+    @handles(GetCurrentProjectRequest)
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
     ) -> GetCurrentProjectResultSuccess | GetCurrentProjectResultFailure:
@@ -3583,6 +3553,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
 
+    @handles(SaveProjectTemplateRequest)
     def on_save_project_template_request(
         self, request: SaveProjectTemplateRequest
     ) -> SaveProjectTemplateResultSuccess | SaveProjectTemplateResultFailure:
@@ -3750,6 +3721,7 @@ class ProjectManager(EngineScoped):
 
         return None
 
+    @handles(UpgradeProjectSchemaRequest)
     async def on_upgrade_project_schema_request(  # noqa: PLR0911
         self, request: UpgradeProjectSchemaRequest
     ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
@@ -3890,6 +3862,7 @@ class ProjectManager(EngineScoped):
             ),
         )
 
+    @handles(ValidateProjectTemplateRequest)
     def on_validate_project_template_request(
         self, request: ValidateProjectTemplateRequest
     ) -> ValidateProjectTemplateResultSuccess:
@@ -4061,6 +4034,7 @@ class ProjectManager(EngineScoped):
             return ParentLinkLookup(path=None, reason=reason)
         return ParentLinkLookup(path=str(resolution.path), reason=None)
 
+    @handles(UnregisterProjectTemplateRequest)
     def on_unregister_project_template_request(  # noqa: C901, PLR0912
         self, request: UnregisterProjectTemplateRequest
     ) -> UnregisterProjectTemplateResultSuccess | UnregisterProjectTemplateResultFailure:
@@ -4137,6 +4111,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully unregistered project template '{project_id}'",
         )
 
+    @handles(AttemptMatchPathAgainstMacroRequest)
     def on_match_path_against_macro_request(
         self, request: AttemptMatchPathAgainstMacroRequest
     ) -> AttemptMatchPathAgainstMacroResultSuccess | AttemptMatchPathAgainstMacroResultFailure:
@@ -4225,6 +4200,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully matched path '{request.file_path}' against macro '{request.parsed_macro.template}'. Extracted {len(extracted)} variables",
         )
 
+    @handles(GetStateForMacroRequest)
     def on_get_state_for_macro_request(
         self, request: GetStateForMacroRequest
     ) -> GetStateForMacroResultSuccess | GetStateForMacroResultFailure:
@@ -4318,6 +4294,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Analyzed macro with {len(all_variables)} variables: {len(satisfied_variables)} satisfied, {len(missing_required_variables)} missing, {len(conflicting_variables)} conflicting",
         )
 
+    @handles(ActivateWorkspaceProjectRequest)
     async def on_activate_workspace_project_request(
         self, _request: ActivateWorkspaceProjectRequest
     ) -> ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure:
@@ -4356,6 +4333,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
 
+    @handles(ExportProjectRequest)
     def on_export_project_request(
         self, request: ExportProjectRequest
     ) -> ExportProjectResultSuccess | ExportProjectResultFailure:
@@ -4427,6 +4405,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Exported project '{request.project_id}' to '{result.archive_path}'.",
         )
 
+    @handles(PreviewImportProjectRequest)
     def on_preview_import_project_request(
         self, request: PreviewImportProjectRequest
     ) -> PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure:
@@ -4454,6 +4433,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Read manifest from project package '{request.archive_path}'.",
         )
 
+    @handles(ImportProjectRequest)
     async def on_import_project_request(
         self, request: ImportProjectRequest
     ) -> ImportProjectResultSuccess | ImportProjectResultFailure:
@@ -4652,6 +4632,7 @@ class ProjectManager(EngineScoped):
         # reload when the workspace actually changes.
         self._initialization_complete = True
 
+    @handles(GetAllSituationsForProjectRequest)
     def on_get_all_situations_for_project_request(
         self, request: GetAllSituationsForProjectRequest
     ) -> GetAllSituationsForProjectResultSuccess | GetAllSituationsForProjectResultFailure:
@@ -4674,6 +4655,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved all situations. Found {len(situations)} situations",
         )
 
+    @handles(AttemptMapAbsolutePathToProjectRequest)
     def on_attempt_map_absolute_path_to_project_request(
         self, request: AttemptMapAbsolutePathToProjectRequest
     ) -> AttemptMapAbsolutePathToProjectResultSuccess | AttemptMapAbsolutePathToProjectResultFailure:

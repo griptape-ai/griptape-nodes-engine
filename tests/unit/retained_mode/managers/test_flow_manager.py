@@ -1,15 +1,15 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
-import base64
 import itertools
-import pickle
+import json
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageFile
 from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
@@ -27,11 +27,13 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
+    SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.serialization.commands import encode_commands
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -108,15 +110,29 @@ def image_with_unrelated_metadata() -> Generator[str, None, None]:
         Path(path).unlink(missing_ok=True)
 
 
-@pytest.fixture
-def image_with_flow_commands() -> Generator[str, None, None]:
-    """A PNG whose FLOW_COMMANDS_KEY payload is a valid pickle."""
-    payload = base64.b64encode(pickle.dumps({"sentinel": "flow"})).decode("ascii")
+def _image_with_flow_commands_text(text: str) -> str:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, payload)
+        info.add_text(FLOW_COMMANDS_KEY, text)
         Image.new("RGB", (4, 4), color="blue").save(f, format="PNG", pnginfo=info)
-        path = f.name
+        return f.name
+
+
+@pytest.fixture
+def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
+    """Commands for a flow with nothing in it."""
+    engine.context_manager.push_workflow(workflow_name="image_metadata_workflow")
+    create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=False))
+    assert isinstance(create_result, CreateFlowResultSuccess)
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=create_result.flow_name))
+    assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess)
+    return serialize_result.serialized_flow_commands
+
+
+@pytest.fixture
+def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands) -> Generator[str, None, None]:
+    """A PNG whose FLOW_COMMANDS_KEY payload is flow commands encoded as JSON."""
+    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)))
     try:
         yield path
     finally:
@@ -159,7 +175,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
     def test_returns_commands_when_flow_commands_key_present(
-        self, engine: Engine, image_with_flow_commands: str
+        self, engine: Engine, image_with_flow_commands: str, empty_flow_commands: SerializedFlowCommands
     ) -> None:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
@@ -167,57 +183,48 @@ class TestExtractFlowCommandsFromImageMetadata:
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
-        assert result.serialized_flow_commands == {"sentinel": "flow"}
+        assert result.serialized_flow_commands == empty_flow_commands
         assert result.altered_workflow_state is False
 
+    @pytest.mark.parametrize(
+        ("text", "reason"),
+        [
+            (json.dumps({"sentinel": "flow"}), "not in a layout Griptape Nodes writes"),
+            (json.dumps({"version": 1, "commands": {"flow_name": "x"}}), "incomplete or damaged"),
+            (json.dumps({"version": 2, "commands": {}}), "saved by a later version"),
+            ("not json or base64!", "neither JSON nor base64"),
+        ],
+    )
+    def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
+        path = _image_with_flow_commands_text(text)
+        try:
+            result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
+            )
+        finally:
+            Path(path).unlink(missing_ok=True)
 
-class TestAwaitFlowCompletion:
-    """Tests for FlowManager._await_flow_completion (the wait_for_completion helper)."""
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert reason in str(result.result_details)
 
-    @pytest.mark.asyncio
-    async def test_returns_none_when_flow_finishes_cleanly(self, engine: Engine) -> None:
-        from unittest.mock import patch
+    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine) -> None:
+        path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}))
+        opened: list[ImageFile.ImageFile] = []
+        real_open = Image.open
 
-        flow_manager = engine.flow_manager
+        def _open(*args: Any, **kwargs: Any) -> ImageFile.ImageFile:
+            image = real_open(*args, **kwargs)
+            opened.append(image)
+            return image
 
-        # No control flow machine -> no error to report; simulate "flow finished" with a single False.
-        with patch.object(flow_manager, "check_for_existing_running_flow", return_value=False):
-            result = await flow_manager._await_flow_completion(timeout_ms=None)
+        with patch.object(Image, "open", _open):
+            engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
+            )
 
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_timeout_string_when_timeout_exceeded(self, engine: Engine) -> None:
-        from unittest.mock import patch
-
-        flow_manager = engine.flow_manager
-
-        # Keep reporting "still running" so the timeout path fires quickly.
-        with patch.object(flow_manager, "check_for_existing_running_flow", return_value=True):
-            result = await flow_manager._await_flow_completion(timeout_ms=10)
-
-        assert result is not None
-        assert "Timed out" in result
-
-    @pytest.mark.asyncio
-    async def test_returns_error_message_when_resolution_machine_errored(self, engine: Engine) -> None:
-        from unittest.mock import MagicMock, patch
-
-        flow_manager = engine.flow_manager
-
-        fake_resolution_machine = MagicMock()
-        fake_resolution_machine.is_errored.return_value = True
-        fake_resolution_machine.get_error_message.return_value = "boom"
-        fake_machine = MagicMock()
-        fake_machine.resolution_machine = fake_resolution_machine
-
-        with (
-            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
-            patch.object(flow_manager, "_global_control_flow_machine", fake_machine),
-        ):
-            result = await flow_manager._await_flow_completion(timeout_ms=None)
-
-        assert result == "boom"
+        (image,) = opened
+        assert image.fp is None
+        Path(path).unlink()
 
 
 class TestStartFlowRequestDefaultsToCurrentContext:
@@ -340,112 +347,6 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         get_flow.assert_called_once_with("derived_parent_flow")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-
-
-class TestStartFlowCancelsOnWaitTimeout:
-    """Tests for the wait_for_completion cancel-on-timeout cleanup in on_start_flow_request."""
-
-    @pytest.mark.asyncio
-    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, engine: Engine) -> None:
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartFlowRequest,
-            StartFlowResultFailure,
-        )
-        from griptape_nodes.retained_mode.events.validation_events import (
-            ValidateFlowDependenciesResultSuccess,
-        )
-
-        flow_manager = engine.flow_manager
-
-        fake_flow = MagicMock()
-        fake_flow.name = "timeout_flow"
-        validate_success = ValidateFlowDependenciesResultSuccess(
-            validation_succeeded=True, exceptions=[], result_details="validated"
-        )
-        cancel_mock = AsyncMock()
-
-        # check_for_existing_running_flow is consulted twice along the wait path:
-        # once before kicking off (must be False), and once after the timeout to decide
-        # whether to cancel (must be True since the flow is still churning).
-        running_flow_states = iter([False, True])
-
-        with (
-            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
-            patch.object(
-                flow_manager,
-                "check_for_existing_running_flow",
-                side_effect=lambda: next(running_flow_states),
-            ),
-            patch.object(
-                flow_manager,
-                "on_validate_flow_dependencies_request",
-                AsyncMock(return_value=validate_success),
-            ),
-            patch.object(flow_manager, "start_flow", AsyncMock()),
-            patch.object(flow_manager, "_global_control_flow_machine", None),
-            patch.object(
-                flow_manager,
-                "_await_flow_completion",
-                AsyncMock(return_value="Timed out waiting for flow completion after 10 ms."),
-            ),
-            patch.object(flow_manager, "cancel_flow_run", cancel_mock),
-        ):
-            result = await flow_manager.on_start_flow_request(
-                StartFlowRequest(flow_name="timeout_flow", wait_for_completion=True, completion_timeout_ms=10)
-            )
-
-        assert isinstance(result, StartFlowResultFailure)
-        assert "did not complete cleanly" in str(result.result_details)
-        cancel_mock.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_does_not_cancel_when_flow_already_finished_with_error(self, engine: Engine) -> None:
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartFlowRequest,
-            StartFlowResultFailure,
-        )
-        from griptape_nodes.retained_mode.events.validation_events import (
-            ValidateFlowDependenciesResultSuccess,
-        )
-
-        flow_manager = engine.flow_manager
-
-        fake_flow = MagicMock()
-        fake_flow.name = "errored_flow"
-        validate_success = ValidateFlowDependenciesResultSuccess(
-            validation_succeeded=True, exceptions=[], result_details="validated"
-        )
-        cancel_mock = AsyncMock()
-
-        # First call (kickoff gate) returns False; second call (post-wait cancel gate) also
-        # returns False because the flow already finished with an error.
-        with (
-            patch.object(flow_manager, "get_flow_by_name", return_value=fake_flow),
-            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
-            patch.object(
-                flow_manager,
-                "on_validate_flow_dependencies_request",
-                AsyncMock(return_value=validate_success),
-            ),
-            patch.object(flow_manager, "start_flow", AsyncMock()),
-            patch.object(flow_manager, "_global_control_flow_machine", None),
-            patch.object(
-                flow_manager,
-                "_await_flow_completion",
-                AsyncMock(return_value="boom"),
-            ),
-            patch.object(flow_manager, "cancel_flow_run", cancel_mock),
-        ):
-            result = await flow_manager.on_start_flow_request(
-                StartFlowRequest(flow_name="errored_flow", wait_for_completion=True)
-            )
-
-        assert isinstance(result, StartFlowResultFailure)
-        cancel_mock.assert_not_called()
 
 
 class TestListNodesInFlowRequest:

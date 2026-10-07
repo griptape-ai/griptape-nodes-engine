@@ -455,6 +455,9 @@ A few rules worth knowing:
     `id`, or a repeated `id` is reported as a library problem, and that feature is left out. Your
     other features and nodes still work.
 - **Checking an id you didn't declare returns `false`** and logs a warning naming the feature.
+- **`is_beta_feature_enabled` returns `false` whenever the user turns all beta features off** with
+    the **Enable beta features** switch, even for a feature with `default` set to `true`. The
+    user's choice for your feature is kept and applies again when they turn the switch back on.
 - **A check in `__init__` only runs when the node is created.** If a user turns the feature on or
     off, nodes already on the canvas keep the parameters they were shown with until the user refreshes the
     node, adds it again, or reopens the workflow. A check in `process` sees the new value on the next run.

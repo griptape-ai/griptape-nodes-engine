@@ -40,6 +40,7 @@ from griptape_nodes.retained_mode.events.node_events import (
 
 # The facade import survives for the dummy-manager guard tests, whose subject it is.
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # noqa: TID251
+from griptape_nodes.retained_mode.managers.library.workers import make_worker_stub_class
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
 from griptape_nodes.utils.version_utils import engine_version
@@ -170,7 +171,7 @@ class TestRoutingFact:
         )
 
         with pytest.raises(RuntimeError, match="requires a dedicated worker"):
-            current_engine().library_manager.get_worker_for_library("Routing Guard")
+            current_engine().library_manager.workers.get_worker_for_library("Routing Guard")
 
 
 class TestRealNodesOnOrchestrator:
@@ -195,7 +196,7 @@ class TestRealNodesOnOrchestrator:
         # __init__ ran and read its edit-time dependency.
         assert node.get_parameter_value("edit_dep_version") == "1.0.0"
         assert type(node).__name__ == "ExecDepNode"
-        assert type(node).__module__ != "griptape_nodes.retained_mode.managers.library_manager"
+        assert type(node).__module__ != "griptape_nodes.retained_mode.managers.library.workers"
 
 
 class TestParameterBehaviorsSurviveOnRealClasses:
@@ -269,8 +270,8 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         assert library_info.requires_worker is False, "...but not via the legacy stub path"
 
         # Exactly what a worker reports after loading the library.
-        schemas = await library_manager._serialize_library_node_schemas("Behavior Library")
-        await library_manager.on_report_library_loaded_request(
+        schemas = await library_manager.workers.serialize_library_node_schemas("Behavior Library")
+        await library_manager.workers.on_report_library_loaded_request(
             ReportLibraryLoadedRequest(
                 library_name="Behavior Library",
                 fitness=LibraryManager.LibraryFitness.GOOD,
@@ -316,7 +317,7 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         library_manager = current_engine().library_manager
 
         with caplog.at_level(logging.WARNING):
-            await library_manager._serialize_library_node_schemas("Behavior Library")
+            await library_manager.workers.serialize_library_node_schemas("Behavior Library")
 
         assert "will not execute on the orchestrator stub" not in caplog.text
         assert "parameter-behaviors-dropped-in-schema" not in caplog.text
@@ -337,7 +338,7 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         library_info.requires_worker = True
 
         with caplog.at_level(logging.WARNING):
-            await library_manager._serialize_library_node_schemas("Behavior Library")
+            await library_manager.workers.serialize_library_node_schemas("Behavior Library")
 
         assert "will not execute on the orchestrator stub" in caplog.text
         assert "connection hooks run on the orchestrator against a stub" in caplog.text
@@ -354,9 +355,9 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         self._register_behavior_library(tmp_path)
         library_manager = current_engine().library_manager
 
-        schemas = await library_manager._serialize_library_node_schemas("Behavior Library")
+        schemas = await library_manager.workers.serialize_library_node_schemas("Behavior Library")
         node_schema = next(s for s in schemas if s.class_name == "BehaviorPreservationNode")
-        stub_class = library_manager._make_worker_stub_class("BehaviorPreservationNode", node_schema.parameters)
+        stub_class = make_worker_stub_class("BehaviorPreservationNode", node_schema.parameters)
         stub = stub_class(name="stubbed")
         current_engine().object_manager.add_object_by_name("stubbed", stub)
 
@@ -416,7 +417,7 @@ class TestUnmetResourcesCostExecutionNotLoading:
         )
 
         with pytest.raises(RuntimeError) as excinfo:
-            current_engine().library_manager.get_worker_for_library("Unmet Resources Refuses")
+            current_engine().library_manager.workers.get_worker_for_library("Unmet Resources Refuses")
 
         message = str(excinfo.value)
         assert "definitely-not-a-real-backend" in message, "the artist is not told what is missing"
@@ -457,7 +458,7 @@ class TestUnmetRequirementCostsExecutionNotEditing:
         )
 
         with pytest.raises(RuntimeError, match="definitely-not-a-real-backend"):
-            current_engine().library_manager.get_worker_for_library("Requires The Impossible")
+            current_engine().library_manager.workers.get_worker_for_library("Requires The Impossible")
 
 
 class TestUnshippableOutputIsKept:

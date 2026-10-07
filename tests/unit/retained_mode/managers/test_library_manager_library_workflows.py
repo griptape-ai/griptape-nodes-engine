@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
+GIT_OPERATIONS_MODULE = "griptape_nodes.retained_mode.managers.library.git_operations"
 LIBRARY_NAME = "TestLib"
 
 
@@ -117,9 +118,11 @@ def _stub_library_lifecycle(
     )
     with (
         patch.object(
-            library_manager, "_establish_register_library_prerequisites", AsyncMock(return_value=prerequisites)
+            library_manager.registration,
+            "_establish_register_library_prerequisites",
+            AsyncMock(return_value=prerequisites),
         ),
-        patch.object(library_manager, "_progress_library_through_lifecycle", AsyncMock(return_value=None)),
+        patch.object(library_manager.registration, "_progress_library_through_lifecycle", AsyncMock(return_value=None)),
     ):
         if register_one is None:
             yield
@@ -153,7 +156,7 @@ class TestCollectWorkflowFilesForLibrary:
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
-            patch(f"{LIBRARY_MANAGER_MODULE}.sys.path", sys_path),
+            patch("sys.path", sys_path),
         ):
             engine.library_manager._collect_workflow_files_for_library(_library_info(library_json))
 
@@ -394,7 +397,7 @@ class TestRemoveLibraryWorkflows:
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"),
             patch.dict(engine.workflow_registry._workflows, {"lib/example": _library_entry()}, clear=True),
         ):
-            result = engine.library_manager.unload_library_from_registry_request(
+            result = engine.library_manager.registration.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
             )
 
@@ -408,7 +411,7 @@ class TestRemoveLibraryWorkflows:
         library name alone there is no way back to them.
         """
         workflow_manager = engine.workflow_manager
-        info_key = workflow_manager._build_workflow_info_key("lib/example.py")
+        info_key = workflow_manager.build_workflow_info_key("lib/example.py")
         verdict = WorkflowManager.WorkflowInfo(
             status=WorkflowManager.WorkflowStatus.GOOD, workflow_path="lib/example.py", workflow_name="example"
         )
@@ -427,7 +430,7 @@ class TestRemoveLibraryWorkflows:
         generation_before = workflow_manager._library_set_generation
 
         with patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.unregister_library"):
-            result = engine.library_manager.unload_library_from_registry_request(
+            result = engine.library_manager.registration.unload_library_from_registry_request(
                 UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
             )
 
@@ -478,7 +481,7 @@ class TestRegisteringALibraryRegistersItsWorkflows:
                 library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
             ),
         ):
-            result = await library_manager.register_library_from_file_request(
+            result = await library_manager.registration.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
@@ -501,14 +504,16 @@ class TestRegisteringALibraryRegistersItsWorkflows:
 
         with (
             patch.object(
-                library_manager, "_establish_register_library_prerequisites", AsyncMock(return_value=already_loaded)
+                library_manager.registration,
+                "_establish_register_library_prerequisites",
+                AsyncMock(return_value=already_loaded),
             ),
             patch.object(library_manager, "register_workflows_for_library", register_one),
             patch.dict(
                 library_manager._library_file_path_to_info, {library_info.library_path: library_info}, clear=True
             ),
         ):
-            result = await library_manager.register_library_from_file_request(
+            result = await library_manager.registration.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
@@ -536,14 +541,18 @@ class TestRegisteringALibraryRegistersItsWorkflows:
 
         with (
             patch.object(
-                library_manager, "_establish_register_library_prerequisites", AsyncMock(return_value=prerequisites)
+                library_manager.registration,
+                "_establish_register_library_prerequisites",
+                AsyncMock(return_value=prerequisites),
             ),
             patch.object(
-                library_manager, "_progress_library_through_lifecycle", AsyncMock(return_value=progression_result)
+                library_manager.registration,
+                "_progress_library_through_lifecycle",
+                AsyncMock(return_value=progression_result),
             ),
             patch.object(library_manager, "register_workflows_for_library", AsyncMock(return_value=None)),
         ):
-            await library_manager.register_library_from_file_request(
+            await library_manager.registration.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
@@ -559,9 +568,11 @@ class TestRegisteringALibraryRegistersItsWorkflows:
         generation_before = engine.workflow_manager._library_set_generation
 
         with patch.object(
-            library_manager, "_establish_register_library_prerequisites", AsyncMock(return_value=already_loaded)
+            library_manager.registration,
+            "_establish_register_library_prerequisites",
+            AsyncMock(return_value=already_loaded),
         ):
-            await library_manager.register_library_from_file_request(
+            await library_manager.registration.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
@@ -591,7 +602,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
         async def dispatch(request: object) -> object:
             if isinstance(request, RegisterLibraryFromFileRequest):
                 with _stub_library_lifecycle(library_manager, library_info, register_one):
-                    return await library_manager.register_library_from_file_request(request)
+                    return await library_manager.registration.register_library_from_file_request(request)
             if isinstance(request, UnloadLibraryFromRegistryRequest):
                 return UnloadLibraryFromRegistryResultSuccess(result_details="unloaded")
             msg = f"Unexpected request: {type(request).__name__}"
@@ -614,7 +625,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
         dispatch = self._register_through_the_real_handler(library_manager, _library_info(library_json), register_one)
 
         with (
-            patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=library_json),
+            patch(f"{GIT_OPERATIONS_MODULE}.find_file_in_directory", return_value=library_json),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch.object(
                 engine,
@@ -623,7 +634,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
         ):
-            result = await library_manager._reload_library_after_git_operation(
+            result = await library_manager.git_operations._reload_library_after_git_operation(
                 library_name=LIBRARY_NAME,
                 library_file_path=str(library_json),
                 failure_result_class=UpdateLibraryResultFailure,
@@ -647,14 +658,14 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
         downloaded.read_text = AsyncMock(return_value=json.dumps({"name": LIBRARY_NAME}))
 
         with (
-            patch(f"{LIBRARY_MANAGER_MODULE}.anyio.Path", return_value=downloaded),
-            patch(f"{LIBRARY_MANAGER_MODULE}.find_file_in_directory", return_value=str(library_json)),
+            patch(f"{GIT_OPERATIONS_MODULE}.anyio.Path", return_value=downloaded),
+            patch(f"{GIT_OPERATIONS_MODULE}.find_file_in_directory", return_value=str(library_json)),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
             patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
             patch.object(engine.config_manager, "set_config_value", MagicMock(return_value=None)),
             patch.dict(library_manager._library_file_path_to_info, {}, clear=True),
         ):
-            result = await library_manager.download_library_request(
+            result = await library_manager.git_operations.download_library_request(
                 DownloadLibraryRequest(
                     git_url="https://example.invalid/lib.git",
                     download_directory=str(tmp_path),
@@ -690,7 +701,7 @@ class TestEachMidSessionArrivalRegistersItsWorkflows:
                 patch.dict(engine.workflow_registry._workflows, {}, clear=True),
             ):
                 result = await asyncio.wait_for(
-                    library_manager.register_library_from_file_request(
+                    library_manager.registration.register_library_from_file_request(
                         RegisterLibraryFromFileRequest(file_path=str(library_json))
                     ),
                     timeout=10,

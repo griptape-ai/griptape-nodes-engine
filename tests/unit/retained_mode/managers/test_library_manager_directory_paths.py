@@ -12,12 +12,12 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryRequest,
     UpdateLibraryResultFailure,
 )
-from griptape_nodes.retained_mode.managers.library_manager import LibraryGitOperationContext
+from griptape_nodes.retained_mode.managers.library.git_operations import LibraryGitOperationContext
 from griptape_nodes.utils.git_utils import GitCloneError, GitPullError
 
 
 class TestGetSandboxDirectory:
-    """Test _get_sandbox_directory resolves absolute and relative paths."""
+    """Test get_sandbox_directory resolves absolute and relative paths."""
 
     def test_relative_path(self, engine: Engine) -> None:
         """A relative sandbox_library_directory is resolved against the workspace."""
@@ -29,12 +29,12 @@ class TestGetSandboxDirectory:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
+                "griptape_nodes.retained_mode.managers.library.sandbox.resolve_workspace_path",
                 return_value=Path("/workspace/sandbox_library"),
             ) as mock_resolve,
             patch.object(Path, "exists", return_value=True),
         ):
-            result = library_manager._get_sandbox_directory()
+            result = library_manager.sandbox.get_sandbox_directory()
 
         mock_resolve.assert_called_once_with(Path("sandbox_library"), Path("/workspace"))
         assert result == Path("/workspace/sandbox_library")
@@ -49,12 +49,12 @@ class TestGetSandboxDirectory:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
+                "griptape_nodes.retained_mode.managers.library.sandbox.resolve_workspace_path",
                 return_value=Path("/opt/sandbox"),
             ) as mock_resolve,
             patch.object(Path, "exists", return_value=True),
         ):
-            result = library_manager._get_sandbox_directory()
+            result = library_manager.sandbox.get_sandbox_directory()
 
         mock_resolve.assert_called_once_with(Path("/opt/sandbox"), Path("/workspace"))
         assert result == Path("/opt/sandbox")
@@ -67,7 +67,7 @@ class TestGetSandboxDirectory:
         config_mgr.workspace_path = Path("/workspace")
 
         with patch.object(engine, "_config_manager", config_mgr):
-            result = library_manager._get_sandbox_directory()
+            result = library_manager.sandbox.get_sandbox_directory()
 
         assert result is None
 
@@ -81,18 +81,18 @@ class TestGetSandboxDirectory:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
+                "griptape_nodes.retained_mode.managers.library.sandbox.resolve_workspace_path",
                 return_value=Path("/workspace/sandbox_library"),
             ),
             patch.object(Path, "exists", return_value=False),
         ):
-            result = library_manager._get_sandbox_directory()
+            result = library_manager.sandbox.get_sandbox_directory()
 
         assert result is None
 
 
 class TestDownloadLibrariesFromGitUrlsPath:
-    """Test _download_libraries_from_git_urls resolves absolute and relative paths."""
+    """Test download_libraries_from_git_urls resolves absolute and relative paths."""
 
     @pytest.mark.asyncio
     async def test_uses_resolved_libraries_root(self, engine: Engine) -> None:
@@ -102,7 +102,7 @@ class TestDownloadLibrariesFromGitUrlsPath:
         config_mgr.resolved_libraries_root.return_value = Path("/workspace/libraries")
 
         with patch.object(engine, "_config_manager", config_mgr):
-            result = await library_manager._download_libraries_from_git_urls([])
+            result = await library_manager.provisioning.download_libraries_from_git_urls([])
 
         config_mgr.resolved_libraries_root.assert_called_once_with()
         assert result == {}
@@ -127,14 +127,14 @@ class TestDownloadLibraryRequestPath:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
+                "griptape_nodes.retained_mode.managers.library.git_operations.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
             ),
             patch("anyio.Path.mkdir"),
             patch("anyio.Path.exists", return_value=False),
             patch.object(asyncio, "to_thread", side_effect=GitCloneError("stop test here")),
         ):
-            result = await library_manager.download_library_request(request)
+            result = await library_manager.git_operations.download_library_request(request)
 
         config_mgr.resolved_libraries_root.assert_called_once_with()
         assert isinstance(result, DownloadLibraryResultFailure)
@@ -155,14 +155,14 @@ class TestDownloadLibraryRequestPath:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
+                "griptape_nodes.retained_mode.managers.library.git_operations.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
             ),
             patch("anyio.Path.mkdir"),
             patch("anyio.Path.exists", return_value=False),
             patch.object(asyncio, "to_thread", side_effect=GitCloneError("stop test here")),
         ):
-            await library_manager.download_library_request(request)
+            await library_manager.git_operations.download_library_request(request)
 
         config_mgr.resolved_libraries_root.assert_not_called()
 
@@ -190,13 +190,13 @@ class TestDownloadLibraryRequestPath:
         with (
             patch.object(engine, "_config_manager", config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
+                "griptape_nodes.retained_mode.managers.library.git_operations.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
             ),
             patch("anyio.Path.mkdir"),
             patch("anyio.Path.exists", return_value=True),
         ):
-            result = await library_manager.download_library_request(request)
+            result = await library_manager.git_operations.download_library_request(request)
 
         assert isinstance(result, DownloadLibraryResultFailure)
         assert result.retryable is True
@@ -222,7 +222,7 @@ class TestDownloadLibraryRequestUrlRef:
             patch("anyio.Path.exists", return_value=False),
             patch.object(asyncio, "to_thread", side_effect=GitCloneError("stop test here")) as mock_to_thread,
         ):
-            await engine.library_manager.download_library_request(request)
+            await engine.library_manager.git_operations.download_library_request(request)
 
         _, clone_url, target_path, ref = mock_to_thread.call_args.args
         return clone_url, target_path, ref
@@ -268,23 +268,23 @@ class TestUpdateLibraryRequestExistingPath:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=validation_context),
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.is_monorepo",
+                "griptape_nodes.retained_mode.managers.library.git_operations.is_monorepo",
                 return_value=False,
             ),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.update_library_git",
+                "griptape_nodes.retained_mode.managers.library.git_operations.update_library_git",
                 side_effect=GitPullError(
                     f"Cannot update library at {library_dir}: You have uncommitted changes. "
                     "Use overwrite_existing=True to discard them."
                 ),
             ),
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 

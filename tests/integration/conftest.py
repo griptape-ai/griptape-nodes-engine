@@ -11,10 +11,6 @@ from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, C
 from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileRequest
 from griptape_nodes.retained_mode.managers import config_manager as config_manager_module
 from griptape_nodes.retained_mode.managers import secrets_manager as secrets_manager_module
-from griptape_nodes.utils import install_file_url_support
-
-# Install file:// URL support for httpx/requests in integration tests
-install_file_url_support()
 
 
 @pytest.fixture(autouse=True)
