@@ -159,13 +159,14 @@ class LaunchExternalViewerRequest(RequestPayload):
     Use when: A node offers an "open in external viewer" action for its output files
     (EXR, HDR, 3D assets) and the user picks the application in the library's settings.
 
-    The viewer command is read from the `<config_category>.viewer_executable` setting. It is
-    split like a shell command line, so it may carry arguments; the file path is appended last.
-    The viewer is launched detached and the request returns without waiting for it.
+    The viewer is launched as `<viewer_executable> <viewer_args...> <path_to_file>`, read from the
+    `<config_category>.viewer_executable` setting (a path, used as is) and the optional
+    `<config_category>.viewer_args` setting (split with shell-style quoting). The viewer is
+    launched detached and the request returns without waiting for it.
 
     Args:
         path_to_file: Path to the file to open
-        config_category: Settings category holding `viewer_executable` (e.g. "openexr")
+        config_category: Settings category holding `viewer_executable` and `viewer_args` (e.g. "openexr")
         fallback_to_os_default: When no viewer is configured, open the file with the operating
             system's associated application instead of failing
 

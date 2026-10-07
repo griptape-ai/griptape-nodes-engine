@@ -1558,7 +1558,8 @@ class OSManager(EngineScoped):
 
     @handles(LaunchExternalViewerRequest)
     def on_launch_external_viewer_request(self, request: LaunchExternalViewerRequest) -> ResultPayload:  # noqa: PLR0911
-        setting_key = f"{request.config_category}.viewer_executable"
+        executable_key = f"{request.config_category}.viewer_executable"
+        args_key = f"{request.config_category}.viewer_args"
         attempt = f"Attempted to open '{request.path_to_file}' in the external viewer"
 
         try:
@@ -1577,50 +1578,54 @@ class OSManager(EngineScoped):
                 failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
             )
 
-        viewer_command = self.engine.config_manager.get_config_value(setting_key, default="")
-        if not viewer_command or not viewer_command.strip():
+        viewer_executable = self.engine.config_manager.get_config_value(executable_key, default="")
+        viewer_executable = (viewer_executable or "").strip()
+        if not viewer_executable:
             if not request.fallback_to_os_default:
-                details = f"{attempt}. Failed because no viewer is set in the '{setting_key}' setting."
+                details = f"{attempt}. Failed because no viewer is set in the '{executable_key}' setting."
                 logger.info(details)
                 return LaunchExternalViewerResultFailure(
                     failure_reason=FileIOFailureReason.NOT_CONFIGURED, result_details=details
                 )
             return self._open_with_os_default_for_viewer(path, attempt)
 
+        viewer_args = self.engine.config_manager.get_config_value(args_key, default="")
         try:
-            viewer_argv = self._split_viewer_command(viewer_command)
+            viewer_arg_list = self._split_viewer_args(viewer_args or "")
         except ValueError as e:
-            details = f"{attempt}. Failed because the '{setting_key}' setting could not be read as a command: {e}"
+            details = f"{attempt}. Failed because the '{args_key}' setting has unbalanced quotes: {e}"
             logger.info(details)
             return LaunchExternalViewerResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
             )
 
         # The OS path is passed unprefixed: viewers do not understand the Windows \\?\ long-path form.
-        argv = [*viewer_argv, os.fspath(path)]
+        argv = [viewer_executable, *viewer_arg_list, os.fspath(path)]
         try:
             self._spawn_detached(argv)
         except FileNotFoundError:
-            details = f"{attempt}. Failed because the viewer '{viewer_argv[0]}' was not found."
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' was not found."
             logger.info(details)
             return LaunchExternalViewerResultFailure(
                 failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
             )
         except PermissionError:
-            details = f"{attempt}. Failed because the viewer '{viewer_argv[0]}' could not be run (permission denied)."
+            details = (
+                f"{attempt}. Failed because the viewer '{viewer_executable}' could not be run (permission denied)."
+            )
             logger.info(details)
             return LaunchExternalViewerResultFailure(
                 failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=details
             )
         except (OSError, ValueError, subprocess.SubprocessError) as e:
-            details = f"{attempt}. Failed because the viewer '{viewer_argv[0]}' could not be started: {e}"
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' could not be started: {e}"
             logger.info(details)
             return LaunchExternalViewerResultFailure(
                 failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
             )
 
         return LaunchExternalViewerResultSuccess(
-            used_fallback=False, result_details=f"Opened '{path}' in the external viewer '{viewer_argv[0]}'."
+            used_fallback=False, result_details=f"Opened '{path}' in the external viewer '{viewer_executable}'."
         )
 
     def _open_with_os_default_for_viewer(self, path: Path, attempt: str) -> ResultPayload:
@@ -1633,15 +1638,15 @@ class OSManager(EngineScoped):
             result_details=f"No external viewer is set, so '{path}' was opened with the default application.",
         )
 
-    def _split_viewer_command(self, viewer_command: str) -> list[str]:
-        """Split a configured viewer command line into argv.
+    def _split_viewer_args(self, viewer_args: str) -> list[str]:
+        """Split the configured viewer arguments with shell-style quoting.
 
         POSIX mode would treat Windows backslashes as escapes, but non-POSIX mode keeps the
         quotes on each token, so they are stripped here before the tokens reach Popen.
         """
         if not self.is_windows():
-            return shlex.split(viewer_command)
-        tokens = shlex.split(viewer_command, posix=False)
+            return shlex.split(viewer_args)
+        tokens = shlex.split(viewer_args, posix=False)
         unquoted = []
         for token in tokens:
             if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":  # noqa: PLR2004
