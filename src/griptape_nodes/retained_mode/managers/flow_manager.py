@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
+import json
 import logging
-import pickle
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
@@ -117,6 +116,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetFlowMetadataResultSuccess,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
     ListFlowsInCurrentContextRequest,
     ListFlowsInCurrentContextResultFailure,
     ListFlowsInCurrentContextResultSuccess,
@@ -172,19 +172,25 @@ from griptape_nodes.retained_mode.events.variable_events import (
     ListVariablesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
+from griptape_nodes.retained_mode.managers.workflow.shape import (
+    build_workflow_shape_from_parameter_info,
+    extract_parameter_shape_info,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
+from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands
+from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_legacy_image_flow_commands
+from griptape_nodes.serialization.values import Unencodable, decode_value, encodable_default, try_encode, value_key
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
+    from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
@@ -254,6 +260,13 @@ class MultiNodeEndNodeResult(NamedTuple):
     parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter]
     alter_parameter_commands: list[AlterParameterDetailsRequest]
     end_node_name: str
+
+
+class ImageFlowCommandsError(Exception):
+    """An image's metadata holds flow commands this engine cannot read.
+
+    The message completes "Failed because ...".
+    """
 
 
 class FlowDeserializationError(Exception):
@@ -1565,7 +1578,7 @@ class FlowManager(EngineScoped):
         )
 
         # Build WorkflowShape from collected parameter shape data
-        workflow_shape = self.engine.workflow_manager.build_workflow_shape_from_parameter_info(
+        workflow_shape = build_workflow_shape_from_parameter_info(
             input_node_params=start_node_result.input_shape_data,
             output_node_params=end_node_packaging_result.output_shape_data,
         )
@@ -2253,9 +2266,7 @@ class FlowManager(EngineScoped):
         )
 
         # Extract parameter shape info for workflow shape (outputs to external consumers)
-        param_shape_info = self.engine.workflow_manager.extract_parameter_shape_info(
-            parameter, include_control_params=True
-        )
+        param_shape_info = extract_parameter_shape_info(parameter, include_control_params=True)
         if param_shape_info is not None:
             if end_node_name not in output_shape_data:
                 output_shape_data[end_node_name] = {}
@@ -2485,10 +2496,17 @@ class FlowManager(EngineScoped):
             # Strip the prefix to get the original parameter name for the StartFlow node
             original_param_name = prefixed_param_name.removeprefix(f"{class_name_prefix}_")
 
-            # Create unique parameter UUID for this value
+            encoded = try_encode(param_value)
+            if isinstance(encoded, Unencodable):
+                logger.warning(
+                    "Attempted to pass '%s' into the packaged flow. Failed because %s The flow runs without it.",
+                    prefixed_param_name,
+                    encoded.reason,
+                )
+                continue
             value_id = id(param_value)
-            unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-            unique_parameter_uuid_to_values[unique_param_uuid] = param_value
+            unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+            unique_parameter_uuid_to_values[unique_param_uuid] = encoded
             serialized_parameter_value_tracker.add_as_serializable(value_id, unique_param_uuid)
 
             # Create set parameter value command
@@ -2551,9 +2569,7 @@ class FlowManager(EngineScoped):
                 return PackageNodesAsSerializedFlowResultFailure(result_details=details)
 
             # Extract parameter shape info for workflow shape (inputs from external sources)
-            param_shape_info = self.engine.workflow_manager.extract_parameter_shape_info(
-                source_param, include_control_params=True
-            )
+            param_shape_info = extract_parameter_shape_info(source_param, include_control_params=True)
             if param_shape_info is not None:
                 if start_node_name not in input_shape_data:
                     input_shape_data[start_node_name] = {}
@@ -2566,7 +2582,6 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 create_node_request=start_create_node_command,
-                workflow_manager=self.engine.workflow_manager,
             )
             if param_value_commands is not None:
                 # Modify each command to target the start node parameter instead
@@ -2581,7 +2596,7 @@ class FlowManager(EngineScoped):
                 node_name=start_node_name,
                 parameter_name=param_name,
                 type=source_param.output_type,
-                default_value=source_param.default_value,
+                default_value=encodable_default(source_param.default_value, source_node.name, source_param.name),
                 tooltip=f"Parameter {target_parameter_name} from node {target_node_name} in packaged flow",
                 initial_setup=True,
             )
@@ -2814,7 +2829,6 @@ class FlowManager(EngineScoped):
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
-                pickle_control_flow_result=request.pickle_control_flow_result,
             )
         except Exception as e:
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
@@ -2893,7 +2907,6 @@ class FlowManager(EngineScoped):
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
-                pickle_control_flow_result=request.pickle_control_flow_result,
             )
         except Exception as e:
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
@@ -3080,7 +3093,6 @@ class FlowManager(EngineScoped):
 
         subflow_machine = ControlFlowMachine(
             flow.name,
-            pickle_control_flow_result=request.pickle_control_flow_result,
             is_isolated=True,
             engine=self.engine,
         )
@@ -3650,22 +3662,17 @@ class FlowManager(EngineScoped):
         variable: FlowVariable,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
     ) -> SerializedFlowCommands.SerializedVariableCommand:
-        """Register the variable's value in the unique-values pool and build the indirect command.
-
-        Values are stored as raw Python objects — ``_generate_unique_values_code`` pickles them at
-        AST-generation time. Each variable gets its own UUID even if another entry holds an equal
-        value; matching the existing parameter-value pattern, dedup-by-equality is not attempted here.
-        """
-        unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-        try:
-            unique_parameter_uuid_to_values[unique_value_uuid] = copy.deepcopy(variable.value)
-        except Exception:
-            # Fall back to by-reference storage; matches the parameter-value code path's warning.
+        """Pool the variable's encoded value under a hash of its content and build the indirect command."""
+        encoded = try_encode(variable.value)
+        if isinstance(encoded, Unencodable):
             logger.warning(
-                "Attempted to serialize variable '%s'. Value could not be deep-copied; storing by reference.",
+                "Attempted to save variable '%s'. Failed because %s It will reopen with no value.",
                 variable.name,
+                encoded.reason,
             )
-            unique_parameter_uuid_to_values[unique_value_uuid] = variable.value
+            encoded = None
+        unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+        unique_parameter_uuid_to_values[unique_value_uuid] = encoded
 
         create_variable_command = CreateVariableRequest(
             name=variable.name,
@@ -4466,10 +4473,10 @@ class FlowManager(EngineScoped):
             msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}' because the value was missing."
             raise FlowDeserializationError(msg)
 
-        # Call the SetParameterValueRequest, subbing in the value from our unique value list.
-        indirect_set_value_command.set_parameter_value_command.value = unique_parameter_uuid_to_values[
-            unique_value_uuid
-        ]
+        # Call the SetParameterValueRequest, subbing in a freshly decoded copy of the pooled value.
+        indirect_set_value_command.set_parameter_value_command.value = decode_value(
+            unique_parameter_uuid_to_values[unique_value_uuid]
+        )
         # Update the parameter value command to have the correct name.
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
@@ -4483,7 +4490,6 @@ class FlowManager(EngineScoped):
         start_node: BaseNode | None = None,
         *,
         debug_mode: bool = False,
-        pickle_control_flow_result: bool = False,
     ) -> None:
         if self.check_for_existing_running_flow():
             # If flow already exists, throw an error
@@ -4500,9 +4506,7 @@ class FlowManager(EngineScoped):
 
         # Initialize global control flow machine and DAG builder
 
-        self._global_control_flow_machine = ControlFlowMachine(
-            flow.name, pickle_control_flow_result=pickle_control_flow_result, engine=self.engine
-        )
+        self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
         # Set off the request here.
         try:
             await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
@@ -4568,6 +4572,9 @@ class FlowManager(EngineScoped):
 
         # An image without embedded flow commands is a valid state, not an error.
         metadata = pil_image.info if hasattr(pil_image, "info") else {}
+        # Closed now: a failure reading the commands can keep this frame, and the open file, alive
+        # until garbage collection, and Windows won't delete or replace an open file.
+        pil_image.close()
         if not metadata:
             return ExtractFlowCommandsFromImageMetadataResultSuccess(
                 result_details=f"Image has no metadata: {file_url_or_path}",
@@ -4584,25 +4591,11 @@ class FlowManager(EngineScoped):
                 altered_workflow_state=False,
             )
 
-        encoded_flow_commands = metadata[FLOW_COMMANDS_KEY]
-
-        # Decode base64
         try:
-            pickled_data = base64.b64decode(encoded_flow_commands)
-        except Exception as e:
+            serialized_flow_commands = self._read_image_flow_commands(metadata[FLOW_COMMANDS_KEY])
+        except ImageFlowCommandsError as error:
             return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Failed to decode base64 flow commands: {e}",
-                file_path=file_url_or_path,
-            )
-
-        # Unpickle SerializedFlowCommands
-        try:
-            # Pickle is safe here: we're deserializing workflow data from images saved by this application
-            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands
-            serialized_flow_commands = pickle.loads(pickled_data)  # noqa: S301
-        except Exception as e:
-            return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Failed to unpickle flow commands: {e}",
+                result_details=f"Attempted to read the workflow saved in image '{file_url_or_path}'. Failed because {error}.",
                 file_path=file_url_or_path,
             )
 
@@ -4634,6 +4627,26 @@ class FlowManager(EngineScoped):
             serialized_flow_commands=serialized_flow_commands,
             altered_workflow_state=False,
         )
+
+    def _read_image_flow_commands(self, text: str) -> SerializedFlowCommands:
+        """Read the flow commands an image's metadata holds as JSON, or as pickle from earlier engines.
+
+        Raises:
+            ImageFlowCommandsError: The text holds no readable flow commands.
+        """
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                return read_legacy_image_flow_commands(
+                    text, self.engine.library_manager.module_loading.stable_module_names()
+                )
+            except LegacyPickleError as error:
+                raise ImageFlowCommandsError(str(error)) from error
+        try:
+            return decode_commands(data, SerializedFlowCommands)
+        except CommandsFormatError as error:
+            raise ImageFlowCommandsError(str(error)) from error
 
     def check_for_existing_running_flow(self) -> bool:
         if self._global_control_flow_machine is None:

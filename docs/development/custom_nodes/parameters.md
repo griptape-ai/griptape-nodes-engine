@@ -28,6 +28,70 @@ All Parameter attributes:
 - **parent_container_name**: str|None — assigns this parameter as a child of a `ParameterContainer` (i.e. a `ParameterList` or `ParameterDictionary`). Used for list-like ownership.
 - **parent_element_name**: str|None — nests this parameter under a `ParameterGroup` (a UI grouping element). Used for visual grouping in the node UI.
 
+## Parameter Values
+
+Parameter values are serialized when:
+
+- a workflow is saved
+- nodes are copied
+- a workflow is embedded in an exported image
+- a node runs in its library's own process (see [Node Isolation with Workers](node_isolation_with_workers.md))
+- a loop or subflow group runs with an **Execution Environment** other than **Local Execution**
+
+These types serialize as-is:
+
+- `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
+- tuples, named tuples, sets, `bytes`, and dicts with non-string keys
+- enums, `pathlib` paths, dates and times, `timedelta`, `UUID`, and `Decimal`
+- pydantic models, dataclasses, and attrs classes
+- griptape objects such as artifacts and rulesets
+
+To serialize any other class, decorate it with `register_value_codec` and give it a `to_state()`
+method that returns the types above, and a `from_state()` classmethod that rebuilds the object from
+them. Subclasses are covered too:
+
+```python
+from griptape_nodes.exe_types.core_types import register_value_codec
+
+
+@register_value_codec
+class Palette:
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+```
+
+For a class you cannot edit, such as one from another package, pass the conversion functions
+instead. They cover that exact class, not its subclasses, and only a class with no other way to
+save. Register them from your library's `before_library_nodes_loaded`, so every process that loads
+your library has them:
+
+```python
+import numpy as np
+
+from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+
+
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
+```
+
+A value of any other class is left out when a workflow is saved and when nodes are copied or
+pasted, with a warning in the log that names the node and parameter. Set `serializable=False` on a
+parameter whose value is never meant to be saved, and it is left out without a warning.
+
 ## Traits
 
 Add functionality via `add_trait()`:

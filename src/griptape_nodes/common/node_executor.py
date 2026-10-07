@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import pickle
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -83,6 +82,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails, build_engine_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultFailure,
     CreateNodeResultSuccess,
@@ -124,7 +124,6 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
@@ -269,6 +268,19 @@ class LoopBodyNodes(NamedTuple):
     node_group_name: str | None
 
 
+class ExecuteNodeFailedError(RuntimeError):
+    """Raised by ``NodeExecutor`` when an ``ExecuteNodeRequest`` fails.
+
+    The message is the flattened text that ends up in ``NodeErrorEvent.error_message``, and
+    ``details`` is what goes in ``NodeErrorEvent.error``. The node's exception, if any, is chained
+    as ``__cause__``.
+    """
+
+    def __init__(self, message: str, *, details: NodeErrorDetails) -> None:
+        super().__init__(message)
+        self.details = details
+
+
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
@@ -344,8 +356,7 @@ class NodeExecutor(EngineScoped):
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
                 exc = getattr(result, "exception", None)
-                msg = self._format_node_failure_message(node.name, result, exc)
-                raise RuntimeError(msg) from exc  # noqa: TRY004
+                raise self._execute_node_failed_error(node.name, result, exc) from exc
             # Copy outputs back onto the in-memory node. Write directly into
             # parameter_output_values (not through set_parameter_value, which
             # targets parameter_values and re-fires before/after_value_set and
@@ -363,6 +374,17 @@ class NodeExecutor(EngineScoped):
             # A connection torn down while this node was running left its input value in place so the
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
+
+    def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
+        message = self._format_node_failure_message(node_name, result, exc)
+        details = None
+        if isinstance(result, ExecuteNodeResultFailure):
+            details = result.error
+        if details is None:
+            # No node-built details means the engine wrote result_details, so its words are kept.
+            result_details = str(getattr(result, "result_details", result))
+            details = build_engine_error_details(node_name, result_details, exc)
+        return ExecuteNodeFailedError(message, details=details)
 
     def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.
@@ -524,7 +546,7 @@ class NodeExecutor(EngineScoped):
 
         Call this at the boundary that deserializes in-process, not at the one that packages.
         Generated workflow files are emitted by reflecting over each create command's non-default
-        fields (workflow_manager._generate_node_creation_code), so a command carrying
+        fields (WorkflowCodeGenerator._generate_node_creation_code), so a command carrying
         broadcast_result=False writes that transport detail into the saved artifact. Packaging runs
         before the execution-environment branch, and the private and cloud-publisher branches hand
         the very same serialized_flow_commands to SaveWorkflowFileFromSerializedFlowRequest -- so
@@ -765,7 +787,6 @@ class NodeExecutor(EngineScoped):
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=True,
         )
 
         workflow_result = await self.engine.ahandle_request(workflow_file_request)
@@ -802,7 +823,6 @@ class NodeExecutor(EngineScoped):
                 workflow_path=workflow_result.file_path,
                 publisher_name=library_name,
                 published_workflow_file_name=published_filename,
-                pickle_control_flow_result=True,
             )
 
         if not await anyio.Path(published_workflow_filename).exists():
@@ -815,16 +835,14 @@ class NodeExecutor(EngineScoped):
         self,
         published_workflow_filename: Path,
         file_name: str,
-        pickle_control_flow_result: bool = True,  # noqa: FBT001, FBT002
         flow_input: dict[str, Any] | None = None,
         node: SubflowNodeGroup | None = None,
-    ) -> dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]:
+    ) -> dict[str, dict[str, Any]]:
         """Execute the published workflow in a subprocess.
 
         Args:
             published_workflow_filename: Path to the workflow file to execute
             file_name: Name of the workflow for logging
-            pickle_control_flow_result: Whether to pickle control flow results (defaults to True)
             flow_input: Optional dictionary of parameter values to pass to the workflow's StartFlow node
             node: Optional SubflowNodeGroup to receive real-time event updates
 
@@ -849,7 +867,6 @@ class NodeExecutor(EngineScoped):
                 await executor.arun(
                     flow_input=flow_input or {},
                     storage_backend=await self._get_storage_backend(),
-                    pickle_control_flow_result=pickle_control_flow_result,
                 )
         except RuntimeError as e:
             # Subprocess returned non-zero exit code
@@ -1351,7 +1368,6 @@ class NodeExecutor(EngineScoped):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=packaged_start_node_name,
-                        pickle_control_flow_result=False,
                     )
                     start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
@@ -1929,7 +1945,6 @@ class NodeExecutor(EngineScoped):
                 start_subflow_request = StartLocalSubflowRequest(
                     flow_name=flow_name,
                     start_node=packaged_start_node_name,
-                    pickle_control_flow_result=False,
                 )
                 start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
@@ -3240,7 +3255,6 @@ class NodeExecutor(EngineScoped):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=start_node_name,
-                        pickle_control_flow_result=False,
                     )
                     start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
                     if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
@@ -3456,7 +3470,6 @@ class NodeExecutor(EngineScoped):
                         subprocess_result = await self._execute_subprocess(
                             published_workflow_filename=workflow_path,
                             file_name=f"{file_name_prefix}_iteration_{iteration_index}",
-                            pickle_control_flow_result=True,
                             flow_input=flow_input,
                             node=subflow_node,
                         )
@@ -3482,7 +3495,6 @@ class NodeExecutor(EngineScoped):
                         subprocess_result = await self._execute_subprocess(
                             published_workflow_filename=workflow_path,
                             file_name=f"{file_name_prefix}_iteration_{iteration_index}",
-                            pickle_control_flow_result=True,
                             flow_input=flow_input,
                             node=subflow_node,
                         )
@@ -3529,7 +3541,6 @@ class NodeExecutor(EngineScoped):
         workflow_path, workflow_result = await self._save_workflow_file_for_loop(
             end_loop_node=end_loop_node,
             package_result=package_result,
-            pickle_control_flow_result=True,
         )
         sanitized_loop_name = end_loop_node.name.replace(" ", "_")
         file_name_prefix = f"{sanitized_loop_name}_private_sequential_loop_flow"
@@ -3563,7 +3574,6 @@ class NodeExecutor(EngineScoped):
         workflow_path, workflow_result = await self._save_workflow_file_for_loop(
             end_loop_node=end_loop_node,
             package_result=package_result,
-            pickle_control_flow_result=True,
         )
         sanitized_loop_name = end_loop_node.name.replace(" ", "_")
         file_name_prefix = f"{sanitized_loop_name}_private_loop_flow"
@@ -3590,15 +3600,12 @@ class NodeExecutor(EngineScoped):
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
-        *,
-        pickle_control_flow_result: bool,
     ) -> tuple[Path, Any]:
         """Save workflow file for loop execution.
 
         Args:
             end_loop_node: The end loop node
             package_result: The packaged flow
-            pickle_control_flow_result: Whether to pickle the control flow result
 
         Returns:
             Tuple of (workflow_path, workflow_result)
@@ -3610,7 +3617,6 @@ class NodeExecutor(EngineScoped):
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
 
         workflow_result = await self.engine.ahandle_request(workflow_file_request)
@@ -3793,7 +3799,6 @@ class NodeExecutor(EngineScoped):
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=True,
         )
 
         workflow_result = await self.engine.ahandle_request(workflow_file_request)
@@ -3827,39 +3832,11 @@ class NodeExecutor(EngineScoped):
         except Exception as e:
             logger.warning("Failed to cleanup workflow files: %s", e)
 
-    def set_parameter_output_values_for_loops(
-        self, subprocess_result: dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]
-    ) -> None:
-        pass
-
-    def _extract_parameter_output_values(
-        self, subprocess_result: dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]
-    ) -> dict[str, Any]:
-        """Extract and deserialize parameter output values from subprocess result.
-
-        Returns:
-            Dictionary of parameter names to their deserialized values
-        """
+    def _extract_parameter_output_values(self, subprocess_result: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Merge the output values of every end node in a subprocess result."""
         parameter_output_values = {}
-        for result_dict in subprocess_result.values():
-            # Handle backward compatibility: old flat structure
-            if not isinstance(result_dict, dict) or "parameter_output_values" not in result_dict:
-                parameter_output_values.update(result_dict)  # type: ignore[arg-type]
-                continue
-
-            param_output_vals = result_dict["parameter_output_values"]
-            unique_uuid_to_values = result_dict.get("unique_parameter_uuid_to_values")
-
-            # No UUID mapping - use values directly
-            if not unique_uuid_to_values:
-                parameter_output_values.update(param_output_vals)
-                continue
-
-            # Deserialize UUID-referenced values
-            for param_name, param_value in param_output_vals.items():
-                parameter_output_values[param_name] = self._deserialize_parameter_value(
-                    param_name, param_value, unique_uuid_to_values
-                )
+        for end_node_values in subprocess_result.values():
+            parameter_output_values.update(end_node_values)
         return parameter_output_values
 
     def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str]) -> None:
@@ -3900,32 +3877,6 @@ class NodeExecutor(EngineScoped):
                 for network in list(dag_builder.graphs.values()):
                     if node_name in network.nodes():
                         network.remove_node(node_name)
-
-    def _deserialize_parameter_value(self, param_name: str, param_value: Any, unique_uuid_to_values: dict) -> Any:
-        """Deserialize a single parameter value, handling UUID references and pickling.
-
-        Args:
-            param_name: Parameter name for logging
-            param_value: Either a direct value or UUID reference
-            unique_uuid_to_values: Mapping of UUIDs to pickled values
-
-        Returns:
-            Deserialized parameter value
-        """
-        # Direct value (not a UUID reference)
-        if param_value not in unique_uuid_to_values:
-            return param_value
-
-        stored_value = unique_uuid_to_values[param_value]
-        try:
-            return pickle.loads(stored_value)  # noqa: S301
-        except pickle.UnpicklingError as e:
-            logger.warning(
-                "Attempted to unpickle stored value for parameter '%s'. Failed because: %s",
-                param_name,
-                e,
-            )
-            raise
 
     def _apply_parameter_values_to_node(
         self,

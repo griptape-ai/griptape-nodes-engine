@@ -19,7 +19,6 @@ from griptape.artifacts.image_url_artifact import ImageUrlArtifact
 from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
-from griptape_nodes.common.parameter_hydration import hydrate_value
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.file import File
@@ -260,9 +259,7 @@ class PublicArtifactUrlParameter:
         # the already-public pass-through.
         self.gtc_file_path = None
 
-        # Parameter values that crossed a JSON boundary (orchestrator <-> worker, workflow load)
-        # arrive as serialized artifact dicts; rehydrate them back into artifacts first.
-        parameter_value = hydrate_value(self._node.get_parameter_value(self._parameter.name))
+        parameter_value = self._node.get_parameter_value(self._parameter.name)
 
         # An upstream failure propagates as an ErrorArtifact. Surface the original error
         # instead of masking it with an AttributeError further down.
@@ -275,6 +272,11 @@ class PublicArtifactUrlParameter:
 
         if isinstance(parameter_value, UrlArtifact):
             return parameter_value.value
+        if isinstance(parameter_value, dict):
+            # Artifact-shaped dict: an UndecodedValue from a library this process doesn't load,
+            # or an untagged dict from a client or an older saved workflow.
+            url: Any = parameter_value.get("value")
+            return url
         return parameter_value
 
     def _build_upload_path(self, url: str) -> Path:

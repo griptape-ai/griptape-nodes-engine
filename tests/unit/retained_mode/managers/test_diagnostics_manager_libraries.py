@@ -64,7 +64,7 @@ def _entry(
     engine = Mock()
     engine.library_manager.get_libraries_attempted_to_load.return_value = [_LIBRARY_PATH]
     engine.library_manager.get_library_info_for_attempted_load.return_value = lib_info
-    engine.library_manager.collate_problems_for_lib_info.return_value = None
+    engine.library_manager.catalog.collate_problems_for_lib_info.return_value = None
     engine.worker_manager.worker_unavailable_reason.return_value = worker_unavailable_reason
     if worker_registered:
         engine.worker_manager.get_worker_for_key.return_value = ("worker-1", "worker-1-requests")
