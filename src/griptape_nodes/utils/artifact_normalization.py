@@ -75,7 +75,7 @@ def _resolve_file_path(file_path: str) -> Path | None:  # noqa: PLR0911
 
 
 def _resolve_static_server_url(url: str) -> Path | None:
-    """Map a localhost static server URL back to the workspace file it serves.
+    """Map a localhost static server URL back to the file it serves.
 
     Args:
         url: URL string that may be a localhost static server URL
@@ -95,15 +95,15 @@ def _resolve_static_server_url(url: str) -> Path | None:
     return parse_static_server_url(url, workspace_path)
 
 
-def _wrap_file_in_place(file_path: Path, artifact_type: type[Any]) -> Any | None:
-    """Wrap a file in an artifact that serves it from where it is.
+def _wrap_file(file_path: Path, artifact_type: type[Any]) -> Any | None:
+    """Wrap a file in an artifact whose value is the file's path.
 
     Args:
         file_path: Path to the file to wrap
         artifact_type: The artifact class to create (ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact)
 
     Returns:
-        Artifact object with a static server URL for the file, or None if the file can't be served
+        Artifact object holding the file's path, or None if no file is there
     """
     # A value that is not a path at all, such as a data URI, can be too long for the OS to
     # look up. That is still an answer to "is this a file?", so treat it as "no".
@@ -116,13 +116,7 @@ def _wrap_file_in_place(file_path: Path, artifact_type: type[Any]) -> Any | None
     if not is_file:
         return None
 
-    try:
-        storage_driver = current_engine().static_files_manager.storage_driver
-        url = storage_driver.create_signed_download_url(file_path)
-        return artifact_type(url)
-    except Exception as e:
-        logger.debug("Failed to create a static server URL for file '%s': %s", file_path, e)
-        return None
+    return artifact_type(str(file_path))
 
 
 def _normalize_string_input(artifact_input: str, artifact_type: type[Any]) -> Any:
@@ -136,20 +130,18 @@ def _normalize_string_input(artifact_input: str, artifact_type: type[Any]) -> An
         Artifact object or original input if normalization fails
     """
     if artifact_input.startswith(("http://", "https://")):
-        # A static server URL minted in an earlier session can carry a port or base URL that
-        # no longer serves, and a `?v=` that no longer matches the file. Re-mint it for the
-        # file it names so it keeps resolving.
+        # A static server URL is a preview address for a file on disk. Store the file's path
+        # instead, so reading the value does not depend on a server running.
         file_path = _resolve_static_server_url(artifact_input)
         if file_path:
-            artifact = _wrap_file_in_place(file_path, artifact_type)
+            artifact = _wrap_file(file_path, artifact_type)
             if artifact:
                 return artifact
         return artifact_type(artifact_input)
 
-    # The static server serves workspace files and external absolute paths directly, so no copy is needed
     file_path = _resolve_file_path(artifact_input)
     if file_path:
-        artifact = _wrap_file_in_place(file_path, artifact_type)
+        artifact = _wrap_file(file_path, artifact_type)
         if artifact:
             return artifact
 
@@ -165,7 +157,7 @@ def normalize_artifact_input(
     """Normalize an artifact input, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths are converted to artifact objects that point at the file where it is.
+    String paths and localhost static server URLs are converted to artifacts holding the file's path.
     Objects that are already the correct artifact type are returned unchanged.
 
     Args:
@@ -192,7 +184,7 @@ def normalize_artifact_input(
 
     # A serialized *Url* artifact dict carries the path or URL in its ``value``; the rest is
     # display metadata the editor tracks alongside it. Hand that string to the branch above
-    # rather than rebuilding the artifact from the dict: it resolves and uploads the path,
+    # rather than rebuilding the artifact from the dict: it resolves the path,
     # and builds the type this parameter declared. The declared type is what tells a path
     # apart from a payload -- a raw ``ImageArtifact`` dict holds base64 bytes in ``value``,
     # which is not a path and must be left alone. The check trusts the declared type, so a
@@ -202,8 +194,8 @@ def normalize_artifact_input(
         inner = artifact_input.get("value")
         if isinstance(inner, str) and inner:
             normalized = _normalize_string_input(inner, artifact_type)
-            # That branch hands back its own input when a path cannot be resolved or
-            # uploaded -- a macro path, or a file outside the workspace. The dict already
+            # That branch hands back its own input when a path cannot be resolved, such as a
+            # macro path or a missing file. The dict already
             # declared the artifact type, so build it from the value instead of letting a
             # dict degrade into a bare string.
             if isinstance(normalized, str):
@@ -222,7 +214,7 @@ def normalize_artifact_list(
     """Normalize a list of artifact inputs, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths are converted to artifact objects that point at the file where it is.
+    String paths and localhost static server URLs are converted to artifacts holding the file's path.
     Objects that are already the correct artifact type are passed through unchanged.
 
     Args:

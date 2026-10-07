@@ -1054,6 +1054,32 @@ class TestParseStaticServerUrl:
         result = parse_static_server_url("http://localhost:8124/workspace/", self.WORKSPACE)
         assert result is None
 
+    def test_maps_external_url_to_absolute_posix_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/Desktop/cat.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/Desktop/cat.png")
+
+    def test_maps_external_url_to_windows_drive_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/C:/Users/artist/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("C:/Users/artist/cat.png")
+
+    def test_external_path_containing_workspace_segment(self) -> None:
+        """An external file whose own path holds `/workspace/` is not read as a workspace file."""
+        result = parse_static_server_url(
+            "http://localhost:8124/external/mnt/workspace/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("/mnt/workspace/cat.png")
+
+    def test_rejects_localhost_url_with_empty_external_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/", self.WORKSPACE)
+        assert result is None
+
     def test_rejects_127_0_0_1(self) -> None:
         """Only the `localhost` spelling is recognized, matching StaticServerFileDriver."""
         result = parse_static_server_url("http://127.0.0.1:8124/workspace/clip.mp4", self.WORKSPACE)

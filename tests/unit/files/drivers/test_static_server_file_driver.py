@@ -60,6 +60,10 @@ class TestStaticServerFileDriver:
         """Test that driver handles localhost URLs on different ports."""
         assert driver.can_handle("http://localhost:3000/workspace/static_files/test.png") is True
 
+    def test_can_handle_localhost_external(self, driver: StaticServerFileDriver) -> None:
+        """Test that driver handles localhost URLs for files outside the workspace."""
+        assert driver.can_handle("http://localhost:8124/external/Users/artist/cat.png") is True
+
     def test_cannot_handle_localhost_without_workspace(self, driver: StaticServerFileDriver) -> None:
         """Test that driver rejects localhost URLs without /workspace/ path."""
         assert driver.can_handle("http://localhost:8124/api/health") is False
@@ -94,6 +98,25 @@ class TestStaticServerFileDriver:
                 timeout=10.0,
             )
         assert content == b"fake image data"
+
+    @pytest.mark.asyncio
+    async def test_read_external_file_from_disk(
+        self,
+        driver: StaticServerFileDriver,
+        mock_config_manager: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test that an /external/ URL reads the file from disk, with no server running."""
+        external_file = tmp_path / "outside" / "cat.png"
+        external_file.parent.mkdir()
+        external_file.write_bytes(b"cat")
+        url = f"http://localhost:8124/external/{external_file.as_posix().removeprefix('/')}?v=1"
+        with patch(
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
+        ):
+            content = await driver.read(url, timeout=10.0)
+        assert content == b"cat"
 
     @pytest.mark.asyncio
     async def test_read_strips_query_params(
@@ -153,7 +176,7 @@ class TestStaticServerFileDriver:
     @pytest.mark.asyncio
     async def test_read_invalid_url_no_workspace(self, driver: StaticServerFileDriver) -> None:
         """Test reading from localhost URL without /workspace/ raises ValueError."""
-        with pytest.raises(ValueError, match="/workspace/ not found"):
+        with pytest.raises(ValueError, match="/workspace/ nor /external/ found"):
             await driver.read(
                 "http://localhost:8124/api/health",
                 timeout=10.0,

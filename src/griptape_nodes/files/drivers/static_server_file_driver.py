@@ -1,8 +1,7 @@
 """File driver for static file server URLs.
 
-Intercepts http://localhost:PORT/workspace/... URLs and reads the files
-directly from the workspace directory on disk, avoiding unnecessary
-HTTP round-trips through the dev server.
+Intercepts http://localhost:PORT/workspace/... and /external/... URLs and reads
+the files directly from disk, so reading them needs no static server running.
 """
 
 from pathlib import Path
@@ -18,8 +17,8 @@ from griptape_nodes.retained_mode.engine import current_engine
 class StaticServerFileDriver(BaseFileDriver):
     """File driver for static file server URLs.
 
-    Handles URLs matching http(s)://localhost:PORT/workspace/... by extracting
-    the workspace-relative path and reading directly from disk.
+    Handles URLs matching http(s)://localhost:PORT/workspace/... or /external/...
+    by mapping them to the file they serve and reading directly from disk.
     """
 
     @property
@@ -32,18 +31,18 @@ class StaticServerFileDriver(BaseFileDriver):
         return 5
 
     def can_handle(self, location: str) -> bool:
-        """Check if location is a localhost URL with /workspace/ path.
+        """Check if location is a localhost URL with a /workspace/ or /external/ path.
 
         Args:
             location: Location string to check
 
         Returns:
-            True if location is a localhost URL with /workspace/ path
+            True if location is a localhost URL with a /workspace/ or /external/ path
         """
         if not location.startswith(("http://localhost:", "https://localhost:")):
             return False
         parsed = urlparse(location)
-        return "/workspace/" in parsed.path
+        return "/workspace/" in parsed.path or parsed.path.startswith("/external/")
 
     def _resolve_to_local_path(self, location: str) -> Path:
         """Resolve a localhost URL to the actual file path on disk.
@@ -61,7 +60,7 @@ class StaticServerFileDriver(BaseFileDriver):
         local_path = parse_static_server_url(location, workspace_path)
 
         if local_path is None:
-            msg = f"Attempted to resolve localhost URL. Failed with url='{location}' because /workspace/ not found in path."
+            msg = f"Attempted to resolve localhost URL. Failed with url='{location}' because neither /workspace/ nor /external/ found in path."
             raise ValueError(msg)
 
         return local_path
