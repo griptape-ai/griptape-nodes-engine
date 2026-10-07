@@ -417,9 +417,6 @@ class BaseNode(ABC):
         self._engine = engine
         self.name = name
         self._state = state
-        # Lazy import: library_registry imports BaseNode from this module.
-        from griptape_nodes.node_library.library_registry import LibraryRegistry
-
         self.broadcasts_events = not LibraryRegistry.is_constructing_throwaway_node()
         if metadata is None:
             self.metadata = {}
