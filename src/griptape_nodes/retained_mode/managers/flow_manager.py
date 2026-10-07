@@ -2831,14 +2831,14 @@ class FlowManager(EngineScoped):
                 debug_mode=request.debug_mode,
             )
         except Exception as e:
-            details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
+            details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
         if self._global_control_flow_machine:
             resolution_machine = self._global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
+                result_details = f"Attempted to run flow '{flow_name}'. Failed due to: {error_message}"
                 exception = RuntimeError(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowResultFailure(
@@ -2909,7 +2909,7 @@ class FlowManager(EngineScoped):
                 debug_mode=request.debug_mode,
             )
         except Exception as e:
-            details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
+            details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
 
         if self._global_control_flow_machine:
