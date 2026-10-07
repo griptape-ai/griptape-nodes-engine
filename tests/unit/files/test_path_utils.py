@@ -1083,6 +1083,13 @@ class TestParseStaticServerUrl:
         )
         assert result == Path("/Users/artist/shot#1.png")
 
+    def test_keeps_semicolon_in_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/renders/clip;v2.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "renders" / "clip;v2.mp4"
+
     def test_external_path_containing_workspace_segment(self) -> None:
         result = parse_static_server_url(
             "http://localhost:8124/external/mnt/workspace/cat.png",

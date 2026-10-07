@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 from griptape_nodes.files.os_utils import is_windows
 
@@ -448,8 +448,8 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     # Strip the version/cachebuster query (`?v=...`) before parsing: it is addressing
     # metadata for the HTTP server, not part of the filename.
     url_without_query = location.split("?", maxsplit=1)[0]
-    # These URLs are not percent-encoded, so a `#` is part of the filename, not a fragment.
-    parsed = urlparse(url_without_query, allow_fragments=False)
+    # These URLs are not percent-encoded, so `#` and `;` are part of the filename.
+    parsed = urlsplit(url_without_query, allow_fragments=False)
 
     # Checked before the workspace segment, which an external file's own path may contain.
     if parsed.path.startswith(_STATIC_SERVER_EXTERNAL_PREFIX):
