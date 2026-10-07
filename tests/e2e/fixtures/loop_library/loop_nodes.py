@@ -26,10 +26,12 @@ class StartFlow(StartNode):
 
 
 class EndFlow(EndNode):
-    """The packaged body's exit node."""
+    """The packaged body's exit node.
 
-    def process(self) -> None:
-        return None
+    Inherits ``EndNode.process``, which copies every non-control parameter's raw value into
+    ``parameter_output_values`` -- the loop packager reads a packaged body's result back out of
+    exactly that dict.
+    """
 
 
 class LoopBodyNode(DataNode):

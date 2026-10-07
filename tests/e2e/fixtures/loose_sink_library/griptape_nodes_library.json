@@ -50,6 +50,15 @@
       }
     },
     {
+      "class_name": "ControlListSinkNode",
+      "file_path": "loose_sink_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "loose data sink taking a list, reached by both a data edge and a control edge",
+        "display_name": "Control List Sink"
+      }
+    },
+    {
       "class_name": "BranchNode",
       "file_path": "loose_sink_nodes.py",
       "metadata": {
