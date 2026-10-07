@@ -5007,8 +5007,7 @@ class ProjectManager(EngineScoped):
            longer exists. The lookup then raises, `{workflow_dir?:/}` swallows it as an
            optional reference, and `{outputs}` silently degrades from the workflow's own folder
            to a workspace-relative path, so saved media resolves somewhere it was never written.
-        2. The registry entry for the context's name. A name the registry does not hold is
-           treated as never saved and falls through to the rungs below.
+        2. The registry entry for the context's name. Missing entries fall through.
         3. The folder the workflow was created in, for a workflow that has never been saved and
            so has no file to answer from. Below the two above because a saved workflow's own
            location always beats the folder it was created in -- the two differ as soon as the
@@ -5033,9 +5032,6 @@ class ProjectManager(EngineScoped):
 
         workflow_name = context_manager.get_current_workflow_name()
         working_directory = context_manager.get_current_workflow_working_directory()
-        # Unregistered with no retained file means never saved: pushing by name and saving both
-        # retain the file path, which rung 1 answers from. Scripts and tests push names they
-        # never register, so treat this like an unsaved entry rather than an error.
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
         except KeyError:
