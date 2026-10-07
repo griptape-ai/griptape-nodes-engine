@@ -52,6 +52,7 @@ from griptape_nodes.exe_types.node_types import (
     ErrorProxyNode,
     NodeDependencies,
     NodeResolutionState,
+    SetInput,
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
@@ -2840,7 +2841,7 @@ class NodeManager(EngineScoped):
         if output_snapshot is not None and modified:
             for output_param_name, new_value in node.parameter_output_values.items():
                 old_value = output_snapshot.get(output_param_name)
-                if not _values_differ(old_value, new_value):
+                if old_value is new_value or old_value == new_value:
                     continue
                 output_param = node.get_parameter_by_name(output_param_name)
                 if output_param is None:
@@ -2907,8 +2908,9 @@ class NodeManager(EngineScoped):
         # If the value should be set on the output dictionary:
         if request.is_output:
             # set it to output values
-            if request.parameter_name in node.parameter_output_values and _values_differ(
-                node.parameter_output_values[request.parameter_name], object_created
+            if (
+                request.parameter_name in node.parameter_output_values
+                and node.parameter_output_values[request.parameter_name] != object_created
             ):
                 modified = True
             node.parameter_output_values[request.parameter_name] = object_created
@@ -2921,10 +2923,26 @@ class NodeManager(EngineScoped):
         )
         # Get the "converted" value here.
         finalized_value = node._get_raw_parameter_value(request.parameter_name)
-        if _values_differ(old_value, finalized_value):
+        resent = self._is_resend(node, request.parameter_name, object_created, old_value)
+        if not resent and old_value != finalized_value:
             modified = True
+        node.last_set_inputs[request.parameter_name] = SetInput(sent=object_created, stored=finalized_value)
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
         return NodeManager.ModifiedReturnValue(finalized_value, modified)
+
+    def _is_resend(self, node: BaseNode, parameter_name: str, sent: Any, old_value: Any) -> bool:
+        """Whether `sent` repeats the last input to a parameter that still holds what that input stored.
+
+        Converters may build a fresh object per set whose `==` is unequal for the same input (a random
+        id, identity equality), so comparing stored values would read a resend as an edit.
+        """
+        last = node.last_set_inputs.get(parameter_name)
+        if last is None:
+            return False
+        # Set some other way since, e.g. by the node itself while running.
+        if last.stored is not old_value:
+            return False
+        return not _values_differ(last.sent, sent)
 
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
     # For PLR0911 (too many return statements): don't want to do a ton of nested chains of success,

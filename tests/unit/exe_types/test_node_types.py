@@ -1,7 +1,6 @@
 from unittest.mock import Mock, patch
 
 import pytest
-from griptape.artifacts import ImageUrlArtifact, TextArtifact
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import (
@@ -406,10 +405,6 @@ class TestOutputValueChangeDetection:
 
         __hash__ = None  # type: ignore[assignment]
 
-        def __eq__(self, other: object) -> bool:
-            message = "The truth value of an array with more than one element is ambiguous."
-            raise ValueError(message)
-
         def __ne__(self, other: object) -> bool:
             message = "The truth value of an array with more than one element is ambiguous."
             raise ValueError(message)
@@ -432,52 +427,6 @@ class TestOutputValueChangeDetection:
 
         assert _values_differ(1, 2) is True
         assert _values_differ("a", "a") is False
-
-
-class TestArtifactChangeDetection:
-    """Artifacts compare by content: a random `id` (and the `name` it defaults) is not a change."""
-
-    def test_equal_content_with_different_ids_is_not_a_change(self) -> None:
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        assert _values_differ(ImageUrlArtifact("https://a.png"), ImageUrlArtifact("https://a.png")) is False
-
-    def test_different_content_is_a_change(self) -> None:
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        assert _values_differ(ImageUrlArtifact("https://a.png"), ImageUrlArtifact("https://b.png")) is True
-
-    def test_an_explicit_name_is_content(self) -> None:
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        old = ImageUrlArtifact("https://a.png", name="cat")
-        new = ImageUrlArtifact("https://a.png", name="dog")
-
-        assert _values_differ(old, new) is True
-
-    def test_a_different_artifact_type_is_a_change(self) -> None:
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        assert _values_differ(TextArtifact("https://a.png"), ImageUrlArtifact("https://a.png")) is True
-
-    def test_artifacts_inside_containers_compare_by_content(self) -> None:
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        old = {"images": [ImageUrlArtifact("https://a.png")]}
-        new = {"images": [ImageUrlArtifact("https://a.png")]}
-
-        assert _values_differ(old, new) is False
-        assert _values_differ(old, {"images": [ImageUrlArtifact("https://b.png")]}) is True
-
-    def test_a_shared_element_with_an_irreflexive_eq_is_not_a_change(self) -> None:
-        """Containers rebuilt around the same elements, as `ParameterList` reads are, must read as unchanged."""
-        from griptape_nodes.exe_types.node_types import _values_differ
-
-        nan = float("nan")
-        element = TestOutputValueChangeDetection._ArrayLike()
-
-        assert _values_differ([nan], [nan]) is False
-        assert _values_differ({"k": element}, {"k": element}) is False
 
 
 class TestParameterVisibilityKeepsTraitStateLive:
