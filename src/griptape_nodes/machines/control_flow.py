@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,8 @@ class ControlFlowContext(EngineScoped):
     flow_name: str
     end_node: BaseNode | None = None
     is_isolated: bool
+    # perf_counter() when the current run started, for the run_seconds the run's end events carry.
+    run_started_at: float | None = None
 
     def __init__(
         self,
@@ -86,6 +89,13 @@ class ControlFlowContext(EngineScoped):
         self.resolution_machine.reset_machine(cancel=cancel)
         self.selected_output = None
         self.paused = False
+        self.run_started_at = None
+
+    def run_seconds(self) -> float | None:
+        """Seconds since the current run started, or None when no run is being timed."""
+        if self.run_started_at is None:
+            return None
+        return time.perf_counter() - self.run_started_at
 
 
 # GOOD!
@@ -154,6 +164,7 @@ class CompleteState(State):
                         payload=ControlFlowResolvedEvent(
                             end_node_name=current_node.name,
                             parameter_output_values=NodeManager.result_parameter_values(current_node),
+                            run_seconds=context.run_seconds(),
                         )
                     )
                 )
@@ -199,6 +210,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
     async def start_flow(
         self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
     ) -> None:
+        self._context.run_started_at = time.perf_counter()
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)
         self._context.current_nodes = current_nodes

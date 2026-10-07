@@ -64,12 +64,14 @@ class DagNode:
         data_dependency_only: True when the node was pulled into a graph solely to feed someone
             else's data input, so it must not advance control when it finishes. See
             ``ExecuteDagState._should_skip_control_flow``.
+        run_seconds: How long the node's last execution took, once it has finished.
     """
 
     task_reference: asyncio.Task | None = field(default=None)
     node_state: NodeState = field(default=NodeState.WAITING)
     node_reference: BaseNode
     data_dependency_only: bool = field(default=False)
+    run_seconds: float | None = field(default=None)
 
 
 class DagBuilder(EngineScoped):
