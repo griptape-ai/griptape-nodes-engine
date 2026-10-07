@@ -897,41 +897,16 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("staticfiles/output.txt")
 
-    def test_builtin_workflow_dir_unregistered_workflow_fails(
+    def test_builtin_workflow_dir_unregistered_workflow_answers_save_folder(
         self,
         project_manager_with_template: ProjectManager,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Test that required {workflow_dir} fails when the workflow exists but is not registered (unsaved)."""
-        from griptape_nodes.common.macro_parser import ParsedMacro
+        """A name the registry does not hold is treated as never saved, not as an error.
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
-        project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
-
-        parsed_macro = ParsedMacro("{workflow_dir}/output.txt")
-        request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
-
-        result = project_manager_with_template.on_get_path_for_macro_request(request)
-
-        assert isinstance(result, GetPathForMacroResultFailure)
-        assert result.failure_reason == PathResolutionFailureReason.MACRO_RESOLUTION_ERROR
-        from griptape_nodes.retained_mode.events.base_events import ResultDetails
-
-        assert isinstance(result.result_details, ResultDetails)
-        assert "workflow_5" in str(result.result_details)
-
-    def test_builtin_workflow_dir_optional_skipped_when_workflow_unregistered(
-        self,
-        project_manager_with_template: ProjectManager,
-    ) -> None:
-        """Test that optional {workflow_dir?:/} falls back gracefully when the workflow is not registered (unsaved)."""
+        Scripts and tests push names they never register. Raising here logged a warning for
+        every directory on every resolution.
+        """
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
@@ -950,10 +925,12 @@ class TestProjectManagerBuiltinVariables:
         parsed_macro = ParsedMacro("{workflow_dir?:/}staticfiles/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
-        result = project_manager_with_template.on_get_path_for_macro_request(request)
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = project_manager_with_template.on_get_path_for_macro_request(request)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
-        assert result.resolved_path == Path("staticfiles/output.txt")
+        assert result.resolved_path == resolve_path_safely(Path("/workspace/staticfiles/output.txt"))
+        assert not [r for r in caplog.records if "dropping it from the path" in r.message]
 
     def test_builtin_optional_degradation_is_logged(
         self,

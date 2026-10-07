@@ -5007,7 +5007,8 @@ class ProjectManager(EngineScoped):
            longer exists. The lookup then raises, `{workflow_dir?:/}` swallows it as an
            optional reference, and `{outputs}` silently degrades from the workflow's own folder
            to a workspace-relative path, so saved media resolves somewhere it was never written.
-        2. The registry entry for the context's name.
+        2. The registry entry for the context's name. A name the registry does not hold is
+           treated as never saved and falls through to the rungs below.
         3. The folder the workflow was created in, for a workflow that has never been saved and
            so has no file to answer from. Below the two above because a saved workflow's own
            location always beats the folder it was created in -- the two differ as soon as the
@@ -5019,8 +5020,7 @@ class ProjectManager(EngineScoped):
            not a misprediction by this rung. See `_resolve_default_workflow_save_dir`.
 
         Raises:
-            RuntimeError: If no workflow is in context, or the context's workflow is not
-                registered on this engine.
+            RuntimeError: If no workflow is in context.
         """
         context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
@@ -5033,21 +5033,15 @@ class ProjectManager(EngineScoped):
 
         workflow_name = context_manager.get_current_workflow_name()
         working_directory = context_manager.get_current_workflow_working_directory()
+        # Unregistered with no retained file means never saved: pushing by name and saving both
+        # retain the file path, which rung 1 answers from. Scripts and tests push names they
+        # never register, so treat this like an unsaved entry rather than an error.
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
-        except KeyError as e:
-            if working_directory is not None:
-                return working_directory
-            # NOT the same as unsaved: the file may be on disk and saved, but keyed
-            # under a different workspace. Say so, rather than reporting a state the
-            # user cannot act on.
-            msg = (
-                f"Workflow '{workflow_name}' is not registered on this engine "
-                f"(it may be registered under a different workspace)"
-            )
-            raise RuntimeError(msg) from e
+        except KeyError:
+            workflow = None
 
-        if workflow.file_path is None:
+        if workflow is None or workflow.file_path is None:
             if working_directory is not None:
                 return working_directory
             return self._resolve_default_workflow_save_dir(project_info)
