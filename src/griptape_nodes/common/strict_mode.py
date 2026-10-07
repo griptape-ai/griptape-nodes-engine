@@ -9,7 +9,7 @@ Two kinds of strict-mode scope exist:
 * ``RUNTIME_EXECUTE`` opens around ``NodeManager.on_execute_node_request``
   for a single node's execution.
 * ``LOAD_PROBE`` opens around each class's schema probe in
-  ``LibraryManager._serialize_library_node_schemas``.
+  ``LibraryWorkers.serialize_library_node_schemas``.
 
 Detectors live at their own call sites (e.g. ``EventManager.handle_request``,
 ``BaseNode.add_parameter``) and import the module-level singleton

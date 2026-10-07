@@ -3662,9 +3662,12 @@ class OSManager(EngineScoped):
             logger.error("Directory %s does not exist. Skipping cleanup.", path)
             return 0.0
 
-        for _, _, files in os.walk(path):
+        # os.walk yields file names relative to each iteration's root, so they
+        # must be rejoined against that root rather than the top-level path.
+        for root, _, files in os.walk(path):
+            root_path = Path(root)
             for f in files:
-                fp = path / f
+                fp = root_path / f
                 if not fp.is_symlink():
                     total_size += fp.stat().st_size
         return total_size / (1024 * 1024 * 1024)  # Convert to GB

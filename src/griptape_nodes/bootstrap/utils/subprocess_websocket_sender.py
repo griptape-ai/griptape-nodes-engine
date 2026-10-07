@@ -11,6 +11,12 @@ import json
 import logging
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
+from griptape_nodes.retained_mode.events.base_events import (
+    BaseEvent,
+    EventResultFailure,
+    EventResultSuccess,
+    EventSerializationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,30 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
             logger.debug("QUEUED: %s event via websocket", event_type)
         except asyncio.QueueFull:
             logger.error("WebSocket queue full, event dropped: %s", event_type)
+
+    def _send_event(self, event_type: str, event: BaseEvent) -> EventSerializationError | None:
+        """Send an event, logging and skipping it if it holds a value with no JSON form.
+
+        Returns:
+            The error when the event was skipped, for callers that cannot let it go.
+        """
+        try:
+            payload = event.json()
+        except EventSerializationError as error:
+            logger.error("Could not send %s: %s", event_type, error)
+            return error
+        self.send_event(event_type, payload)
+        return None
+
+    def _send_result(self, event_type: str, event: EventResultSuccess | EventResultFailure) -> None:
+        """Send a result, or a GenericResultFailure naming why it could not be sent, so the requester hears back."""
+        try:
+            payload = event.strict_json()
+        except EventSerializationError as error:
+            logger.error("Could not send %s for %s: %s", event_type, type(event.request).__name__, error)
+            self.send_event("failure_result", event.failure_json(error))
+            return
+        self.send_event(event_type, payload)
 
     async def _stop_websocket_connection(self) -> None:
         """Stop the sender task and close client."""

@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import griptape_nodes.retained_mode.managers.workflow.codegen as codegen_module
+import griptape_nodes.retained_mode.managers.workflow.saving as saving_module
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -150,7 +152,7 @@ _FIXTURE_LIBRARY_SCHEMA: dict[str, Any] = {
 class _FrozenDateTime(datetime_module.datetime):
     """A ``datetime`` subclass whose ``now()`` always answers the same instant.
 
-    ``_generate_workflow_metadata_from_commands`` stamps ``last_modified_date`` with
+    ``WorkflowCodeGenerator.generate_workflow_metadata_from_commands`` stamps ``last_modified_date`` with
     ``datetime.now(tz=UTC)`` internally, with no caller-supplied override. Two saves of an
     otherwise-identical graph would then differ by that timestamp alone, which would make a
     byte-identical-output assertion fail for a reason that has nothing to do with the
@@ -162,6 +164,12 @@ class _FrozenDateTime(datetime_module.datetime):
     @classmethod
     def now(cls, tz: datetime_module.tzinfo | None = None) -> datetime_module.datetime:  # noqa: ARG003
         return cls._FIXED
+
+
+def _freeze_workflow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze `datetime` in every module that stamps a saved or reloaded workflow."""
+    for module in (codegen_module, saving_module):
+        monkeypatch.setattr(module, "datetime", _FrozenDateTime)
 
 
 @pytest.fixture(autouse=True)
@@ -249,7 +257,7 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     destination = ProjectFileDestination(str(tmp_path / f"{file_stem}.py"))
-    save_result = engine.workflow_manager._save_workflow_file_inline(
+    save_result = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=destination,
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -260,14 +268,13 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return save_result.file_path
 
 
 def _read_saved_source(file_path: str) -> str:
-    source = Path(file_path).read_text()
+    source = Path(file_path).read_text(encoding="utf-8")
     ast.parse(source)  # the written file must always be syntactically valid Python
     return source
 
@@ -291,9 +298,7 @@ def _round_trip_single_value(engine: Engine, tmp_path: Path, file_stem: str, val
 
     file_path = _save_flow_to_disk(engine, flow_name, tmp_path, file_stem)
     with pytest.MonkeyPatch.context() as monkeypatch:
-        import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-        monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+        _freeze_workflow_clock(monkeypatch)
         _reload_from_disk(engine, file_path)
 
     return _get_value(engine, node_name, "value")
@@ -368,9 +373,9 @@ class TestSharedValueDeduplication:
         file_path = _save_flow_to_disk(engine, flow_name, tmp_path, "dedup")
         source = _read_saved_source(file_path)
 
-        # The unique-values pool is keyed by the pickled value; the same object must land in
+        # The unique-values pool is keyed by a hash of the value; the same value must land in
         # exactly one pool entry rather than being duplicated once per referencing parameter.
-        assert source.count("pickle.loads(") == 1
+        assert source.count("'shared': ['value', 'payload']") == 1
 
         _reload_from_disk(engine, file_path)
 
@@ -629,36 +634,15 @@ class TestSubFlowRoundTrip:
 
 
 class TestDeterministicSaveOutput:
-    """Whether saving the same live graph twice at the same instant must not churn the diff.
+    """Saving the same live graph twice at the same instant does not churn the diff."""
 
-    Pending the ruling in #5441 on whether saved workflow files must be diff-stable. The
-    mechanism below (a fresh UUID pool key minted on every serialization) is real and
-    deterministic; whether it should be fixed depends on that decision.
-    """
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DECISION: pending #5441 (must saved workflow files be diff-stable?). The disk-save "
-            "path (SaveWorkflowRequest -> SerializeFlowToCommandsRequest -> "
-            "on_serialize_node_to_commands -> handle_parameter_value_saving -> "
-            "_handle_value_hashing, all in node_manager.py) mints a fresh str(uuid4()) pool key "
-            "every time a value is serialized, so two saves of the identical, unedited graph land "
-            "the same pickled bytes under two different unique_values_dict keys. If #5441 rules "
-            "that saves must be diff-stable: saving an unedited graph twice in a row must not move "
-            "the diff, since nothing about the graph changed, and this test should be promoted. If "
-            "not: delete this test, since it asserts a contract nobody has ratified. - see #5441"
-        ),
-    )
     def test_two_saves_of_the_same_graph_are_byte_identical(self, engine: Engine, tmp_path: Path) -> None:
         flow_name, library_name = _fresh_flow(engine, "determinism_workflow", tmp_path)
         node_name = _create_round_trip_node(engine, "Holder", flow_name, library_name)
         _set_value(engine, node_name, "value", {"a": 1, "b": [1, 2, 3]})
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            _freeze_workflow_clock(monkeypatch)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "first_save")
             second_path = _save_flow_to_disk(engine, flow_name, tmp_path, "second_save")
@@ -675,29 +659,12 @@ class TestDeterministicSaveOutput:
 
 
 class TestIdempotentSaveLoadSave:
-    """Whether save, reload, and save again should reproduce the first file exactly.
+    """Save, reload, and save again reproduces the first file exactly.
 
-    Pending the ruling in #5441 on whether saved workflow files must be diff-stable. If it
-    rules yes, this is the strongest single guarantee in the pipeline: reopening and resaving
-    a workflow with no edits should not move anything, and any drift would mean some piece of
-    state is not round-tripping losslessly through the generated code.
+    Any drift would mean some piece of state is not round-tripping losslessly through the
+    generated code.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DECISION: pending #5441 (must saved workflow files be diff-stable?). The "
-            "unique-values pool on the disk-save path is keyed by a fresh str(uuid4()) on every "
-            "serialization (node_manager.py handle_parameter_value_saving -> "
-            "_handle_value_hashing, reached via SerializeFlowToCommandsRequest -> "
-            "on_serialize_node_to_commands), so reloading a saved workflow and resaving it "
-            "without any edits mints new pool keys for the same values and the resave diffs "
-            "against the original. If #5441 rules that saves must be diff-stable: a "
-            "reopen-and-resave with no edits must reproduce the original file exactly, and this "
-            "test should be promoted. If not: delete this test, since it asserts a contract nobody "
-            "has ratified. - see #5441"
-        ),
-    )
     def test_resaving_a_freshly_reloaded_workflow_reproduces_the_first_save(
         self, engine: Engine, tmp_path: Path
     ) -> None:
@@ -707,9 +674,7 @@ class TestIdempotentSaveLoadSave:
         _set_value(engine, node_name, "value2", "some text")
 
         with pytest.MonkeyPatch.context() as monkeypatch:
-            import griptape_nodes.retained_mode.managers.workflow_manager as workflow_manager_module
-
-            monkeypatch.setattr(workflow_manager_module, "datetime", _FrozenDateTime)
+            _freeze_workflow_clock(monkeypatch)
 
             first_path = _save_flow_to_disk(engine, flow_name, tmp_path, "roundtrip")
             first_source = _read_saved_source(first_path)

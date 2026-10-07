@@ -7,14 +7,18 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlparse
 
 from griptape_nodes.utils.file_utils import find_file_in_directory
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -314,13 +318,17 @@ _CHECKOUT_REFLOG_PATTERN = re.compile(r"^checkout: moving from \S+ to (?P<target
 # before a connection is attempted.
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 
+# Submodule URLs come from the library, so they cannot use `file` to read repositories from the
+# user's disk. GIT_ALLOW_PROTOCOL would otherwise override git's default block.
+_GIT_SUBMODULE_ALLOWED_PROTOCOLS = "git:http:https:ssh"
+
 # git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
 # `ext` helper hands its address to a shell. The prefix is anchored and excludes "/", ":" and
 # "[" so a normal URL ("https://host/x") and an IPv6 literal ("https://[::1]/x") don't match.
 _REMOTE_HELPER_URL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
 
 
-def _git_env() -> dict[str, str]:
+def _git_env(allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS) -> dict[str, str]:
     """Build the environment for a git subprocess.
 
     The engine runs headless, so git must never block on an interactive credential
@@ -335,7 +343,7 @@ def _git_env() -> dict[str, str]:
     return {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
+        "GIT_ALLOW_PROTOCOL": allowed_protocols,
     }
 
 
@@ -395,7 +403,9 @@ def _git_os_error(cwd: Path | None, error: OSError) -> GitError:
     return GitError(msg)
 
 
-def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+def _git(
+    args: list[str], cwd: Path | None, allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS
+) -> subprocess.CompletedProcess[str]:
     """Run a git command to completion without inspecting its exit code.
 
     Raises:
@@ -407,7 +417,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(  # noqa: S603
             ["git", *args],  # noqa: S607
             cwd=cwd,
-            env=_git_env(),
+            env=_git_env(allowed_protocols),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             # git writes paths, refs, and messages as UTF-8 regardless of the process locale,
@@ -435,6 +445,7 @@ def _run_git(
     error_msg: str,
     cwd: Path | None = None,
     error_cls: type[GitError] = GitError,
+    allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS,
 ) -> str:
     """Run a git command and return its stripped stdout.
 
@@ -443,6 +454,7 @@ def _run_git(
         error_msg: Prefix for the raised exception's message. git's stderr is appended to it.
         cwd: Directory to run the command in.
         error_cls: Exception type to raise when the command fails.
+        allowed_protocols: Transports git may use, as a GIT_ALLOW_PROTOCOL list.
 
     Returns:
         str: The command's stdout, stripped.
@@ -453,7 +465,7 @@ def _run_git(
         GitRepositoryError: If cwd is not a directory.
         GitError: If git times out or cannot be run for any other reason.
     """
-    result = _git(args, cwd)
+    result = _git(args, cwd, allowed_protocols)
     if result.returncode != 0:
         msg = f"{error_msg}: {result.stderr.strip()}"
         raise error_cls(msg)
@@ -777,13 +789,83 @@ def has_uncommitted_changes(library_path: Path) -> bool:
         msg = f"Cannot check status: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
+    # reset --hard cannot remove untracked submodule files, so treating them as edits would block updates.
     status = _run_git(
-        ["status", "--porcelain"],
+        ["status", "--porcelain", "--ignore-submodules=untracked"],
         error_msg=f"Failed to check git status at {library_path}",
         cwd=library_path,
         error_cls=GitRepositoryError,
     )
     return bool(status)
+
+
+def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[GitError], force: bool = False) -> None:
+    """Check out every submodule at the commit HEAD records, cloning any that are missing.
+
+    reset and checkout move submodule pointers without touching the submodule trees, which then
+    read as uncommitted changes on the next update. A no-op for repositories without submodules.
+    """
+    args = ["submodule", "update", "--init", "--recursive"]
+    if force:
+        args.append("--force")
+    _run_git(
+        args,
+        error_msg=error_msg,
+        cwd=library_path,
+        error_cls=error_cls,
+        allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+    )
+
+
+def _realign_submodules(library_path: Path) -> None:
+    """Realign submodules that are behind the commits recorded by HEAD, so they don't read as edits.
+
+    Only submodules whose current commit is an ancestor of the recorded commit are moved. A
+    divergent or ahead checkout may contain user work and remains for the status check to report.
+    """
+    root = get_git_repository_root(library_path)
+    if root is None:
+        return
+
+    stale_paths = [path for path in _moved_submodule_paths(root) if _submodule_is_behind(root, path)]
+    if not stale_paths:
+        return
+
+    try:
+        _run_git(
+            ["--literal-pathspecs", "submodule", "update", "--recursive", "--", *stale_paths],
+            error_msg="Could not realign submodules",
+            cwd=root,
+            allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+        )
+    except GitError as e:
+        logger.debug("Leaving submodules at %s as they are: %s", root, e)
+
+
+def _moved_submodule_paths(root: Path) -> list[str]:
+    """Return paths, relative to root, of submodules not at the commit HEAD records."""
+    status = _try_git(["submodule", "status"], root)
+    if not status:
+        return []
+
+    paths = []
+    for line in status.splitlines():
+        # `git submodule status` prefixes moved submodules with "+" and may append "(<describe>)".
+        if not line.startswith("+"):
+            continue
+        _sha, _, rest = line[1:].partition(" ")
+        if rest.endswith(")") and " (" in rest:
+            rest = rest.rsplit(" (", 1)[0]
+        paths.append(rest)
+    return paths
+
+
+def _submodule_is_behind(root: Path, path: str) -> bool:
+    """Return whether the checkout is an ancestor of the submodule commit recorded by HEAD."""
+    recorded = _try_git(["rev-parse", f"HEAD:{path}"], root)
+    if recorded is None:
+        return False
+    return _try_git(["merge-base", "--is-ancestor", "HEAD", recorded], root / path) is not None
 
 
 def _resolve_update_upstream(library_path: Path) -> str:
@@ -838,6 +920,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     """
     upstream = _resolve_update_upstream(library_path)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -848,6 +931,12 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     error_msg = f"Git error during update at {library_path}"
     _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} but could not fetch or check out its submodules",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream)
 
@@ -880,6 +969,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         msg = f"No origin remote found for repository at {library_path}"
         raise GitPullError(msg)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -903,6 +993,12 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _remember_tracked_tag(library_path, tag_name, GitPullError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch or check out its submodules",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -974,6 +1070,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
 
     if _ref_exists(library_path, f"refs/heads/{branch_name}"):
         _run_git(["checkout", branch_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
+        _update_submodules(
+            library_path,
+            error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
+            error_cls=GitRefError,
+        )
         logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
         return
 
@@ -986,6 +1087,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
         ["checkout", "-b", branch_name, "--track", remote_branch_name],
         error_msg=error_msg,
         cwd=library_path,
+        error_cls=GitRefError,
+    )
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
         error_cls=GitRefError,
     )
     logger.debug(
@@ -1042,6 +1148,11 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
         msg = f"Ref {ref_name} not found at {library_path}"
         raise GitRefError(msg)
 
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {ref_name} but could not fetch or check out its submodules",
+        error_cls=GitRefError,
+    )
     logger.debug("Checked out %s at %s", ref_name, library_path)
 
 
@@ -1084,6 +1195,18 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         error_cls=GitCloneError,
     )
 
+    # A partial clone left in place would block a retry with "already exists".
+    try:
+        _finish_clone(git_url, target_path, branch_tag_commit)
+    except GitError:
+        try:
+            shutil.rmtree(target_path, onexc=_clear_readonly_and_retry)
+        except OSError as cleanup_error:
+            logger.warning("Could not remove the partial clone at %s: %s", target_path, cleanup_error)
+        raise
+
+
+def _finish_clone(git_url: str, target_path: Path, branch_tag_commit: str | None) -> None:
     if branch_tag_commit:
         # A single checkout covers all three: a remote branch name becomes a local
         # tracking branch, a tag or commit lands on a detached HEAD.
@@ -1096,6 +1219,20 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         if _current_branch(target_path) is None and _ref_exists(target_path, f"refs/tags/{branch_tag_commit}"):
             _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
+
+    # After the checkout, so submodules land on the commits the requested ref records.
+    _update_submodules(
+        target_path,
+        error_msg=f"Failed to fetch submodules of {git_url} in {target_path}",
+        error_cls=GitCloneError,
+    )
+
+
+def _clear_readonly_and_retry(func: Callable[[str], object], target: str, _exc: BaseException) -> None:
+    """Let rmtree delete git's read-only object files, which Windows refuses to unlink."""
+    target_path = Path(target)
+    target_path.chmod(target_path.stat().st_mode | stat.S_IWRITE)
+    func(target)
 
 
 def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:

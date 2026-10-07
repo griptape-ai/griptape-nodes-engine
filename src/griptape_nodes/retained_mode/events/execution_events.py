@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Required, TypedDict
+from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
@@ -11,8 +11,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue, Value
 
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
@@ -77,7 +78,7 @@ class StartFlowRequest(RequestPayload):
     flow_name: str | None = None
     flow_node_name: str | None = None
     debug_mode: bool = False
-    # If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess.
+    # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
 
 
@@ -112,9 +113,7 @@ class StartLocalSubflowRequest(RequestPayload):
     Args:
         flow_name: Name of the flow to start as a subflow
         start_node: The node to start execution from (None to auto-detect start node)
-        pickle_control_flow_result: Ignored. Pickling happens while broadcasting
-            ControlFlowResolvedEvent, and a local subflow always runs isolated, which does not
-            broadcast that event -- so there is no result to pickle for this request.
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartLocalSubflowResultSuccess | StartLocalSubflowResultFailure
     """
@@ -148,7 +147,7 @@ class StartFlowFromNodeRequest(RequestPayload):
         flow_name: Name of the flow to start (deprecated)
         node_name: Name of the node to start execution from
         debug_mode: Whether to run in debug mode (default: False)
-        pickle_control_flow_result: If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: StartFlowFromNodeResultSuccess | StartFlowFromNodeResultFailure (with validation exceptions)
     """
@@ -388,11 +387,7 @@ class ParameterSpotlightEvent(ExecutionPayload):
 @PayloadRegistry.register
 class ControlFlowResolvedEvent(ExecutionPayload):
     end_node_name: str
-    parameter_output_values: dict
-    # Optional field for pickled parameter values - when present, parameter_output_values contains UUID references
-    unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, bytes] | None = field(
-        default=None
-    )
+    parameter_output_values: dict[str, Value]
 
 
 @dataclass
@@ -406,7 +401,7 @@ class ControlFlowCancelledEvent(ExecutionPayload):
 @PayloadRegistry.register
 class NodeResolvedEvent(ExecutionPayload):
     node_name: str
-    parameter_output_values: dict
+    parameter_output_values: dict[str, DisplayValue]
     node_type: str
     specific_library_name: str | None = None
 
@@ -417,7 +412,7 @@ class ParameterValueUpdateEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -441,8 +436,18 @@ class NodeFinishProcessEvent(ExecutionPayload):
 @dataclass
 @PayloadRegistry.register
 class NodeErrorEvent(ExecutionPayload):
+    """A node failed during a flow run.
+
+    Args:
+        node_name: The node that failed.
+        error_message: The failure as one flattened string, for logs and older editors.
+        error: The same failure in parts, without engine preambles or the node name prefix.
+            Optional so events from older engines still parse.
+    """
+
     node_name: str
     error_message: str
+    error: NodeErrorDetails | None = None
 
 
 @dataclass
@@ -463,7 +468,7 @@ class GriptapeEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     type: str
-    value: Any
+    value: DisplayValue
 
 
 class NodeMetadata(TypedDict, total=False):
@@ -525,7 +530,10 @@ class ExecuteNodeRequest(RequestPayload):
     """
 
     node_name: str
-    parameter_values: dict[str, Any] = field(default_factory=dict)
+    parameter_values: dict[str, Value] = field(default_factory=dict)
+    # Plumbing between the flow and wherever the node runs, so no client needs the result. Values
+    # cross strictly here, so broadcasting one the node holds in memory would fail to send.
+    broadcast_result: bool = field(default=False, kw_only=True)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
@@ -543,7 +551,7 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
         parameter_output_values: Output parameter values from the node.
     """
 
-    parameter_output_values: dict[str, Any] = field(default_factory=dict)
+    parameter_output_values: dict[str, Value] = field(default_factory=dict)
 
 
 @dataclass
@@ -556,9 +564,13 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
             `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
             without reading the message, because they mean different things to whoever is looking:
             nothing ran, versus something ran and broke.
+        error: The failure in parts for `NodeErrorEvent.error`, built from the node's own exception
+            where the node failed, so it is complete even when the node ran in a worker. None when
+            the engine wrote `result_details` itself, such as for a worker that stopped responding.
     """
 
     validation_exceptions: list[Exception] | None = None
+    error: NodeErrorDetails | None = None
 
 
 @dataclass

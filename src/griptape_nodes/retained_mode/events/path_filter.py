@@ -1,7 +1,7 @@
 """Dot-path field projection for WebSocket result payloads.
 
 Used by EventResult.dict() to prune the unstructured result dict before broadcast.
-Frontend callers set RequestPayload.fields to shrink the wire payload; safe_unstructure
+Frontend callers set RequestPayload.fields to shrink the wire payload; the converter
 still materializes the full result in memory — only transmission is reduced.
 
 Path mini-language

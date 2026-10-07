@@ -16,8 +16,10 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.utils import git_utils
 from griptape_nodes.utils.git_utils import (
     _GIT_ALLOWED_PROTOCOLS,
+    _GIT_SUBMODULE_ALLOWED_PROTOCOLS,
     _GIT_TIMEOUT_SECONDS,
     GitCloneError,
     GitError,
@@ -71,9 +73,18 @@ def remove_repo(path: Path) -> None:
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command with a throwaway identity so commits succeed without machine git config."""
+    """Run git with fixture-only identity and local-file transport settings."""
     return subprocess.run(  # noqa: S603
-        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", *args],  # noqa: S607
+        [  # noqa: S607
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "protocol.file.allow=always",
+            *args,
+        ],
         cwd=cwd,
         check=True,
         capture_output=True,
@@ -818,7 +829,10 @@ class TestGitEnvironment:
 
         assert mock_run.call_args_list
         for call in mock_run.call_args_list:
-            assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
+            if call.args[0][1] == "submodule":
+                assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_SUBMODULE_ALLOWED_PROTOCOLS
+            else:
+                assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
             assert call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
@@ -1494,6 +1508,227 @@ class TestCloneRepository:
 
         with pytest.raises(GitCloneError, match="Git error while cloning"):
             clone_repository(str(temp_dir / "does-not-exist"), target)
+
+
+class TestSubmodules:
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def allow_file_submodules(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The fixtures vendor local repositories, which production refuses for submodules."""
+        monkeypatch.setattr(git_utils, "_GIT_SUBMODULE_ALLOWED_PROTOCOLS", _GIT_ALLOWED_PROTOCOLS)
+
+    @staticmethod
+    def commit_file(repo: Path, name: str, content: str) -> str:
+        (repo / name).write_text(content, encoding="utf-8")
+        run_git(repo, "add", ".")
+        run_git(repo, "commit", "-m", f"write {name}")
+        return head_sha(repo)
+
+    def make_origin_with_submodule(self, temp_dir: Path) -> Path:
+        upstream = temp_dir / "upstream"
+        upstream.mkdir()
+        run_git(upstream, "init", "-b", "main")
+        self.commit_file(upstream, "code.py", "v1")
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "submodule", "add", str(upstream), "vendor/upstream")
+        run_git(origin, "commit", "-m", "add submodule")
+        return origin
+
+    def bump_submodule(self, origin: Path, upstream: Path) -> str:
+        sha = self.commit_file(upstream, "code.py", "v2")
+        submodule = origin / "vendor" / "upstream"
+        run_git(submodule, "fetch", "origin")
+        run_git(submodule, "checkout", sha)
+        run_git(origin, "add", "vendor/upstream")
+        run_git(origin, "commit", "-m", "bump submodule")
+        return sha
+
+    def test_clone_repository_populates_submodules(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        target = temp_dir / "clone"
+
+        clone_repository(str(origin), target)
+
+        assert head_sha(target / "vendor" / "upstream") == head_sha(upstream)
+        assert has_uncommitted_changes(target) is False
+
+    def test_clone_repository_checks_out_submodules_at_the_requested_ref(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "tag", "v1")
+        self.bump_submodule(origin, upstream)
+        target = temp_dir / "clone"
+
+        clone_repository(str(origin), target, "v1")
+
+        assert head_sha(target / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(target) is False
+
+    def test_git_update_from_remote_moves_submodules_to_the_new_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+
+        git_update_from_remote(clone)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_to_moving_tag_moves_submodules_to_the_new_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        run_git(origin, "tag", "latest")
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone, "latest")
+        new_sha = self.bump_submodule(origin, upstream)
+        run_git(origin, "tag", "-f", "latest")
+
+        update_to_moving_tag(clone, "latest")
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_with_overwrite_discards_changes_inside_submodules(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+        (clone / "vendor" / "upstream" / "code.py").write_text("dirty", encoding="utf-8")
+
+        update_library_git(clone, overwrite_existing=True)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_realigns_a_submodule_left_behind_without_overwrite(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        new_sha = self.bump_submodule(origin, upstream)
+        run_git(clone, "fetch", "origin")
+        run_git(clone, "reset", "--hard", "origin/main")
+
+        update_library_git(clone)
+
+        assert head_sha(clone / "vendor" / "upstream") == new_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_after_a_failed_submodule_fetch_succeeds_without_overwrite(self, temp_dir: Path) -> None:
+        """A submodule added upstream is fetched only after HEAD moves, so it can fail mid-update."""
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        extra = temp_dir / "extra"
+        extra.mkdir()
+        run_git(extra, "init", "-b", "main")
+        extra_sha = self.commit_file(extra, "extra.py", "v1")
+        run_git(origin, "submodule", "add", str(extra), "vendor/extra")
+        run_git(origin, "commit", "-m", "add second submodule")
+        extra.rename(temp_dir / "unreachable")
+
+        with pytest.raises(GitPullError, match="could not fetch or check out its submodules"):
+            update_library_git(clone)
+
+        (temp_dir / "unreachable").rename(extra)
+        update_library_git(clone)
+
+        assert head_sha(clone / "vendor" / "extra") == extra_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_update_still_refuses_edits_inside_a_submodule(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        (clone / "vendor" / "upstream" / "code.py").write_text("edited", encoding="utf-8")
+
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            update_library_git(clone)
+
+    def test_update_leaves_a_submodule_on_a_local_commit_for_the_user_to_confirm(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        local_sha = self.commit_file(clone / "vendor" / "upstream", "code.py", "local work")
+
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            update_library_git(clone)
+
+        assert head_sha(clone / "vendor" / "upstream") == local_sha
+
+    def test_untracked_files_inside_a_submodule_are_not_uncommitted_changes(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+        (clone / "vendor" / "upstream" / "build_output.txt").write_text("x", encoding="utf-8")
+
+        assert has_uncommitted_changes(clone) is False
+
+    def test_clone_repository_removes_the_clone_when_submodules_fail(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        (temp_dir / "upstream").rename(temp_dir / "unreachable")
+        target = temp_dir / "clone"
+
+        with pytest.raises(GitCloneError, match="Failed to fetch submodules"):
+            clone_repository(str(origin), target)
+
+        assert not target.exists()
+
+    def test_switch_branch_or_tag_moves_submodules_to_the_ref_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "tag", "v1")
+        self.bump_submodule(origin, upstream)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+
+        switch_branch_or_tag(clone, "v1")
+
+        assert head_sha(clone / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(clone) is False
+
+    def test_switch_branch_moves_submodules_to_the_branch_pointer(self, temp_dir: Path) -> None:
+        origin = self.make_origin_with_submodule(temp_dir)
+        upstream = temp_dir / "upstream"
+        old_sha = head_sha(upstream)
+        run_git(origin, "branch", "stable")
+        self.bump_submodule(origin, upstream)
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone)
+
+        switch_branch(clone, "stable")
+
+        assert head_sha(clone / "vendor" / "upstream") == old_sha
+        assert has_uncommitted_changes(clone) is False
+
+
+class TestSubmoduleProtocols:
+    def test_clone_repository_refuses_a_submodule_on_the_local_disk(self, tmp_path: Path) -> None:
+        local = tmp_path / "local"
+        local.mkdir()
+        run_git(local, "init", "-b", "main")
+        (local / "secret.txt").write_text("secret", encoding="utf-8")
+        run_git(local, "add", ".")
+        run_git(local, "commit", "-m", "secret")
+        origin = make_origin_repo(tmp_path / "origin")
+        run_git(origin, "submodule", "add", str(local), "vendor/local")
+        run_git(origin, "commit", "-m", "add submodule")
+        target = tmp_path / "clone"
+
+        with pytest.raises(GitCloneError, match="Failed to fetch submodules"):
+            clone_repository(str(origin), target)
+
+        assert not (target / "vendor" / "local" / "secret.txt").exists()
 
 
 class TestSparseCheckoutLibraryJson:

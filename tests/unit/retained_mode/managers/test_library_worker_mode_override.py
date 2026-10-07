@@ -50,46 +50,46 @@ class TestResolveRequiresWorker:
     def test_no_declarations_returns_false(self) -> None:
         mgr = _make_library_manager()
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([])):
-            assert mgr._resolve_requires_worker("/p.json", []) is False
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([])):
+            assert mgr.workers.resolve_requires_worker("/p.json", []) is False
 
     def test_incompatible_ignores_override(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.INCOMPATIBLE)
         entry = LibraryRegistration(path="/p.json", worker_mode_override=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is False
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is False
 
     def test_compatible_with_suggested_orchestrator_no_override(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.ORCHESTRATOR)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/p.json")])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is False
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/p.json")])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is False
 
     def test_compatible_with_suggested_worker_no_override(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/p.json")])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/p.json")])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_compatible_with_override_to_worker(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.ORCHESTRATOR)
         entry = LibraryRegistration(path="/p.json", worker_mode_override=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_compatible_with_override_to_orchestrator(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.WORKER)
         entry = LibraryRegistration(path="/p.json", worker_mode_override=WorkerMode.ORCHESTRATOR)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is False
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is False
 
     def test_dict_entry_with_override(self) -> None:
         # libraries_to_register may surface as raw dicts before validation.
@@ -97,16 +97,16 @@ class TestResolveRequiresWorker:
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.ORCHESTRATOR)
         entry = {"path": "/p.json", "worker_mode_override": "WORKER"}
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_bare_string_entry_no_override(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register(["/p.json"])):
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register(["/p.json"])):
             # Bare-string entry has no override; falls back to the manifest's suggested mode.
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_invalid_override_falls_back_to_manifest(self) -> None:
         mgr = _make_library_manager()
@@ -114,8 +114,8 @@ class TestResolveRequiresWorker:
         # Hand-edited config with garbage value.
         entry = {"path": "/p.json", "worker_mode_override": "BOGUS"}
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_path_match_is_case_insensitive(self) -> None:
         # Existing libraries_to_register comparison helpers use .lower(); mirror that.
@@ -123,15 +123,17 @@ class TestResolveRequiresWorker:
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.ORCHESTRATOR)
         entry = LibraryRegistration(path="/Some/Path.json", worker_mode_override=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
-            assert mgr._resolve_requires_worker("/some/path.json", decls) is True
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
+            assert mgr.workers.resolve_requires_worker("/some/path.json", decls) is True
 
     def test_no_matching_entry_falls_back_to_manifest(self) -> None:
         mgr = _make_library_manager()
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/other.json")])):
-            assert mgr._resolve_requires_worker("/p.json", decls) is True
+        with patch.object(
+            mgr.workers, "_engine", _patch_libraries_to_register([LibraryRegistration(path="/other.json")])
+        ):
+            assert mgr.workers.resolve_requires_worker("/p.json", decls) is True
 
     def test_resolver_matches_by_registered_path_not_resolved_path(self) -> None:
         # Regression: when the user types a workspace-relative or `~`-prefixed path in
@@ -143,9 +145,9 @@ class TestResolveRequiresWorker:
         decls = _decls(compatibility=WorkerCompatibility.COMPATIBLE, suggested=WorkerMode.ORCHESTRATOR)
         entry = LibraryRegistration(path="~/dev/lib.json", worker_mode_override=WorkerMode.WORKER)
 
-        with patch.object(mgr, "_engine", _patch_libraries_to_register([entry])):
+        with patch.object(mgr.workers, "_engine", _patch_libraries_to_register([entry])):
             # Caller passes the user's `registered_path` (matches the entry verbatim), not
             # the resolved absolute path the engine would otherwise produce.
-            assert mgr._resolve_requires_worker("~/dev/lib.json", decls) is True
+            assert mgr.workers.resolve_requires_worker("~/dev/lib.json", decls) is True
             # Sanity: the resolved absolute path no longer matches anything in the config.
-            assert mgr._resolve_requires_worker("/Users/me/dev/lib.json", decls) is False
+            assert mgr.workers.resolve_requires_worker("/Users/me/dev/lib.json", decls) is False

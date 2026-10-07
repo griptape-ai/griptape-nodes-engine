@@ -26,9 +26,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultFailure,
     UpdateLibraryResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.library_manager import (
+from griptape_nodes.retained_mode.managers.library.git_operations import (
     LibraryGitOperationContext,
-    LibraryManager,
     MinimumReleaseAgeConfig,
 )
 from griptape_nodes.retained_mode.managers.settings import (
@@ -39,8 +38,9 @@ from griptape_nodes.utils.library_utils import LibraryVersionInfo
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
-LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
+LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library.git_operations"
 MIN_AGE_HOURS = 24.0
 
 
@@ -65,7 +65,7 @@ class TestEvaluateUpdateAgeGate:
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
-            decision = library_manager._evaluate_update_age_gate(young_commit)
+            decision = library_manager.git_operations._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is False
         assert decision.gated is False
@@ -75,7 +75,7 @@ class TestEvaluateUpdateAgeGate:
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
-            decision = library_manager._evaluate_update_age_gate(young_commit)
+            decision = library_manager.git_operations._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is True
         assert decision.gated is True
@@ -88,7 +88,7 @@ class TestEvaluateUpdateAgeGate:
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
-            decision = library_manager._evaluate_update_age_gate(old_commit)
+            decision = library_manager.git_operations._evaluate_update_age_gate(old_commit)
 
         assert decision.enabled is True
         assert decision.gated is False
@@ -100,7 +100,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = engine.library_manager
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
-            decision = library_manager._evaluate_update_age_gate(None)
+            decision = library_manager.git_operations._evaluate_update_age_gate(None)
 
         assert decision.enabled is True
         assert decision.gated is False
@@ -111,7 +111,7 @@ class TestEvaluateUpdateAgeGate:
         naive_young_commit = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(hours=1)
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
-            decision = library_manager._evaluate_update_age_gate(naive_young_commit)
+            decision = library_manager.git_operations._evaluate_update_age_gate(naive_young_commit)
 
         assert decision.gated is True
 
@@ -124,7 +124,7 @@ class TestEvaluateUpdateAgeGate:
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             caplog.at_level("WARNING"),
         ):
-            decision = library_manager._evaluate_update_age_gate(None)
+            decision = library_manager.git_operations._evaluate_update_age_gate(None)
 
         assert decision.gated is False
         assert any("could not be determined" in message for message in caplog.messages)
@@ -136,7 +136,7 @@ class TestEvaluateUpdateAgeGate:
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             caplog.at_level("WARNING"),
         ):
-            decision = library_manager._evaluate_update_age_gate(None)
+            decision = library_manager.git_operations._evaluate_update_age_gate(None)
 
         assert decision.enabled is False
         assert not any("could not be determined" in message for message in caplog.messages)
@@ -148,7 +148,7 @@ class TestEvaluateUpdateAgeGate:
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
         with patch.object(engine, "_config_manager", config_mgr):
-            decision = library_manager._evaluate_update_age_gate(
+            decision = library_manager.git_operations._evaluate_update_age_gate(
                 old_commit, config=MinimumReleaseAgeConfig(hours=MIN_AGE_HOURS)
             )
 
@@ -164,7 +164,7 @@ class TestReadMinimumReleaseAgeConfig:
         library_manager = engine.library_manager
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=12.0)):
-            config = library_manager._read_minimum_release_age_config()
+            config = library_manager.git_operations._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=12.0)
         assert config.enabled is True
@@ -173,7 +173,7 @@ class TestReadMinimumReleaseAgeConfig:
         library_manager = engine.library_manager
 
         with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
-            config = library_manager._read_minimum_release_age_config()
+            config = library_manager.git_operations._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
         assert config.enabled is False
@@ -189,7 +189,7 @@ class TestReadMinimumReleaseAgeConfig:
         null_config_mgr.get_config_value.return_value = None
 
         with patch.object(engine, "_config_manager", null_config_mgr):
-            config = library_manager._read_minimum_release_age_config()
+            config = library_manager.git_operations._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
         assert config.enabled is False
@@ -215,20 +215,20 @@ class TestUpdateLibraryRequestAgeGate:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_get_remote_target_commit_datetime",
                 new=AsyncMock(return_value=young_commit),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git") as mock_update_git,
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 
@@ -245,26 +245,26 @@ class TestUpdateLibraryRequestAgeGate:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_get_remote_target_commit_datetime",
                 new=AsyncMock(return_value=old_commit),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git") as mock_update_git,
             patch(f"{LIBRARY_MANAGER_MODULE}.is_on_tag", return_value=False),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_reload_library_after_git_operation",
                 new=AsyncMock(return_value="2.0.0"),
             ),
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 
@@ -280,26 +280,26 @@ class TestUpdateLibraryRequestAgeGate:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_get_remote_target_commit_datetime",
                 new=AsyncMock(return_value=None),
             ) as mock_remote_age,
             patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git"),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_on_tag", return_value=False),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_reload_library_after_git_operation",
                 new=AsyncMock(return_value="2.0.0"),
             ),
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 
@@ -314,26 +314,26 @@ class TestUpdateLibraryRequestAgeGate:
 
         with (
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_validate_and_prepare_library_for_git_operation",
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_get_remote_target_commit_datetime",
                 new=AsyncMock(return_value=None),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git") as mock_update_git,
             patch(f"{LIBRARY_MANAGER_MODULE}.is_on_tag", return_value=False),
             patch.object(
-                library_manager,
+                library_manager.git_operations,
                 "_reload_library_after_git_operation",
                 new=AsyncMock(return_value="2.0.0"),
             ),
         ):
-            result = await library_manager.update_library_request(
+            result = await library_manager.git_operations.update_library_request(
                 UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
             )
 
@@ -353,7 +353,7 @@ class TestGetRemoteTargetCommitDatetime:
             patch(f"{LIBRARY_MANAGER_MODULE}.get_git_remote", return_value=None),
             patch(f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version") as mock_clone,
         ):
-            result = await library_manager._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
+            result = await library_manager.git_operations._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
 
         assert result is None
         mock_clone.assert_not_called()
@@ -371,7 +371,7 @@ class TestGetRemoteTargetCommitDatetime:
                 side_effect=GitError("boom"),
             ),
         ):
-            result = await library_manager._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
+            result = await library_manager.git_operations._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
 
         assert result is None
 
@@ -419,14 +419,16 @@ class TestCheckLibraryUpdateRequestAgeGate:
             patch(f"{LIBRARY_MANAGER_MODULE}.get_local_commit_sha", return_value=local_commit),
             patch(f"{LIBRARY_MANAGER_MODULE}.remote_ref_exists", return_value=True),
             patch(f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version", return_value=version_info),
-            patch.object(library_manager, "_check_engine_version_compatibility", return_value=(True, "1.0.0")),
+            patch.object(
+                library_manager.git_operations, "_check_engine_version_compatibility", return_value=(True, "1.0.0")
+            ),
             patch.object(
                 engine,
                 "_config_manager",
                 _config_manager(minimum_release_age_hours=minimum_release_age_hours),
             ),
         ):
-            result = await library_manager.check_library_update_request(
+            result = await library_manager.git_operations.check_library_update_request(
                 CheckLibraryUpdateRequest(library_name="test_lib")
             )
 
@@ -542,7 +544,7 @@ class TestSyncLibrariesRequestAgeGate:
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
-            result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
+            result = await library_manager.sync.sync_libraries_request(SyncLibrariesRequest())
 
         assert isinstance(result, SyncLibrariesResultSuccess)
         assert result.libraries_checked == len(check_results)
@@ -587,7 +589,7 @@ class TestSyncLibrariesRequestAgeGate:
             patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
-            result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
+            result = await library_manager.sync.sync_libraries_request(SyncLibrariesRequest())
 
         assert isinstance(result, SyncLibrariesResultSuccess)
         assert result.libraries_updated == 0

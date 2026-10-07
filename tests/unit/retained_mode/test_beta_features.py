@@ -401,7 +401,7 @@ class TestLibraryBetaFeatures:
         _register_library(entries_by_flag[other_features], name="My Library")
         _register_library(entries_by_flag[new_features], name="my-library")
 
-        problems = engine.library_manager._check_beta_feature_settings_collision(
+        problems = engine.library_manager.registration._check_beta_feature_settings_collision(
             "my-library", LibraryRegistry.get_library("my-library")
         )
 

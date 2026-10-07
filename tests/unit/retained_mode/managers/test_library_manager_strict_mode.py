@@ -1,4 +1,4 @@
-"""Probe-level tests for strict-mode routing in _serialize_library_node_schemas.
+"""Probe-level tests for strict-mode routing in serialize_library_node_schemas.
 
 Uses a fixture probe detector that calls ``STRICT_MODE.report`` from inside a
 node class's ``__init__``. The scope wrapper on the probe loop is then
@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.app_events import WorkerNodeSchema
+from griptape_nodes.serialization.converter import converter
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
@@ -50,7 +53,7 @@ def patched_registry() -> Callable[[dict[str, type]], AbstractContextManager[Non
                 return nodes[node_type](name)
 
         with patch.multiple(
-            "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry",
+            "griptape_nodes.retained_mode.managers.library.workers.LibraryRegistry",
             get_library=MagicMock(return_value=lib),
             create_node=MagicMock(side_effect=_create_node),
         ):
@@ -94,7 +97,7 @@ class TestSerializeSchemasStrictMode:
     async def test_clean_class_is_included(self, patched_registry: Callable[[dict[str, type]], Any]) -> None:
         manager = current_engine().library_manager
         with patched_registry({"Clean": _CleanProbe}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["Clean"]
 
@@ -105,7 +108,7 @@ class TestSerializeSchemasStrictMode:
         caplog.set_level(logging.DEBUG, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"Violator": _ViolatingProbe, "Clean": _CleanProbe}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         # Violating class dropped from output even though it only warns on the
         # orchestrator: the drop is gated on drops_class_from_schema, not severity.
@@ -147,11 +150,43 @@ class TestHuggingFaceRepoParameterSurvivesTheProbe:
             patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=_refuse_bus),
             patched_registry({"HFNode": _ProbeWithHuggingFaceRepoParam}),
         ):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         # Before the construction-time deferral, the component's bus requests fired
         # reentrant-bus-in-init here and the class was dropped from the schemas.
         assert [s.class_name for s in schemas] == ["HFNode"]
+
+
+class _NoPlainDataForm:
+    """A default value the value codec cannot encode."""
+
+
+class _ProbeWithDefaults:
+    """Node class whose probe parameters default to an artifact and to a value with no plain-data form."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.parameters = [
+            Parameter(name="image", default_value=ImageUrlArtifact("https://example.com/cat.png")),
+            Parameter(name="handle", default_value=_NoPlainDataForm()),
+        ]
+
+
+class TestSchemaDefaultValues:
+    @pytest.mark.asyncio
+    async def test_defaults_cross_with_their_type_or_as_none(
+        self, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        manager = current_engine().library_manager
+        with patched_registry({"Defaults": _ProbeWithDefaults}):
+            (schema,) = await manager.workers.serialize_library_node_schemas("libA")
+
+        received = converter.structure(converter.unstructure(schema), WorkerNodeSchema)
+
+        image, handle = received.parameters
+        assert isinstance(image.default_value, ImageUrlArtifact)
+        assert image.default_value.value == "https://example.com/cat.png"
+        assert handle.default_value is None
 
 
 class _DummyTrait(Trait):
@@ -206,7 +241,7 @@ class TestParameterBehaviorsDropped:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"Clean": _ProbeWithCleanParams}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["Clean"]
         assert not any("p_clean" in r.getMessage() for r in caplog.records)
@@ -218,7 +253,7 @@ class TestParameterBehaviorsDropped:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"WithBehavior": _ProbeWithConverterParam}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         # Warning, not error: the class still yields a schema.
         assert [s.class_name for s in schemas] == ["WithBehavior"]
@@ -235,7 +270,7 @@ class TestParameterBehaviorsDropped:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"WithValidator": _ProbeWithValidatorParam}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["WithValidator"]
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -249,7 +284,7 @@ class TestParameterBehaviorsDropped:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"WithTrait": _ProbeWithTraitParam}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["WithTrait"]
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -312,7 +347,7 @@ class TestInertWorkerHooks:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"WithConnHook": _ProbeWithConnectionHook}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         # Warning, not error: the class still yields a schema.
         assert [s.class_name for s in schemas] == ["WithConnHook"]
@@ -329,7 +364,7 @@ class TestInertWorkerHooks:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"WithValueHook": _ProbeWithValueHook}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["WithValueHook"]
 
@@ -348,7 +383,7 @@ class TestInertWorkerHooks:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"EngineHook": _ProbeInheritingEngineHook}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["EngineHook"]
         assert not any("after_value_set" in r.getMessage() for r in caplog.records)
@@ -360,7 +395,7 @@ class TestInertWorkerHooks:
         caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
         manager = current_engine().library_manager
         with patched_registry({"Clean": _CleanProbe}):
-            schemas = await manager._serialize_library_node_schemas("libA")
+            schemas = await manager.workers.serialize_library_node_schemas("libA")
 
         assert [s.class_name for s in schemas] == ["Clean"]
         assert not any("hook" in r.getMessage().lower() for r in caplog.records)
