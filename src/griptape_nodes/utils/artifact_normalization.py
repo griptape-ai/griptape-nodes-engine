@@ -10,8 +10,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from griptape_nodes.files.path_utils import parse_static_server_url
+from griptape_nodes.files.path_utils import parse_static_server_url, resolve_path_safely
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMapAbsolutePathToProjectRequest,
+    AttemptMapAbsolutePathToProjectResultSuccess,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +107,8 @@ def _wrap_file(file_path: Path, artifact_type: type[Any]) -> Any | None:
         artifact_type: The artifact class to create (ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact)
 
     Returns:
-        Artifact object holding the file's path, or None if no file is there
+        Artifact object holding the file's path, as a macro path when it is in the workspace,
+        or None if no file is there
     """
     # A value that is not a path at all, such as a data URI, can be too long for the OS to
     # look up. That is still an answer to "is this a file?", so treat it as "no".
@@ -116,7 +121,25 @@ def _wrap_file(file_path: Path, artifact_type: type[Any]) -> Any | None:
     if not is_file:
         return None
 
-    return artifact_type(str(file_path))
+    return artifact_type(_to_stored_path(file_path))
+
+
+def _to_stored_path(file_path: Path) -> str:
+    """Return the path to store for a file: a macro path inside the workspace, else absolute.
+
+    A macro path keeps the workflow working when the workspace moves or opens on another machine.
+    """
+    engine = current_engine()
+    workspace_path = resolve_path_safely(engine.config_manager.workspace_path)
+    resolved_path = resolve_path_safely(file_path)
+    if not resolved_path.is_relative_to(workspace_path):
+        return str(file_path)
+
+    result = engine.handle_request(AttemptMapAbsolutePathToProjectRequest(absolute_path=resolved_path))
+    if isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess) and result.mapped_path is not None:
+        return result.mapped_path
+
+    return f"{{workspace_dir}}/{resolved_path.relative_to(workspace_path).as_posix()}"
 
 
 def _normalize_string_input(artifact_input: str, artifact_type: type[Any]) -> Any:
@@ -157,7 +180,8 @@ def normalize_artifact_input(
     """Normalize an artifact input, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths and localhost static server URLs are converted to artifacts holding the file's path.
+    String paths and localhost static server URLs are converted to artifacts holding the file's path,
+    as a macro path when the file is in the workspace.
     Objects that are already the correct artifact type are returned unchanged.
 
     Args:
@@ -213,7 +237,8 @@ def normalize_artifact_list(
     """Normalize a list of artifact inputs, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths and localhost static server URLs are converted to artifacts holding the file's path.
+    String paths and localhost static server URLs are converted to artifacts holding the file's path,
+    as a macro path when the file is in the workspace.
     Objects that are already the correct artifact type are passed through unchanged.
 
     Args:

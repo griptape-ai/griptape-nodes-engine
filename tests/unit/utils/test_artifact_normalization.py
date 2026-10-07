@@ -9,6 +9,11 @@ import pytest
 from griptape.artifacts import AudioUrlArtifact, ImageArtifact, ImageUrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMapAbsolutePathToProjectRequest,
+    AttemptMapAbsolutePathToProjectResultFailure,
+    AttemptMapAbsolutePathToProjectResultSuccess,
+)
 from griptape_nodes.utils import artifact_normalization
 from griptape_nodes.utils.artifact_normalization import normalize_artifact_input, normalize_artifact_list
 
@@ -31,13 +36,21 @@ LARGE_PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(bytes(5000)).de
 def workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Give path resolution a workspace, so relative values are looked up on disk.
 
-    The engine has no static files manager: normalization must not need a static server.
+    The engine has no static files manager: normalization must not need a static server. No
+    project is loaded, so workspace files map to `{workspace_dir}`.
     """
     engine = MagicMock()
     engine.config_manager.workspace_path = tmp_path
+    engine.handle_request.return_value = AttemptMapAbsolutePathToProjectResultFailure(result_details="no project")
     del engine.static_files_manager
     monkeypatch.setattr(artifact_normalization, "current_engine", lambda: engine)
     return tmp_path
+
+
+@pytest.fixture
+def engine(workspace: Path) -> MagicMock:  # noqa: ARG001
+    """The mock engine the `workspace` fixture installed."""
+    return artifact_normalization.current_engine()  # type: ignore[return-value]
 
 
 @pytest.mark.parametrize(
@@ -181,8 +194,8 @@ def test_list_of_artifact_dicts_is_normalized_element_wise() -> None:
 
 
 @pytest.mark.parametrize("relative", [True, False], ids=["relative", "absolute"])
-def test_workspace_path_becomes_its_absolute_path(workspace: Path, relative: bool) -> None:  # noqa: FBT001
-    """A workspace file path becomes an artifact holding the file's absolute path."""
+def test_workspace_path_becomes_a_workspace_dir_macro_path(workspace: Path, relative: bool) -> None:  # noqa: FBT001
+    """A workspace file outside every project directory is stored under `{workspace_dir}`."""
     file_path = workspace / "renders" / "image.jpg"
     file_path.parent.mkdir()
     file_path.write_bytes(b"data")
@@ -191,7 +204,25 @@ def test_workspace_path_becomes_its_absolute_path(workspace: Path, relative: boo
     result = normalize_artifact_input(artifact_input, ImageUrlArtifact)
 
     assert isinstance(result, ImageUrlArtifact)
-    assert result.value == str(file_path)
+    assert result.value == "{workspace_dir}/renders/image.jpg"
+
+
+def test_workspace_path_in_a_project_directory_uses_its_macro(workspace: Path, engine: MagicMock) -> None:
+    """A workspace file inside a project directory is stored as that directory's macro path."""
+    file_path = workspace / "inputs" / "image.jpg"
+    file_path.parent.mkdir()
+    file_path.write_bytes(b"data")
+    engine.handle_request.return_value = AttemptMapAbsolutePathToProjectResultSuccess(
+        mapped_path="{inputs}/image.jpg", result_details="mapped"
+    )
+
+    result = normalize_artifact_input(str(file_path), ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value == "{inputs}/image.jpg"
+    request = engine.handle_request.call_args.args[0]
+    assert isinstance(request, AttemptMapAbsolutePathToProjectRequest)
+    assert request.absolute_path == file_path.resolve()
 
 
 @pytest.mark.usefixtures("workspace")
@@ -207,7 +238,7 @@ def test_external_path_is_kept(tmp_path_factory: pytest.TempPathFactory) -> None
 
 
 def test_workspace_static_server_url_becomes_its_path(workspace: Path) -> None:
-    """A static server URL saved by an earlier session becomes the path of the file it serves."""
+    """A static server URL saved by an earlier session becomes a macro path for the file it serves."""
     file_path = workspace / "staticfiles" / "image.jpg"
     file_path.parent.mkdir()
     file_path.write_bytes(b"data")
@@ -217,7 +248,7 @@ def test_workspace_static_server_url_becomes_its_path(workspace: Path) -> None:
     )
 
     assert isinstance(result, ImageUrlArtifact)
-    assert result.value == str(file_path)
+    assert result.value == "{workspace_dir}/staticfiles/image.jpg"
 
 
 @pytest.mark.usefixtures("workspace")
