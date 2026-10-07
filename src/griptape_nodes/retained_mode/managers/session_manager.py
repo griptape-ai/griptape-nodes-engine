@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
-from xdg_base_dirs import xdg_state_home
 
 from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionRequest,
@@ -30,6 +29,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     SessionHeartbeatResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.utils.engine_dirs import engine_state_dir
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -357,7 +357,7 @@ class SessionManager:
         Args:
             engine_id: Optional engine ID to create engine-specific directory
         """
-        base_dir = xdg_state_home() / "griptape_nodes"
+        base_dir = engine_state_dir()
         if engine_id:
             return base_dir / "engines" / engine_id
         return base_dir

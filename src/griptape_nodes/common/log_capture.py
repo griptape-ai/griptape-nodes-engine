@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple
 
-from xdg_base_dirs import xdg_state_home
+from griptape_nodes.utils.engine_dirs import engine_state_dir
 
 LOGGER_NAME = "griptape_nodes"
 
@@ -149,7 +149,7 @@ def default_log_directory() -> Path:
     # directory. A Windows service account or a container without `USERPROFILE` has none and
     # the standard library raises, so logs go to the temporary directory instead.
     try:
-        state_home = xdg_state_home()
+        state_dir = engine_state_dir()
     except RuntimeError:
         fallback = Path(tempfile.gettempdir()) / "griptape_nodes" / "logs"
         logger.warning(
@@ -160,7 +160,7 @@ def default_log_directory() -> Path:
         )
         return fallback
 
-    return state_home / "griptape_nodes" / "logs"
+    return state_dir / "logs"
 
 
 def resolve_log_directory(configured_directory: str) -> Path:

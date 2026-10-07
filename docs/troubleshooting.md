@@ -288,7 +288,7 @@ The desktop application keeps its own log files for the local engine it manages,
 
 If you run the engine manually (with `gtn` or `gtn engine`), logs print directly to that terminal. Scroll back and copy the relevant portion from there.
 
-The engine also keeps its own log files, so you don't have to catch a problem while the terminal is still open. Each engine process writes one file in `<XDG_DATA_HOME>/griptape_nodes/logs`, rolls it over at 10 MB, and deletes files that haven't been touched for a week. Three settings control this: `logging.log_to_file`, `logging.log_directory`, and `logging.log_retention_days` (see the [Configuration Reference](reference/configuration_reference.md)). `gtn diagnostics collect` gathers these files for you.
+The engine also keeps its own log files, so you don't have to catch a problem while the terminal is still open. Each engine process writes one file in the `logs` folder of the engine state directory (`<XDG_STATE_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_STATE_DIR` when that is set), rolls it over at 10 MB, and deletes files that haven't been touched for a week. Three settings control this: `logging.log_to_file`, `logging.log_directory`, and `logging.log_retention_days` (see the [Configuration Reference](reference/configuration_reference.md)). `gtn diagnostics collect` gathers these files for you.
 
 If the logs don't show enough detail, raise the engine's log level: open the Configuration Editor (**Settings → All Settings**), search for "log level", set it to `DEBUG`, and reproduce the issue (see [Editing Settings in the Editor](guides/configuration.md#editing-settings-in-the-editor)). When running headless with no editor attached, you can set it through an environment variable instead:
 

@@ -16,7 +16,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineNameRequest,
@@ -32,6 +31,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.utils.name_generator import generate_engine_name
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -271,8 +271,8 @@ class EngineIdentityManager:
 
     @staticmethod
     def _get_engine_data_dir() -> Path:
-        """Get the XDG data directory for engine identity storage."""
-        return xdg_data_home() / "griptape_nodes"
+        """Get the engine data directory for engine identity storage."""
+        return engine_data_dir()
 
     @staticmethod
     def _get_engine_data_file() -> Path:

@@ -152,7 +152,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_returns_tuple(self) -> None:
         """Test that filter returns tuple with filtered paths and removed library names."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             paths = [
@@ -170,7 +170,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_no_removals(self) -> None:
         """Test filter when no old paths are present."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             paths = ["/custom/path", "https://github.com/user/lib@main"]
@@ -189,7 +189,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_removes_all_three_library_types(self) -> None:
         """Test that all three old library types are removed."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
@@ -211,7 +211,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_preserves_custom_paths_and_git_urls(self) -> None:
         """Test that custom paths and git URLs are preserved."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
@@ -228,7 +228,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_handles_object_form_dict_entries(self) -> None:
         """Object-form dict entries are filtered by their `path` and preserved otherwise."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
@@ -244,7 +244,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_handles_library_registration_entries(self) -> None:
         """Already parsed LibraryRegistration entries are filtered by their `path`."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
@@ -260,7 +260,7 @@ class TestFilterOldXdgLibraryPaths:
 
     def test_filter_mixed_string_and_object_entries(self) -> None:
         """A mix of bare strings and object-form entries is handled without error."""
-        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+        with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
             mock_xdg.return_value = Path("/home/user/.local/share")
 
             xdg_base = "/home/user/.local/share/griptape_nodes/libraries"

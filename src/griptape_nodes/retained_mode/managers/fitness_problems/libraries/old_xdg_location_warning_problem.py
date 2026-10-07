@@ -3,9 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from xdg_base_dirs import xdg_data_home
-
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ class OldXdgLocationWarningProblem(LibraryProblem):
                 len(instances),
             )
 
-        old_libraries_path = xdg_data_home() / "griptape_nodes" / "libraries"
+        old_libraries_path = engine_data_dir() / "libraries"
         return (
             f"WARNING: Starting with version 0.65.0, libraries are now managed in your workspace directory. "
             f"This library is located in {old_libraries_path} and will not receive updates because it is not tracked "
