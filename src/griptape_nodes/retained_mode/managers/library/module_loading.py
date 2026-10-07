@@ -12,7 +12,7 @@ from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
-from griptape_nodes.files.path_utils import resolve_workspace_path
+from griptape_nodes.files.path_utils import canonicalize_for_identity_preserving_symlinks, resolve_workspace_path
 from griptape_nodes.node_library.library_registry import (
     Library,
     LibraryRegistry,
@@ -912,7 +912,12 @@ class LibraryModuleLoading(EngineScoped):
         parameters. Returns False (recording a library problem) when the header cannot be read or
         carries no shape.
         """
-        workflow_file_path = resolve_workspace_path(Path(workflow_node_definition.workflow_path), base_dir)
+        # Deliberately not `canonicalize_for_identity`: the workspace scan registers a linked
+        # workflow under the link's path, and resolving it would key it by a full machine-specific
+        # path instead.
+        workflow_file_path = canonicalize_for_identity_preserving_symlinks(
+            workflow_node_definition.workflow_path, base=base_dir
+        )
         try:
             workflow_metadata = read_workflow_metadata(workflow_file_path)
         except WorkflowMetadataError as err:

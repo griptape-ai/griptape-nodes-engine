@@ -20,7 +20,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
-from griptape_nodes.files.path_utils import derive_registry_key
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity_preserving_symlinks,
+    derive_registry_key,
+    relative_to_keeping_or_following_links,
+)
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
     StartLocalSubflowResultSuccess,
@@ -260,7 +264,10 @@ def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], r
 
 
 def ensure_workflow_registered(
-    workflow_registry: _WorkflowRegistry, workflow_file_path: Path, workflow_metadata: WorkflowMetadata
+    workspace_path: Path,
+    workflow_registry: _WorkflowRegistry,
+    workflow_file_path: Path,
+    workflow_metadata: WorkflowMetadata,
 ) -> str:
     """Register `workflow_file_path` in `workflow_registry` if it is not there already.
 
@@ -277,16 +284,34 @@ def ensure_workflow_registered(
         KeyError: The key was claimed concurrently.
         ValueError: The workflow file is no longer on disk.
     """
-    registry_key = derive_registry_key(str(workflow_file_path))
+    path_for_key = _workspace_relative_workflow_path(workspace_path, workflow_file_path)
+    registry_key = derive_registry_key(path_for_key)
     if workflow_registry.has_workflow_with_name(registry_key):
         return registry_key
 
     workflow_registry.generate_new_workflow(
         registry_key=registry_key,
         metadata=workflow_metadata,
-        file_path=str(workflow_file_path),
+        file_path=path_for_key,
     )
     return registry_key
+
+
+def _workspace_relative_workflow_path(workspace_path: Path, workflow_file_path: Path) -> str:
+    """Return the workspace-relative form of a workflow's path, or the path itself if outside it.
+
+    The workspace scan keys workflows by this path, so the same form is needed here or one file is
+    registered twice under two names. A workflow outside the workspace (such as a library's bundled
+    one) keeps its full path.
+
+    The workspace is read on every call, not baked into the node class: the registry is rebuilt
+    when the workspace changes, but the node types a library minted survive that reload.
+    """
+    relative_path = relative_to_keeping_or_following_links(workflow_file_path, workspace_path)
+    if relative_path is None:
+        return str(canonicalize_for_identity_preserving_symlinks(workflow_file_path))
+
+    return str(relative_path)
 
 
 class WorkflowNode(ControlNode):
@@ -344,7 +369,10 @@ class WorkflowNode(ControlNode):
         """
         try:
             self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
-                self.engine.workflow_registry, self.workflow_file_path, self.workflow_metadata
+                self.engine.config_manager.workspace_path,
+                self.engine.workflow_registry,
+                self.workflow_file_path,
+                self.workflow_metadata,
             )
         except (KeyError, ValueError):
             logger.warning(
@@ -417,7 +445,10 @@ class WorkflowNode(ControlNode):
         """Return the backing workflow's registry key, registering it if it is not registered yet."""
         try:
             return ensure_workflow_registered(
-                self.engine.workflow_registry, self.workflow_file_path, self.workflow_metadata
+                self.engine.config_manager.workspace_path,
+                self.engine.workflow_registry,
+                self.workflow_file_path,
+                self.workflow_metadata,
             )
         except (KeyError, ValueError) as err:
             msg = (
