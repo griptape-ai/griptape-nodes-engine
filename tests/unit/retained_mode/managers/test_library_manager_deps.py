@@ -1411,7 +1411,7 @@ class TestALibraryThatCannotMeetTheFloorsStillInstalls:
     async def test_the_debug_log_carries_the_resolver_reason(
         self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Without uv's explanation nobody can tell which requirement conflicted."""
+        """The debug log keeps uv's explanation of which requirement conflicted."""
         with (
             patch(
                 "griptape_nodes.retained_mode.managers.library.dependencies.engine_package_floors",

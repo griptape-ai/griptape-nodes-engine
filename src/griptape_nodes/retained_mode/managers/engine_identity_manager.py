@@ -125,7 +125,7 @@ class EngineIdentityManager:
 
         # Save updated engine data
         self._add_or_update_engine(self._current_engine_data)
-        logger.info("Updated engine name to: %s", engine_name)
+        logger.debug("Updated engine name to: %s", engine_name)
 
     @property
     def all_engines(self) -> list[EngineData]:

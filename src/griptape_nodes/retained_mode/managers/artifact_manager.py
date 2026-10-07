@@ -566,7 +566,7 @@ class ArtifactManager(EngineScoped):
                 )
                 break
 
-            logger.info(
+            logger.debug(
                 "Source file '%s' changed while its preview was being generated; regenerating from the new content.",
                 source_path,
             )
