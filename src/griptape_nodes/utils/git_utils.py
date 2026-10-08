@@ -719,13 +719,16 @@ def get_current_tag(library_path: Path) -> str | None:
 
 
 def is_on_tag(library_path: Path) -> bool:
-    """Check if HEAD is currently pointing to a tag.
+    """Check whether the checkout follows a tag.
+
+    A followed tag need not point at HEAD: a fetch that moved it followed by a failed
+    checkout leaves HEAD behind while the checkout still follows the tag.
 
     Args:
         library_path: The path to the library directory.
 
     Returns:
-        bool: True if HEAD is on a tag, False otherwise.
+        bool: True if the checkout follows a tag, False otherwise.
     """
     return get_current_tag(library_path) is not None
 
