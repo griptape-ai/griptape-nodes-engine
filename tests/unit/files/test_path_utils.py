@@ -1054,6 +1054,57 @@ class TestParseStaticServerUrl:
         result = parse_static_server_url("http://localhost:8124/workspace/", self.WORKSPACE)
         assert result is None
 
+    def test_maps_external_url_to_absolute_posix_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/Desktop/cat.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/Desktop/cat.png")
+
+    def test_maps_external_url_to_windows_drive_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/C:/Users/artist/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("C:/Users/artist/cat.png")
+
+    def test_maps_external_url_to_unc_path(self) -> None:
+        """`LocalStorageDriver` builds a UNC path's URL as `/external//server/share/...`."""
+        result = parse_static_server_url(
+            "http://localhost:8124/external//server/share/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("//server/share/cat.png")
+
+    def test_keeps_hash_in_external_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/shot#1.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/shot#1.png")
+
+    def test_keeps_semicolon_in_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/renders/clip;v2.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "renders" / "clip;v2.mp4"
+
+    def test_external_path_containing_workspace_segment(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/mnt/workspace/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("/mnt/workspace/cat.png")
+
+    def test_external_posix_dir_with_colon_is_not_a_drive(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/x:foo/bar.png", self.WORKSPACE)
+        assert result == Path("/x:foo/bar.png")
+
+    def test_rejects_localhost_url_with_empty_external_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/", self.WORKSPACE)
+        assert result is None
+
     def test_rejects_127_0_0_1(self) -> None:
         """Only the `localhost` spelling is recognized, matching StaticServerFileDriver."""
         result = parse_static_server_url("http://127.0.0.1:8124/workspace/clip.mp4", self.WORKSPACE)

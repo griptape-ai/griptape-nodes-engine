@@ -211,7 +211,7 @@ class Client:
         # Close websocket connection
         if self._websocket:
             await self._websocket.close()
-        logger.info("WebSocket client disconnected")
+        logger.debug("WebSocket client disconnected")
 
     async def _manage_connection(self) -> None:
         """Manage WebSocket connection lifecycle with automatic reconnection.

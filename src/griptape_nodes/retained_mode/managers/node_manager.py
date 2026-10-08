@@ -2493,7 +2493,7 @@ class NodeManager(EngineScoped):
                 # Early return with warning - we're just preserving the original changes
                 details = f"Parameter '{request.parameter_name}' alteration recorded for ErrorProxyNode '{node_name}'. Original node '{node.original_node_type}' had loading errors - preserving changes for correct recreation when dependency '{node.original_library_name}' is resolved."
 
-                result_details = ResultDetails(message=details, level=logging.WARNING)
+                result_details = ResultDetails(message=details, level=logging.DEBUG)
                 return AlterParameterDetailsResultSuccess(result_details=result_details)
 
             # Reject runtime parameter alterations on ErrorProxy
@@ -2570,7 +2570,7 @@ class NodeManager(EngineScoped):
             if request.initial_setup:
                 node.record_initialization_request(request)
                 details = f"ParameterGroup '{request.group_name}' alteration recorded for ErrorProxyNode '{node_name}'. Original node '{node.original_node_type}' had loading errors - preserving changes for correct recreation when dependency '{node.original_library_name}' is resolved."
-                result_details = ResultDetails(message=details, level=logging.WARNING)
+                result_details = ResultDetails(message=details, level=logging.DEBUG)
                 return AlterParameterGroupDetailsResultSuccess(result_details=result_details)
 
             details = f"Cannot modify ParameterGroup '{request.group_name}' on placeholder node '{node_name}'. This placeholder preserves your workflow structure but doesn't allow modifications."
@@ -6012,7 +6012,7 @@ class NodeManager(EngineScoped):
         if request.from_index == request.to_index:
             details = f"Item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' is already at index {request.from_index}. No reordering needed."
             return ReorderParameterListItemResultSuccess(
-                result_details=ResultDetails(message=details, level=logging.WARNING)
+                result_details=ResultDetails(message=details, level=logging.DEBUG)
             )
 
         # Perform the reorder by moving the item in the _children list

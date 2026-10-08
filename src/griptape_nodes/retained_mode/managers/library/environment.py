@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import anyio
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -27,6 +26,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.utils.async_utils import subprocess_run
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 
 if TYPE_CHECKING:
@@ -266,8 +266,8 @@ class LibraryEnvironment(EngineScoped):
             library_dir = Path(library_file_path).parent.absolute()
             return library_dir / venv_dir_name
 
-        # Create venv relative to the xdg data home
-        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
+        # Create venv relative to the engine data directory
+        return engine_data_dir() / "libraries" / clean_library_name / venv_dir_name
 
     async def add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
         """Add a library's directory and edit-time venv site-packages to sys.path.

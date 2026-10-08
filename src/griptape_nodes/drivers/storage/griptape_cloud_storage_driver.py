@@ -262,7 +262,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         response_data = response.json()
         bucket_id = response_data["bucket_id"]
 
-        logger.info("Created new Griptape Cloud bucket '%s' with ID: %s", bucket_name, bucket_id)
+        logger.debug("Created new Griptape Cloud bucket '%s' with ID: %s", bucket_name, bucket_id)
         return bucket_id
 
     def list_files(self) -> list[str]:
@@ -526,7 +526,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             response_data = response.json()
             signed_url = response_data["url"]
 
-            logger.info("Converted cloud asset URL to signed URL: %s", asset_url)
+            logger.debug("Converted cloud asset URL to signed URL: %s", asset_url)
         except Exception as e:
             if isinstance(e, httpx2.HTTPStatusError):
                 logger.warning(

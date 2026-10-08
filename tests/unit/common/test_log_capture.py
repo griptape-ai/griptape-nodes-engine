@@ -33,6 +33,7 @@ from griptape_nodes.common.log_capture import (
     resolve_log_directory,
     session_log_lines,
 )
+from griptape_nodes.utils import engine_dirs
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -250,7 +251,7 @@ class TestDefaultLogDirectory:
         A Windows service account, or a container without `USERPROFILE`, has none, and the
         standard library raises -- which came out of `ConfigManager.__init__` and stopped startup.
         """
-        monkeypatch.setattr(log_capture, "xdg_state_home", self._no_home)
+        monkeypatch.setattr(engine_dirs, "xdg_state_home", self._no_home)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             directory = default_log_directory()
@@ -263,7 +264,7 @@ class TestDefaultLogDirectory:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A configured absolute path needs no home directory, and is used unchanged."""
-        monkeypatch.setattr(log_capture, "xdg_state_home", self._no_home)
+        monkeypatch.setattr(engine_dirs, "xdg_state_home", self._no_home)
 
         assert resolve_log_directory(str(tmp_path)) == tmp_path
 
