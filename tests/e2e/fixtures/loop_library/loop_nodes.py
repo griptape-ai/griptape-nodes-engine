@@ -21,9 +21,15 @@ from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
 class StartFlow(StartNode):
     """The packaged body's entry node."""
 
+    def process(self) -> None:
+        return None
+
 
 class EndFlow(EndNode):
     """The packaged body's exit node."""
+
+    def process(self) -> None:
+        return None
 
 
 class LoopBodyNode(DataNode):
