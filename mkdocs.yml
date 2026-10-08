@@ -88,6 +88,7 @@ plugins:
         Get started:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install Griptape Nodes via the Desktop app (recommended), a manual engine install, or license activation
+          - offline_and_proxy_installs.md: Running Griptape Nodes behind an HTTP(S) proxy, with TLS inspection, an internal package index, or no internet access
           - uninstalling.md: Fully remove Griptape Nodes — the Desktop app uninstaller, `gtn self uninstall`, and the workspace, caches, and model downloads left behind
           - architecture.md: Deployment architecture for the Griptape Cloud and on-premises models — components, trust boundaries, and what leaves your network
           - faq.md: Frequently asked questions
@@ -144,6 +145,7 @@ plugins:
         Workflows:
           - guides/variables.md: Workflow variables — scopes, variable nodes, and inline {name} substitution
           - guides/assets.md: Where generated files go, previews and downloads, and uploads
+          - guides/templates.md: Workflow templates — creating workflows from library and personal templates, and saving your own
           - guides/workflow_versions.md: Save As New Version and versioned workflow files
           - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
@@ -265,6 +267,7 @@ nav:
   - Get Started:
       - Overview: index.md
       - Installation: installation.md
+      - Offline and Proxy Installs: offline_and_proxy_installs.md
       - Uninstalling: uninstalling.md
       - Architecture: architecture.md
       - Tutorials:
@@ -324,6 +327,7 @@ nav:
       - Workflows:
           - Variables: guides/variables.md
           - Assets & Outputs: guides/assets.md
+          - Templates: guides/templates.md
           - Workflow Versions: guides/workflow_versions.md
           - Publishing: guides/publishing.md
       - MCP:

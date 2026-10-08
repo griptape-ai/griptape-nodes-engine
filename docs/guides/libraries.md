@@ -15,14 +15,22 @@ and the engine will tell you about it.
 
 ## What you start with
 
-The engine supports a **Sandbox Library** — a scratchpad library
+The engine supports a **Sandbox Library**, a scratchpad library
 for quickly developing your own custom nodes without authoring a
-full library. It isn't there until you set one up: under
-**Settings → Library → Sandbox Settings**, point **Sandbox Library
-Directory** at a folder that exists on disk. Once it does, the
-engine picks up `.py` node files from that directory, and what you
-see in the editor's Sandbox category depends on what's actually in
-it.
+full library. No setting needs to change: the **Sandbox Library
+Directory** defaults to a folder named `sandbox_library` inside your
+workspace. The engine doesn't create that folder for you, so make it
+yourself, or click **Create** next to the field under **Settings →
+Libraries → Sandbox Settings**. To use a different folder, enter its
+path in that field; a relative path is read relative to the workspace.
+
+To add a node, drop a `.py` file that defines a `BaseNode` subclass
+into the folder (subfolders are scanned too), then run
+[Refresh Libraries](#refreshing-libraries). The node appears in the
+editor's **Sandbox** category under its class name. The engine writes
+the folder's `griptape_nodes_library.json` for you; you don't author
+one. A file that fails to import is skipped, and the engine log names the
+file and the error.
 
 The Sandbox Library can also turn your own saved workflows into
 nodes. See [Turning a workflow into a node](#turning-a-workflow-into-a-node)
@@ -75,14 +83,14 @@ together.
 
 ## Updating libraries
 
-In the same **Libraries** panel, the icon buttons next to the
-filter chips let you:
+In the same **Libraries** panel, the buttons in the panel header
+let you:
 
 - **Check for updates** — scan all installed libraries for new
     versions. Anything with an update available shows up under the
     **Updates** filter.
-- **Refresh** — re-read the library list (helpful if you just
-    installed something and want to confirm it took).
+- **Refresh Libraries** — reload every library. See
+    [Refreshing libraries](#refreshing-libraries).
 
 For ambient update awareness, **Configuration Editor → Libraries**
 controls how aggressively the engine checks for library updates on
@@ -100,6 +108,25 @@ its own.
 
 You don't have to configure any of this; the defaults are fine for
 most artists.
+
+## Refreshing libraries
+
+**Refresh Libraries** unloads every library and loads them again
+from your configuration, re-scanning the Sandbox Library folder on
+the way. Use it after you add or edit a sandbox node, edit a
+library's files on disk, or change the libraries to register. It's
+in three places:
+
+- The header's **File** menu → **Refresh Libraries**.
+- The **Refresh Libraries** button at the bottom of the left
+    sidebar.
+- The **Refresh Libraries** button in the **Libraries** panel
+    header, next to **Check for updates**.
+
+Refreshing clears the workflow that's loaded in the editor. If it
+has unsaved changes, the editor asks first: **Save & Refresh** saves
+it and reopens it after the reload; **Don't Save** discards the
+changes. A saved workflow is reopened automatically.
 
 ## Toggling and removing libraries
 
@@ -362,8 +389,8 @@ A few things worth knowing:
 - **Clones / venvs**: in the directory the editor cloned the
     library into; the library's `.venv` lives next to its
     `griptape_nodes_library.json`.
-- **Sandbox library**: the sandbox directory is configured
-    separately in your settings; defaults vary by platform.
+- **Sandbox library**: `sandbox_library` in your workspace, unless
+    you set **Sandbox Library Directory** to another folder.
 
 To pin a project to specific library versions (so activating it provisions
 and, if needed, overwrites libraries to match), see
