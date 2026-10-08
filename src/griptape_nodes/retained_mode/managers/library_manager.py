@@ -275,6 +275,11 @@ class LibraryManager(EngineScoped):
                 logger.error("Failed to discover libraries: %s", discover_result.result_details)
                 return reconcile_failures
 
+            # A worker's libraries_directory mirrors the orchestrator's, so the hint would
+            # otherwise repeat once per worker; only the orchestrator needs to tell the user.
+            if not self._is_worker:
+                await self.discovery.log_unregistered_libraries(discover_result.libraries_discovered)
+
             # A worker is told which library it serves, but that library's declared library
             # dependencies are part of what it needs to run: CorridorKey's OCIO path reaches into
             # the OpenEXR library, which loaded on the orchestrator and was absent from the worker,

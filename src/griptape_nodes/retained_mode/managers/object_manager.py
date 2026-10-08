@@ -95,10 +95,10 @@ class ObjectManager(EngineScoped):
         self._name_to_objects[final_name] = source_obj
         del self._name_to_objects[request.object_name]
 
-        details = f"Successfully renamed object '{request.object_name}' to '{final_name}`."
+        details = f"Successfully renamed object '{request.object_name}' to '{final_name}'."
         log_level = logging.DEBUG
         if final_name != request.requested_name:
-            details += " WARNING: Originally requested the name '{request.requested_name}', but that was taken."
+            details += f" Originally requested the name '{request.requested_name}', but that was taken."
             log_level = logging.WARNING
         if log_level == logging.WARNING:
             result_details = ResultDetails(message=details, level=logging.WARNING)

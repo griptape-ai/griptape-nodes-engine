@@ -125,7 +125,7 @@ class BaseNodeElement:
 
     def _emit_alter_element_event_if_possible(self) -> None:
         """Emit an AlterElementEvent if we have node context and the necessary dependencies."""
-        if self._node_context is None:
+        if self._node_context is None or not self._node_context.broadcasts_events:
             return
 
         # Imported here to avoid circular dependencies: the event modules reach the element tree.

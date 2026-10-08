@@ -4117,7 +4117,7 @@ class NodeManager(EngineScoped):
             if isinstance(node, ErrorProxyNode):
                 reference_node = None
             else:
-                with LibraryRegistry.constructing_node():
+                with LibraryRegistry.constructing_node(throwaway=True):
                     reference_node = type(node)(
                         name="REFERENCE NODE",
                         metadata={

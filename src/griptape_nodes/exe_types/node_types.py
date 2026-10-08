@@ -343,6 +343,8 @@ class BaseNode(ABC):
     parameter_output_values: TrackedParameterOutputValues
     _local_objects: LocalObjectScope | None
     stop_flow: bool = False
+    # False for a node built under ``LibraryRegistry.constructing_node(throwaway=True)``.
+    broadcasts_events: bool = True
     root_ui_element: BaseNodeElement
     _state: NodeResolutionState
     _tracked_parameters: list[BaseNodeElement]
@@ -415,6 +417,7 @@ class BaseNode(ABC):
         self._engine = engine
         self.name = name
         self._state = state
+        self.broadcasts_events = not LibraryRegistry.is_constructing_throwaway_node()
         if metadata is None:
             self.metadata = {}
         else:
@@ -2119,6 +2122,8 @@ class BaseNode(ABC):
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
+        if not self.broadcasts_events:
+            return
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
@@ -2363,6 +2368,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
 
     def _emit_parameter_change_event(self, parameter_name: str, value: Any, *, deleted: bool = False) -> None:
         """Emit an AlterElementEvent for parameter output value changes."""
+        if not self._node.broadcasts_events:
+            return
         parameter = self._node.get_parameter_by_name(parameter_name)
         if parameter is not None:
             from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent

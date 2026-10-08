@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -99,6 +100,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetNextVersionIndexRequest,
     GetNextVersionIndexResultFailure,
     GetNextVersionIndexResultSuccess,
+    LaunchExternalViewerRequest,
+    LaunchExternalViewerResultFailure,
+    LaunchExternalViewerResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
@@ -569,6 +573,7 @@ class OSManager(EngineScoped):
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
                 failure_log_level=failure_log_level,
+                broadcast_result=False,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):
@@ -1547,6 +1552,125 @@ class OSManager(EngineScoped):
             details = f"Exception occurred when trying to open path: {e}"
             logger.error(details)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=details)
+
+    @handles(LaunchExternalViewerRequest)
+    def on_launch_external_viewer_request(self, request: LaunchExternalViewerRequest) -> ResultPayload:  # noqa: PLR0911
+        executable_key = f"{request.config_category}.viewer_executable"
+        args_key = f"{request.config_category}.viewer_args"
+        attempt = f"Attempted to open '{request.path_to_file}' in the external viewer"
+
+        try:
+            path = self._resolve_file_path(request.path_to_file, workspace_only=False)
+        except (ValueError, RuntimeError):
+            details = f"{attempt}. Failed because the path is not valid."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        if not path.exists():
+            details = f"{attempt}. Failed because the file does not exist."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+
+        viewer_executable = self.engine.config_manager.get_config_value(executable_key, default="")
+        viewer_executable = (viewer_executable or "").strip()
+        if not viewer_executable:
+            if not request.fallback_to_os_default:
+                details = f"{attempt}. Failed because no viewer is set in the '{executable_key}' setting."
+                logger.info(details)
+                return LaunchExternalViewerResultFailure(
+                    failure_reason=FileIOFailureReason.NOT_CONFIGURED, result_details=details
+                )
+            return self._open_with_os_default_for_viewer(path, attempt)
+
+        viewer_args = self.engine.config_manager.get_config_value(args_key, default="")
+        try:
+            viewer_arg_list = self._split_viewer_args(viewer_args or "")
+        except ValueError as e:
+            details = f"{attempt}. Failed because the '{args_key}' setting has unbalanced quotes: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        # The OS path is passed unprefixed: viewers do not understand the Windows \\?\ long-path form.
+        argv = [viewer_executable, *viewer_arg_list, os.fspath(path)]
+        try:
+            self._spawn_detached(argv)
+        except FileNotFoundError:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' was not found."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+        except PermissionError:
+            details = (
+                f"{attempt}. Failed because the viewer '{viewer_executable}' could not be run (permission denied)."
+            )
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=details
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' could not be started: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
+            )
+
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=False, result_details=f"Opened '{path}' in the external viewer '{viewer_executable}'."
+        )
+
+    def _open_with_os_default_for_viewer(self, path: Path, attempt: str) -> ResultPayload:
+        open_result = self.on_open_associated_file_request(OpenAssociatedFileRequest(path_to_file=os.fspath(path)))
+        if isinstance(open_result, OpenAssociatedFileResultFailure):
+            details = f"{attempt}. No viewer is set, and opening it with the default application failed: {open_result.result_details}"
+            return LaunchExternalViewerResultFailure(failure_reason=open_result.failure_reason, result_details=details)
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=True,
+            result_details=f"No external viewer is set, so '{path}' was opened with the default application.",
+        )
+
+    def _split_viewer_args(self, viewer_args: str) -> list[str]:
+        """Split the configured viewer arguments with shell-style quoting.
+
+        POSIX mode would treat Windows backslashes as escapes, but non-POSIX mode keeps the
+        quotes on each token, so they are stripped here before the tokens reach Popen.
+        """
+        if not self.is_windows():
+            return shlex.split(viewer_args)
+        tokens = shlex.split(viewer_args, posix=False)
+        unquoted = []
+        for token in tokens:
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":  # noqa: PLR2004
+                unquoted.append(token[1:-1])
+            else:
+                unquoted.append(token)
+        return unquoted
+
+    def _spawn_detached(self, argv: list[str]) -> None:
+        """Start ``argv`` without waiting for it, so it outlives the engine and never blocks it."""
+        if self.is_windows():
+            creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # pyright: ignore[reportAttributeAccessIssue]
+            subprocess.Popen(  # noqa: S603
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            return
+        subprocess.Popen(  # noqa: S603
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def _is_hidden(self, dir_entry: os.DirEntry, stat_result: os.stat_result | None = None) -> bool:
         """Check if a directory entry is hidden in an OS-independent way.

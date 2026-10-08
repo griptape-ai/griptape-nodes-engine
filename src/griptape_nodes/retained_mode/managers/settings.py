@@ -471,7 +471,7 @@ class Settings(BaseModel):
     libraries_directory: str = Field(
         category=FILE_SYSTEM,
         default="libraries",
-        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
+        description="Path to the directory where libraries from libraries_to_download are installed; those load automatically. Anything else placed here is not loaded until its path is added to libraries_to_register (Add Library in the editor). Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
     ffmpeg_directory: str = Field(
         category=FILE_SYSTEM,
