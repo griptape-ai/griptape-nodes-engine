@@ -269,6 +269,14 @@ class VariableReference:
     access: VariableAccess = VariableAccess.READ_WRITE
 
 
+@dataclass(frozen=True)
+class SetInput:
+    """A value as sent to a parameter, and what its converters stored for it."""
+
+    sent: Any
+    stored: Any
+
+
 @dataclass
 class NodeDependencies:
     """Dependencies that a node has on external resources.
@@ -431,6 +439,9 @@ class BaseNode(ABC):
         # its own prior objects.
         self.local_object_source = f"{name}@{uuid.uuid4().hex[:8]}"
         self.parameter_values = {}
+        # Per parameter, the last value sent through `SetParameterValueRequest`. Lets the engine tell a
+        # resend from an edit when converters build a fresh, unequal object for the same input.
+        self.last_set_inputs: dict[str, SetInput] = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)
         self._local_objects = None
         self.root_ui_element = BaseNodeElement()

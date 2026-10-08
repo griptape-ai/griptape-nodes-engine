@@ -113,7 +113,7 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
 
 **A serialized dict's declared `type` distinguishes a path from a payload** - `<Kind>UrlArtifact` dicts hold a path or URL in `value`; raw `<Kind>Artifact` dicts hold base64 bytes. Only unwrap `value` when the dict's `type` names the artifact type you are normalizing to, or base64 is treated as a path. The node libraries make the same check in `coerce_media_url_or_data_uri`.
 
-**Do not derive artifact ids to stabilize equality** - `BaseArtifact.id` defaults to random hex and takes part in `__eq__`, and `NodeManager` reads artifact inequality as a user edit, so normalizing the same input twice unresolves the downstream subgraph. That is a property of the existing string branch too, and the fix belongs in that comparison, not in the value feeding it. Do not fingerprint payloads into synthetic ids to work around it for one branch — it leaves the branch beside it inconsistent and hides the real bug. See [#5621](https://github.com/griptape-ai/griptape-nodes-engine/issues/5621).
+**Do not derive artifact ids to stabilize equality** - Converters may build a fresh object per set that is unequal to the last one for the same input (`BaseArtifact.id` is random and takes part in `__eq__`; a class without `__eq__` compares by identity). `NodeManager` handles this for every type: a set that resends a parameter's last input (`BaseNode.last_set_inputs`) while it still holds what that input stored is not an edit, so downstream stays resolved. Do not fingerprint payloads into synthetic ids, and do not special-case artifact or other library types in change detection. See [#5621](https://github.com/griptape-ai/griptape-nodes-engine/issues/5621).
 
 ## Documentation
 
