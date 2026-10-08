@@ -11,10 +11,6 @@ from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
     ModelCatalogLibraryProperty,
     NodeDeclaration,
-    SuggestedWorkerMode,
-    WorkerCompatibility,
-    WorkerMode,
-    WorkerModeCompatibility,
     find_model_catalog,
     resolve_node_models,
 )
@@ -144,31 +140,8 @@ class LibraryMetadata(BaseModel):
     # Resource requirements for this library. If None, library is assumed to work on any platform.
     resources: ResourceRequirements | None = None
     # Declarative properties / capabilities for this library. Applies to all nodes in the library.
-    # See griptape_nodes.node_library.library_declarations for the supported types,
-    # including WorkerModeCompatibility for orchestrator/worker hosting.
+    # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[LibraryDeclaration] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _reject_incompatible_with_suggested_worker(self) -> LibraryMetadata:
-        # A library declared INCOMPATIBLE with worker hosting must not also
-        # suggest WORKER as its launch mode. The two declarations live on
-        # the same metadata block, so the cross-axis check belongs here --
-        # the individual declaration models are independent and can't see
-        # each other.
-        capability = next((d for d in self.declarations if isinstance(d, WorkerModeCompatibility)), None)
-        if capability is None or capability.compatibility is not WorkerCompatibility.INCOMPATIBLE:
-            return self
-        suggested = next(
-            (d for d in self.declarations if isinstance(d, SuggestedWorkerMode)),
-            None,
-        )
-        if suggested is not None and suggested.mode is WorkerMode.WORKER:
-            msg = (
-                "Library declares WorkerModeCompatibility(compatibility=INCOMPATIBLE) but also "
-                "declares SuggestedWorkerMode(mode=WORKER); the two are contradictory."
-            )
-            raise ValueError(msg)
-        return self
 
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
@@ -513,13 +486,10 @@ class LibraryRegistry:
         (e.g. ``type(node)(name=...)`` or ``node_class(name=...)`` for
         an ephemeral probe / reference node), so:
 
-        - the parameter-mutation-during-aprocess detector skips the
-          declarative ``add_parameter`` calls inside the constructed
-          node's ``__init__`` (otherwise it would fire once per
-          parameter declared by the helper instance), and
-        - the reentrant-bus-in-init detector still fires for the
-          right reason if the constructed node's ``__init__`` issues
-          a bus request.
+        the parameter-mutation-during-aprocess detector skips the
+        declarative ``add_parameter`` calls inside the constructed node's
+        ``__init__`` (otherwise it would fire once per parameter declared
+        by the helper instance).
 
         Pass ``throwaway=True`` for a node no client ever sees, such as the
         serializer's reference copy or a type probe. It sends no element
@@ -540,10 +510,10 @@ class LibraryRegistry:
     def is_constructing_node(cls) -> bool:
         """Return True if a node ``__init__`` is currently running on the calling task.
 
-        The reentrant-bus-in-init and parameter-mutation-during-aprocess
-        strict-mode detectors consult this so they can fire from outside
-        ``LibraryRegistry`` without owning their own depth counter. The
-        flag is set by ``create_node`` and by ``constructing_node()``.
+        The parameter-mutation-during-aprocess strict-mode detector consults
+        this so it can fire from outside ``LibraryRegistry`` without owning
+        its own depth counter. The flag is set by ``create_node`` and by
+        ``constructing_node()``.
         """
         return _constructing_node.get()
 

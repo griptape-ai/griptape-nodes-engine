@@ -418,8 +418,8 @@ class RemoteHandler:
 
     ``original`` is the handler this shim replaced and MUST be retained so the
     out-of-scope fallback can still service requests that bootstrap code makes
-    (e.g. ``self.add_parameter(...)`` issuing ``AddParameterToNodeRequest``
-    from a node's ``__init__`` under a LOAD_PROBE scope).
+    (e.g. ``self.add_parameter(...)`` issuing ``AddParameterToNodeRequest`` from
+    a node's ``__init__``, which runs before the execution scope opens).
     """
 
     original: Any  # HandlerCallback; typed loosely to avoid a runtime import cycle

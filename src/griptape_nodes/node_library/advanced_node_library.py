@@ -91,11 +91,10 @@ class AdvancedNodeLibrary:
 
         Both sync and async handler callables are supported.
 
-        **Orchestrator process only.** Handlers registered via this method run in
-        the orchestrator process. Libraries loaded in worker processes will not have
-        their handlers forwarded to the orchestrator, so requests dispatched there
-        will result in "No manager found". Cross-worker handler support is tracked
-        in GH#4748.
+        **Registered per process.** Every library loads on the orchestrator, so its
+        handlers always serve requests dispatched there. A library whose nodes execute
+        in a worker also loads in that worker, which registers its own copy; the two
+        processes never forward handler requests to each other.
 
         **Singleton handlers only.** This mechanism is for services where exactly
         one library is the provider (e.g. colour conversion, ML inference). For
@@ -177,10 +176,10 @@ class AdvancedNodeLibrary:
         node-execution state is process-wide, so a request issued from a hook can
         perturb an in-flight operation. Do external work (HTTP, file writes) instead.
 
-        **Orchestrator process only.** Hooks are registered on the event manager of
-        whichever process loads the library, so a worker-mode library's hooks never
-        observe requests handled by the orchestrator. Cross-worker hook support is
-        tracked in GH#4748.
+        **Registered per process.** Hooks are registered on the event manager of
+        whichever process loads the library. A library whose nodes execute in a worker
+        loads in both processes, so each copy observes only the requests its own
+        process handles.
 
         **Not durable.** In-flight hooks are abandoned at process exit. Do not use
         them where delivery must be guaranteed.

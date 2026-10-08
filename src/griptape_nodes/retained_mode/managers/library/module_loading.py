@@ -32,9 +32,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeModuleImportProblem,
     OldXdgLocationWarningProblem,
     PostDispatchHookRegistrationProblem,
-    PostDispatchHooksWorkerIncompatibleProblem,
     RequestHandlerRegistrationProblem,
-    RequestHandlersWorkerIncompatibleProblem,
     WorkflowNodeLoadProblem,
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryFitness, LibraryInfo, LibraryLifecycleState
@@ -532,20 +530,6 @@ class LibraryModuleLoading(EngineScoped):
             try:
                 # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4744 revisit per-entry error granularity
                 handlers = advanced_library.get_request_handlers()
-                if handlers and library_info.requires_worker:
-                    library_info.problems.append(
-                        RequestHandlersWorkerIncompatibleProblem(
-                            library_name=library_data.name,
-                            handler_count=len(handlers),
-                        )
-                    )
-                    logger.warning(
-                        "Library '%s' declares %d request handler(s) via get_request_handlers() but requires "
-                        "worker mode. Handlers are only registered in the worker process and cannot be reached "
-                        "from the orchestrator. See https://github.com/griptape-ai/griptape-nodes-engine/issues/4748",
-                        library_data.name,
-                        len(handlers),
-                    )
                 for request_type, handler in handlers:
                     event_manager = self.engine.event_manager
                     event_manager.assign_manager_to_request_type(request_type, handler)
@@ -568,21 +552,6 @@ class LibraryModuleLoading(EngineScoped):
         if advanced_library:
             try:
                 hooks = advanced_library.get_post_dispatch_hooks()
-                if hooks and library_info.requires_worker:
-                    library_info.problems.append(
-                        PostDispatchHooksWorkerIncompatibleProblem(
-                            library_name=library_data.name,
-                            hook_count=len(hooks),
-                        )
-                    )
-                    logger.warning(
-                        "Library '%s' declares %d post-dispatch hook(s) via get_post_dispatch_hooks() but "
-                        "requires worker mode. Hooks are only registered in the worker process and do not "
-                        "observe requests handled by the orchestrator. "
-                        "See https://github.com/griptape-ai/griptape-nodes-engine/issues/4748",
-                        library_data.name,
-                        len(hooks),
-                    )
                 for request_type, callback in hooks:
                     # Hooks match on the exact request type, so a key that is not a class can
                     # never equal `type(request)`: the hook would register cleanly and then

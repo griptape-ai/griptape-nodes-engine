@@ -66,22 +66,16 @@ class KeySupport(StrEnum):
 
 
 class WorkerCompatibility(StrEnum):
-    """Whether a library can run in a worker subprocess.
-
-    Absence of a ``WorkerModeCompatibility`` declaration is treated as
-    ``COMPATIBLE``.
-    """
+    """Accepted for backward compatibility; no longer affects where a library runs."""
 
     COMPATIBLE = "COMPATIBLE"
     INCOMPATIBLE = "INCOMPATIBLE"
 
 
 class WorkerMode(StrEnum):
-    """Where a worker-compatible library launches by default.
+    """Accepted for backward compatibility; no longer affects where a library runs.
 
-    Only meaningful when the library is also ``WorkerCompatibility.COMPATIBLE``.
-    Absence of a ``SuggestedWorkerMode`` declaration is treated as
-    ``ORCHESTRATOR``.
+    Still the type of ``LibraryRegistration.worker_mode_override``.
     """
 
     ORCHESTRATOR = "ORCHESTRATOR"
@@ -103,11 +97,10 @@ class LifecycleStageLibraryProperty(BaseModel):
 
 
 class WorkerModeCompatibility(BaseModel):
-    """Declares whether this library is compatible with worker hosting.
+    """Accepted for backward compatibility; no longer affects where a library runs.
 
-    Pair with a ``SuggestedWorkerMode`` to state the author's suggested
-    starting point; absence of this declaration is treated as
-    ``compatibility=COMPATIBLE``.
+    A library's nodes execute in a worker when it declares
+    ``pip_dependencies_exec``.
     """
 
     type: Literal["worker_mode_compatibility"] = "worker_mode_compatibility"
@@ -115,16 +108,11 @@ class WorkerModeCompatibility(BaseModel):
 
 
 class SuggestedWorkerMode(BaseModel):
-    """Declares the author's suggested launch mode (orchestrator vs. worker).
+    """Accepted for backward compatibility; no longer affects where a library runs.
 
-    A starting point, not a hard constraint -- once the GUI override ships,
-    users can flip a worker-compatible library between modes. Absence of
-    this declaration is treated as "no author suggestion"; consumers apply
-    the engine default (today: orchestrator).
-
-    Only meaningful when paired with ``WorkerCompatibility.COMPATIBLE``. A
-    ``LibraryMetadata`` validator rejects the contradictory pairing of
-    ``INCOMPATIBLE`` with ``mode=WORKER``.
+    A library's nodes execute in a worker when it declares
+    ``pip_dependencies_exec``. A manifest declaring ``mode=WORKER`` loads and
+    runs in-process, and says so once at load time.
     """
 
     type: Literal["suggested_worker_mode"] = "suggested_worker_mode"
@@ -238,31 +226,6 @@ LibraryDeclaration = Annotated[
     | LibraryDependencyDeclaration,
     Field(discriminator="type"),
 ]
-
-
-def requires_worker_process(declarations: Sequence[LibraryDeclaration]) -> bool:
-    """Resolve the load-time worker-process decision from a library's declarations.
-
-    A library requires a dedicated worker subprocess when:
-
-    1. It is compatible with worker hosting (``WorkerCompatibility.COMPATIBLE``
-       -- absence of a ``WorkerModeCompatibility`` is treated as ``COMPATIBLE``),
-       AND
-    2. Its suggested launch mode is ``WorkerMode.WORKER``.
-
-    Anything else -- ``INCOMPATIBLE`` capability, no
-    ``SuggestedWorkerMode`` at all, or ``ORCHESTRATOR`` suggestion --
-    means the library runs in the orchestrator process.
-
-    Centralized here so the future GUI flip updates only one site.
-    """
-    capability = next((d for d in declarations if isinstance(d, WorkerModeCompatibility)), None)
-    if capability is not None and capability.compatibility is WorkerCompatibility.INCOMPATIBLE:
-        return False
-    suggested = next((d for d in declarations if isinstance(d, SuggestedWorkerMode)), None)
-    if suggested is None:
-        return False
-    return suggested.mode is WorkerMode.WORKER
 
 
 def find_model_catalog(declarations: Sequence[LibraryDeclaration]) -> ModelCatalogLibraryProperty | None:

@@ -2,7 +2,7 @@
 
 RemoteHandler is the single chokepoint where a worker services a request whose authoritative state
 lives on the orchestrator. What decides its behavior is one thing: whether the worker is inside a
-node-execution scope. Inside, it forwards; outside (bootstrap, library load, LOAD_PROBE) it
+node-execution scope. Inside, it forwards; outside (bootstrap, library load, node construction) it
 delegates to the handler it replaced, so a node's ``__init__`` can still call ``add_parameter``.
 """
 

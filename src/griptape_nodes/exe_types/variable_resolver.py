@@ -202,9 +202,9 @@ class VariableResolver:
 
         Routing it through GetVariableSubstitutionEnabledRequest so it forwards was tried and
         backed out: `parameter_output_values[...] = x` inside a node `__init__` reaches this
-        through TrackedParameterOutputValues, so every node construction became a bus request
-        and tripped `reentrant-bus-in-init`. Fixing it properly means resolving the answer once
-        per execution and carrying it, rather than asking per value.
+        through TrackedParameterOutputValues, so every node construction became a bus request.
+        Fixing it properly means resolving the answer once per execution and carrying it,
+        rather than asking per value.
         """
         return engine.workflow_manager.variable_substitution.is_enabled()
 

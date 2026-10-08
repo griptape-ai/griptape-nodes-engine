@@ -1,14 +1,12 @@
 # Node Isolation with Workers
 
-This page is the operational guide for running your library
-**isolated**: in a dedicated Python subprocess so your library's
-pinned dependencies (`torch`, `transformers`, `diffusers`) cannot
-collide with another library's. Artists pick this with the
-**Shared / Isolated** dropdown in the editor (see
-[Libraries](../../guides/libraries.md#shared-vs-isolated)); under the hood,
-an isolated library runs on a **worker** subprocess. This page is
-the author's side of that mechanism. For the rule catalog that
-catches isolation mistakes, see
+This page is the operational guide for isolating your library's **node
+execution** in a dedicated Python subprocess, so your library's pinned
+dependencies (`torch`, `transformers`, `diffusers`) cannot collide with
+another library's. You declare which dependencies are heavy enough to
+need that, and the engine routes execution accordingly; there is no
+setting for an artist to pick. For the rule catalog that catches
+execution-boundary mistakes, see
 [Strict Mode Reference](strict_mode.md).
 
 ## Vocabulary
@@ -17,93 +15,75 @@ A few terms used throughout this page:
 
 - **Orchestrator** — the main Griptape Nodes Python process. It owns
     the flow graph, connections, parameter registry, config, and
-    secrets. The editor talks to the orchestrator directly.
+    secrets. The editor talks to the orchestrator directly. **Every
+    library's node classes are imported here**, including yours.
 - **Worker subprocess** — a separate Python process that runs your
-    library's nodes. Each library that opts into worker mode gets its
-    own. Workers communicate with the orchestrator over a WebSocket
-    connection (the **bus**).
+    library's `process` methods. A library with execution dependencies
+    gets its own. Workers communicate with the orchestrator over a
+    WebSocket connection (the **bus**).
+- **`pip_dependencies` and `pip_dependencies_exec`** — the two
+    dependency sets in your manifest. The first is what importing your
+    node modules and constructing your nodes needs; the second is what
+    only `process` needs.
+- **Library venv and `.venv-exec`** — `pip_dependencies` installs into
+    the library venv (`<library>/.venv`), which the orchestrator uses.
+    `pip_dependencies_exec` installs into `<library>/.venv-exec`, which
+    is on `sys.path` only in the worker.
 - **`process` and `aprocess`** — your node's execution method.
     Implement `process(self) -> ...` as you do today; the framework
     wraps it as `async def aprocess(self) -> None` so it can run on the
     worker's event loop. The strict-mode rules describe behavior "from
     inside aprocess," but in practice that means "from inside the
     `process` method you wrote."
-- **Schema probe** — a one-time pass at library load where the worker
-    instantiates each registered node class once to discover its
-    parameter layout. This runs your `__init__` before any execute
-    request arrives.
 
-## Should I opt in?
+## Do my nodes need an execution venv?
 
-**Opt in if** your library pins specific versions of heavy ML
-packages (`torch`, `transformers`, `diffusers`, `accelerate`,
-`peft`, `controlnet-aux`, custom CUDA wheels) and you want to coexist
-with other libraries that pin different versions. Worker mode is the
-mechanism for cross-library dependency isolation.
+The question is not whether to isolate your library. It is whether a
+dependency is needed *only* at `process` time.
 
-**Stay opted out if** your library only uses lightweight, broadly
-compatible packages (the standard library, `pydantic`, `griptape`
-itself, common HTTP / YAML / JSON tooling). Running in the
-orchestrator process avoids the cross-process serialization tax
-described below.
+**Declare `pip_dependencies_exec` for** heavy ML packages your nodes
+import inside `process`: `torch`, `transformers`, `diffusers`,
+`accelerate`, `peft`, `controlnet-aux`, custom CUDA wheels. These are
+the pins that collide with another library's, and keeping them out of
+the orchestrator's import path is the whole point.
 
-If unsure, the safer default is to opt in — the cost is real but
-small, and it future-proofs against a downstream user installing a
-heavier library next to yours.
+**Keep in `pip_dependencies`** everything needed to import your node
+modules and construct your nodes: the package your node file imports at
+module scope, whatever a `Parameter` default or a trait touches,
+anything a value hook calls. The orchestrator installs this set, and the
+editor, workflow loading, and your parameter behaviors depend on it.
+Keep it light.
 
-## How to opt in
+A library that declares no `pip_dependencies_exec` is entirely edit-time
+and runs in the orchestrator, with no worker and no serialization tax.
+Declaring the set is what buys dependency isolation, and it costs the
+cross-process boundary described below.
 
-Worker hosting is described by two declarations on your library's
-`metadata.declarations` in `griptape-nodes-library.json`. They live
-side by side because they answer two different questions:
+The split is a judgment about your own code, not a performance dial. If
+a package is imported at module scope in a node file, it is an edit-time
+dependency whether you want it to be or not: the orchestrator cannot
+import the module without it.
 
-- **`worker_mode_compatibility`** — whether the library is *compatible*
-    with worker hosting. One field, `compatibility`:
-    - `COMPATIBLE`: the library can run in either the orchestrator
-        process or a dedicated worker subprocess.
-    - `INCOMPATIBLE`: the library only works in the orchestrator
-        process and must never be hosted on a worker.
-- **`suggested_worker_mode`** — where the library *launches* when
-    nothing else overrides. One field, `mode`: `ORCHESTRATOR` or
-    `WORKER`. Omit the declaration to take the engine default (today:
-    orchestrator). The editor exposes a per-library **Shared /
-    Isolated** dropdown (Shared = orchestrator, Isolated = worker)
-    that lets users flip a `COMPATIBLE` library between modes; this
-    declaration is the author's suggested starting point for that
-    dropdown.
+## How to declare execution dependencies
 
-Omitting both declarations is equivalent to declaring
-`worker_mode_compatibility` with `compatibility=COMPATIBLE` and no
-`suggested_worker_mode` — the library is capable of worker mode but
-launches in the orchestrator until something asks for the flip.
-
-Declaring `worker_mode_compatibility` with
-`compatibility=INCOMPATIBLE` and a `suggested_worker_mode` of `WORKER`
-is contradictory; library metadata validation rejects that
-combination.
+Both sets live under `metadata.dependencies` in
+`griptape-nodes-library.json`:
 
 ```json
 {
     "name": "My Library",
-    "library_schema_version": "0.10.0",
+    "library_schema_version": "0.14.0",
     "metadata": {
         "author": "<Your Name>",
         "description": "<Description>",
         "library_version": "0.1.0",
         "engine_version": "0.85.0",
         "tags": ["AI", "Custom"],
-        "declarations": [
-            {
-                "type": "worker_mode_compatibility",
-                "compatibility": "COMPATIBLE"
-            },
-            {
-                "type": "suggested_worker_mode",
-                "mode": "WORKER"
-            }
-        ],
         "dependencies": {
             "pip_dependencies": [
+                "pillow==11.0.0"
+            ],
+            "pip_dependencies_exec": [
                 "torch==2.4.1",
                 "transformers==4.45.2"
             ],
@@ -118,20 +98,40 @@ combination.
 }
 ```
 
-Worker mode only delivers specific environment control if you pin specific
+Isolation only delivers specific environment control if you pin specific
 wheels. A loose `torch>=2.0` resolves to whatever pip finds, which
 drifts between developers' machines and users' machines. Pin
-`torch==2.4.1`, not `torch>=2.0`. `pip_install_flags` is the escape
-hatch for index URLs and other arguments your install legitimately
-needs.
+`torch==2.4.1`, not `torch>=2.0`. `pip_install_flags` applies to both
+installs and is the escape hatch for index URLs and other arguments your
+install legitimately needs.
 
-The schemas:
-[`WorkerModeCompatibility`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_declarations.py)
-and
-[`SuggestedWorkerMode`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_declarations.py)
-in `library_declarations.py`, and
-[`Dependencies`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_registry.py#L39)
+The schema:
+[`Dependencies`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_registry.py)
 in `library_registry.py`.
+
+The older `worker_mode_compatibility` and `suggested_worker_mode`
+declarations still parse, so no manifest in the wild fails to load, but
+neither one affects where a library's nodes execute. Remove them when
+convenient.
+
+## What the orchestrator still does for your library
+
+This is the fact that makes the rest of the page short, and the one an
+author coming from an earlier engine will not believe without being told
+outright: **the orchestrator imports your node modules for real.** Your
+classes are the classes the editor holds. So all of this runs on the
+orchestrator, for an execution-dependency library exactly as for any
+other:
+
+- `__init__`, including every `add_parameter` call
+- `Parameter` `converters`, `validators`, and `traits`, including a
+    `Button`'s click handler
+- `before_value_set` / `after_value_set` when a user edits a value
+- connection hooks: `after_incoming_connection`,
+    `after_outgoing_connection`, the `allow_*` validators, and the
+    `*_removed` variants
+
+Only `process` goes to the worker.
 
 ## What you give up
 
@@ -156,11 +156,8 @@ Two practical implications:
     `RemoveParameterFromNodeRequest`, etc.) and the engine handles
     the round-trip correctly.
 
-Requests issued **outside** node execution (during library load or
-bootstrap) are not forwarded — the worker is not connected to the
-orchestrator at that point. Bus calls from `__init__` reentrantly
-hit the worker's own event loop, which is why `__init__` has its own
-strict-mode rule (next section).
+Requests issued **outside** node execution are not forwarded; the worker
+answers them against its own state.
 
 ## Passing values that cannot be serialized
 
@@ -175,32 +172,13 @@ restrictions on containers and cross-library wires.
 
 ## Lifecycle changes you need to know
 
-### `__init__` runs during library load
-
-The worker subprocess instantiates each registered node class once
-at startup to extract a parameter schema for the orchestrator. Three
-implications:
-
-- **No I/O in `__init__`.** Network calls, auth checks, disk reads,
-    database connections all block library load. The schema probe has
-    a finite timeout, and a class whose `__init__` raises or times out
-    is **silently dropped from the exported library** with no rule
-    fired. Move I/O into `process` or a lifecycle hook that runs after
-    construction.
-- **No event-bus calls in `__init__`.** Reentering the bus during
-    the schema probe deadlocks the worker. The
-    [`reentrant-bus-in-init`](strict_mode.md) correctness rule fails
-    the class on this; because it is a correctness-class violation,
-    the class is also dropped from the library schema.
-- **Parameters declared in `__init__` are the normal pattern.**
-    `self.add_parameter(...)` is fine here — the schema probe is the
-    one place a node is "supposed to" define its parameter list.
-
 ### Each `ExecuteNodeRequest` constructs a fresh node
 
 The worker materializes a transient node from request metadata, runs
 `process`, and discards it. **Your node holds no in-memory state
-between calls.**
+between calls.** This is the single most surprising thing an author
+hits, and it is true on every execute: the worker-side node that ran
+the previous execution no longer exists.
 
 The supported patterns for moving values:
 
@@ -285,15 +263,12 @@ in the editor — is left unapplied for that run, with a warning
 naming the parameter; it does not fail the execution, and the
 authoritative value on the orchestrator is untouched.
 
-### Value hooks: it depends on which kind of library
+### Value hooks run in both processes
 
-**Execution-dependency libraries** (the ones that declare
-`pip_dependencies_exec`) keep real node classes on the
-orchestrator, so `before_value_set` / `after_value_set` fire there
-when a user edits a value, exactly as they do for a Shared
-library. Hooks that adjust the parameter list in response to user
-input — showing or hiding fields when a dropdown changes, growing
-a list — work normally at edit time.
+`before_value_set` / `after_value_set` fire on the orchestrator when a
+user edits a value, so hooks that adjust the parameter list in response
+to user input — showing or hiding fields when a dropdown changes,
+growing a list — work normally at edit time.
 
 Two things to know about those hooks at *execution* time:
 
@@ -306,60 +281,6 @@ Two things to know about those hooks at *execution* time:
     execution follows the rule above: route it through the request
     bus if it needs to persist, and do not expect to read it back in
     that same execution.
-
-**Legacy worker-mode libraries** (Isolated mode, chosen by
-`worker_mode_override` or `suggested_worker_mode`) behave
-differently, because the orchestrator holds only a stub copy of
-your node class — parameters, no code — so it never calls your
-overrides when a user edits a value. Transforming an incoming
-value still works, since the hooks run as inputs are applied just
-before `process`, but a parameter-list change made inside them is
-discarded with the temporary node: it skips the
-[`parameter-mutation-during-aprocess`](strict_mode.md) rule and
-does not propagate either. For those libraries, define the full
-parameter list statically in `__init__`. Overriding a value hook
-fires the
-[`value-hooks-execute-only-on-worker`](strict_mode.md) warning at
-library load.
-
-### Connection hooks never fire under isolation
-
-`after_incoming_connection`, `after_outgoing_connection`, the
-`allow_*` validators, and the `*_removed` variants are invoked on
-the orchestrator when connections change — connections are
-orchestrator-owned state, and the worker is not consulted. For a
-worker-hosted library those calls land on the stub class, so an
-override you write never runs, silently. Overriding a connection
-hook fires the
-[`connection-hooks-inert-on-worker`](strict_mode.md) warning at
-library load. If your node needs to react to wiring (the
-dynamic-parameter pattern), run the library in Shared mode.
-
-### Parameter `converters`, `validators`, and `traits` do not cross to the orchestrator
-
-When the schema probe exports your library, only the scalar-shaped
-fields of each `Parameter` (name, type, default, tooltip, allowed
-modes) are serialized for the orchestrator's stub copy of the
-class. Custom `converters`, `validators`, and `traits` you attached
-to a `Parameter` are **not** carried across — they live in the
-worker's process and run only when the worker executes the node.
-
-The orchestrator stub still accepts user input on those parameters
-and ships values to the worker, but the orchestrator-side UI cannot
-re-run your `converters` / `validators` / `traits` to massage or
-reject values before they leave the editor. Authors see this as a
-[`parameter-behaviors-dropped-in-schema`](strict_mode.md) warning
-at library load.
-
-Two workable patterns:
-
-- **Move the validation or transform into `process`.** The worker
-    re-runs it on the actual value. The cost is that the editor
-    cannot show the user a validation failure inline; they only see
-    it when the node executes.
-- **Accept the divergence as orchestrator-only UI sugar.** If the
-    converter is purely a display nicety (e.g., title-casing a
-    string), losing it on the orchestrator is harmless.
 
 ## Configuration, secrets, and the current project propagate automatically
 
@@ -401,31 +322,22 @@ var.
 value, because it represents the user's stated intent. The engine
 logs a `WARNING` so the asymmetry is visible.
 
-## "Is my library isolation-ready?" checklist
+## Checklist
 
-- [ ] `worker_mode_compatibility` declared in `metadata.declarations`
-    with `compatibility: COMPATIBLE` (or omit the declaration entirely
-    -- absence is treated as `COMPATIBLE`), plus `suggested_worker_mode`
-    with `mode: WORKER` (or omit `suggested_worker_mode` if you want the
-    library to launch in the orchestrator by default and let users opt
-    in via the GUI)
-- [ ] `__init__` does no I/O and issues no event-bus requests
+- [ ] Heavy packages only `process` needs declared in
+    `pip_dependencies_exec`, with everything needed to import your node
+    modules left in `pip_dependencies`
+- [ ] Both sets pinned to specific versions
+- [ ] `pip_install_flags` set if your install needs a custom index
+    URL or other arguments
+- [ ] `process` inputs and outputs serialize, or the output is marked
+    `serializable=False`
 - [ ] No `add_parameter` / `remove_parameter_element` from inside
     `process`; use `AddParameterToNodeRequest` /
     `RemoveParameterFromNodeRequest` via
     `GriptapeNodes.handle_request(...)` instead
 - [ ] Cross-node / flow state passed in via parameters, not fetched
     from inside `process`
-- [ ] No connection hooks (`after_incoming_connection` and siblings)
-    overridden -- they never fire for a worker-hosted library
-- [ ] `before_value_set` / `after_value_set` used only for value
-    transformation, not editor-time reactivity or parameter-list
-    mutation
-- [ ] Custom `converters` / `validators` / `traits` either re-run
-    inside `process` or accepted as orchestrator-only UI sugar
-- [ ] `pip_dependencies` pinned to specific versions
-- [ ] `pip_install_flags` set if your install needs a custom index
-    URL or other arguments
 
 ## Strict mode is your safety net
 
@@ -436,17 +348,11 @@ from, prefixed with `Worker-<engine-id>` so you can tell it apart
 from orchestrator output. Look for both **WARNING** and **ERROR**
 entries.
 
-The five rules and their actual severities:
+One rule, checked while a node executes:
 
-| Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                                                                         |
-| --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`reentrant-bus-in-init`](strict_mode.md)                 | ERROR        | ERROR   | Correctness rule. The class is dropped from the library schema.                                                                                                                                               |
-| [`parameter-behaviors-dropped-in-schema`](strict_mode.md) | WARNING      | WARNING | Fires during library load when a `Parameter` carries `converters` / `validators` / `traits` that the worker schema cannot serialize. Does not escalate.                                                       |
-| [`connection-hooks-inert-on-worker`](strict_mode.md)      | WARNING      | WARNING | Fires during library load when a node class overrides a connection lifecycle hook. Those hooks run on the orchestrator against the stub, so the override never runs. Does not escalate.                       |
-| [`value-hooks-execute-only-on-worker`](strict_mode.md)    | WARNING      | WARNING | Fires during library load when a node class overrides `before_value_set` / `after_value_set`. Value transformation still works; editor-time reactivity and parameter-list mutation do not. Does not escalate. |
-| [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                                                                        |
+| Rule                                                   | Orchestrator | Worker | Notes                                                  |
+| ------------------------------------------------------ | ------------ | ------ | ------------------------------------------------------ |
+| [`parameter-mutation-during-aprocess`](strict_mode.md) | WARNING      | ERROR  | Promotes the node's result to a failure on the worker. |
 
 If a strict-mode line fires, the rule's remediation message names
-exactly which guideline above was violated and how to fix it. A
-worker log free of strict-mode WARNING and ERROR entries is the bar
-for "isolation-ready."
+exactly which guideline above was violated and how to fix it.

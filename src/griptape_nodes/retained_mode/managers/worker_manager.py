@@ -107,9 +107,8 @@ class WorkerManager(EngineScoped):
     # heartbeat timeout; see `orchestrator_silence_allowed_s` for why the two sides differ.
     MINIMUM_ORCHESTRATOR_SILENCE_S: float = 30.0
     # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
-    # on the boot wait for worker libraries, on `wait_until_executable`, and on each worker's reply to
-    # a project-switch fan-out. Not a heartbeat bound on either side: a worker keeps answering
-    # challenges while it loads.
+    # on `wait_until_executable` and on each worker's reply to a project-switch fan-out. Not a
+    # heartbeat bound on either side: a worker keeps answering challenges while it loads.
     DEFAULT_LIBRARY_LOAD_TIMEOUT_S: float = 600.0
     # How long to wait for a worker to exit after SIGTERM before escalating to
     # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
@@ -1001,22 +1000,6 @@ class WorkerManager(EngineScoped):
                 f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
             )
             raise RuntimeError(msg) from None
-
-    async def wait_for_libraries(self, library_names: list[str], timeout_s: float) -> list[str]:
-        """Wait for several libraries at once. Returns the names that did not settle in time.
-
-        Boot uses this rather than `wait_until_executable` per library: one collective ceiling, and
-        the caller decides what an unsettled library means for the rest of initialization.
-        """
-        pending = [name for name in library_names if not self.has_settled(name)]
-        if not pending:
-            return []
-        try:
-            with anyio.fail_after(timeout_s):
-                await asyncio.gather(*[self._execution_ready[name].wait() for name in pending])
-        except TimeoutError:
-            return [name for name in pending if not self.has_settled(name)]
-        return []
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

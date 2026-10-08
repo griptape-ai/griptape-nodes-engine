@@ -30,7 +30,6 @@ _LIBRARY_PATH = "/libraries/painter/griptape_nodes_library.json"
 def _lib_info(
     *,
     library_name: str | None = "Painter",
-    requires_worker: bool = False,
     executes_in_worker: bool = False,
     execution_unavailable_reason: str | None = None,
     execution_env_failure: str | None = None,
@@ -42,7 +41,6 @@ def _lib_info(
         library_path=_LIBRARY_PATH,
         is_sandbox=False,
         library_name=library_name,
-        requires_worker=requires_worker,
         executes_in_worker=executes_in_worker,
         execution_unavailable_reason=execution_unavailable_reason,
         execution_env_failure=execution_env_failure,
@@ -147,28 +145,19 @@ class TestWhyNoWorkerIsServingIt:
 
 
 class TestWorkerDeclarations:
-    """Both flags are reported, because they are not the same question.
+    """Where a library executes is reported, because a reader cannot otherwise tell.
 
-    Legacy worker mode keeps a library's nodes from loading in this process at all, so they
-    arrive as stubs from the worker; execution dependencies load the real nodes here and send
-    only `process()` out. Collapsing the two leaves a reader unable to tell an empty sidebar
-    entry from a node that cannot run.
+    The nodes load in this process either way, so a node that will not run looks identical in
+    the sidebar to one that will. `executes_in_worker` is what says a failure belongs to the
+    execution environment rather than to the library.
     """
 
-    def test_a_library_running_only_its_execution_in_a_worker(self) -> None:
-        entry = _entry(_lib_info(requires_worker=False, executes_in_worker=True))
+    def test_a_library_running_its_execution_in_a_worker(self) -> None:
+        entry = _entry(_lib_info(executes_in_worker=True))
 
-        assert entry.requires_worker is False
-        assert entry.executes_in_worker is True
-
-    def test_a_legacy_worker_mode_library(self) -> None:
-        entry = _entry(_lib_info(requires_worker=True, executes_in_worker=True))
-
-        assert entry.requires_worker is True
         assert entry.executes_in_worker is True
 
     def test_a_library_that_needs_no_worker_at_all(self) -> None:
         entry = _entry(_lib_info())
 
-        assert entry.requires_worker is False
         assert entry.executes_in_worker is False

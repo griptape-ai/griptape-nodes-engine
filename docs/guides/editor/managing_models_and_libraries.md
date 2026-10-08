@@ -9,7 +9,7 @@ Management** windows. This page covers both.
 <!-- screenshot (#5166): the Manage menu open, showing Model Management and Library Management items -->
 
 For the concepts behind libraries — how installs are isolated from each
-other, Shared vs. Isolated execution, and what to do when something goes
+other, where a library's nodes execute, and what to do when something goes
 wrong — see [Libraries](../libraries.md). This page is about the two
 management windows themselves.
 
@@ -161,7 +161,6 @@ re-cloning the library.
 ### Removing a library
 
 The Library Management window itself doesn't delete a library's files from
-disk — for that, plus toggling a library off without removing it, or
-choosing whether it runs Shared or Isolated, see
+disk — for that, plus toggling a library off without removing it, see
 [Toggling and removing libraries](../libraries.md#toggling-and-removing-libraries)
 in the Libraries guide.

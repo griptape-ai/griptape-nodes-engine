@@ -183,9 +183,9 @@ plugins:
           - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
-          - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - development/custom_nodes/node_isolation_with_workers.md: Running a library's node execution in a worker subprocess for dependency isolation
           - development/custom_nodes/passing_unserializable_values.md: Passing pipelines, tensors and other unserializable values between nodes across a worker process boundary
-          - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
+          - development/custom_nodes/strict_mode.md: Strict-mode rules checked while a node executes
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var

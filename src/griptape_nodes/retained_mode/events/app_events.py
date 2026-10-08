@@ -11,7 +11,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.values import Value
 
 
 class InitializationPhase(StrEnum):
@@ -209,49 +208,13 @@ class EngineInitializationProgress(AppPayload):
 
 
 @dataclass
-class WorkerParameterSchema:
-    """Serialized parameter from a worker-loaded node.
-
-    Contains the fields needed to reconstruct a Parameter on the orchestrator
-    without importing the worker library's Python modules.
-    """
-
-    name: str
-    type: str
-    input_types: list[str]
-    output_type: str
-    default_value: Value
-    tooltip: Any
-    tooltip_as_input: Any
-    tooltip_as_property: Any
-    tooltip_as_output: Any
-    mode_allowed_input: bool
-    mode_allowed_property: bool
-    mode_allowed_output: bool
-    user_defined: bool
-    settable: bool
-    serializable: bool
-    private: bool
-    exclude_from_metadata: bool
-    ui_options: dict | None
-
-
-@dataclass
-class WorkerNodeSchema:
-    """Serialized node from a worker-loaded library."""
-
-    class_name: str
-    parameters: list[WorkerParameterSchema]
-
-
-@dataclass
 @PayloadRegistry.register
 class LibraryLoadedNotification(AppPayload):
     """Notification that a library has finished loading, including its fitness outcome.
 
     Raised by the process that owns the library's record, so listeners including the GUI can update
-    their view of library health. For a library hosted in a worker that process is the orchestrator,
-    once it has accepted the worker's ``ReportLibraryLoadedRequest``.
+    their view of library health. For a library whose nodes execute in a worker that process is the
+    orchestrator, once it has accepted the worker's ``ReportLibraryLoadedRequest``.
 
     Args:
         library_name: Name of the library that was loaded.
@@ -269,8 +232,7 @@ class LibraryLoadedNotification(AppPayload):
 class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
     """Sent by a worker to the orchestrator to report how a library loaded in the worker.
 
-    The orchestrator never imported a worker-hosted library, so the worker's account is the only one
-    there is, and it is what releases anything waiting to route execution to that worker.
+    It is what releases anything waiting to route execution to that worker.
 
     ``SkipTheLineMixin`` because the orchestrator may be executing a node when this arrives, and that
     node can itself be waiting on this very report through ``WorkerManager.wait_until_executable``.
@@ -280,15 +242,11 @@ class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
         library_name: Name of the library that finished loading in the worker.
         fitness: Final fitness value (LibraryManager.LibraryFitness string).
         problem_details: Human-readable summary of problems, or None if there are none.
-        node_schemas: Serialized node/parameter schemas, set only for a library the orchestrator
-            cannot import, which registers stub classes from them. None for an execution-dependency
-            library, whose real classes the orchestrator already registered itself.
     """
 
     library_name: str
     fitness: str
     problem_details: str | None = None
-    node_schemas: list[WorkerNodeSchema] | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
