@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -61,13 +62,98 @@ class LibraryMetadataLoading(EngineScoped):
         event_manager.register_request_handlers(self)
 
     @handles(LoadLibraryMetadataFromFileRequest)
-    def load_library_metadata_from_file_request(  # noqa: PLR0911, C901
+    def load_library_metadata_from_file_request(
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
         """Load library metadata from a JSON file without loading the actual node modules.
 
         This method provides a lightweight way to get library schema information
         without the overhead of dynamically importing Python modules.
+        """
+        result = self._read_library_metadata(request)
+        if isinstance(result, LoadLibraryMetadataFromFileResultSuccess):
+            result.git_remote, result.git_ref = get_git_info(_library_dir(result))
+        return result
+
+    @handles(LoadMetadataForAllLibrariesRequest)
+    async def load_metadata_for_all_libraries_request(
+        self,
+        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
+    ) -> ResultPayload:
+        """Load metadata for all libraries from configuration without loading node modules.
+
+        This loads metadata from both library JSON files specified in configuration
+        and generates sandbox library metadata by scanning Python files without importing them.
+        """
+        successful_libraries = []
+        failed_libraries = []
+
+        # Discover library files for metadata loading
+        library_files = await self.engine.library_manager.discovery.discover_library_files()
+
+        # Load metadata for all discovered library files (including disabled ones,
+        # so their names/versions can be displayed in status output).
+        for discovered in library_files:
+            metadata_request = LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path)
+            metadata_result = await self._aload_library_metadata(metadata_request)
+
+            if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
+                # Stamp the user's verbatim registered_path onto the response so the GUI
+                # can map this metadata back to the matching `libraries_to_register` row
+                # without re-implementing the engine's path resolution logic.
+                metadata_result.registered_path = discovered.registered_path
+                successful_libraries.append(metadata_result)
+            else:
+                failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
+
+        # Generate sandbox library metadata if configured
+        sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
+        if sandbox_library_dir:
+            # Try to load existing JSON first - only scan if load fails
+            sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME
+            sandbox_result = await self._aload_library_metadata(
+                LoadLibraryMetadataFromFileRequest(file_path=str(sandbox_json_path))
+            )
+
+            # If load failed, it either didn't exist or was malformed. Try scanning, which will generate a fresh one.
+            if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultFailure):
+                scan_result = self.engine.library_manager.sandbox.scan_sandbox_directory_request(
+                    ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
+                )
+                # Map scan result to load result for consistency
+                if isinstance(scan_result, ScanSandboxDirectoryResultSuccess):
+                    sandbox_result = LoadLibraryMetadataFromFileResultSuccess(
+                        library_schema=scan_result.library_schema,
+                        file_path=str(sandbox_json_path),
+                        git_remote=None,
+                        git_ref=None,
+                        enabled=True,
+                        is_registered=is_library_name_registered(scan_result.library_schema.name),
+                        result_details=scan_result.result_details,
+                    )
+                # else: Keep the load failure result
+
+            if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultSuccess):
+                successful_libraries.append(sandbox_result)
+            else:
+                failed_libraries.append(sandbox_result)
+
+        details = (
+            f"Successfully loaded metadata for {len(successful_libraries)} libraries, {len(failed_libraries)} failed"
+        )
+        return LoadMetadataForAllLibrariesResultSuccess(
+            successful_libraries=successful_libraries,
+            failed_libraries=failed_libraries,
+            result_details=details,
+        )
+
+    def _read_library_metadata(  # noqa: PLR0911, C901
+        self, request: LoadLibraryMetadataFromFileRequest
+    ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
+        """Validate a library JSON file into metadata, leaving the git details unset.
+
+        The git lookup is left to the caller because it spawns several git subprocesses,
+        which the async handler has to keep off the event loop.
         """
         file_path = request.file_path
 
@@ -200,92 +286,34 @@ class LibraryMetadataLoading(EngineScoped):
                 result_details=details,
             )
 
-        # Use get_git_info (not get_git_remote + get_current_ref) to open the repo once
-        # instead of three times — this is called for every library on every metadata load.
-        library_dir = json_path.parent.absolute()
-        git_remote, git_ref = get_git_info(library_dir)
-
         existing_info = self.engine.library_manager._library_file_path_to_info.get(file_path)
         enabled = existing_info.enabled if existing_info is not None else True
         details = f"Successfully loaded library metadata from JSON file at {json_path}"
         return LoadLibraryMetadataFromFileResultSuccess(
             library_schema=library_data,
             file_path=file_path,
-            git_remote=git_remote,
-            git_ref=git_ref,
+            git_remote=None,
+            git_ref=None,
             enabled=enabled,
             is_registered=is_library_name_registered(library_data.name),
             result_details=details,
         )
 
-    @handles(LoadMetadataForAllLibrariesRequest)
-    async def load_metadata_for_all_libraries_request(
-        self,
-        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
-    ) -> ResultPayload:
-        """Load metadata for all libraries from configuration without loading node modules.
+    async def _aload_library_metadata(
+        self, request: LoadLibraryMetadataFromFileRequest
+    ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
+        """Load one library's metadata, running its git lookup off the event loop.
 
-        This loads metadata from both library JSON files specified in configuration
-        and generates sandbox library metadata by scanning Python files without importing them.
+        The editor polls `LoadMetadataForAllLibrariesRequest` repeatedly while the engine starts
+        up, and git subprocesses are slow to spawn on Windows. Run on the loop, every library's
+        lookups stall engine initialization for the length of the whole poll.
         """
-        successful_libraries = []
-        failed_libraries = []
+        result = self._read_library_metadata(request)
+        if isinstance(result, LoadLibraryMetadataFromFileResultSuccess):
+            result.git_remote, result.git_ref = await asyncio.to_thread(get_git_info, _library_dir(result))
+        return result
 
-        # Discover library files for metadata loading
-        library_files = await self.engine.library_manager.discovery.discover_library_files()
 
-        # Load metadata for all discovered library files (including disabled ones,
-        # so their names/versions can be displayed in status output).
-        for discovered in library_files:
-            metadata_request = LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path)
-            metadata_result = self.load_library_metadata_from_file_request(metadata_request)
-
-            if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
-                # Stamp the user's verbatim registered_path onto the response so the GUI
-                # can map this metadata back to the matching `libraries_to_register` row
-                # without re-implementing the engine's path resolution logic.
-                metadata_result.registered_path = discovered.registered_path
-                successful_libraries.append(metadata_result)
-            else:
-                failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
-
-        # Generate sandbox library metadata if configured
-        sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
-        if sandbox_library_dir:
-            # Try to load existing JSON first - only scan if load fails
-            sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME
-            sandbox_result = self.load_library_metadata_from_file_request(
-                LoadLibraryMetadataFromFileRequest(file_path=str(sandbox_json_path))
-            )
-
-            # If load failed, it either didn't exist or was malformed. Try scanning, which will generate a fresh one.
-            if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultFailure):
-                scan_result = self.engine.library_manager.sandbox.scan_sandbox_directory_request(
-                    ScanSandboxDirectoryRequest(directory_path=str(sandbox_library_dir))
-                )
-                # Map scan result to load result for consistency
-                if isinstance(scan_result, ScanSandboxDirectoryResultSuccess):
-                    sandbox_result = LoadLibraryMetadataFromFileResultSuccess(
-                        library_schema=scan_result.library_schema,
-                        file_path=str(sandbox_json_path),
-                        git_remote=None,
-                        git_ref=None,
-                        enabled=True,
-                        is_registered=is_library_name_registered(scan_result.library_schema.name),
-                        result_details=scan_result.result_details,
-                    )
-                # else: Keep the load failure result
-
-            if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultSuccess):
-                successful_libraries.append(sandbox_result)
-            else:
-                failed_libraries.append(sandbox_result)
-
-        details = (
-            f"Successfully loaded metadata for {len(successful_libraries)} libraries, {len(failed_libraries)} failed"
-        )
-        return LoadMetadataForAllLibrariesResultSuccess(
-            successful_libraries=successful_libraries,
-            failed_libraries=failed_libraries,
-            result_details=details,
-        )
+def _library_dir(result: LoadLibraryMetadataFromFileResultSuccess) -> Path:
+    """Directory holding the library JSON, which is where its git repository is looked up."""
+    return Path(result.file_path).parent.absolute()
