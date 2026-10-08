@@ -1996,6 +1996,7 @@ class NodeManager(EngineScoped):
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
         )
+        new_param.default_value = NodeManager._widen_int_for_float(new_param, new_param.default_value)
         # Hand saved state to the traits so their converters, validators, and rendered
         # options match what was saved.
         if request.traits:
@@ -2376,6 +2377,7 @@ class NodeManager(EngineScoped):
             parameter.default_value = None
         elif request.default_value is not None:
             parameter.default_value = request.default_value
+        parameter.default_value = NodeManager._widen_int_for_float(parameter, parameter.default_value)
         if request.mode_allowed_input is not None:
             # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
             if request.mode_allowed_input is True:
@@ -2529,11 +2531,18 @@ class NodeManager(EngineScoped):
                     result_details=ResultDetails(message=details, level=logging.WARNING)
                 )
             self.modify_key_parameter_fields(request, element)
+            if request.parameter_name in node.parameter_values:
+                node.parameter_values[request.parameter_name] = NodeManager._widen_int_for_float(
+                    element, node.parameter_values[request.parameter_name]
+                )
 
         # This field requires the node as well
         if request.default_value is not None:
             # TODO: https://github.com/griptape-ai/griptape-nodes/issues/825
-            node.parameter_values[request.parameter_name] = request.default_value
+            default_value = request.default_value
+            if isinstance(element, Parameter):
+                default_value = NodeManager._widen_int_for_float(element, default_value)
+            node.parameter_values[request.parameter_name] = default_value
 
         details = f"Successfully altered details for Element '{request.parameter_name}' from Node '{node_name}'."
         result = AlterParameterDetailsResultSuccess(result_details=details)
@@ -2736,7 +2745,7 @@ class NodeManager(EngineScoped):
                     return result
 
         # Store original values in temp vars before calling before_value_set
-        parameter_value = request.value
+        parameter_value = NodeManager._widen_int_for_float(parameter, request.value)
         parameter_value_type = request.data_type
 
         # Call before_value_set hook (allows nodes to modify values and temporarily control settable state)
@@ -4831,6 +4840,26 @@ class NodeManager(EngineScoped):
                 continue
             entry["trait_module"] = stable_namespace
         return trait_states
+
+    @staticmethod
+    def _widen_int_for_float(parameter: Parameter, value: Any) -> Any:
+        """Return a whole-number int as a float when the parameter is declared float.
+
+        JSON can't tell ``2.0`` from ``2``, so the editor sends whole-number floats as ints. A plain
+        ``Parameter(type="float")`` has no converter to undo that. A parameter that also accepts
+        ``int`` keeps its ints, and ``bool``, an ``int`` subclass, is left alone.
+        """
+        if ParameterType.attempt_get_builtin(parameter.type) != ParameterTypeBuiltin.FLOAT:
+            return value
+        accepts_int = any(
+            ParameterType.attempt_get_builtin(input_type) == ParameterTypeBuiltin.INT
+            for input_type in parameter.input_types
+        )
+        if accepts_int:
+            return value
+        if not isinstance(value, int) or isinstance(value, bool):
+            return value
+        return float(value)
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
