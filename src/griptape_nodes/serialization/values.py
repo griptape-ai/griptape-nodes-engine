@@ -147,7 +147,8 @@ def untag(data: JsonValue) -> JsonValue:
     """Return encoded ``data`` without its type tags, for a client that reads plain JSON.
 
     Each tagged value becomes its state: a tuple its list, an enum its value, an artifact its
-    fields. A dict key that is not text becomes its JSON text. Not reversible.
+    fields. A dict key that is not text becomes its JSON text. Not reversible, except that a dict
+    with its own ``"$type"`` key stays wrapped, so a client sending it back sets a dict.
     """
     if isinstance(data, list):
         return [untag(item) for item in data]
@@ -164,8 +165,8 @@ def _untag_tagged(data: dict[str, JsonValue]) -> JsonValue:
     state = data[VALUE_KEY]
     if data[TYPE_KEY] == _DICT_TYPE_NAME:
         if isinstance(state, dict):
-            # A wrapped dict: its own "$type" key is data, not a tag.
-            return {key: untag(item) for key, item in state.items()}
+            # Wrapped because its own "$type" key is data. Unwrapped, that key would read as a tag.
+            return {TYPE_KEY: _DICT_TYPE_NAME, VALUE_KEY: {key: untag(item) for key, item in state.items()}}
         if isinstance(state, list):
             pairs = cast("list[list[JsonValue]]", state)
             return {_key_text(untag(key)): untag(item) for key, item in pairs}

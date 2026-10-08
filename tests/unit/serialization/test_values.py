@@ -563,7 +563,7 @@ class TestUntag:
             ({1, 2}, [1, 2]),
             (Color.RED, "red"),
             (Size.SMALL, 1),
-            (Path("a/b.png"), "a/b.png"),
+            (Path("a/b.png"), str(Path("a/b.png"))),
             (b"\x00\x01\xff", "AAH/"),
             (float("nan"), "nan"),
             (Span(1, 2), {"start": 1, "end": 2}),
@@ -585,10 +585,16 @@ class TestUntag:
     def test_keys_that_are_not_text_become_json_text(self) -> None:
         assert untag(encode_value({1: "one", (2, 3): "x"})) == {"1": "one", "[2,3]": "x"}
 
-    def test_dict_with_its_own_type_key_keeps_it(self) -> None:
+    def test_dict_with_its_own_type_key_stays_wrapped_and_comes_back_a_dict(self) -> None:
         value = {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": (1, 2)}
 
-        assert untag(encode_value(value)) == {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": [1, 2]}
+        untagged = untag(encode_value(value))
+
+        assert untagged == {
+            TYPE_KEY: "builtins:dict",
+            VALUE_KEY: {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": [1, 2]},
+        }
+        assert decode_value(untagged) == {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": [1, 2]}
 
     def test_plain_data_is_unchanged(self) -> None:
         value = {"a": [1, {"b": None}], "c": "d"}
