@@ -350,6 +350,9 @@ class BaseNode(ABC):
         None  # The control input parameter used to enter this node during execution
     )
     lock: bool = False  # When lock is true, the node is locked and can't be modified. When lock is false, the node is unlocked and can be modified.
+    # True when the node reads RESOLVED only because a run passed through it while it was locked,
+    # not because it executed. Unlocking such a node unresolves it so the next run executes it.
+    resolved_while_locked: bool = False
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired

@@ -234,6 +234,11 @@ class ExecuteDagState(State):
 
             return
 
+        # A locked node passes its frozen outputs through without executing. Record when that pass
+        # is the only reason it now reads RESOLVED, so unlocking it can put it back in the next run.
+        current_node.resolved_while_locked = current_node.lock and (
+            current_node.resolved_while_locked or current_node.state != NodeResolutionState.RESOLVED
+        )
         # Publish all parameter updates.
         current_node.state = NodeResolutionState.RESOLVED
         ExecuteDagState._unresolve_if_an_input_was_torn_down(current_node)

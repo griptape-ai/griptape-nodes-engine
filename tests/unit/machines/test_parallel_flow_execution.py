@@ -770,3 +770,67 @@ class TestLockedNodeIsNeverQueuedOrExecuted:
 
         assert result.leaf_nodes == {"locked"}
         assert context.node_to_reference["locked"].node_state == NodeState.WAITING
+
+
+class TestLockedNodeRecordsResolvingWithoutExecuting:
+    """A run passing through a locked node marks it RESOLVED without executing it.
+
+    The node records when that pass is the only reason it reads RESOLVED, so that unlocking it can
+    unresolve it and the next downstream run executes it.
+    """
+
+    @staticmethod
+    def _context_with_done_node(node: MagicMock) -> ParallelResolutionContext:
+        graph = DirectedGraph()
+        graph.add_node(node.name)
+
+        dag_builder = DagBuilder()
+        dag_builder.graphs[node.name] = graph
+        dag_builder.node_to_reference[node.name] = DagNode(node_reference=node, node_state=NodeState.DONE)
+
+        context = ParallelResolutionContext(
+            "flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=MagicMock()
+        )
+        context.engine.event_manager.aput_event = AsyncMock()
+        return context
+
+    @staticmethod
+    def _node(state: NodeResolutionState, *, lock: bool, resolved_while_locked: bool = False) -> MagicMock:
+        node = MagicMock(spec=BaseNode)
+        node.name = "node"
+        node.lock = lock
+        node.state = state
+        node.resolved_while_locked = resolved_while_locked
+        node.parameter_values = {}
+        node.parameter_output_values = {}
+        node.consume_deferred_reset_flag.return_value = False
+        return node
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("lock", "state", "resolved_while_locked", "expected"),
+        [
+            pytest.param(True, NodeResolutionState.UNRESOLVED, False, True, id="locked-never-ran"),
+            pytest.param(True, NodeResolutionState.RESOLVED, False, False, id="locked-after-running"),
+            pytest.param(True, NodeResolutionState.RESOLVED, True, True, id="locked-passed-through-again"),
+            pytest.param(False, NodeResolutionState.RESOLVING, True, False, id="unlocked-executed"),
+        ],
+    )
+    async def test_records_whether_the_node_resolved_without_executing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        lock: bool,
+        state: NodeResolutionState,
+        resolved_while_locked: bool,
+        expected: bool,
+    ) -> None:
+        node = self._node(state, lock=lock, resolved_while_locked=resolved_while_locked)
+        context = self._context_with_done_node(node)
+        monkeypatch.setattr(ExecuteDagState, "get_next_control_graph", MagicMock())
+        monkeypatch.setattr(ExecuteDagState, "check_for_new_start_nodes", MagicMock())
+
+        await ExecuteDagState.handle_done_nodes(context, context.node_to_reference["node"], "node")
+
+        assert node.state == NodeResolutionState.RESOLVED
+        assert node.resolved_while_locked is expected
