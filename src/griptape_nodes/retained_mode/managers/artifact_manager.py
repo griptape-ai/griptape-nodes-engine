@@ -765,7 +765,7 @@ class ArtifactManager(EngineScoped):
             Success with path_to_preview string, or failure with details
         """
         # FAILURE CASE: Verify source file exists and get its metadata
-        file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
+        file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False, broadcast_result=False)
         file_info_result = self.engine.handle_request(file_info_request)
 
         if not isinstance(file_info_result, GetFileInfoResultSuccess):

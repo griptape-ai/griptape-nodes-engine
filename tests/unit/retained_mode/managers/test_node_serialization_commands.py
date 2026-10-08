@@ -370,6 +370,17 @@ class TestSerializeNodeToCommandsBasics:
 
         assert isinstance(result, SerializeNodeToCommandsResultFailure)
 
+    def test_reference_node_broadcasts_no_events(
+        self, engine: Engine, library_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        events: list[object] = []
+        monkeypatch.setattr(engine.event_manager, "put_event", events.append)
+
+        _serialize(engine, node_name)
+
+        assert events == []
+
 
 class TestElementModificationCommands:
     """User-defined parameters replay via AddParameterToNodeRequest; library ones only diff."""

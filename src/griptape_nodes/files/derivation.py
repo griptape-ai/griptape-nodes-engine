@@ -113,7 +113,7 @@ def resolve_file_extension_directory(extension: str, extra_vars: Mapping[str, st
     """
     if not extension:
         return None
-    project_result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
+    project_result = GriptapeNodes.handle_request(GetCurrentProjectRequest(broadcast_result=False))
     if not isinstance(project_result, GetCurrentProjectResultSuccess):
         return None
     raw_macro = project_result.project_info.template.file_extension_directories.get(extension.lower())
@@ -129,7 +129,7 @@ def resolve_file_extension_directory(extension: str, extra_vars: Mapping[str, st
         k: v for k, v in (extra_vars or {}).items() if k not in ("file_name_base", "file_extension")
     }
     resolve_result = GriptapeNodes.handle_request(
-        GetPathForMacroRequest(parsed_macro=ParsedMacro(raw_macro), variables=resolution_vars)
+        GetPathForMacroRequest(parsed_macro=ParsedMacro(raw_macro), variables=resolution_vars, broadcast_result=False)
     )
     if not isinstance(resolve_result, GetPathForMacroResultSuccess):
         logger.warning(

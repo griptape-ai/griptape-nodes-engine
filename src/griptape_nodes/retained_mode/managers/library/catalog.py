@@ -400,7 +400,7 @@ class LibraryCatalog(EngineScoped):
             # that resolves against the library -- e.g. ``get_declared_models``
             # populating a model dropdown from the ``model_catalog`` -- works
             # during the probe just as it does under ``create_node``.
-            with LibraryRegistry.constructing_node():
+            with LibraryRegistry.constructing_node(throwaway=True):
                 probe_node = node_class(
                     name=probe_name,
                     metadata={"library": library_name, "node_type": request.node_type},
