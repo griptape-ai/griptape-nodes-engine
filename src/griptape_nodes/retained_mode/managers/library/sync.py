@@ -49,6 +49,12 @@ class LibrarySync(EngineScoped):
     @handles(SyncLibrariesRequest)
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return SyncLibrariesResultFailure(
+                result_details=managed.environment_provides_libraries_message("sync libraries")
+            )
+
         # Phase 1: Download missing libraries from both config keys
         config_mgr = self.engine.config_manager
 

@@ -43,6 +43,10 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.external_environment import (
+    LIBRARY_PATHS_ENV_VAR,
+    library_paths_from_environment,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     LibraryProblem,
     NodePermissionDeniedProblem,
@@ -96,10 +100,14 @@ class DiscoveredLibraryEntry(NamedTuple):
 
     For directory entries that expand into multiple library files, every discovered
     child shares the parent directory's `registered_path`.
+
+    `from_environment` is True for a library listed in `GTN_LIBRARY_PATHS`, whose
+    `registered_path` is then the verbatim entry from that variable.
     """
 
     registration: LibraryRegistration
     registered_path: str
+    from_environment: bool = False
 
 
 class ResolvedDiscoveryPath(NamedTuple):
@@ -233,7 +241,7 @@ class LibraryDiscovery(EngineScoped):
                 urls_added,
             )
 
-    async def discover_libraries_request(
+    async def discover_libraries_request(  # noqa: C901 (sandbox, environment, and config sources each branch)
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
@@ -251,9 +259,24 @@ class LibraryDiscovery(EngineScoped):
 
         discovered_libraries = []
         seen_libraries = set()
+        managed = self.engine.library_manager.managed_environment
+        environment_mode = managed.provisioned_by_environment()
+        managed.environment_library_paths = managed.environment_paths_from(config_library_entries)
+
+        # The environment decides every library that loads, so the sandbox is reported rather
+        # than scanned: scanning writes its manifest into the workspace.
+        if request.include_sandbox and environment_mode:
+            sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
+            if sandbox_library_dir:
+                managed.create_not_provided_library_info_entry(
+                    str(sandbox_library_dir / LIBRARY_CONFIG_FILENAME),
+                    is_sandbox=True,
+                    enabled=True,
+                    registered_path=None,
+                )
 
         # Process sandbox library first if requested
-        if request.include_sandbox:
+        if request.include_sandbox and not environment_mode:
             sandbox_library_dir = self.engine.library_manager.sandbox.get_sandbox_directory()
             if sandbox_library_dir:
                 # Generate/update the sandbox library JSON file
@@ -291,6 +314,17 @@ class LibraryDiscovery(EngineScoped):
             entry = discovered.registration
             file_path = Path(entry.path)
             file_path_str = entry.path
+
+            # A configured library the environment does not provide is recorded with the reason and
+            # left out of the discovered list, so nothing tries to load it.
+            if environment_mode and not discovered.from_environment:
+                managed.create_not_provided_library_info_entry(
+                    file_path_str,
+                    is_sandbox=False,
+                    enabled=entry.enabled,
+                    registered_path=discovered.registered_path,
+                )
+                continue
 
             # Add to discovered libraries with is_sandbox=False
             if file_path not in seen_libraries:
@@ -510,7 +544,7 @@ class LibraryDiscovery(EngineScoped):
 
         return LoadLibrariesResultSuccess(result_details=ResultDetails(message=message, level=logging.INFO))
 
-    async def discover_library_files(self) -> list[DiscoveredLibraryEntry]:
+    async def discover_library_files(self) -> list[DiscoveredLibraryEntry]:  # noqa: C901 (environment, config, and download sources each branch)
         """Discover library JSON files from config and workspace recursively.
 
         Returns:
@@ -525,7 +559,9 @@ class LibraryDiscovery(EngineScoped):
         discovered_entries: list[DiscoveredLibraryEntry] = []
         seen_paths: set[Path] = set()
 
-        async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
+        async def process_path(
+            path: Path, *, enabled: bool, registered_path: str, from_environment: bool = False
+        ) -> None:
             """Process a path, handling both files and directories."""
             if await anyio.Path(path).is_dir():
                 # Recursively find library files. find_files_recursive skips hidden
@@ -542,6 +578,7 @@ class LibraryDiscovery(EngineScoped):
                             DiscoveredLibraryEntry(
                                 registration=LibraryRegistration(path=str(lib_path), enabled=enabled),
                                 registered_path=registered_path,
+                                from_environment=from_environment,
                             )
                         )
             elif path.suffix == ".json" and path not in seen_paths:
@@ -550,8 +587,25 @@ class LibraryDiscovery(EngineScoped):
                     DiscoveredLibraryEntry(
                         registration=LibraryRegistration(path=str(path), enabled=enabled),
                         registered_path=registered_path,
+                        from_environment=from_environment,
                     )
                 )
+
+        # Libraries the environment provides come first, so a libraries_to_register entry naming the
+        # same manifest is the duplicate, not the environment's copy. Read from the engine's startup
+        # environment, not a project's: a project template must not change which libraries the
+        # environment provides.
+        startup_environ = self.engine.project_manager.get_pre_project_environ()
+        for environment_path in library_paths_from_environment(startup_environ):
+            resolved = resolve_discovery_path(LibraryRegistration(path=environment_path), config_mgr.workspace_path)
+            if resolved is None:
+                logger.warning(
+                    "Ignoring '%s' in %s: there is no library at that path.", environment_path, LIBRARY_PATHS_ENV_VAR
+                )
+                continue
+            await process_path(
+                resolved.path, enabled=True, registered_path=resolved.registered_path, from_environment=True
+            )
 
         # Add from config
         config_libraries = config_mgr.get_config_value(user_libraries_section, default=[])
@@ -559,6 +613,12 @@ class LibraryDiscovery(EngineScoped):
             resolved = resolve_discovery_path(entry, config_mgr.workspace_path)
             if resolved is not None:
                 await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
+
+        # Nothing is downloaded when the environment provides the libraries, so there is no
+        # provisioned copy to find. The libraries_to_register entries above are still discovered,
+        # so each can be reported as not provided rather than silently vanishing.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            return discovered_entries
 
         # Add provisioned git-sourced libraries. Each libraries_to_download entry is
         # cloned into the workspace libraries_directory by reconcile; discovery

@@ -29,6 +29,7 @@ DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+LIBRARY_PROVISIONED_BY_KEY = "library.provisioned_by"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 LOG_TO_FILE_KEY = "logging.log_to_file"
@@ -36,16 +37,17 @@ LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
 SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
-# are always strings, so under this flag beta feature entries are converted to booleans, and one
-# that can't be converted fails validation so the variable is reported as a bad value.
-BETA_FEATURES_FROM_ENV_CONTEXT = "beta_features_from_env"
+# are always strings, so validators that need a typed value convert under this flag, and a value
+# that can't be converted fails validation so the variable is reported as a bad value instead of
+# silently becoming a default. Beta feature entries and `library.provisioned_by` read it.
+FROM_ENV_CONTEXT = "from_env"
 
 logger = logging.getLogger("griptape_nodes")
 
 _BOOL_ADAPTER = TypeAdapter(bool)
 # (config key, repr of value) pairs already warned about. Settings is validated on every config
 # reload, so without this one bad entry would log the same warning many times per session.
-_reported_invalid_beta_features: set[tuple[str, str]] = set()
+_reported_invalid_settings: set[tuple[str, str]] = set()
 
 
 def _validate_beta_feature_map(map_key: str, v: Any, *, from_env: bool) -> dict[str, bool]:
@@ -95,13 +97,13 @@ def _env_value_to_bool(config_key: str, value: Any) -> bool:
         raise ValueError(msg) from e
 
 
-def _warn_once(report_key: tuple[str, str], message: str) -> None:
-    """Log a beta feature warning the first time this (config key, value) pair is seen."""
-    if report_key in _reported_invalid_beta_features:
+def _warn_once(report_key: tuple[str, str], message: str, *, level: int = logging.WARNING) -> None:
+    """Log a settings warning the first time this (config key, value) pair is seen."""
+    if report_key in _reported_invalid_settings:
         return
 
-    _reported_invalid_beta_features.add(report_key)
-    logger.warning(message)
+    _reported_invalid_settings.add(report_key)
+    logger.log(level, message)
 
 
 class Category(BaseModel):
@@ -374,7 +376,26 @@ class LibraryDependencyInstallBehavior(StrEnum):
     NEVER = "never"
 
 
+class LibraryProvisioner(StrEnum):
+    ENGINE = "engine"
+    ENVIRONMENT = "environment"
+
+
 class LibrarySettings(BaseModel):
+    provisioned_by: LibraryProvisioner = Field(
+        default=LibraryProvisioner.ENGINE,
+        description=(
+            "What provides libraries and their Python dependencies. 'engine' (the default) has the engine "
+            "download libraries, build a virtual environment for each one, and install its dependencies. "
+            "'environment' is for an engine started inside an environment another tool has already "
+            "prepared: the engine loads only the libraries listed in the GTN_LIBRARY_PATHS environment "
+            "variable, never builds virtual environments, never downloads, updates, or installs "
+            "libraries, and marks every other configured library (libraries_to_register entries and the "
+            "sandbox library) as not provided by the environment. A library dependency is then "
+            "satisfied only by a library the environment provides. Any other value is treated as "
+            "'environment' and reported as an error, so a misspelled value never downloads or builds."
+        ),
+    )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
         default=LibraryDependencyInstallBehavior.ALWAYS,
         description=(
@@ -411,6 +432,33 @@ class LibrarySettings(BaseModel):
             "time."
         ),
     )
+
+    @field_validator("provisioned_by", mode="before")
+    @classmethod
+    def validate_provisioned_by(cls, v: Any, info: ValidationInfo) -> LibraryProvisioner:  # noqa: ARG003 (both sources fail closed the same way)
+        """Accept any letter case, and fail closed on anything else.
+
+        A value that is neither 'engine' nor 'environment', from a config file or a
+        GTN_CONFIG_LIBRARY__PROVISIONED_BY variable, is treated as 'environment' and reported as an
+        error. Falling back to 'engine' instead would have a launcher's misspelled 'environment'
+        download, build, and prune exactly what the environment was meant to provide, after one
+        warning that is easy to miss because GTN_LIBRARY_PATHS libraries still load either way.
+        """
+        if isinstance(v, LibraryProvisioner):
+            return v
+        if isinstance(v, str):
+            try:
+                return LibraryProvisioner(v.strip().lower())
+            except ValueError:
+                pass
+        _warn_once(
+            (LIBRARY_PROVISIONED_BY_KEY, repr(v)),
+            f"{LIBRARY_PROVISIONED_BY_KEY} is {v!r}, which is neither 'engine' nor 'environment'. Treating it as "
+            "'environment' so nothing is downloaded, built, or installed: only libraries listed in GTN_LIBRARY_PATHS "
+            "load. Fix the value to use the engine's own provisioning.",
+            level=logging.ERROR,
+        )
+        return LibraryProvisioner.ENVIRONMENT
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod
@@ -657,17 +705,17 @@ class Settings(BaseModel):
         because the merged config keeps raw values and readers would treat it as unset anyway.
 
         A `GTN_CONFIG_BETA_FEATURES__<ID>` variable is the exception. It is validated under
-        `BETA_FEATURES_FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
+        `FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
         it can't, so the env loader reports the variable as having an invalid value.
         """
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         return _validate_beta_feature_map(BETA_FEATURES_KEY, v, from_env=from_env)
 
     @field_validator("library_beta_features", mode="before")
     @classmethod
     def validate_library_beta_features(cls, v: Any, info: ValidationInfo) -> dict[str, dict[str, bool]]:
         """Apply the `beta_features` rules to each library's map, one library at a time."""
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         if not isinstance(v, dict) and from_env:
             msg = f"{LIBRARY_BETA_FEATURES_KEY} must be a map of library names to feature maps, got {v!r}"
             raise ValueError(msg)
