@@ -21,6 +21,9 @@ from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
 class StartFlow(StartNode):
     """The packaged body's entry node."""
 
+    def process(self) -> None:
+        return None
+
 
 class EndFlow(EndNode):
     """The packaged body's exit node."""
@@ -52,6 +55,74 @@ class LoopBodyNode(DataNode):
 
     def process(self) -> None:
         self.parameter_output_values["result"] = self.get_parameter_value("text") or ""
+
+
+class LoopJoinNode(DataNode):
+    """A body node with two inputs, so one can come from outside the loop: ``prefix`` + ``item``."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="prefix",
+                tooltip="Text to put first",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="item",
+                tooltip="Value to put after the prefix",
+                input_types=["any"],
+                type="any",
+                default_value="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="result",
+                tooltip="Joined text",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        prefix = self.get_parameter_value("prefix") or ""
+        item = self.get_parameter_value("item")
+        self.parameter_output_values["result"] = f"{prefix}{item}"
+
+
+class LoopResultsNode(DataNode):
+    """Sits after a loop and takes its ``results``: copies ``items`` to ``result``."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="items",
+                tooltip="The loop's results",
+                type="list",
+                default_value=[],
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="result",
+                tooltip="The loop's results, copied",
+                type="list",
+                default_value=[],
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        self.parameter_output_values["result"] = list(self.get_parameter_value("items") or [])
 
 
 class LoopEndNode(BaseIterativeEndNode):

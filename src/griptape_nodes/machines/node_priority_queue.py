@@ -69,6 +69,8 @@ class NodePriorityQueue:
         Returns:
             The name of the highest priority node, or None if queue is empty
         """
+        self._drop_nodes_missing_from_dag()
+
         if self._needs_reorder:
             self._reorder()
             self._needs_reorder = False
@@ -123,6 +125,20 @@ class NodePriorityQueue:
 
         self._blocked_nodes = nodes_still_blocked
         return promoted_count
+
+    def _drop_nodes_missing_from_dag(self) -> None:
+        """Forget queued and blocked nodes the DAG no longer has.
+
+        A node can leave the DAG while it waits here: packaging a loop body pulls in data nodes
+        from outside the loop and removes them from the DAG the loop runs in, without reaching
+        this queue. Every lookup below assumes a queued name is still in the DAG.
+        """
+        if not self._queued_nodes and not self._blocked_nodes:
+            return
+
+        node_to_reference = self._context.node_to_reference
+        self._queued_nodes = [name for name in self._queued_nodes if name in node_to_reference]
+        self._blocked_nodes = [name for name in self._blocked_nodes if name in node_to_reference]
 
     def _reorder(self) -> None:
         """Reorder the queue based on current node priorities."""
