@@ -54,6 +54,9 @@ class FileIOFailureReason(StrEnum):
         "extension_mismatch"  # Sniffed byte format disagrees with destination suffix and coercion is disabled
     )
 
+    # Configuration errors
+    NOT_CONFIGURED = "not_configured"  # A setting the operation needs (e.g. a viewer executable) is empty
+
     # Generic errors
     IO_ERROR = "io_error"  # Generic I/O error
     UNKNOWN = "unknown"  # Unexpected error
@@ -142,6 +145,59 @@ class OpenAssociatedFileResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
     Attributes:
         failure_reason: Classification of why the open failed
+        result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason
+
+
+@dataclass
+@PayloadRegistry.register
+class LaunchExternalViewerRequest(RequestPayload):
+    """Open a file in the external viewer application the user configured for a library.
+
+    Use when: A node offers an "open in external viewer" action for its output files
+    (EXR, HDR, 3D assets) and the user picks the application in the library's settings.
+
+    The viewer is launched as `<viewer_executable> <viewer_args...> <path_to_file>`, read from the
+    `<config_category>.viewer_executable` setting (a path, used as is) and the optional
+    `<config_category>.viewer_args` setting (split with shell-style quoting). The viewer is
+    launched detached and the request returns without waiting for it.
+
+    Args:
+        path_to_file: Path to the file to open
+        config_category: Settings category holding `viewer_executable` and `viewer_args` (e.g. "openexr")
+        fallback_to_os_default: When no viewer is configured, open the file with the operating
+            system's associated application instead of failing
+
+    Results: LaunchExternalViewerResultSuccess | LaunchExternalViewerResultFailure (path not found,
+        no viewer configured, viewer failed to launch)
+    """
+
+    path_to_file: str
+    config_category: str
+    fallback_to_os_default: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class LaunchExternalViewerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """External viewer launched, or the file was opened with the OS default application.
+
+    Attributes:
+        used_fallback: True when no viewer was configured and the OS default application was used
+    """
+
+    used_fallback: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class LaunchExternalViewerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """External viewer launch failed.
+
+    Attributes:
+        failure_reason: Classification of why the launch failed
         result_details: Human-readable error message (inherited from ResultPayloadFailure)
     """
 
