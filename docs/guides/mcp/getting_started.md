@@ -105,6 +105,9 @@ To create a new MCP Server you'll need to configure the appropriate MCP Server s
 
     Notice we just modified the **command** and **args** settings to match what was in the docs.
 
+    If the server fails to start with `[Errno 2] No such file or directory: 'uvx'`, see
+    [Server Won't Start](./connection_types/stdio.md#server-wont-start).
+
     **Optional: Add Custom Rules**
 
     You can optionally add custom rules in the **Rules** text area to provide instructions for the AI agent when using this MCP server. These rules are automatically applied when the agent uses tools from this server.

@@ -87,8 +87,8 @@ For detailed information about the filesystem server's capabilities and configur
   "args": [
     "-y",
     "@modelcontextprotocol/server-filesystem",
-    "/Users/jason/Desktop",
-    "/Users/jason/Downloads"
+    "/Users/<username>/Desktop",
+    "/Users/<username>/Downloads"
   ],
   "env": {},
   "cwd": null,
@@ -97,7 +97,10 @@ For detailed information about the filesystem server's capabilities and configur
 }
 ```
 
-> **Important**: Replace `/Users/jason/Desktop` and `/Users/jason/Downloads` with your actual desktop and downloads folder paths. The filesystem server can only access directories you explicitly allow.
+> **Important**: Replace `/Users/<username>/Desktop` and `/Users/<username>/Downloads` with your actual desktop and downloads folder paths. The filesystem server can only access directories you explicitly allow.
+
+If the server fails to start with `[Errno 2] No such file or directory: 'npx'`, see
+[Server Won't Start](./connection_types/stdio.md#server-wont-start).
 
 1. **Click Create Server**
 
@@ -204,8 +207,8 @@ Configure the filesystem server to only access specific directories:
   "args": [
     "-y",
     "@modelcontextprotocol/server-filesystem",
-    "/Users/jason/Documents/Work",
-    "/Users/jason/Documents/Projects"
+    "/Users/<username>/Documents/Work",
+    "/Users/<username>/Documents/Projects"
   ]
 }
 ```
