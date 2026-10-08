@@ -516,7 +516,6 @@ class ExecuteDagState(State):
                 )
                 if isinstance(result, SetParameterValueResultFailure):
                     msg = f"Failed to set parameter value for node '{current_node.name}' and parameter '{parameter.name}'. Details: {result.result_details}"
-                    logger.error(msg)
                     raise RuntimeError(msg)
 
     @staticmethod

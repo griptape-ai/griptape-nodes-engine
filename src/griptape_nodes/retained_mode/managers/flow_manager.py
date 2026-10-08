@@ -4877,7 +4877,6 @@ class FlowManager(EngineScoped):
 
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                logger.error("Node '%s' failed: %s", node.name, error_message)
                 self._global_single_node_resolution = False
                 self._global_control_flow_machine.context.current_nodes = []
                 self.engine.event_manager.put_event(

@@ -3403,10 +3403,6 @@ class OSManager(EngineScoped):
                 error_details = f"Disk full: {e}"
                 raise OSError(error_details) from e
             raise
-        except Exception as e:
-            error_details = f"Unexpected error: {type(e).__name__}: {e}"
-            logger.error(error_details)
-            raise
 
     def _write_locked_discarding_debris(
         self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str
