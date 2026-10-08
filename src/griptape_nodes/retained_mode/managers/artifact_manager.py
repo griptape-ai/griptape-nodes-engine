@@ -404,7 +404,6 @@ class ArtifactManager(EngineScoped):
                 f"Attempted to register default artifact providers during initialization. "
                 f"Failed due to: {failure_details}"
             )
-            logger.error(error_message)
             raise RuntimeError(error_message)
 
     @handles(GeneratePreviewRequest)

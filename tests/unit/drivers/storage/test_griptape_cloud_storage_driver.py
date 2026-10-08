@@ -209,10 +209,8 @@ class TestGriptapeCloudStorageDriverParseCloudAssetPath:
         assert "https://cloud.griptape.ai" in error_message
         assert "cloud.griptape.ai" in error_message
 
-        # Verify error was also logged
-        assert len(caplog.records) == 1
-        assert caplog.records[0].levelno == logging.ERROR
-        assert "Invalid cloud asset URL" in caplog.records[0].message
+        # The caller reports the raised error, so the driver does not log it too.
+        assert not caplog.records
 
     def test_parse_full_url_with_nested_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
         """Full URL with nested path after assets should extract correctly."""

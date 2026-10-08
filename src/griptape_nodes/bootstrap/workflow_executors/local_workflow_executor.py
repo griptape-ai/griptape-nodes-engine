@@ -234,7 +234,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return True, None
         if type(result_event.payload).__name__ == "ControlFlowCancelledEvent":
             msg = "Control flow cancelled"
-            logger.error(msg)
             return True, LocalExecutorError(msg)
 
         return False, None

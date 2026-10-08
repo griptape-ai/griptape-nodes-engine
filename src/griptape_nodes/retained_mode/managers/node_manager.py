@@ -3928,7 +3928,6 @@ class NodeManager(EngineScoped):
         )
 
         if not isinstance(group_result, SerializeNodeToCommandsResultSuccess):
-            logger.error("Failed to serialize group node '%s'", group_name)
             msg = f"Failed to serialize children and group node '{group_name}'"
             raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -3954,7 +3953,6 @@ class NodeManager(EngineScoped):
             )
 
             if not isinstance(child_result, SerializeNodeToCommandsResultSuccess):
-                logger.error("%s failed to serialize child node '%s'", group_name, child_name)
                 msg = f"Failed to serialize child node '{child_name}'"
                 raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -4674,9 +4672,8 @@ class NodeManager(EngineScoped):
             if metadata and "_parent_group_uuid" in metadata:
                 parent_group_uuid = metadata["_parent_group_uuid"]
                 if parent_group_uuid not in node_uuid_to_name:
-                    logger.error("Parent group UUID %s not found in UUID mapping", parent_group_uuid)
                     return DeserializeSelectedNodesFromCommandsResultFailure(
-                        result_details="Parent group UUID not found in UUID mapping"
+                        result_details=f"Parent group UUID {parent_group_uuid} not found in UUID mapping"
                     )
                 node_command.create_node_command.parent_group_name = node_uuid_to_name[parent_group_uuid]
                 del metadata["_parent_group_uuid"]

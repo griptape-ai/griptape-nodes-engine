@@ -660,7 +660,6 @@ class StaticFilesManager(EngineScoped):
             raise
         except Exception as e:
             msg = f"Failed to save static file {file_name}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 

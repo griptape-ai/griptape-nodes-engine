@@ -4092,13 +4092,7 @@ class NodeExecutor(EngineScoped):
 
         delete_request = DeleteWorkflowRequest(name=workflow_name)
         delete_result = await self.engine.ahandle_request(delete_request)
-        if isinstance(delete_result, DeleteWorkflowResultFailure):
-            logger.error(
-                "Failed to delete workflow '%s'. Error: %s",
-                workflow_name,
-                delete_result.result_details,
-            )
-        else:
+        if not isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.debug(
                 "Cleanup result for workflow '%s': %s",
                 workflow_name,
