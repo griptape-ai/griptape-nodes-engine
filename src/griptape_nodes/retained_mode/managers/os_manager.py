@@ -14,7 +14,7 @@ import subprocess
 import sys
 import uuid
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -35,7 +35,7 @@ from griptape_nodes.common.macro_parser import (
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailureReason
 from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
-from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.macro_parser.segments import ParsedSegment, ParsedStaticValue, ParsedVariable
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
@@ -834,8 +834,10 @@ class OSManager(EngineScoped):
     # CREATE_NEW File Collision Policy - Helper Methods
     # ============================================================================
 
-    def _bind_project_variables_for_index_scan(self, macro_path: MacroPath) -> MacroPath:
-        """Bake project directories and builtins into a macro so only its `{_index}` slot is left open.
+    def _bind_project_variables_for_index_scan(
+        self, macro_path: MacroPath, index_var_name: str = SEQUENCE_VARIABLE_NAME
+    ) -> MacroPath:
+        """Bake project directories and builtins into a macro so only its index slot is left open.
 
         Callers such as `DirectoryDestination` and `build_versioned_sequence_destination` pass
         project macros like `{outputs}/renders_v{###}` without binding `{outputs}`. The index
@@ -846,7 +848,8 @@ class OSManager(EngineScoped):
         text, giving an absolute template such as `/project/outputs/renders_v{###}`.
 
         Args:
-            macro_path: MacroPath whose template contains an unresolved `{_index}` slot.
+            macro_path: MacroPath whose template contains an unresolved index slot.
+            index_var_name: Name of the index slot to leave open. Defaults to `_index`.
 
         Returns:
             A MacroPath with only the index slot unresolved. Returns `macro_path` unchanged
@@ -854,18 +857,18 @@ class OSManager(EngineScoped):
             bind every variable themselves are scanned as given.
         """
         template = macro_path.parsed_macro.template
-        if SEQUENCE_VARIABLE_NAME in macro_path.variables:
+        if index_var_name in macro_path.variables:
             return macro_path
 
         slot_groups = [
             group
             for group in MACRO_VARIABLE_GROUP_PATTERN.findall(template)
-            if self._is_single_variable_group(group, SEQUENCE_VARIABLE_NAME)
+            if self._is_single_variable_group(group, index_var_name)
         ]
         if not slot_groups:
             return macro_path
 
-        sentinel_vars: MacroVariables = {SEQUENCE_VARIABLE_NAME: VERSION_INDEX_SENTINEL}
+        sentinel_vars: MacroVariables = {index_var_name: VERSION_INDEX_SENTINEL}
         rendered_slots = [ParsedMacro(group).resolve(sentinel_vars) for group in slot_groups]
 
         result = self.engine.handle_request(
@@ -1297,6 +1300,55 @@ class OSManager(EngineScoped):
                     return request.file_path, segment
         return self._convert_str_path_to_macro_with_index(str(file_path)), None
 
+    def _find_walk_start_index(
+        self, macro_path: MacroPath, index_var: ParsedVariable, floor: int, swapped_ext: str | None
+    ) -> int:
+        """Find the first index at or above `floor` that no file on disk already uses.
+
+        The collision walk's own start (2 after the seed, N+1 after a reverse-match) knows
+        nothing about files already on disk, so with many saves under one base name it would
+        probe each one in turn and run out of candidates. One scan lets it skip them.
+
+        Args:
+            macro_path: The caller's MacroPath, possibly with the index slot already bound.
+            index_var: The sequence slot the walk increments.
+            floor: The lowest index the walk may use.
+            swapped_ext: The extension the walk writes in place of the macro's own, if any.
+
+        Returns:
+            The first unused index at or above `floor`. Returns `floor` when the macro cannot
+            be scanned (project variables fail to resolve, or another required slot stays open).
+        """
+        index_var_name = index_var.info.name
+        unbound_variables = {key: value for key, value in macro_path.variables.items() if key != index_var_name}
+        scan_macro_path = self._bind_project_variables_for_index_scan(
+            MacroPath(parsed_macro=macro_path.parsed_macro, variables=unbound_variables),
+            index_var_name,
+        )
+        scan_macro = scan_macro_path.parsed_macro
+
+        # `_identify_index_variable` skips optional slots, so it returns None for an optional
+        # index slot when nothing else is open. Any other result names a different open slot.
+        try:
+            open_required_var = self._identify_index_variable(scan_macro, scan_macro_path.variables)
+        except ValueError:
+            return floor
+        if open_required_var is not None and open_required_var.info.name != index_var_name:
+            return floor
+
+        # Walked candidates land on disk with the swapped extension, so scan for that one.
+        if swapped_ext is not None:
+            stem, dot, suffix = scan_macro.template.rpartition(".")
+            if not dot or "{" in suffix or "}" in suffix or "/" in suffix:
+                return floor
+            scan_macro = ParsedMacro(f"{stem}.{swapped_ext}")
+
+        taken_indices = set(self._scan_existing_indices(scan_macro, scan_macro_path.variables, index_var_name))
+        start_index = floor
+        while start_index in taken_indices:
+            start_index += 1
+        return start_index
+
     def _scan_for_next_available_index(
         self,
         parsed_macro: ParsedMacro,
@@ -1357,15 +1409,41 @@ class OSManager(EngineScoped):
                 # Cannot resolve without index - treat as required
                 pass
 
-        # Build glob pattern by partially resolving with known variables
-        partial = partial_resolve(parsed_macro.template, parsed_macro.segments, variables, secrets_manager)
+        existing_indices = self._scan_existing_indices(parsed_macro, variables, index_var_name)
+        return self._find_next_index_with_gap_fill(existing_indices)
+
+    def _scan_existing_indices(
+        self, parsed_macro: ParsedMacro, variables: MacroVariables, index_var_name: str
+    ) -> list[int]:
+        """Return the index of every file on disk that matches the macro.
+
+        Args:
+            parsed_macro: Parsed macro template
+            variables: Known variable values (index variable NOT included)
+            index_var_name: Name of the index slot to read from each matching file
+
+        Returns:
+            The indices found, in no particular order. Empty when the parent directory is missing.
+        """
+        secrets_manager = self.engine.secrets_manager
+
+        # Build glob pattern by partially resolving with known variables. `partial_resolve`
+        # drops unbound optional slots, so treat the index slot as required here to keep
+        # its wildcard in the pattern.
+        glob_segments: list[ParsedSegment] = []
+        for segment in parsed_macro.segments:
+            if isinstance(segment, ParsedVariable) and segment.info.name == index_var_name:
+                glob_segments.append(replace(segment, info=segment.info._replace(is_required=True)))
+            else:
+                glob_segments.append(segment)
+        partial = partial_resolve(parsed_macro.template, glob_segments, variables, secrets_manager)
         glob_pattern = self._build_glob_pattern_from_partially_resolved(partial.segments, index_var_name)
 
         # Scan existing files matching pattern
         glob_path = Path(glob_pattern)
         if not glob_path.parent.exists():
-            # Parent directory doesn't exist - start at index 1
-            return 1
+            # Parent directory doesn't exist - nothing to scan
+            return []
 
         existing_files = list(glob_path.parent.glob(glob_path.name))
         existing_indices = []
@@ -1378,7 +1456,7 @@ class OSManager(EngineScoped):
             if extracted_index is not None:
                 existing_indices.append(extracted_index)
 
-        return self._find_next_index_with_gap_fill(existing_indices)
+        return existing_indices
 
     @staticmethod
     def platform() -> str:
@@ -2807,7 +2885,7 @@ class OSManager(EngineScoped):
                     # A. Original MacroPath with a padded slot — `request.file_path` is
                     #    the same MacroPath the caller sent. We re-resolve each iteration
                     #    via `_resolve_macro_path_to_string` so project directories get
-                    #    substituted. Skip the filesystem scan; just walk forward.
+                    #    substituted.
                     #
                     #    Three starting-index cases depending on whether the slot was
                     #    bound at request time, and (if unbound) whether the seed gate
@@ -2820,6 +2898,8 @@ class OSManager(EngineScoped):
                     #    - Optional `{x?:NN}` unbound: seed didn't fire (it's gated on
                     #      required); the first attempt resolved with the slot OMITTED
                     #      → start at 1 so this loop is the FIRST place we try a value.
+                    #    A scan of existing files then moves the start to the first index at
+                    #    or above it that no file uses.
                     # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
                     #    — variables is empty, template is fully static except `{_index}`.
                     #    Run the existing scan to find a starting index (`output.png`
@@ -2840,6 +2920,9 @@ class OSManager(EngineScoped):
                         else:
                             # Optional + unbound: seed didn't fire; this loop is the first try.
                             start_idx = 1
+                        # Skip past files already on disk so MAX_INDEXED_CANDIDATES bounds
+                        # attempts after the first free index, not the count of prior saves.
+                        start_idx = self._find_walk_start_index(macro_path, padded_index_var, start_idx, swapped_ext)
                     else:
                         starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
                         start_idx = starting_index if starting_index is not None else 1
