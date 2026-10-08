@@ -7,6 +7,7 @@ node runs in one, and ride back on ``ExecuteNodeResultFailure.error`` like any o
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from dataclasses import dataclass, field
@@ -25,6 +26,13 @@ ALLOWED_LINK_SCHEMES = ("http://", "https://")
 # A link starting with "#" opens a place in the editor, such as "#settings-secrets?filter=MY_KEY".
 EDITOR_LINK_PREFIX = "#"
 RESPONSE_DROPPED_FIELD = "response_dropped"
+# Longer messages are left as they are, so reading a printed response stays cheap.
+MAX_PRINTED_RESPONSE_MESSAGE_CHARS = 2 * MAX_RESPONSE_BYTES
+# How many "{" in a message are tried as the start of a printed response before giving up.
+MAX_PRINTED_RESPONSE_STARTS = 8
+# A line above a printed response is its label, and is dropped, only when it ends in ":" and is at
+# most this many words, like "Full API response:". A longer line is a sentence and stays.
+MAX_RESPONSE_LABEL_WORDS = 4
 
 
 @dataclass
@@ -55,6 +63,14 @@ class ErrorAttachments:
     fields: dict[str, str]
     response: dict[str, Any] | None
     links: list[NodeErrorLink]
+
+
+@dataclass
+class _PrintedResponse:
+    """A response dict a node printed at the end of its message, split from the text before it."""
+
+    message: str
+    response: dict[str, Any]
 
 
 def build_node_error_details(node_name: str, error: BaseException | list[Exception]) -> NodeErrorDetails:
@@ -132,12 +148,193 @@ def _from_validation(node_name: str, exceptions: list[Exception]) -> NodeErrorDe
 def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
     details = NodeErrorDetails(message=_message(node_name, exc), exception_type=_exception_type(exc))
     attachments = _attachments(exc)
-    if attachments is None:
+    if attachments is not None:
+        details.fields = attachments.fields
+        details.response = attachments.response
+        details.links = attachments.links
+    # A response the node attached wins, even one dropped for its size.
+    if details.response is not None or RESPONSE_DROPPED_FIELD in details.fields:
         return details
-    details.fields = attachments.fields
-    details.response = attachments.response
-    details.links = attachments.links
+    printed = _split_printed_response(details.message)
+    if printed is not None:
+        details.message = printed.message
+        details.response = printed.response
     return details
+
+
+def _split_printed_response(message: str) -> _PrintedResponse | None:
+    r"""Split off a response dict printed at the end of a message, with the label in front of it.
+
+    Many nodes put the provider's response in their message with an f-string, which prints a Python
+    dict, not JSON. ``ast.literal_eval`` reads that back exactly and only evaluates literals, so it
+    is safe on error text.
+
+    Returns None, so the message is kept as it is, when no dict runs to the end of the message, when
+    the dict is empty or has nothing in front of it, or when it isn't a response ``NodeError`` could
+    attach.
+
+    Examples:
+        "Processing failed.\n\nFull API response:\n{'status': 'ERRORED'}" splits into
+        "Processing failed." and {"status": "ERRORED"}.
+
+        "Error code: 400 - {'error': {'code': 'unsupported_value'}}" splits into "Error code: 400"
+        and {"error": {"code": "unsupported_value"}}.
+    """
+    if len(message) > MAX_PRINTED_RESPONSE_MESSAGE_CHARS:
+        return None
+    starts = [index for index, char in enumerate(message) if char == "{"]
+    for start in starts[:MAX_PRINTED_RESPONSE_STARTS]:
+        response = _literal_dict(message[start:])
+        if response is None:
+            continue
+        # The first "{" that reads as a dict is the outermost one. A dict inside it is part of the
+        # response, never the response itself.
+        if not _introduces_response(message[:start]):
+            return None
+        return _printed_response(message[:start], response)
+    return None
+
+
+def _introduces_response(text: str) -> bool:
+    """Whether the text before a dict hands off to it with ":", "-", or a line break.
+
+    A dict right after a word is part of something else, such as a model config that prints as
+    ``CLIPTextConfig {...}``, so it stays in the message.
+    """
+    before = text.rstrip(" \t")
+    return before.endswith((":", "-", "\n"))
+
+
+def _printed_response(text: str, response: dict[str, Any]) -> _PrintedResponse | None:
+    message = _strip_response_label(text)
+    if not message:
+        return None
+    if _sanitize_response(response) is None:
+        return None
+    reason = _provider_reason(response)
+    if reason is not None and reason not in message:
+        message = _join_sentences(message, reason)
+    return _PrintedResponse(message=message, response=response)
+
+
+def _provider_reason(response: dict[str, Any]) -> str | None:
+    """Return the provider's own explanation from the standard error fields, if the response has one.
+
+    The explanation is often the only part that says what to fix, such as which parameter the
+    provider rejected, so it is kept in the message as well as in the response. These are the field
+    names JSON APIs use for error text, checked in this order:
+
+    * ``error.message`` (OpenAI, Anthropic, Google)
+    * ``message``
+    * ``detail.message`` (ElevenLabs), or ``detail`` as text (FastAPI)
+    * ``detail[].msg``, FastAPI's list of validation errors, joined into one line
+    * ``errors[].message``, joined into one line
+    * ``error`` as text
+    * ``status_detail.details``, or ``status_detail.error`` (Griptape Cloud's proxy)
+    """
+    error = response.get("error")
+    detail = response.get("detail")
+    status_detail = response.get("status_detail")
+    candidates: list[Any] = []
+    if isinstance(error, dict):
+        candidates.append(error.get("message"))
+    candidates.append(response.get("message"))
+    if isinstance(detail, dict):
+        candidates.append(detail.get("message"))
+    candidates.append(detail)
+    candidates.append(_joined_messages(detail, "msg"))
+    candidates.append(_joined_messages(response.get("errors"), "message"))
+    candidates.append(error)
+    if isinstance(status_detail, dict):
+        candidates.append(status_detail.get("details"))
+        candidates.append(status_detail.get("error"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _joined_messages(items: Any, key: str) -> str | None:
+    """Join the text under ``key`` in a list of error objects, such as FastAPI's validation errors."""
+    if not isinstance(items, list):
+        return None
+    texts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = item.get(key)
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    if not texts:
+        return None
+    joined = texts[0]
+    for text in texts[1:]:
+        if joined.endswith((".", "!", "?")):
+            joined = f"{joined} {text}"
+        else:
+            joined = f"{joined}; {text}"
+    return joined
+
+
+def _join_sentences(first: str, second: str) -> str:
+    if first.endswith((".", "!", "?")):
+        return f"{first} {second}"
+    return f"{first}. {second}"
+
+
+def _literal_dict(text: str) -> dict[str, Any] | None:
+    """Read a dict printed with ``str()`` (a Python dict), or a response body printed as JSON text."""
+    source = text.strip()
+    value = _python_literal(source)
+    if value is None:
+        # JSON's true, false, and null aren't Python, so a raw response body needs its own parser.
+        value = _json_value(source)
+    if not isinstance(value, dict) or not value:
+        return None
+    return value
+
+
+def _python_literal(source: str) -> Any:
+    try:
+        expression = ast.parse(source, mode="eval").body
+        value = ast.literal_eval(expression)
+    # What parse and literal_eval raise for text that isn't a literal, or is one too deep to read.
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    # The parser skips a trailing "# ..." as a comment. That text belongs to the message, so the
+    # dict doesn't run to the end of it.
+    if ast.get_source_segment(source, expression) != source:
+        return None
+    return value
+
+
+def _json_value(source: str) -> Any:
+    try:
+        return json.loads(source)
+    # JSONDecodeError is a ValueError, raised for text after the value too. RecursionError for one
+    # nested too deep.
+    except (ValueError, RecursionError):
+        return None
+
+
+def _strip_response_label(text: str) -> str:
+    """Remove what introduced the response: a label line like "Full API response:", or ": " or " - "."""
+    if _ends_with_response_label(text):
+        text = text.rstrip().rpartition("\n")[0]
+    return text.rstrip().rstrip(":-").rstrip()
+
+
+def _ends_with_response_label(text: str) -> bool:
+    """Whether the response starts on its own line under a short line ending in ":", with text above."""
+    if not text.rstrip(" \t").endswith("\n"):
+        return False
+    head, newline, last_line = text.rstrip().rpartition("\n")
+    if not newline or not head.strip():
+        return False
+    label = last_line.strip()
+    if not label.endswith(":"):
+        return False
+    return len(label.split()) <= MAX_RESPONSE_LABEL_WORDS
 
 
 def _attachments(exc: BaseException) -> ErrorAttachments | None:

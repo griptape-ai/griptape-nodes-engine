@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultFailure, NodeErrorEvent
 from griptape_nodes.retained_mode.events.node_error_details import (
+    MAX_PRINTED_RESPONSE_MESSAGE_CHARS,
     MAX_RESPONSE_BYTES,
     RESPONSE_DROPPED_FIELD,
     NodeErrorDetails,
@@ -376,6 +377,279 @@ class TestNodeErrorAttachments:
 
         assert details.fields == {}
         assert details.response is None
+
+
+class TestPrintedResponse:
+    """A node that prints the provider's response into its message instead of raising ``NodeError``."""
+
+    def test_labelled_response_moves_to_response_on_both_paths(self, failed_while_running: Any) -> None:
+        response_json = {"generation_id": "90db", "status_detail": {"details": "proxy client error"}, "seed": None}
+        exc = RuntimeError(f"{NODE_NAME}: Processing failed.\n\nFull API response:\n{response_json}")
+        result = failed_while_running(exc)
+
+        for details in _both_paths(result):
+            assert details.message == "Processing failed. proxy client error"
+            assert details.response == response_json
+        assert str(exc) in str(_executor_error(result))
+
+    def test_response_after_a_dash_moves_to_response(self) -> None:
+        body = {"error": {"message": "Unsupported value: 'temperature'", "param": "temperature", "code": None}}
+        exc = ValueError(f"Agent run failed because of an exception: Error code: 400 - {body}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == (
+            "Agent run failed because of an exception: Error code: 400. Unsupported value: 'temperature'"
+        )
+        assert details.response == body
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"error": {"message": "Temperature is not supported.", "code": "x"}},
+            {"message": "Temperature is not supported."},
+            {"detail": "Temperature is not supported."},
+            {"error": "Temperature is not supported."},
+            {"status_detail": {"details": "Temperature is not supported.", "error": "bad_request"}},
+            {"status_detail": {"error": "Temperature is not supported."}},
+        ],
+        ids=["error.message", "message", "detail", "error as text", "status_detail.details", "status_detail.error"],
+    )
+    def test_the_providers_explanation_stays_in_the_message(self, response: dict[str, Any]) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError(f"Request failed: {response}"))
+
+        assert details.message == "Request failed. Temperature is not supported."
+        assert details.response == response
+
+    def test_elevenlabs_detail_message_stays_in_the_message(self) -> None:
+        # The body ElevenLabs returned through the Griptape proxy for empty text.
+        response = {
+            "detail": {
+                "type": "validation_error",
+                "code": "invalid_parameters",
+                "message": "Input at position 0 has empty text.",
+                "status": "input_text_empty",
+                "request_id": "8ed4bb7b",
+                "param": "text",
+            }
+        }
+        exc = RuntimeError(f"{NODE_NAME} generation failed.\n\nFull API response:\n{response}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == f"{NODE_NAME} generation failed. Input at position 0 has empty text."
+        assert details.response == response
+
+    def test_a_response_printed_as_json_text_moves_to_response(self) -> None:
+        # Seedance prints the raw body, so it arrives as JSON with false and null, not a Python dict.
+        body = '{"error": {"code": "InvalidParameter", "message": "The image format is not supported.", "retryable": false, "param": null}}'
+        exc = RuntimeError(f"failed to create private asset: HTTP 400 - {body}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "failed to create private asset: HTTP 400. The image format is not supported."
+        assert details.response == json.loads(body)
+
+    def test_json_text_with_more_text_after_it_is_kept(self) -> None:
+        message = 'Request failed: {"retryable": false} after 3 retries'
+
+        details = build_node_error_details(NODE_NAME, ValueError(message))
+
+        assert details.message == message
+        assert details.response is None
+
+    def test_fastapi_validation_errors_are_joined_into_the_message(self) -> None:
+        response = {
+            "detail": [
+                {"loc": ["body", "prompt"], "msg": "Field required", "type": "missing"},
+                {"loc": ["body", "steps"], "msg": "Input should be less than 50", "type": "less_than"},
+            ]
+        }
+
+        details = build_node_error_details(NODE_NAME, ValueError(f"generation failed: {response}"))
+
+        assert details.message == "generation failed. Field required; Input should be less than 50"
+
+    def test_an_errors_list_is_joined_into_the_message(self) -> None:
+        response = {"errors": [{"message": "Prompt is too long."}, {"code": "x"}, {"message": "Seed is invalid."}]}
+
+        details = build_node_error_details(NODE_NAME, ValueError(f"Request failed: {response}"))
+
+        assert details.message == "Request failed. Prompt is too long. Seed is invalid."
+
+    def test_a_response_without_an_explanation_leaves_the_message_short(self) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError("Request failed.\nResponse:\n{'status': 'ERRORED'}"))
+
+        assert details.message == "Request failed."
+
+    def test_an_explanation_already_in_the_message_is_not_repeated(self) -> None:
+        exc = ValueError("Temperature is not supported: {'message': 'Temperature is not supported'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Temperature is not supported"
+
+    def test_response_after_a_colon_moves_to_response(self) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError("Request failed: {'status': 'ERRORED'}"))
+
+        assert details.message == "Request failed"
+        assert details.response == {"status": "ERRORED"}
+
+    def test_tuples_in_the_response_become_lists(self) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError("Request failed: {'size': (1024, 768)}"))
+
+        assert json.loads(json.dumps(details.response)) == {"size": [1024, 768]}
+
+    def test_braces_before_the_response_are_skipped(self) -> None:
+        exc = ValueError("Prompt {subject} failed.\nError details:\n{'reason': 'moderated'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Prompt {subject} failed."
+        assert details.response == {"reason": "moderated"}
+
+    def test_crlf_line_endings_are_removed_with_the_label(self) -> None:
+        exc = RuntimeError("Processing failed.\r\n\r\nFull API response:\r\n{'status': 'ERRORED'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Processing failed."
+        assert details.response == {"status": "ERRORED"}
+
+    @pytest.mark.parametrize("label", ["Full API response:", "Full error details:", "Full response:"])
+    def test_label_lines_libraries_use_are_removed(self, label: str) -> None:
+        details = build_node_error_details(NODE_NAME, RuntimeError(f"Upload failed.\n\n{label}\n{{'code': 7}}"))
+
+        assert details.message == "Upload failed."
+        assert details.response == {"code": 7}
+
+    def test_a_label_of_any_wording_is_removed(self) -> None:
+        exc = RuntimeError("Upload failed.\nRaw provider reply:\n{'code': 7}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Upload failed."
+
+    def test_a_short_line_without_a_colon_is_kept(self) -> None:
+        exc = RuntimeError("Upload failed.\nSee below\n{'code': 7}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Upload failed.\nSee below"
+
+    def test_a_short_line_ending_in_a_colon_on_the_same_line_as_the_response_is_kept(self) -> None:
+        details = build_node_error_details(NODE_NAME, RuntimeError("Upload failed.\nProvider error: {'code': 7}"))
+
+        assert details.message == "Upload failed.\nProvider error"
+
+    def test_a_dict_right_after_a_word_stays_in_the_message(self) -> None:
+        # transformers prints a model config as its class name and then JSON, which can read as a dict.
+        message = 'head_dim could not be found in the config:\nCLIPTextConfig {\n  "hidden_size": 512\n}'
+
+        details = build_node_error_details(NODE_NAME, ValueError(message))
+
+        assert details.message == message
+        assert details.response is None
+
+    def test_a_provider_response_from_a_dependency_moves_to_response(self) -> None:
+        # Raised by huggingface_hub's fal provider, which the diffusers library calls.
+        exc = ValueError("Response from fal ai image-segmentation API does not contain an image: {'masks': []}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Response from fal ai image-segmentation API does not contain an image"
+        assert details.response == {"masks": []}
+
+    def test_a_line_ending_in_a_colon_that_is_not_a_label_is_kept(self) -> None:
+        exc = RuntimeError("Generation failed.\nThe provider said for prompt 'cat':\n{'status': 'ERRORED'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Generation failed.\nThe provider said for prompt 'cat'"
+        assert details.response == {"status": "ERRORED"}
+
+    def test_a_sentence_ending_in_response_is_kept(self) -> None:
+        exc = RuntimeError("Generation failed.\nThe provider returned an unexpected response:\n{'status': 'x'}")
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Generation failed.\nThe provider returned an unexpected response"
+        assert details.response == {"status": "x"}
+
+    def test_a_message_that_is_only_a_label_keeps_the_label(self) -> None:
+        details = build_node_error_details(NODE_NAME, RuntimeError("Full API response: {'status': 'ERRORED'}"))
+
+        assert details.message == "Full API response"
+        assert details.response == {"status": "ERRORED"}
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "{'status': 'ERRORED'}",
+            "\n{'status': 'ERRORED'}",
+            "Request failed: {}",
+            "Request failed: {'status': 'ERRORED'} # 3 of 5 retries",
+            "a {b} {c} {d} {e} {f} {g} {h} {i}: {'status': 'ERRORED'}",
+            f"Request failed: {'{' * 250}'a': 1{'}' * 250}",
+            "Request failed: {'status': 'ERRORED'} after 3 retries",
+            "Request failed: {'ERRORED', 'FAILED'}",
+            "Request failed: {'status': ERRORED}",
+            "Request failed: {'data': b'raw'}",
+            f"Request failed: {{'image': '{'A' * MAX_RESPONSE_BYTES}'}}",
+            f"{'x' * MAX_PRINTED_RESPONSE_MESSAGE_CHARS} {{'status': 'ERRORED'}}",
+            "Missing required keys: {'factor'}",
+            "Keyword arguments {'foo': 1} are not expected by FluxPipeline and will be ignored.",
+            "CUDA out of memory. Tried to allocate 2.00 GiB",
+        ],
+        ids=[
+            "nothing before it",
+            "only whitespace before it",
+            "empty",
+            "a comment after it",
+            "too many braces before it",
+            "nested too deep",
+            "text after it",
+            "a set",
+            "not a literal",
+            "not JSON",
+            "over the size cap",
+            "message too long",
+            "a set from transformers",
+            "a dict mid-sentence from diffusers",
+            "no dict",
+        ],
+    )
+    def test_message_is_kept_when_there_is_no_response_to_move(self, message: str) -> None:
+        details = build_node_error_details(NODE_NAME, ValueError(message))
+
+        assert details.message == message
+        assert details.response is None
+
+    def test_attached_response_wins_over_a_printed_one(self) -> None:
+        exc = NodeError("Request failed: {'status': 'printed'}", response={"status": "attached"})
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Request failed: {'status': 'printed'}"
+        assert details.response == {"status": "attached"}
+
+    def test_dropped_attached_response_is_not_replaced_by_a_printed_one(self) -> None:
+        exc = NodeError("Request failed: {'status': 'printed'}", response={"image": "A" * MAX_RESPONSE_BYTES})
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Request failed: {'status': 'printed'}"
+        assert details.response is None
+        assert details.fields == {RESPONSE_DROPPED_FIELD: "true"}
+
+    def test_node_error_without_a_response_keeps_its_fields_and_gets_the_printed_one(self) -> None:
+        exc = NodeError("Request failed: {'status': 'ERRORED'}", fields={"generation_id": "90db"})
+
+        details = build_node_error_details(NODE_NAME, exc)
+
+        assert details.message == "Request failed"
+        assert details.response == {"status": "ERRORED"}
+        assert details.fields == {"generation_id": "90db"}
 
 
 class TestEventWireForm:

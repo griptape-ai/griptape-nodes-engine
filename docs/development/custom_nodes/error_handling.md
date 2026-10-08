@@ -290,8 +290,9 @@ raise NodeError(
 
 Anything over a limit is dropped and the rest of the error still reaches the editor. `NodeError`
 works the same way when the node runs in a worker. Other exception types still work, and their
-message and type are shown, but the editor only reads `fields`, `response`, and `links` from a
-`NodeError`.
+message and type are shown, but only a `NodeError` can attach `fields` and `links`. When no
+`response` is attached, a dict printed at the end of the message is sent as `response` and removed
+from the message, so the editor can still show it in parts.
 
 #### Common failures
 
