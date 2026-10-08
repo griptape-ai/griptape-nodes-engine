@@ -5,7 +5,8 @@ import pytest
 from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
+from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION, BaseNode, DataNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
@@ -19,6 +20,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.serialization.values import encode_value
 
 _LIBRARY_REGISTRY_CREATE_NODE_PATH = "griptape_nodes.retained_mode.managers.node_manager.LibraryRegistry.create_node"
+_IS_BETA_ENABLED_PATH = "griptape_nodes.retained_mode.managers.node_manager.is_beta_enabled"
 
 
 def _make_mock_node(name: str = "test_node") -> MagicMock:
@@ -737,3 +739,142 @@ class TestExecuteNodeWorkerValues:
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "'handle'" in str(result.result_details)
         assert "'text'" not in str(result.result_details)
+
+
+def _make_mock_group(name: str, execution_environment: str, parent_group: MagicMock | None = None) -> MagicMock:
+    group = MagicMock(spec=SubflowNodeGroup)
+    group.name = name
+    # An instance attribute, so the spec does not provide it.
+    group.execution_environment = MagicMock()
+    group.execution_environment.name = "execution_environment"
+    group.get_parameter_value.return_value = execution_environment
+    group.parent_group = parent_group
+    return group
+
+
+class TestExecuteNodePrivateExecutionRoute:
+    """Orchestrator-side routing of nodes inside a Private Execution group to the general-purpose worker."""
+
+    _LIBRARY_WORKER = ("library-eng-id", "library-topic")
+    _PRIVATE_WORKER = ("private-eng-id", "private-topic")
+
+    def _make_node_in(self, parent_group: MagicMock | None) -> MagicMock:
+        node = _make_mock_node()
+        node.metadata = {"library": "some_library"}
+        node.parent_group = parent_group
+        return node
+
+    def _make_worker_manager(self, private_worker: tuple[str, str] | None) -> MagicMock:
+        wm = MagicMock()
+        wm.get_worker_for_key.return_value = private_worker
+        wm.route_to_worker = AsyncMock(
+            return_value={
+                "result_type": ExecuteNodeResultSuccess.__name__,
+                "result": {"parameter_output_values": {"out": 1}, "result_details": "ok"},
+            }
+        )
+        return wm
+
+    async def _execute(
+        self,
+        node: MagicMock,
+        wm: MagicMock,
+        *,
+        beta_enabled: bool = True,
+        library_worker: tuple[str, str] | None = None,
+    ) -> ExecuteNodeResultSuccess | ExecuteNodeResultFailure:
+        lib_mgr = _make_mock_library_manager(is_worker=False)
+        lib_mgr.workers.get_worker_for_library.return_value = library_worker
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=node), library_manager=lib_mgr, worker_manager=wm
+        )
+        request = ExecuteNodeRequest(
+            node_name=node.name,
+            node_metadata=cast("NodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}),
+        )
+        with patch(_IS_BETA_ENABLED_PATH, return_value=beta_enabled):
+            result = await node_manager.on_execute_node_request(request)
+        assert isinstance(result, ExecuteNodeResultSuccess | ExecuteNodeResultFailure)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_a_node_in_a_private_execution_group_runs_on_the_general_purpose_worker(self) -> None:
+        node = self._make_node_in(_make_mock_group("Group", PRIVATE_EXECUTION))
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.get_worker_for_key.assert_called_once_with(None)
+        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_local_group_inside_a_private_execution_group_runs_on_the_worker(self) -> None:
+        outer = _make_mock_group("Outer", PRIVATE_EXECUTION)
+        node = self._make_node_in(_make_mock_group("Inner", LOCAL_EXECUTION, parent_group=outer))
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_library_worker_takes_precedence_over_the_private_execution_worker(self) -> None:
+        node = self._make_node_in(_make_mock_group("Group", PRIVATE_EXECUTION))
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm, library_worker=self._LIBRARY_WORKER)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert wm.route_to_worker.await_args.args[1:] == self._LIBRARY_WORKER
+        wm.get_worker_for_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fails_naming_the_group_when_the_worker_is_not_running(self) -> None:
+        node = self._make_node_in(_make_mock_group("My Group", PRIVATE_EXECUTION))
+        wm = self._make_worker_manager(None)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "'My Group'" in str(result.result_details)
+        assert f"'{node.name}'" in str(result.result_details)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_runs_locally_when_the_beta_feature_is_off(self) -> None:
+        node = self._make_node_in(_make_mock_group("Group", PRIVATE_EXECUTION))
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm, beta_enabled=False)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("execution_environment", [LOCAL_EXECUTION, "Some Library"])
+    async def test_a_node_outside_any_private_execution_group_runs_locally(self, execution_environment: str) -> None:
+        node = self._make_node_in(_make_mock_group("Group", execution_environment))
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_node_in_no_group_runs_locally(self) -> None:
+        node = self._make_node_in(None)
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()

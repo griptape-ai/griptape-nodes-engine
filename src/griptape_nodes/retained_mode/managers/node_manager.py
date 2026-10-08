@@ -69,6 +69,7 @@ from griptape_nodes.node_library.library_declarations import (
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.retained_mode.beta_features import PRIVATE_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
@@ -3311,6 +3312,11 @@ class NodeManager(EngineScoped):
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
+            # A library's own worker comes first: that is where its dependencies are installed. Only a
+            # node that would otherwise run here moves to the worker that runs Private Execution groups.
+            private_result = await self._execute_node_in_private_execution_worker(request, node)
+            if private_result is not None:
+                return private_result
 
         async with STRICT_MODE.scoped_execution(
             kind=StrictModeScopeKind.RUNTIME_EXECUTE,
@@ -3439,6 +3445,29 @@ class NodeManager(EngineScoped):
         if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
             return None
         return library_manager.catalog.get_collated_problems_for_library(library_name)
+
+    async def _execute_node_in_private_execution_worker(
+        self, request: ExecuteNodeRequest, node: BaseNode
+    ) -> ResultPayload | None:
+        """Run the node on the general-purpose worker if it is inside a Private Execution group.
+
+        Returns None when the node is not inside one, or the beta feature is off, so the caller runs it here.
+        """
+        if not is_beta_enabled(PRIVATE_EXECUTION_IN_WORKER, self.engine.config_manager):
+            return None
+        private_group = self._enclosing_private_execution_group(node)
+        if private_group is None:
+            return None
+        wm = self.engine.worker_manager
+        private_worker = wm.get_worker_for_key(None) if wm is not None else None
+        if wm is None or private_worker is None:
+            details = (
+                f"Attempted to run '{request.node_name}' in the Private Execution group "
+                f"'{private_group.name}'. Failed because the background process that runs "
+                "Private Execution groups is not running."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
+        return await self._execute_node_via_worker(request, wm, private_worker)
 
     async def _execute_node_via_worker(
         self,
@@ -3599,6 +3628,20 @@ class NodeManager(EngineScoped):
             dropped = self.engine.resource_manager.drain_deferred_releases()
             if dropped:
                 logger.debug("Released %d held object(s) deferred while nodes were running.", dropped)
+
+    @staticmethod
+    def _enclosing_private_execution_group(node: BaseNode) -> SubflowNodeGroup | None:
+        """The nearest group around the node that is set to Private Execution, or None.
+
+        Looks past the groups in between, so a Local Execution group inside a Private Execution group
+        runs where its enclosing group does.
+        """
+        group = node.parent_group
+        while isinstance(group, SubflowNodeGroup):
+            if group.get_parameter_value(group.execution_environment.name) == PRIVATE_EXECUTION:
+                return group
+            group = group.parent_group
+        return None
 
     @staticmethod
     def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
