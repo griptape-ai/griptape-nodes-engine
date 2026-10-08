@@ -152,9 +152,6 @@ class LibraryEnvironment(EngineScoped):
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(library_venv_path.parent, min_space_gb):
             error_msg = OSManager.format_disk_space_error(library_venv_path.parent)
-            logger.error(
-                "Attempted to create virtual environment (requires %.1f GB). Failed: %s", min_space_gb, error_msg
-            )
             error_message = f"Disk space error creating virtual environment (requires {min_space_gb} GB): {error_msg}"
             raise RuntimeError(error_message)
 

@@ -271,7 +271,6 @@ class WorkerManager(EngineScoped):
                 "Workers and orchestrators must share an engine version because the "
                 "wire shape of every event is tied to the engine build."
             )
-            logger.error(details)
             return worker_events.RegisterWorkerResultFailure(result_details=details)
 
         session_id = self.engine.get_session_id()

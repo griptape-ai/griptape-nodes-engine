@@ -146,7 +146,6 @@ class EngineIdentityManager:
             )
         except Exception as err:
             error_message = f"Failed to get engine name: {err}"
-            logger.error(error_message)
             return GetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
     @handles(SetEngineNameRequest)
@@ -155,7 +154,6 @@ class EngineIdentityManager:
         try:
             if not request.engine_name or not request.engine_name.strip():
                 error_message = "Engine name cannot be empty"
-                logger.warning(error_message)
                 return SetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
             self.engine_name = request.engine_name.strip()
@@ -167,7 +165,6 @@ class EngineIdentityManager:
 
         except Exception as err:
             error_message = f"Failed to set engine name: {err}"
-            logger.error(error_message)
             return SetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
     def _get_or_initialize_engine_data(self) -> EngineData:

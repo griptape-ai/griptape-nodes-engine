@@ -571,7 +571,6 @@ class LibraryManager(EngineScoped):
         all_libraries_result = await self.engine.ahandle_request(all_libraries_request)
         if not isinstance(all_libraries_result, ListRegisteredLibrariesResultSuccess):
             details = "When preparing to reload all libraries, failed to get registered libraries."
-            logger.error(details)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
         # Close the gate before the registry is emptied, and not any earlier: the
@@ -588,7 +587,6 @@ class LibraryManager(EngineScoped):
                 unload_library_result = self.engine.handle_request(unload_library_request)
                 if not unload_library_result.succeeded():
                     details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
-                    logger.error(details)
                     return ReloadAllLibrariesResultFailure(result_details=details)
 
             # Notify pre-reload callbacks (e.g. to terminate worker processes) before

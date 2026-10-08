@@ -645,7 +645,6 @@ class NodeExecutor(EngineScoped):
         try:
             self.get_workflow_handler(library_name)
         except ValueError as e:
-            logger.error("Library execution failed for node '%s' via library '%s': %s", node.name, library_name, e)
             msg = f"Failed to execute node '{node.name}' via library '{library_name}': {e}"
             raise RuntimeError(msg) from e
 
@@ -864,26 +863,15 @@ class NodeExecutor(EngineScoped):
             workflow_path=str(published_workflow_filename),
             on_event=on_event,
         )
-        try:
-            async with subprocess_executor as executor:
-                await executor.arun(
-                    flow_input=flow_input or {},
-                    storage_backend=await self._get_storage_backend(),
-                )
-        except RuntimeError as e:
-            # Subprocess returned non-zero exit code
-            logger.error(
-                "Subprocess execution failed for workflow '%s' at path '%s'. Error: %s",
-                file_name,
-                published_workflow_filename,
-                e,
+        async with subprocess_executor as executor:
+            await executor.arun(
+                flow_input=flow_input or {},
+                storage_backend=await self._get_storage_backend(),
             )
-            raise
 
         my_subprocess_result = subprocess_executor.output
         if my_subprocess_result is None:
             msg = f"Subprocess completed but returned no output for workflow '{file_name}'"
-            logger.error(msg)
             raise ValueError(msg)
         return my_subprocess_result
 
@@ -1024,8 +1012,7 @@ class NodeExecutor(EngineScoped):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
             except KeyError:
-                msg = "Could not find library '%s' for loop execution", execution_type
-                logger.error(msg)
+                msg = f"Could not find library '{execution_type}' for loop execution"
                 raise RuntimeError(msg)  # noqa: B904
 
             library_name = library.get_library_data().name
@@ -2310,9 +2297,9 @@ class NodeExecutor(EngineScoped):
         if execution_type not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
-            except KeyError:
-                logger.error("Could not find library '%s' for %s execution", execution_type, label)
-                raise
+            except KeyError as err:
+                msg = f"Could not find library '{execution_type}' for {label} execution"
+                raise RuntimeError(msg) from err
 
         workflow_start_end_nodes = await self._get_workflow_start_end_nodes(library)
 
@@ -4105,13 +4092,7 @@ class NodeExecutor(EngineScoped):
 
         delete_request = DeleteWorkflowRequest(name=workflow_name)
         delete_result = await self.engine.ahandle_request(delete_request)
-        if isinstance(delete_result, DeleteWorkflowResultFailure):
-            logger.error(
-                "Failed to delete workflow '%s'. Error: %s",
-                workflow_name,
-                delete_result.result_details,
-            )
-        else:
+        if not isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.debug(
                 "Cleanup result for workflow '%s': %s",
                 workflow_name,

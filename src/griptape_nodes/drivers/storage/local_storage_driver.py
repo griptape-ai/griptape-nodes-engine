@@ -90,14 +90,12 @@ class LocalStorageDriver(BaseStorageDriver):
             response.raise_for_status()
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to create upload URL for file {resolved_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
         url = response_data.get("url")
         if url is None:
             msg = f"Failed to get upload URL for file {resolved_path}: {response_data}"
-            logger.error(msg)
             raise ValueError(msg)
 
         return {
@@ -225,7 +223,6 @@ class LocalStorageDriver(BaseStorageDriver):
                 logger.debug("File %s is already absent from local storage; nothing to delete", path)
                 return
             msg = f"Failed to delete file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
     def list_files(self) -> list[str]:
@@ -242,7 +239,6 @@ class LocalStorageDriver(BaseStorageDriver):
             response.raise_for_status()
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to list files: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()

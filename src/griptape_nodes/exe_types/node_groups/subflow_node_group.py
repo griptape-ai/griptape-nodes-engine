@@ -1272,7 +1272,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             )
 
             if isinstance(result, StartLocalSubflowResultFailure):
-                logger.error("%s: %s", self.name, result.result_details)
                 # Clear partial outputs to prevent inconsistent state
                 self.parameter_output_values.clear()
                 # Re-raise the error message directly without wrapping

@@ -663,7 +663,6 @@ class LibraryDependencies(EngineScoped):
 
         if not self.engine.library_manager.environment.can_write_to_venv_location(library_venv_python_path):
             msg = f"Attempted to set up the {venv_kind} environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
-            logger.warning(msg)
             raise DependencyInstallError(msg)
 
         config_manager = self.engine.config_manager

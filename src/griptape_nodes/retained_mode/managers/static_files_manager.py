@@ -497,7 +497,6 @@ class StaticFilesManager(EngineScoped):
             parsed = ParsedMacro(file_path)
         except MacroSyntaxError as e:
             msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because the path has invalid macro syntax: {e}"
-            logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         # Keep the original macro form alongside the resolved path: preview metadata
@@ -661,7 +660,6 @@ class StaticFilesManager(EngineScoped):
             raise
         except Exception as e:
             msg = f"Failed to save static file {file_name}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 
