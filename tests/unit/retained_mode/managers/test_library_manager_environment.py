@@ -521,6 +521,33 @@ class TestLibraryDependencies:
         assert main_info.fitness == LibraryManager.LibraryFitness.GOOD
 
     @pytest.mark.asyncio
+    async def test_a_provided_dependency_that_failed_to_load_is_named_as_failed(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The environment does provide it, so the artist is pointed at its load failure, not told to add it.
+        dependency = _write_library(tmp_path / "env" / "griptape_nodes_library_openexr", "OpenEXR Library")
+        dependency.write_text("{ not json", encoding="utf-8")
+        main = _write_library(
+            tmp_path / "env" / "main_lib",
+            "Main Library",
+            declarations=[LibraryDependencyDeclaration(url=DEPENDENCY_URL)],
+        )
+        configure(environment_paths=[dependency, main], environment_mode=True)
+        library_manager = engine.library_manager
+        download = AsyncMock()
+        monkeypatch.setattr(library_manager.git_operations, "download_library_request", download)
+
+        await library_manager.load_all_libraries_from_config()
+
+        download.assert_not_awaited()
+        main_info = _info_for(library_manager, main)
+        dependency_problems = [p for p in main_info.problems if isinstance(p, LibraryDependencyProblem)]
+        assert [problem.dependency_name for problem in dependency_problems] == [DEPENDENCY_URL]
+        assert "failed to load" in dependency_problems[0].error_message
+        assert "does not provide it" not in dependency_problems[0].error_message
+        assert main_info.fitness == LibraryManager.LibraryFitness.FLAWED
+
+    @pytest.mark.asyncio
     async def test_a_configured_copy_does_not_satisfy_it_and_nothing_is_downloaded(
         self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

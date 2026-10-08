@@ -136,7 +136,7 @@ def reset_beta_feature_warnings() -> None:
     Settings warns once per (key, value) per process, so a test asserting on that warning would
     otherwise fail whenever an earlier test in the same process hit the same value.
     """
-    settings_module._reported_invalid_beta_features.clear()
+    settings_module._reported_invalid_settings.clear()
 
 
 @pytest.fixture(autouse=True)

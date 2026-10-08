@@ -615,23 +615,17 @@ class LibraryRegistrar(EngineScoped):
                                 repo_name = parsed_dep.repo_name
                                 # In environment mode only a library the environment provides can
                                 # satisfy it; a configured copy (even a disabled one) never loads.
+                                candidates = self._library_dependency_candidates(
+                                    repo_name, environment_mode=environment_mode
+                                )
                                 already_registered = any(
-                                    (
-                                        info.library_name == repo_name
-                                        or managed.library_path_names_repo(
-                                            info.library_path, repo_name, environment_mode=environment_mode
-                                        )
-                                    )
-                                    and (
-                                        not environment_mode or managed.is_known_environment_library(info.library_path)
-                                    )
-                                    and info.lifecycle_state != LibraryLifecycleState.FAILURE
+                                    info.lifecycle_state != LibraryLifecycleState.FAILURE
                                     and info.fitness
                                     not in (
                                         LibraryFitness.UNUSABLE,
                                         LibraryFitness.MISSING,
                                     )
-                                    for info in self.engine.library_manager._library_file_path_to_info.values()
+                                    for info in candidates
                                 )
                                 if already_registered:
                                     logger.debug(
@@ -642,22 +636,32 @@ class LibraryRegistrar(EngineScoped):
                                 # Only a library the environment provides can satisfy a dependency
                                 # then; a download would be a library nobody put in the environment.
                                 if environment_mode:
+                                    # The environment may provide it but have it fail to load; then the
+                                    # fix is that library's own problems, not adding it again.
+                                    if candidates:
+                                        failed = candidates[0]
+                                        failed_name = failed.library_name or failed.library_path
+                                        reason = (
+                                            f"The environment provides it as '{failed_name}', but that library "
+                                            "failed to load. See its problems in Library Management."
+                                        )
+                                    else:
+                                        reason = (
+                                            "The environment this engine runs in does not provide it, and "
+                                            "libraries are not downloaded in that case. Ask whoever set up "
+                                            "this environment to add it."
+                                        )
                                     if dep.required:
                                         library_info.problems.append(
-                                            LibraryDependencyProblem(
-                                                dependency_name=dep.url,
-                                                error_message=(
-                                                    "The environment this engine runs in does not provide it, and "
-                                                    "libraries are not downloaded in that case. Ask whoever set up "
-                                                    "this environment to add it."
-                                                ),
-                                            )
+                                            LibraryDependencyProblem(dependency_name=dep.url, error_message=reason)
                                         )
                                         library_info.fitness = LibraryFitness.FLAWED
                                     logger.info(
-                                        "Library '%s' depends on '%s', which the environment does not provide.",
+                                        "Library '%s' depends on '%s', which the environment does not provide "
+                                        "as a loaded library: %s",
                                         library_info.library_name,
                                         dep.url,
+                                        reason,
                                     )
                                     continue
                                 if install_behavior == LibraryDependencyInstallBehavior.NEVER:
@@ -941,6 +945,24 @@ class LibraryRegistrar(EngineScoped):
 
         # Success - progressed to LOADED state
         return None
+
+    def _library_dependency_candidates(self, repo_name: str, *, environment_mode: bool) -> list[LibraryInfo]:
+        """The known libraries that could satisfy a dependency on *repo_name*, whatever their state.
+
+        In environment mode only libraries the environment provides count.
+        """
+        managed = self.engine.library_manager.managed_environment
+        candidates: list[LibraryInfo] = []
+        for info in self.engine.library_manager._library_file_path_to_info.values():
+            names_repo = info.library_name == repo_name or managed.library_path_names_repo(
+                info.library_path, repo_name, environment_mode=environment_mode
+            )
+            if not names_repo:
+                continue
+            if environment_mode and not managed.is_known_environment_library(info.library_path):
+                continue
+            candidates.append(info)
+        return candidates
 
     def _apply_metadata_load_failure(
         self,

@@ -47,7 +47,7 @@ logger = logging.getLogger("griptape_nodes")
 _BOOL_ADAPTER = TypeAdapter(bool)
 # (config key, repr of value) pairs already warned about. Settings is validated on every config
 # reload, so without this one bad entry would log the same warning many times per session.
-_reported_invalid_beta_features: set[tuple[str, str]] = set()
+_reported_invalid_settings: set[tuple[str, str]] = set()
 
 
 def _validate_beta_feature_map(map_key: str, v: Any, *, from_env: bool) -> dict[str, bool]:
@@ -99,10 +99,10 @@ def _env_value_to_bool(config_key: str, value: Any) -> bool:
 
 def _warn_once(report_key: tuple[str, str], message: str, *, level: int = logging.WARNING) -> None:
     """Log a settings warning the first time this (config key, value) pair is seen."""
-    if report_key in _reported_invalid_beta_features:
+    if report_key in _reported_invalid_settings:
         return
 
-    _reported_invalid_beta_features.add(report_key)
+    _reported_invalid_settings.add(report_key)
     logger.log(level, message)
 
 
