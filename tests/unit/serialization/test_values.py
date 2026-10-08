@@ -35,6 +35,7 @@ from griptape_nodes.serialization.values import (
     encode_value,
     register_value_codec,
     try_encode,
+    untag,
 )
 
 if TYPE_CHECKING:
@@ -552,3 +553,44 @@ class TestTryEncode:
 
     def test_display_encoding_falls_back_to_text(self) -> None:
         assert isinstance(encode_for_display(object()), str)
+
+
+class TestUntag:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ((1, "b"), [1, "b"]),
+            ({1, 2}, [1, 2]),
+            (Color.RED, "red"),
+            (Size.SMALL, 1),
+            (Path("a/b.png"), "a/b.png"),
+            (b"\x00\x01\xff", "AAH/"),
+            (float("nan"), "nan"),
+            (Span(1, 2), {"start": 1, "end": 2}),
+            ({"pair": (1, (2, 3))}, {"pair": [1, [2, 3]]}),
+        ],
+    )
+    def test_tagged_value_becomes_its_state(self, value: Any, expected: Any) -> None:
+        assert untag(encode_value(value)) == expected
+
+    def test_artifact_keeps_its_fields_without_the_tag(self) -> None:
+        image = ImageUrlArtifact("https://example.com/a.png", name="a")
+
+        untagged: Any = untag(encode_value(image))
+
+        assert TYPE_KEY not in untagged
+        assert untagged["type"] == "ImageUrlArtifact"
+        assert untagged["value"] == "https://example.com/a.png"
+
+    def test_keys_that_are_not_text_become_json_text(self) -> None:
+        assert untag(encode_value({1: "one", (2, 3): "x"})) == {"1": "one", "[2,3]": "x"}
+
+    def test_dict_with_its_own_type_key_keeps_it(self) -> None:
+        value = {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": (1, 2)}
+
+        assert untag(encode_value(value)) == {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": [1, 2]}
+
+    def test_plain_data_is_unchanged(self) -> None:
+        value = {"a": [1, {"b": None}], "c": "d"}
+
+        assert untag(encode_value(value)) == value

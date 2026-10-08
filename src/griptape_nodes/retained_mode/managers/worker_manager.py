@@ -19,7 +19,13 @@ from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriv
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
+from griptape_nodes.retained_mode.events.base_events import (
+    RESULT_EVENT_TYPES,
+    EventRequest,
+    EventResultFailure,
+    EventResultSuccess,
+    EventSerializationError,
+)
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommandRefusal,
     provisioned_by_environment,
@@ -33,6 +39,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.serialization.converter import for_clients
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -1412,7 +1419,29 @@ class WorkerManager(EngineScoped):
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
         payload["response_topic"] = session_response_topic
         logger.debug("Relaying %s to %s", payload.get("event_type"), session_response_topic)
-        await self._tx.send_message(dest_socket, json.dumps(payload), session_response_topic)
+        await self._tx.send_message(dest_socket, self._for_gui(payload), session_response_topic)
+
+    @staticmethod
+    def _for_gui(payload: dict) -> str:
+        """A worker's result as the GUI reads it: rebuilt, then sent without the type tags engines exchange."""
+        event_cls = (
+            EventResultSuccess if payload.get("event_type") == EventResultSuccess.__name__ else EventResultFailure
+        )
+        try:
+            event = event_cls.from_dict(payload)
+            event.request_id = payload.get("request_id")
+            event.response_topic = payload.get("response_topic")
+            event.retained_mode = payload.get("retained_mode")
+            with for_clients():
+                return event.json()
+        except Exception as error:
+            # A result filtered by `fields`, or of a type only the worker registers, cannot be rebuilt.
+            logger.warning(
+                "Relayed a worker's %s with its values' type tags, because it could not be rebuilt: %s",
+                payload.get("result_type"),
+                error,
+            )
+            return json.dumps(payload)
 
     def _determine_response_topic(self) -> str:
         """Determine the response topic based on current session and engine IDs."""

@@ -45,7 +45,7 @@ import sys
 import uuid
 import weakref
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any, Protocol, Self, overload
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast, overload
 
 import attrs
 from griptape.mixins.serializable_mixin import SerializableMixin
@@ -67,7 +67,8 @@ TYPE_KEY = "$type"
 VALUE_KEY = "$value"
 
 type Value = Any
-"""Any parameter value. Payload fields annotated with it cross the wire as tagged plain data."""
+"""Any parameter value. Payload fields annotated with it cross the wire as tagged plain data
+between engines, and as ``untag``-ged data to clients."""
 
 type DisplayValue = Any
 """A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
@@ -140,6 +141,39 @@ def encode_for_display(value: Any) -> JsonValue:
     if isinstance(encoded, Unencodable):
         return str(value)
     return encoded
+
+
+def untag(data: JsonValue) -> JsonValue:
+    """Return encoded ``data`` without its type tags, for a client that reads plain JSON.
+
+    Each tagged value becomes its state: a tuple its list, an enum its value, an artifact its
+    fields. A dict key that is not text becomes its JSON text. Not reversible.
+    """
+    if isinstance(data, list):
+        return [untag(item) for item in data]
+    if not isinstance(data, dict):
+        return data
+    if TYPE_KEY not in data:
+        return {key: untag(item) for key, item in data.items()}
+    return _untag_tagged(data)
+
+
+def _untag_tagged(data: dict[str, JsonValue]) -> JsonValue:
+    if VALUE_KEY not in data:
+        return {key: untag(item) for key, item in data.items() if key != TYPE_KEY}
+    state = data[VALUE_KEY]
+    if data[TYPE_KEY] == _DICT_TYPE_NAME:
+        if isinstance(state, dict):
+            # A wrapped dict: its own "$type" key is data, not a tag.
+            return {key: untag(item) for key, item in state.items()}
+        if isinstance(state, list):
+            pairs = cast("list[list[JsonValue]]", state)
+            return {_key_text(untag(key)): untag(item) for key, item in pairs}
+    return untag(state)
+
+
+def _key_text(key: JsonValue) -> str:
+    return key if isinstance(key, str) else _canonical_json(key)
 
 
 def decode_value(data: Any) -> Any:
@@ -323,6 +357,9 @@ def _tagged(cls: type, state: JsonValue) -> dict[str, JsonValue]:
 
 def _canonical_json(data: JsonValue) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+_DICT_TYPE_NAME = type_name(dict)
 
 
 def _decode_tagged(data: dict[str, Any]) -> Any:

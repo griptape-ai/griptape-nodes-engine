@@ -26,10 +26,14 @@ from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
-from griptape_nodes.retained_mode.events.base_events import EventRequest
+from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
+)
+from griptape_nodes.retained_mode.events.parameter_events import (
+    GetParameterValueRequest,
+    GetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
@@ -711,6 +715,24 @@ class TestRelayWorkerResult:
         await worker_manager.relay_worker_result(payload)
 
         worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_values_reach_the_gui_without_type_tags(self, worker_manager: WorkerManager) -> None:
+        result = EventResultSuccess(
+            request=GetParameterValueRequest(node_name="n", parameter_name="pair"),
+            result=GetParameterValueResultSuccess(
+                input_types=["any"], type="any", output_type="any", value=(1, "b"), result_details="ok"
+            ),
+            request_id="r-1",
+            response_topic=_WORKER_RESPONSE_TOPIC,
+        )
+
+        await worker_manager.relay_worker_result(json.loads(result.json()))
+
+        relayed = json.loads(worker_manager._tx.send_message.call_args.args[1])  # type: ignore[union-attr]
+        assert relayed["result"]["value"] == [1, "b"]
+        assert relayed["request_id"] == "r-1"
+        assert relayed["response_topic"] == f"sessions/{_SESSION}/response"
 
 
 class TestEvictWorker:

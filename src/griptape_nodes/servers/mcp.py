@@ -94,6 +94,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.serialization.converter import for_clients
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
@@ -383,7 +384,8 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload) -> dic
         )
     else:
         result_event = EventResultFailure(request=request_payload, result=result_payload)
-    return json.loads(result_event.json())
+    with for_clients():
+        return json.loads(result_event.json())
 
 
 async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int | None = None) -> dict[str, Any]:

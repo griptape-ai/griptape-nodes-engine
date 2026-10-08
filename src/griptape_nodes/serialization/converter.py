@@ -4,6 +4,8 @@ import json
 import logging
 import traceback
 import types
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
 from datetime import datetime
@@ -26,9 +28,12 @@ from griptape_nodes.serialization.values import (
     decode_value,
     encode_for_display,
     encode_value,
+    untag,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from cattrs import Converter
 
 logger = logging.getLogger(__name__)
@@ -38,9 +43,38 @@ converter = make_converter()
 
 # --- Unstructure hooks (serialization) ---
 
+_sending_to_client: ContextVar[bool] = ContextVar("sending_to_client", default=False)
+
+
+@contextmanager
+def for_clients() -> Iterator[None]:
+    """Serialize parameter values without their type tags, for a message bound for a client.
+
+    Another engine needs the tags to rebuild a value as its exact class. A client, such as the
+    editor or an MCP agent, reads plain JSON and sends plain JSON back, which the engine sets as is.
+    """
+    token = _sending_to_client.set(True)
+    try:
+        yield
+    finally:
+        _sending_to_client.reset(token)
+
+
+def _for_destination(encoded: Any) -> Any:
+    return untag(encoded) if _sending_to_client.get() else encoded
+
+
+def _unstructure_value(value: Any) -> Any:
+    return _for_destination(encode_value(value))
+
+
+def _unstructure_display_value(value: Any) -> Any:
+    return _for_destination(encode_for_display(value))
+
+
 # Fields annotated `Value` carry any parameter value, as tagged plain data.
-converter.register_unstructure_hook(Value, encode_value)
-converter.register_unstructure_hook(DisplayValue, encode_for_display)
+converter.register_unstructure_hook(Value, _unstructure_value)
+converter.register_unstructure_hook(DisplayValue, _unstructure_display_value)
 
 
 # Griptape objects (artifacts, rulesets, drivers) are parameter values, so they cross only in fields
@@ -114,9 +148,9 @@ def _unstructure_element_document(document: dict[str, Any]) -> dict[str, Any]:
 
 def _unstructure_element_entry(key: str, item: Any) -> Any:
     if key in _ELEMENT_VALUE_KEYS:
-        return encode_for_display(item)
+        return _unstructure_display_value(item)
     if key == "element_id_to_value":
-        return {element_id: encode_for_display(value) for element_id, value in item.items()}
+        return {element_id: _unstructure_display_value(value) for element_id, value in item.items()}
     if key == "children" and isinstance(item, list):
         return [_unstructure_element_document(child) for child in item]
     return converter.unstructure(item)
