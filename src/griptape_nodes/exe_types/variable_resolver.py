@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from contextvars import ContextVar
@@ -328,9 +329,32 @@ class VariableResolver:
 
     @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
-        """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
-        return {
-            name: value
-            for name, value in variables.items()
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
-        }
+        """Filter a name→value dict to the values that can substitute into {VAR} tokens.
+
+        str and int (excluding bool) pass through unchanged. A list passes as a string with one
+        item per line, so the substitution and picker code downstream only ever sees str/int.
+        """
+        filtered: dict[str, str | int] = {}
+        for name, value in variables.items():
+            if isinstance(value, list):
+                filtered[name] = VariableResolver._render_list(value)
+            elif isinstance(value, (str, int)) and not isinstance(value, bool):
+                filtered[name] = value
+        return filtered
+
+    @staticmethod
+    def _render_list(items: list[Any]) -> str:
+        """Join list items into one string, one item per line."""
+        return "\n".join(VariableResolver._render_list_item(item) for item in items)
+
+    @staticmethod
+    def _render_list_item(item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, (dict, list)):
+            try:
+                return json.dumps(item)
+            except (TypeError, ValueError):
+                # Non-JSON values, or a container that contains itself.
+                return str(item)
+        return str(item)
