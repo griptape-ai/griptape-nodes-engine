@@ -239,3 +239,32 @@ class TestGriptapeCloudFileDriver:
         mock_cloud_storage_driver.extract_workspace_path_from_cloud_url.return_value = None
         size = driver.get_size("https://cloud.griptape.ai/invalid/url")
         assert size == 0
+
+
+class TestGriptapeCloudFileDriverBaseUrlPath:
+    """Test that requests keep the path on base_url."""
+
+    @pytest.mark.asyncio
+    async def test_read_keeps_base_url_path(self) -> None:
+        driver = GriptapeCloudFileDriver(
+            bucket_id="test-bucket-123", api_key="test-api-key", base_url="https://example.com/prefix"
+        )
+        mock_api_response = Mock()
+        mock_api_response.json = Mock(return_value={"url": "https://signed.url/file.txt"})
+        mock_api_response.raise_for_status = Mock()
+        mock_download_response = Mock()
+        mock_download_response.content = b"cloud file content"
+        mock_download_response.raise_for_status = Mock()
+
+        with patch("httpx2.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_api_response)
+            mock_client.get = AsyncMock(return_value=mock_download_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            await driver.read("https://example.com/prefix/buckets/123/assets/test.txt", timeout=30.0)
+
+        args, _ = mock_client.post.call_args
+        assert args[0] == "https://example.com/prefix/api/buckets/123/asset-urls/test.txt"
