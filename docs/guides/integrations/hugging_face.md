@@ -207,3 +207,44 @@ huggingface-cli download black-forest-labs/FLUX.1-dev
 !!! success "Setup Complete"
 
     After completing these steps, the Hugging Face Nodes should be ready to use in Griptape Nodes!
+
+## Controlling Model Downloads
+
+If you manage Griptape Nodes for a team, you may want to decide which models are available instead of letting the engine and model libraries download from Hugging Face. Griptape Nodes downloads and finds models with Hugging Face's own `huggingface_hub` package and doesn't change any of its settings, so the standard Hugging Face environment variables control it. Hugging Face documents them in [Environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables). This section covers how Griptape Nodes behaves when you set them.
+
+### Where to set the variables
+
+Set them in either of these places, then restart Griptape Nodes:
+
+- The environment that launches Griptape Nodes, such as your shell profile, a service definition, or a container. Values set here take priority.
+- The `.env` file in your Griptape Nodes configuration directory (commonly `~/.config/griptape_nodes/.env`). See [Configuration](../configuration.md).
+
+The engine, its worker processes and its model download processes all use the same values.
+
+### Block downloads
+
+Set [`HF_HUB_OFFLINE=1`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfhuboffline) to stop all requests to Hugging Face. Models that are already in the cache keep working. With offline mode on:
+
+- Downloading an uncached model from **Model Management** fails with "Cannot find an appropriate cached snapshot folder for the specified revision on the local disk and outgoing traffic has been disabled." Downloading a model that is already cached succeeds without going online. The same applies to models listed in `models_to_download` in your configuration, which the engine downloads at startup.
+- Searching in **Model Management** fails, because search always asks Hugging Face.
+- Model dropdowns on nodes list the models in the cache. Models a node supports but that aren't cached show as "Not downloaded" and can't be run.
+- Most model nodes only load from the cache, but a few fetch extra files from Hugging Face when they run. Offline mode blocks those too, so make sure every file such a node needs is already cached.
+
+### Use a shared or managed cache
+
+Set [`HF_HOME`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfhome) or [`HF_HUB_CACHE`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfhubcache) to point Griptape Nodes at a cache you control, such as a network share. **Model Management** lists and deletes models in that cache, and model dropdowns read from it. Hugging Face explains the cache layout in [Manage the cache](https://huggingface.co/docs/huggingface_hub/guides/manage-cache).
+
+### Pre-download models
+
+Fill the cache ahead of time with `hf download`, described in [Download files from the Hub](https://huggingface.co/docs/huggingface_hub/guides/download) and the [CLI guide](https://huggingface.co/docs/huggingface_hub/guides/cli). Keep in mind:
+
+- Run it with the same `HF_HOME` or `HF_HUB_CACHE` that Griptape Nodes uses, or the models land in a different cache.
+- Download the whole repository. Nodes load only what's in the cache, so a download filtered to some files can leave a model that shows up in the dropdown but fails to load.
+
+### Use an internal mirror
+
+`huggingface_hub` also reads `HF_ENDPOINT`, the address it downloads and searches from. Set it to an internal mirror of the Hugging Face Hub to serve models from your own server.
+
+### Use local model files
+
+The Modular Diffusion library's **Load Pipeline Component** node loads a component from a single checkpoint file or a local diffusers-format folder, so you can use model files that aren't in the Hugging Face cache at all.
