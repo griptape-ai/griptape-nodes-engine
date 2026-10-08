@@ -1,3 +1,4 @@
+import json
 import logging
 from enum import StrEnum
 from pathlib import Path
@@ -22,6 +23,7 @@ EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
+WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -39,7 +41,8 @@ SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so validators that need a typed value convert under this flag, and a value
 # that can't be converted fails validation so the variable is reported as a bad value instead of
-# silently becoming a default. Beta feature entries and `library.provisioned_by` read it.
+# silently becoming a default. Beta feature entries, `worker.command_prefix`, and
+# `library.provisioned_by` read it.
 FROM_ENV_CONTEXT = "from_env"
 
 logger = logging.getLogger("griptape_nodes")
@@ -134,16 +137,22 @@ LOGGING = Category(name="Logging", description="Where engine logs are kept and h
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
-    """Enhanced Field with default category that can be overridden."""
-    if "json_schema_extra" not in kwargs:
+    """Enhanced Field with default category that can be overridden.
+
+    A caller-supplied `json_schema_extra` dict keeps its own keys and gains the category unless it
+    already names one.
+    """
+    json_schema_extra = dict(kwargs.get("json_schema_extra") or {})
+    if "category" not in json_schema_extra:
         # Convert Category to dict or use string directly
         if isinstance(category, Category):
             category_dict = {"name": category.name}
             if category.description:
                 category_dict["description"] = category.description
-            kwargs["json_schema_extra"] = {"category": category_dict}
+            json_schema_extra["category"] = category_dict
         else:
-            kwargs["json_schema_extra"] = {"category": category}
+            json_schema_extra["category"] = category
+    kwargs["json_schema_extra"] = json_schema_extra
     return PydanticField(**kwargs)
 
 
@@ -362,6 +371,46 @@ class WorkerSettings(BaseModel):
             "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),
     )
+    command_prefix: list[str] = Field(
+        default_factory=list,
+        json_schema_extra={"env_var_format": "json_list"},
+        description=(
+            "Words placed in front of the command that starts a library's worker process, so the worker "
+            "runs inside an environment another tool prepares (for example a package manager that "
+            "resolves the library's packages). Empty (the default) starts workers directly. Each word "
+            "may contain {library_request}, {library_name}, {engine_version}, and {python_version}, "
+            "filled per worker: {library_request} is the library's entry in the "
+            "GTN_LIBRARY_WORKER_REQUESTS environment variable (a word that is exactly {library_request} "
+            "becomes one word per space-separated part of that entry), {library_name} is the library's "
+            "name, {engine_version} is this engine's version, and {python_version} is the Python it runs "
+            "on (major.minor). The worker always runs this engine's own Python interpreter, so the "
+            "environment the prefix prepares must be for that Python. When a word uses {library_request} and the library has no entry, the "
+            "worker starts without the prefix, except when library.provisioned_by is 'environment', "
+            "where the worker is not started and the library reports why. The environment variable "
+            'takes a JSON list, e.g. GTN_CONFIG_WORKER__COMMAND_PREFIX=\'["env-tool", "run", '
+            '"{library_request}", "--"]\'.'
+        ),
+    )
+
+    @field_validator("command_prefix", mode="before")
+    @classmethod
+    def validate_command_prefix(cls, v: Any, info: ValidationInfo) -> Any:
+        """Parse the JSON list a GTN_CONFIG_WORKER__COMMAND_PREFIX variable carries.
+
+        Env vars are always strings and a list has no other string form, so under
+        `FROM_ENV_CONTEXT` a string is read as JSON. A blank one means no prefix.
+        A string from a config file is left for the list type to reject, as for any list setting.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if not from_env or not isinstance(v, str):
+            return v
+        if not v.strip():
+            return []
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError as e:
+            msg = f"{WORKER_COMMAND_PREFIX_KEY} must be a JSON list of strings, got {v!r}"
+            raise ValueError(msg) from e
 
 
 class AgentSettings(BaseModel):

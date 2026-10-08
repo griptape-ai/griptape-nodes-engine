@@ -20,6 +20,13 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
+from griptape_nodes.retained_mode.managers.external_environment import (
+    WorkerCommandRefusal,
+    provisioned_by_environment,
+    read_worker_command_prefix,
+    resolve_worker_command,
+    worker_requests_from_environment,
+)
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
@@ -454,6 +461,12 @@ class WorkerManager(EngineScoped):
             # same clean env baseline a fresh engine would have. Inheriting the live os.environ
             # would bake the orchestrator's current-project env vars into the worker's restore
             # baseline, leaving the worker unable to unset them on a later project switch.
+            #
+            # On top of that baseline the engine sets only the variables named below, one by one.
+            # Nothing is forwarded by pattern: a variable an environment tool set while preparing
+            # the orchestrator reaches the worker as part of the baseline every child process
+            # inherits, unchanged, and a configured worker.command_prefix -- which owns preparing
+            # the worker's environment -- decides what to do with it.
             base_environ = self.engine.project_manager.get_pre_project_environ()
             worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
             # Stamp the spawning orchestrator's id so the worker can report it in its discovery
@@ -864,7 +877,7 @@ class WorkerManager(EngineScoped):
         # has to exist before the process starts. It does: the orchestrator builds it while
         # registering the library, and a library whose build failed is never asked for a worker --
         # LibraryManager knows its own build result and does not request one.
-        args = [
+        command = [
             sys.executable,
             "-m",
             "griptape_nodes_app",
@@ -874,7 +887,25 @@ class WorkerManager(EngineScoped):
             "--library-name",
             library_name,
         ]
-        await self.spawn_worker(args, library_name)
+        # A configured prefix starts the worker inside an environment another tool prepares for
+        # this library. Read per spawn, like the request list, so a reload picks up a change.
+        # The engine's startup environment, not a project's: a project template must not change
+        # which packages a library's worker resolves or how it is started.
+        startup_environ = self.engine.project_manager.get_pre_project_environ()
+        resolved = resolve_worker_command(
+            command=command,
+            prefix=read_worker_command_prefix(self.engine.config_manager, startup_environ),
+            library_name=library_name,
+            worker_requests=worker_requests_from_environment(startup_environ),
+            engine_version=engine_version,
+            python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+            environment_mode=provisioned_by_environment(self.engine.config_manager),
+        )
+        if isinstance(resolved, WorkerCommandRefusal):
+            logger.error("Not starting a worker for library '%s': %s", library_name, resolved.reason)
+            self.note_worker_unavailable(library_name, resolved.reason)
+            return
+        await self.spawn_worker(resolved.args, library_name)
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
         """Record a spawn that raised before producing a worker.
