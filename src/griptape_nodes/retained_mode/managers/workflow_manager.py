@@ -86,6 +86,10 @@ from griptape_nodes.retained_mode.managers.workflow.codegen import WORKFLOW_META
 from griptape_nodes.retained_mode.managers.workflow.file_operations import WorkflowFileOperations
 from griptape_nodes.retained_mode.managers.workflow.loading import EPOCH_START
 from griptape_nodes.retained_mode.managers.workflow.publishing import WorkflowPublishing
+from griptape_nodes.retained_mode.managers.workflow.referenced_dependencies import (
+    ReferencedWorkflowDependencies,
+    collect_referenced_workflow_dependencies,
+)
 from griptape_nodes.retained_mode.managers.workflow.referenced_import import ReferencedWorkflowImport
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowRunner, collate_problems_by_type
 from griptape_nodes.retained_mode.managers.workflow.saving import (
@@ -610,8 +614,21 @@ class WorkflowManager(EngineScoped):
             else:
                 registered_libraries = list_libraries_result.libraries
 
+        # A workflow's header names only the libraries its own nodes need. The libraries behind a
+        # referenced sub-workflow live in that sub-workflow's header, so check them too -- otherwise
+        # a sub-workflow that has since changed which libraries it needs leaves this check reporting
+        # on the wrong set, and silent about a library the load is about to require.
+        referenced_dependencies = self.collect_referenced_workflow_dependencies(workflow_metadata)
+        problems.extend(referenced_dependencies.problems)
+
+        libraries_to_check = list(workflow_metadata.node_libraries_referenced)
+        directly_referenced_names = {lib.library_name for lib in libraries_to_check}
+        libraries_to_check.extend(
+            lib for lib in referenced_dependencies.libraries if lib.library_name not in directly_referenced_names
+        )
+
         dependency_infos = []
-        for node_library_referenced in workflow_metadata.node_libraries_referenced:
+        for node_library_referenced in libraries_to_check:
             library_name = node_library_referenced.library_name
             desired_version_str = node_library_referenced.library_version
             try:
@@ -887,6 +904,12 @@ class WorkflowManager(EngineScoped):
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
         """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`."""
         return await self.runner.run_workflow(relative_file_path)
+
+    def collect_referenced_workflow_dependencies(
+        self, workflow_metadata: WorkflowMetadata
+    ) -> ReferencedWorkflowDependencies:
+        """Libraries declared by the workflows `workflow_metadata` references. See `referenced_dependencies`."""
+        return collect_referenced_workflow_dependencies(self.engine.workflow_registry, workflow_metadata)
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""
