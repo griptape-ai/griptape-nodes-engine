@@ -14,7 +14,11 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     SubflowNodeGroup,
 )
 from griptape_nodes.exe_types.node_types import BaseNode, Connection
-from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionResultSuccess
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    DeleteConnectionRequest,
+    DeleteConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeResultFailure,
@@ -30,6 +34,7 @@ if TYPE_CHECKING:
 
 _UNMAP_RECREATED_EDGE_COUNT = 2
 _UNMAP_DELETED_EDGE_COUNT = 4
+_PROXY_CONNECTION_COUNT_AFTER_TWO_REMAPPED_EDGES = 4
 
 
 class TestSubflowNodeGroupCreateSubflow:
@@ -78,6 +83,19 @@ class TestSubflowNodeGroupCreateSubflow:
 
         assert group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
         assert group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
+
+    def test_deduplicates_saved_proxy_side_metadata(self, engine: Engine) -> None:
+        group = _MiniSubflowGroup(
+            name="G",
+            metadata={
+                "left_parameters": ["exec_in", "exec_in", "other"],
+                "right_parameters": ["exec_out", "other", "other"],
+            },
+        )
+        engine.object_manager.add_object_by_name(group.name, group)
+
+        assert group.metadata["left_parameters"] == ["group_exec_in", "exec_in", "other"]
+        assert group.metadata["right_parameters"] == ["group_exec_out", "exec_out", "other"]
 
 
 class TestGetAllNodes:
@@ -174,8 +192,9 @@ class TestSubflowNodeGroupProxyLifecycle:
 
         group._register_side_parameter(LEFT_PARAMETERS_KEY, "group_exec_in")
         group._register_side_parameter(LEFT_PARAMETERS_KEY, "group_exec_in")
+        group._register_side_parameter(LEFT_PARAMETERS_KEY, "new_proxy")
 
-        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in", "saved_proxy"]
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in", "saved_proxy", "new_proxy"]
 
     def test_proxy_creation_reports_an_unsuccessful_add(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         group = _MiniSubflowGroup(name="failed_proxy")
@@ -225,6 +244,22 @@ class TestSubflowNodeGroupProxyLifecycle:
         group._cleanup_proxy_parameter(proxy, LEFT_PARAMETERS_KEY)
 
         assert group.get_parameter_by_name(proxy.name) is proxy
+
+    def test_cleanup_keeps_proxy_with_an_outgoing_bridge_after_deserialization(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        group = _group_with_proxy(engine, "outgoing_graph_proxy")
+        proxy = group.get_parameter_by_name("proxy")
+        assert proxy is not None
+        graph = MagicMock()
+        graph.get_incoming_connections_to_parameter.return_value = []
+        graph.get_outgoing_connections_from_parameter.return_value = [object()]
+        monkeypatch.setattr(engine.flow_manager, "get_connections", MagicMock(return_value=graph))
+
+        group._cleanup_proxy_parameter(proxy, RIGHT_PARAMETERS_KEY)
+
+        assert group.get_parameter_by_name(proxy.name) is proxy
+        assert proxy.name in group.metadata[RIGHT_PARAMETERS_KEY]
 
     def test_cleanup_keeps_metadata_when_parameter_removal_fails(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch
@@ -413,6 +448,53 @@ class TestSubflowNodeGroupProxyLifecycle:
         assert node.parent_group is group
 
     @pytest.mark.parametrize("is_incoming", [True, False])
+    def test_unmap_restores_parent_group_when_direct_creation_raises(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, is_incoming: bool
+    ) -> None:
+        group = _MiniSubflowGroup(name="raising_unmap_group")
+        node = BaseNode(name="inside")
+        node.parent_group = group
+        endpoint = BaseNode(name="endpoint")
+        proxy = Parameter(name="proxy", tooltip="")
+        endpoint_parameter = Parameter(name="endpoint_param", tooltip="")
+        internal_connection = (
+            Connection(group, proxy, node, Parameter(name="internal_in", tooltip=""))
+            if is_incoming
+            else Connection(node, Parameter(name="internal_out", tooltip=""), group, proxy)
+        )
+        wall_connection = (
+            Connection(endpoint, endpoint_parameter, group, proxy)
+            if is_incoming
+            else Connection(group, proxy, endpoint, endpoint_parameter)
+        )
+        connections = MagicMock()
+        connections.get_outgoing_connections_to_node.return_value = (
+            {} if is_incoming else {"internal_out": [internal_connection]}
+        )
+        connections.get_outgoing_connections_from_parameter.return_value = [wall_connection]
+        connections.get_incoming_connections_from_node.return_value = (
+            {"internal_in": [internal_connection]} if is_incoming else {}
+        )
+        connections.get_incoming_connections_to_parameter.return_value = [wall_connection]
+        success = MagicMock()
+        success.failed.return_value = False
+
+        def raise_during_creation(_request: CreateConnectionRequest) -> None:
+            assert node.parent_group is None
+            msg = "creation raised"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(engine.flow_manager, "on_delete_connection_request", MagicMock(return_value=success))
+        monkeypatch.setattr(
+            engine.flow_manager, "on_create_connection_request", MagicMock(side_effect=raise_during_creation)
+        )
+
+        with pytest.raises(ValueError, match="creation raised"):
+            group.unmap_node_connections(node, connections)
+
+        assert node.parent_group is group
+
+    @pytest.mark.parametrize("is_incoming", [True, False])
     def test_unmap_reports_a_failed_wall_connection_removal(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, is_incoming: bool
     ) -> None:
@@ -488,6 +570,138 @@ class TestSubflowNodeGroupProxyLifecycle:
         expected_parameter = target_parameter if is_incoming else source_parameter
         create_proxy.assert_called_once_with(expected_parameter, is_incoming=is_incoming)
         create_connections.assert_called_once_with(proxy, connection, is_incoming=is_incoming)
+
+    def test_grouped_proxy_reuses_existing_proxy(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        group = _MiniSubflowGroup(name="reused_proxy_group")
+        source_node = BaseNode(name="source")
+        target_node = BaseNode(name="target")
+        source_parameter = Parameter(name="source_value", tooltip="")
+        target_parameter = Parameter(name="target_value", tooltip="")
+        connection = Connection(source_node, source_parameter, target_node, target_parameter)
+        proxy = Parameter(name="existing_proxy", tooltip="")
+        create_proxy = MagicMock()
+        create_connections = MagicMock()
+        handle_request = MagicMock(return_value=DeleteConnectionResultSuccess(result_details="deleted"))
+        monkeypatch.setattr(group, "_find_existing_proxy_for_source", MagicMock(return_value=proxy))
+        monkeypatch.setattr(group, "_create_proxy_parameter_for_connection", create_proxy)
+        monkeypatch.setattr(group, "_create_connections_for_proxy_single", create_connections)
+        monkeypatch.setattr(engine, "handle_request", handle_request)
+
+        group._map_external_connections_group([connection], is_incoming=True)
+
+        handle_request.assert_called_once_with(
+            DeleteConnectionRequest(
+                source_parameter_name=source_parameter.name,
+                target_parameter_name=target_parameter.name,
+                source_node_name=source_node.name,
+                target_node_name=target_node.name,
+            )
+        )
+        create_proxy.assert_not_called()
+        create_connections.assert_called_once_with(proxy, connection, is_incoming=True)
+
+    def test_grouped_proxy_ignores_an_empty_connection_list(
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        group = _MiniSubflowGroup(name="empty_proxy_group")
+        find_proxy = MagicMock()
+        handle_request = MagicMock()
+        monkeypatch.setattr(group, "_find_existing_proxy_for_source", find_proxy)
+        monkeypatch.setattr(engine, "handle_request", handle_request)
+
+        group._map_external_connections_group([], is_incoming=True)
+
+        find_proxy.assert_not_called()
+        handle_request.assert_not_called()
+
+    @pytest.mark.parametrize("is_incoming", [True, False])
+    def test_find_existing_proxy_matches_source_on_the_correct_side(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, is_incoming: bool
+    ) -> None:
+        group = _MiniSubflowGroup(name="existing_proxy_group")
+        proxy = Parameter(name="proxy", tooltip="")
+        group.add_parameter(proxy)
+        side_key = LEFT_PARAMETERS_KEY if is_incoming else RIGHT_PARAMETERS_KEY
+        group.metadata[side_key] = ["removed_proxy", proxy.name]
+        source_node = BaseNode(name="source")
+        source_parameter = Parameter(name="source_value", tooltip="")
+        matching_connection = Connection(source_node, source_parameter, group, proxy)
+        connections = MagicMock()
+        connections.get_incoming_connections_to_parameter.return_value = [matching_connection]
+        monkeypatch.setattr(engine.flow_manager, "get_connections", MagicMock(return_value=connections))
+
+        result = group._find_existing_proxy_for_source(source_node, source_parameter, is_incoming=is_incoming)
+
+        assert result is proxy
+
+    def test_find_existing_proxy_returns_none_when_source_does_not_match(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        group = _MiniSubflowGroup(name="unmatched_proxy_group")
+        proxy = Parameter(name="proxy", tooltip="")
+        group.add_parameter(proxy)
+        group.metadata[LEFT_PARAMETERS_KEY].append(proxy.name)
+        source_node = BaseNode(name="source")
+        source_parameter = Parameter(name="source_value", tooltip="")
+        different_source = Connection(
+            BaseNode(name="different_source"),
+            Parameter(name="different_value", tooltip=""),
+            group,
+            proxy,
+        )
+        connections = MagicMock()
+        connections.get_incoming_connections_to_parameter.return_value = [different_source]
+        monkeypatch.setattr(engine.flow_manager, "get_connections", MagicMock(return_value=connections))
+
+        result = group._find_existing_proxy_for_source(source_node, source_parameter, is_incoming=True)
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        ("is_incoming", "first_is_internal", "second_is_internal"),
+        [(True, False, True), (False, True, False)],
+    )
+    def test_proxy_connections_preserve_direction_and_increment_cleanup_count(
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        is_incoming: bool,
+        first_is_internal: bool,
+        second_is_internal: bool,
+    ) -> None:
+        group = _MiniSubflowGroup(name="proxy_edges")
+        source_node = BaseNode(name="source")
+        target_node = BaseNode(name="target")
+        source_parameter = Parameter(name="source_value", tooltip="")
+        target_parameter = Parameter(name="target_value", tooltip="")
+        proxy = Parameter(name="proxy", tooltip="")
+        connection = Connection(source_node, source_parameter, target_node, target_parameter)
+        handle_request = MagicMock()
+        monkeypatch.setattr(engine, "handle_request", handle_request)
+
+        group._create_connections_for_proxy_single(proxy, connection, is_incoming=is_incoming)
+        group._create_connections_for_proxy_single(proxy, connection, is_incoming=is_incoming)
+
+        assert [request.args[0] for request in handle_request.call_args_list] == [
+            CreateConnectionRequest(
+                source_parameter_name=source_parameter.name,
+                target_parameter_name=proxy.name,
+                source_node_name=source_node.name,
+                target_node_name=group.name,
+                is_node_group_internal=first_is_internal,
+            ),
+            CreateConnectionRequest(
+                source_parameter_name=proxy.name,
+                target_parameter_name=target_parameter.name,
+                source_node_name=group.name,
+                target_node_name=target_node.name,
+                is_node_group_internal=second_is_internal,
+            ),
+        ] * 2
+        assert group._proxy_param_to_connections[proxy.name] == _PROXY_CONNECTION_COUNT_AFTER_TWO_REMAPPED_EDGES
 
     def test_remove_nodes_unmaps_each_node_and_remaps_remaining_nodes(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch
