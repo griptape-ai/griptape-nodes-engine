@@ -833,7 +833,11 @@ class ExecuteDagState(State):
 
                     # Every caller of the machine reports the failure from `get_error_message()`.
                     logger.debug("Node '%s' failed", node_name, exc_info=exc)
-                    msg = f"Node '{node_name}' encountered a problem: {exc}"
+                    # ExecuteNodeFailedError already names the node.
+                    if isinstance(exc, ExecuteNodeFailedError):
+                        msg = str(exc)
+                    else:
+                        msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(
                         ExecutionGriptapeNodeEvent(
