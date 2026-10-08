@@ -2837,8 +2837,13 @@ class NodeManager(EngineScoped):
 
         # Propagate side-effect output changes to downstream nodes.
         # When after_value_set modifies output parameters, those
-        # changes must reach downstream nodes.
-        if output_snapshot is not None and modified:
+        # changes must reach downstream nodes. This is an edit-time behavior: during a run,
+        # each downstream node collects its inputs from upstream outputs before it executes,
+        # and pushing preview outputs ahead of that re-fires every downstream after_value_set,
+        # so live-preview nodes in a chain re-render once per upstream hop. The check is
+        # engine-wide: a node edited while any flow runs skips this too, even outside that run.
+        is_flow_running = self.engine.flow_manager.check_for_existing_running_flow()
+        if output_snapshot is not None and modified and not is_flow_running:
             for output_param_name, new_value in node.parameter_output_values.items():
                 old_value = output_snapshot.get(output_param_name)
                 if old_value is new_value or old_value == new_value:
