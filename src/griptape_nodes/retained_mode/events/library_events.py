@@ -870,6 +870,40 @@ class ReloadAllLibrariesResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class ReloadSandboxLibraryRequest(RequestPayload):
+    """Reload only the sandbox library, picking up node files added or changed in the sandbox directory.
+
+    Unregisters the sandbox library, rescans `sandbox_library_directory`, and registers it again.
+    Every other library stays loaded and no worker process is restarted, so unlike
+    ReloadAllLibrariesRequest this does not clear workflow state. Nodes already in a workflow keep
+    the class they were created with until they are recreated. It never runs alongside
+    ReloadAllLibrariesRequest: whichever starts second waits for the first to finish.
+
+    It fails when the sandbox is off (`library.sandbox_enabled`; off by default when
+    `library.provisioned_by` is 'environment').
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ReloadSandboxLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The sandbox library was reloaded.
+
+    Args:
+        node_types: The node types the sandbox library registered after the reload.
+    """
+
+    node_types: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReloadSandboxLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Sandbox library reload failed. Common causes: no sandbox directory configured, a sandbox not allowed in this environment, a node file that fails to import."""
+
+
+@dataclass
+@PayloadRegistry.register
 class DiscoverLibrariesRequest(RequestPayload):
     """Discover all libraries from configuration.
 

@@ -134,9 +134,7 @@ class LibraryRegistrar(EngineScoped):
         # Checked here rather than only at discovery, so a library registered by path from the
         # editor or a script is held to the same rule as one found at startup.
         managed = self.engine.library_manager.managed_environment
-        if managed.provisioned_by_environment() and not await managed.is_provided_by_environment(
-            library_info.library_path
-        ):
+        if managed.provisioned_by_environment() and not await managed.is_allowed_in_environment(library_info):
             managed.mark_not_provided_by_environment(library_info)
             self.engine.library_manager._library_file_path_to_info[library_info.library_path] = library_info
             details = (

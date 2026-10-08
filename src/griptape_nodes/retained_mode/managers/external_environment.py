@@ -98,6 +98,30 @@ def provisioned_by_environment(config_manager: ConfigManager) -> bool:
     return read_provisioned_by(config_manager) is LibraryProvisioner.ENVIRONMENT
 
 
+def read_sandbox_enabled(config_manager: ConfigManager) -> bool | None:
+    """The configured `library.sandbox_enabled`, read through the Settings validator.
+
+    True or False when set, None when unset or unreadable (the validator has already warned about a
+    value it could not read). Only this field is validated, as for `read_provisioned_by`.
+    """
+    library_section = config_manager.get_config_value(LIBRARY_SECTION_KEY, default={}) or {}
+    if not isinstance(library_section, dict) or "sandbox_enabled" not in library_section:
+        return None
+    return LibrarySettings.model_validate({"sandbox_enabled": library_section["sandbox_enabled"]}).sandbox_enabled
+
+
+def sandbox_enabled(config_manager: ConfigManager) -> bool:
+    """Whether the sandbox library loads: `library.sandbox_enabled`, or the mode's default when unset.
+
+    Unset means on when the engine provisions libraries and off when the environment does, so
+    environment mode stays strict unless a studio opts in.
+    """
+    setting = read_sandbox_enabled(config_manager)
+    if setting is None:
+        return not provisioned_by_environment(config_manager)
+    return setting
+
+
 def read_worker_command_prefix(
     config_manager: ConfigManager, startup_environ: Mapping[str, str]
 ) -> WorkerCommandPrefix:

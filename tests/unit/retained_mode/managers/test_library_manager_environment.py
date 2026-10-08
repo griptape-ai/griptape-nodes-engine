@@ -8,6 +8,7 @@ environment the suite happens to run in.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import TYPE_CHECKING, Protocol
@@ -42,11 +43,19 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromRequirementSpecifierResultFailure,
     RegisterSandboxNodeFromSourceRequest,
     RegisterSandboxNodeFromSourceResultFailure,
+    RegisterSandboxNodeFromSourceResultSuccess,
+    ReloadAllLibrariesRequest,
+    ReloadAllLibrariesResultSuccess,
+    ReloadSandboxLibraryRequest,
+    ReloadSandboxLibraryResultFailure,
+    ReloadSandboxLibraryResultSuccess,
+    ScanSandboxDirectoryResultFailure,
     SwitchLibraryRefRequest,
     SwitchLibraryRefResultFailure,
     SyncLibrariesRequest,
     SyncLibrariesResultFailure,
     UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultFailure,
     UpdateLibraryRequest,
     UpdateLibraryResultFailure,
 )
@@ -122,6 +131,7 @@ class Configure(Protocol):
         registered: list[Path] | None = None,
         environment_mode: bool,
         downloads: list[str] | None = None,
+        allow_sandbox: bool = False,
     ) -> None:
         """Configure the engine's libraries and provisioner for one test."""
 
@@ -143,10 +153,13 @@ def configure(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         registered: list[Path] | None = None,
         environment_mode: bool,
         downloads: list[str] | None = None,
+        allow_sandbox: bool = False,
     ) -> None:
         monkeypatch.setenv(LIBRARY_PATHS_ENV_VAR, os.pathsep.join(str(path) for path in environment_paths))
         if environment_mode:
             monkeypatch.setenv("GTN_CONFIG_LIBRARY__PROVISIONED_BY", "environment")
+        if allow_sandbox:
+            monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "true")
         config = engine.config_manager
         config.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(path) for path in registered or []])
         config.set_config_value(LIBRARIES_TO_DOWNLOAD_KEY, list(downloads or []))
@@ -728,3 +741,394 @@ class TestNothingOutsideTheEnvironmentMixesIn:
         assert result.has_update is False
         assert result.current_version == result.latest_version == "1.0.0"
         assert "environment" in str(result.result_details)
+
+
+def _write_sandbox_node(sandbox: Path, class_name: str) -> Path:
+    sandbox.mkdir(exist_ok=True)
+    source = sandbox / f"{class_name.lower()}.py"
+    source.write_text(_NODE_SOURCE.format(class_name=class_name), encoding="utf-8")
+    return source
+
+
+class TestSandboxAllowedByTheEnvironment:
+    """library.sandbox_enabled lets the sandbox in; everything else stays refused."""
+
+    @pytest.mark.asyncio
+    async def test_the_sandbox_loads_and_is_listed(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        configured = _write_library(tmp_path / "config" / "a_lib", "A Library")
+        configure(environment_paths=[], registered=[configured], environment_mode=True, allow_sandbox=True)
+        library_manager = engine.library_manager
+        init_venv = AsyncMock()
+        install = AsyncMock()
+        monkeypatch.setattr(library_manager.environment, "init_library_venv", init_venv)
+        monkeypatch.setattr(library_manager.dependencies, "_install_dependency_set", install)
+
+        await library_manager.load_all_libraries_from_config()
+
+        sandbox_library = LibraryRegistry.get_library(name=LibraryManager.SANDBOX_LIBRARY_NAME)
+        assert "LooseNode" in sandbox_library.get_registered_nodes()
+        init_venv.assert_not_awaited()
+        install.assert_not_awaited()
+        assert not (sandbox / ".venv").exists()
+        # Only the sandbox is let in.
+        assert "A Library" not in LibraryRegistry.list_libraries()
+
+        result = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+            LoadMetadataForAllLibrariesRequest()
+        )
+        assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+        by_name = {entry.library_schema.name: entry for entry in result.successful_libraries}
+        sandbox_entry = by_name[LibraryManager.SANDBOX_LIBRARY_NAME]
+        assert sandbox_entry.is_registered is True
+        # No registered_path: the sandbox comes from sandbox_library_directory, not from the
+        # environment or libraries_to_register, which is how the editor keeps it out of either list.
+        assert sandbox_entry.registered_path is None
+        assert sandbox_entry.file_path == str(sandbox / LibraryManager.LIBRARY_CONFIG_FILENAME)
+        assert by_name["A Library"].is_registered is False
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_node_can_be_added(self, engine: Engine, configure: Configure, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        configure(environment_paths=[], environment_mode=True, allow_sandbox=True)
+        await engine.library_manager.load_all_libraries_from_config()
+        source = _write_sandbox_node(sandbox, "AddedNode")
+
+        result = await engine.ahandle_request(RegisterSandboxNodeFromSourceRequest(file_path=str(source)))
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess)
+        assert result.registered_class_names == ["AddedNode"]
+
+    @pytest.mark.asyncio
+    async def test_without_the_opt_in_the_sandbox_is_still_refused(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        configure(environment_paths=[], environment_mode=True, allow_sandbox=False)
+
+        await engine.library_manager.load_all_libraries_from_config()
+
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+        assert not (sandbox / LibraryManager.LIBRARY_CONFIG_FILENAME).exists()
+
+
+class TestReloadSandboxLibrary:
+    @pytest.mark.asyncio
+    async def test_reload_picks_up_new_nodes_and_leaves_environment_libraries_and_workers_alone(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        from_environment = _write_library(tmp_path / "env" / "b_lib", "B Library")
+        configure(environment_paths=[from_environment], environment_mode=True, allow_sandbox=True)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        environment_library = LibraryRegistry.get_library(name="B Library")
+        environment_info = _info_for(library_manager, from_environment)
+        reset_workers = AsyncMock()
+        start_workers = AsyncMock()
+        monkeypatch.setattr(engine.worker_manager, "reset_workers", reset_workers)
+        monkeypatch.setattr(library_manager.workers, "_start_workers", start_workers)
+        monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [reset_workers])
+        _write_sandbox_node(sandbox, "NewNode")
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess)
+        assert set(result.node_types) == {"LooseNode", "NewNode"}
+        assert "NewNode" in LibraryRegistry.get_library(name=LibraryManager.SANDBOX_LIBRARY_NAME).get_registered_nodes()
+        # The environment's library is the same loaded object, and no worker was stopped or started.
+        assert LibraryRegistry.get_library(name="B Library") is environment_library
+        assert _info_for(library_manager, from_environment) is environment_info
+        reset_workers.assert_not_awaited()
+        start_workers.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_environment_mode_without_the_opt_in_refuses(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=True, allow_sandbox=False)
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "does not include a sandbox library" in str(result.result_details)
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+
+    @pytest.mark.asyncio
+    async def test_venv_mode_reloads_the_sandbox_too(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        await engine.library_manager.load_all_libraries_from_config()
+        _write_sandbox_node(sandbox, "NewNode")
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess)
+        assert set(result.node_types) == {"LooseNode", "NewNode"}
+
+    @pytest.mark.asyncio
+    async def test_no_sandbox_directory_fails_with_where_to_set_it(self, engine: Engine, configure: Configure) -> None:
+        configure(environment_paths=[], environment_mode=False)
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "Sandbox Settings" in str(result.result_details)
+
+
+class TestReloadSandboxLibraryFailures:
+    """Each way a sandbox reload can fail says which step failed, and a failed load can be retried."""
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_that_failed_to_load_reloads_once_fixed(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        broken = sandbox / "loosenode.py"
+        broken.write_text("this is not python\n", encoding="utf-8")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        broken.unlink()
+        _write_sandbox_node(sandbox, "LooseNode")
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess)
+        assert result.node_types == ["LooseNode"]
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_that_cannot_be_unloaded_is_reported(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        monkeypatch.setattr(
+            library_manager.registration,
+            "unload_library_from_registry_request",
+            lambda _request: UnloadLibraryFromRegistryResultFailure(result_details="it is in use"),
+        )
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "could not be unloaded: it is in use" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_directory_that_cannot_be_scanned_is_reported(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        monkeypatch.setattr(
+            engine.library_manager.sandbox,
+            "scan_sandbox_directory_request",
+            lambda _request: ScanSandboxDirectoryResultFailure(result_details="unreadable"),
+        )
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "could not be scanned" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_that_fails_to_register_is_reported(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        monkeypatch.setattr(
+            engine.library_manager.registration,
+            "register_library_from_file_request",
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="bad manifest")),
+        )
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "could not be loaded: bad manifest" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_allowing_the_sandbox_after_it_was_refused_loads_it(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=True, allow_sandbox=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "true")
+        engine.config_manager.load_configs()
+
+        await library_manager.load_all_libraries_from_config()
+
+        assert LibraryManager.SANDBOX_LIBRARY_NAME in LibraryRegistry.list_libraries()
+
+    @pytest.mark.asyncio
+    async def test_refresh_sandbox_after_allowing_it_loads_it(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=True, allow_sandbox=False)
+        await engine.library_manager.load_all_libraries_from_config()
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "true")
+        engine.config_manager.load_configs()
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess)
+        assert result.node_types == ["LooseNode"]
+
+
+class TestSandboxTurnedOff:
+    """library.sandbox_enabled = false turns the sandbox off in either mode, with a reason."""
+
+    @pytest.mark.asyncio
+    async def test_engine_mode_can_turn_the_sandbox_off(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sandbox = tmp_path / "sandbox"
+        _write_sandbox_node(sandbox, "LooseNode")
+        monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", "false")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+
+        await library_manager.load_all_libraries_from_config()
+        added = await engine.ahandle_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(_write_sandbox_node(sandbox, "AddedNode")))
+        )
+        reload = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+        # Turned off means not scanned: scanning would write the sandbox's manifest.
+        assert not (sandbox / "griptape_nodes_library.json").exists()
+        assert isinstance(added, RegisterSandboxNodeFromSourceResultFailure)
+        assert isinstance(reload, ReloadSandboxLibraryResultFailure)
+        for result in (added, reload):
+            assert "turned off (library.sandbox_enabled is false)" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case",
+        [
+            (None, "does not include a sandbox library. Set library.sandbox_enabled to true"),
+            ("false", "turned off (library.sandbox_enabled is false)"),
+        ],
+    )
+    async def test_environment_mode_says_why_the_sandbox_is_off(
+        self, engine: Engine, configure: Configure, monkeypatch: pytest.MonkeyPatch, case: tuple[str | None, str]
+    ) -> None:
+        setting, expected = case
+        if setting is not None:
+            monkeypatch.setenv("GTN_CONFIG_LIBRARY__SANDBOX_ENABLED", setting)
+        configure(environment_paths=[], environment_mode=True)
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert expected in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_setting_in_a_config_file_says_how_to_allow_it(
+        self, engine: Engine, configure: Configure
+    ) -> None:
+        configure(environment_paths=[], environment_mode=True)
+        # The validator reads "yes" as unset, so environment mode keeps the sandbox off; the reason
+        # must say so rather than claim the setting is false.
+        engine.config_manager.set_config_value("library.sandbox_enabled", "yes")
+
+        result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+
+        assert isinstance(result, ReloadSandboxLibraryResultFailure)
+        assert "does not include a sandbox library. Set library.sandbox_enabled to true" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_overlapping_reloads_run_one_at_a_time(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        await engine.library_manager.load_all_libraries_from_config()
+
+        first, second = await asyncio.gather(
+            engine.ahandle_request(ReloadSandboxLibraryRequest()),
+            engine.ahandle_request(ReloadSandboxLibraryRequest()),
+        )
+
+        assert isinstance(first, ReloadSandboxLibraryResultSuccess), first.result_details
+        assert isinstance(second, ReloadSandboxLibraryResultSuccess), second.result_details
+        assert LibraryManager.SANDBOX_LIBRARY_NAME in LibraryRegistry.list_libraries()
+
+
+class TestSandboxReloadAndFullReload:
+    """A sandbox reload and a reload of every library never run at the same time."""
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_reload_waits_for_a_running_full_reload(
+        self, engine: Engine, configure: Configure, tmp_path: Path
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        # Stand in for a full reload in progress.
+        library_manager._close_libraries_loading_gate()
+        gate = library_manager._libraries_loading_complete
+
+        reload = asyncio.create_task(engine.ahandle_request(ReloadSandboxLibraryRequest()))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not reload.done()
+
+        gate.set()
+        result = await reload
+
+        assert isinstance(result, ReloadSandboxLibraryResultSuccess), result.result_details
+        assert library_manager._libraries_loading_complete.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_full_reload_waits_for_a_sandbox_reload(
+        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_sandbox_node(tmp_path / "sandbox", "LooseNode")
+        configure(environment_paths=[], environment_mode=False)
+        library_manager = engine.library_manager
+        await library_manager.load_all_libraries_from_config()
+        monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [])
+        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock())
+        registration = library_manager.registration
+        register = registration.register_library_from_file_request
+        full_reload: list[asyncio.Task] = []
+
+        async def register_while_a_full_reload_starts(request: RegisterLibraryFromFileRequest) -> object:
+            # Only the sandbox reload's own register runs here; the full reload below must wait.
+            monkeypatch.setattr(registration, "register_library_from_file_request", register)
+            assert not library_manager._libraries_loading_complete.is_set()
+            full_reload.append(asyncio.create_task(engine.ahandle_request(ReloadAllLibrariesRequest())))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not full_reload[0].done()
+            assert LibraryManager.SANDBOX_LIBRARY_NAME not in LibraryRegistry.list_libraries()
+            return await register(request)
+
+        monkeypatch.setattr(registration, "register_library_from_file_request", register_while_a_full_reload_starts)
+
+        sandbox_result = await engine.ahandle_request(ReloadSandboxLibraryRequest())
+        full_result = await full_reload[0]
+
+        assert isinstance(sandbox_result, ReloadSandboxLibraryResultSuccess), sandbox_result.result_details
+        assert isinstance(full_result, ReloadAllLibrariesResultSuccess), full_result.result_details
+        assert LibraryManager.SANDBOX_LIBRARY_NAME in LibraryRegistry.list_libraries()
