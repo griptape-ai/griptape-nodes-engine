@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
-from xdg_base_dirs import xdg_config_home, xdg_data_home
+
+from griptape_nodes.utils.engine_dirs import engine_config_dir, engine_data_dir
 
 
 @dataclass
@@ -30,8 +31,8 @@ class InitConfig:
 console = Console()
 
 # Directory paths
-CONFIG_DIR = xdg_config_home() / "griptape_nodes"
-DATA_DIR = xdg_data_home() / "griptape_nodes"
+CONFIG_DIR = engine_config_dir()
+DATA_DIR = engine_data_dir()
 ENV_FILE = CONFIG_DIR / ".env"
 CONFIG_FILE = CONFIG_DIR / "griptape_nodes_config.json"
 

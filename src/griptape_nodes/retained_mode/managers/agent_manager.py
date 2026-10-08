@@ -35,7 +35,6 @@ import httpx2
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
@@ -153,6 +152,7 @@ from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusa
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -423,7 +423,7 @@ class AgentManager(EngineScoped):
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
 
-        self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
+        self._threads_dir: Path = engine_data_dir() / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
             self._threads_dir, config_manager, secrets_manager
         )
@@ -684,7 +684,6 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return GetThreadMetadataResultFailure(result_details=details)
 
             thread = self._thread_storage.get_thread_metadata(request.thread_id)
@@ -713,7 +712,6 @@ class AgentManager(EngineScoped):
             return DeleteThreadResultSuccess(thread_id=request.thread_id, result_details="Thread deleted successfully.")
         except ValueError as e:
             details = str(e)
-            logger.error(details)
             return DeleteThreadResultFailure(result_details=details)
         except Exception as e:
             details = f"Error deleting thread: {e}"
@@ -725,7 +723,6 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return RenameThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, title=request.new_title)
@@ -745,12 +742,10 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
             if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=True)
@@ -769,12 +764,10 @@ class AgentManager(EngineScoped):
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
             if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=False)

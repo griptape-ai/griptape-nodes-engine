@@ -226,7 +226,6 @@ class LibraryWorkers(EngineScoped):
         library_info = self.engine.library_manager.get_library_info_by_library_name(request.library_name)
         if library_info is None:
             details = f"Received a library load report for unknown library '{request.library_name}'."
-            logger.warning(details)
             return ReportLibraryLoadedResultFailure(result_details=details)
         # Only a legacy worker-mode library takes its fitness from the worker: the orchestrator
         # never loaded it, so the worker's verdict is the only one there is. An exec-deps library
@@ -588,7 +587,7 @@ class LibraryWorkers(EngineScoped):
                     for problem in library_info.problems
                 )
                 if has_unmet_requirement and not library_info.requires_worker:
-                    logger.info(
+                    logger.debug(
                         "Not starting a worker for library '%s': %s",
                         library_info.library_name,
                         library_info.execution_unavailable_reason,
@@ -620,7 +619,7 @@ class LibraryWorkers(EngineScoped):
                     library_info.library_name
                 )
                 if build_failure is not None:
-                    logger.error(
+                    logger.debug(
                         "Not requesting a worker for library '%s': %s", library_info.library_name, build_failure
                     )
                     self.engine.library_manager._worker_manager.note_worker_unavailable(

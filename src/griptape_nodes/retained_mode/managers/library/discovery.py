@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import anyio
 
-from griptape_nodes.files.path_utils import resolve_workspace_path
+from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_workspace_path
 from griptape_nodes.node_library.library_declarations import (
     LifecycleStageLibraryProperty,
 )
@@ -565,15 +565,76 @@ class LibraryDiscovery(EngineScoped):
         # resolves it to its installed manifest there so it loads scoped to the
         # workspace that declares it, without ever being written into the global
         # libraries_to_register config (which would leak it into every project).
+        libraries_root = config_mgr.resolved_libraries_root()
         download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         for download in normalize_library_downloads(download_libraries):
             manifest_path = await self.engine.library_manager.provisioning.installed_manifest_path_for_download(
-                download, config_mgr.resolved_libraries_root()
+                download, libraries_root
             )
             if manifest_path is not None:
                 await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
 
         return discovered_entries
+
+    async def log_unregistered_libraries(self, discovered_libraries: list[DiscoveredLibrary]) -> None:
+        """Log a hint for each library manifest under the libraries root that discovery did not pick up.
+
+        Nothing under `libraries_directory` loads on its own: a library loads only from a
+        `libraries_to_register` entry or a `libraries_to_download` entry. A manifest copied
+        into that folder by hand is otherwise skipped silently.
+
+        Not reported: manifests in the top-level folder of a download entry, and in the
+        sandbox library, which loads separately. A top-level folder that is a git clone may
+        be another project's `libraries_to_download` install in the shared libraries root,
+        so its hint says so.
+
+        Called once per actual load (boot, reload), on the orchestrator only, rather than
+        from `discover_library_files` itself: that helper also backs lazy per-request lookups
+        and metadata refreshes, which would otherwise re-log the same hint many times a session.
+        """
+        config_mgr = self.engine.config_manager
+        libraries_root = config_mgr.resolved_libraries_root()
+        if not await anyio.Path(libraries_root).is_dir():
+            return
+
+        download_directories: list[Path] = []
+        download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        for download in normalize_library_downloads(download_libraries):
+            manifest_path = await self.engine.library_manager.provisioning.installed_manifest_path_for_download(
+                download, libraries_root
+            )
+            if manifest_path is not None:
+                download_directories.append(manifest_path.parent)
+
+        discovered_paths = {canonicalize_for_identity(library.path) for library in discovered_libraries}
+        download_identities = [canonicalize_for_identity(directory) for directory in download_directories]
+        sandbox_directory = self.engine.library_manager.sandbox.get_sandbox_directory()
+        sandbox_identity = None
+        if sandbox_directory is not None:
+            sandbox_identity = canonicalize_for_identity(sandbox_directory)
+
+        for manifest_path in await find_files_recursive(
+            libraries_root,
+            LIBRARY_CONFIG_GLOB_PATTERN,
+            max_depth=self.engine.config_manager.discovery_max_depth,
+        ):
+            identity = canonicalize_for_identity(manifest_path)
+            if identity in discovered_paths:
+                continue
+            if sandbox_identity is not None and identity.is_relative_to(sandbox_identity):
+                continue
+            # Judge ownership by the unresolved top-level folder so a symlinked library still counts as under the root.
+            top_directory = libraries_root / manifest_path.relative_to(libraries_root).parts[0]
+            top_identity = canonicalize_for_identity(top_directory)
+            if any(download.is_relative_to(top_identity) for download in download_identities):
+                continue
+            message = (
+                "Found library '%s' in the libraries directory, but it is not registered, so it was not loaded. "
+                "To load it, use Add Library or add its path to libraries_to_register in your config."
+            )
+            if await anyio.Path(top_directory / ".git").exists():
+                message += " If another project downloads it through libraries_to_download, no action is needed."
+            logger.info(message, manifest_path)
 
     def _add_git_urls_for_removed_libraries(
         self,

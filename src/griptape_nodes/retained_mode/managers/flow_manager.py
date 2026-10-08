@@ -1878,7 +1878,6 @@ class FlowManager(EngineScoped):
 
             if serialized_node is None:
                 error_msg = f"Data integrity error: Could not find serialized node for package node '{package_node.name}'. This indicates a logic error in the serialization process."
-                logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
             package_alter_parameter_commands = []
@@ -4878,7 +4877,6 @@ class FlowManager(EngineScoped):
 
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                logger.error("Node '%s' failed: %s", node.name, error_message)
                 self._global_single_node_resolution = False
                 self._global_control_flow_machine.context.current_nodes = []
                 self.engine.event_manager.put_event(

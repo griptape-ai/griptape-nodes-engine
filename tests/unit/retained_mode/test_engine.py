@@ -6,6 +6,7 @@ can be rebound for a scope without leaking into the rest of the process.
 """
 
 import asyncio
+import logging
 import threading
 from collections.abc import Iterator
 
@@ -19,6 +20,8 @@ from griptape_nodes.retained_mode.engine import (
     has_current_engine,
     reset_root_engine,
 )
+from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
+from griptape_nodes.retained_mode.events.secrets_events import SetSecretValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
@@ -273,3 +276,57 @@ class TestRootEngine:
 
         assert len(observed) == racer_count
         assert all(engine is observed[0] for engine in observed)
+
+
+class TestFailedRequestLogging:
+    """A request that fails outside its handler is logged by type and ID, never by its contents.
+
+    A handler that raises is caught by the event manager. The engine's own ``except`` runs when
+    dispatch or the result broadcast fails, and a request's repr can carry a secret value, as a
+    ``SetSecretValueRequest`` does.
+    """
+
+    SECRET_VALUE = "sk-test-0123456789abcdef"  # noqa: S105 - a fake value the test proves is not logged
+
+    def _request(self) -> SetSecretValueRequest:
+        return SetSecretValueRequest(key="TEST_SERVICE_API_KEY", value=self.SECRET_VALUE, request_id="req-42")
+
+    def test_sync_failure_does_not_log_the_secret_value(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def _fail(**_kwargs: object) -> None:
+            msg = "dispatch failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(engine.event_manager, "handle_request", _fail)
+
+        with caplog.at_level(logging.ERROR):
+            result = engine.handle_request(self._request())
+
+        assert isinstance(result, ResultPayloadFailure)
+        self._assert_logged_without_the_secret(caplog)
+
+    @pytest.mark.asyncio
+    async def test_async_failure_does_not_log_the_secret_value(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def _fail(**_kwargs: object) -> None:
+            msg = "dispatch failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(engine.event_manager, "ahandle_request", _fail)
+
+        with caplog.at_level(logging.ERROR):
+            result = await engine.ahandle_request(self._request())
+
+        assert isinstance(result, ResultPayloadFailure)
+        self._assert_logged_without_the_secret(caplog)
+
+    def _assert_logged_without_the_secret(self, caplog: pytest.LogCaptureFixture) -> None:
+        records = [record for record in caplog.records if "Unhandled exception" in record.getMessage()]
+        assert len(records) == 1
+        record = records[0]
+        assert "SetSecretValueRequest" in record.getMessage()
+        assert "req-42" in record.getMessage()
+        assert record.exc_info is not None
+        assert self.SECRET_VALUE not in caplog.text

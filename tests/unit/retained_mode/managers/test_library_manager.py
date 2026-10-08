@@ -42,6 +42,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultFailure,
     DescribeNodeTypeResultSuccess,
+    DiscoverLibrariesRequest,
+    DiscoverLibrariesResultSuccess,
     GetAllInfoForAllLibrariesRequest,
     GetAllInfoForAllLibrariesResultFailure,
     GetAllInfoForAllLibrariesResultSuccess,
@@ -418,7 +420,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -442,7 +444,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -503,7 +505,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -538,7 +540,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -571,7 +573,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -610,7 +612,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -647,7 +649,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -689,7 +691,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -3118,6 +3120,209 @@ class TestDiscoverProvisionedManifestPaths:
         assert result == []
 
 
+class TestUnregisteredLibraryHint:
+    """Discovery logs a hint for a manifest under the libraries root that nothing registers.
+
+    Nothing in `libraries_directory` loads on its own, so a library copied there by hand
+    is skipped. The hint names the manifest and how to register it; registered and
+    downloaded libraries get no hint. Logging happens once per actual load (via
+    `log_unregistered_libraries`, called from `load_all_libraries_from_config` on the
+    orchestrator), not from `discover_library_files` itself -- that helper also backs
+    lazy per-request lookups and metadata refreshes, which must stay silent.
+    """
+
+    @staticmethod
+    async def _discover(
+        engine: Engine, libraries_dir: Path, libraries: object, downloads: object | None = None
+    ) -> None:
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, libraries, downloads)
+        with patch.object(engine, "_config_manager", config_manager):
+            discover_result = await engine.library_manager.discovery.discover_libraries_request(
+                DiscoverLibrariesRequest(include_sandbox=False)
+            )
+            assert isinstance(discover_result, DiscoverLibrariesResultSuccess)
+            await engine.library_manager.discovery.log_unregistered_libraries(discover_result.libraries_discovered)
+
+    @staticmethod
+    def _hints(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [record.getMessage() for record in caplog.records if "not registered" in record.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_unregistered_manifest_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert str(manifest_dir / "griptape_nodes_library.json") in hints[0]
+        assert "libraries_to_register" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_registered_manifest_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [str(manifest_dir)])
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_downloaded_library_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        repo_dir = libraries_dir / "griptape-nodes-library-standard"
+        TestInstalledLibraryVersion._write_manifest(repo_dir / "library", "Griptape Nodes Library", "0.78.0")
+        # A second manifest elsewhere in the downloaded repo belongs to that download too.
+        TestInstalledLibraryVersion._write_manifest(repo_dir / "examples" / "nested", "Example Library", "0.1.0")
+        downloads = ["https://github.com/griptape-ai/griptape-nodes-library-standard"]
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [], downloads)
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_git_clone_hint_mentions_other_projects(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A clone may be a hand-cloned library or another project's libraries_to_download install.
+        libraries_dir = tmp_path / "libraries"
+        repo_dir = libraries_dir / "cloned-lib"
+        TestInstalledLibraryVersion._write_manifest(repo_dir, "Cloned Library", "1.0.0")
+        (repo_dir / ".git").mkdir()
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert "another project" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_symlinked_library_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        target_dir = tmp_path / "dev" / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(target_dir, "My Library", "1.0.0")
+        libraries_dir = tmp_path / "libraries"
+        libraries_dir.mkdir()
+        (libraries_dir / "my_lib").symlink_to(target_dir, target_is_directory=True)
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        assert len(self._hints(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_sibling_of_nested_sandbox_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        sandbox_dir = libraries_dir / "dev" / "sandbox"
+        TestInstalledLibraryVersion._write_manifest(sandbox_dir, "Sandbox Library", None)
+        TestInstalledLibraryVersion._write_manifest(libraries_dir / "dev" / "my_lib", "My Library", "1.0.0")
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine.library_manager.sandbox, "get_sandbox_directory", return_value=sandbox_dir),
+        ):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert "my_lib" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_sandbox_under_libraries_root_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        sandbox_dir = libraries_dir / "sandbox"
+        TestInstalledLibraryVersion._write_manifest(sandbox_dir, "Sandbox Library", None)
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine.library_manager.sandbox, "get_sandbox_directory", return_value=sandbox_dir),
+        ):
+            await self._discover(engine, libraries_dir, [])
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_bare_discovery_does_not_log_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`discover_library_files` also backs lazy per-request lookups and metadata refreshes.
+
+        Those must stay silent: only `log_unregistered_libraries`, called once per actual
+        load, logs the hint.
+        """
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, [])
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine, "_config_manager", config_manager),
+        ):
+            await engine.library_manager.discovery.discover_library_files()
+
+        assert self._hints(caplog) == []
+
+
+class TestUnregisteredLibraryHintCallSite:
+    """`load_all_libraries_from_config` logs the hint on the orchestrator only."""
+
+    @staticmethod
+    def _discover_result() -> DiscoverLibrariesResultSuccess:
+        return DiscoverLibrariesResultSuccess(result_details="discovered", libraries_discovered=[])
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_logs_hint(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        mock_log_hint = AsyncMock()
+        with (
+            patch.object(library_manager.provisioning, "reconcile_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(
+                library_manager.discovery, "discover_libraries_request", AsyncMock(return_value=self._discover_result())
+            ),
+            patch.object(library_manager.discovery, "log_unregistered_libraries", mock_log_hint),
+        ):
+            await library_manager.load_all_libraries_from_config()
+
+        mock_log_hint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_worker_does_not_log_hint(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        library_manager._is_worker = True
+        mock_log_hint = AsyncMock()
+        with (
+            patch.object(library_manager.provisioning, "reconcile_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(
+                library_manager.discovery, "discover_libraries_request", AsyncMock(return_value=self._discover_result())
+            ),
+            patch.object(library_manager.discovery, "log_unregistered_libraries", mock_log_hint),
+        ):
+            await library_manager.load_all_libraries_from_config()
+
+        mock_log_hint.assert_not_awaited()
+
+
 class TestRegistrationSatisfiedByInstalled:
     """The PEP 440 compare that decides whether provisioning can skip an entry."""
 
@@ -3897,6 +4102,8 @@ class TestDiscoverDownloadedLibraries:
                 # libraries_directory is absolute here, so the global-workspace base is unused for
                 # resolution, but configured_global_workspace_path() must get a real path, not None.
                 return str(tmp_path)
+            if key == "discovery_max_depth":
+                return DEFAULT_MAX_SEARCH_DEPTH
             return None
 
         with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):

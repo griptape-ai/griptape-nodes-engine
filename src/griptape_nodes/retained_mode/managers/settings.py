@@ -436,7 +436,7 @@ class LoggingSettings(BaseModel):
     log_directory: str = Field(
         category=LOGGING,
         default="",
-        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means `<XDG_STATE_HOME>/griptape_nodes/logs`.",
+        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means the `logs` folder in the engine state directory: `<XDG_STATE_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_STATE_DIR` when that is set.",
     )
     log_retention_days: int = Field(
         category=LOGGING,
@@ -471,12 +471,12 @@ class Settings(BaseModel):
     libraries_directory: str = Field(
         category=FILE_SYSTEM,
         default="libraries",
-        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
+        description="Path to the directory where libraries from libraries_to_download are installed; those load automatically. Anything else placed here is not loaded until its path is added to libraries_to_register (Add Library in the editor). Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
     ffmpeg_directory: str = Field(
         category=FILE_SYSTEM,
         default="",
-        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means `<XDG_DATA_HOME>/griptape_nodes/ffmpeg`. To supply your own binaries instead of downloading, point this at a directory containing `bin/<platform>/` holding ffmpeg, ffprobe, and an empty `installed.crumb` file - static-ffmpeg treats that marker as proof of a completed install, and re-downloads over the binaries whenever it is missing.",
+        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means the `ffmpeg` folder in the engine data directory: `<XDG_DATA_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_DATA_DIR` when that is set. To supply your own binaries instead of downloading, point this at a directory containing `bin/<platform>/` holding ffmpeg, ffprobe, and an empty `installed.crumb` file - static-ffmpeg treats that marker as proof of a completed install, and re-downloads over the binaries whenever it is missing.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,

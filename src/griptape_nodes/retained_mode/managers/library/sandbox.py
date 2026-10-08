@@ -366,7 +366,8 @@ class LibrarySandbox(EngineScoped):
                     )
                 )
                 details = f"Attempted to load module in sandbox library '{candidate_path}'. Failed because an exception occurred: {err}."
-                logger.warning(details)
+                # The library report lists this problem; logging it too repeats it.
+                logger.debug(details)
                 continue  # SKIP IT
 
             # Peek inside for any BaseNodes.
@@ -766,7 +767,9 @@ class LibrarySandbox(EngineScoped):
 
             engine_version = self.engine.handle_engine_version_request(request=GetEngineVersionRequest())
             if not isinstance(engine_version, GetEngineVersionResultSuccess):
-                details = "Could not get engine version for sandbox library generation."
+                details = (
+                    f"Could not get engine version for sandbox library generation: {engine_version.result_details}"
+                )
                 return LoadLibraryMetadataFromFileResultFailure(
                     library_path=sandbox_library_dir_as_posix,
                     library_name=SANDBOX_LIBRARY_NAME,

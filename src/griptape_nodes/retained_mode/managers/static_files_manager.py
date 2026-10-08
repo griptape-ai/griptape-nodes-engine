@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import anyio
-from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
@@ -60,11 +59,12 @@ from griptape_nodes.servers.static import (
     STATIC_SERVER_PORT,
     STATIC_SERVER_URL,
 )
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
 
-USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
+USER_CONFIG_PATH = engine_config_dir() / "griptape_nodes_config.json"
 
 
 class ResolvedStaticFilePath(NamedTuple):
@@ -497,7 +497,6 @@ class StaticFilesManager(EngineScoped):
             parsed = ParsedMacro(file_path)
         except MacroSyntaxError as e:
             msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because the path has invalid macro syntax: {e}"
-            logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         # Keep the original macro form alongside the resolved path: preview metadata
@@ -661,7 +660,6 @@ class StaticFilesManager(EngineScoped):
             raise
         except Exception as e:
             msg = f"Failed to save static file {file_name}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 

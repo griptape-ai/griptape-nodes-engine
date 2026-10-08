@@ -7,7 +7,6 @@ from typing import Literal, overload
 
 from dotenv import dotenv_values, get_key, set_key, unset_key
 from dotenv.main import DotEnv
-from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.retained_mode.events.app_events import SecretChanged
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -29,10 +28,11 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 
 logger = logging.getLogger("griptape_nodes")
 
-ENV_VAR_PATH = xdg_config_home() / "griptape_nodes" / ".env"
+ENV_VAR_PATH = engine_config_dir() / ".env"
 
 
 def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values: Mapping[str, str]) -> dict[str, str]:
@@ -155,7 +155,6 @@ class SecretsManager:
 
         if secret_value is None and request.should_error_on_not_found:
             details = f"Secret '{secret_key}' not found."
-            logger.error(details)
             return GetSecretValueResultFailure(result_details=details)
 
         return GetSecretValueResultSuccess(
@@ -196,7 +195,6 @@ class SecretsManager:
                 secret_values = dotenv_values(ENV_VAR_PATH)
             except OSError as err:
                 details = f"Attempted to read stored secrets from '{ENV_VAR_PATH}'. Failed because the file could not be read: {err}"
-                logger.error(details)
                 return GetAllSecretValuesResultFailure(result_details=details)
         else:
             secret_values = {}
@@ -211,12 +209,10 @@ class SecretsManager:
 
         if not ENV_VAR_PATH.exists():
             details = f"Secret file does not exist: '{ENV_VAR_PATH}'"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         if get_key(ENV_VAR_PATH, secret_name) is None:
             details = f"Secret {secret_name} not found in {ENV_VAR_PATH}"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         unset_key(ENV_VAR_PATH, secret_name)

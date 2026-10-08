@@ -386,7 +386,6 @@ class LibraryGitOperations(EngineScoped):
                     f"{age_gate.age_hours:.1f}h old, younger than the required {age_gate.minimum_release_age_hours:.1f}h "
                     f"minimum release age (library.minimum_release_age). Try again once the target commit ages."
                 )
-                logger.info(details)
                 return UpdateLibraryResultFailure(result_details=details, age_gated=True)
 
         # Perform git update (auto-detects branch vs tag workflow)
@@ -670,7 +669,6 @@ class LibraryGitOperations(EngineScoped):
             checkout = sparse_checkout_library_json(normalized_url, ref)
         except GitError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
-            logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
 
         library_version = checkout.library_version
@@ -682,7 +680,6 @@ class LibraryGitOperations(EngineScoped):
             library_schema = LibrarySchema(**library_data_raw)
         except Exception as e:
             details = f"Invalid library schema from {normalized_url}: {e}"
-            logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
 
         # Return success with full library metadata

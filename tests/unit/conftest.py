@@ -10,15 +10,21 @@ from unittest.mock import patch
 import pytest
 from xdg_base_dirs import xdg_state_home
 
-from griptape_nodes.common import log_capture
-from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
-from griptape_nodes.retained_mode.managers import settings as settings_module
+# Engine dir overrides bypass the `xdg_*_home` patches tests rely on, and some paths
+# (`USER_CONFIG_PATH`) are built at import, so drop them before importing `griptape_nodes`.
+for _engine_dir_env_var in ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR"):
+    os.environ.pop(_engine_dir_env_var, None)
+
+from griptape_nodes.common import log_capture  # noqa: E402
+from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine  # noqa: E402
+from griptape_nodes.retained_mode.managers import settings as settings_module  # noqa: E402
+from griptape_nodes.utils import engine_dirs  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
 # level, so merely collecting them wrote to the real XDG state directory and pruned it.
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
-_session_log_home_patch = patch.object(log_capture, "xdg_state_home", lambda: Path(_session_log_home.name))
+_session_log_home_patch = patch.object(engine_dirs, "xdg_state_home", lambda: Path(_session_log_home.name))
 
 
 def _real_log_directory() -> Path | None:
@@ -119,7 +125,7 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         state_home = Path(temp_dir)
-        with patch.object(log_capture, "xdg_state_home", lambda: state_home):
+        with patch.object(engine_dirs, "xdg_state_home", lambda: state_home):
             yield state_home / "griptape_nodes" / "logs"
 
             # Detach the sinks while the directory still exists: they live on the process-global

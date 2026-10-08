@@ -275,6 +275,11 @@ class LibraryManager(EngineScoped):
                 logger.error("Failed to discover libraries: %s", discover_result.result_details)
                 return reconcile_failures
 
+            # A worker's libraries_directory mirrors the orchestrator's, so the hint would
+            # otherwise repeat once per worker; only the orchestrator needs to tell the user.
+            if not self._is_worker:
+                await self.discovery.log_unregistered_libraries(discover_result.libraries_discovered)
+
             # A worker is told which library it serves, but that library's declared library
             # dependencies are part of what it needs to run: CorridorKey's OCIO path reaches into
             # the OpenEXR library, which loaded on the orchestrator and was absent from the worker,
@@ -566,7 +571,6 @@ class LibraryManager(EngineScoped):
         all_libraries_result = await self.engine.ahandle_request(all_libraries_request)
         if not isinstance(all_libraries_result, ListRegisteredLibrariesResultSuccess):
             details = "When preparing to reload all libraries, failed to get registered libraries."
-            logger.error(details)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
         # Close the gate before the registry is emptied, and not any earlier: the
@@ -583,7 +587,6 @@ class LibraryManager(EngineScoped):
                 unload_library_result = self.engine.handle_request(unload_library_request)
                 if not unload_library_result.succeeded():
                     details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
-                    logger.error(details)
                     return ReloadAllLibrariesResultFailure(result_details=details)
 
             # Notify pre-reload callbacks (e.g. to terminate worker processes) before

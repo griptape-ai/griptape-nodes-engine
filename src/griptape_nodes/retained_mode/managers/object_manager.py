@@ -57,7 +57,6 @@ class ObjectManager(EngineScoped):
         source_obj = self.attempt_get_object_by_name(request.object_name)
         if source_obj is None:
             details = f"Attempted to rename object '{request.object_name}', but no object of that name could be found."
-            logger.error(details)
             return RenameObjectResultFailure(next_available_name=None, result_details=details)
 
         # Is there a collision?
@@ -75,7 +74,6 @@ class ObjectManager(EngineScoped):
                 # Not allowed to use it :(
                 # Fail it but be nice and offer the next name that WOULD HAVE been available.
                 details = f"Attempted to rename object '{request.object_name}' to '{request.requested_name}'. Failed because another object of that name exists. Next available name would have been '{next_name}'."
-                logger.error(details)
                 return RenameObjectResultFailure(next_available_name=next_name, result_details=details)
             # We'll use the next available name.
             final_name = next_name
@@ -88,17 +86,16 @@ class ObjectManager(EngineScoped):
                 self.engine.node_manager.handle_node_rename(old_name=request.object_name, new_name=final_name)
             case _:
                 details = f"Attempted to rename an object named '{request.object_name}', but that object wasn't of a type supported for rename."
-                logger.error(details)
                 return RenameObjectResultFailure(next_available_name=None, result_details=details)
 
         # Update the object table.
         self._name_to_objects[final_name] = source_obj
         del self._name_to_objects[request.object_name]
 
-        details = f"Successfully renamed object '{request.object_name}' to '{final_name}`."
+        details = f"Successfully renamed object '{request.object_name}' to '{final_name}'."
         log_level = logging.DEBUG
         if final_name != request.requested_name:
-            details += " WARNING: Originally requested the name '{request.requested_name}', but that was taken."
+            details += f" Originally requested the name '{request.requested_name}', but that was taken."
             log_level = logging.WARNING
         if log_level == logging.WARNING:
             result_details = ResultDetails(message=details, level=logging.WARNING)
@@ -110,7 +107,6 @@ class ObjectManager(EngineScoped):
     async def on_clear_all_object_state_request(self, request: ClearAllObjectStateRequest) -> ResultPayload:
         if not request.i_know_what_im_doing:
             details = "Attempted to clear all object state and delete everything. Failed because they didn't know what they were doing."
-            logger.warning(details)
             return ClearAllObjectStateResultFailure(result_details=details)
 
         # Cancel any in-flight run before tearing its bookkeeping down: the reset
@@ -133,7 +129,6 @@ class ObjectManager(EngineScoped):
             self.engine.flow_manager.reset_global_execution_state()
         except Exception as e:
             details = f"Attempted to reset global execution state. Failed with exception: {e}"
-            logger.error(details)
             return ClearAllObjectStateResultFailure(result_details=details)
 
         # Tear down each active workflow: cancel its running flows, delete its child
@@ -144,7 +139,6 @@ class ObjectManager(EngineScoped):
                 self.engine.clear_current_workflow_data()
         except Exception as e:
             details = f"Attempted to clear all object state and delete everything. Failed with exception: {e}"
-            logger.error(details)
             return ClearAllObjectStateResultFailure(result_details=details)
         finally:
             # clear_current_workflow_data releases the objects this process holds; the workers hold their
@@ -156,7 +150,6 @@ class ObjectManager(EngineScoped):
 
         if self._name_to_objects:
             details = f"Attempted to clear all object state, but {len(self._name_to_objects)} object(s) remained after workflow teardown."
-            logger.error(details)
             return ClearAllObjectStateResultFailure(result_details=details)
 
         # Clear all local workflow variables

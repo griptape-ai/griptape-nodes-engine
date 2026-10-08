@@ -91,8 +91,8 @@ class PythonSubprocessExecutor:
         subprocess_env["PYTHONUNBUFFERED"] = "1"
 
         try:
-            logger.info("Starting subprocess: %s", " ".join(command))
-            logger.info("Working directory: %s", cwd)
+            logger.debug("Starting subprocess: %s", " ".join(command))
+            logger.debug("Working directory: %s", cwd)
 
             self._process = await asyncio.create_subprocess_exec(
                 *command,
@@ -102,7 +102,7 @@ class PythonSubprocessExecutor:
                 stderr=asyncio.subprocess.PIPE,
             )
             self._is_running = True
-            logger.info("Subprocess started with PID: %s", self._process.pid)
+            logger.debug("Subprocess started with PID: %s", self._process.pid)
 
             # Stream stdout and stderr concurrently for real-time output
             stdout_lines: list[str] = []
@@ -117,9 +117,8 @@ class PythonSubprocessExecutor:
             returncode = self._process.returncode
 
             if returncode == 0:
-                logger.info("Subprocess completed successfully with return code: %d", returncode)
+                logger.debug("Subprocess completed successfully with return code: %d", returncode)
             else:
-                logger.error("Subprocess failed with return code: %d", returncode)
                 msg = f"Subprocess failed with return code: {returncode}"
                 raise RuntimeError(msg)  # noqa: TRY301
 
@@ -145,20 +144,20 @@ class PythonSubprocessExecutor:
             return True
 
         try:
-            logger.info("Terminating subprocess...")
+            logger.debug("Terminating subprocess...")
             self._process.terminate()
 
             # Wait for graceful termination with timeout using context manager
             try:
                 async with asyncio.timeout(5.0):
                     await self._process.wait()
-                logger.info("Subprocess terminated gracefully")
+                logger.debug("Subprocess terminated gracefully")
                 return True  # noqa: TRY300
             except TimeoutError:
                 logger.warning("Subprocess did not terminate gracefully, force killing...")
                 self._process.kill()
                 await self._process.wait()
-                logger.info("Subprocess force killed")
+                logger.debug("Subprocess force killed")
                 return True
 
         except Exception as e:

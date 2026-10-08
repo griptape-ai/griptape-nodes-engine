@@ -164,13 +164,12 @@ class RequestClient:
             else:
                 result = await asyncio.wrap_future(response_future)
 
-        except TimeoutError:
-            logger.error("Request %s timed out", request_id)
+        except TimeoutError as e:
             self.discard_request(request_id)
-            raise
+            msg = f"Request {request_id} timed out"
+            raise TimeoutError(msg) from e
 
-        except Exception as e:
-            logger.error("Request %s failed: %s", request_id, e)
+        except Exception:
             self.discard_request(request_id)
             raise
         else:
@@ -227,13 +226,12 @@ class RequestClient:
             else:
                 result = await asyncio.wrap_future(response_future)
 
-        except TimeoutError:
-            logger.error("Forwarded request %s timed out", request_id)
+        except TimeoutError as e:
             self.discard_request(request_id)
-            raise
+            msg = f"Forwarded request {request_id} timed out"
+            raise TimeoutError(msg) from e
 
-        except Exception as e:
-            logger.error("Forwarded request %s failed: %s", request_id, e)
+        except Exception:
             self.discard_request(request_id)
             raise
         else:
@@ -317,8 +315,7 @@ class RequestClient:
                 results = await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
             else:
                 results = await gather
-        except (TimeoutError, Exception) as e:
-            logger.error("Batch request failed: %s", e)
+        except Exception:
             for request_id in request_ids:
                 self.discard_request(request_id)
             raise

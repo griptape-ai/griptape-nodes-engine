@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.file_utils import find_all_files_in_directory
 from griptape_nodes.utils.git_utils import (
     get_git_repository_root,
@@ -109,7 +109,7 @@ def filter_old_xdg_library_paths(library_paths: list[Any]) -> tuple[list[Any], s
         return library_paths, set()
 
     # Build list of old XDG path prefixes to remove
-    xdg_libraries_base = xdg_data_home() / "griptape_nodes" / "libraries"
+    xdg_libraries_base = engine_data_dir() / "libraries"
     old_library_names = [
         "griptape_nodes_library",
         "griptape_nodes_advanced_media_library",

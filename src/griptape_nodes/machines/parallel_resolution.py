@@ -516,7 +516,6 @@ class ExecuteDagState(State):
                 )
                 if isinstance(result, SetParameterValueResultFailure):
                     msg = f"Failed to set parameter value for node '{current_node.name}' and parameter '{parameter.name}'. Details: {result.result_details}"
-                    logger.error(msg)
                     raise RuntimeError(msg)
 
     @staticmethod
@@ -826,13 +825,14 @@ class ExecuteDagState(State):
                 if task.cancelled():
                     # Task was cancelled - this is expected during flow cancellation
                     dag_node.node_state = NodeState.CANCELED
-                    logger.info("Task execution was cancelled.")
+                    logger.debug("Task execution was cancelled.")
                     return ErrorState
                 if (exc := task.exception()) is not None:
                     node_name = dag_node.node_reference.name
                     dag_node.node_state = NodeState.ERRORED
 
-                    logger.error("Error processing node '%s'", node_name, exc_info=exc)
+                    # Every caller of the machine reports the failure from `get_error_message()`.
+                    logger.debug("Node '%s' failed", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(

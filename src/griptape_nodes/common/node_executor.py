@@ -352,6 +352,8 @@ class NodeExecutor(EngineScoped):
                     workflow_name=workflow_context.name,
                     workflow_file_path=workflow_context.file_path,
                     workflow_working_directory=workflow_context.working_directory,
+                    # The failure is raised below and reported by whoever started the run.
+                    failure_log_level=logging.DEBUG,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
@@ -643,7 +645,6 @@ class NodeExecutor(EngineScoped):
         try:
             self.get_workflow_handler(library_name)
         except ValueError as e:
-            logger.error("Library execution failed for node '%s' via library '%s': %s", node.name, library_name, e)
             msg = f"Failed to execute node '{node.name}' via library '{library_name}': {e}"
             raise RuntimeError(msg) from e
 
@@ -862,26 +863,15 @@ class NodeExecutor(EngineScoped):
             workflow_path=str(published_workflow_filename),
             on_event=on_event,
         )
-        try:
-            async with subprocess_executor as executor:
-                await executor.arun(
-                    flow_input=flow_input or {},
-                    storage_backend=await self._get_storage_backend(),
-                )
-        except RuntimeError as e:
-            # Subprocess returned non-zero exit code
-            logger.error(
-                "Subprocess execution failed for workflow '%s' at path '%s'. Error: %s",
-                file_name,
-                published_workflow_filename,
-                e,
+        async with subprocess_executor as executor:
+            await executor.arun(
+                flow_input=flow_input or {},
+                storage_backend=await self._get_storage_backend(),
             )
-            raise
 
         my_subprocess_result = subprocess_executor.output
         if my_subprocess_result is None:
             msg = f"Subprocess completed but returned no output for workflow '{file_name}'"
-            logger.error(msg)
             raise ValueError(msg)
         return my_subprocess_result
 
@@ -1022,8 +1012,7 @@ class NodeExecutor(EngineScoped):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
             except KeyError:
-                msg = "Could not find library '%s' for loop execution", execution_type
-                logger.error(msg)
+                msg = f"Could not find library '{execution_type}' for loop execution"
                 raise RuntimeError(msg)  # noqa: B904
 
             library_name = library.get_library_data().name
@@ -1050,7 +1039,7 @@ class NodeExecutor(EngineScoped):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully packaged %d nodes for loop execution from '%s' to '%s'",
             len(all_nodes),
             start_node.name,
@@ -1083,7 +1072,7 @@ class NodeExecutor(EngineScoped):
             end_node: The BaseIterativeEndNode
         """
         total_iterations = start_node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "No nodes found between '%s' and '%s'. Processing empty loop body.",
             start_node.name,
             end_node.name,
@@ -1100,7 +1089,7 @@ class NodeExecutor(EngineScoped):
                     connected_source_param = conn.source_parameter_name
                     break
 
-        logger.info(
+        logger.debug(
             "Processing %d iterations for empty loop from '%s' to '%s' (connected param: %s)",
             total_iterations,
             start_node.name,
@@ -1308,7 +1297,7 @@ class NodeExecutor(EngineScoped):
                 if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
                     context_manager.pop_flow()
 
-            logger.info("Successfully deserialized flow for sequential execution: %s", flow_name)
+            logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
             # Get node mappings
             start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
             start_node_name = start_node_mapping.node_name
@@ -1331,7 +1320,7 @@ class NodeExecutor(EngineScoped):
 
             # Execute iterations one at a time
             for iteration_index in range(total_iterations):
-                logger.info(
+                logger.debug(
                     "Starting sequential iteration %d/%d for loop ending at '%s'",
                     iteration_index,
                     total_iterations,
@@ -1358,7 +1347,7 @@ class NodeExecutor(EngineScoped):
 
                 # Execute this iteration with event translation instead of suppression
                 # This allows the UI to show the original nodes highlighting during loop execution
-                logger.info(
+                logger.debug(
                     "Executing subflow for iteration %d - flow: '%s', start_node: '%s'",
                     iteration_index,
                     flow_name,
@@ -1393,7 +1382,7 @@ class NodeExecutor(EngineScoped):
                 control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
 
                 if control_action == IterationControlAction.SKIP:
-                    logger.info(
+                    logger.debug(
                         "Skip detected at iteration %d/%d - skipping result collection",
                         iteration_index + 1,
                         total_iterations,
@@ -1402,7 +1391,7 @@ class NodeExecutor(EngineScoped):
                     continue
 
                 if control_action == IterationControlAction.BREAK:
-                    logger.info(
+                    logger.debug(
                         "Break detected at iteration %d/%d - collecting result then stopping",
                         iteration_index + 1,
                         total_iterations,
@@ -1430,7 +1419,7 @@ class NodeExecutor(EngineScoped):
                 )
                 iteration_results.update(single_iteration_results)
 
-                logger.info("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
+                logger.debug("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
 
                 if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
                     end_loop_node.start_node.advance_sequential_progress(iteration_index)
@@ -1470,7 +1459,7 @@ class NodeExecutor(EngineScoped):
             end_node: The BaseIterativeEndNode marking the end of the loop
         """
         total_iterations = start_node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "Executing loop sequentially from '%s' to '%s' for %d iterations",
             start_node.name,
             end_node.name,
@@ -1487,7 +1476,7 @@ class NodeExecutor(EngineScoped):
 
         # Handle empty loop body (no nodes between start and end)
         if package_result_and_execution is None:
-            logger.info("Empty loop body - results already set by _package_loop_body")
+            logger.debug("Empty loop body - results already set by _package_loop_body")
             return
         package_result, execution_type = package_result_and_execution
 
@@ -1550,7 +1539,7 @@ class NodeExecutor(EngineScoped):
             )
         # A break legitimately stops the loop early — not a failure.
         if break_occurred:
-            logger.info(
+            logger.debug(
                 "Loop '%s' broke early at %d of %d iterations (break signal)",
                 end_node.name,
                 len(successful_iterations),
@@ -1566,7 +1555,7 @@ class NodeExecutor(EngineScoped):
             )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
-            logger.info(
+            logger.debug(
                 "Loop execution stopped early at %d of %d iterations",
                 len(successful_iterations),
                 total_iterations,
@@ -1578,7 +1567,7 @@ class NodeExecutor(EngineScoped):
             value = iteration_results[iteration_index]
             end_node._results_list.append(value)
 
-        logger.info(
+        logger.debug(
             "Loop '%s': Built results list with %d items from sequential iterations",
             end_node.name,
             len(end_node._results_list),
@@ -1586,16 +1575,16 @@ class NodeExecutor(EngineScoped):
 
         # Output final results to the results parameter
         end_node._output_results_list()
-        logger.info("Loop '%s': Outputted final results list", end_node.name)
+        logger.debug("Loop '%s': Outputted final results list", end_node.name)
 
         # Apply last iteration values to the original packaged nodes
         self._apply_last_iteration_to_packaged_nodes(
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
-        logger.info("Loop '%s': Applied last iteration values to packaged nodes", end_node.name)
+        logger.debug("Loop '%s': Applied last iteration values to packaged nodes", end_node.name)
 
-        logger.info(
+        logger.debug(
             "Completed sequential loop execution from '%s' to '%s' with %d results",
             start_node.name,
             end_node.name,
@@ -1628,7 +1617,7 @@ class NodeExecutor(EngineScoped):
                 for param_name, param_value in resolved_upstream_values.items():
                     if param_name not in parameter_values_per_iteration[iteration_index]:
                         parameter_values_per_iteration[iteration_index][param_name] = param_value
-            logger.info(
+            logger.debug(
                 "Added %d resolved upstream values to %d iterations",
                 len(resolved_upstream_values),
                 len(parameter_values_per_iteration),
@@ -1655,7 +1644,7 @@ class NodeExecutor(EngineScoped):
 
         total_iterations = start_node._get_total_iterations()
         if total_iterations == 0:
-            logger.info("No iterations for empty loop from '%s' to '%s'", start_node.name, node.name)
+            logger.debug("No iterations for empty loop from '%s' to '%s'", start_node.name, node.name)
             return
 
         # Check if we should run in order (default is in order / True)
@@ -1671,7 +1660,7 @@ class NodeExecutor(EngineScoped):
 
         # Handle empty loop body (no nodes between start and end)
         if package_result_and_execution_type is None:
-            logger.info("Empty loop body - results already set by _package_loop_body")
+            logger.debug("Empty loop body - results already set by _package_loop_body")
             return
         package_result, execution_type = package_result_and_execution_type
         # Get parameter values for each iteration
@@ -1724,7 +1713,7 @@ class NodeExecutor(EngineScoped):
                 total_iterations,
             )
 
-        logger.info(
+        logger.debug(
             "Completed execution of %d iterations for loop '%s' (%d successful, %d failed)",
             total_iterations,
             start_node.name,
@@ -1750,7 +1739,7 @@ class NodeExecutor(EngineScoped):
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Successfully aggregated %d results for loop '%s' to '%s'",
             len(iteration_results),
             start_node.name,
@@ -2029,7 +2018,7 @@ class NodeExecutor(EngineScoped):
                     total_iterations,
                 )
                 return None
-            logger.info(
+            logger.debug(
                 "While group '%s': execution error on iteration %d/%d, no iterations remaining",
                 node.name,
                 iteration + 1,
@@ -2041,7 +2030,7 @@ class NodeExecutor(EngineScoped):
         loop_action = self._get_while_control_action(node, node_name_mappings)
 
         if loop_action == WhileControlParam.DONE:
-            logger.info("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
+            logger.debug("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
             return True
 
         if loop_action == WhileControlParam.CONTINUE:
@@ -2053,7 +2042,7 @@ class NodeExecutor(EngineScoped):
                     total_iterations,
                 )
                 return None
-            logger.info(
+            logger.debug(
                 "While group '%s': continue requested on iteration %d/%d, no iterations remaining",
                 node.name,
                 iteration + 1,
@@ -2062,7 +2051,7 @@ class NodeExecutor(EngineScoped):
             return False
 
         # Neither done nor continue was triggered and execution didn't error - treat as done
-        logger.info(
+        logger.debug(
             "While group '%s': completed without control signal on iteration %d, treating as done",
             node.name,
             iteration + 1,
@@ -2308,9 +2297,9 @@ class NodeExecutor(EngineScoped):
         if execution_type not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
-            except KeyError:
-                logger.error("Could not find library '%s' for %s execution", execution_type, label)
-                raise
+            except KeyError as err:
+                msg = f"Could not find library '{execution_type}' for {label} execution"
+                raise RuntimeError(msg) from err
 
         workflow_start_end_nodes = await self._get_workflow_start_end_nodes(library)
 
@@ -2336,7 +2325,7 @@ class NodeExecutor(EngineScoped):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully packaged %d nodes for %s '%s'",
             len(node_names),
             label,
@@ -2370,7 +2359,7 @@ class NodeExecutor(EngineScoped):
 
         total_iterations = node._get_total_iterations()
         if total_iterations == 0:
-            logger.info("No iterations for empty iterative group '%s'", node.name)
+            logger.debug("No iterations for empty iterative group '%s'", node.name)
             node._output_results_list()
             return
 
@@ -2394,7 +2383,7 @@ class NodeExecutor(EngineScoped):
 
         # Handle empty group (no child nodes)
         if package_result is None:
-            logger.info("Empty iterative group '%s' - no child nodes to execute", node.name)
+            logger.debug("Empty iterative group '%s' - no child nodes to execute", node.name)
             node._output_results_list()
             return
 
@@ -2444,7 +2433,7 @@ class NodeExecutor(EngineScoped):
             msg = f"Iterative group execution failed: {failed_count} of {total_iterations} iterations failed"
             raise RuntimeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully completed parallel execution of %d iterations for iterative group '%s'",
             total_iterations,
             node.name,
@@ -2465,7 +2454,7 @@ class NodeExecutor(EngineScoped):
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Successfully aggregated %d results for iterative group '%s'",
             len(iteration_results),
             node.name,
@@ -2481,7 +2470,7 @@ class NodeExecutor(EngineScoped):
             execution_type: The execution environment type
         """
         total_iterations = node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "Executing iterative group '%s' sequentially for %d iterations",
             node.name,
             total_iterations,
@@ -2492,7 +2481,7 @@ class NodeExecutor(EngineScoped):
 
         # Handle empty group (no child nodes)
         if package_result is None:
-            logger.info("Empty iterative group '%s' - no child nodes to execute", node.name)
+            logger.debug("Empty iterative group '%s' - no child nodes to execute", node.name)
             node._output_results_list()
             return
 
@@ -2544,7 +2533,7 @@ class NodeExecutor(EngineScoped):
 
         # Check if execution stopped early
         if break_occurred:
-            logger.info(
+            logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations (break signal)",
                 len(successful_iterations),
                 total_iterations,
@@ -2559,7 +2548,7 @@ class NodeExecutor(EngineScoped):
             )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
-            logger.info(
+            logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations",
                 len(successful_iterations),
                 total_iterations,
@@ -2571,7 +2560,7 @@ class NodeExecutor(EngineScoped):
             value = iteration_results[iteration_index]
             node._results_list.append(value)
 
-        logger.info(
+        logger.debug(
             "Iterative group '%s': Built results list with %d items from sequential iterations",
             node.name,
             len(node._results_list),
@@ -2586,7 +2575,7 @@ class NodeExecutor(EngineScoped):
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Completed sequential iterative group execution for '%s' with %d results",
             node.name,
             len(iteration_results),
@@ -2618,7 +2607,7 @@ class NodeExecutor(EngineScoped):
                 for param_name, param_value in resolved_upstream_values.items():
                     if param_name not in parameter_values_per_iteration[iteration_index]:
                         parameter_values_per_iteration[iteration_index][param_name] = param_value
-            logger.info(
+            logger.debug(
                 "Added %d resolved upstream values to %d iterations for group '%s'",
                 len(resolved_upstream_values),
                 len(parameter_values_per_iteration),
@@ -2797,7 +2786,7 @@ class NodeExecutor(EngineScoped):
                         upstream_value,
                     )
 
-        logger.info("Collected %d resolved upstream values for loop execution", len(resolved_upstream_values))
+        logger.debug("Collected %d resolved upstream values for loop execution", len(resolved_upstream_values))
         return resolved_upstream_values
 
     def _get_upstream_connection_value(
@@ -3242,7 +3231,7 @@ class NodeExecutor(EngineScoped):
                         and context_manager.get_current_flow().name == deserialize_result.flow_name
                     ):
                         context_manager.pop_flow()
-            logger.info("Successfully deserialized %d flow instances for parallel execution", total_iterations)
+            logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
             # Step 2: Define the per-iteration coroutine
             packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
 
@@ -3308,7 +3297,7 @@ class NodeExecutor(EngineScoped):
                             set_value_result.result_details,
                         )
 
-            logger.info("Successfully set input values for %d iterations", total_iterations)
+            logger.debug("Successfully set input values for %d iterations", total_iterations)
             # Step 4: Run all iterations concurrently.
             # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
             # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
@@ -3443,7 +3432,7 @@ class NodeExecutor(EngineScoped):
             start_node_name = node_metadata.display_name
 
         mode_str = "sequentially" if run_sequentially else "concurrently"
-        logger.info(
+        logger.debug(
             "Executing %d iterations %s in %s for loop '%s'",
             total_iterations,
             mode_str,
@@ -3458,7 +3447,7 @@ class NodeExecutor(EngineScoped):
                 for iteration_index in range(total_iterations):
                     try:
                         flow_input = {start_node_name: parameter_values_per_iteration[iteration_index]}
-                        logger.info(
+                        logger.debug(
                             "Executing iteration %d/%d for loop '%s'",
                             iteration_index + 1,
                             total_iterations,
@@ -3485,7 +3474,7 @@ class NodeExecutor(EngineScoped):
                 async def run_single_iteration(iteration_index: int) -> tuple[int, bool, dict[str, Any] | None]:
                     try:
                         flow_input = {start_node_name: parameter_values_per_iteration[iteration_index]}
-                        logger.info(
+                        logger.debug(
                             "Executing iteration %d/%d for loop '%s'",
                             iteration_index + 1,
                             total_iterations,
@@ -3516,7 +3505,7 @@ class NodeExecutor(EngineScoped):
                 )
             )
 
-            logger.info(
+            logger.debug(
                 "Successfully completed %d/%d iterations %s in %s for loop '%s'",
                 len(successful_iterations),
                 total_iterations,
@@ -3625,7 +3614,7 @@ class NodeExecutor(EngineScoped):
             raise TypeError(msg)
 
         workflow_path = Path(workflow_result.file_path)
-        logger.info("Saved workflow to '%s'", workflow_path)
+        logger.debug("Saved workflow to '%s'", workflow_path)
 
         return workflow_path, workflow_result
 
@@ -4075,7 +4064,7 @@ class NodeExecutor(EngineScoped):
                 target_param_name,
             )
 
-        logger.info(
+        logger.debug(
             "Successfully applied %d parameter values from last iteration to packaged nodes",
             len(last_iteration_values),
         )
@@ -4103,14 +4092,8 @@ class NodeExecutor(EngineScoped):
 
         delete_request = DeleteWorkflowRequest(name=workflow_name)
         delete_result = await self.engine.ahandle_request(delete_request)
-        if isinstance(delete_result, DeleteWorkflowResultFailure):
-            logger.error(
-                "Failed to delete workflow '%s'. Error: %s",
-                workflow_name,
-                delete_result.result_details,
-            )
-        else:
-            logger.info(
+        if not isinstance(delete_result, DeleteWorkflowResultFailure):
+            logger.debug(
                 "Cleanup result for workflow '%s': %s",
                 workflow_name,
                 delete_result.result_details,

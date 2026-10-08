@@ -3258,7 +3258,6 @@ class ProjectManager(EngineScoped):
                 f"Attempted to activate project '{resolved_project_id}'. Failed because no loaded "
                 f"project template has that id, so its configuration could not be established."
             )
-            logger.error(details)
             return SetCurrentProjectResultFailure(result_details=details)
 
         return self._refuse_unresolvable_declared_paths(project_info)
@@ -3524,7 +3523,7 @@ class ProjectManager(EngineScoped):
         for that case.
         """
         if generation <= self._last_adopted_generation:
-            logger.info(
+            logger.debug(
                 "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
                 project_id,
                 generation,

@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -99,6 +100,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetNextVersionIndexRequest,
     GetNextVersionIndexResultFailure,
     GetNextVersionIndexResultSuccess,
+    LaunchExternalViewerRequest,
+    LaunchExternalViewerResultFailure,
+    LaunchExternalViewerResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
@@ -569,6 +573,7 @@ class OSManager(EngineScoped):
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
                 failure_log_level=failure_log_level,
+                broadcast_result=False,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):
@@ -1440,16 +1445,14 @@ class OSManager(EngineScoped):
             os.execvp(args[0], args)  # noqa: S606
 
     @handles(OpenAssociatedFileRequest)
-    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         # Validate that exactly one of path_to_file or file_entry is provided
         if request.path_to_file is None and request.file_entry is None:
             msg = "Either path_to_file or file_entry must be provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         if request.path_to_file is not None and request.file_entry is not None:
             msg = "Only one of path_to_file or file_entry should be provided, not both"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Get the file path to open
@@ -1462,13 +1465,11 @@ class OSManager(EngineScoped):
         else:
             # This should never happen due to validation above, but type checker needs it
             msg = "No valid file path provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # At this point, file_path_str is guaranteed to be a string
         if file_path_str is None:
             msg = "No valid file path provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Sanitize and validate the path (file or directory)
@@ -1477,19 +1478,17 @@ class OSManager(EngineScoped):
             path = self._resolve_file_path(file_path_str, workspace_only=False)
         except (ValueError, RuntimeError):
             details = f"Invalid file path: '{file_path_str}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
             )
 
         if not path.exists():
             details = f"Path does not exist: '{path}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
             )
 
-        logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
+        logger.debug("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
             raw_platform = sys.platform
@@ -1503,7 +1502,7 @@ class OSManager(EngineScoped):
                 # Windows -- a prefixed path makes ShellExecute fail to open the file. The
                 # path is already validated to exist above, so hand it over unprefixed.
                 os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
-                logger.info("Opened path on Windows: %s", path)
+                logger.debug("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location
                 subprocess.run(  # noqa: S603
@@ -1512,7 +1511,7 @@ class OSManager(EngineScoped):
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on macOS: %s", path)
+                logger.debug("Opened path on macOS: %s", path)
             elif self.is_linux():
                 # Use full path to xdg-open to satisfy linter
                 # Common locations for xdg-open:
@@ -1521,7 +1520,6 @@ class OSManager(EngineScoped):
                 xdg_path = next((p for p in xdg_paths if Path(p).exists()), None)
                 if not xdg_path:
                     details = "xdg-open not found in standard locations"
-                    logger.info(details)
                     return OpenAssociatedFileResultFailure(
                         failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                     )
@@ -1532,10 +1530,9 @@ class OSManager(EngineScoped):
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on Linux: %s", path)
+                logger.debug("Opened path on Linux: %s", path)
             else:
                 details = f"Unsupported platform: '{raw_platform}'"
-                logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                 )
@@ -1545,12 +1542,129 @@ class OSManager(EngineScoped):
             details = (
                 f"Process error when opening file: return code={e.returncode}, stdout={e.stdout}, stderr={e.stderr}"
             )
-            logger.error(details)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=details)
         except Exception as e:
             details = f"Exception occurred when trying to open path: {e}"
-            logger.error(details)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=details)
+
+    @handles(LaunchExternalViewerRequest)
+    def on_launch_external_viewer_request(self, request: LaunchExternalViewerRequest) -> ResultPayload:  # noqa: PLR0911
+        executable_key = f"{request.config_category}.viewer_executable"
+        args_key = f"{request.config_category}.viewer_args"
+        attempt = f"Attempted to open '{request.path_to_file}' in the external viewer"
+
+        try:
+            path = self._resolve_file_path(request.path_to_file, workspace_only=False)
+        except (ValueError, RuntimeError):
+            details = f"{attempt}. Failed because the path is not valid."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        if not path.exists():
+            details = f"{attempt}. Failed because the file does not exist."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+
+        viewer_executable = self.engine.config_manager.get_config_value(executable_key, default="")
+        viewer_executable = (viewer_executable or "").strip()
+        if not viewer_executable:
+            if not request.fallback_to_os_default:
+                details = f"{attempt}. Failed because no viewer is set in the '{executable_key}' setting."
+                logger.info(details)
+                return LaunchExternalViewerResultFailure(
+                    failure_reason=FileIOFailureReason.NOT_CONFIGURED, result_details=details
+                )
+            return self._open_with_os_default_for_viewer(path, attempt)
+
+        viewer_args = self.engine.config_manager.get_config_value(args_key, default="")
+        try:
+            viewer_arg_list = self._split_viewer_args(viewer_args or "")
+        except ValueError as e:
+            details = f"{attempt}. Failed because the '{args_key}' setting has unbalanced quotes: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        # The OS path is passed unprefixed: viewers do not understand the Windows \\?\ long-path form.
+        argv = [viewer_executable, *viewer_arg_list, os.fspath(path)]
+        try:
+            self._spawn_detached(argv)
+        except FileNotFoundError:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' was not found."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+        except PermissionError:
+            details = (
+                f"{attempt}. Failed because the viewer '{viewer_executable}' could not be run (permission denied)."
+            )
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=details
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' could not be started: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
+            )
+
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=False, result_details=f"Opened '{path}' in the external viewer '{viewer_executable}'."
+        )
+
+    def _open_with_os_default_for_viewer(self, path: Path, attempt: str) -> ResultPayload:
+        open_result = self.on_open_associated_file_request(OpenAssociatedFileRequest(path_to_file=os.fspath(path)))
+        if isinstance(open_result, OpenAssociatedFileResultFailure):
+            details = f"{attempt}. No viewer is set, and opening it with the default application failed: {open_result.result_details}"
+            return LaunchExternalViewerResultFailure(failure_reason=open_result.failure_reason, result_details=details)
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=True,
+            result_details=f"No external viewer is set, so '{path}' was opened with the default application.",
+        )
+
+    def _split_viewer_args(self, viewer_args: str) -> list[str]:
+        """Split the configured viewer arguments with shell-style quoting.
+
+        POSIX mode would treat Windows backslashes as escapes, but non-POSIX mode keeps the
+        quotes on each token, so they are stripped here before the tokens reach Popen.
+        """
+        if not self.is_windows():
+            return shlex.split(viewer_args)
+        tokens = shlex.split(viewer_args, posix=False)
+        unquoted = []
+        for token in tokens:
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":  # noqa: PLR2004
+                unquoted.append(token[1:-1])
+            else:
+                unquoted.append(token)
+        return unquoted
+
+    def _spawn_detached(self, argv: list[str]) -> None:
+        """Start ``argv`` without waiting for it, so it outlives the engine and never blocks it."""
+        if self.is_windows():
+            creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # pyright: ignore[reportAttributeAccessIssue]
+            subprocess.Popen(  # noqa: S603
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            return
+        subprocess.Popen(  # noqa: S603
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def _is_hidden(self, dir_entry: os.DirEntry, stat_result: os.stat_result | None = None) -> bool:
         """Check if a directory entry is hidden in an OS-independent way.
@@ -1629,18 +1743,15 @@ class OSManager(EngineScoped):
             # Check if directory exists
             if not directory.exists():
                 msg = f"Directory does not exist: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
             if not directory.is_dir():
                 msg = f"Path is not a directory: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
             # Check workspace constraints
             is_workspace_path, relative_or_abs_path = self._validate_workspace_path(directory)
             if request.workspace_only and not is_workspace_path:
                 msg = f"Directory is outside workspace: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
             # Cache workspace path and resolved workspace to avoid repeated lookups/resolutions
@@ -1762,13 +1873,11 @@ class OSManager(EngineScoped):
 
             except PermissionError as e:
                 msg = f"Permission denied listing directory {directory}: {e}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(
                     failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg
                 )
             except OSError as e:
                 msg = f"I/O error listing directory {directory}: {e}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
             # Group sequence files into Sequence objects when requested.
@@ -1827,7 +1936,6 @@ class OSManager(EngineScoped):
 
         except Exception as e:
             msg = f"Unexpected error in list_directory: {type(e).__name__}: {e}"
-            logger.error(msg)
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
     @handles(ListDirectorySequencesRequest)
@@ -1917,7 +2025,6 @@ class OSManager(EngineScoped):
             )
         except Exception as e:
             msg = f"Attempted to deduce sequences from file list. Failed with {type(e).__name__}: {e}"
-            logger.error(msg)
             return DeduceSequencesFromFileListResultFailure(
                 failure_reason=FileIOFailureReason.UNKNOWN,
                 result_details=msg,
@@ -2212,7 +2319,6 @@ class OSManager(EngineScoped):
             location = request.file_path
         else:
             msg = "Either file_path or file_entry must be provided"
-            logger.error(msg)
             return ReadFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Sanitize path string (basic cleanup)
@@ -2289,7 +2395,6 @@ class OSManager(EngineScoped):
                 base_path = self._resolve_file_path(request.file_path, workspace_only=False)
             except (ValueError, RuntimeError) as e:
                 msg = f"Invalid path: {e}"
-                logger.error(msg)
                 return GetNextUnusedFilenameResultFailure(
                     failure_reason=FileIOFailureReason.INVALID_PATH,
                     result_details=msg,
@@ -2317,7 +2422,6 @@ class OSManager(EngineScoped):
             index_info = self._identify_index_variable(parsed_macro, variables)
         except ValueError as e:
             msg = f"Failed to identify index variable in path template: {e}"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2326,7 +2430,6 @@ class OSManager(EngineScoped):
         if index_info is None:
             # No unresolved variables - cannot auto-increment
             msg = "No index variable found in path template"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2347,7 +2450,6 @@ class OSManager(EngineScoped):
                 available_filename = parsed_macro.resolve(index_vars, secrets_manager)
         except MacroResolutionError as e:
             msg = f"Failed to resolve path template: {e}"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
                 result_details=msg,
@@ -2372,7 +2474,6 @@ class OSManager(EngineScoped):
             index_info = self._identify_index_variable(parsed_macro, variables)
         except ValueError as e:
             msg = f"Attempted to find next version index. Failed: {e}"
-            logger.error(msg)
             return GetNextVersionIndexResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2380,7 +2481,6 @@ class OSManager(EngineScoped):
 
         if index_info is None:
             msg = "Attempted to find next version index. Failed because no unresolved {_index} variable was found in the macro template."
-            logger.error(msg)
             return GetNextVersionIndexResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -3425,12 +3525,7 @@ class OSManager(EngineScoped):
             # Check for disk full
             if "No space left" in str(e) or "Disk full" in str(e):
                 error_details = f"Disk full: {e}"
-                logger.error(error_details)
                 raise OSError(error_details) from e
-            raise
-        except Exception as e:
-            error_details = f"Unexpected error: {type(e).__name__}: {e}"
-            logger.error(error_details)
             raise
 
     def _write_locked_discarding_debris(
@@ -3810,7 +3905,6 @@ class OSManager(EngineScoped):
             full_path_str = request.get_full_path()
         except ValueError as e:
             msg = f"Invalid path specification: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Determine if path is absolute (not constrained to workspace)
@@ -3819,7 +3913,6 @@ class OSManager(EngineScoped):
         # If workspace_only is True and path is absolute, it's outside workspace
         if request.workspace_only and is_absolute:
             msg = f"Absolute path is outside workspace: {full_path_str}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve path - if absolute, use as-is; if relative, align to workspace
@@ -3840,43 +3933,37 @@ class OSManager(EngineScoped):
             file_path.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as e:
             msg = f"Permission denied creating parent directory for {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error creating parent directory for {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Create file or directory
         try:
             if request.is_directory:
                 file_path.mkdir()
-                logger.info("Created directory: %s", file_path)
+                logger.debug("Created directory: %s", file_path)
             # Create file with optional content
             elif request.content is not None:
                 with file_path.open("w", encoding=request.encoding) as f:
                     f.write(request.content)
-                logger.info("Created file with content: %s", file_path)
+                logger.debug("Created file with content: %s", file_path)
             else:
                 file_path.touch()
-                logger.info("Created empty file: %s", file_path)
+                logger.debug("Created empty file: %s", file_path)
         except PermissionError as e:
             msg = f"Permission denied creating {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             # Check for disk full
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full creating {file_path}: {e}"
-                logger.error(msg)
                 return CreateFileResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error creating {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error creating {file_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3893,26 +3980,22 @@ class OSManager(EngineScoped):
             old_path = self._resolve_file_path(request.old_path, workspace_only=request.workspace_only is True)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         try:
             new_path = self._resolve_file_path(request.new_path, workspace_only=request.workspace_only is True)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if old path exists
         if not old_path.exists():
             msg = f"Source path does not exist: {old_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if new path already exists
         if new_path.exists():
             msg = f"Destination path already exists: {new_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check workspace constraints for both paths
@@ -3921,7 +4004,6 @@ class OSManager(EngineScoped):
 
         if request.workspace_only and (not is_old_in_workspace or not is_new_in_workspace):
             msg = f"One or both paths are outside workspace: {old_path} -> {new_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Create parent directories for new path if needed
@@ -3929,11 +4011,9 @@ class OSManager(EngineScoped):
             new_path.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as e:
             msg = f"Permission denied creating parent directory for {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error creating parent directory for {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Perform the rename operation
@@ -3941,15 +4021,12 @@ class OSManager(EngineScoped):
             old_path.rename(new_path)
         except PermissionError as e:
             msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error renaming {old_path} to {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3969,19 +4046,16 @@ class OSManager(EngineScoped):
             source_normalized = normalize_path_for_platform(source_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
         if not Path(source_normalized).exists():
             msg = f"Source file does not exist: {source_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a file (not a directory)
         if not Path(source_normalized).is_file():
             msg = f"Source path is not a file: {source_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve destination path
@@ -3990,13 +4064,11 @@ class OSManager(EngineScoped):
             dest_normalized = normalize_path_for_platform(destination_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless overwrite is True)
         if Path(dest_normalized).exists() and not request.overwrite:
             msg = f"Destination file already exists: {destination_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Create parent directory if it doesn't exist
@@ -4006,11 +4078,9 @@ class OSManager(EngineScoped):
                 dest_parent.mkdir(parents=True)
             except PermissionError as e:
                 msg = f"Permission denied creating parent directory {dest_parent}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
             except OSError as e:
                 msg = f"I/O error creating parent directory {dest_parent}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Copy the file
@@ -4018,20 +4088,16 @@ class OSManager(EngineScoped):
             bytes_copied = self._copy_file(source_path, destination_path)
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full copying {source_path} to {destination_path}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error copying {source_path} to {destination_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -4295,19 +4361,16 @@ class OSManager(EngineScoped):
             source_normalized = normalize_path_for_platform(source_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
         if not Path(source_normalized).exists():
             msg = f"Source path does not exist: {source_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a directory
         if not Path(source_normalized).is_dir():
             msg = f"Source path is not a directory: {source_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve and normalize destination path
@@ -4316,13 +4379,11 @@ class OSManager(EngineScoped):
             dest_normalized = normalize_path_for_platform(destination_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless dirs_exist_ok is True)
         if Path(dest_normalized).exists() and not dirs_exist_ok:
             msg = f"Destination path already exists: {destination_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         return CopyTreeValidationResult(
@@ -4465,20 +4526,16 @@ class OSManager(EngineScoped):
             )
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full copying {source_path} to {destination_path}: {e}"
-                logger.error(msg)
                 return CopyTreeResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error copying {source_path} to {destination_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
