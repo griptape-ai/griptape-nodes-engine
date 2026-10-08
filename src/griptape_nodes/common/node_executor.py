@@ -1001,6 +1001,10 @@ class NodeExecutor(EngineScoped):
         flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
 
+        # Data dependency collection skips RESOLVED nodes. A node fed by the start node's per-pass
+        # outputs is still RESOLVED from the previous run, and must be packaged to re-evaluate per pass.
+        connections.unresolve_future_nodes(start_node)
+
         # Collect all nodes in the forward control path from start to end
         nodes_in_control_flow = DagBuilder.collect_nodes_in_forward_control_path(start_node, end_node, connections)
 
