@@ -43,10 +43,12 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelFlowRequest,
     ExecuteNodeRequest,
     ResolveNodeRequest,
     StartFlowFromNodeRequest,
     StartFlowRequest,
+    UnresolveFlowRequest,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     AutoLayoutFlowRequest,
@@ -117,6 +119,8 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "ExecuteNodeRequest": ExecuteNodeRequest,
     "StartFlowRequest": StartFlowRequest,
     "StartFlowFromNodeRequest": StartFlowFromNodeRequest,
+    "CancelFlowRequest": CancelFlowRequest,
+    "UnresolveFlowRequest": UnresolveFlowRequest,
     # Flows
     "CreateFlowRequest": CreateFlowRequest,
     "DeleteFlowRequest": DeleteFlowRequest,

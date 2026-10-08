@@ -185,7 +185,7 @@ class CancelFlowRequest(RequestPayload):
     stopping execution due to errors or changes. Cleanly terminates execution.
 
     Args:
-        flow_name: Name of the flow to cancel (deprecated)
+        flow_name: Name of the flow to cancel (required)
 
     Results: CancelFlowResultSuccess | CancelFlowResultFailure (cancellation error)
     """
@@ -209,6 +209,17 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class UnresolveFlowRequest(RequestPayload):
+    """Reset every node in a flow back to unresolved.
+
+    Use when: Clearing cached results so the next run re-executes every node.
+    Does not stop a running flow; use CancelFlowRequest for that.
+
+    Args:
+        flow_name: Name of the flow to unresolve (required)
+
+    Results: UnresolveFlowResultSuccess | UnresolveFlowResultFailure (unresolve error)
+    """
+
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
