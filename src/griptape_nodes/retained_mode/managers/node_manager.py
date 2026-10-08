@@ -1995,6 +1995,7 @@ class NodeManager(EngineScoped):
             parent_element_name=parent_group.name if parent_group is not None else None,
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
+            serializable=request.serializable,
         )
         # Hand saved state to the traits so their converters, validators, and rendered
         # options match what was saved.
