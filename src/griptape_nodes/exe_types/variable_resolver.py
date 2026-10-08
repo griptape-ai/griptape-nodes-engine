@@ -349,12 +349,11 @@ class VariableResolver:
 
     @staticmethod
     def _render_list_item(item: Any) -> str:
+        """Strings pass through. Every other item is JSON, so a value is spelled the same at any depth."""
         if isinstance(item, str):
             return item
-        if isinstance(item, (dict, list)):
-            try:
-                return json.dumps(item)
-            except (TypeError, ValueError):
-                # Non-JSON values, or a container that contains itself.
-                return str(item)
-        return str(item)
+        try:
+            return json.dumps(item)
+        except (TypeError, ValueError):
+            # Non-JSON values, or a container that contains itself.
+            return str(item)

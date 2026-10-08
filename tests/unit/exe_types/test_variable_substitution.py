@@ -1154,10 +1154,10 @@ class TestListVariableSubstitution:
 
         assert VariableResolver.resolve_string("{names}", filtered) == "a\nb\nc"
 
-    def test_non_string_items_render_as_text(self) -> None:
-        filtered = VariableResolver._filter_for_substitution({"items": [1, True, {"k": "v"}, ["x"]]})
+    def test_non_string_items_render_as_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"items": [1, True, None, {"k": True}, ["x"]]})
 
-        assert filtered["items"] == '1\nTrue\n{"k": "v"}\n["x"]'
+        assert filtered["items"] == '1\ntrue\nnull\n{"k": true}\n["x"]'
 
     def test_empty_list_renders_empty_string(self) -> None:
         filtered = VariableResolver._filter_for_substitution({"items": []})
