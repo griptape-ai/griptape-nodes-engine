@@ -370,6 +370,17 @@ class TestSerializeNodeToCommandsBasics:
 
         assert isinstance(result, SerializeNodeToCommandsResultFailure)
 
+    def test_reference_node_broadcasts_no_events(
+        self, engine: Engine, library_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        events: list[object] = []
+        monkeypatch.setattr(engine.event_manager, "put_event", events.append)
+
+        _serialize(engine, node_name)
+
+        assert events == []
+
 
 class TestElementModificationCommands:
     """User-defined parameters replay via AddParameterToNodeRequest; library ones only diff."""
@@ -399,6 +410,21 @@ class TestElementModificationCommands:
             if isinstance(command, AddParameterToNodeRequest) and command.parameter_name == "extra"
         ]
         assert len(add_commands) == 1
+
+    def test_user_defined_parameter_keeps_serializable_false_across_a_round_trip(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        add_result = engine.handle_request(
+            AddParameterToNodeRequest(node_name=node_name, parameter_name="extra", tooltip="", serializable=False)
+        )
+        assert isinstance(add_result, AddParameterToNodeResultSuccess), add_result
+
+        restored = _round_trip(engine, node_name)
+
+        parameter = restored.get_parameter_by_name("extra")
+        assert parameter is not None
+        assert parameter.serializable is False
 
     def test_unchanged_library_parameter_is_not_re_added(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")

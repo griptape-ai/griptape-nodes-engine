@@ -8,11 +8,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from xdg_base_dirs import xdg_data_home
-
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
-from griptape_nodes.files.path_utils import resolve_workspace_path
+from griptape_nodes.exe_types.workflow_node import (
+    WorkflowNode,
+    WorkflowNodeDefinitionError,
+    build_workflow_node_class,
+)
+from griptape_nodes.files.path_utils import canonicalize_for_identity_preserving_symlinks, resolve_workspace_path
 from griptape_nodes.node_library.library_registry import (
     Library,
     LibraryRegistry,
@@ -45,6 +47,7 @@ from griptape_nodes.serialization.type_names import (
     is_dynamic_module_name,
     register_stable_module_name,
 )
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -440,8 +443,8 @@ class LibraryModuleLoading(EngineScoped):
         """
         any_nodes_loaded_successfully = False
 
-        # Check if library is in old XDG location
-        old_xdg_libraries_path = xdg_data_home() / "griptape_nodes" / "libraries"
+        # Check if library is in old engine data location
+        old_xdg_libraries_path = engine_data_dir() / "libraries"
         library_path_obj = Path(library_info.library_path)
         try:
             # Check if the library path is relative to the old XDG location
@@ -630,6 +633,40 @@ class LibraryModuleLoading(EngineScoped):
 
         # Update lifecycle state to LOADED
         library_info.lifecycle_state = LibraryLifecycleState.LOADED
+
+    def build_workflow_node_class_from_definition(
+        self, workflow_node_definition: WorkflowNodeDefinition, base_dir: Path
+    ) -> type[WorkflowNode] | WorkflowNodeLoadProblem:
+        """Generate the node type a saved workflow file describes, or the problem that prevents it."""
+        # Deliberately not `canonicalize_for_identity`: the workspace scan registers a linked
+        # workflow under the link's path, and resolving it would key it by a full machine-specific
+        # path instead.
+        workflow_file_path = canonicalize_for_identity_preserving_symlinks(
+            workflow_node_definition.workflow_path, base=base_dir
+        )
+        try:
+            workflow_metadata = read_workflow_metadata(workflow_file_path)
+        except WorkflowMetadataError as err:
+            return WorkflowNodeLoadProblem(
+                node_type=workflow_node_definition.node_type,
+                workflow_path=str(workflow_file_path),
+                error_message=str(err),
+            )
+
+        try:
+            node_class = build_workflow_node_class(
+                node_type=workflow_node_definition.node_type,
+                workflow_file_path=workflow_file_path,
+                workflow_metadata=workflow_metadata,
+            )
+        except WorkflowNodeDefinitionError as err:
+            return WorkflowNodeLoadProblem(
+                node_type=workflow_node_definition.node_type,
+                workflow_path=str(workflow_file_path),
+                error_message=str(err),
+            )
+
+        return node_class
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.
@@ -912,33 +949,9 @@ class LibraryModuleLoading(EngineScoped):
         parameters. Returns False (recording a library problem) when the header cannot be read or
         carries no shape.
         """
-        workflow_file_path = resolve_workspace_path(Path(workflow_node_definition.workflow_path), base_dir)
-        try:
-            workflow_metadata = read_workflow_metadata(workflow_file_path)
-        except WorkflowMetadataError as err:
-            library_info.problems.append(
-                WorkflowNodeLoadProblem(
-                    node_type=workflow_node_definition.node_type,
-                    workflow_path=str(workflow_file_path),
-                    error_message=str(err),
-                )
-            )
-            return False
-
-        try:
-            node_class = build_workflow_node_class(
-                node_type=workflow_node_definition.node_type,
-                workflow_file_path=workflow_file_path,
-                workflow_metadata=workflow_metadata,
-            )
-        except WorkflowNodeDefinitionError as err:
-            library_info.problems.append(
-                WorkflowNodeLoadProblem(
-                    node_type=workflow_node_definition.node_type,
-                    workflow_path=str(workflow_file_path),
-                    error_message=str(err),
-                )
-            )
+        node_class = self.build_workflow_node_class_from_definition(workflow_node_definition, base_dir)
+        if isinstance(node_class, WorkflowNodeLoadProblem):
+            library_info.problems.append(node_class)
             return False
 
         library_problem = library.register_new_node_type(node_class, metadata=workflow_node_definition.metadata)

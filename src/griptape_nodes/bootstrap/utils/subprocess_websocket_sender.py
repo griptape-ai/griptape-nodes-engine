@@ -45,13 +45,13 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
 
     async def _start_websocket_connection(self) -> None:
         """Start WebSocket client and sender background task."""
-        logger.info("Starting WebSocket sender for session %s", self._session_id)
+        logger.debug("Starting WebSocket sender for session %s", self._session_id)
 
         self._ws_shutdown_event.clear()
         await self._start_websocket_client()
         self._create_websocket_task(self._ws_send_loop())
 
-        logger.info("WebSocket sender started for session %s", self._session_id)
+        logger.debug("WebSocket sender started for session %s", self._session_id)
 
     async def _ws_send_loop(self) -> None:
         """Background task to send queued messages."""
@@ -127,13 +127,13 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
 
     async def _stop_websocket_connection(self) -> None:
         """Stop the sender task and close client."""
-        logger.info("Stopping WebSocket sender for session %s", self._session_id)
+        logger.debug("Stopping WebSocket sender for session %s", self._session_id)
 
         self._ws_shutdown_event.set()
         await self._stop_websocket_task()
         await self._stop_websocket_client()
 
-        logger.info("WebSocket sender stopped for session %s", self._session_id)
+        logger.debug("WebSocket sender stopped for session %s", self._session_id)
 
     async def _wait_for_websocket_queue_flush(self, timeout_seconds: float = 5.0) -> None:
         """Wait for all queued messages to be sent.

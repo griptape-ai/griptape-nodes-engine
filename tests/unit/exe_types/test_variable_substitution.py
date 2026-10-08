@@ -1146,3 +1146,33 @@ class TestPredicateWalksSurviveCycles:
         value.append(value)
 
         assert VariableResolver.would_substitute(value, {"VAR": "x"}) is True
+
+
+class TestListVariableSubstitution:
+    def test_list_of_strings_renders_one_item_per_line(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"names": ["a", "b", "c"]})
+
+        assert VariableResolver.resolve_string("{names}", filtered) == "a\nb\nc"
+
+    def test_non_string_items_render_as_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"items": [1, True, None, {"k": True}, ["x"]]})
+
+        assert filtered["items"] == '1\ntrue\nnull\n{"k": true}\n["x"]'
+
+    def test_empty_list_renders_empty_string(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"items": []})
+
+        assert filtered["items"] == ""
+
+    def test_self_referential_list_does_not_raise(self) -> None:
+        value: list = ["a"]
+        value.append(value)
+
+        filtered = VariableResolver._filter_for_substitution({"items": value})
+
+        assert str(filtered["items"]).startswith("a\n")
+
+    def test_dict_and_bool_values_are_still_excluded(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1}, "b": True})
+
+        assert filtered == {}

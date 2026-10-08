@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue, Value
 
@@ -435,8 +436,18 @@ class NodeFinishProcessEvent(ExecutionPayload):
 @dataclass
 @PayloadRegistry.register
 class NodeErrorEvent(ExecutionPayload):
+    """A node failed during a flow run.
+
+    Args:
+        node_name: The node that failed.
+        error_message: The failure as one flattened string, for logs and older editors.
+        error: The same failure in parts, without engine preambles or the node name prefix.
+            Optional so events from older engines still parse.
+    """
+
     node_name: str
     error_message: str
+    error: NodeErrorDetails | None = None
 
 
 @dataclass
@@ -553,9 +564,13 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
             `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
             without reading the message, because they mean different things to whoever is looking:
             nothing ran, versus something ran and broke.
+        error: The failure in parts for `NodeErrorEvent.error`, built from the node's own exception
+            where the node failed, so it is complete even when the node ran in a worker. None when
+            the engine wrote `result_details` itself, such as for a worker that stopped responding.
     """
 
     validation_exceptions: list[Exception] | None = None
+    error: NodeErrorDetails | None = None
 
 
 @dataclass

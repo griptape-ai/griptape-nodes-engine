@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
+from griptape_nodes.common.node_executor import ExecuteNodeFailedError
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.control_flow import ControlFlowMachine
@@ -21,6 +22,8 @@ from griptape_nodes.machines.parallel_resolution import (
     ParallelResolutionContext,
     ParallelResolutionMachine,
 )
+from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
@@ -664,7 +667,48 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert task not in context.task_to_node
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
-        assert context.error_message is not None
+        assert context.error_message == "Node 'n' encountered a problem: boom"
+
+    @pytest.mark.asyncio
+    async def test_errored_task_sends_the_node_error_in_parts(self) -> None:
+        """The NodeErrorEvent keeps its flattened message and adds the node's own words and type."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "n"
+        node.lock = False
+        node.state = NodeResolutionState.RESOLVING
+        graph = DirectedGraph()
+        graph.add_node("n")
+        dag_builder = DagBuilder()
+        dag_builder.graphs["n"] = graph
+        dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
+        engine = MagicMock()
+        engine.event_manager.aput_event = AsyncMock()
+        context = ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=engine)
+
+        raised = KeyError("n: Key 'b' not found")
+        flattened = "Node 'n' execution failed: Attempted to execute node 'n'. Failed with error: \"n: Key 'b'\""
+
+        async def _boom() -> None:
+            details = NodeErrorDetails(message="Key 'b' not found", exception_type="builtins.KeyError")
+            raise ExecuteNodeFailedError(flattened, details=details) from raised
+
+        task = asyncio.ensure_future(_boom())
+        await asyncio.sleep(0)
+        context.task_to_node[task] = dag_builder.node_to_reference["n"]
+        context.running_tasks_count = 1
+
+        await ExecuteDagState.on_update(context)
+
+        await_args = engine.event_manager.aput_event.await_args
+        assert await_args is not None
+        payload = await_args.args[0].wrapped_event.payload
+        assert isinstance(payload, NodeErrorEvent)
+        assert payload.error_message == flattened
+        assert payload.error is not None
+        assert payload.error.message == "Key 'b' not found"
+        assert payload.error.exception_type == "builtins.KeyError"
+        # ExecuteNodeFailedError already names the node, so the run's message adds no second prefix.
+        assert context.error_message == flattened
 
 
 class TestLockedNodeIsNeverQueuedOrExecuted:

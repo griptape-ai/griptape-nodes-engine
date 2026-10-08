@@ -110,10 +110,23 @@ uvx mcp-server-git
 
 ### Server Won't Start
 
-- Verify the command exists in PATH
-- Check file permissions
-- Ensure all dependencies are installed
-- Test the command manually in terminal
+If the error is `[Errno 2] No such file or directory: 'npx'` (or `'uvx'`, `'python'`), the engine
+can't find that command on its PATH:
+
+- **Desktop app**: update to v0.27.0 or later. Earlier versions don't inherit your login shell's
+    PATH on macOS and Linux, so a command installed via Homebrew, nvm, or similar isn't visible to
+    the engine.
+- **Running the engine outside the desktop app** (terminal, service, container) without a
+    login-shell PATH: either put the tool on PATH before starting the engine, or set `command` to
+    its absolute path (find it with `which npx`) and set a complete `PATH` in `env`. Setting `PATH`
+    in `env` *replaces* the inherited PATH rather than extending it, so include every directory your
+    other tools need, not just the one for this command.
+
+If the command starts but the server still fails, also check:
+
+- File permissions
+- That all dependencies are installed
+- Whether the command works when run manually in a terminal
 
 ### Connection Timeout
 
@@ -130,7 +143,8 @@ uvx mcp-server-git
 
 ## Best Practices
 
-1. **Use Absolute Paths**: For commands and working directories
+1. **Use Absolute Paths**: Needed only if the engine's PATH doesn't include your command's
+    directory, as described in [Server Won't Start](#server-wont-start) above
 1. **Set Environment Variables**: For configuration and secrets
 1. **Handle Errors Gracefully**: Implement proper error handling
 1. **Monitor Resources**: Watch for memory leaks or high CPU usage

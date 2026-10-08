@@ -79,10 +79,10 @@ class SubprocessWebSocketBaseMixin:
             SubprocessWebSocketUnavailableError: If there is no API key.
         """
         api_key = self._require_websocket_api_key()
-        logger.info("Starting WebSocket client for session %s", self._session_id)
+        logger.debug("Starting WebSocket client for session %s", self._session_id)
         self._ws_client = Client(api_key=api_key)
         await self._ws_client.connect()
-        logger.info("WebSocket client connected for session %s", self._session_id)
+        logger.debug("WebSocket client connected for session %s", self._session_id)
 
     def _require_websocket_api_key(self) -> str:
         """Return the API key the subprocess WebSocket connects with, or raise if it cannot connect.
@@ -126,4 +126,4 @@ class SubprocessWebSocketBaseMixin:
 
         await self._ws_client.disconnect()
         self._ws_client = None
-        logger.info("WebSocket client disconnected for session %s", self._session_id)
+        logger.debug("WebSocket client disconnected for session %s", self._session_id)

@@ -19,6 +19,12 @@ from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartFlowFromNodeRequest,
+    StartFlowFromNodeResultFailure,
+    StartFlowRequest,
+    StartFlowResultFailure,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
@@ -32,6 +38,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.serialization.commands import encode_commands
 
@@ -347,6 +354,60 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         get_flow.assert_called_once_with("derived_parent_flow")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestStartFlowFailureMessage:
+    """A failed run reports which flow failed and why."""
+
+    @pytest.fixture
+    def ready_flow_manager(self, engine: Engine) -> Generator[Any, None, None]:
+        flow_manager = engine.flow_manager
+        validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
+        with (
+            patch.object(flow_manager, "get_flow_by_name", return_value=MagicMock()),
+            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
+            patch.object(flow_manager, "get_start_node_queue"),
+            patch.object(flow_manager, "on_validate_flow_dependencies_request", return_value=validated),
+        ):
+            yield flow_manager
+
+    @pytest.mark.asyncio
+    async def test_start_flow_reports_exception(self, ready_flow_manager: Any) -> None:
+        with patch.object(ready_flow_manager, "start_flow", side_effect=RuntimeError("boom")):
+            result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
+
+        assert isinstance(result, StartFlowResultFailure)
+        assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
+
+    @pytest.mark.asyncio
+    async def test_start_flow_reports_resolution_error(self, ready_flow_manager: Any) -> None:
+        machine = MagicMock()
+        machine.resolution_machine.is_errored.return_value = True
+        machine.resolution_machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
+        with (
+            patch.object(ready_flow_manager, "start_flow"),
+            patch.object(ready_flow_manager, "_global_control_flow_machine", machine),
+        ):
+            result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
+
+        assert isinstance(result, StartFlowResultFailure)
+        assert (
+            str(result.result_details)
+            == "Attempted to run flow 'f'. Failed due to: Node 'n' encountered a problem: boom"
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_flow_from_node_reports_exception(self, ready_flow_manager: Any, engine: Engine) -> None:
+        with (
+            patch.object(engine.object_manager, "attempt_get_object_by_name_as_type", return_value=MagicMock()),
+            patch.object(ready_flow_manager, "start_flow", side_effect=RuntimeError("boom")),
+        ):
+            result = await ready_flow_manager.on_start_flow_from_node_request(
+                StartFlowFromNodeRequest(node_name="n", flow_name="f")
+            )
+
+        assert isinstance(result, StartFlowFromNodeResultFailure)
+        assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
 
 
 class TestListNodesInFlowRequest:

@@ -236,7 +236,7 @@ class LibraryDependencies(EngineScoped):
         return list(dict.fromkeys([*roots, *dependencies]))
 
     @handles(InstallLibraryDependenciesRequest)
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901 (edit and execution environments each branch)
         """Install a library's dependencies into its edit-time and execution environments.
 
         Edit-time dependencies go into ``.venv``, which is always created even when there is
@@ -259,6 +259,15 @@ class LibraryDependencies(EngineScoped):
         library_data = metadata_result.library_schema
         library_name = library_data.name
         library_metadata = library_data.metadata
+
+        # Neither environment is built, and nothing on disk is touched: the environment the engine
+        # was started in already holds this library's packages.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            details = f"Library '{library_name}' uses the packages its environment provides; nothing to install"
+            logger.debug(details)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name, dependencies_installed=0, result_details=details
+            )
 
         pip_dependencies = []
         pip_dependencies_exec = []
@@ -346,7 +355,7 @@ class LibraryDependencies(EngineScoped):
             ),
             execution_failure,
         )
-        logger.info(details)
+        logger.debug(details)
         return InstallLibraryDependenciesResultSuccess(
             library_name=library_name, dependencies_installed=installed_count, result_details=details
         )
@@ -394,7 +403,9 @@ class LibraryDependencies(EngineScoped):
 
         Raises:
             subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries.
         """
+        self.engine.library_manager.managed_environment.ensure_engine_provisions("install library packages")
         async with engine_version_constraints() as constraint_flags:
             try:
                 await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
@@ -403,7 +414,8 @@ class LibraryDependencies(EngineScoped):
                 reason = (constrained_error.stderr or "").strip()
                 if not reason:
                     reason = f"the installer exited with code {constrained_error.returncode}"
-                logger.warning(
+                # The library report names any components this leaves older than the engine's own.
+                logger.debug(
                     "Attempted to install dependencies into the environment at %s under the versions this engine runs "
                     "on. Installing without them; the result may hold components older than the engine's own. "
                     "Failed due to: %s",
@@ -520,10 +532,12 @@ class LibraryDependencies(EngineScoped):
         # Both callers need library_name, and one path can hold more than one entry -- a FAILURE
         # record alongside the copy that loaded -- so a match on the failed one answers "not
         # installed here" for a library that is. Prefer an entry that actually names itself.
+        managed = self.engine.library_manager.managed_environment
+        environment_mode = managed.provisioned_by_environment()
         matches = [
             info
             for info in self.engine.library_manager._library_file_path_to_info.values()
-            if repo_name in Path(info.library_path).parts
+            if managed.library_path_names_repo(info.library_path, repo_name, environment_mode=environment_mode)
         ]
         named = next((info for info in matches if info.library_name is not None), None)
         if named is not None:
@@ -662,7 +676,6 @@ class LibraryDependencies(EngineScoped):
 
         if not self.engine.library_manager.environment.can_write_to_venv_location(library_venv_python_path):
             msg = f"Attempted to set up the {venv_kind} environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
-            logger.warning(msg)
             raise DependencyInstallError(msg)
 
         config_manager = self.engine.config_manager
@@ -675,7 +688,7 @@ class LibraryDependencies(EngineScoped):
         if not pip_dependencies:
             return
 
-        logger.info("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
+        logger.debug("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:

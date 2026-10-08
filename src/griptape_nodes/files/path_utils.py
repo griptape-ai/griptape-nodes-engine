@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 from griptape_nodes.files.os_utils import is_windows
 
@@ -46,6 +46,13 @@ _URL_SCHEME_MATCH_PATTERN = r"^[A-Za-z][A-Za-z0-9+.\-]+://"
 
 # The path segment that the static file server mounts the workspace directory under.
 _STATIC_SERVER_WORKSPACE_SEGMENT = "/workspace/"
+
+# The path prefix the static file server serves files outside the workspace under, followed by
+# the file's absolute path without its leading slash.
+_STATIC_SERVER_EXTERNAL_PREFIX = "/external/"
+
+# A drive path as `LocalStorageDriver` writes it after `/external/` (`C:/Users/...`).
+_EXTERNAL_WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:/")
 
 # A `file://` netloc that is actually a drive letter, from a hand-written or legacy URI
 # (`file://C:/Users/...`, `file://c|/Users/...`). This names a local Windows path, not a
@@ -404,13 +411,14 @@ def is_url(location: str) -> bool:
 
 
 def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
-    """Map a static file server URL back to the workspace file it serves.
+    """Map a static file server URL back to the file it serves.
 
-    The engine hands node outputs around as static server URLs
-    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?v=<version>``).
-    Those URLs address a file that already exists inside the workspace, so a
-    consumer that needs a real path -- to hand to a subprocess like FFmpeg, say --
-    can have one without an HTTP round-trip.
+    Values saved by older engines hold static server URLs, either for a workspace file
+    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?v=<version>``) or for a
+    file outside it (``http://localhost:8124/external/Users/artist/clip.mp4``). Those
+    URLs address a file that already exists on disk, so a consumer that needs a real
+    path -- to hand to a subprocess like FFmpeg, say -- can have one without an HTTP
+    round-trip, and without a server running.
 
     Only ``localhost`` URLs qualify. A remote host may serve a ``/workspace/``
     path too, but its files are not on this machine, so there is no local path to
@@ -430,6 +438,8 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
         ...     Path("/home/artist/GriptapeNodes"),
         ... )
         PosixPath('/home/artist/GriptapeNodes/staticfiles/clip.mp4')
+        >>> parse_static_server_url("http://localhost:8124/external/Users/artist/clip.mp4", Path("/ws"))
+        PosixPath('/Users/artist/clip.mp4')
         >>> parse_static_server_url("http://localhost:8124/api/health", Path("/ws")) is None
         True
         >>> parse_static_server_url("https://example.com/workspace/clip.mp4", Path("/ws")) is None
@@ -441,7 +451,12 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     # Strip the version/cachebuster query (`?v=...`) before parsing: it is addressing
     # metadata for the HTTP server, not part of the filename.
     url_without_query = location.split("?", maxsplit=1)[0]
-    parsed = urlparse(url_without_query)
+    # These URLs are not percent-encoded, so `#` and `;` are part of the filename.
+    parsed = urlsplit(url_without_query, allow_fragments=False)
+
+    # Checked before the workspace segment, which an external file's own path may contain.
+    if parsed.path.startswith(_STATIC_SERVER_EXTERNAL_PREFIX):
+        return _parse_external_static_server_path(parsed.path)
 
     if _STATIC_SERVER_WORKSPACE_SEGMENT not in parsed.path:
         return None
@@ -457,6 +472,21 @@ def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
     # (`StaticServerFileDriver`) does, which is the point: `File.resolve()` and
     # `File.read_bytes()` must agree on which file a URL names.
     return workspace_path / workspace_relative_path
+
+
+def _parse_external_static_server_path(url_path: str) -> Path | None:
+    """Recover the absolute path from a static server ``/external/`` URL path.
+
+    ``LocalStorageDriver.create_signed_download_url`` builds these by dropping the absolute
+    path's leading slash, so a POSIX path gets it back and a Windows drive path does not.
+    Not percent-decoded, for the same reason as the workspace form.
+    """
+    external_path = url_path.removeprefix(_STATIC_SERVER_EXTERNAL_PREFIX)
+    if not external_path:
+        return None
+    if _EXTERNAL_WINDOWS_DRIVE_PATTERN.match(external_path):
+        return Path(external_path)
+    return Path("/" + external_path)
 
 
 def sanitize_path_string(path: str | Path) -> str:
@@ -860,9 +890,14 @@ def _anchor_and_resolve(expanded: Path, base: Path | None) -> Path:
     ``canonicalize_expanded_for_identity``: the two differ only in whether they
     sanitize and expand first, and must not drift in what they do afterwards.
     """
+    return _anchor(expanded, base).resolve(strict=False)
+
+
+def _anchor(expanded: Path, base: Path | None) -> Path:
+    """Anchor a relative path to ``base`` (default CWD) and normalize it, following no symlinks."""
     if not expanded.is_absolute():
         expanded = (base if base is not None else Path.cwd()) / expanded
-    return resolve_path_safely(expanded).resolve(strict=False)
+    return resolve_path_safely(expanded)
 
 
 def canonicalize_expanded_for_identity(expanded: Path, *, base: Path | None = None) -> Path:
@@ -911,6 +946,26 @@ def canonicalize_for_identity(path: str | Path, *, base: Path | None = None) -> 
     return _anchor_and_resolve(expand_path(sanitize_path_string(path)), base)
 
 
+def canonicalize_for_identity_preserving_symlinks(path: str | Path, *, base: Path | None = None) -> Path:
+    """Produce a path identity that names a symlink by the link rather than by its target.
+
+    Everything ``canonicalize_for_identity`` does except the final symlink resolution (and, like it,
+    without the Windows long-path prefix), so the result is still fit to be a key.
+
+    Use only where the link is the identity the engine already uses: directory scans report a
+    linked file by the link's path, so resolving it would place the file where no scan looked.
+
+    Args:
+        path: Raw path string or Path object (may contain ~, env vars, quotes,
+            shell escapes, or relative segments).
+        base: Base directory for relative paths. Defaults to ``Path.cwd()``.
+
+    Returns:
+        Absolute, normalized Path with any symlinks along it left intact.
+    """
+    return _anchor(expand_path(sanitize_path_string(path)), base)
+
+
 def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     r"""Produce a path suitable for handing to the filesystem.
 
@@ -943,6 +998,42 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     if prefixed == normalized_str:
         return normalized
     return Path(prefixed)
+
+
+def relative_to_keeping_or_following_links(
+    path: str | Path, root: str | Path, *, base: Path | None = None
+) -> Path | None:
+    """Return ``path`` relative to ``root`` if it is inside it, else None.
+
+    Tried twice, because links can sit in two places:
+
+    - Links kept: a scan names a file in a linked subfolder by the link, so ``<root>/link/f.py`` is
+      inside even when ``link`` points elsewhere.
+    - Links followed: a link above the file can hide one that is really inside, and a root reached
+      through a link has its real location accepted too.
+
+    Safe because paths are normalized as text first: ``link/../x.py`` becomes ``<root>/x.py``
+    before any link is followed, so a ``..`` never reaches past a link.
+
+    Args:
+        path: Path to test (may be relative to ``base``).
+        root: Directory the path should be inside.
+        base: Base directory for a relative ``path``. Defaults to ``Path.cwd()``.
+
+    Returns:
+        The path relative to ``root``, or None if it is outside ``root``.
+    """
+    kept_root = canonicalize_for_identity_preserving_symlinks(root)
+    kept_path = canonicalize_for_identity_preserving_symlinks(path, base=base)
+    if kept_path.is_relative_to(kept_root):
+        return kept_path.relative_to(kept_root)
+
+    followed_root = canonicalize_for_identity(root)
+    followed_path = canonicalize_for_identity(path, base=base)
+    if followed_path.is_relative_to(followed_root):
+        return followed_path.relative_to(followed_root)
+
+    return None
 
 
 def canonicalize_to_posix(path: str | Path) -> str:

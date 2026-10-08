@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import anyio
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -27,6 +26,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.utils.async_utils import subprocess_run
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 
 if TYPE_CHECKING:
@@ -106,6 +106,10 @@ class LibraryEnvironment(EngineScoped):
         Returns None when the directory does not exist. A failed build leaves it behind, so
         callers must consult `execution_env_failure_reason` before treating a path as usable.
         """
+        # The environment provides the worker's packages; a .venv-exec left from an earlier run
+        # when the engine provisioned libraries must not front them.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            return None
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None:
             return None
@@ -130,7 +134,10 @@ class LibraryEnvironment(EngineScoped):
 
         Raises:
             RuntimeError: If the virtual environment cannot be created.
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries (a
+                RuntimeError, so callers turn it into their normal failure).
         """
+        self.engine.library_manager.managed_environment.ensure_engine_provisions("build a library environment")
         python_version = platform.python_version()
 
         if is_venv_functional(library_venv_path):
@@ -152,9 +159,6 @@ class LibraryEnvironment(EngineScoped):
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(library_venv_path.parent, min_space_gb):
             error_msg = OSManager.format_disk_space_error(library_venv_path.parent)
-            logger.error(
-                "Attempted to create virtual environment (requires %.1f GB). Failed: %s", min_space_gb, error_msg
-            )
             error_message = f"Disk space error creating virtual environment (requires {min_space_gb} GB): {error_msg}"
             raise RuntimeError(error_message)
 
@@ -266,8 +270,8 @@ class LibraryEnvironment(EngineScoped):
             library_dir = Path(library_file_path).parent.absolute()
             return library_dir / venv_dir_name
 
-        # Create venv relative to the xdg data home
-        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
+        # Create venv relative to the engine data directory
+        return engine_data_dir() / "libraries" / clean_library_name / venv_dir_name
 
     async def add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
         """Add a library's directory and edit-time venv site-packages to sys.path.
@@ -386,6 +390,10 @@ class LibraryEnvironment(EngineScoped):
         execution directory is not on the path, so its edit-time venv is still spliced.
         """
         if self._execution_env_is_already_on_sys_path(library_name):
+            return
+
+        # The environment already put every package on the path before the engine started.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
             return
 
         venv_path = self.get_library_venv_path(library_name, library_file_path, execution=False)

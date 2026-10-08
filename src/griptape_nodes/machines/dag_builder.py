@@ -105,7 +105,6 @@ class DagBuilder(EngineScoped):
 
         if node.start_node is None:
             error_msg = f"Error: {node.name} is not properly connected to a start node"
-            logger.error(error_msg)
             raise ValueError(error_msg)
 
         return self.collect_loop_body_nodes(node.start_node, node, connections)

@@ -493,12 +493,13 @@ class Engine:
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 event_mgr.put_event(GriptapeNodeEvent(wrapped_event=result_event))
         except Exception as e:
+            # Log the type and ID, never the request itself: its repr includes every field, and a
+            # SetSecretValueRequest carries the secret value. The traceback says what failed.
             logger.exception(
-                "Unhandled exception while processing request of type %s. "
-                "Consider saving your work and restarting the engine if issues persist."
-                "Request: %s",
+                "Unhandled exception while processing request of type %s (request_id: %s). "
+                "Consider saving your work and restarting the engine if issues persist.",
                 type(request).__name__,
-                request,
+                request.request_id,
             )
             return ResultPayloadFailure(
                 exception=e, result_details=f"Unhandled exception while processing {type(request).__name__}: {e}"
@@ -520,12 +521,12 @@ class Engine:
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 await event_mgr.aput_event(GriptapeNodeEvent(wrapped_event=result_event))
         except Exception as e:
+            # Same as handle_request: the request's repr can include a secret value.
             logger.exception(
-                "Unhandled exception while processing async request of type %s. "
-                "Consider saving your work and restarting the engine if issues persist."
-                "Request: %s",
+                "Unhandled exception while processing async request of type %s (request_id: %s). "
+                "Consider saving your work and restarting the engine if issues persist.",
                 type(request).__name__,
-                request,
+                request.request_id,
             )
             return ResultPayloadFailure(
                 exception=e, result_details=f"Unhandled exception while processing async {type(request).__name__}: {e}"
@@ -614,7 +615,6 @@ class Engine:
             )
         except Exception as err:
             details = f"Attempted to get engine version. Failed due to '{err}'."
-            logger.error(details)
             return GetEngineVersionResultFailure(result_details=details)
 
     @handles(EngineHeartbeatRequest)
@@ -657,7 +657,6 @@ class Engine:
             )
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
-            logger.error(details)
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
 
     def _get_instance_info(self) -> dict[str, str | None]:

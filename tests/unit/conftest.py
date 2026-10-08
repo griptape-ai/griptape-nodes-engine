@@ -10,15 +10,25 @@ from unittest.mock import patch
 import pytest
 from xdg_base_dirs import xdg_state_home
 
-from griptape_nodes.common import log_capture
-from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
-from griptape_nodes.retained_mode.managers import settings as settings_module
+# Engine dir overrides bypass the `xdg_*_home` patches tests rely on, and some paths
+# (`USER_CONFIG_PATH`) are built at import, so drop them before importing `griptape_nodes`.
+for _engine_dir_env_var in ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR"):
+    os.environ.pop(_engine_dir_env_var, None)
+
+from griptape_nodes.common import log_capture  # noqa: E402
+from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine  # noqa: E402
+from griptape_nodes.retained_mode.managers import settings as settings_module  # noqa: E402
+from griptape_nodes.retained_mode.managers.external_environment import (  # noqa: E402
+    LIBRARY_PATHS_ENV_VAR,
+    LIBRARY_WORKER_REQUESTS_ENV_VAR,
+)
+from griptape_nodes.utils import engine_dirs  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
 # level, so merely collecting them wrote to the real XDG state directory and pruned it.
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
-_session_log_home_patch = patch.object(log_capture, "xdg_state_home", lambda: Path(_session_log_home.name))
+_session_log_home_patch = patch.object(engine_dirs, "xdg_state_home", lambda: Path(_session_log_home.name))
 
 
 def _real_log_directory() -> Path | None:
@@ -96,6 +106,36 @@ def isolate_user_config() -> Generator[Path, None, None]:
             reset_root_engine()
 
 
+_EXTERNAL_ENVIRONMENT_VARS = (
+    LIBRARY_PATHS_ENV_VAR,
+    LIBRARY_WORKER_REQUESTS_ENV_VAR,
+    "GTN_CONFIG_LIBRARY__PROVISIONED_BY",
+    "GTN_CONFIG_WORKER__COMMAND_PREFIX",
+    "GTN_CONFIG_LIBRARY__SANDBOX_ENABLED",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_external_environment() -> Generator[None, None, None]:
+    """Clear the variables an externally managed environment sets for the engine.
+
+    Library discovery reads GTN_LIBRARY_PATHS and every worker spawn reads the rest, so a suite run
+    from inside such an environment (a studio launcher, a package manager's shell) would otherwise
+    load that environment's libraries or prefix workers with its command. Tests that exercise these
+    hooks set the variables themselves.
+
+    This saves and restores the variables itself instead of using `monkeypatch`: an autouse fixture
+    that requests `monkeypatch` creates it before the test's own fixtures, so it is torn down after
+    them. A test that combines `monkeypatch.chdir` with a temporary-directory fixture would then
+    still be inside that directory when it is removed, which Windows refuses.
+    """
+    saved = {name: os.environ.pop(name) for name in _EXTERNAL_ENVIRONMENT_VARS if name in os.environ}
+    yield
+    for name in _EXTERNAL_ENVIRONMENT_VARS:
+        os.environ.pop(name, None)
+    os.environ.update(saved)
+
+
 @pytest.fixture(autouse=True)
 def reset_beta_feature_warnings() -> None:
     """Forget which bad beta feature values were already warned about.
@@ -103,7 +143,7 @@ def reset_beta_feature_warnings() -> None:
     Settings warns once per (key, value) per process, so a test asserting on that warning would
     otherwise fail whenever an earlier test in the same process hit the same value.
     """
-    settings_module._reported_invalid_beta_features.clear()
+    settings_module._reported_invalid_settings.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +159,7 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         state_home = Path(temp_dir)
-        with patch.object(log_capture, "xdg_state_home", lambda: state_home):
+        with patch.object(engine_dirs, "xdg_state_home", lambda: state_home):
             yield state_home / "griptape_nodes" / "logs"
 
             # Detach the sinks while the directory still exists: they live on the process-global

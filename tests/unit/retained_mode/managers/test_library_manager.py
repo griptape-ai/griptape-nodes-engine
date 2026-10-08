@@ -8,12 +8,13 @@ from collections.abc import Callable, Generator
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
     LibraryDependencyDeclaration,
@@ -27,18 +28,22 @@ from griptape_nodes.node_library.library_declarations import (
 )
 from griptape_nodes.node_library.library_registry import (
     Dependencies,
+    Library,
     LibraryMetadata,
     LibraryRegistry,
     LibrarySchema,
     NodeMetadata,
     get_declared_models,
 )
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultFailure,
     DescribeNodeTypeResultSuccess,
+    DiscoverLibrariesRequest,
+    DiscoverLibrariesResultSuccess,
     GetAllInfoForAllLibrariesRequest,
     GetAllInfoForAllLibrariesResultFailure,
     GetAllInfoForAllLibrariesResultSuccess,
@@ -54,12 +59,25 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromFileResultSuccess,
+    RegisterSandboxNodeFromSourceRequest,
+    RegisterSandboxNodeFromSourceResultFailure,
+    RegisterSandboxNodeFromSourceResultSuccess,
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    DuplicateLibraryProblem,
+    DuplicateNodeRegistrationProblem,
+    WorkflowNodeLoadProblem,
+)
 from griptape_nodes.retained_mode.managers.library.environment import LibraryVenvInitResult
 from griptape_nodes.retained_mode.managers.library.provisioning import registration_satisfied_by_installed
+from griptape_nodes.retained_mode.managers.library.sandbox import (
+    SUBFLOW_NODE_ICON,
+    LibrarySandbox,
+    node_type_for_subflow_workflow_name,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
@@ -402,7 +420,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -426,7 +444,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -487,7 +505,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -522,7 +540,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -555,7 +573,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -594,7 +612,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -631,7 +649,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -673,7 +691,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
 
         with (
             patch.object(engine, "_config_manager", mock_config_manager),
-            patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
 
@@ -1769,7 +1787,21 @@ class TestAddLibraryPathsToSysPath:
             sys.path[:] = original_sys_path
 
 
-class TestRegisterSandboxNodeFromSourceRequest:
+class SandboxImportSpyBase:
+    """Shared fixture for sandbox tests that check which files get imported as node source."""
+
+    @pytest.fixture
+    def load_module_from_file(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Spy on node-source imports, still importing for real so Python nodes load."""
+        module_loading = engine.library_manager.module_loading
+        load_module_from_file = Mock(
+            spec=module_loading.load_module_from_file, side_effect=module_loading.load_module_from_file
+        )
+        monkeypatch.setattr(module_loading, "load_module_from_file", load_module_from_file)
+        return load_module_from_file
+
+
+class TestRegisterSandboxNodeFromSourceRequest(SandboxImportSpyBase):
     """Tests for LibraryManager.register_sandbox_node_from_source_request."""
 
     _LIBRARY_NAME = "Sandbox Library"
@@ -2029,6 +2061,360 @@ class TestRegisterSandboxNodeFromSourceRequest:
 
         assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
         assert "BaseNode" in str(result.result_details)
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink creation needs privileges on Windows")
+    def test_linked_sandbox_accepts_paths_through_the_link(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is the folder the link points at
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sandbox folder that is a link still contains the files written through it."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterSandboxNodeFromSourceRequest,
+            RegisterSandboxNodeFromSourceResultSuccess,
+        )
+
+        library_manager = engine.library_manager
+        sandbox_link = tmp_path / "sandbox_link"
+        sandbox_link.symlink_to(_isolate_registry_and_config, target_is_directory=True)
+        monkeypatch.setattr(
+            library_manager.sandbox,
+            "get_sandbox_directory",
+            MagicMock(spec=LibrarySandbox.get_sandbox_directory, return_value=sandbox_link),
+        )
+        (sandbox_link / self._FILE_NAME).write_text(self._SOURCE_OK)
+
+        for requested_path in (self._FILE_NAME, str(sandbox_link / self._FILE_NAME)):
+            result = library_manager.sandbox.register_sandbox_node_from_source_request(
+                RegisterSandboxNodeFromSourceRequest(file_path=requested_path)
+            )
+
+            assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), requested_path
+
+    def test_python_node_source_is_imported(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        load_module_from_file: Mock,
+    ) -> None:
+        source_file = _isolate_registry_and_config / self._FILE_NAME
+        source_file.write_text(self._SOURCE_OK)
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(source_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess)
+        load_module_from_file.assert_called_once_with(source_file, self._LIBRARY_NAME)
+
+    def test_saved_workflow_registers_a_workflow_node(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow", description="Shouts.")
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), result
+        assert result.registered_class_names == ["ShoutWorkflow"]
+        assert result.replaced_class_names == []
+        assert result.library_name == self._LIBRARY_NAME
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        node_class = library.get_node_class("ShoutWorkflow")
+        assert issubclass(node_class, WorkflowNode)
+        assert node_class.workflow_file_path == workflow_file
+        node_metadata = library.get_node_metadata("ShoutWorkflow")
+        assert node_metadata.category == _LibraryManager.SANDBOX_CATEGORY_NAME
+        assert node_metadata.icon == SUBFLOW_NODE_ICON
+        assert node_metadata.description == "Shouts."
+
+    def test_saved_workflow_is_not_imported(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        load_module_from_file: Mock,
+    ) -> None:
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), result
+        load_module_from_file.assert_not_called()
+
+    def test_saved_workflow_replaces_a_node_of_the_same_name(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        library_manager = engine.library_manager
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+        request = RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file), replace_if_exists=True)
+        first = library_manager.sandbox.register_sandbox_node_from_source_request(request)
+        assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess), first
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        first_class = library.get_node_class("ShoutWorkflow")
+
+        second = library_manager.sandbox.register_sandbox_node_from_source_request(request)
+
+        assert isinstance(second, RegisterSandboxNodeFromSourceResultSuccess), second
+        assert second.registered_class_names == ["ShoutWorkflow"]
+        assert second.replaced_class_names == ["ShoutWorkflow"]
+        assert library.get_node_class("ShoutWorkflow") is not first_class
+
+    def test_saved_workflow_does_not_replace_a_node_when_replacing_is_not_allowed(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        library_manager = engine.library_manager
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+        first = library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+        assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess), first
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        first_class = library.get_node_class("ShoutWorkflow")
+
+        second = library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file), replace_if_exists=False)
+        )
+
+        assert isinstance(second, RegisterSandboxNodeFromSourceResultFailure)
+        assert str(second.result_details) == (
+            f"Attempted to register the saved workflow at '{workflow_file}' as node type 'ShoutWorkflow'. "
+            "Failed because a node type with that name is already registered in the Sandbox Library and "
+            "replace_if_exists=False."
+        )
+        assert library.get_node_class("ShoutWorkflow") is first_class
+
+    def test_unreadable_workflow_header_fails_without_importing(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        load_module_from_file: Mock,
+    ) -> None:
+        broken = _isolate_registry_and_config / "broken.py"
+        broken.write_text("# /// script\n# [tool.griptape-nodes]\n# name = \n# ///\n", encoding="utf-8")
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(broken))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
+        assert str(result.result_details).startswith(
+            f"Attempted to register the saved workflow at '{broken}' as a sandbox node. Failed because its "
+            f"workflow header could not be read: Attempted to read workflow metadata from '{broken}'. Failed "
+            "because the header is not valid TOML"
+        )
+        load_module_from_file.assert_not_called()
+        assert LibraryRegistry.get_library(self._LIBRARY_NAME).get_registered_nodes() == []
+
+    def test_workflow_without_start_and_end_nodes_fails(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "no_shape", with_shape=False)
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
+        assert str(result.result_details) == (
+            f"Attempted to register the saved workflow at '{workflow_file}' as node type 'NoShape'. Failed "
+            "because the workflow cannot become a node: Workflow 'no_shape' cannot back a node because it has "
+            "no saved input and output shape. Add a Start Flow node and an End Flow node to the workflow, then "
+            "save it."
+        )
+        assert LibraryRegistry.get_library(self._LIBRARY_NAME).get_registered_nodes() == []
+
+    def test_saved_workflow_fails_when_the_sandbox_library_is_not_registered(
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        """A saved workflow cannot be registered without a Sandbox Library."""
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+        get_library = Mock(spec=LibraryRegistry.get_library, side_effect=KeyError)
+        monkeypatch.setattr(LibraryRegistry, "get_library", get_library)
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
+        assert "the Sandbox Library is not registered in the engine" in str(result.result_details)
+        get_library.assert_called_once_with(self._LIBRARY_NAME)
+
+    def test_failed_replacement_keeps_the_node_already_registered(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        """A workflow that cannot become a node leaves the existing node of that name in place."""
+        library_manager = engine.library_manager
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+        first = library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+        assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess), first
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        first_class = library.get_node_class("ShoutWorkflow")
+        _write_saved_workflow(_isolate_registry_and_config, "shout_workflow", with_shape=False)
+
+        second = library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file), replace_if_exists=True)
+        )
+
+        assert isinstance(second, RegisterSandboxNodeFromSourceResultFailure)
+        assert library.get_node_class("ShoutWorkflow") is first_class
+
+    @pytest.fixture
+    def sandbox_library_info(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> _LibraryManager.LibraryInfo:
+        """The Sandbox Library's load entry, as engine startup would leave it."""
+        library_path = str(_isolate_registry_and_config / _LibraryManager.LIBRARY_CONFIG_FILENAME)
+        library_info = _LibraryManager.LibraryInfo(
+            lifecycle_state=_LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=_LibraryManager.LibraryFitness.GOOD,
+            library_path=library_path,
+            is_sandbox=True,
+            library_name=_LibraryManager.SANDBOX_LIBRARY_NAME,
+        )
+        monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_path, library_info)
+        return library_info
+
+    @pytest.fixture
+    def register_node_type_from_library(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Have the registry report a duplicate for the node type, which the handler otherwise never meets."""
+        problem = DuplicateNodeRegistrationProblem(class_name="ShoutWorkflow", library_name=self._LIBRARY_NAME)
+        register_node_type_from_library = Mock(
+            spec=LibraryRegistry.register_node_type_from_library, return_value=problem
+        )
+        monkeypatch.setattr(LibraryRegistry, "register_node_type_from_library", register_node_type_from_library)
+        return register_node_type_from_library
+
+    def test_problem_reported_while_registering_succeeds_with_a_warning_and_records_it(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        sandbox_library_info: _LibraryManager.LibraryInfo,
+        register_node_type_from_library: Mock,
+    ) -> None:
+        """The node type went in, so the request succeeds; the problem is recorded and returned as a warning."""
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), result.result_details
+        assert result.registered_class_names == ["ShoutWorkflow"]
+        assert sandbox_library_info.problems == [register_node_type_from_library.return_value]
+        summary = (
+            f"Registered the saved workflow at '{workflow_file}' as node type 'ShoutWorkflow' "
+            "in the Sandbox Library (replaced: 0)."
+        )
+        warning = (
+            f"Attempted to register the saved workflow at '{workflow_file}' as node type 'ShoutWorkflow'. "
+            "The node type may have been registered, but the Sandbox Library reported a problem: "
+            "Attempted to register node class 'ShoutWorkflow' from library 'Sandbox Library', but a node with "
+            "that name from that library was already registered. Check to ensure you aren't re-adding the "
+            "same libraries multiple times."
+        )
+        assert isinstance(result.result_details, ResultDetails)
+        assert [(detail.level, detail.message) for detail in result.result_details.result_details] == [
+            (logging.INFO, summary),
+            (logging.WARNING, warning),
+        ]
+        register_node_type_from_library.assert_called_once_with(library=library, node_class_name="ShoutWorkflow")
+        node_class = library.get_node_class("ShoutWorkflow")
+        assert issubclass(node_class, WorkflowNode)
+        assert node_class.workflow_file_path == workflow_file
+
+    def test_unexpected_problem_type_fails_saying_the_node_type_may_be_registered(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        sandbox_library_info: _LibraryManager.LibraryInfo,
+        register_node_type_from_library: Mock,
+    ) -> None:
+        """A problem type other than a duplicate is recorded and fails the request, hedging on registration."""
+        problem = DuplicateLibraryProblem()
+        register_node_type_from_library.return_value = problem
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+
+        result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+        )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultFailure)
+        assert sandbox_library_info.problems == [problem]
+        message = (
+            f"Attempted to register the saved workflow at '{workflow_file}' as node type 'ShoutWorkflow'. "
+            "Failed because the Sandbox Library reported a problem: "
+            f"{DuplicateLibraryProblem.collate_problems_for_display([problem])} "
+            "The node type may have been registered anyway. "
+            "Check whether node type 'ShoutWorkflow' is listed in the Sandbox Library "
+            "before using it, or retry with replace_if_exists=True."
+        )
+        assert isinstance(result.result_details, ResultDetails)
+        assert [(detail.level, detail.message) for detail in result.result_details.result_details] == [
+            (logging.ERROR, message)
+        ]
+
+    @pytest.fixture
+    def sandbox_library_info_lookup(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Find no load entry for the Sandbox Library, so a problem has nowhere to be recorded."""
+        library_manager = engine.library_manager
+        sandbox_library_info_lookup = Mock(spec=library_manager.get_library_info_by_library_name, return_value=None)
+        monkeypatch.setattr(library_manager, "get_library_info_by_library_name", sandbox_library_info_lookup)
+        return sandbox_library_info_lookup
+
+    def test_problem_with_no_library_entry_to_record_it_is_logged(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+        sandbox_library_info_lookup: Mock,
+        register_node_type_from_library: Mock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A problem the Sandbox Library cannot record is logged as a warning rather than dropped."""
+        workflow_file = _write_saved_workflow(_isolate_registry_and_config, "shout_workflow")
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = engine.library_manager.sandbox.register_sandbox_node_from_source_request(
+                RegisterSandboxNodeFromSourceRequest(file_path=str(workflow_file))
+            )
+
+        assert isinstance(result, RegisterSandboxNodeFromSourceResultSuccess), result.result_details
+        assert result.registered_class_names == ["ShoutWorkflow"]
+        warning = (
+            f"Attempted to record a problem registering the saved workflow at '{workflow_file}' as node type "
+            "'ShoutWorkflow'. Failed because the Sandbox Library has no load entry to record it in. The problem: "
+            "Attempted to register node class 'ShoutWorkflow' from library 'Sandbox Library', but a node with "
+            "that name from that library was already registered. Check to ensure you aren't re-adding the "
+            "same libraries multiple times."
+        )
+        assert [(record.levelno, record.getMessage()) for record in caplog.records] == [(logging.WARNING, warning)]
+        sandbox_library_info_lookup.assert_called_once_with(_LibraryManager.SANDBOX_LIBRARY_NAME)
+        register_node_type_from_library.assert_called_once_with(
+            library=LibraryRegistry.get_library(self._LIBRARY_NAME), node_class_name="ShoutWorkflow"
+        )
 
 
 class _DescribeNodeTypeProbe(BaseNode):
@@ -2732,6 +3118,209 @@ class TestDiscoverProvisionedManifestPaths:
             result = await library_manager.discovery.discover_library_files()
 
         assert result == []
+
+
+class TestUnregisteredLibraryHint:
+    """Discovery logs a hint for a manifest under the libraries root that nothing registers.
+
+    Nothing in `libraries_directory` loads on its own, so a library copied there by hand
+    is skipped. The hint names the manifest and how to register it; registered and
+    downloaded libraries get no hint. Logging happens once per actual load (via
+    `log_unregistered_libraries`, called from `load_all_libraries_from_config` on the
+    orchestrator), not from `discover_library_files` itself -- that helper also backs
+    lazy per-request lookups and metadata refreshes, which must stay silent.
+    """
+
+    @staticmethod
+    async def _discover(
+        engine: Engine, libraries_dir: Path, libraries: object, downloads: object | None = None
+    ) -> None:
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, libraries, downloads)
+        with patch.object(engine, "_config_manager", config_manager):
+            discover_result = await engine.library_manager.discovery.discover_libraries_request(
+                DiscoverLibrariesRequest(include_sandbox=False)
+            )
+            assert isinstance(discover_result, DiscoverLibrariesResultSuccess)
+            await engine.library_manager.discovery.log_unregistered_libraries(discover_result.libraries_discovered)
+
+    @staticmethod
+    def _hints(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [record.getMessage() for record in caplog.records if "not registered" in record.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_unregistered_manifest_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert str(manifest_dir / "griptape_nodes_library.json") in hints[0]
+        assert "libraries_to_register" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_registered_manifest_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [str(manifest_dir)])
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_downloaded_library_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        repo_dir = libraries_dir / "griptape-nodes-library-standard"
+        TestInstalledLibraryVersion._write_manifest(repo_dir / "library", "Griptape Nodes Library", "0.78.0")
+        # A second manifest elsewhere in the downloaded repo belongs to that download too.
+        TestInstalledLibraryVersion._write_manifest(repo_dir / "examples" / "nested", "Example Library", "0.1.0")
+        downloads = ["https://github.com/griptape-ai/griptape-nodes-library-standard"]
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [], downloads)
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_git_clone_hint_mentions_other_projects(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A clone may be a hand-cloned library or another project's libraries_to_download install.
+        libraries_dir = tmp_path / "libraries"
+        repo_dir = libraries_dir / "cloned-lib"
+        TestInstalledLibraryVersion._write_manifest(repo_dir, "Cloned Library", "1.0.0")
+        (repo_dir / ".git").mkdir()
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert "another project" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_symlinked_library_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        target_dir = tmp_path / "dev" / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(target_dir, "My Library", "1.0.0")
+        libraries_dir = tmp_path / "libraries"
+        libraries_dir.mkdir()
+        (libraries_dir / "my_lib").symlink_to(target_dir, target_is_directory=True)
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await self._discover(engine, libraries_dir, [])
+
+        assert len(self._hints(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_sibling_of_nested_sandbox_logs_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        sandbox_dir = libraries_dir / "dev" / "sandbox"
+        TestInstalledLibraryVersion._write_manifest(sandbox_dir, "Sandbox Library", None)
+        TestInstalledLibraryVersion._write_manifest(libraries_dir / "dev" / "my_lib", "My Library", "1.0.0")
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine.library_manager.sandbox, "get_sandbox_directory", return_value=sandbox_dir),
+        ):
+            await self._discover(engine, libraries_dir, [])
+
+        hints = self._hints(caplog)
+        assert len(hints) == 1
+        assert "my_lib" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_sandbox_under_libraries_root_logs_no_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        libraries_dir = tmp_path / "libraries"
+        sandbox_dir = libraries_dir / "sandbox"
+        TestInstalledLibraryVersion._write_manifest(sandbox_dir, "Sandbox Library", None)
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine.library_manager.sandbox, "get_sandbox_directory", return_value=sandbox_dir),
+        ):
+            await self._discover(engine, libraries_dir, [])
+
+        assert self._hints(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_bare_discovery_does_not_log_hint(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`discover_library_files` also backs lazy per-request lookups and metadata refreshes.
+
+        Those must stay silent: only `log_unregistered_libraries`, called once per actual
+        load, logs the hint.
+        """
+        libraries_dir = tmp_path / "libraries"
+        manifest_dir = libraries_dir / "my_lib"
+        TestInstalledLibraryVersion._write_manifest(manifest_dir, "My Library", "1.0.0")
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, [])
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine, "_config_manager", config_manager),
+        ):
+            await engine.library_manager.discovery.discover_library_files()
+
+        assert self._hints(caplog) == []
+
+
+class TestUnregisteredLibraryHintCallSite:
+    """`load_all_libraries_from_config` logs the hint on the orchestrator only."""
+
+    @staticmethod
+    def _discover_result() -> DiscoverLibrariesResultSuccess:
+        return DiscoverLibrariesResultSuccess(result_details="discovered", libraries_discovered=[])
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_logs_hint(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        mock_log_hint = AsyncMock()
+        with (
+            patch.object(library_manager.provisioning, "reconcile_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(
+                library_manager.discovery, "discover_libraries_request", AsyncMock(return_value=self._discover_result())
+            ),
+            patch.object(library_manager.discovery, "log_unregistered_libraries", mock_log_hint),
+        ):
+            await library_manager.load_all_libraries_from_config()
+
+        mock_log_hint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_worker_does_not_log_hint(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        library_manager._is_worker = True
+        mock_log_hint = AsyncMock()
+        with (
+            patch.object(library_manager.provisioning, "reconcile_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(
+                library_manager.discovery, "discover_libraries_request", AsyncMock(return_value=self._discover_result())
+            ),
+            patch.object(library_manager.discovery, "log_unregistered_libraries", mock_log_hint),
+        ):
+            await library_manager.load_all_libraries_from_config()
+
+        mock_log_hint.assert_not_awaited()
 
 
 class TestRegistrationSatisfiedByInstalled:
@@ -3513,6 +4102,8 @@ class TestDiscoverDownloadedLibraries:
                 # libraries_directory is absolute here, so the global-workspace base is unused for
                 # resolution, but configured_global_workspace_path() must get a real path, not None.
                 return str(tmp_path)
+            if key == "discovery_max_depth":
+                return DEFAULT_MAX_SEARCH_DEPTH
             return None
 
         with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):
@@ -4174,3 +4765,429 @@ class TestLibraryManagerDuplicateEntryHygiene:
 
         assert info is not None
         assert info.library_path == "/libs/copyA/griptape_nodes_library.json"
+
+
+class TestNodeTypeForSubflowWorkflowName:
+    """Tests for node_type_for_subflow_workflow_name."""
+
+    def test_snake_case_name_becomes_pascal_case(self) -> None:
+        assert node_type_for_subflow_workflow_name("shout_workflow") == "ShoutWorkflow"
+
+    def test_punctuation_and_spaces_are_dropped(self) -> None:
+        assert node_type_for_subflow_workflow_name("My cool workflow (v2)!") == "MyCoolWorkflowV2"
+
+    def test_interior_capitals_are_preserved(self) -> None:
+        assert node_type_for_subflow_workflow_name("makeHDRImage") == "MakeHDRImage"
+
+    def test_leading_digits_get_a_prefix(self) -> None:
+        assert node_type_for_subflow_workflow_name("3d_scan") == "Subflow3dScan"
+
+    def test_name_with_no_usable_characters_falls_back_to_the_prefix(self) -> None:
+        assert node_type_for_subflow_workflow_name("!!!") == "Subflow"
+
+    def test_accented_latin_letters_survive(self) -> None:
+        assert node_type_for_subflow_workflow_name("café crème") == "CaféCrème"
+
+    def test_cjk_name_survives(self) -> None:
+        assert node_type_for_subflow_workflow_name("日本語 ワークフロー") == "日本語ワークフロー"
+
+    def test_cyrillic_name_survives(self) -> None:
+        assert node_type_for_subflow_workflow_name("привет_мир") == "ПриветМир"
+
+    def test_greek_name_survives(self) -> None:
+        assert node_type_for_subflow_workflow_name("ροή εργασίας") == "ΡοήΕργασίας"
+
+    def test_characters_a_class_name_cannot_hold_are_dropped(self) -> None:
+        # "½" and "²" read as numbers to `isalnum` but Python will not take them in a name.
+        assert node_type_for_subflow_workflow_name("½ scale²") == "Scale"
+
+    @pytest.mark.parametrize(
+        "workflow_name",
+        [
+            "shout_workflow",
+            "3d_scan",
+            "!!!",
+            "café crème",
+            "日本語 ワークフロー",
+            "привет_мир",
+            "ροή εργασίας",
+            "½ scale²",
+        ],
+    )
+    def test_every_derived_name_can_be_a_class_name(self, workflow_name: str) -> None:
+        node_type = node_type_for_subflow_workflow_name(workflow_name)
+
+        assert node_type.isidentifier()
+        assert type(node_type, (object,), {}).__name__ == node_type
+
+
+def _write_saved_workflow(
+    directory: Path,
+    file_stem: str,
+    *,
+    workflow_name: str | None = None,
+    description: str | None = None,
+    with_shape: bool = True,
+) -> Path:
+    """Write a minimal saved workflow into `directory`: a metadata header, then code that must never run."""
+    shape = {
+        "inputs": {"Start Flow": {"text": {"name": "text", "type": "str", "default_value": ""}}},
+        "outputs": {"End Flow": {"result": {"name": "result", "type": "str", "default_value": ""}}},
+    }
+    header_lines = [
+        "# /// script",
+        "# [tool.griptape-nodes]",
+        f'# name = "{workflow_name or file_stem}"',
+        f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+        '# engine_version_created_with = "0.0.0"',
+        "# node_libraries_referenced = []",
+    ]
+    if description is not None:
+        header_lines.append(f'# description = "{description}"')
+    if with_shape:
+        header_lines.append(f"# workflow_shape = {json.dumps(json.dumps(shape, separators=(',', ':')))}")
+    header_lines.append("# ///")
+    header_lines.append("raise RuntimeError('A saved workflow was imported as node source.')")
+    workflow_path = directory / f"{file_stem}.py"
+    workflow_path.write_text("\n".join(header_lines) + "\n", encoding="utf-8")
+    return workflow_path
+
+
+_SANDBOX_NODE_SOURCE = (
+    "from griptape_nodes.exe_types.node_types import DataNode\n"
+    "\n"
+    "class {class_name}(DataNode):\n"
+    "    def process(self) -> None:\n"
+    "        return None\n"
+)
+
+
+class TestAttemptGenerateSandboxLibraryFromSchema(SandboxImportSpyBase):
+    """Tests for LibrarySandbox.attempt_generate_sandbox_library_from_schema."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        """LibraryRegistry holds class-level state that survives the engine reset fixture."""
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    @pytest.fixture
+    def sandbox_directory(self, tmp_path: Path) -> Path:
+        sandbox_directory = tmp_path / "sandbox"
+        sandbox_directory.mkdir()
+        return sandbox_directory
+
+    @pytest.fixture
+    def library_info(self, sandbox_directory: Path) -> _LibraryManager.LibraryInfo:
+        return _LibraryManager.LibraryInfo(
+            lifecycle_state=_LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED,
+            fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path=str(sandbox_directory / _LibraryManager.LIBRARY_CONFIG_FILENAME),
+            is_sandbox=True,
+            library_name=_LibraryManager.SANDBOX_LIBRARY_NAME,
+        )
+
+    def _scan(self, engine: Engine, sandbox_directory: Path) -> LibrarySchema:
+        """Scan the sandbox the way discovery does, returning the schema the loader starts from."""
+        scan_result = engine.library_manager.sandbox._generate_sandbox_library_metadata(
+            sandbox_directory=sandbox_directory
+        )
+        assert isinstance(scan_result, LoadLibraryMetadataFromFileResultSuccess), scan_result
+        return scan_result.library_schema
+
+    async def _load(
+        self, engine: Engine, sandbox_directory: Path, library_info: _LibraryManager.LibraryInfo
+    ) -> Library:
+        await engine.library_manager.sandbox.attempt_generate_sandbox_library_from_schema(
+            library_schema=self._scan(engine, sandbox_directory),
+            sandbox_directory=str(sandbox_directory),
+            library_info=library_info,
+        )
+        return LibraryRegistry.get_library(_LibraryManager.SANDBOX_LIBRARY_NAME)
+
+    @pytest.mark.asyncio
+    async def test_saved_workflow_becomes_a_workflow_node_without_being_imported(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+        load_module_from_file: Mock,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow", description="Shouts loudly.")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        load_module_from_file.assert_not_called()
+        assert library.get_registered_nodes() == ["ShoutWorkflow"]
+        node_metadata = library.get_node_metadata("ShoutWorkflow")
+        assert node_metadata.display_name == "shout_workflow"
+        assert node_metadata.description == "Shouts loudly."
+        assert node_metadata.category == _LibraryManager.SANDBOX_CATEGORY_NAME
+        assert node_metadata.icon == SUBFLOW_NODE_ICON
+        assert library_info.problems == []
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_path_is_relative_to_the_sandbox(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        (sandbox_directory / "nested").mkdir()
+        _write_saved_workflow(sandbox_directory / "nested", "shout_workflow")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        workflow_nodes = library.get_library_data().workflow_nodes
+        assert workflow_nodes is not None
+        assert [workflow_node.workflow_path for workflow_node in workflow_nodes] == [
+            str(Path("nested") / "shout_workflow.py")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_node_type_follows_the_workflow_name_not_the_file_name(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "file_on_disk", workflow_name="Loud Shout")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_registered_nodes() == ["LoudShout"]
+        assert library.get_node_metadata("LoudShout").display_name == "Loud Shout"
+
+    @pytest.mark.asyncio
+    async def test_description_falls_back_to_naming_the_workflow(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_node_metadata("ShoutWorkflow").description == "Runs the 'shout_workflow' workflow."
+
+    @pytest.mark.asyncio
+    async def test_python_nodes_load_alongside_workflow_nodes(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+        load_module_from_file: Mock,
+    ) -> None:
+        node_file = sandbox_directory / "probe_node.py"
+        node_file.write_text(_SANDBOX_NODE_SOURCE.format(class_name="ProbeNode"))
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        # The sandbox scan and the eager node loader each import the node file; the workflow never.
+        node_file_import = call(node_file, _LibraryManager.SANDBOX_LIBRARY_NAME)
+        load_module_from_file.assert_has_calls([node_file_import, node_file_import])
+        assert load_module_from_file.call_count == 2  # noqa: PLR2004
+        assert sorted(library.get_registered_nodes()) == ["ProbeNode", "ShoutWorkflow"]
+        assert library.get_node_metadata("ProbeNode").category == _LibraryManager.SANDBOX_CATEGORY_NAME
+
+    @pytest.mark.asyncio
+    async def test_sandbox_with_only_workflows_registers_them(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+        _write_saved_workflow(sandbox_directory, "whisper")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert sorted(library.get_registered_nodes()) == ["ShoutWorkflow", "Whisper"]
+        assert library_info.lifecycle_state == _LibraryManager.LibraryLifecycleState.LOADED
+        assert library_info.fitness == _LibraryManager.LibraryFitness.GOOD
+
+    @pytest.mark.asyncio
+    async def test_workflow_nodes_add_no_category_of_their_own(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+        _write_saved_workflow(sandbox_directory, "whisper")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        category_keys = [key for category in library.get_categories() for key in category]
+        assert category_keys == [_LibraryManager.SANDBOX_CATEGORY_NAME]
+
+    @pytest.mark.asyncio
+    async def test_schema_has_no_workflow_nodes_when_there_are_none(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        (sandbox_directory / "probe_node.py").write_text(_SANDBOX_NODE_SOURCE.format(class_name="ProbeNode"))
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_library_data().workflow_nodes == []
+
+    @pytest.mark.asyncio
+    async def test_workflow_nodes_are_written_back_to_the_manifest(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        await self._load(engine, sandbox_directory, library_info)
+
+        manifest = json.loads((sandbox_directory / _LibraryManager.LIBRARY_CONFIG_FILENAME).read_text())
+        assert [workflow_node["node_type"] for workflow_node in manifest["workflow_nodes"]] == ["ShoutWorkflow"]
+
+    @pytest.mark.asyncio
+    async def test_workflow_details_are_read_again_on_every_load(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "shout_workflow", description="First description.")
+        await self._load(engine, sandbox_directory, library_info)
+        LibraryRegistry._clear()
+        _write_saved_workflow(
+            sandbox_directory, "shout_workflow", workflow_name="Loud Shout", description="Second description."
+        )
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_registered_nodes() == ["LoudShout"]
+        node_metadata = library.get_node_metadata("LoudShout")
+        assert node_metadata.display_name == "Loud Shout"
+        assert node_metadata.description == "Second description."
+
+    @pytest.mark.asyncio
+    async def test_unreadable_header_records_a_problem_without_importing_the_file(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+        load_module_from_file: Mock,
+    ) -> None:
+        broken = sandbox_directory / "broken.py"
+        broken.write_text("# /// script\n# [tool.griptape-nodes]\n# name = \n# ///\n", encoding="utf-8")
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        load_module_from_file.assert_not_called()
+        assert library.get_registered_nodes() == ["ShoutWorkflow"]
+        assert len(library_info.problems) == 1
+        problem = library_info.problems[0]
+        assert isinstance(problem, WorkflowNodeLoadProblem)
+        assert problem.node_type == "broken"
+        assert problem.workflow_path == str(broken)
+        assert problem.error_message.startswith(
+            f"Attempted to read workflow metadata from '{broken}'. Failed because the header is not valid TOML"
+        )
+
+    @pytest.mark.asyncio
+    async def test_file_that_is_not_utf8_records_a_problem_and_healthy_nodes_still_load(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        (sandbox_directory / "probe_node.py").write_text(_SANDBOX_NODE_SOURCE.format(class_name="ProbeNode"))
+        latin1 = sandbox_directory / "latin1.py"
+        latin1.write_bytes(b"# caf\xe9\n")  # spellchecker:disable-line
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_registered_nodes() == ["ProbeNode"]
+        assert len(library_info.problems) == 1
+        problem = library_info.problems[0]
+        assert isinstance(problem, WorkflowNodeLoadProblem)
+        assert problem.node_type == "latin1"
+        assert problem.workflow_path == str(latin1)
+        assert "could not be read" in problem.error_message
+
+    @pytest.mark.asyncio
+    async def test_more_than_one_header_records_a_problem_without_importing_the_file(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+        load_module_from_file: Mock,
+    ) -> None:
+        doubled = _write_saved_workflow(sandbox_directory, "doubled")
+        doubled.write_text(doubled.read_text() * 2, encoding="utf-8")
+
+        await self._load(engine, sandbox_directory, library_info)
+
+        load_module_from_file.assert_not_called()
+        assert len(library_info.problems) == 1
+        problem = library_info.problems[0]
+        assert isinstance(problem, WorkflowNodeLoadProblem)
+        assert problem.node_type == "doubled"
+        assert "has 2 'script' metadata sections" in problem.error_message
+
+    @pytest.mark.asyncio
+    async def test_workflow_without_start_and_end_nodes_records_a_problem(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+        load_module_from_file: Mock,
+    ) -> None:
+        _write_saved_workflow(sandbox_directory, "no_shape", with_shape=False)
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        load_module_from_file.assert_not_called()
+        assert library.get_registered_nodes() == []
+        assert len(library_info.problems) == 1
+        problem = library_info.problems[0]
+        assert isinstance(problem, WorkflowNodeLoadProblem)
+        assert problem.node_type == "NoShape"
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_clashing_with_a_python_node_records_a_duplicate(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        (sandbox_directory / "shout_node.py").write_text(_SANDBOX_NODE_SOURCE.format(class_name="ShoutWorkflow"))
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        await self._load(engine, sandbox_directory, library_info)
+
+        assert library_info.problems == [
+            DuplicateNodeRegistrationProblem(
+                class_name="ShoutWorkflow", library_name=_LibraryManager.SANDBOX_LIBRARY_NAME
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_takes_the_name_when_it_clashes_with_a_python_node(
+        self,
+        engine: Engine,
+        sandbox_directory: Path,
+        library_info: _LibraryManager.LibraryInfo,
+    ) -> None:
+        """Python nodes register first, so the workflow node is the one left under the shared name."""
+        (sandbox_directory / "shout_node.py").write_text(_SANDBOX_NODE_SOURCE.format(class_name="ShoutWorkflow"))
+        _write_saved_workflow(sandbox_directory, "shout_workflow")
+
+        library = await self._load(engine, sandbox_directory, library_info)
+
+        assert library.get_registered_nodes() == ["ShoutWorkflow"]
+        assert issubclass(library.get_node_class("ShoutWorkflow"), WorkflowNode)
+        assert library.get_node_metadata("ShoutWorkflow").icon == SUBFLOW_NODE_ICON
