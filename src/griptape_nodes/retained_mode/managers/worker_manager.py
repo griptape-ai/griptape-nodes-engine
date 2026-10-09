@@ -143,8 +143,9 @@ class WorkerManager(EngineScoped):
 
         # Worker keys whose spawn has been claimed but has not yet reached the registry above,
         # each mapped to a token identifying the attempt that holds it. Keyed by attempt rather
-        # than by name alone so a spawn can only ever release its own claim.
-        self._spawns_in_flight: dict[str, object] = {}
+        # than by name alone so a spawn can only ever release its own claim. The claim is set once
+        # the attempt ends, so a caller that must not race the spawn can wait for it.
+        self._spawns_in_flight: dict[str, asyncio.Event] = {}
 
         # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
         # binds its exit Future to its creating loop, so proc.wait() is only legal on this
@@ -450,7 +451,7 @@ class WorkerManager(EngineScoped):
         # entry cannot serve as this guard: it is written only once the subprocess exists, and the
         # work in between suspends. A second fork for one library leaves one of the two processes
         # untracked, holding that library's dependencies until its own heartbeat lapses.
-        claim = object()
+        claim = asyncio.Event()
         self._spawns_in_flight[worker_key] = claim
         try:
             # Spawn with the orchestrator's PRE-project environ so the worker boots with the
@@ -529,6 +530,7 @@ class WorkerManager(EngineScoped):
             # find the key belonging to the reload's spawn, and freeing that admits a third fork.
             if self._spawns_in_flight.get(worker_key) is claim:
                 del self._spawns_in_flight[worker_key]
+            claim.set()
         logger.debug("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
     async def reset_workers(self) -> None:
@@ -544,69 +546,71 @@ class WorkerManager(EngineScoped):
             len(self._managed_worker_processes),
             list(self._managed_worker_processes.keys()),
         )
-        await asyncio.gather(
-            *(
-                self._terminate_via_spawn_loop(library_name, proc)
-                for library_name, proc in list(self._managed_worker_processes.items())
-            )
-        )
+        await self._stop_workers(library_names=None, action="reload")
+        # Cleared with the registry, not left behind: a spawn still inside its awaits holds this
+        # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
+        self._spawns_in_flight.clear()
+
+    async def stop_worker_for_library(self, library_name: str) -> None:
+        """Terminate the worker serving one library and forget it, leaving every other worker running.
+
+        A spawn already under way is waited out first and its process stopped with the rest, so once
+        this returns no worker for the library is running or about to start.
+        """
+        claim = self._spawns_in_flight.get(library_name)
+        if claim is not None:
+            await claim.wait()
+        await self._stop_workers(library_names={library_name}, action="reset")
+
+    async def _stop_workers(self, *, library_names: set[str] | None, action: str) -> None:
+        """Terminate the named libraries' workers (every worker when None) and forget them.
+
+        Anything awaiting one of them is failed with the reason, and its response topic is
+        unsubscribed.
+        """
+        processes = [
+            (library_name, proc)
+            for library_name, proc in self._managed_worker_processes.items()
+            if library_names is None or library_name in library_names
+        ]
+        worker_ids = [
+            wid
+            for wid, registration in self._workers.items()
+            if library_names is None or registration.worker_key in library_names
+        ]
+        await asyncio.gather(*(self._terminate_via_spawn_loop(library_name, proc) for library_name, proc in processes))
         # Settle anything still awaiting one of these workers, BEFORE the registry is cleared.
         # Clearing it is what makes this the last chance: the heartbeat loop can only evict ids it
         # can still see, so after this nothing reaches these requests at all. route_to_worker has no
         # wall-clock ceiling, so a node dispatched into a worker this call terminates would await a
         # future that never settles.
         if self._transport is not None:
-            for wid in list(self._workers):
+            for wid in worker_ids:
                 registration = self._workers[wid]
                 await self._tx.request_client.fail_requests_by_tag(
                     wid,
                     worker_events.WorkerGoneError(
-                        f"worker '{wid}' was shut down to reload library '{registration.worker_key}'"
+                        f"worker '{wid}' was shut down to {action} library '{registration.worker_key}'"
                         if registration.worker_key
-                        else f"worker '{wid}' was shut down to reload libraries"
+                        else f"worker '{wid}' was shut down to {action} libraries"
                     ),
                 )
         session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
-            for wid in list(self._workers):
-                response_topic = f"sessions/{session_id}/workers/{wid}/response"
-                try:
-                    await self._tx.unsubscribe_from_topic(response_topic)
-                except Exception as e:
-                    logger.debug("Failed to unsubscribe from '%s' during reset: %s", response_topic, e)
-        self._managed_worker_processes.clear()
-        # Cleared with the registry, not left behind: a spawn still inside its awaits holds this
-        # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
-        self._spawns_in_flight.clear()
-        self._workers.clear()
-
-    async def stop_worker_for_library(self, library_name: str) -> None:
-        """Terminate the worker serving one library and forget it, leaving every other worker running.
-
-        `reset_workers` for a single library: anything awaiting the worker is failed with the reason,
-        its response topic is unsubscribed, and its claim is dropped so a later spawn is admitted.
-        """
-        proc = self._managed_worker_processes.pop(library_name, None)
-        if proc is not None:
-            await self._terminate_via_spawn_loop(library_name, proc)
-        worker_ids = [wid for wid, registration in self._workers.items() if registration.worker_key == library_name]
-        if self._transport is not None:
-            for wid in worker_ids:
-                await self._tx.request_client.fail_requests_by_tag(
-                    wid,
-                    worker_events.WorkerGoneError(f"worker '{wid}' was shut down to reset library '{library_name}'"),
-                )
-        session_id = self.engine.get_session_id()
-        if session_id and self._transport is not None:
             for wid in worker_ids:
                 response_topic = f"sessions/{session_id}/workers/{wid}/response"
                 try:
                     await self._tx.unsubscribe_from_topic(response_topic)
                 except Exception as e:
-                    logger.debug("Failed to unsubscribe from '%s' while stopping a worker: %s", response_topic, e)
+                    logger.debug("Failed to unsubscribe from '%s' while stopping workers: %s", response_topic, e)
+        if library_names is None:
+            self._managed_worker_processes.clear()
+            self._workers.clear()
+            return
+        for library_name, _proc in processes:
+            self._managed_worker_processes.pop(library_name, None)
         for wid in worker_ids:
-            del self._workers[wid]
-        self._spawns_in_flight.pop(library_name, None)
+            self._workers.pop(wid, None)
 
     async def route_to_worker(
         self,

@@ -287,6 +287,7 @@ class LibraryMetadataLoading(EngineScoped):
                 # else: Keep the load failure result
 
             if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultSuccess):
+                self._stamp_load_outcome(sandbox_result)
                 successful_libraries.append(sandbox_result)
             else:
                 failed_libraries.append(sandbox_result)

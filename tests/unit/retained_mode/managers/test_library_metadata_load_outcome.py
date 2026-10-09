@@ -116,3 +116,25 @@ class TestMetadataCarriesLoadOutcome:
         assert entry.fitness is None
         assert entry.problems is None
         assert entry.execution_env_failure is None
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_that_failed_to_load_reports_why(self, engine: Engine, tmp_path: Path) -> None:
+        """The sandbox entry is built outside the configured-library loop and is stamped all the same."""
+        sandbox_manifest = _write_manifest(tmp_path / "sandbox")
+        engine.config_manager.set_config_value("sandbox_library_directory", str(tmp_path / "sandbox"))
+        engine.library_manager._library_file_path_to_info[str(sandbox_manifest)] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.FAILURE,
+            fitness=LibraryManager.LibraryFitness.UNUSABLE,
+            library_path=str(sandbox_manifest),
+            is_sandbox=True,
+            library_name=LIBRARY_NAME,
+            problems=[DependencyInstallationFailedProblem(error_details="no wheel for this platform")],
+        )
+
+        result = await engine.ahandle_request(LoadMetadataForAllLibrariesRequest())
+
+        assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+        [entry] = [entry for entry in result.successful_libraries if entry.file_path == str(sandbox_manifest)]
+        assert entry.lifecycle_state == "failure"
+        assert entry.problems is not None
+        assert "no wheel for this platform" in entry.problems

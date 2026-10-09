@@ -948,7 +948,7 @@ class TestSpawnWorker:
             assert "My Library" in worker_manager._spawns_in_flight
 
             await worker_manager.reset_workers()
-            reload_claim = object()
+            reload_claim = asyncio.Event()
             worker_manager._spawns_in_flight["My Library"] = reload_claim
 
             released.set()
@@ -1148,7 +1148,7 @@ class TestResetWorkers:
         the next run would wait out the whole startup grace and then blame the library load.
         """
         worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
-        worker_manager._spawns_in_flight["My Library"] = object()
+        worker_manager._spawns_in_flight["My Library"] = asyncio.Event()
 
         await worker_manager.reset_workers()
 
@@ -1261,17 +1261,36 @@ class TestStopWorkerForLibrary:
         assert unsubscribed == [f"sessions/{_SESSION}/workers/eng-a/response"]
 
     @pytest.mark.asyncio
-    async def test_admits_a_later_spawn_for_that_library(self, worker_manager: WorkerManager) -> None:
-        """A claim left behind would refuse the spawn that brings the library's worker back."""
+    async def test_waits_out_a_spawn_in_flight_and_stops_what_it_started(self, worker_manager: WorkerManager) -> None:
+        """A spawn parked between its claim and the registry write must not leave a live worker behind.
+
+        Without the wait, the stop would find nothing to terminate, and the spawn would then resume and
+        register a worker importing from the environment the caller is about to delete.
+        """
         worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
-        worker_manager._spawns_in_flight["Lib A"] = object()
+        released = asyncio.Event()
 
-        await worker_manager.stop_worker_for_library("Lib A")
+        async def park_until_released() -> None:
+            await released.wait()
 
-        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "Lib A")
+        proc = _managed_proc_mock()
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", park_until_released),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+        ):
+            spawn = asyncio.create_task(worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "Lib A"))
+            await asyncio.sleep(0.01)
+            stop = asyncio.create_task(worker_manager.stop_worker_for_library("Lib A"))
+            await asyncio.sleep(0.01)
+            assert not stop.done()
 
-        mock_exec.assert_called_once()
+            released.set()
+            await spawn
+            await stop
+
+        proc.terminate.assert_called_once()
+        assert "Lib A" not in worker_manager._managed_worker_processes
+        assert "Lib A" not in worker_manager._spawns_in_flight
 
     @pytest.mark.asyncio
     async def test_settles_requests_awaiting_that_worker(self, worker_manager: WorkerManager) -> None:
