@@ -10,6 +10,8 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+## [0.103.3] - 2026-10-09
+
 ### Fixed
 
 - The engine now pins `huggingface-hub<2` to prevent dependency conflicts that mark libraries as
@@ -206,7 +208,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.2...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.3...HEAD
+[0.103.3]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.2...v0.103.3
 [0.103.2]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.1...v0.103.2
 [0.103.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.0...v0.103.1
 [0.103.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...v0.103.0
