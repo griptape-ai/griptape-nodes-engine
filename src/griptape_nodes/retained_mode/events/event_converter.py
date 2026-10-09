@@ -1,11 +1,14 @@
-"""Moved to ``griptape_nodes.serialization.converter``; kept so node libraries importing this path keep working."""
+"""Moved to ``griptape_nodes.retained_mode.events.converters``; kept so node libraries importing this path keep working."""
 
 import warnings
 from typing import Any
 
-from griptape_nodes.serialization.converter import converter, register_polymorphic_dataclass
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.converters import register_polymorphic_dataclass
 
 __all__ = ["converter", "register_polymorphic_dataclass", "safe_unstructure"]
+
+converter = converters.engine
 
 
 def safe_unstructure(obj: Any) -> Any:

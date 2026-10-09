@@ -4,8 +4,6 @@ import json
 import logging
 import traceback
 import types
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
 from datetime import datetime
@@ -14,67 +12,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
 
 from cattrs.gen import make_dict_structure_fn, make_dict_unstructure_fn, make_hetero_tuple_unstructure_fn, override
-from cattrs.preconf.json import make_converter
-from cattrs.strategies import include_subclasses, use_class_methods
+from cattrs.strategies import use_class_methods
 from griptape.mixins.serializable_mixin import SerializableMixin
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.serialization.type_names import resolve_type_name, type_name
-from griptape_nodes.serialization.values import (
-    DisplayValue,
-    Value,
-    ValueEncodeError,
-    decode_value,
-    encode_for_display,
-    encode_value,
-    untag,
-)
+from griptape_nodes.serialization.values import DisplayValue, Value, ValueEncodeError, decode_value
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from cattrs import Converter
 
 logger = logging.getLogger(__name__)
 
-converter = make_converter()
-
-
 # --- Unstructure hooks (serialization) ---
-
-_sending_to_client: ContextVar[bool] = ContextVar("sending_to_client", default=False)
-
-
-@contextmanager
-def for_clients() -> Iterator[None]:
-    """Serialize parameter values without their type tags, for a message bound for a client.
-
-    Another engine needs the tags to rebuild a value as its exact class. A client, such as the
-    editor or an MCP agent, reads plain JSON and sends plain JSON back, which the engine sets as is.
-    """
-    token = _sending_to_client.set(True)
-    try:
-        yield
-    finally:
-        _sending_to_client.reset(token)
-
-
-def _for_destination(encoded: Any) -> Any:
-    return untag(encoded) if _sending_to_client.get() else encoded
-
-
-def _unstructure_value(value: Any) -> Any:
-    return _for_destination(encode_value(value))
-
-
-def _unstructure_display_value(value: Any) -> Any:
-    return _for_destination(encode_for_display(value))
-
-
-# Fields annotated `Value` carry any parameter value, as tagged plain data.
-converter.register_unstructure_hook(Value, _unstructure_value)
-converter.register_unstructure_hook(DisplayValue, _unstructure_display_value)
 
 
 # Griptape objects (artifacts, rulesets, drivers) are parameter values, so they cross only in fields
@@ -84,25 +36,6 @@ converter.register_unstructure_hook(DisplayValue, _unstructure_display_value)
 def _refuse_griptape_object(obj: SerializableMixin) -> Any:
     msg = f"A '{type(obj).__qualname__}' value is sent only in a field that carries parameter values."
     raise ValueEncodeError(msg)
-
-
-converter.register_unstructure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, SerializableMixin),
-    _refuse_griptape_object,
-)
-
-# Pydantic BaseModel subclasses (WorkflowMetadata, WorkflowShape, etc.)
-# mode="json" ensures all values are JSON-serializable (e.g. datetime -> ISO string)
-converter.register_unstructure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, BaseModel),
-    lambda obj: obj.model_dump(mode="json"),
-)
-
-# datetime subclasses (e.g. pendulum.DateTime from griptape) -> ISO format string
-converter.register_unstructure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, datetime) and cls is not datetime,
-    lambda obj: obj.isoformat(),
-)
 
 
 # Exception -> structured dict.
@@ -130,11 +63,6 @@ def _unstructure_exception(obj: Exception) -> dict[str, Any]:
     }
 
 
-converter.register_unstructure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, Exception),
-    _unstructure_exception,
-)
-
 type ElementDocument = dict[str, Any]
 """A node element and its children, as the editor sees them. Parameter values sit under
 ``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
@@ -142,18 +70,18 @@ type ElementDocument = dict[str, Any]
 _ELEMENT_VALUE_KEYS = frozenset({"value", "default_value"})
 
 
-def _unstructure_element_document(document: dict[str, Any]) -> dict[str, Any]:
-    return {key: _unstructure_element_entry(key, item) for key, item in document.items()}
+def _unstructure_element_document(document: dict[str, Any], conv: Converter) -> dict[str, Any]:
+    return {key: _unstructure_element_entry(key, item, conv) for key, item in document.items()}
 
 
-def _unstructure_element_entry(key: str, item: Any) -> Any:
+def _unstructure_element_entry(key: str, item: Any, conv: Converter) -> Any:
     if key in _ELEMENT_VALUE_KEYS:
-        return _unstructure_display_value(item)
+        return conv.unstructure(item, DisplayValue)
     if key == "element_id_to_value":
-        return {element_id: _unstructure_display_value(value) for element_id, value in item.items()}
+        return {element_id: conv.unstructure(value, DisplayValue) for element_id, value in item.items()}
     if key == "children" and isinstance(item, list):
-        return [_unstructure_element_document(child) for child in item]
-    return converter.unstructure(item)
+        return [_unstructure_element_document(child, conv) for child in item]
+    return conv.unstructure(item)
 
 
 def _structure_element_document(document: dict[str, Any], _cls: Any) -> dict[str, Any]:
@@ -170,36 +98,8 @@ def _structure_element_entry(key: str, item: Any) -> Any:
     return item
 
 
-converter.register_unstructure_hook(ElementDocument, _unstructure_element_document)
-converter.register_structure_hook(ElementDocument, _structure_element_document)
-
-# Bare `type` references (e.g. provider_class: type), named the way the value codec names classes.
-converter.register_unstructure_hook(type, type_name)
-
-# ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
-# never set by a caller, so the template is the entire value: sending the segments would send a
-# derived copy that the receiving side has to rebuild anyway. Without this, cattrs has no hook for
-# the dataclass and passes it through untouched, so the failure lands in json.dumps instead.
-converter.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
-
-
 # --- Structure hooks (deserialization) ---
 
-converter.register_structure_hook(Value, lambda data, _: decode_value(data))
-converter.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
-
-converter.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
-
-converter.register_structure_hook(type, lambda name, _: resolve_type_name(name))
-
-# The JSON preset strict mode rejects ints for float fields, but JSON has
-# no distinction between int and float, so coerce int -> float on input.
-converter.register_structure_hook(float, lambda v, _: float(v))
-
-# Request payloads declare path-bearing fields as `Path` (e.g. project_path),
-# but the wire form is always a string. Coerce so handlers can call .parent /
-# Path arithmetic without first re-wrapping.
-converter.register_structure_hook(Path, lambda v, _: Path(v))
 
 # Union types composed entirely of JSON-primitive types (str, int, float, bool,
 # dict, list, None). The JSON parser already produces the correct Python type,
@@ -213,12 +113,6 @@ def _is_json_primitive_union(cls: Any) -> bool:
     if origin is Union or origin is types.UnionType:
         return all(arg in _JSON_PRIMITIVE_TYPES for arg in get_args(cls))
     return False
-
-
-converter.register_structure_hook_func(
-    _is_json_primitive_union,
-    lambda v, _: v,
-)
 
 
 # Unions of enums (e.g. `SequenceScanFailureReason | FileIOFailureReason`) arrive as a bare member
@@ -245,15 +139,6 @@ def _structure_enum_union(value: Any, cls: Any) -> Enum | None:
     raise ValueError(msg)
 
 
-converter.register_structure_hook_func(lambda cls: _enum_union_members(cls) is not None, _structure_enum_union)
-
-# Pydantic BaseModel subclasses
-converter.register_structure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, BaseModel),
-    lambda obj, cls: cls.model_validate(obj),
-)
-
-
 # Exception <- structured dict.
 #
 # Rebuilds a ``ForwardedException`` on the receiving side because the
@@ -263,12 +148,6 @@ converter.register_structure_hook_func(
 # ``[<type>] ... Worker traceback: ...`` block in the orchestrator's
 # user-visible ``RuntimeError`` message.
 def _structure_exception(obj: Any, _cls: type) -> Exception:
-    # Lazy import to avoid a circular dependency: base_events imports
-    # from this module (the converter is registered at import time
-    # from base_events), so ForwardedException cannot be imported at
-    # module load.
-    from griptape_nodes.retained_mode.events.base_events import ForwardedException
-
     if not isinstance(obj, dict):
         return ForwardedException(str(obj))
     return ForwardedException(
@@ -278,16 +157,10 @@ def _structure_exception(obj: Any, _cls: type) -> Exception:
     )
 
 
-converter.register_structure_hook_func(
-    lambda cls: isinstance(cls, type) and issubclass(cls, Exception),
-    _structure_exception,
-)
-
-
 # --- Hook factories for dataclasses and NamedTuples ---
 #
-# Each factory takes the converter it builds a hook for, so a copy of this converter builds hooks
-# that recurse through the copy.
+# Each factory takes the converter it builds a hook for, so every event converter builds hooks
+# that recurse through itself.
 #
 # Some event dataclasses have circular imports that force TYPE_CHECKING-only imports
 # (e.g. library_events -> library_manager -> library_events). With `from __future__ import annotations`,
@@ -341,17 +214,6 @@ def _make_dataclass_structure_fn(cls: type, conv: Converter) -> Any:
         return _make_fallback_structure_fn(cls)
 
 
-converter.register_unstructure_hook_factory(
-    lambda cls: is_dataclass(cls) and isinstance(cls, type),
-    _make_dataclass_unstructure_fn,
-)
-
-converter.register_structure_hook_factory(
-    lambda cls: is_dataclass(cls) and isinstance(cls, type),
-    _make_dataclass_structure_fn,
-)
-
-
 # NamedTuples, by their resolved field types. cattrs' own hooks read the raw annotations, which
 # `from __future__ import annotations` leaves as text, so a field typed `str` fails to structure.
 def _is_namedtuple(cls: Any) -> bool:
@@ -376,32 +238,78 @@ def _make_namedtuple_structure_fn(cls: type, conv: Converter) -> Any:
     return lambda data, _: cls(*structure_fields(data, fields_tuple))
 
 
-converter.register_unstructure_hook_factory(_is_namedtuple, _make_namedtuple_unstructure_fn)
-converter.register_structure_hook_factory(_is_namedtuple, _make_namedtuple_structure_fn)
+def configure_converter(conv: Converter) -> None:
+    """Register the engine's hooks on ``conv``, in order: cattrs tries the latest first.
 
-# --- Class-specific (un)structuring methods ---
-#
-# Classes that define `_cattrs_structure` (classmethod) and/or `_cattrs_unstructure`
-# (instance method) use those for custom serialization.  Registered after the dataclass
-# factories so that `use_class_methods` has higher priority (cattrs checks factories in
-# reverse registration order), ensuring _cattrs_structure/_cattrs_unstructure take
-# precedence over the generated dataclass code.
-use_class_methods(converter, structure_method_name="_cattrs_structure", unstructure_method_name="_cattrs_unstructure")
-
-
-def register_polymorphic_dataclass(cls: type) -> None:
-    """Configure the converter to (un)structure ``cls`` as a union of itself and its subclasses.
-
-    Without this, a field typed ``list[BaseClass]`` round-trips every entry
-    as the base class and silently drops subclass-only fields. Call this
-    once per polymorphic root, after every subclass has been declared at
-    import time. Lives here so converter wiring stays in one place rather
-    than each data module reaching into ``cattrs.strategies`` itself.
-
-    Disambiguation is by unique field names; if a future subclass has no
-    unique field, switch to a tagged-union strategy at this seam.
+    Like ``cattrs.preconf.json.configure_converter``, and run after it. Fields typed ``Value`` and
+    ``DisplayValue`` need their unstructure hooks registered separately, since they differ by who
+    reads the result.
     """
-    include_subclasses(cls, converter)
+    conv.register_unstructure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, SerializableMixin),
+        _refuse_griptape_object,
+    )
+    # Pydantic BaseModel subclasses (WorkflowMetadata, WorkflowShape, etc.)
+    # mode="json" ensures all values are JSON-serializable (e.g. datetime -> ISO string)
+    conv.register_unstructure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, BaseModel),
+        lambda obj: obj.model_dump(mode="json"),
+    )
+    # datetime subclasses (e.g. pendulum.DateTime from griptape) -> ISO format string
+    conv.register_unstructure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, datetime) and cls is not datetime,
+        lambda obj: obj.isoformat(),
+    )
+    conv.register_unstructure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, Exception),
+        _unstructure_exception,
+    )
+    conv.register_unstructure_hook(ElementDocument, lambda document: _unstructure_element_document(document, conv))
+    conv.register_structure_hook(ElementDocument, _structure_element_document)
+    # Bare `type` references (e.g. provider_class: type), named the way the value codec names classes.
+    conv.register_unstructure_hook(type, type_name)
+    # ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
+    # never set by a caller, so the template is the entire value: sending the segments would send a
+    # derived copy that the receiving side has to rebuild anyway. Without this, cattrs has no hook for
+    # the dataclass and passes it through untouched, so the failure lands in json.dumps instead.
+    conv.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
+    conv.register_structure_hook(Value, lambda data, _: decode_value(data))
+    conv.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
+    conv.register_structure_hook(ParsedMacro, lambda template, _: ParsedMacro(template))
+    conv.register_structure_hook(type, lambda name, _: resolve_type_name(name))
+    # The JSON preset strict mode rejects ints for float fields, but JSON has
+    # no distinction between int and float, so coerce int -> float on input.
+    conv.register_structure_hook(float, lambda v, _: float(v))
+    # Request payloads declare path-bearing fields as `Path` (e.g. project_path),
+    # but the wire form is always a string. Coerce so handlers can call .parent /
+    # Path arithmetic without first re-wrapping.
+    conv.register_structure_hook(Path, lambda v, _: Path(v))
+    conv.register_structure_hook_func(
+        _is_json_primitive_union,
+        lambda v, _: v,
+    )
+    conv.register_structure_hook_func(lambda cls: _enum_union_members(cls) is not None, _structure_enum_union)
+    conv.register_structure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, BaseModel),
+        lambda obj, cls: cls.model_validate(obj),
+    )
+    conv.register_structure_hook_func(
+        lambda cls: isinstance(cls, type) and issubclass(cls, Exception),
+        _structure_exception,
+    )
+    conv.register_unstructure_hook_factory(
+        lambda cls: is_dataclass(cls) and isinstance(cls, type),
+        _make_dataclass_unstructure_fn,
+    )
+    conv.register_structure_hook_factory(
+        lambda cls: is_dataclass(cls) and isinstance(cls, type),
+        _make_dataclass_structure_fn,
+    )
+    conv.register_unstructure_hook_factory(_is_namedtuple, _make_namedtuple_unstructure_fn)
+    conv.register_structure_hook_factory(_is_namedtuple, _make_namedtuple_structure_fn)
+    # Classes that define `_cattrs_structure` (classmethod) and/or `_cattrs_unstructure` (instance
+    # method) use those. Last, so they take precedence over the generated dataclass code.
+    use_class_methods(conv, structure_method_name="_cattrs_structure", unstructure_method_name="_cattrs_unstructure")
 
 
 def dump_json(data: Any, **kwargs: Any) -> str:

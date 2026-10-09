@@ -23,6 +23,7 @@ from mcp.types import (
 from pydantic import TypeAdapter
 from starlette.types import Receive, Scope, Send
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
@@ -42,6 +43,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     GetWorkflowContextRequest,
     SetWorkflowContextRequest,
 )
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ResolveNodeRequest,
@@ -94,7 +96,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
-from griptape_nodes.serialization.converter import for_clients
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
@@ -384,8 +385,12 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload) -> dic
         )
     else:
         result_event = EventResultFailure(request=request_payload, result=result_payload)
-    with for_clients():
-        return json.loads(result_event.json())
+    try:
+        text = converters.client.dumps(result_event)
+    except EventSerializationError as error:
+        mcp_server_logger.error("%s", error)
+        text = converters.client.failure_dumps(result_event, error)
+    return json.loads(text)
 
 
 async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int | None = None) -> dict[str, Any]:

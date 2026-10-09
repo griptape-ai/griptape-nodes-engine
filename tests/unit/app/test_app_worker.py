@@ -24,7 +24,7 @@ import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
-from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -678,7 +678,7 @@ class TestGetMessageFilters:
 class TestRelayWorkerResult:
     @pytest.mark.asyncio
     async def test_heartbeat_success_updates_last_seen(self, worker_manager: WorkerManager) -> None:
-        # result_type lives at the outer level — set by BaseEvent.dict(), not inside result{}
+        # result_type lives at the outer level — set by converters.engine.unstructure(BaseEvent), not inside result{}
         payload = {
             "event_type": "EventResultSuccess",
             "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,
@@ -727,7 +727,7 @@ class TestRelayWorkerResult:
             response_topic=_WORKER_RESPONSE_TOPIC,
         )
 
-        await worker_manager.relay_worker_result(json.loads(result.json()))
+        await worker_manager.relay_worker_result(json.loads(converters.engine.dumps(result)))
 
         relayed = json.loads(worker_manager._tx.send_message.call_args.args[1])  # type: ignore[union-attr]
         assert relayed["result"]["value"] == [1, "b"]

@@ -20,9 +20,11 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import WorkerNodeSchema
-from griptape_nodes.serialization.converter import converter
 from tests.unit.exe_types.mocks import MockNode
+
+converter = converters.engine
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

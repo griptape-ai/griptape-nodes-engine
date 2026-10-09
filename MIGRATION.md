@@ -59,6 +59,31 @@ class MyLibrary(AdvancedNodeLibrary):
         )
 ```
 
+## Events are serialized by converters
+
+**Embedders and request API clients written in Python.** Events and payloads no longer have
+serialization methods. Use the cattrs converters in `griptape_nodes.retained_mode.events.converters`,
+picked by who reads the message:
+
+```python
+from griptape_nodes.retained_mode.events import converters
+
+converters.client.dumps(event)  # was: event.json()
+converters.engine.unstructure(event)  # was: event.dict()
+converters.engine.dumps(result)  # was: result.strict_json()
+converters.engine.failure_dumps(result, error)  # was: result.failure_json(error)
+converters.engine.dumps(payload)  # was: payload.to_json()
+converters.engine.structure(data, EventResultSuccess)  # was: EventResultSuccess.from_dict(data)
+```
+
+`engine` tags parameter values with their type, for another engine process. `client` writes them as
+plain JSON, for the editor and other clients. `dumps` raises `EventSerializationError`, now in
+`converters`, where `json()` sent a failure in place of a result it could not send. Catch it and send
+`failure_dumps` to keep that behavior.
+
+Events are pydantic models, so `event.dict()` and `event.json()` still exist, but they now return
+pydantic's form, not the wire format.
+
 ## `serializable=False` outputs are held in their own process across a worker boundary
 
 `Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it

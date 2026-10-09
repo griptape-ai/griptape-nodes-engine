@@ -11,6 +11,8 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
+from griptape_nodes.retained_mode.events import converters
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
@@ -207,7 +209,7 @@ class RequestClient:
         request_id = event_request.request_id
         event_request.response_topic = worker_response_topic
         # Before tracking, so a request that cannot be sent leaves no pending response behind.
-        payload_dict = json.loads(event_request.json())
+        payload_dict = json.loads(converters.engine.dumps(event_request))
 
         response_future = await self._track_request(request_id)
 

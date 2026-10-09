@@ -12,6 +12,7 @@ from griptape_nodes.bootstrap.utils.python_subprocess_executor import PythonSubp
 from griptape_nodes.bootstrap.utils.subprocess_websocket_listener import SubprocessWebSocketListenerMixin
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
@@ -145,7 +146,7 @@ class SubprocessWorkflowExecutor(WorkflowExecutor, PythonSubprocessExecutor, Sub
             logger.debug("Ignoring event type: %s", event_type)
             return
 
-        ex_event = ExecutionEvent.from_dict(data=payload)
+        ex_event = converters.engine.structure(payload, ExecutionEvent)
 
         if isinstance(ex_event.payload, ControlFlowResolvedEvent):
             logger.info("Workflow execution completed successfully")
@@ -166,9 +167,9 @@ class SubprocessWorkflowExecutor(WorkflowExecutor, PythonSubprocessExecutor, Sub
     async def _process_result_event(self, event: dict) -> None:
         payload = event.get("payload", {})
         if payload.get("type", "unknown") == "success_result":
-            result_event = EventResultSuccess.from_dict(data=payload)
+            result_event = converters.engine.structure(payload, EventResultSuccess)
         else:
-            result_event = EventResultFailure.from_dict(data=payload)
+            result_event = converters.engine.structure(payload, EventResultFailure)
 
         if isinstance(result_event.request, StartFlowRequest):
             logger.info("Received StartFlowRequest result event")

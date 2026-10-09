@@ -8,16 +8,15 @@ from typing import Any, NamedTuple
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException, RequestPayload
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
-from griptape_nodes.serialization.converter import (
-    _is_json_primitive_union,
-    converter,
-    dump_json,
-)
+from griptape_nodes.serialization.converter import _is_json_primitive_union, dump_json
 from griptape_nodes.serialization.values import Value, ValueEncodeError
+
+converter = converters.engine
 
 
 class _UnresolvableHints(NamedTuple):
@@ -54,8 +53,8 @@ class TestValueFields:
         artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
         payload = _ValuePayload(value=(1, 2), by_name={"image": artifact}, items=[b"x"], maybe={1: "one"})
 
-        wire = json.loads(json.dumps(converter.unstructure(payload)))
-        restored = converter.structure(wire, _ValuePayload)
+        sent = json.loads(json.dumps(converter.unstructure(payload)))
+        restored = converter.structure(sent, _ValuePayload)
 
         assert restored.value == (1, 2)
         assert type(restored.by_name["image"]) is ImageUrlArtifact
@@ -64,9 +63,9 @@ class TestValueFields:
         assert restored.maybe == {1: "one"}
 
     def test_value_fields_are_tagged_on_the_wire(self) -> None:
-        wire = converter.unstructure(_ValuePayload(value=(1, 2)))
+        sent = converter.unstructure(_ValuePayload(value=(1, 2)))
 
-        assert wire["value"] == {"$type": "builtins:tuple", "$value": [1, 2]}
+        assert sent["value"] == {"$type": "builtins:tuple", "$value": [1, 2]}
 
 
 class TestIsJsonPrimitiveUnion:
@@ -193,7 +192,7 @@ class TestSetParameterValueRequestStructuring:
                 },
             },
         }
-        event = EventRequest.from_dict(data)
+        event = converters.engine.structure(data, EventRequest)
 
         assert isinstance(event.request, SetParameterValueRequest)
         assert event.request.node_name == "Load Image"

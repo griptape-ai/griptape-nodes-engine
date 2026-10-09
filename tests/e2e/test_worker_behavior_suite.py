@@ -27,6 +27,7 @@ import pytest
 from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -279,11 +280,12 @@ class TestStateAccessFromAWorker:
         bytes come back as mojibake rather than raising -- which is why the corruption was silent.
         """
         from griptape_nodes.retained_mode.events.os_events import WriteFileRequest
-        from griptape_nodes.serialization.converter import converter
+
+        converter = converters.engine
 
         original = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
-        wire = json.loads(json.dumps(converter.unstructure(WriteFileRequest(file_path="x.png", content=original))))
-        round_tripped = converter.structure(wire, WriteFileRequest).content
+        sent = json.loads(json.dumps(converter.unstructure(WriteFileRequest(file_path="x.png", content=original))))
+        round_tripped = converter.structure(sent, WriteFileRequest).content
 
         assert round_tripped != original, "if this now round-trips, file I/O could safely forward"
         assert isinstance(round_tripped, str)

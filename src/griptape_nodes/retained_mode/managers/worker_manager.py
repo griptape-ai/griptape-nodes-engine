@@ -17,9 +17,10 @@ import anyio
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommandRefusal,
     provisioned_by_environment,
@@ -388,7 +389,7 @@ class WorkerManager(EngineScoped):
                 # and both charging that to the worker and leaving nothing to evict it are the
                 # orchestrator's problem becoming the worker's.
                 try:
-                    await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
+                    await self._tx.send_message("EventRequest", converters.engine.dumps(hb), registration.request_topic)
                 except Exception:
                     logger.warning(
                         "Could not challenge worker %s on '%s'; not counting it against the worker.",
@@ -1109,7 +1110,7 @@ class WorkerManager(EngineScoped):
         worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
-        await self._tx.send_message("EventRequest", forwarded.json(), worker_request_topic)
+        await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)
 
     async def _on_config_changed(self, _event: ConfigChanged) -> None:
         """Fan out a ReloadConfigRequest after the orchestrator's config mutation succeeded.
@@ -1390,7 +1391,7 @@ class WorkerManager(EngineScoped):
         publish directly to the session response topic.
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
-        # BaseEvent.dict() adds result_type at the outer level (not inside the result dict).
+        # The event converters add result_type at the outer level (not inside the result dict).
         result_event_type = payload.get("result_type", "")
         if result_event_type == worker_events.WorkerHeartbeatResultSuccess.__name__:
             response_topic = payload.get("response_topic", "")

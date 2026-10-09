@@ -15,6 +15,7 @@ import pytest
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
 from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultFailure, NodeErrorEvent
 from griptape_nodes.retained_mode.events.node_error_details import (
@@ -24,7 +25,8 @@ from griptape_nodes.retained_mode.events.node_error_details import (
     build_node_error_details,
 )
 from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
-from griptape_nodes.serialization.converter import converter
+
+converter = converters.engine
 
 NODE_NAME = "Get Dictionary Value by Key"
 
@@ -47,8 +49,8 @@ def _raised(exc: Exception) -> Exception:
 
 def _across_worker(result: ExecuteNodeResultFailure) -> ExecuteNodeResultFailure:
     """Send a result through the converter the way a worker sends it back."""
-    wire = json.loads(json.dumps(converter.unstructure(result)))
-    return converter.structure(wire, ExecuteNodeResultFailure)
+    sent = json.loads(json.dumps(converter.unstructure(result)))
+    return converter.structure(sent, ExecuteNodeResultFailure)
 
 
 def _executor_error(result: ExecuteNodeResultFailure) -> ExecuteNodeFailedError:
@@ -387,8 +389,8 @@ class TestEventWireForm:
             node_name=NODE_NAME, error_message=str(exc), error=build_node_error_details(NODE_NAME, exc)
         )
 
-        wire = json.loads(json.dumps(converter.unstructure(event)))
-        rebuilt = converter.structure(wire, NodeErrorEvent)
+        sent = json.loads(json.dumps(converter.unstructure(event)))
+        rebuilt = converter.structure(sent, NodeErrorEvent)
 
         assert rebuilt == event
 
