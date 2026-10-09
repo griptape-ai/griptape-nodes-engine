@@ -248,7 +248,6 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
-from griptape_nodes.serialization.converter import dump_json
 from griptape_nodes.serialization.legacy_pickle import (
     LegacyPickleError,
     read_legacy_clipboard_commands,
@@ -260,6 +259,7 @@ from griptape_nodes.serialization.values import (
     Unencodable,
     ValueEncodeError,
     decode_value,
+    dump_json,
     encodable_default,
     try_encode,
     value_key,

@@ -73,6 +73,10 @@ type DisplayValue = Any
 """A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
 that a value with no plain-data form is sent as its text instead of failing."""
 
+type ElementDocument = dict[str, Any]
+"""A node element and its children, as the editor sees them. Parameter values sit under
+``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
+
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
 
@@ -627,3 +631,20 @@ _BUILTIN_CODECS: list[tuple[Callable[[type], bool], _Codec]] = [
 # Weak, so classes from a reloaded library file are not kept alive.
 _registered: weakref.WeakKeyDictionary[type, _Registration] = weakref.WeakKeyDictionary()
 _codec_cache: weakref.WeakKeyDictionary[type, _Codec | None] = weakref.WeakKeyDictionary()
+
+
+def dump_json(data: Any, **kwargs: Any) -> str:
+    """Write the converter's output as JSON text.
+
+    Raises:
+        ValueEncodeError: ``data`` holds a value with no JSON form. The converter passes objects it
+            has no hook for through unchanged, so this is where they surface.
+    """
+    return json.dumps(data, default=_refuse_json_value, **kwargs)
+
+
+# Passed explicitly: griptape swaps `JSONEncoder.default` process-wide for one that sends any object
+# with a `to_dict()` through it, and fails on the rest without naming their type.
+def _refuse_json_value(obj: Any) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value has no plain-data form."
+    raise ValueEncodeError(msg)

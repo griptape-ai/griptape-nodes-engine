@@ -14,8 +14,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.converter import ElementDocument
-from griptape_nodes.serialization.values import DisplayValue, Value
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument, Value
 
 if TYPE_CHECKING:
     from collections.abc import Callable

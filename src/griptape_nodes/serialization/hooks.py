@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import traceback
 import types
@@ -19,7 +18,7 @@ from pydantic import BaseModel
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.serialization.type_names import resolve_type_name, type_name
-from griptape_nodes.serialization.values import DisplayValue, Value, ValueEncodeError, decode_value
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument, Value, ValueEncodeError, decode_value
 
 if TYPE_CHECKING:
     from cattrs import Converter
@@ -62,10 +61,6 @@ def _unstructure_exception(obj: Exception) -> dict[str, Any]:
         "traceback": tb,
     }
 
-
-type ElementDocument = dict[str, Any]
-"""A node element and its children, as the editor sees them. Parameter values sit under
-``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
 
 _ELEMENT_VALUE_KEYS = frozenset({"value", "default_value"})
 
@@ -301,20 +296,3 @@ def configure_converter(conv: Converter) -> None:
     conv.register_structure_hook_factory(_is_namedtuple, _make_namedtuple_structure_fn)
     # Register last so class methods take precedence over generated dataclass hooks.
     use_class_methods(conv, structure_method_name="_cattrs_structure", unstructure_method_name="_cattrs_unstructure")
-
-
-def dump_json(data: Any, **kwargs: Any) -> str:
-    """Write the converter's output as JSON text.
-
-    Raises:
-        ValueEncodeError: ``data`` holds a value with no JSON form. The converter passes objects it
-            has no hook for through unchanged, so this is where they surface.
-    """
-    return json.dumps(data, default=_refuse_json_value, **kwargs)
-
-
-# Passed explicitly: griptape swaps `JSONEncoder.default` process-wide for one that sends any object
-# with a `to_dict()` through it, and fails on the rest without naming their type.
-def _refuse_json_value(obj: Any) -> Any:
-    msg = f"A '{type(obj).__qualname__}' value has no plain-data form."
-    raise ValueEncodeError(msg)

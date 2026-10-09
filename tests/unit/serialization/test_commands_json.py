@@ -56,8 +56,7 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, _serialize_flow
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
-from griptape_nodes.serialization.converter import dump_json
-from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, is_plain_data
+from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, dump_json, is_plain_data
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode

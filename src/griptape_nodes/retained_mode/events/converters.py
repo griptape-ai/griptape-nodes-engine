@@ -28,12 +28,13 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.converter import configure_converter, dump_json
+from griptape_nodes.serialization.hooks import configure_converter
 from griptape_nodes.serialization.type_names import TypeNameError
 from griptape_nodes.serialization.values import (
     DisplayValue,
     Value,
     ValueEncodeError,
+    dump_json,
     encode_for_display,
     encode_value,
     untag,

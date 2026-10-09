@@ -5,7 +5,7 @@ from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventRequestBatch, RequestPayload
 from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.serialization.converter import ElementDocument
+from griptape_nodes.serialization.values import ElementDocument
 
 
 @dataclass

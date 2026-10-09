@@ -13,8 +13,8 @@ from griptape_nodes.retained_mode.events.base_events import EventRequest, Forwar
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
-from griptape_nodes.serialization.converter import _is_json_primitive_union, dump_json
-from griptape_nodes.serialization.values import Value, ValueEncodeError
+from griptape_nodes.serialization.hooks import _is_json_primitive_union
+from griptape_nodes.serialization.values import Value, ValueEncodeError, dump_json
 
 converter = converters.engine
 
