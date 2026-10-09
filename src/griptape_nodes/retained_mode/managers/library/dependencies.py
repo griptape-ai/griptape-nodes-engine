@@ -719,7 +719,7 @@ class LibraryDependencies(EngineScoped):
             library_name=library_name,
             library_file_path=library_file_path,
             pip_dependencies=pip_dependencies,
-            venv_kind=venv_kind,
+            execution=execution,
             fresh_venv=not venv_init.reused,
         )
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
@@ -743,7 +743,7 @@ class LibraryDependencies(EngineScoped):
                         library_name=library_name,
                         library_file_path=library_file_path,
                         pip_dependencies=pip_dependencies,
-                        venv_kind=venv_kind,
+                        execution=execution,
                         fresh_venv=True,
                     ),
                 )
@@ -788,7 +788,7 @@ class LibraryDependencies(EngineScoped):
         library_name: str,
         library_file_path: str,
         pip_dependencies: list[str],
-        venv_kind: str,
+        execution: bool,
         fresh_venv: bool,
     ) -> None:
         """Log the install that is about to run and report it on the library's progress event.
@@ -797,13 +797,24 @@ class LibraryDependencies(EngineScoped):
         announced at INFO with a warning about the wait. A reused one usually only needs a quick
         check that its packages are still there, so it is logged at DEBUG. Its detail still warns
         about the wait, because a library update can add packages that take as long to install.
+
+        A library with execution dependencies gets two installs, its edit-time environment and
+        then its execution environment, so the execution one says it is for running the nodes.
         """
-        package_count = len(pip_dependencies)
-        summary = summarize_dependencies(pip_dependencies)
+        # The execution set repeats the edit-time set and can overlap the declared execution pins.
+        unique_dependencies = list(dict.fromkeys(pip_dependencies))
+        package_count = len(unique_dependencies)
+        summary = summarize_dependencies(unique_dependencies)
         if package_count == 1:
             package_noun = "package"
         else:
             package_noun = "packages"
+        if execution:
+            venv_kind = "execution"
+            purpose = f"running nodes from {library_name}"
+        else:
+            venv_kind = "edit-time"
+            purpose = library_name
 
         if fresh_venv:
             logger.info(
@@ -815,9 +826,9 @@ class LibraryDependencies(EngineScoped):
                 summary,
             )
             detail = (
-                f"Installing {package_count} {package_noun} for {library_name}: {summary}. "
-                "The first install can take several minutes."
+                f"Installing {package_count} {package_noun} for {purpose}: {summary}. This can take several minutes."
             )
+
         else:
             logger.debug(
                 "Checking %d %s for library '%s' (%s environment): %s",
@@ -827,13 +838,13 @@ class LibraryDependencies(EngineScoped):
                 venv_kind,
                 summary,
             )
-            detail = f"Checking packages for {library_name}. Installing any that are new can take several minutes."
+            detail = f"Checking packages for {purpose}. Installing any that are new can take several minutes."
 
         self._report_install_progress(
             library_name=library_name,
             library_file_path=library_file_path,
             detail=detail,
-            dependencies=list(pip_dependencies),
+            dependencies=unique_dependencies,
         )
 
     def _report_install_progress(

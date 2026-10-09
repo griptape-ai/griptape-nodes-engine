@@ -120,7 +120,7 @@ class TestAFreshEnvironmentInstall:
                 is_worker=False,
                 detail=(
                     "Installing 5 packages for Diffusers: torch, diffusers, transformers, and 2 more. "
-                    "The first install can take several minutes."
+                    "This can take several minutes."
                 ),
                 dependencies=_DEPENDENCIES,
             )
@@ -150,7 +150,7 @@ class TestAFreshEnvironmentInstall:
         await install.run(["torch"])
 
         assert install.progress_events[0].detail == (
-            "Installing 1 package for Diffusers: torch. The first install can take several minutes."
+            "Installing 1 package for Diffusers: torch. This can take several minutes."
         )
 
     @pytest.mark.asyncio
@@ -162,6 +162,19 @@ class TestAFreshEnvironmentInstall:
             await _Install(engine, reused=False).run(_DEPENDENCIES, execution=True)
 
         assert any("(execution environment)" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_an_execution_install_says_it_is_for_running_the_nodes(self, engine: Engine) -> None:
+        install = _Install(engine, reused=False)
+
+        # The execution set is the edit-time set plus the execution pins, which can repeat one.
+        await install.run(["torch", "diffusers", "torch"], execution=True)
+
+        assert install.progress_events[0].detail == (
+            "Installing 2 packages for running nodes from Diffusers: torch, diffusers. This can take several minutes."
+        )
+        assert install.progress_events[0].dependencies == ["torch", "diffusers"]
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("during_load")
@@ -248,7 +261,7 @@ class TestAReusedEnvironmentInstall:
             "Checking packages for Diffusers. Installing any that are new can take several minutes.",
             (
                 "Installing 5 packages for Diffusers: torch, diffusers, transformers, and 2 more. "
-                "The first install can take several minutes."
+                "This can take several minutes."
             ),
             None,
         ]
