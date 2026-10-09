@@ -482,14 +482,27 @@ class TestLibraryInstallProgress:
 
         assert events[0].detail == "Downloading torch (2.0GiB) for running nodes from Diffusers..."
 
-    def test_logs_every_installer_line_at_debug(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+    def test_logs_downloads_at_info_and_other_installer_lines_at_debug(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
         progress = _progress(engine)
 
         with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
-            progress.on_installer_line("Resolved 7 packages in 404ms")
+            for line in [
+                "Resolved 7 packages in 404ms",
+                "Downloading torch (2.0GiB)",
+                " Downloaded torch",
+                "Prepared 7 packages in 3m 2s",
+                "Installed 7 packages in 14ms",
+            ]:
+                progress.on_installer_line(line)
 
-        assert "Installer (Diffusers, edit-time environment): Resolved 7 packages in 404ms" in [
-            record.getMessage() for record in caplog.records
+        assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
+            ("DEBUG", "Installer (Diffusers, edit-time environment): Resolved 7 packages in 404ms"),
+            ("INFO", "Downloading torch (2.0GiB) for library 'Diffusers' (edit-time environment)"),
+            ("DEBUG", "Installer (Diffusers, edit-time environment): Downloaded torch"),
+            ("INFO", "Downloaded 7 packages for library 'Diffusers' (edit-time environment), installing them"),
+            ("DEBUG", "Installer (Diffusers, edit-time environment): Installed 7 packages in 14ms"),
         ]
 
     def test_sends_nothing_outside_a_load(self, engine: Engine) -> None:

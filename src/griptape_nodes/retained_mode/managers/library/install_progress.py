@@ -130,31 +130,46 @@ class LibraryInstallProgress:
     def on_installer_line(self, line: str) -> None:
         """Turn one line of uv's output into an updated detail, when it says where the install is.
 
-        Every line is logged at DEBUG, so a DEBUG log still shows the installer's own output.
+        A download starting and the downloads finishing are logged at INFO, since they only happen
+        during a real install and are the progress a console user waits on. Every other line is
+        logged at DEBUG, so a DEBUG log still shows the installer's own output.
         """
         text = line.strip()
         if not text:
             return
-        logger.debug("Installer (%s, %s environment): %s", self._library_name, self._venv_kind, text)
 
         downloading = _DOWNLOADING_LINE.match(text)
         if downloading is not None:
-            self._pending_downloads[downloading.group("name")] = downloading.group("size")
+            name = downloading.group("name")
+            size = downloading.group("size")
+            logger.info(
+                "Downloading %s (%s) for library '%s' (%s environment)", name, size, self._library_name, self._venv_kind
+            )
+            self._pending_downloads[name] = size
             self._report(self._detail_for_downloads())
             return
 
+        prepared = _PREPARED_LINE.match(text)
+        if prepared is not None:
+            package_count = int(prepared.group("count"))
+            package_noun = _package_noun(package_count)
+            logger.info(
+                "Downloaded %d %s for library '%s' (%s environment), installing them",
+                package_count,
+                package_noun,
+                self._library_name,
+                self._venv_kind,
+            )
+            self._pending_downloads.clear()
+            self._report(f"Installing {package_count} {package_noun} for {self._purpose}...")
+            return
+
+        logger.debug("Installer (%s, %s environment): %s", self._library_name, self._venv_kind, text)
         downloaded = _DOWNLOADED_LINE.match(text)
         if downloaded is not None:
             self._pending_downloads.pop(downloaded.group("name"), None)
             if self._pending_downloads:
                 self._report(self._detail_for_downloads())
-            return
-
-        prepared = _PREPARED_LINE.match(text)
-        if prepared is not None:
-            self._pending_downloads.clear()
-            package_count = int(prepared.group("count"))
-            self._report(f"Installing {package_count} {_package_noun(package_count)} for {self._purpose}...")
 
     def clear(self) -> None:
         """Clear the install's detail once the installer has stopped, whether it worked or not.
