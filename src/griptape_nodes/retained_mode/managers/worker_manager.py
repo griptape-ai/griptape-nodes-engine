@@ -1417,6 +1417,9 @@ class WorkerManager(EngineScoped):
 
     @staticmethod
     def _for_clients(payload: dict) -> str:
+        # Untags the JSON rather than reading the result back, since its payload class may live in a
+        # library only the worker has loaded. Only values carry tags, but a plain field holding its own
+        # "$type" key would lose it here.
         untagged = {**payload}
         for section in ("request", "result"):
             if section in untagged:

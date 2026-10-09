@@ -66,14 +66,15 @@ class EventConverter(JsonConverter):
         configure_converter(self)
         # Register after the shared pydantic hooks so event hooks take precedence.
         _configure_event_hooks(self)
+        for root in _polymorphic_roots:
+            include_subclasses(root, self)
         _event_converters.add(self)
 
     def dumps(self, obj: Any, unstructure_as: Any = None, **kwargs: Any) -> str:
         """Raise ``EventSerializationError`` if ``obj`` holds a value with no JSON form."""
         if isinstance(obj, Payload):
-            data = _unstructure_payload(obj, self)
-        else:
-            data = self.unstructure(obj, unstructure_as=unstructure_as)
+            return _to_json(_unstructure_payload(obj, self), type(obj).__name__, **kwargs)
+        data = self.unstructure(obj, unstructure_as=unstructure_as)
         described_as = None
         if isinstance(data, dict):
             described_as = data.get("result_type") or data.get("payload_type") or data.get("request_type")
@@ -102,12 +103,13 @@ class EventConverter(JsonConverter):
 
 
 def register_polymorphic_dataclass(cls: type) -> None:
-    """Read and write ``cls`` as a union of itself and its subclasses, on every ``EventConverter``.
+    """Read and write ``cls`` as a union of itself and its subclasses, on every ``EventConverter``, made before or after.
 
     Without this, a field typed ``list[BaseClass]`` round-trips every entry as the base class and
     silently drops subclass-only fields. Call it once per polymorphic root, after every subclass is
     declared. Subclasses are told apart by their unique field names.
     """
+    _polymorphic_roots.append(cls)
     for conv in _event_converters:
         include_subclasses(cls, conv)
 
@@ -284,6 +286,7 @@ def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
 
 
 _event_converters: weakref.WeakSet[EventConverter] = weakref.WeakSet()
+_polymorphic_roots: list[type] = []
 
 engine = EventConverter(value=encode_value, display=encode_for_display)
 """Writes for another engine process: parameter values tagged with their type."""

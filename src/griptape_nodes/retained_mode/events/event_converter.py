@@ -1,4 +1,7 @@
-"""Compatibility imports for node libraries; use ``griptape_nodes.retained_mode.events.converters``."""
+"""Compatibility imports for node libraries; use ``griptape_nodes.retained_mode.events.converters``.
+
+``converter`` is ``converters.engine``, so a hook registered on it does not reach ``converters.client``.
+"""
 
 import warnings
 from typing import Any

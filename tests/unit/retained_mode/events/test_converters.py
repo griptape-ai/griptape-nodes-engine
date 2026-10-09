@@ -72,5 +72,7 @@ class TestEventConverter:
 
         converters.register_polymorphic_dataclass(_Shape)
 
-        for converter in (conv, converters.engine, converters.client):
+        later = converters.EventConverter(value=lambda v: v, display=lambda v: v)
+
+        for converter in (conv, later, converters.engine, converters.client):
             assert isinstance(converter.structure({"name": "c", "radius": 1.0}, _Shape), _Circle)

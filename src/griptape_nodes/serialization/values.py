@@ -170,8 +170,8 @@ def _untag_tagged(data: dict[str, JsonValue]) -> JsonValue:
         if isinstance(state, list):
             pairs = cast("list[list[JsonValue]]", state)
             untagged = {_key_text(untag(key)): untag(item) for key, item in pairs}
-            if len(untagged) < len(pairs):
-                # Keys collide as text, e.g. 1 and "1". Tagged keys keep them apart.
+            if len(untagged) < len(pairs) or TYPE_KEY in untagged:
+                # Keys collide as text, e.g. 1 and "1", or a "$type" key would read as a tag.
                 return {TYPE_KEY: _DICT_TYPE_NAME, VALUE_KEY: [[key, untag(item)] for key, item in pairs]}
             return untagged
     return untag(state)
