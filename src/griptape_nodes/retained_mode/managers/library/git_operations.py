@@ -310,14 +310,22 @@ class LibraryGitOperations(EngineScoped):
             library_required_engine_version
         )
 
+        # Nothing newer can run on this engine, so this is "no update", not a failed check.
         if not is_compatible:
-            details = (
-                f"Cannot update Library '{library_name}'. "
-                f"The update requires engine version {library_required_engine_version} "
-                f"but the current engine version is {current_engine_version}. "
-                f"Please update your engine first."
+            details = self._engine_too_old_for_update_details(
+                library_name, library_required_engine_version, current_engine_version
             )
-            return CheckLibraryUpdateResultFailure(result_details=details)
+            logger.info(details)
+            return CheckLibraryUpdateResultSuccess(
+                has_update=False,
+                current_version=current_version,
+                latest_version=latest_version,
+                git_remote=git_remote,
+                git_ref=git_ref,
+                local_commit=local_commit,
+                remote_commit=remote_commit,
+                result_details=details,
+            )
 
         # Evaluate the age gate only when an update actually exists, so callers can surface a
         # "pending age gate" state. Skipping the evaluation when up to date avoids a spurious
@@ -359,7 +367,7 @@ class LibraryGitOperations(EngineScoped):
         )
 
     @handles(UpdateLibraryRequest)
-    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911
+    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         """Update a library to the latest version using the appropriate git strategy.
 
         Automatically detects whether the library uses branch-based or tag-based workflow:
@@ -397,6 +405,10 @@ class LibraryGitOperations(EngineScoped):
         if in_monorepo:
             details = f"Cannot update Library '{library_name}'. Repository contains multiple libraries and must be updated manually."
             return UpdateLibraryResultFailure(result_details=details)
+
+        engine_failure = await self._update_target_engine_failure(library_name, library_dir)
+        if engine_failure is not None:
+            return engine_failure
 
         # Enforce the update age gate before mutating the working tree. Only pay the
         # remote round-trip when gating is actually enabled, so the common (disabled) path is free.
@@ -765,6 +777,47 @@ class LibraryGitOperations(EngineScoped):
             return True, current_engine_version
         else:
             return is_compatible, current_engine_version
+
+    @staticmethod
+    def _engine_too_old_for_update_details(
+        library_name: str, required_engine_version: str, current_engine_version: str
+    ) -> str:
+        return (
+            f"Cannot update Library '{library_name}'. "
+            f"The update requires engine version {required_engine_version} "
+            f"but the current engine version is {current_engine_version}. "
+            f"Please update your engine first."
+        )
+
+    async def _update_target_engine_failure(
+        self, library_name: str, library_dir: Path
+    ) -> UpdateLibraryResultFailure | None:
+        """Refuse an update whose target needs a newer engine; None when the update may proceed.
+
+        The target is read at update time because the remote can advance between a check and the
+        update that follows it. Without a remote there is nothing to update to, and
+        update_library_git reports that itself.
+        """
+        try:
+            git_remote = await asyncio.to_thread(get_git_remote, library_dir)
+            if git_remote is None:
+                return None
+            git_ref = await asyncio.to_thread(get_current_ref, library_dir)
+            version_info = await asyncio.to_thread(clone_and_get_library_version, git_remote, git_ref or "HEAD")
+        except GitError as e:
+            details = (
+                f"Cannot update Library '{library_name}'. "
+                f"Failed because the engine version the update requires could not be read: {e}"
+            )
+            return UpdateLibraryResultFailure(result_details=details)
+
+        is_compatible, current_engine_version = self._check_engine_version_compatibility(version_info.engine_version)
+        if is_compatible:
+            return None
+        details = self._engine_too_old_for_update_details(
+            library_name, version_info.engine_version, current_engine_version
+        )
+        return UpdateLibraryResultFailure(result_details=details)
 
     def _read_minimum_release_age_config(self) -> MinimumReleaseAgeConfig:
         """Read the minimum-release-age setting once. Centralizes the key literal and default handling."""
