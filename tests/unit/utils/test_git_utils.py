@@ -1188,6 +1188,93 @@ class TestUpdateLibraryGit:
 
         assert get_local_commit_sha(clone) == moved_sha
 
+    def test_update_library_git_keeps_stable_when_nightly_shares_the_commit(self, temp_dir: Path) -> None:
+        """Test that a library on stable keeps following stable when nightly points at the same commit."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "stable")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+        stable_sha = head_sha(clone)
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == stable_sha
+        assert get_current_tag(clone) == "stable"
+
+    def test_update_library_git_keeps_stable_after_a_no_op_update(self, temp_dir: Path) -> None:
+        """Test that the tracked tag survives updates that don't move HEAD, which write no reflog entry."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "stable")
+        update_library_git(clone)
+        run_git(clone, "reflog", "expire", "--expire=now", "--all")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+
+        update_library_git(clone)
+
+        assert get_current_tag(clone) == "stable"
+
+    def test_update_library_git_keeps_nightly_when_stable_shares_the_commit(self, temp_dir: Path) -> None:
+        """Test that a library on nightly keeps following nightly when stable points at the same commit."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "nightly")
+        clone = temp_dir / "clone"
+        clone_repository(str(origin), clone, "nightly")
+        run_git(origin, "tag", "stable")
+        run_git(clone, "fetch", "--tags", "origin")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "-f", "nightly")
+        nightly_sha = head_sha(origin)
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == nightly_sha
+
+    def test_update_library_git_follows_stable_after_a_failed_checkout_moved_it(self, temp_dir: Path) -> None:
+        """Test that a library keeps following stable after a fetch moved stable but the checkout failed.
+
+        That leaves HEAD on the old commit with only nightly pointing at it.
+        """
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+        switch_branch_or_tag(clone, "stable")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "release")
+        run_git(origin, "tag", "-f", "stable")
+        release_sha = head_sha(origin)
+
+        # An untracked file the new commit would overwrite makes the checkout fail after the fetch.
+        blocker = clone / "extra.txt"
+        blocker.write_text("local", encoding="utf-8")
+        with pytest.raises(GitRefError):
+            switch_branch_or_tag(clone, "stable")
+        blocker.unlink()
+        assert get_current_ref(clone) == "stable"
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == release_sha
+        assert get_current_tag(clone) == "stable"
+
     def test_update_library_git_raises_error_when_detached_head_without_known_tag(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised for a detached HEAD that isn't on a known tag."""
         origin = make_origin_repo(temp_dir / "origin")
@@ -1273,6 +1360,59 @@ class TestSwitchBranchOrTag:
         switch_branch_or_tag(clone, "v1.0.0")
 
         assert get_current_tag(clone) == "v1.0.0"
+
+    def test_switch_branch_or_tag_records_the_tag_it_switched_to(self, temp_dir: Path) -> None:
+        """Test that switching to stable keeps reporting stable when nightly shares the commit and the reflog is gone."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        run_git(origin, "tag", "nightly")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        switch_branch_or_tag(clone, "stable")
+        run_git(clone, "reflog", "expire", "--expire=now", "--all")
+
+        assert get_current_tag(clone) == "stable"
+
+    def test_switch_branch_or_tag_keeps_the_old_tag_when_the_checkout_fails(self, temp_dir: Path) -> None:
+        """Test that a failed switch to nightly leaves the library reporting and updating on stable."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        clone = clone_repo(origin, temp_dir / "clone")
+        switch_branch_or_tag(clone, "stable")
+        stable_sha = head_sha(clone)
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "nightly build")
+        run_git(origin, "tag", "nightly")
+
+        # An untracked file the nightly commit would overwrite makes the checkout fail after the fetch.
+        blocker = clone / "extra.txt"
+        blocker.write_text("local", encoding="utf-8")
+        with pytest.raises(GitRefError):
+            switch_branch_or_tag(clone, "nightly")
+        blocker.unlink()
+        assert get_current_ref(clone) == "stable"
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == stable_sha
+        assert get_current_ref(clone) == "stable"
+
+    def test_switch_branch_or_tag_to_a_branch_stops_reporting_the_recorded_tag(self, temp_dir: Path) -> None:
+        """Test that a tag recorded by an earlier switch is not reported once on a branch."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "v1.0.0")
+        clone = clone_repo(origin, temp_dir / "clone")
+        switch_branch_or_tag(clone, "v1.0.0")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance main")
+        switch_branch_or_tag(clone, "main")
+
+        assert get_current_ref(clone) == "main"
+        assert get_current_tag(clone) is None
 
     def test_switch_branch_or_tag_checks_out_remote_only_branch(self, temp_dir: Path) -> None:
         """Test that a branch only present on the remote is checked out as a tracking branch."""
