@@ -4,9 +4,6 @@ A worker's project manager is a replica populated by broadcast, so it can serve 
 chain; the orchestrator holds the authoritative one. So `GetAttributionContextRequest` stays
 out of `LOCAL_ONLY_REQUEST_TYPES` and a worker-side `RemoteHandler` forwards it -- but only
 inside a `node_execution_scope`, which is the only time a node spends credits.
-
-No shipping library runs worker-hosted today; a `worker_mode_override` config entry can
-flip one, which is why this is wired now rather than deferred.
 """
 
 from __future__ import annotations

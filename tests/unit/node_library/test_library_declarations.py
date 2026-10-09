@@ -24,7 +24,6 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerMode,
     WorkerModeCompatibility,
     iter_catalog_models,
-    requires_worker_process,
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import (
@@ -61,9 +60,8 @@ def _make_node_metadata(**kwargs: Any) -> NodeMetadata:
 
 class TestMetadataDeclarationsDefaults:
     def test_library_metadata_declarations_defaults_to_empty(self) -> None:
-        # Absence of any declaration is "no opinion" -- consumers (e.g.
-        # ``requires_worker_process``) apply their own defaults rather than
-        # the model materializing synthetic declarations.
+        # Absence of any declaration is "no opinion" -- consumers apply their own
+        # defaults rather than the model materializing synthetic declarations.
         assert _make_library_metadata().declarations == []
 
     def test_node_metadata_declarations_defaults_to_empty(self) -> None:
@@ -294,25 +292,51 @@ class TestSuggestedWorkerMode:
         assert decl.mode is WorkerMode.WORKER
 
 
-# ---------- LibraryMetadata cross-declaration validator ----------
+# ---------- LibraryMetadata worker declaration pairs ----------
 
 
-class TestLibraryMetadataWorkerValidation:
-    def test_rejects_incompatible_with_suggested_worker_mode(self) -> None:
-        # The two declarations live on the same metadata block and contradict
-        # each other; the cross-axis check belongs on LibraryMetadata.
-        with pytest.raises(ValidationError):
-            _make_library_metadata(
-                declarations=[
-                    WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
-                    SuggestedWorkerMode(mode=WorkerMode.WORKER),
+class TestLibraryMetadataWorkerDeclarations:
+    """Every pairing of the two worker declarations parses.
+
+    Neither one decides where a library's nodes execute any more, so there is no
+    contradiction left for a cross-declaration validator to reject. A manifest written
+    against either rule must keep loading.
+    """
+
+    def test_allows_incompatible_with_suggested_worker(self) -> None:
+        # Once rejected as self-contradictory. Both declarations are inert now, so the
+        # pairing has to parse rather than fail the library.
+        metadata = _make_library_metadata(
+            declarations=[
+                WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
+                SuggestedWorkerMode(mode=WorkerMode.WORKER),
+            ],
+        )
+
+        assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
+        assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
+
+    def test_the_same_pairing_parses_from_the_wire(self) -> None:
+        # ``model_validate`` is the wire-format entry point, and a manifest on disk
+        # arrives through it rather than through the constructor.
+        metadata = LibraryMetadata.model_validate(
+            {
+                "author": "t",
+                "description": "t",
+                "library_version": "1.0.0",
+                "engine_version": "1.0.0",
+                "tags": [],
+                "declarations": [
+                    {"type": "worker_mode_compatibility", "compatibility": "INCOMPATIBLE"},
+                    {"type": "suggested_worker_mode", "mode": "WORKER"},
                 ],
-            )
+            }
+        )
+
+        assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
+        assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
 
     def test_allows_incompatible_with_suggested_orchestrator(self) -> None:
-        # INCOMPATIBLE + ORCHESTRATOR is consistent (redundant but legal):
-        # the library can only run in the orchestrator, and the suggested
-        # mode agrees.
         metadata = _make_library_metadata(
             declarations=[
                 WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
@@ -333,69 +357,6 @@ class TestLibraryMetadataWorkerValidation:
             )
             assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
             assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
-
-    def test_validator_runs_on_model_validate(self) -> None:
-        # The validator must fire when LibraryMetadata is rebuilt from JSON,
-        # not only when constructed directly. Pydantic's ``model_validate``
-        # is the wire-format entry point; a regression that disables the
-        # validator for that path silently lets bad manifests in.
-        with pytest.raises(ValidationError):
-            LibraryMetadata.model_validate(
-                {
-                    "author": "t",
-                    "description": "t",
-                    "library_version": "1.0.0",
-                    "engine_version": "1.0.0",
-                    "tags": [],
-                    "declarations": [
-                        {"type": "worker_mode_compatibility", "compatibility": "INCOMPATIBLE"},
-                        {"type": "suggested_worker_mode", "mode": "WORKER"},
-                    ],
-                }
-            )
-
-
-# ---------- requires_worker_process free function ----------
-
-
-class TestRequiresWorkerProcess:
-    def test_no_declarations_returns_false(self) -> None:
-        # Absence of both declarations is the orchestrator-default case.
-        assert requires_worker_process([]) is False
-
-    def test_compatible_without_suggested_mode_returns_false(self) -> None:
-        # COMPATIBLE alone is "I can run as a worker"; without a suggested
-        # mode the engine still defaults to orchestrator.
-        decls = [WorkerModeCompatibility(compatibility=WorkerCompatibility.COMPATIBLE)]
-        assert requires_worker_process(decls) is False
-
-    def test_compatible_with_suggested_orchestrator_returns_false(self) -> None:
-        decls = [
-            WorkerModeCompatibility(compatibility=WorkerCompatibility.COMPATIBLE),
-            SuggestedWorkerMode(mode=WorkerMode.ORCHESTRATOR),
-        ]
-        assert requires_worker_process(decls) is False
-
-    def test_compatible_with_suggested_worker_returns_true(self) -> None:
-        decls = [
-            WorkerModeCompatibility(compatibility=WorkerCompatibility.COMPATIBLE),
-            SuggestedWorkerMode(mode=WorkerMode.WORKER),
-        ]
-        assert requires_worker_process(decls) is True
-
-    def test_incompatible_with_suggested_orchestrator_returns_false(self) -> None:
-        decls = [
-            WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
-            SuggestedWorkerMode(mode=WorkerMode.ORCHESTRATOR),
-        ]
-        assert requires_worker_process(decls) is False
-
-    def test_suggested_worker_alone_returns_true(self) -> None:
-        # Absence of WorkerModeCompatibility is treated as COMPATIBLE per
-        # the consumer-site default; a SuggestedWorkerMode of WORKER then
-        # selects worker hosting.
-        decls = [SuggestedWorkerMode(mode=WorkerMode.WORKER)]
-        assert requires_worker_process(decls) is True
 
 
 # ---------- Schema version ----------

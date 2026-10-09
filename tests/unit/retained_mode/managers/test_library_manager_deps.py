@@ -49,7 +49,10 @@ from griptape_nodes.retained_mode.managers.library.dependencies import (
     describe_dependency_install,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
-from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
+from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_TO_REGISTER_KEY,
+    LibraryDependencyInstallBehavior,
+)
 from griptape_nodes.utils.version_utils import ShadowedPackage
 
 
@@ -782,14 +785,11 @@ class TestDownloadLibraryRequestAutoRegister:
         assert "fake-library" in str(result.result_details)
 
 
-class TestWorkerDelegatedAdvancedLibrarySkip:
-    """The orchestrator must not import a worker-delegated library's advanced module.
+class TestAdvancedLibraryModuleLoads:
+    """The advanced module is imported on the orchestrator, for every library.
 
-    The advanced module executes in the engine process and its third-party imports
-    resolve against the library venv -- which the orchestrator deliberately never
-    creates for worker-delegated libraries (the worker installs its own deps). Before
-    the skip, any manifest dependency imported by the advanced module raised
-    ModuleNotFoundError on the orchestrator and hard-failed the registration.
+    It executes in the engine process and its third-party imports resolve against the
+    library venv, which the orchestrator builds for every library it registers.
     """
 
     def _make_schema(self, *, advanced_library_path: str | None) -> MagicMock:
@@ -801,9 +801,7 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         schema.settings = None
         return schema
 
-    def _make_lib_info(
-        self, *, state: LibraryManager.LibraryLifecycleState, requires_worker: bool
-    ) -> LibraryManager.LibraryInfo:
+    def _make_lib_info(self, *, state: LibraryManager.LibraryLifecycleState) -> LibraryManager.LibraryInfo:
         return LibraryManager.LibraryInfo(
             lifecycle_state=state,
             library_path="/mock.json",
@@ -811,49 +809,12 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
             library_name="test_lib",
             library_version="1.0.0",
             fitness=LibraryManager.LibraryFitness.GOOD,
-            requires_worker=requires_worker,
         )
 
     @pytest.mark.asyncio
-    async def test_orchestrator_skips_advanced_module_for_worker_delegated_library(self, engine: Engine) -> None:
+    async def test_the_advanced_module_is_loaded_and_handed_to_the_registry(self, engine: Engine) -> None:
         mgr = engine.library_manager
-        lib_info = self._make_lib_info(
-            state=LibraryManager.LibraryLifecycleState.WORKER_DELEGATED, requires_worker=True
-        )
-        schema = self._make_schema(advanced_library_path="lib_advanced.py")
-
-        with (
-            patch.object(
-                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
-            ),
-            patch.object(mgr.environment, "add_library_paths_to_sys_path", new=AsyncMock()),
-            patch.object(mgr.module_loading, "load_advanced_library_module") as mock_advanced,
-            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
-            patch(
-                "griptape_nodes.retained_mode.managers.library.registration.LibraryRegistry.generate_new_library",
-                return_value=MagicMock(),
-            ) as mock_generate,
-        ):
-            result = await mgr.registration._progress_library_through_lifecycle(
-                library_info=lib_info,
-                file_path="/mock.json",
-                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
-            )
-
-        assert result is None
-        mock_advanced.assert_not_called()
-        # The library still registers -- with no advanced instance -- so the editor and
-        # workflow loading see it while the worker loads the real module in its process.
-        assert mock_generate.call_args.kwargs["advanced_library"] is None
-        assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.WORKER_PENDING
-
-    @pytest.mark.asyncio
-    async def test_in_process_library_still_loads_the_advanced_module(self, engine: Engine) -> None:
-        """Pins the non-worker path: the skip must key on worker delegation, not fire always."""
-        mgr = engine.library_manager
-        lib_info = self._make_lib_info(
-            state=LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED, requires_worker=False
-        )
+        lib_info = self._make_lib_info(state=LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED)
         schema = self._make_schema(advanced_library_path="lib_advanced.py")
         advanced_instance = MagicMock()
 
@@ -883,14 +844,12 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         assert mock_generate.call_args.kwargs["advanced_library"] is advanced_instance
 
 
-class TestRequiresWorkerResolvedOnFilePathRegistration:
-    """A by-file-path registration must resolve requires_worker for itself.
+class TestLegacyWorkerModeIsInertOnFilePathRegistration:
+    """A manifest asking for worker mode loads, and its nodes still execute in process.
 
-    This path enters METADATA_LOADED directly, so the DISCOVERED-phase writer that normally
-    resolves requires_worker never runs. Without resolving it here, a library whose manifest
-    suggests worker mode loads in-process when added to a running engine from the editor --
-    and its advanced module then imports manifest dependencies against a venv the
-    orchestrator deliberately never created (the pygit2 breakage).
+    Libraries in the wild declare `suggested_worker_mode: WORKER`. Nothing routes on that any
+    more -- `executes_in_worker` follows the manifest's execution dependencies, and this
+    manifest declares none. The declaration earns one advisory line and no behavior.
     """
 
     def _worker_mode_schema(self) -> MagicMock:
@@ -898,6 +857,7 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
         schema.name = "worker_mode_lib"
         schema.metadata.library_version = "1.0.0"
         schema.metadata.declarations = [SuggestedWorkerMode(mode=WorkerMode.WORKER)]
+        schema.metadata.dependencies = None
         return schema
 
     def _request(self) -> RegisterLibraryFromFileRequest:
@@ -905,12 +865,6 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
     @pytest.mark.asyncio
     async def test_an_existing_library_info_is_updated_in_place(self, engine: Engine) -> None:
-        """Discovered-but-unnamed LibraryInfo: the stale requires_worker must be overwritten.
-
-        `_library_file_path_to_info` can already hold an entry from discovery that never got a
-        library_name (so it defaulted requires_worker to False). Updating every other field
-        while leaving that one stale is how a worker library ends up loading in-process.
-        """
         mgr = engine.library_manager
         lib_info = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
@@ -918,7 +872,6 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
             is_sandbox=False,
             library_name=None,
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
-            requires_worker=False,
         )
 
         with (
@@ -933,12 +886,12 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info is lib_info
-        assert lib_info.requires_worker is True
+        assert lib_info.executes_in_worker is False
         assert lib_info.library_name == "worker_mode_lib"
         assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
     @pytest.mark.asyncio
-    async def test_a_new_library_info_is_created_with_it(self, engine: Engine) -> None:
+    async def test_a_new_library_info_is_created_without_worker_execution(self, engine: Engine) -> None:
         """Nothing discovered yet -- the freshly built LibraryInfo carries the resolved value."""
         mgr = engine.library_manager
 
@@ -953,13 +906,39 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
             result = await mgr.registration._establish_register_library_prerequisites(self._request())
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
-        assert result.library_info.requires_worker is True
+        assert result.library_info.executes_in_worker is False
         assert result.library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
     @pytest.mark.asyncio
-    async def test_a_library_with_no_worker_declaration_stays_in_process(self, engine: Engine) -> None:
-        """The resolution must read the manifest, not default to worker mode for everyone."""
+    async def test_the_declaration_is_advised_on_exactly_once(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One line per library load. A per-attempt log is how this turns into startup noise."""
         mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+
+        with (
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(self._worker_mode_schema()),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {}),
+        ):
+            await mgr.registration._establish_register_library_prerequisites(self._request())
+
+        advisories = [r for r in caplog.records if "legacy worker mode" in r.getMessage()]
+        assert len(advisories) == 1
+        assert "worker_mode_lib" in advisories[0].getMessage()
+        assert "pip_dependencies_exec" in advisories[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_no_worker_declaration_is_not_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The advisory must read the manifest, not fire for every library that loads."""
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
         schema = self._worker_mode_schema()
         schema.metadata.declarations = []
 
@@ -972,7 +951,169 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
             result = await mgr.registration._establish_register_library_prerequisites(self._request())
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
-        assert result.library_info.requires_worker is False
+        assert result.library_info.executes_in_worker is False
+        assert [r for r in caplog.records if "legacy worker mode" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_library_that_took_the_advice_is_not_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Declaring execution dependencies silences it, even alongside the legacy declaration.
+
+        That pairing is the state an author lands in the moment they take the advice, and the
+        engine goes on accepting the declaration. Advising there would make the line
+        unsilenceable by doing the right thing.
+        """
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+        schema = self._worker_mode_schema()
+        schema.metadata.dependencies = MagicMock(pip_dependencies_exec=["torch"])
+
+        with (
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {}),
+        ):
+            result = await mgr.registration._establish_register_library_prerequisites(self._request())
+
+        assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
+        assert result.library_info.executes_in_worker is True
+        assert [r for r in caplog.records if "legacy worker mode" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_worker_does_not_advise_on_the_declaration(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A worker discovers every configured library, so advising there multiplies the line.
+
+        It is also the wrong process to be giving the advice from, being the one already
+        executing nodes for libraries that did declare execution dependencies.
+        """
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+
+        with (
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(self._worker_mode_schema()),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {}),
+            patch.object(mgr, "_is_worker", True),
+        ):
+            await mgr.registration._establish_register_library_prerequisites(self._request())
+
+        assert [r for r in caplog.records if "legacy worker mode" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_config_only_worker_override_is_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The shape the GUI's Shared/Isolated dropdown wrote, so the common one in the field.
+
+        The manifest says nothing; the request lives entirely in the user's config, and it is
+        the one arm whose regression is a silently dropped advisory rather than a crash.
+        """
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+        schema = self._worker_mode_schema()
+        schema.metadata.declarations = []
+        lib_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name=None,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            registered_path="/mock.json",
+        )
+        entries = [{"path": "/mock.json", "worker_mode_override": "WORKER"}]
+
+        with (
+            patch.object(
+                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+            patch.object(
+                engine.config_manager,
+                "get_config_value",
+                side_effect=lambda key, **_kwargs: entries if key == LIBRARIES_TO_REGISTER_KEY else None,
+            ),
+        ):
+            await mgr.registration._establish_register_library_prerequisites(self._request())
+
+        advisories = [r for r in caplog.records if "legacy worker mode" in r.getMessage()]
+        assert len(advisories) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_orchestrator_override_is_not_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """That override outranked the manifest under legacy worker mode, so nothing changed here.
+
+        The library already ran in process, and the advice is to go change a setting whose
+        value is already the outcome it recommends.
+        """
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+        lib_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name=None,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            registered_path="/mock.json",
+        )
+        entries = [{"path": "/mock.json", "worker_mode_override": "ORCHESTRATOR"}]
+
+        with (
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(self._worker_mode_schema()),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+            patch.object(
+                engine.config_manager,
+                "get_config_value",
+                side_effect=lambda key, **_kwargs: entries if key == LIBRARIES_TO_REGISTER_KEY else None,
+            ),
+        ):
+            await mgr.registration._establish_register_library_prerequisites(self._request())
+
+        assert [r for r in caplog.records if "legacy worker mode" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_fixed_after_discovery_is_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A manifest that failed at discovery leaves a DISCOVERED record for the lifecycle to load."""
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+        lib_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name=None,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+        )
+
+        with (
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                side_effect=[_metadata_success(self._worker_mode_schema()), _METADATA_STOP],
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr.registration._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=self._request(),
+            )
+
+        advisories = [r for r in caplog.records if "legacy worker mode" in r.getMessage()]
+        assert len(advisories) == 1
 
 
 class TestPipInstallFailureIsRecordedOnTheLibrary:
@@ -1131,79 +1272,28 @@ class TestExecutionEnvironmentResolvesBothSets:
         assert "no solution found" in reason
 
 
-def _metadata_for_mock(schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuccess:
-    return LoadLibraryMetadataFromFileResultSuccess(
-        library_schema=schema,
-        file_path="/mock.json",
-        git_remote=None,
-        git_ref=None,
-        enabled=True,
-        is_registered=False,
-        result_details=ResultDetails(message="OK", level=20),
-    )
+class TestTheOrchestratorOwnsTheEditVenv:
+    """Exactly one process may write `<library>/.venv`, and it is the orchestrator.
 
-
-class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
-    """A manifest can declare worker mode AND execution dependencies; nothing rejects the pair.
-
-    The orchestrator skips LOADING such a library, which is not the same as skipping its execution
-    environment: the worker receives `.venv-exec` as PYTHONPATH and so cannot be the process that
-    creates it. When the orchestrator skipped the install outright, neither process built it, the
-    spawn was not refused (no failure was recorded), and the worker started with no PYTHONPATH --
-    reaching the raw ModuleNotFoundError that the refusal exists to prevent.
+    Every library loads there, so the orchestrator builds that venv and keeps it on its own
+    sys.path for the session. A worker touching it risks concurrent `uv pip install` runs at one
+    target, and the corrupt-install recovery path rmtrees the directory outright.
     """
 
-    def _worker_mode_info(self) -> LibraryManager.LibraryInfo:
-        info = _make_lib_info()
-        info.requires_worker = True
-        return info
-
-    def _schema(self, mgr: LibraryManager) -> MagicMock:
-        schema = MagicMock()
-        schema.name = "test_lib"
-        schema.metadata.library_version = "1.0.0"
-        schema.metadata.dependencies.pip_dependencies = ["fakeedit"]
-        schema.metadata.dependencies.pip_install_flags = []
-        schema.metadata.dependencies.pip_dependencies_exec = ["faketorch"]
-        schema.metadata.declarations = []
-        mgr._is_worker = False
-        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
-        return schema
-
-    def test_the_orchestrator_does_not_own_the_edit_venv_for_it(self, engine: Engine) -> None:
-        """The worker builds `<library>/.venv`, because only the worker loads the library."""
-        mgr = engine.library_manager
-        mgr._is_worker = False
-        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
-
-        assert mgr.dependencies._this_process_owns_the_edit_venv("/mock.json") is False
-
-    def test_the_orchestrator_still_owns_the_edit_venv_for_an_exec_deps_library(self, engine: Engine) -> None:
-        """Guards the guard: the change above must not stop the ordinary case building."""
+    def test_the_orchestrator_owns_the_edit_venv_for_an_exec_deps_library(self, engine: Engine) -> None:
         mgr = engine.library_manager
         mgr._is_worker = False
         mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
 
         assert mgr.dependencies._this_process_owns_the_edit_venv("/mock.json") is True
 
-    @pytest.mark.asyncio
-    async def test_the_orchestrator_builds_its_execution_environment(self, engine: Engine) -> None:
+    def test_a_worker_refuses_a_library_it_has_no_record_of(self, engine: Engine) -> None:
+        """Guessing wrong re-opens the double-writer hazard, so an unknown library is refused."""
         mgr = engine.library_manager
-        schema = self._schema(mgr)
+        mgr._is_worker = True
+        mgr._library_file_path_to_info.pop("/mock.json", None)
 
-        with (
-            patch.object(
-                mgr.metadata_loading, "load_library_metadata_from_file_request", return_value=_metadata_for_mock(schema)
-            ),
-            patch.object(mgr.dependencies, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
-        ):
-            await mgr.dependencies.install_library_dependencies_request(
-                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
-            )
-
-        targets = [call.kwargs["execution"] for call in install.await_args_list]
-        # Exactly one install, and it is the execution one: the edit-time venv is the worker's.
-        assert targets == [True]
+        assert mgr.dependencies._this_process_owns_the_edit_venv("/mock.json") is False
 
 
 class TestTheInstallMessageDescribesWhatHappened:

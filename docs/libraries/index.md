@@ -6,8 +6,8 @@ ships installed by default; every other library lives in its own Git
 repository and is installed through the editor's **Libraries** panel or the
 `gtn` CLI.
 
-For how installation, updating,
-dependency isolation, and Shared/Isolated modes work, see the
+For how installation, updating, dependency isolation, and process
+isolation work, see the
 [Libraries guide](../guides/libraries.md).
 
 ## Documented libraries

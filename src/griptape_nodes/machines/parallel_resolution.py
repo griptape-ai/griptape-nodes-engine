@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError
@@ -300,6 +301,7 @@ class ExecuteDagState(State):
                         parameter_output_values=display_output_values,
                         node_type=current_node.__class__.__name__,
                         specific_library_name=library_name,
+                        run_seconds=done_node.run_seconds,
                     )
                 )
             )
@@ -601,7 +603,11 @@ class ExecuteDagState(State):
     @staticmethod
     async def execute_node(engine: Engine, current_node: DagNode) -> None:
         executor = engine.flow_manager.node_executor
-        await executor.execute(current_node.node_reference)
+        started_at = time.perf_counter()
+        try:
+            await executor.execute(current_node.node_reference)
+        finally:
+            current_node.run_seconds = time.perf_counter() - started_at
 
     @staticmethod
     async def on_enter(context: ParallelResolutionContext) -> type[State] | None:
@@ -846,6 +852,7 @@ class ExecuteDagState(State):
                                     node_name=node_name,
                                     error_message=str(exc),
                                     error=_node_error_details(node_name, exc),
+                                    run_seconds=dag_node.run_seconds,
                                 )
                             )
                         )

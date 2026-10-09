@@ -1,17 +1,15 @@
-"""Node carrying everything a schema stub drops, for a library routed to a worker.
+"""Node carrying the parameter behaviors that exist only as Python, for a worker-routed library.
 
 The point of this fixture is the combination: the library declares execution dependencies, so
-its execution goes to a worker -- and yet the ORCHESTRATOR holds this real class, so the
-parameter behaviors that only exist in Python survive. A stub rebuilt from
-``WorkerParameterSchema`` carries scalar fields and ``ui_options`` only, so all three of these
-would be gone:
+its execution goes to a worker -- and yet the ORCHESTRATOR holds this real class, so all of
+these reach the editor:
 
 - a ``Button`` trait, whose click handler lives on the trait rather than on the node. This is
-  the worst of the family, because ``ui_options`` DO serialize, so the button renders and
-  looks clickable while being guaranteed to fail (griptape-nodes-engine#5420).
+  the worst of the family to lose, because ``ui_options`` DO serialize, so the button renders
+  and looks clickable while being guaranteed to fail (griptape-nodes-engine#5420).
 - a converter, which rewrites an incoming value.
 - a validator, which refuses one.
-- a value hook and a connection hook override, which a stub class does not carry at all.
+- a value hook and a connection hook override.
 
 Module scope stays clean of the execution dependency on purpose: that is the contract that
 lets the orchestrator import this at all.

@@ -796,21 +796,21 @@ class LibraryDiscovery(EngineScoped):
 
         library_name = None
         library_version = None
-        requires_worker = False
         executes_in_worker = False
         lifecycle_state = LibraryLifecycleState.DISCOVERED
 
         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
             library_name = metadata_result.library_schema.name
             library_version = metadata_result.library_schema.metadata.library_version
-            requires_worker = self.engine.library_manager.workers.resolve_requires_worker(
-                registered_path,
-                metadata_result.library_schema.metadata.declarations,
-            )
-            executes_in_worker = resolve_executes_in_worker(
-                requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
-            )
+            executes_in_worker = resolve_executes_in_worker(metadata=metadata_result.library_schema.metadata)
             lifecycle_state = LibraryLifecycleState.METADATA_LOADED
+            if enabled:
+                self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
+                    library_name=library_name,
+                    registered_path=registered_path,
+                    declarations=metadata_result.library_schema.metadata.declarations,
+                    executes_in_worker=executes_in_worker,
+                )
 
         if not enabled:
             lifecycle_state = LibraryLifecycleState.DISABLED
@@ -824,6 +824,5 @@ class LibraryDiscovery(EngineScoped):
             library_name=library_name,
             library_version=library_version,
             registered_path=registered_path,
-            requires_worker=requires_worker,
             executes_in_worker=executes_in_worker,
         )

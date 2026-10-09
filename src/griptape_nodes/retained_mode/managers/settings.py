@@ -213,8 +213,8 @@ class LibraryRegistration(BaseModel):
     """A library entry in libraries_to_register with optional metadata.
 
     Bare path strings remain valid in the config; this object form is used when
-    additional fields (such as `enabled` or `worker_mode_override`) need to be
-    set per entry. Each entry names an already-present local library by `path`;
+    additional fields (such as `enabled`) need to be set per entry. Each entry
+    names an already-present local library by `path`;
     version-pinned remote sources are declared separately in `libraries_to_download`.
     """
 
@@ -228,10 +228,8 @@ class LibraryRegistration(BaseModel):
     worker_mode_override: WorkerMode | None = Field(
         default=None,
         description=(
-            "Per-library override of the launch mode declared in the library's manifest. "
-            "ORCHESTRATOR or WORKER. Only honored when the manifest declares "
-            "WorkerModeCompatibility.COMPATIBLE; ignored for INCOMPATIBLE libraries. "
-            "None reverts to the manifest's SuggestedWorkerMode."
+            "Accepted for backward compatibility; no longer affects where a library runs. "
+            "A library's nodes execute in a worker when it declares pip_dependencies_exec."
         ),
     )
 
@@ -282,8 +280,8 @@ class AppInitializationComplete(BaseModel):
         description=(
             "Libraries the engine loads on startup. Each entry can be a path to a single "
             "griptape_nodes_library.json file or a folder containing one or more libraries. "
-            "Use the toggle to enable or skip a library, and pick whether it runs alongside "
-            "the engine or in its own isolated process when the library supports it."
+            "Use the toggle to enable or skip a library. Where a library's nodes execute is "
+            "not a setting; a library declaring pip_dependencies_exec executes them in a worker."
         ),
     )
     workflows_to_register: list[str] = Field(default_factory=list)
@@ -365,9 +363,9 @@ class WorkerSettings(BaseModel):
     library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Seconds a worker may take to load its library before the orchestrator marks the "
-            "library as FAILURE. Also bounds how long running a node waits for its library's worker "
-            "to finish loading, and how long a project switch waits for each worker to adopt it. "
+            "Seconds a worker may take to load its library. Bounds how long running a node waits "
+            "for its library's worker to finish loading, and how long a project switch waits for "
+            "each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
             "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),

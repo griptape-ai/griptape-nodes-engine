@@ -4,12 +4,9 @@ Strict mode is a runtime contract for what node code is allowed to do
 across the orchestrator/worker split. This module owns scope, severity
 resolution, and violation reporting -- and nothing else.
 
-Two kinds of strict-mode scope exist:
-
-* ``RUNTIME_EXECUTE`` opens around ``NodeManager.on_execute_node_request``
-  for a single node's execution.
-* ``LOAD_PROBE`` opens around each class's schema probe in
-  ``LibraryWorkers.serialize_library_node_schemas``.
+One kind of strict-mode scope exists: ``RUNTIME_EXECUTE``, which opens
+around ``NodeManager.on_execute_node_request`` for a single node's
+execution.
 
 Detectors live at their own call sites (e.g. ``EventManager.handle_request``,
 ``BaseNode.add_parameter``) and import the module-level singleton
@@ -22,8 +19,7 @@ Severity is picked per-rule by the reporter's severity resolver:
 correctness rules fail on both sides, ergonomics rules warn on the
 orchestrator and escalate to ERROR on the worker. Callers that need to
 escalate a worker violation (e.g. convert ``ExecuteNodeResultSuccess``
-to a failure, or skip a class's schema) inspect the scope's
-``violations`` list after exit.
+to a failure) inspect the scope's ``violations`` list after exit.
 
 "Am I currently constructing a node?" and "What request is currently
 being dispatched?" are NOT owned here. Those facts belong to
@@ -67,7 +63,6 @@ class SeverityResolver(Protocol):
 
 class StrictModeScopeKind(StrEnum):
     RUNTIME_EXECUTE = "runtime_execute"
-    LOAD_PROBE = "load_probe"
 
 
 class StrictModeSeverity(StrEnum):
@@ -280,13 +275,11 @@ class StrictModeReporter:
             message=message,
         )
         scope.violations.append(violation)
-        subject_label = "node" if scope.kind is StrictModeScopeKind.RUNTIME_EXECUTE else "class"
         log = self._logger.error if severity is StrictModeSeverity.ERROR else self._logger.warning
         log(
-            "strict-mode [%s/%s] %s=%s library=%s: %s",
+            "strict-mode [%s/%s] node=%s library=%s: %s",
             scope.kind.value,
             severity.value,
-            subject_label,
             scope.subject,
             scope.library_name,
             message,

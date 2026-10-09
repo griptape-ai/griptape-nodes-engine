@@ -177,7 +177,6 @@ class LibraryManager(EngineScoped):
             self.workers.on_session_started,
         )
 
-        worker_manager.register_worker_evicted_callback(self.workers.on_worker_evicted)
         self._pre_reload_callbacks.append(worker_manager.reset_workers)
 
     def is_initializing(self) -> bool:
@@ -541,14 +540,6 @@ class LibraryManager(EngineScoped):
         # send AppStartSessionRequest again, so workers must be started here.
         await self.workers.maybe_start_workers_for_existing_session()
 
-        # Wait for workers only when restarting into an existing session (workers were just
-        # spawned above). On a fresh boot there is no session yet -- workers start later
-        # when AppStartSessionRequest arrives and will finish before the user can open a
-        # workflow. Awaiting here on fresh boot would wait the full worker-startup grace
-        # period for workers that haven't started yet.
-        if self.engine.get_session_id():
-            await self.workers.await_pending_workers()
-
         # Register all secrets now that libraries are loaded and settings are merged
         self.engine.secrets_manager.register_all_secrets()
 
@@ -565,8 +556,8 @@ class LibraryManager(EngineScoped):
         # table and "engine ready" banner, and other consumers (the GUI, the
         # desktop app) can react to the same event. Only the orchestrator
         # announces readiness; dedicated library workers do not. Presentation is
-        # owned by the app, not the engine. The library statuses reflect real
-        # fitness because workers have already reported back above.
+        # owned by the app, not the engine. The statuses are the orchestrator's own
+        # verdicts, derived from loading each library's real node modules here.
         if not self._is_worker:
             self.engine.event_manager.put_event(
                 AppEvent(
@@ -663,14 +654,9 @@ class LibraryManager(EngineScoped):
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
         await self.workers.maybe_start_workers_for_existing_session()
 
-        # Wait for worker-delegated libraries to finish loading before returning. The GUI
-        # opens the current workflow immediately on receiving the result, so all node types
-        # must be registered before we respond.
-        await self.workers.await_pending_workers()
-
-        # Signal readiness again so the app re-renders the library status table with real
-        # fitness now that workers have reported back. is_initial_start=False so the app
-        # refreshes the table without re-showing the startup banner. Orchestrator only.
+        # Signal readiness again so the app re-renders the library status table against the
+        # reloaded set. is_initial_start=False so the app refreshes the table without
+        # re-showing the startup banner. Orchestrator only.
         if not self._is_worker:
             self.engine.event_manager.put_event(
                 AppEvent(

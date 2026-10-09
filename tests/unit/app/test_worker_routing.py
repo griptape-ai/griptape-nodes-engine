@@ -7,7 +7,7 @@ These tests pin down the two invariants that replaced the old
    inside a ``node_execution_scope``. Outside that scope it delegates
    to the ``original`` handler it displaced, which preserves bootstrap and
    library-load behaviour (e.g. nodes calling ``self.add_parameter(...)``
-   during LOAD_PROBE).
+   from ``__init__``).
 2. ``register_remote_handlers`` swaps the dispatch table entry for every
    registered type outside ``LOCAL_ONLY_REQUEST_TYPES``, preserving the "one handler per
    request type" invariant enforced by ``assign_manager_to_request_type``.
@@ -273,12 +273,12 @@ class TestInstallRemoteHandlersSwap:
         assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
 
     def test_post_install_out_of_scope_still_runs_original(self) -> None:
-        """Bootstrap-path regression guard: LOAD_PROBE-style calls must stay local.
+        """Bootstrap-path regression guard: construction-time calls must stay local.
 
-        A node's ``__init__`` running under LOAD_PROBE will issue an
-        ``AddParameterToNodeRequest`` outside ``node_execution_scope``.
-        The RemoteHandler installed for that type must delegate to the
-        original handler rather than trying to forward.
+        A node's ``__init__`` issues an ``AddParameterToNodeRequest`` outside
+        ``node_execution_scope``, including when the worker materializes a transient
+        node for a dispatch. The RemoteHandler installed for that type must delegate
+        to the original handler rather than trying to forward.
         """
         event_manager = EventManager()
 

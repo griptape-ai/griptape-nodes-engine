@@ -175,31 +175,29 @@ class TestParameterMutationDetector:
             mock_node.add_parameter(param)
         assert scope.violations == []
 
-    def test_no_violation_when_add_parameter_called_from_init_under_load_probe(self) -> None:
-        """__init__ calls to add_parameter during a LOAD_PROBE scope are not violations.
+    def test_no_violation_when_add_parameter_called_from_init_inside_a_scope(self) -> None:
+        """__init__ calls to add_parameter are not violations even with a scope open.
 
-        LibraryWorkers.serialize_library_node_schemas instantiates every node
-        class inside a LOAD_PROBE scope. Nodes legitimately declare their
-        parameters by calling self.add_parameter(...) from __init__, so those
-        calls must not report parameter-mutation-during-aprocess. The
-        constructor flag suppresses the rule in this case; the
-        ``_in_aprocess`` flag is also unset because no aprocess is running.
+        Nodes legitimately declare their parameters by calling self.add_parameter(...)
+        from __init__, so those calls must not report
+        parameter-mutation-during-aprocess. The constructor flag suppresses the rule in
+        this case; the ``_in_aprocess`` flag is also unset because no aprocess is running.
         """
 
         class NodeAddsParameterInInit(MockNode):
-            def __init__(self, name: str = "probe_node") -> None:
+            def __init__(self, name: str = "declaring_node") -> None:
                 super().__init__(name=name)
                 self.add_parameter(Parameter(name="declared_in_init", type="str"))
 
         token = _constructing_node.set(True)
         try:
             with STRICT_MODE.open_scope(
-                kind=StrictModeScopeKind.LOAD_PROBE,
+                kind=StrictModeScopeKind.RUNTIME_EXECUTE,
                 subject="NodeAddsParameterInInit",
                 library_name="test_library",
                 is_worker=True,
             ) as scope:
-                NodeAddsParameterInInit(name="__schema_probe__")
+                NodeAddsParameterInInit(name="declaring_node")
         finally:
             _constructing_node.reset(token)
         assert scope.violations == []
