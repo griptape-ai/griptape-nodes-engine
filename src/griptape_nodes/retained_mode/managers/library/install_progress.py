@@ -27,7 +27,7 @@ _SUMMARY_PACKAGE_LIMIT = 3
 # terminal, one per event, with no progress bars: "Downloading torch (2.0GiB)" only for packages
 # large enough to be worth announcing, " Downloaded torch" when that download finishes, and
 # "Prepared 35 packages in 4m 12s" once everything is downloaded and built.
-_DOWNLOADING_LINE = re.compile(r"^Downloading (?P<name>\S+) \((?P<size>[\d.]+\s*[KMGT]?i?B)\)$")
+_DOWNLOADING_LINE = re.compile(r"^Downloading (?P<name>\S+) \((?P<size>\d+(?:\.\d+)?\s*[KMGT]?i?B)\)$")
 _DOWNLOADED_LINE = re.compile(r"^Downloaded (?P<name>\S+)$")
 _PREPARED_LINE = re.compile(r"^Prepared (?P<count>\d+) packages?\b")
 # Printed at the start of every uv run, including the retry without the engine's version floors.
@@ -36,7 +36,7 @@ _RESOLVED_LINE = re.compile(r"^Resolved \d+ packages?\b")
 # (torch, the CUDA wheels), and there are only a few per install. Smaller ones go to DEBUG, so a
 # console at the default level is not filled with every package. The editor gets them all.
 _INFO_DOWNLOAD_BYTES = 100 * 1024**2
-_SIZE = re.compile(r"^(?P<amount>[\d.]+)\s*(?P<unit>[KMGT]?)i?B$")
+_SIZE = re.compile(r"^(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?)i?B$")
 _UNIT_EXPONENTS = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}
 
 
@@ -186,6 +186,9 @@ class LibraryInstallProgress:
             self._pending_downloads.pop(downloaded.group("name"), None)
             if self._pending_downloads:
                 self._report(self._detail_for_downloads())
+            else:
+                # uv can still be building packages before it reports them all prepared.
+                self._report(f"Preparing packages for {self._purpose}...")
 
     def clear(self) -> None:
         """Clear the install's detail once the installer has stopped, whether it worked or not.

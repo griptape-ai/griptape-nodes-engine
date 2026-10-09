@@ -410,6 +410,7 @@ class TestInstallerProgressFromUv:
             "Downloading pillow (4.6MiB) for Diffusers...",
             "Downloading torch (2.0GiB) and 1 more for Diffusers...",
             "Downloading torch (2.0GiB) for Diffusers...",
+            "Preparing packages for Diffusers...",
             "Installing 35 packages for Diffusers...",
             None,
         ]
