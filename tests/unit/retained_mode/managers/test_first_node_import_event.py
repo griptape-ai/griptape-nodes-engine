@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import types
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,14 +23,16 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.app_events import InitializationStatus, LibraryNodesLoading
-from griptape_nodes.retained_mode.events.base_events import AppEvent, EventResultFailure
+from griptape_nodes.retained_mode.events.base_events import AppEvent, EventResultFailure, RequestPayload
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultFailure
+from griptape_nodes.retained_mode.managers.event_manager import _AsyncRequestPreparer
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Awaitable, Callable, Iterator
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -437,6 +440,23 @@ class TestIsNodeTypeLoaded:
             library.is_node_type_loaded("NoSuchNode")
 
 
+@dataclass
+class _UnhandledRequest(RequestPayload):
+    pass
+
+
+def _preparer_for_node_creation(
+    engine: Engine, preparer: Callable[[RequestPayload], Awaitable[None]]
+) -> AbstractContextManager[object]:
+    """Swap in a preparer for `CreateNodeRequest`, tied to the engine's own handler for it."""
+    event_manager = engine.event_manager
+    handler = event_manager._request_type_to_manager[CreateNodeRequest]
+    return patch.dict(
+        event_manager._async_request_preparers,
+        {CreateNodeRequest: _AsyncRequestPreparer(handler=handler, preparer=preparer)},
+    )
+
+
 class TestAsyncRequestPreparer:
     @pytest.mark.asyncio
     async def test_runs_before_the_handler_on_the_async_path_only(self, engine: Engine) -> None:
@@ -451,7 +471,10 @@ class TestAsyncRequestPreparer:
 
         event_manager = engine.event_manager
         with (
-            patch.dict(event_manager._async_request_preparers, {CreateNodeRequest: preparer}),
+            patch.dict(
+                event_manager._async_request_preparers,
+                {CreateNodeRequest: _AsyncRequestPreparer(handler=handler, preparer=preparer)},
+            ),
             patch.dict(event_manager._request_type_to_manager, {CreateNodeRequest: handler}),
         ):
             await engine.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
@@ -464,7 +487,7 @@ class TestAsyncRequestPreparer:
         async def preparer(_request: object) -> None:
             raise RuntimeError
 
-        with patch.dict(engine.event_manager._async_request_preparers, {CreateNodeRequest: preparer}):
+        with _preparer_for_node_creation(engine, preparer):
             result = await engine.event_manager.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
 
         assert isinstance(result, EventResultFailure)
@@ -482,12 +505,40 @@ class TestAsyncRequestPreparer:
         event_manager = engine.event_manager
         event_manager.add_pre_dispatch_hook(refuse)
         try:
-            with patch.dict(event_manager._async_request_preparers, {CreateNodeRequest: preparer}):
+            with _preparer_for_node_creation(engine, preparer):
                 await event_manager.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
         finally:
             event_manager.remove_pre_dispatch_hook(refuse)
 
         assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_is_skipped_when_another_handler_has_taken_the_request_type_over(self, engine: Engine) -> None:
+        calls: list[str] = []
+
+        async def preparer(_request: object) -> None:
+            calls.append("preparer")
+
+        def forwarding_handler(request: CreateNodeRequest) -> CreateNodeResultFailure:
+            calls.append("forwarded")
+            return CreateNodeResultFailure(result_details=f"forwarded {request.node_type}")
+
+        event_manager = engine.event_manager
+        # Like a worker, which forwards node creation to the orchestrator instead of handling it.
+        with (
+            _preparer_for_node_creation(engine, preparer),
+            patch.dict(event_manager._request_type_to_manager, {CreateNodeRequest: forwarding_handler}),
+        ):
+            await event_manager.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
+
+        assert calls == ["forwarded"]
+
+    def test_a_request_type_with_no_handler_cannot_get_a_preparer(self, engine: Engine) -> None:
+        async def preparer(_request: object) -> None:
+            return None
+
+        with pytest.raises(ValueError, match="no handler is registered"):
+            engine.event_manager.register_async_request_preparer(_UnhandledRequest, preparer)
 
     def test_a_second_preparer_for_the_same_request_type_is_refused(self, engine: Engine) -> None:
         async def preparer(_request: object) -> None:

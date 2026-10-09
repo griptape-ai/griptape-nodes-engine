@@ -9,7 +9,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from asyncio_thread_runner import ThreadRunner
 from typing_extensions import TypedDict, TypeVar
@@ -174,6 +174,13 @@ class ResultContext(TypedDict, total=False):
     request_id: str | None
 
 
+class _AsyncRequestPreparer(NamedTuple):
+    """A preparer and the handler it was registered alongside, which it runs before."""
+
+    handler: Callable[..., Any]
+    preparer: Callable[[RequestPayload], Awaitable[None]]
+
+
 class EventManager(EngineScoped):
     def __init__(self, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -222,7 +229,7 @@ class EventManager(EngineScoped):
         # Async preparers, keyed by exact request type, awaited by `ahandle_request` just before a
         # request's handler. They let a synchronous handler's slow first step be announced and the
         # announcement sent before the handler blocks the event loop.
-        self._async_request_preparers: dict[type[RequestPayload], Callable[[RequestPayload], Awaitable[None]]] = {}
+        self._async_request_preparers: dict[type[RequestPayload], _AsyncRequestPreparer] = {}
         # Post-dispatch hooks, keyed by exact request type. Notification-only: they run
         # after the result exists and cannot change it. Lists rather than sets because a
         # callback need not be hashable -- a callable dataclass (RemoteHandler) has
@@ -410,13 +417,22 @@ class EventManager(EngineScoped):
         assume the state it checked is unchanged when the handler starts. An exception it raises is
         reported as the request's failure, like one from the handler. One preparer per request type.
 
+        The preparer is tied to the handler registered for ``request_type`` now, and runs only when
+        that handler is the one dispatching. A preparer can then rely on its handler running after
+        it: when another handler takes the request type over, such as a worker forwarding the
+        request to the orchestrator, the preparer is skipped.
+
         Raises:
-            ValueError: If ``request_type`` already has a preparer.
+            ValueError: If ``request_type`` already has a preparer, or has no handler yet.
         """
         if request_type in self._async_request_preparers:
             msg = f"Attempted to register an async preparer for '{request_type.__name__}'. Failed because one is already registered."
             raise ValueError(msg)
-        self._async_request_preparers[request_type] = preparer
+        handler = self._request_type_to_manager.get(request_type)
+        if handler is None:
+            msg = f"Attempted to register an async preparer for '{request_type.__name__}'. Failed because no handler is registered for it yet."
+            raise ValueError(msg)
+        self._async_request_preparers[request_type] = _AsyncRequestPreparer(handler=handler, preparer=preparer)
 
     def remove_pre_dispatch_hook(
         self,
@@ -1170,7 +1186,10 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
 
-        preparer = self._async_request_preparers.get(request_type)
+        preparer = None
+        registered_preparer = self._async_request_preparers.get(request_type)
+        if registered_preparer is not None and registered_preparer.handler == callback:
+            preparer = registered_preparer.preparer
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
