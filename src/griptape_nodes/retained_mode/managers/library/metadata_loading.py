@@ -251,6 +251,7 @@ class LibraryMetadataLoading(EngineScoped):
                 # same name. Only the environment's own entry can be the one that loaded.
                 if environment_mode and not discovered.from_environment:
                     metadata_result.is_registered = False
+                self._stamp_load_outcome(metadata_result)
                 successful_libraries.append(metadata_result)
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
@@ -286,6 +287,7 @@ class LibraryMetadataLoading(EngineScoped):
                 # else: Keep the load failure result
 
             if isinstance(sandbox_result, LoadLibraryMetadataFromFileResultSuccess):
+                self._stamp_load_outcome(sandbox_result)
                 successful_libraries.append(sandbox_result)
             else:
                 failed_libraries.append(sandbox_result)
@@ -298,3 +300,18 @@ class LibraryMetadataLoading(EngineScoped):
             failed_libraries=failed_libraries,
             result_details=details,
         )
+
+    def _stamp_load_outcome(self, metadata_result: LoadLibraryMetadataFromFileResultSuccess) -> None:
+        """Copy the engine's record of the last load attempt for this file onto its metadata.
+
+        A manifest that parses says nothing about whether the library then loaded: one whose
+        dependency install failed reads exactly like one added since the last refresh, unless the
+        record of the attempt travels with it.
+        """
+        library_info = self.engine.library_manager._library_file_path_to_info.get(metadata_result.file_path)
+        if library_info is None:
+            return
+        metadata_result.lifecycle_state = library_info.lifecycle_state.value
+        metadata_result.fitness = library_info.fitness.value
+        metadata_result.problems = self.engine.library_manager.catalog.collate_problems_for_lib_info(library_info)
+        metadata_result.execution_env_failure = library_info.execution_env_failure
