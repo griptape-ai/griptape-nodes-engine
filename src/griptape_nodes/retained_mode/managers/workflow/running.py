@@ -172,7 +172,6 @@ class WorkflowRunner(EngineScoped):
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
-            logger.error(execution_result.execution_details)
             return RunWorkflowFromScratchResultFailure(
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
             )
@@ -205,7 +204,6 @@ class WorkflowRunner(EngineScoped):
                 status=execution_result.status,
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
-        logger.error(execution_result.execution_details)
         return RunWorkflowWithCurrentStateResultFailure(
             result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
         )

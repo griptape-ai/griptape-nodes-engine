@@ -3258,7 +3258,6 @@ class ProjectManager(EngineScoped):
                 f"Attempted to activate project '{resolved_project_id}'. Failed because no loaded "
                 f"project template has that id, so its configuration could not be established."
             )
-            logger.error(details)
             return SetCurrentProjectResultFailure(result_details=details)
 
         return self._refuse_unresolvable_declared_paths(project_info)

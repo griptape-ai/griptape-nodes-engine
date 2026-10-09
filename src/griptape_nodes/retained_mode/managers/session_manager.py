@@ -295,7 +295,6 @@ class SessionManager:
             )
         except Exception as err:
             details = f"Failed to end session due to '{err}'."
-            logger.error(details)
             return AppEndSessionResultFailure(result_details=details)
 
     @handles(AppGetSessionRequest)
@@ -315,14 +314,12 @@ class SessionManager:
             active_session_id = self.active_session_id
             if active_session_id is None:
                 details = "Session heartbeat received but no active session found"
-                logger.warning(details)
                 return SessionHeartbeatResultFailure(result_details=details)
 
             details = f"Session heartbeat successful for session: {active_session_id}"
             return SessionHeartbeatResultSuccess(result_details=details)
         except Exception as err:
             details = f"Failed to handle session heartbeat: {err}"
-            logger.error(details)
             return SessionHeartbeatResultFailure(result_details=details)
 
     @staticmethod

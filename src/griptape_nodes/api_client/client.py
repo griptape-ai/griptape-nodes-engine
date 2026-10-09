@@ -191,7 +191,6 @@ class Client:
             await asyncio.wait_for(self._connection_ready.wait(), timeout=10.0)
             logger.debug("WebSocket client connected")
         except TimeoutError as e:
-            logger.error("Failed to connect WebSocket client: timeout")
             msg = "Connection timeout - failed to connect to Nodes API."
             raise ConnectionError(msg) from e
 

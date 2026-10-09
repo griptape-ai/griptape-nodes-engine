@@ -1878,7 +1878,6 @@ class FlowManager(EngineScoped):
 
             if serialized_node is None:
                 error_msg = f"Data integrity error: Could not find serialized node for package node '{package_node.name}'. This indicates a logic error in the serialization process."
-                logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
             package_alter_parameter_commands = []
@@ -2831,14 +2830,14 @@ class FlowManager(EngineScoped):
                 debug_mode=request.debug_mode,
             )
         except Exception as e:
-            details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
+            details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
         if self._global_control_flow_machine:
             resolution_machine = self._global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
+                result_details = f"Attempted to run flow '{flow_name}'. Failed due to: {error_message}"
                 exception = RuntimeError(error_message)
                 # Pass through the error message without adding extra wrapping
                 return StartFlowResultFailure(
@@ -2909,7 +2908,7 @@ class FlowManager(EngineScoped):
                 debug_mode=request.debug_mode,
             )
         except Exception as e:
-            details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
+            details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
 
         if self._global_control_flow_machine:
@@ -4887,7 +4886,6 @@ class FlowManager(EngineScoped):
 
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                logger.error("Node '%s' failed: %s", node.name, error_message)
                 self._global_single_node_resolution = False
                 self._global_control_flow_machine.context.current_nodes = []
                 self.engine.event_manager.put_event(

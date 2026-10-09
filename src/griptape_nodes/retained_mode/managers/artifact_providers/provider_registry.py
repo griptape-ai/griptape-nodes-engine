@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -12,8 +11,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
         BaseArtifactProvider,
     )
-
-logger = logging.getLogger("griptape_nodes")
 
 
 class ProviderRegistry(EngineScoped):
@@ -110,7 +107,6 @@ class ProviderRegistry(EngineScoped):
             try:
                 self._provider_instances[provider_class] = provider_class(registry=self, engine=self.engine)
             except Exception as e:
-                logger.error("Failed to instantiate provider %s: %s", provider_class.__name__, e)
                 msg = f"Failed to instantiate provider {provider_class.__name__}: {e}"
                 raise RuntimeError(msg) from e
 

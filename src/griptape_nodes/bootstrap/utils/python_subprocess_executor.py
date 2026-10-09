@@ -119,7 +119,6 @@ class PythonSubprocessExecutor:
             if returncode == 0:
                 logger.debug("Subprocess completed successfully with return code: %d", returncode)
             else:
-                logger.error("Subprocess failed with return code: %d", returncode)
                 msg = f"Subprocess failed with return code: {returncode}"
                 raise RuntimeError(msg)  # noqa: TRY301
 

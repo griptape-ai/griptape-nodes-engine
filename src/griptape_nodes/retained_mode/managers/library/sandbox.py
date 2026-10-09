@@ -43,12 +43,18 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileRequest,
     LoadLibraryMetadataFromFileResultFailure,
     LoadLibraryMetadataFromFileResultSuccess,
+    RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultSuccess,
     RegisterSandboxNodeFromSourceRequest,
     RegisterSandboxNodeFromSourceResultFailure,
     RegisterSandboxNodeFromSourceResultSuccess,
+    ReloadSandboxLibraryRequest,
+    ReloadSandboxLibraryResultFailure,
+    ReloadSandboxLibraryResultSuccess,
     ScanSandboxDirectoryRequest,
     ScanSandboxDirectoryResultFailure,
     ScanSandboxDirectoryResultSuccess,
+    UnloadLibraryFromRegistryRequest,
 )
 from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
@@ -110,6 +116,9 @@ class SandboxCandidates:
 class LibrarySandbox(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
+        # Serializes ReloadSandboxLibraryRequest: two quick refreshes must not interleave unload,
+        # rescan, and register.
+        self._sandbox_reload_lock = asyncio.Lock()
         event_manager.register_request_handlers(self)
 
     def get_sandbox_directory(self) -> Path | None:
@@ -174,7 +183,7 @@ class LibrarySandbox(EngineScoped):
         )
 
     @handles(RegisterSandboxNodeFromSourceRequest)
-    def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911
+    def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911, PLR0912
         self, request: RegisterSandboxNodeFromSourceRequest
     ) -> ResultPayload:
         """Register node types from a `.py` file in the sandbox dir.
@@ -197,6 +206,14 @@ class LibrarySandbox(EngineScoped):
         discovers files that exist on disk but are absent from the manifest, and the loader
         resolves their class names and writes the manifest back for us.
         """
+        # The environment decides every node type that exists, so none is added from a loose file
+        # unless the sandbox is enabled; the sandbox can also be turned off when the engine provisions.
+        managed = self.engine.library_manager.managed_environment
+        if not managed.sandbox_enabled():
+            return RegisterSandboxNodeFromSourceResultFailure(
+                result_details=managed.sandbox_off_message(f"add the sandbox node in '{request.file_path}'")
+            )
+
         # Resolve and validate the sandbox directory. Agents cannot register nodes on a
         # system that has not opted in to a sandbox.
         sandbox_dir = self.get_sandbox_directory()
@@ -329,6 +346,35 @@ class LibrarySandbox(EngineScoped):
             replaced_class_names=replaced_class_names,
             result_details=summary,
         )
+
+    @handles(ReloadSandboxLibraryRequest)
+    async def reload_sandbox_library_request(self, request: ReloadSandboxLibraryRequest) -> ResultPayload:  # noqa: ARG002
+        """Reload only the sandbox library: unregister it, rescan its directory, and register it again.
+
+        Every other library stays loaded and no worker is restarted, which is what lets an artist
+        pick up a new sandbox node in a studio environment without relaunching. Workflow state is
+        not cleared; nodes already in a workflow keep the class they were created with. Reloads run
+        one at a time, and never alongside a reload of every library. If the rescan or register
+        fails after the unload, the sandbox stays unloaded until a reload succeeds, as with
+        ReloadAllLibrariesRequest.
+        """
+        managed = self.engine.library_manager.managed_environment
+        if not managed.sandbox_enabled():
+            return ReloadSandboxLibraryResultFailure(
+                result_details=managed.sandbox_off_message("reload the sandbox library")
+            )
+
+        if self.get_sandbox_directory() is None:
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    "Attempted to reload the sandbox library. Failed because no sandbox directory is set up, "
+                    "or the configured one does not exist. Set it in Settings -> Libraries -> Sandbox "
+                    "Settings first."
+                )
+            )
+
+        async with self._sandbox_reload_lock:
+            return await self._reload_sandbox_library_behind_gate()
 
     async def attempt_generate_sandbox_library_from_schema(  # noqa: C901
         self,
@@ -501,6 +547,74 @@ class LibrarySandbox(EngineScoped):
             return False
 
         return True
+
+    async def _reload_sandbox_library_behind_gate(self) -> ResultPayload:
+        """Run the reload with the libraries-loading gate closed, as a reload of every library does.
+
+        Waiting for the gate to open lets a running reload of every library finish first. Closing
+        it then keeps a new one out until this reload is done: ReloadAllLibrariesRequest lists the
+        registered libraries through a gated query before it unloads anything, so it waits here
+        instead of unloading the sandbox mid-register. Library queries wait too, rather than
+        seeing the sandbox missing.
+        """
+        library_manager = self.engine.library_manager
+        # Loop because another coroutine may close the gate between it opening and this resuming.
+        while not library_manager._libraries_loading_complete.is_set():
+            await library_manager._libraries_loading_complete.wait()
+        library_manager._close_libraries_loading_gate()
+        gate = library_manager._libraries_loading_complete
+        try:
+            return await self._reload_sandbox_library()
+        finally:
+            gate.set()
+
+    async def _reload_sandbox_library(self) -> ResultPayload:
+        registration = self.engine.library_manager.registration
+        if is_library_name_registered(SANDBOX_LIBRARY_NAME):
+            unload_result = registration.unload_library_from_registry_request(
+                UnloadLibraryFromRegistryRequest(library_name=SANDBOX_LIBRARY_NAME)
+            )
+            if not unload_result.succeeded():
+                return ReloadSandboxLibraryResultFailure(
+                    result_details=(
+                        f"Attempted to reload the sandbox library. Failed because it could not be unloaded: "
+                        f"{unload_result.result_details}"
+                    )
+                )
+
+        # A sandbox that failed to load is not registered, so the unload above left its record; drop
+        # it so the rescan starts clean instead of finding it still in FAILURE.
+        library_infos = self.engine.library_manager._library_file_path_to_info
+        for stale_path in [path for path, info in library_infos.items() if info.is_sandbox]:
+            del library_infos[stale_path]
+
+        sandbox_json_path = self.engine.library_manager.discovery.discover_sandbox_library()
+        if sandbox_json_path is None:
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    "Attempted to reload the sandbox library. Failed because its directory could not be "
+                    "scanned for node files. Check the engine log for details."
+                )
+            )
+
+        register_result = await registration.register_library_from_file_request(
+            RegisterLibraryFromFileRequest(file_path=str(sandbox_json_path), load_as_default_library=False)
+        )
+        if not isinstance(register_result, RegisterLibraryFromFileResultSuccess):
+            return ReloadSandboxLibraryResultFailure(
+                result_details=(
+                    f"Attempted to reload the sandbox library. Failed because it could not be loaded: "
+                    f"{register_result.result_details}"
+                )
+            )
+
+        node_types = LibraryRegistry.get_library(name=SANDBOX_LIBRARY_NAME).get_registered_nodes()
+        return ReloadSandboxLibraryResultSuccess(
+            node_types=node_types,
+            result_details=ResultDetails(
+                message=f"Reloaded the sandbox library with {len(node_types)} node type(s).", level=logging.INFO
+            ),
+        )
 
     def _register_sandbox_workflow_node_from_source(
         self,
@@ -767,7 +881,9 @@ class LibrarySandbox(EngineScoped):
 
             engine_version = self.engine.handle_engine_version_request(request=GetEngineVersionRequest())
             if not isinstance(engine_version, GetEngineVersionResultSuccess):
-                details = "Could not get engine version for sandbox library generation."
+                details = (
+                    f"Could not get engine version for sandbox library generation: {engine_version.result_details}"
+                )
                 return LoadLibraryMetadataFromFileResultFailure(
                     library_path=sandbox_library_dir_as_posix,
                     library_name=SANDBOX_LIBRARY_NAME,

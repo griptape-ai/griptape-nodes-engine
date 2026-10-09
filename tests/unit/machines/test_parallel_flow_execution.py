@@ -667,7 +667,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert task not in context.task_to_node
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
-        assert context.error_message is not None
+        assert context.error_message == "Node 'n' encountered a problem: boom"
 
     @pytest.mark.asyncio
     async def test_errored_task_sends_the_node_error_in_parts(self) -> None:
@@ -707,6 +707,8 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert payload.error is not None
         assert payload.error.message == "Key 'b' not found"
         assert payload.error.exception_type == "builtins.KeyError"
+        # ExecuteNodeFailedError already names the node, so the run's message adds no second prefix.
+        assert context.error_message == flattened
 
 
 class TestLockedNodeIsNeverQueuedOrExecuted:

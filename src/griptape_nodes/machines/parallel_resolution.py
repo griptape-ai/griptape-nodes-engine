@@ -518,7 +518,6 @@ class ExecuteDagState(State):
                 )
                 if isinstance(result, SetParameterValueResultFailure):
                     msg = f"Failed to set parameter value for node '{current_node.name}' and parameter '{parameter.name}'. Details: {result.result_details}"
-                    logger.error(msg)
                     raise RuntimeError(msg)
 
     @staticmethod
@@ -840,7 +839,11 @@ class ExecuteDagState(State):
 
                     # Every caller of the machine reports the failure from `get_error_message()`.
                     logger.debug("Node '%s' failed", node_name, exc_info=exc)
-                    msg = f"Node '{node_name}' encountered a problem: {exc}"
+                    # ExecuteNodeFailedError already names the node.
+                    if isinstance(exc, ExecuteNodeFailedError):
+                        msg = str(exc)
+                    else:
+                        msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(
                         ExecutionGriptapeNodeEvent(

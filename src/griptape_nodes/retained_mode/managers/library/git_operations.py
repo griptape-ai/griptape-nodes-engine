@@ -155,6 +155,24 @@ class LibraryGitOperations(EngineScoped):
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no Library with that name was registered."
             return CheckLibraryUpdateResultFailure(result_details=details)
 
+        # The environment chose this version, and a newer one arrives only through it, so there is
+        # nothing to ask git about. Answered as a success: nothing is wrong with the library.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            current_version = library.get_metadata().library_version
+            return CheckLibraryUpdateResultSuccess(
+                has_update=False,
+                current_version=current_version,
+                latest_version=current_version,
+                git_remote=None,
+                git_ref=None,
+                local_commit=None,
+                remote_commit=None,
+                result_details=(
+                    f"Library '{library_name}' is provided by the environment this engine runs in. "
+                    f"Updates come from whoever set up that environment."
+                ),
+            )
+
         # Find the library file path. Route through the shared resolver so the update path
         # (_validate_and_prepare_library_for_git_operation) and this check path can never
         # disagree about which on-disk copy a duplicately-registered library maps to.
@@ -350,6 +368,12 @@ class LibraryGitOperations(EngineScoped):
         """
         library_name = request.library_name
 
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return UpdateLibraryResultFailure(
+                result_details=managed.environment_provides_libraries_message(f"update library '{library_name}'")
+            )
+
         # Validate library and prepare for git operation
         validation_result = await self._validate_and_prepare_library_for_git_operation(
             library_name=library_name,
@@ -386,7 +410,6 @@ class LibraryGitOperations(EngineScoped):
                     f"{age_gate.age_hours:.1f}h old, younger than the required {age_gate.minimum_release_age_hours:.1f}h "
                     f"minimum release age (library.minimum_release_age). Try again once the target commit ages."
                 )
-                logger.info(details)
                 return UpdateLibraryResultFailure(result_details=details, age_gated=True)
 
         # Perform git update (auto-detects branch vs tag workflow)
@@ -450,10 +473,18 @@ class LibraryGitOperations(EngineScoped):
         )
 
     @handles(SwitchLibraryRefRequest)
-    async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:
+    async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:  # noqa: PLR0911 (each failure returns its own result)
         """Switch a library to a different git branch or tag."""
         library_name = request.library_name
         ref_name = request.ref_name
+
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return SwitchLibraryRefResultFailure(
+                result_details=managed.environment_provides_libraries_message(
+                    f"switch library '{library_name}' to '{ref_name}'"
+                )
+            )
 
         # Validate library and prepare for git operation
         validation_result = await self._validate_and_prepare_library_for_git_operation(
@@ -515,6 +546,14 @@ class LibraryGitOperations(EngineScoped):
     @handles(DownloadLibraryRequest)
     async def download_library_request(self, request: DownloadLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Download a library from a git repository."""
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return DownloadLibraryResultFailure(
+                result_details=managed.environment_provides_libraries_message(
+                    f"download the library at '{request.git_url}'"
+                )
+            )
+
         parsed_url = parse_git_url_with_ref(normalize_github_url(request.git_url))
         git_url = parsed_url.url
         # Explicit branch_tag_commit wins over a url@ref suffix.
@@ -670,7 +709,6 @@ class LibraryGitOperations(EngineScoped):
             checkout = sparse_checkout_library_json(normalized_url, ref)
         except GitError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
-            logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
 
         library_version = checkout.library_version
@@ -682,7 +720,6 @@ class LibraryGitOperations(EngineScoped):
             library_schema = LibrarySchema(**library_data_raw)
         except Exception as e:
             details = f"Invalid library schema from {normalized_url}: {e}"
-            logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
 
         # Return success with full library metadata
@@ -832,6 +869,16 @@ class LibraryGitOperations(EngineScoped):
             On success: LibraryGitOperationContext with library info
             On failure: ResultPayloadFailure instance
         """
+        # Every git operation on an installed library comes through here, so environment mode is
+        # enforced here too, not only by each handler's own check.
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return failure_result_class(
+                result_details=managed.environment_provides_libraries_message(
+                    f"{operation_description} Library '{library_name}'"
+                )
+            )
+
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None:
             details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no Library with that name was found."

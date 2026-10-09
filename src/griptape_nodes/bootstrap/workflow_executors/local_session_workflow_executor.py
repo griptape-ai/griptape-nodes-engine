@@ -162,7 +162,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
                 if isinstance(start_flow_result, StartFlowResultFailure):
                     msg = f"Failed to start flow {flow_name}"
-                    logger.error(msg)
                     event_result_failure = EventResultFailure(request=start_flow_request, result=start_flow_result)
                     self._send_result("failure_result", event_result_failure)
                     raise LocalExecutorError(msg) from start_flow_result.exception  # noqa: TRY301

@@ -1995,6 +1995,7 @@ class NodeManager(EngineScoped):
             parent_element_name=parent_group.name if parent_group is not None else None,
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
+            serializable=request.serializable,
         )
         # Hand saved state to the traits so their converters, validators, and rendered
         # options match what was saved.
@@ -3213,7 +3214,6 @@ class NodeManager(EngineScoped):
 
         # Check if the node is already in the DAG - if so, skip this resolution. It's already queued or has been resolved.
         if node.name in flow_mgr._global_dag_builder.node_to_reference:
-            logger.error("Node %s is already executing. Cannot start execution.", node.name)
             return ResolveNodeResultFailure(
                 validation_exceptions=[],
                 result_details=f"Node {node.name} is already executing. Cannot start execution.",
@@ -3493,7 +3493,6 @@ class NodeManager(EngineScoped):
                 f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
                 f"{err} Editing the node still works and your workflow keeps it."
             )
-            logger.error(details)
             return ExecuteNodeResultFailure(result_details=details, exception=err)
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation
@@ -3930,7 +3929,6 @@ class NodeManager(EngineScoped):
         )
 
         if not isinstance(group_result, SerializeNodeToCommandsResultSuccess):
-            logger.error("Failed to serialize group node '%s'", group_name)
             msg = f"Failed to serialize children and group node '{group_name}'"
             raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -3956,7 +3954,6 @@ class NodeManager(EngineScoped):
             )
 
             if not isinstance(child_result, SerializeNodeToCommandsResultSuccess):
-                logger.error("%s failed to serialize child node '%s'", group_name, child_name)
                 msg = f"Failed to serialize child node '{child_name}'"
                 raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -4676,9 +4673,8 @@ class NodeManager(EngineScoped):
             if metadata and "_parent_group_uuid" in metadata:
                 parent_group_uuid = metadata["_parent_group_uuid"]
                 if parent_group_uuid not in node_uuid_to_name:
-                    logger.error("Parent group UUID %s not found in UUID mapping", parent_group_uuid)
                     return DeserializeSelectedNodesFromCommandsResultFailure(
-                        result_details="Parent group UUID not found in UUID mapping"
+                        result_details=f"Parent group UUID {parent_group_uuid} not found in UUID mapping"
                     )
                 node_command.create_node_command.parent_group_name = node_uuid_to_name[parent_group_uuid]
                 del metadata["_parent_group_uuid"]
@@ -5930,7 +5926,7 @@ class NodeManager(EngineScoped):
         )
         rename_result = self.engine.object_manager.on_rename_object_request(rename_request)
         if not isinstance(rename_result, RenameObjectResultSuccess):
-            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name."
+            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name: {rename_result.result_details}"
             return ResetNodeToDefaultsResultFailure(result_details=details)
 
         # SUCCESS PATH

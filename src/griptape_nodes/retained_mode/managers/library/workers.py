@@ -226,7 +226,6 @@ class LibraryWorkers(EngineScoped):
         library_info = self.engine.library_manager.get_library_info_by_library_name(request.library_name)
         if library_info is None:
             details = f"Received a library load report for unknown library '{request.library_name}'."
-            logger.warning(details)
             return ReportLibraryLoadedResultFailure(result_details=details)
         # Only a legacy worker-mode library takes its fitness from the worker: the orchestrator
         # never loaded it, so the worker's verdict is the only one there is. An exec-deps library

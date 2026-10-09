@@ -1,3 +1,4 @@
+import json
 import logging
 from enum import StrEnum
 from pathlib import Path
@@ -22,6 +23,7 @@ EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
+WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -29,6 +31,8 @@ DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+LIBRARY_PROVISIONED_BY_KEY = "library.provisioned_by"
+LIBRARY_SANDBOX_ENABLED_KEY = "library.sandbox_enabled"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 LOG_TO_FILE_KEY = "logging.log_to_file"
@@ -36,16 +40,18 @@ LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
 SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
-# are always strings, so under this flag beta feature entries are converted to booleans, and one
-# that can't be converted fails validation so the variable is reported as a bad value.
-BETA_FEATURES_FROM_ENV_CONTEXT = "beta_features_from_env"
+# are always strings, so validators that need a typed value convert under this flag, and a value
+# that can't be converted fails validation so the variable is reported as a bad value instead of
+# silently becoming a default. Beta feature entries, `worker.command_prefix`,
+# `library.provisioned_by`, and `library.sandbox_enabled` read it.
+FROM_ENV_CONTEXT = "from_env"
 
 logger = logging.getLogger("griptape_nodes")
 
 _BOOL_ADAPTER = TypeAdapter(bool)
 # (config key, repr of value) pairs already warned about. Settings is validated on every config
 # reload, so without this one bad entry would log the same warning many times per session.
-_reported_invalid_beta_features: set[tuple[str, str]] = set()
+_reported_invalid_settings: set[tuple[str, str]] = set()
 
 
 def _validate_beta_feature_map(map_key: str, v: Any, *, from_env: bool) -> dict[str, bool]:
@@ -95,13 +101,13 @@ def _env_value_to_bool(config_key: str, value: Any) -> bool:
         raise ValueError(msg) from e
 
 
-def _warn_once(report_key: tuple[str, str], message: str) -> None:
-    """Log a beta feature warning the first time this (config key, value) pair is seen."""
-    if report_key in _reported_invalid_beta_features:
+def _warn_once(report_key: tuple[str, str], message: str, *, level: int = logging.WARNING) -> None:
+    """Log a settings warning the first time this (config key, value) pair is seen."""
+    if report_key in _reported_invalid_settings:
         return
 
-    _reported_invalid_beta_features.add(report_key)
-    logger.warning(message)
+    _reported_invalid_settings.add(report_key)
+    logger.log(level, message)
 
 
 class Category(BaseModel):
@@ -132,16 +138,22 @@ LOGGING = Category(name="Logging", description="Where engine logs are kept and h
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
-    """Enhanced Field with default category that can be overridden."""
-    if "json_schema_extra" not in kwargs:
+    """Enhanced Field with default category that can be overridden.
+
+    A caller-supplied `json_schema_extra` dict keeps its own keys and gains the category unless it
+    already names one.
+    """
+    json_schema_extra = dict(kwargs.get("json_schema_extra") or {})
+    if "category" not in json_schema_extra:
         # Convert Category to dict or use string directly
         if isinstance(category, Category):
             category_dict = {"name": category.name}
             if category.description:
                 category_dict["description"] = category.description
-            kwargs["json_schema_extra"] = {"category": category_dict}
+            json_schema_extra["category"] = category_dict
         else:
-            kwargs["json_schema_extra"] = {"category": category}
+            json_schema_extra["category"] = category
+    kwargs["json_schema_extra"] = json_schema_extra
     return PydanticField(**kwargs)
 
 
@@ -360,6 +372,46 @@ class WorkerSettings(BaseModel):
             "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),
     )
+    command_prefix: list[str] = Field(
+        default_factory=list,
+        json_schema_extra={"env_var_format": "json_list"},
+        description=(
+            "Words placed in front of the command that starts a library's worker process, so the worker "
+            "runs inside an environment another tool prepares (for example a package manager that "
+            "resolves the library's packages). Empty (the default) starts workers directly. Each word "
+            "may contain {library_request}, {library_name}, {engine_version}, and {python_version}, "
+            "filled per worker: {library_request} is the library's entry in the "
+            "GTN_LIBRARY_WORKER_REQUESTS environment variable (a word that is exactly {library_request} "
+            "becomes one word per space-separated part of that entry), {library_name} is the library's "
+            "name, {engine_version} is this engine's version, and {python_version} is the Python it runs "
+            "on (major.minor). The worker always runs this engine's own Python interpreter, so the "
+            "environment the prefix prepares must be for that Python. When a word uses {library_request} and the library has no entry, the "
+            "worker starts without the prefix, except when library.provisioned_by is 'environment', "
+            "where the worker is not started and the library reports why. The environment variable "
+            'takes a JSON list, e.g. GTN_CONFIG_WORKER__COMMAND_PREFIX=\'["env-tool", "run", '
+            '"{library_request}", "--"]\'.'
+        ),
+    )
+
+    @field_validator("command_prefix", mode="before")
+    @classmethod
+    def validate_command_prefix(cls, v: Any, info: ValidationInfo) -> Any:
+        """Parse the JSON list a GTN_CONFIG_WORKER__COMMAND_PREFIX variable carries.
+
+        Env vars are always strings and a list has no other string form, so under
+        `FROM_ENV_CONTEXT` a string is read as JSON. A blank one means no prefix.
+        A string from a config file is left for the list type to reject, as for any list setting.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if not from_env or not isinstance(v, str):
+            return v
+        if not v.strip():
+            return []
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError as e:
+            msg = f"{WORKER_COMMAND_PREFIX_KEY} must be a JSON list of strings, got {v!r}"
+            raise ValueError(msg) from e
 
 
 class AgentSettings(BaseModel):
@@ -374,7 +426,38 @@ class LibraryDependencyInstallBehavior(StrEnum):
     NEVER = "never"
 
 
+class LibraryProvisioner(StrEnum):
+    ENGINE = "engine"
+    ENVIRONMENT = "environment"
+
+
 class LibrarySettings(BaseModel):
+    provisioned_by: LibraryProvisioner = Field(
+        default=LibraryProvisioner.ENGINE,
+        description=(
+            "What provides libraries and their Python dependencies. 'engine' (the default) has the engine "
+            "download libraries, build a virtual environment for each one, and install its dependencies. "
+            "'environment' is for an engine started inside an environment another tool has already "
+            "prepared: the engine loads only the libraries listed in the GTN_LIBRARY_PATHS environment "
+            "variable, never builds virtual environments, never downloads, updates, or installs "
+            "libraries, and marks every other configured library (libraries_to_register entries, and the "
+            "sandbox library unless library.sandbox_enabled is true) as not provided by the environment. "
+            "A library dependency is then satisfied only by a library the environment provides. Any other "
+            "value is treated as 'environment' and reported as an error, so a misspelled value never "
+            "downloads or builds."
+        ),
+    )
+    sandbox_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the sandbox library (sandbox_library_directory) is scanned and loaded, and sandbox "
+            "nodes can be added. Unset (the default) means on when library.provisioned_by is 'engine' "
+            "and off when it is 'environment'. True turns it on in either mode: in environment mode no "
+            "virtual environment is built for it, so everything its nodes import must already be in "
+            "the environment, and every other library the environment does not provide is still "
+            "refused. False turns it off in either mode."
+        ),
+    )
     dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
         default=LibraryDependencyInstallBehavior.ALWAYS,
         description=(
@@ -411,6 +494,56 @@ class LibrarySettings(BaseModel):
             "time."
         ),
     )
+
+    @field_validator("provisioned_by", mode="before")
+    @classmethod
+    def validate_provisioned_by(cls, v: Any, info: ValidationInfo) -> LibraryProvisioner:  # noqa: ARG003 (both sources fail closed the same way)
+        """Accept any letter case, and fail closed on anything else.
+
+        A value that is neither 'engine' nor 'environment', from a config file or a
+        GTN_CONFIG_LIBRARY__PROVISIONED_BY variable, is treated as 'environment' and reported as an
+        error. Falling back to 'engine' instead would have a launcher's misspelled 'environment'
+        download, build, and prune exactly what the environment was meant to provide, after one
+        warning that is easy to miss because GTN_LIBRARY_PATHS libraries still load either way.
+        """
+        if isinstance(v, LibraryProvisioner):
+            return v
+        if isinstance(v, str):
+            try:
+                return LibraryProvisioner(v.strip().lower())
+            except ValueError:
+                pass
+        _warn_once(
+            (LIBRARY_PROVISIONED_BY_KEY, repr(v)),
+            f"{LIBRARY_PROVISIONED_BY_KEY} is {v!r}, which is neither 'engine' nor 'environment'. Treating it as "
+            "'environment' so nothing is downloaded, built, or installed: only libraries listed in GTN_LIBRARY_PATHS "
+            "load. Fix the value to use the engine's own provisioning.",
+            level=logging.ERROR,
+        )
+        return LibraryProvisioner.ENVIRONMENT
+
+    @field_validator("sandbox_enabled", mode="before")
+    @classmethod
+    def validate_sandbox_enabled(cls, v: Any, info: ValidationInfo) -> bool | None:
+        """Accept true or false in any letter case, and keep a bad value from resetting the whole config.
+
+        From a GTN_CONFIG_LIBRARY__SANDBOX_ENABLED variable an unrecognized value raises, so the env
+        loader reports the variable and ignores it. From a config file it falls back to unset (the
+        mode's default) with a warning.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if v is None or isinstance(v, bool):
+            return v
+        if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            return v.strip().lower() == "true"
+        if from_env:
+            msg = f"{LIBRARY_SANDBOX_ENABLED_KEY} must be true or false, got {v!r}"
+            raise ValueError(msg)
+        _warn_once(
+            (LIBRARY_SANDBOX_ENABLED_KEY, repr(v)),
+            f"Ignoring {LIBRARY_SANDBOX_ENABLED_KEY}: expected true or false, got {v!r}. Using the default.",
+        )
+        return None
 
     @field_validator("dependency_install_behavior", mode="before")
     @classmethod
@@ -657,17 +790,17 @@ class Settings(BaseModel):
         because the merged config keeps raw values and readers would treat it as unset anyway.
 
         A `GTN_CONFIG_BETA_FEATURES__<ID>` variable is the exception. It is validated under
-        `BETA_FEATURES_FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
+        `FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
         it can't, so the env loader reports the variable as having an invalid value.
         """
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         return _validate_beta_feature_map(BETA_FEATURES_KEY, v, from_env=from_env)
 
     @field_validator("library_beta_features", mode="before")
     @classmethod
     def validate_library_beta_features(cls, v: Any, info: ValidationInfo) -> dict[str, dict[str, bool]]:
         """Apply the `beta_features` rules to each library's map, one library at a time."""
-        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
         if not isinstance(v, dict) and from_env:
             msg = f"{LIBRARY_BETA_FEATURES_KEY} must be a map of library names to feature maps, got {v!r}"
             raise ValueError(msg)

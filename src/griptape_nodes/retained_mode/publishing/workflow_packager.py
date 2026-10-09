@@ -194,7 +194,6 @@ class WorkflowPackager:
         )
         if not isinstance(result, CopyFileResultSuccess):
             msg = f"Failed to copy file from '{source_path}' to '{destination_path}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     @staticmethod
@@ -220,7 +219,6 @@ class WorkflowPackager:
         )
         if not isinstance(result, CopyTreeResultSuccess):
             msg = f"Failed to copy tree from '{source_path}' to '{destination_path}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     # -- Library bundling --
@@ -252,7 +250,6 @@ class WorkflowPackager:
                     f"Attempted to package workflow '{workflow.metadata.name}'. "
                     f"Failed gathering library info for library '{library_ref.library_name}'."
                 )
-                logger.error(msg)
                 raise ValueError(msg)
 
             library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
@@ -299,7 +296,6 @@ class WorkflowPackager:
         )
         if not isinstance(result, WriteFileResultSuccess):
             msg = f"Failed to write config to '{config_path}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     # -- Environment file --
@@ -320,7 +316,6 @@ class WorkflowPackager:
         result = GriptapeNodes.handle_request(GetAllSecretValuesRequest())
         if not isinstance(result, GetAllSecretValuesResultSuccess):
             msg = "Failed to get all secret values."
-            logger.error(msg)
             raise TypeError(msg)
 
         for secret_name, secret_value in result.values.items():
@@ -362,7 +357,6 @@ class WorkflowPackager:
         )
         if not isinstance(result, WriteFileResultSuccess):
             msg = f"Failed to write environment file to '{env_file_path}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     @staticmethod
@@ -403,7 +397,6 @@ class WorkflowPackager:
         )
         if not isinstance(write_result, WriteFileResultSuccess):
             msg = f"Failed to write the project template (project.yml) to '{destination}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     # -- Dependencies --
@@ -413,7 +406,6 @@ class WorkflowPackager:
         result = GriptapeNodes.handle_request(GetEngineVersionRequest())
         if not isinstance(result, GetEngineVersionResultSuccess):
             msg = f"Failed to get engine version for workflow '{self._workflow_name}'."
-            logger.error(msg)
             raise TypeError(msg)
         return f"v{result.major}.{result.minor}.{result.patch}"
 
@@ -578,7 +570,6 @@ dependencies = [
         )
         if not isinstance(result, WriteFileResultSuccess):
             msg = f"Failed to write pyproject.toml to '{destination}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     # -- Static file / asset gathering --
@@ -1015,12 +1006,10 @@ dependencies = [
         )
         if not isinstance(read_result, ReadFileResultSuccess):
             msg = f"Failed to read download models script template from '{template_path}'."
-            logger.error(msg)
             raise TypeError(msg)
         template = read_result.content
         if not isinstance(template, str):
             msg = f"Expected text content for download models script template at '{template_path}'."
-            logger.error(msg)
             raise TypeError(msg)
         commands_repr = ", ".join(repr(cmd) for cmd in commands)
         script_content = template.replace(
@@ -1034,7 +1023,6 @@ dependencies = [
         )
         if not isinstance(write_result, WriteFileResultSuccess):
             msg = f"Failed to write download models script to '{destination}'."
-            logger.error(msg)
             raise TypeError(msg)
         return True
 
@@ -1056,7 +1044,6 @@ dependencies = [
                 f"Failed to remove the model download script left by a previous publish at '{script_path}'. "
                 f"Leaving it in place would download models this workflow no longer uses."
             )
-            logger.error(msg)
             raise TypeError(msg)
 
     # -- Staging --
@@ -1159,7 +1146,6 @@ dependencies = [
         result = GriptapeNodes.handle_request(MakeDirectoryRequest(path=str(path), create_parents=True, exist_ok=True))
         if not isinstance(result, MakeDirectoryResultSuccess):
             msg = f"Failed to create directory '{path}'."
-            logger.error(msg)
             raise TypeError(msg)
 
     @staticmethod
@@ -1173,10 +1159,7 @@ dependencies = [
         result = GriptapeNodes.handle_request(
             RenameFileRequest(old_path=str(source), new_path=str(destination), workspace_only=False)
         )
-        if not isinstance(result, RenameFileResultSuccess):
-            logger.error("Could not rename '%s' to '%s'.", source, destination)
-            return False
-        return True
+        return isinstance(result, RenameFileResultSuccess)
 
     @staticmethod
     def _raise_publish_failure(destination: Path, failure_context: str) -> NoReturn:
@@ -1186,7 +1169,6 @@ dependencies = [
         configured, so the message stays on the destination regardless of which move failed.
         """
         msg = f"Failed to publish the workflow bundle to '{destination}'. Could not {failure_context}."
-        logger.error(msg)
         raise TypeError(msg)
 
     @staticmethod
@@ -1236,7 +1218,6 @@ dependencies = [
             destination.mkdir(parents=True, exist_ok=True)
         except (FileNotFoundError, OSError) as err:
             msg = f"Failed to package to folder. Failed to create destination directory: {err}"
-            logger.error(msg)
             raise TypeError(msg) from err
 
         reserved_paths = [*RESERVED_BUNDLE_PATHS, *(additional_reserved_paths or [])]
@@ -1246,7 +1227,6 @@ dependencies = [
         workflow_file_path = workflow.file_path
         if workflow_file_path is None:
             msg = f"Cannot package unsaved workflow '{workflow.metadata.name}'. Save the workflow before packaging."
-            logger.error(msg)
             raise TypeError(msg)
         full_path = WorkflowRegistry.get_complete_file_path(workflow_file_path)
         entrypoint_workflow_path = Path(Path(full_path).name)
@@ -1321,7 +1301,6 @@ dependencies = [
                 f"published bundle, which collides with '{collision_for_display}', a file the bundle needs. "
                 "Move or rename the file, then publish again."
             )
-            logger.error(msg)
             raise TypeError(msg)
 
     @classmethod
@@ -1346,7 +1325,6 @@ dependencies = [
                 f"'{destination_for_display}' inside the published bundle, which collides with "
                 f"'{collision_for_display}', a file the bundle needs. Rename the workflow, then publish again."
             )
-            logger.error(msg)
             raise TypeError(msg)
 
     @classmethod
