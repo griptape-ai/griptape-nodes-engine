@@ -30,6 +30,10 @@ _SUMMARY_PACKAGE_LIMIT = 3
 _DOWNLOADING_LINE = re.compile(r"^Downloading (?P<name>\S+) \((?P<size>[\d.]+\s*[KMGT]?i?B)\)$")
 _DOWNLOADED_LINE = re.compile(r"^Downloaded (?P<name>\S+)$")
 _PREPARED_LINE = re.compile(r"^Prepared (?P<count>\d+) packages?\b")
+# Downloads at least this large are logged at INFO: they are what makes an install take minutes
+# (torch, the CUDA wheels), and there are only a few per install. Smaller ones go to DEBUG, so a
+# console at the default level is not filled with every package. The editor gets them all.
+_INFO_DOWNLOAD_BYTES = 100 * 1024**2
 _SIZE = re.compile(r"^(?P<amount>[\d.]+)\s*(?P<unit>[KMGT]?)i?B$")
 _UNIT_EXPONENTS = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}
 
@@ -130,9 +134,10 @@ class LibraryInstallProgress:
     def on_installer_line(self, line: str) -> None:
         """Turn one line of uv's output into an updated detail, when it says where the install is.
 
-        A download starting and the downloads finishing are logged at INFO, since they only happen
-        during a real install and are the progress a console user waits on. Every other line is
-        logged at DEBUG, so a DEBUG log still shows the installer's own output.
+        A large download starting (100 MiB or more) and uv having every package ready (downloaded or
+        taken from its cache) are logged at INFO, since they only happen during a real install and
+        are what a console user waits on. Every other line, smaller downloads included, is logged
+        at DEBUG, so a DEBUG log still shows the installer's own output.
         """
         text = line.strip()
         if not text:
@@ -142,9 +147,16 @@ class LibraryInstallProgress:
         if downloading is not None:
             name = downloading.group("name")
             size = downloading.group("size")
-            logger.info(
-                "Downloading %s (%s) for library '%s' (%s environment)", name, size, self._library_name, self._venv_kind
-            )
+            if _size_in_bytes(size) >= _INFO_DOWNLOAD_BYTES:
+                logger.info(
+                    "Downloading %s (%s) for library '%s' (%s environment)",
+                    name,
+                    size,
+                    self._library_name,
+                    self._venv_kind,
+                )
+            else:
+                logger.debug("Installer (%s, %s environment): %s", self._library_name, self._venv_kind, text)
             self._pending_downloads[name] = size
             self._report(self._detail_for_downloads())
             return
@@ -154,7 +166,7 @@ class LibraryInstallProgress:
             package_count = int(prepared.group("count"))
             package_noun = _package_noun(package_count)
             logger.info(
-                "Downloaded %d %s for library '%s' (%s environment), installing them",
+                "Ready to install %d %s for library '%s' (%s environment)",
                 package_count,
                 package_noun,
                 self._library_name,

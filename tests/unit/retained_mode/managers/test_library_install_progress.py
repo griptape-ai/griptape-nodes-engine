@@ -482,7 +482,7 @@ class TestLibraryInstallProgress:
 
         assert events[0].detail == "Downloading torch (2.0GiB) for running nodes from Diffusers..."
 
-    def test_logs_downloads_at_info_and_other_installer_lines_at_debug(
+    def test_logs_large_downloads_at_info_and_other_installer_lines_at_debug(
         self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         progress = _progress(engine)
@@ -491,6 +491,7 @@ class TestLibraryInstallProgress:
             for line in [
                 "Resolved 7 packages in 404ms",
                 "Downloading torch (2.0GiB)",
+                "Downloading pillow (4.6MiB)",
                 " Downloaded torch",
                 "Prepared 7 packages in 3m 2s",
                 "Installed 7 packages in 14ms",
@@ -500,8 +501,9 @@ class TestLibraryInstallProgress:
         assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
             ("DEBUG", "Installer (Diffusers, edit-time environment): Resolved 7 packages in 404ms"),
             ("INFO", "Downloading torch (2.0GiB) for library 'Diffusers' (edit-time environment)"),
+            ("DEBUG", "Installer (Diffusers, edit-time environment): Downloading pillow (4.6MiB)"),
             ("DEBUG", "Installer (Diffusers, edit-time environment): Downloaded torch"),
-            ("INFO", "Downloaded 7 packages for library 'Diffusers' (edit-time environment), installing them"),
+            ("INFO", "Ready to install 7 packages for library 'Diffusers' (edit-time environment)"),
             ("DEBUG", "Installer (Diffusers, edit-time environment): Installed 7 packages in 14ms"),
         ]
 
