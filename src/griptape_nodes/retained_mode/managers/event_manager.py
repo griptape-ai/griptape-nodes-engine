@@ -219,6 +219,10 @@ class EventManager(EngineScoped):
         # handle_request runs on arbitrary threads, so guard the list and snapshot
         # it before iteration.
         self._pre_dispatch_hooks_lock = threading.Lock()
+        # Async preparers, keyed by exact request type, awaited by `ahandle_request` just before a
+        # request's handler. They let a synchronous handler's slow first step be announced and the
+        # announcement sent before the handler blocks the event loop.
+        self._async_request_preparers: dict[type[RequestPayload], Callable[[RequestPayload], Awaitable[None]]] = {}
         # Post-dispatch hooks, keyed by exact request type. Notification-only: they run
         # after the result exists and cannot change it. Lists rather than sets because a
         # callback need not be hashable -- a callable dataclass (RemoteHandler) has
@@ -388,6 +392,22 @@ class EventManager(EngineScoped):
         with self._pre_dispatch_hooks_lock:
             if hook not in self._pre_dispatch_hooks:
                 self._pre_dispatch_hooks.append(hook)
+
+    def register_async_request_preparer(
+        self,
+        request_type: type[RequestPayload],
+        preparer: Callable[[RequestPayload], Awaitable[None]],
+    ) -> None:
+        """Await ``preparer`` before the handler of every ``request_type`` request `ahandle_request` runs.
+
+        For a synchronous handler whose work blocks the event loop: the preparer can send an event
+        and yield so the event leaves the process before the handler starts. It runs after the
+        pre-dispatch hooks, so a request they refuse never reaches it. `handle_request` does not
+        run preparers, because it can be called from inside a running handler with no loop to
+        yield to. A preparer must not raise. One preparer per request type; registering another
+        replaces it.
+        """
+        self._async_request_preparers[request_type] = preparer
 
     def remove_pre_dispatch_hook(
         self,
@@ -1140,6 +1160,10 @@ class EventManager(EngineScoped):
                 short_circuit,
                 context=result_context,
             )
+
+        preparer = self._async_request_preparers.get(request_type)
+        if preparer is not None:
+            await preparer(request)
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)

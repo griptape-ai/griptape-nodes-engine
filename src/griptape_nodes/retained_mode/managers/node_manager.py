@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
@@ -68,9 +69,16 @@ from griptape_nodes.node_library.library_declarations import (
     find_model_catalog,
     resolve_node_models,
 )
-from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.node_library.library_registry import (
+    Library,
+    LibraryNameAndVersion,
+    LibraryRegistry,
+    LibraryRegistryError,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.app_events import InitializationStatus, LibraryNodesLoading
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     EventRequest,
     ResultDetails,
     ResultPayload,
@@ -275,6 +283,12 @@ logger = logging.getLogger("griptape_nodes")
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
 
+# How long to yield after announcing a node module import, so the app's event queue sends the
+# announcement before the import blocks the event loop. The broadcast leaves Python once the queue
+# task hands it to the IPC layer, which takes a few loop turns, so this is generous next to them
+# and nothing next to an import worth announcing.
+_NODE_IMPORT_ANNOUNCEMENT_SECONDS = 0.05
+
 # A node in one of these states owes the running flow nothing further, so deleting it takes
 # nothing away from the run.
 _SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
@@ -371,6 +385,7 @@ class NodeManager(EngineScoped):
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
         event_manager.register_request_handlers(self)
+        event_manager.register_async_request_preparer(CreateNodeRequest, self._aprepare_create_node)
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
@@ -725,7 +740,9 @@ class NodeManager(EngineScoped):
         )
         remapped_requested_node_name = (request.node_name is not None) and (request.node_name != final_node_name)
 
-        # OK, let's try and create the Node.
+        # OK, let's try and create the Node. When creating it imports its library's node module for
+        # the first time, say when that import has finished (see `_aprepare_create_node`).
+        library_importing_node = self._library_that_will_import_node(request.node_type, request.specific_library_name)
         node = None
         try:
             # License-policy checkpoint: gate instantiating this node type on its
@@ -753,6 +770,11 @@ class NodeManager(EngineScoped):
                 f"{readable_exception_message(err)}"
             )
             logger.error(details)
+            # A policy denial is refused before anything imports, and LOADING was never sent for it.
+            if library_importing_node is not None and not isinstance(err, _NodeInstantiationDeniedError):
+                self._report_node_import_finished(
+                    library_importing_node, request.node_type, error=readable_exception_message(err)
+                )
 
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
@@ -788,6 +810,9 @@ class NodeManager(EngineScoped):
                     return CreateNodeResultFailure(result_details=details)
             else:
                 return CreateNodeResultFailure(result_details=details)
+        else:
+            if library_importing_node is not None:
+                self._report_node_import_finished(library_importing_node, request.node_type, error=None)
         # Add it to the Flow.
         parent_flow.add_node(node)
 
@@ -980,6 +1005,78 @@ class NodeManager(EngineScoped):
             parent_group_name=node.parent_group.name if node.parent_group else None,
             result_details=ResultDetails(message=details, level=log_level),
         )
+
+    async def _aprepare_create_node(self, request: RequestPayload) -> None:
+        """Announce a first-time import of the node's library module, before the handler blocks on it.
+
+        With lazy node loading, creating the first node from a library imports its node module,
+        which can take a minute for libraries built on large packages. The handler is synchronous,
+        so anything it sent would only leave after the import. Sending LOADING here and yielding
+        lets the editor say why the new node has not appeared yet. Skipped for a node the license
+        policy denies, which the handler refuses before importing anything.
+        """
+        if not isinstance(request, CreateNodeRequest):
+            return
+        library = self._library_that_will_import_node(request.node_type, request.specific_library_name)
+        if library is None:
+            return
+        denial = self._evaluate_instantiation_checkpoint(
+            node_type=request.node_type,
+            specific_library_name=request.specific_library_name,
+            event_manager=self.engine.event_manager,
+        )
+        if denial is not None:
+            return
+
+        library_name = library.get_library_data().name
+        self._send_library_nodes_loading(
+            LibraryNodesLoading(
+                library_name=library_name,
+                node_type=request.node_type,
+                status=InitializationStatus.LOADING,
+                message=f"Loading {library_name} nodes for the first time. This can take a minute.",
+            )
+        )
+        await asyncio.sleep(_NODE_IMPORT_ANNOUNCEMENT_SECONDS)
+
+    def _report_node_import_finished(self, library: Library, node_type: str, *, error: str | None) -> None:
+        """Say a first-time import of the node's library module has ended, and how.
+
+        COMPLETE when the module imported, even if the node itself then failed to build: the
+        library's nodes are loaded either way. FAILED, with ``error``, only when the import did not.
+        """
+        library_name = library.get_library_data().name
+        if library.is_node_type_loaded(node_type):
+            self._send_library_nodes_loading(
+                LibraryNodesLoading(
+                    library_name=library_name, node_type=node_type, status=InitializationStatus.COMPLETE
+                )
+            )
+            return
+        self._send_library_nodes_loading(
+            LibraryNodesLoading(
+                library_name=library_name, node_type=node_type, status=InitializationStatus.FAILED, error=error
+            )
+        )
+
+    def _send_library_nodes_loading(self, payload: LibraryNodesLoading) -> None:
+        self.engine.event_manager.put_event(AppEvent(payload=payload))
+
+    @staticmethod
+    def _library_that_will_import_node(node_type: str, specific_library_name: str | None) -> Library | None:
+        """The node type's library when creating the node will first import its module, else None.
+
+        None also for a node type no registered library provides; the handler reports that.
+        """
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        except LibraryRegistryError:
+            return None
+        if not library.has_node_type(node_type):
+            return None
+        if library.is_node_type_loaded(node_type):
+            return None
+        return library
 
     def _get_flow_for_node_group_operation(self, flow_name: str | None) -> AddNodesToNodeGroupResultFailure | None:
         """Get the flow for a node group operation."""

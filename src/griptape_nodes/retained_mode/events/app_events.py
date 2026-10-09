@@ -209,6 +209,32 @@ class EngineInitializationProgress(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
+class LibraryNodesLoading(AppPayload):
+    """A library's node module is being imported for the first time, so creating a node is waiting on it.
+
+    With lazy node loading, a library's node modules are imported the first time one of its nodes
+    is created, which can take a minute for libraries built on large packages. LOADING is sent
+    before the import starts so the editor can say why the new node has not appeared, then
+    COMPLETE or FAILED once it ends. Only `CreateNodeRequest` handled through the asynchronous
+    request path sends LOADING; a node created any other way gets only the COMPLETE or FAILED.
+
+    Args:
+        library_name: Name of the library whose nodes are loading
+        node_type: The node type whose creation started the import
+        status: LOADING before the import, COMPLETE or FAILED after it
+        message: Artist-readable text to show while LOADING, None otherwise
+        error: Why the import failed when status is FAILED, None otherwise
+    """
+
+    library_name: str
+    node_type: str
+    status: InitializationStatus
+    message: str | None = None
+    error: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
 class LibraryLoadedNotification(AppPayload):
     """Notification that a library has finished loading, including its fitness outcome.
 

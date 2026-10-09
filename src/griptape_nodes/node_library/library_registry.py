@@ -576,6 +576,11 @@ class NodeTypeEntry:
         self._resolved = node_class
         self._loader = loader
 
+    @property
+    def is_resolved(self) -> bool:
+        """Whether the node's class is already available, so resolving it imports nothing."""
+        return self._resolved is not None
+
     def resolve(self) -> type[BaseNode]:
         """Return the node class, importing its module on first use for a lazy entry.
 
@@ -788,6 +793,16 @@ class Library:
 
     def has_node_type(self, node_type: str) -> bool:
         return node_type in self._node_types
+
+    def is_node_type_loaded(self, node_type: str) -> bool:
+        """Whether `node_type`'s module is already imported, so creating the node imports nothing.
+
+        False for a lazily registered node type that has not been used yet.
+        """
+        if node_type not in self._node_types:
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise LibraryRegistryError(msg)
+        return self._node_types[node_type].is_resolved
 
     def get_node_metadata(self, node_type: str) -> NodeMetadata:
         if node_type not in self._node_metadata:
