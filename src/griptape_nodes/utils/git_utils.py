@@ -306,6 +306,13 @@ _GIT_MISSING_MESSAGE = (
 # thread until the engine is restarted.
 _GIT_TIMEOUT_SECONDS = 600
 
+# Repository-local git config key naming the tag a detached-HEAD library follows.
+_TRACKED_TAG_CONFIG_KEY = "griptape-nodes.trackedTag"
+
+# Reflog subject git writes for a checkout, e.g. "checkout: moving from main to stable"
+# or "checkout: moving from 1a2b3c to refs/tags/stable".
+_CHECKOUT_REFLOG_PATTERN = re.compile(r"^checkout: moving from \S+ to (?P<target>\S+)$")
+
 # Transports a library URL is allowed to use. Anything outside this list, notably a
 # "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
 # before a connection is attempted.
@@ -524,12 +531,75 @@ def _current_branch(library_path: Path) -> str | None:
 def _tag_at_head(library_path: Path) -> str | None:
     """Name of a tag pointing at HEAD, or None when HEAD isn't tagged.
 
-    Reports the first name git lists when several tags share the commit.
+    Several tags often share a commit: right after a release, ``stable`` and ``nightly``
+    both point at it. git lists them alphabetically, so the first name says nothing about
+    which one the library follows. Prefer the newest tag checkout in HEAD's reflog, and fall
+    back to the first listed tag only when the reflog names none of them.
     """
-    tags = _try_git(["tag", "--points-at", "HEAD"], library_path)
-    if not tags:
+    tags_output = _try_git(["tag", "--points-at", "HEAD"], library_path)
+    if not tags_output:
         return None
-    return tags.splitlines()[0].strip()
+    tags = [tag.strip() for tag in tags_output.splitlines() if tag.strip()]
+
+    reflog_tag = _last_checked_out_tag(library_path, tags)
+    if reflog_tag is not None:
+        return reflog_tag
+
+    return tags[0]
+
+
+def _last_checked_out_tag(library_path: Path, candidate_tags: list[str]) -> str | None:
+    """Newest tag among candidate_tags that HEAD's reflog shows being checked out, or None."""
+    reflog = _try_git(["reflog", "show", "--format=%gs", "HEAD"], library_path)
+    if not reflog:
+        return None
+
+    for subject in reflog.splitlines():
+        match = _CHECKOUT_REFLOG_PATTERN.match(subject.strip())
+        if match is None:
+            continue
+        target = match.group("target").removeprefix("refs/tags/")
+        if target in candidate_tags:
+            return target
+    return None
+
+
+def _tracked_tag(library_path: Path) -> str | None:
+    """The tag recorded by ``_remember_tracked_tag``, or None when none is recorded or it no longer exists."""
+    tracked_tag = _try_git(["config", "--get", _TRACKED_TAG_CONFIG_KEY], library_path)
+    if not tracked_tag or not _ref_exists(library_path, f"refs/tags/{tracked_tag}"):
+        return None
+    return tracked_tag
+
+
+def _followed_tag(library_path: Path) -> str | None:
+    """Name of the tag the checkout follows, or None when it follows none.
+
+    On a detached HEAD the recorded tag wins even when it no longer points at HEAD: a fetch
+    that moved it followed by a failed checkout leaves HEAD behind, at a commit carrying only
+    unrelated tags or none. Reporting and updating both resolve through here so they agree.
+    """
+    if _current_branch(library_path) is None:
+        tracked_tag = _tracked_tag(library_path)
+        if tracked_tag is not None:
+            return tracked_tag
+    return _tag_at_head(library_path)
+
+
+def _remember_tracked_tag(library_path: Path, tag_name: str, error_cls: type[GitError]) -> None:
+    """Record tag_name as the tag this checkout follows, so updates keep following it.
+
+    The reflog alone can't hold this: a checkout that doesn't move HEAD writes no entry,
+    and entries expire, so a library that rarely changes would lose its channel.
+
+    Call only after the checkout succeeds, so a failed checkout keeps following the old tag.
+    """
+    _run_git(
+        ["config", _TRACKED_TAG_CONFIG_KEY, tag_name],
+        error_msg=f"Failed to record tracked tag {tag_name} at {library_path}",
+        cwd=library_path,
+        error_cls=error_cls,
+    )
 
 
 def _ref_exists(library_path: Path, ref: str) -> bool:
@@ -560,7 +630,7 @@ def _describe_head(library_path: Path) -> str | None:
     if branch is not None:
         return branch
 
-    return _tag_at_head(library_path) or head_sha
+    return _followed_tag(library_path) or head_sha
 
 
 def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
@@ -628,13 +698,13 @@ def get_current_ref(library_path: Path) -> str | None:
 
 
 def get_current_tag(library_path: Path) -> str | None:
-    """Get the current tag name if HEAD is pointing to a tag.
+    """Get the name of the tag the checkout follows.
 
     Args:
         library_path: The path to the library directory.
 
     Returns:
-        str | None: The current tag name if found, None if not on a tag or not a git repository.
+        str | None: The followed tag name if found, None if not on a tag or not a git repository.
 
     Raises:
         GitNotFoundError: If git is not installed.
@@ -645,17 +715,20 @@ def get_current_tag(library_path: Path) -> str | None:
     if _head_commit_sha(library_path) is None:
         return None
 
-    return _tag_at_head(library_path)
+    return _followed_tag(library_path)
 
 
 def is_on_tag(library_path: Path) -> bool:
-    """Check if HEAD is currently pointing to a tag.
+    """Check whether the checkout follows a tag.
+
+    A followed tag need not point at HEAD: a fetch that moved it followed by a failed
+    checkout leaves HEAD behind while the checkout still follows the tag.
 
     Args:
         library_path: The path to the library directory.
 
     Returns:
-        bool: True if HEAD is on a tag, False otherwise.
+        bool: True if the checkout follows a tag, False otherwise.
     """
     return get_current_tag(library_path) is not None
 
@@ -922,6 +995,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _remember_tracked_tag(library_path, tag_name, GitPullError)
     _update_submodules(
         library_path,
         error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch or check out its submodules",
@@ -1062,6 +1136,7 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
             cwd=library_path,
             error_cls=GitRefError,
         )
+        _remember_tracked_tag(library_path, ref_name, GitRefError)
     elif _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
         # -B resets an existing local branch onto the freshly fetched remote tip.
         _run_git(
@@ -1144,6 +1219,8 @@ def _finish_clone(git_url: str, target_path: Path, branch_tag_commit: str | None
             cwd=target_path,
             error_cls=GitCloneError,
         )
+        if _current_branch(target_path) is None and _ref_exists(target_path, f"refs/tags/{branch_tag_commit}"):
+            _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
 
     # After the checkout, so submodules land on the commits the requested ref records.
