@@ -340,3 +340,17 @@ def _entry_label(index: int, entry: Any) -> str:
 
 def _today() -> date:
     return datetime.now(tz=UTC).date()
+
+
+PRIVATE_EXECUTION_IN_WORKER = register_beta_feature(
+    BetaFeature(
+        id="private_execution_in_worker",
+        name="Private Execution in a worker",
+        description=(
+            "Runs the nodes of a group set to Private Execution in a background process that stays open "
+            "for the session, instead of starting a new process each time the group runs."
+        ),
+        owner="@kateforsberg13",
+        remove_by=date(2027, 4, 1),
+    )
+)

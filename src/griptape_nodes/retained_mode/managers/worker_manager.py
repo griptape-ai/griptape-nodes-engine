@@ -430,8 +430,10 @@ class WorkerManager(EngineScoped):
                 logger.warning(msg)
                 raise RuntimeError(msg)
 
-    def get_worker_for_key(self, key: str) -> tuple[str, str] | None:
+    def get_worker_for_key(self, key: str | None) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for a worker registered under key, or None.
+
+        A key of None finds a general-purpose worker, one not tied to any library.
 
         Today returns the first registered worker for the key. Future versions can
         load-balance across multiple workers for the same key.

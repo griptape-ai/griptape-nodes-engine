@@ -830,6 +830,25 @@ class TestGetWorkerForKey:
 
         assert result is None
 
+    def test_none_finds_the_general_purpose_worker_not_a_library_worker(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers["library-engine"] = WorkerRegistration(
+            request_topic="library-topic", worker_key="My Library"
+        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        result = worker_manager.get_worker_for_key(None)
+
+        assert result == (_ENGINE, _WORKER_REQUEST_TOPIC)
+
+    def test_none_finds_nothing_when_only_library_workers_are_registered(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
+        )
+
+        result = worker_manager.get_worker_for_key(None)
+
+        assert result is None
+
 
 class TestLibraryWorkerCleanup:
     def _seed(self, worker_manager: WorkerManager) -> None:
