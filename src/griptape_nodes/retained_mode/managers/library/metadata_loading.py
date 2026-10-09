@@ -315,3 +315,6 @@ class LibraryMetadataLoading(EngineScoped):
         metadata_result.fitness = library_info.fitness.value
         metadata_result.problems = self.engine.library_manager.catalog.collate_problems_for_lib_info(library_info)
         metadata_result.execution_env_failure = library_info.execution_env_failure
+        metadata_result.reset_requires_restart = self.engine.library_manager.reset.reset_requires_restart(
+            metadata_result.library_schema.name, metadata_result.file_path
+        )

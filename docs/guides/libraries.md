@@ -247,6 +247,23 @@ Fix the underlying issue, then re-trigger the install (re-paste the
 URL in the **Add Library** modal, or use the CLI alternative below
 with `--overwrite`).
 
+### "A library stopped working after an install or update"
+
+A library's Python packages can end up broken: an install that
+stopped partway, an update that failed, or a package changed from
+outside Griptape Nodes. Press **Reset** on the library's row in the
+**Libraries** panel. It shows on libraries in the **Errors** filter
+too. Reset deletes the library's virtual environments (`.venv` and
+`.venv-exec`) and installs its packages again. The library's files
+and your settings stay as they are.
+
+Reset downloads the library's packages again, so it can take a
+while for a heavy library. If the engine has already loaded packages
+from the library, it can't swap them while it's running. In that case
+the reset finishes the next time the engine starts, and Griptape
+Nodes asks you to restart it. Libraries provided by your studio's
+environment can't be reset here. Ask whoever set up that environment.
+
 ### "A node looks broken or red in the editor"
 
 The engine couldn't construct that node — usually because its
