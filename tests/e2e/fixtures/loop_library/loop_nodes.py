@@ -130,6 +130,52 @@ class LoopResultsNode(DataNode):
         self.parameter_output_values["result"] = list(self.get_parameter_value("items") or [])
 
 
+class OutsideCounterDataNode(DataNode):
+    """A node living OUTSIDE the loop, with a run counter standing in for an Agent/image-gen call.
+
+    No control connections, so it is a plain data dependency. Used to measure how many times a
+    node outside a packaged loop body actually runs when it gets pulled into the packaged flow as
+    an unresolved data dependency (see ``NodeExecutor._collect_loop_body_nodes`` ->
+    ``DagBuilder.collect_data_dependencies_for_node``).
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.run_count = 0
+        self.add_parameter(
+            Parameter(
+                name="value",
+                tooltip="Constant value, computed once",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        self.run_count += 1
+        self.parameter_output_values["value"] = f"outside-run-{self.run_count}"
+
+
+class AnySinkDataNode(DataNode):
+    """A downstream sink that accepts any type, used to pull an upstream node in as a dependency."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="value",
+                tooltip="Anything",
+                type="any",
+                default_value=None,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        return None
+
+
 class LoopEndNode(BaseIterativeEndNode):
     """Closes the loop. Declared before the Start node so it can name it as compatible."""
 

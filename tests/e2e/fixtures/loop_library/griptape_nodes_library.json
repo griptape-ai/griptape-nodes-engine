@@ -77,6 +77,24 @@
       }
     },
     {
+      "class_name": "OutsideCounterDataNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Data node outside the loop with a run counter",
+        "display_name": "Outside Counter"
+      }
+    },
+    {
+      "class_name": "AnySinkDataNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Accepts any type, used to pull an upstream node in as a dependency",
+        "display_name": "Any Sink"
+      }
+    },
+    {
       "class_name": "LoopEndNode",
       "file_path": "loop_nodes.py",
       "metadata": {

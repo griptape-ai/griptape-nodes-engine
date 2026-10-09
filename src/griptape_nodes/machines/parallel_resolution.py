@@ -806,6 +806,11 @@ class ExecuteDagState(State):
             )
             # Set state BEFORE adding to task_to_node to avoid race condition
             node_reference.node_state = NodeState.PROCESSING
+            # This node is about to produce new outputs, so anything resolved against its previous
+            # outputs is stale. Without this, a re-run (pressing Run again, or the next pass of a
+            # loop) leaves downstream data nodes RESOLVED, and the upstream walk that gathers a
+            # later node's inputs skips them and hands on the previous run's values.
+            context.engine.flow_manager.get_connections().unresolve_future_nodes(node_reference.node_reference)
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
             node_reference.node_reference.clear_cancellation()
