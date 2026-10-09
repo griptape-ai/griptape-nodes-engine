@@ -1,4 +1,4 @@
-"""Moved to ``griptape_nodes.retained_mode.events.converters``; kept so node libraries importing this path keep working."""
+"""Compatibility imports for node libraries; use ``griptape_nodes.retained_mode.events.converters``."""
 
 import warnings
 from typing import Any

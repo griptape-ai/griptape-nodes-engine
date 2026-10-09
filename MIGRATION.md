@@ -62,8 +62,8 @@ class MyLibrary(AdvancedNodeLibrary):
 ## Events are serialized by converters
 
 **Embedders and request API clients written in Python.** Events and payloads no longer have
-serialization methods. Use the cattrs converters in `griptape_nodes.retained_mode.events.converters`,
-picked by who reads the message:
+wire-format serialization methods. Use the cattrs converters in
+`griptape_nodes.retained_mode.events.converters` for the message's reader:
 
 ```python
 from griptape_nodes.retained_mode.events import converters

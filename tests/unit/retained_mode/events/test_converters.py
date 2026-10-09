@@ -1,5 +1,3 @@
-"""``engine`` and ``client`` share every hook except how they write parameter values."""
-
 import json
 from dataclasses import dataclass
 

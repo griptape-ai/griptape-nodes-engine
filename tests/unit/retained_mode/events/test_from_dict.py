@@ -1,5 +1,3 @@
-"""Tests for reading events with the event converters, PayloadRegistry integration and _resolve_payload_type."""
-
 import pytest
 
 from griptape_nodes.retained_mode.events import converters

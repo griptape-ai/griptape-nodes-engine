@@ -239,23 +239,19 @@ def _make_namedtuple_structure_fn(cls: type, conv: Converter) -> Any:
 
 
 def configure_converter(conv: Converter) -> None:
-    """Register the engine's hooks on ``conv``, in order: cattrs tries the latest first.
+    """Register shared hooks after ``cattrs.preconf.json.configure_converter``.
 
-    Like ``cattrs.preconf.json.configure_converter``, and run after it. Fields typed ``Value`` and
-    ``DisplayValue`` need their unstructure hooks registered separately, since they differ by who
-    reads the result.
+    cattrs tries the latest hook first. Register ``Value`` and ``DisplayValue`` unstructure
+    hooks separately for the message's reader.
     """
     conv.register_unstructure_hook_func(
         lambda cls: isinstance(cls, type) and issubclass(cls, SerializableMixin),
         _refuse_griptape_object,
     )
-    # Pydantic BaseModel subclasses (WorkflowMetadata, WorkflowShape, etc.)
-    # mode="json" ensures all values are JSON-serializable (e.g. datetime -> ISO string)
     conv.register_unstructure_hook_func(
         lambda cls: isinstance(cls, type) and issubclass(cls, BaseModel),
         lambda obj: obj.model_dump(mode="json"),
     )
-    # datetime subclasses (e.g. pendulum.DateTime from griptape) -> ISO format string
     conv.register_unstructure_hook_func(
         lambda cls: isinstance(cls, type) and issubclass(cls, datetime) and cls is not datetime,
         lambda obj: obj.isoformat(),
@@ -266,12 +262,8 @@ def configure_converter(conv: Converter) -> None:
     )
     conv.register_unstructure_hook(ElementDocument, lambda document: _unstructure_element_document(document, conv))
     conv.register_structure_hook(ElementDocument, _structure_element_document)
-    # Bare `type` references (e.g. provider_class: type), named the way the value codec names classes.
     conv.register_unstructure_hook(type, type_name)
-    # ParsedMacro -> its template string. `segments` is parsed from the template by __post_init__ and
-    # never set by a caller, so the template is the entire value: sending the segments would send a
-    # derived copy that the receiving side has to rebuild anyway. Without this, cattrs has no hook for
-    # the dataclass and passes it through untouched, so the failure lands in json.dumps instead.
+    # ParsedMacro.segments is derived by __post_init__; only the template crosses the wire.
     conv.register_unstructure_hook(ParsedMacro, lambda macro: macro.template)
     conv.register_structure_hook(Value, lambda data, _: decode_value(data))
     conv.register_structure_hook(DisplayValue, lambda data, _: decode_value(data))
@@ -307,8 +299,7 @@ def configure_converter(conv: Converter) -> None:
     )
     conv.register_unstructure_hook_factory(_is_namedtuple, _make_namedtuple_unstructure_fn)
     conv.register_structure_hook_factory(_is_namedtuple, _make_namedtuple_structure_fn)
-    # Classes that define `_cattrs_structure` (classmethod) and/or `_cattrs_unstructure` (instance
-    # method) use those. Last, so they take precedence over the generated dataclass code.
+    # Register last so class methods take precedence over generated dataclass hooks.
     use_class_methods(conv, structure_method_name="_cattrs_structure", unstructure_method_name="_cattrs_unstructure")
 
 

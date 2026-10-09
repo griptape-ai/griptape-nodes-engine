@@ -678,7 +678,6 @@ class TestGetMessageFilters:
 class TestRelayWorkerResult:
     @pytest.mark.asyncio
     async def test_heartbeat_success_updates_last_seen(self, worker_manager: WorkerManager) -> None:
-        # result_type lives at the outer level — set by converters.engine.unstructure(BaseEvent), not inside result{}
         payload = {
             "event_type": "EventResultSuccess",
             "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,

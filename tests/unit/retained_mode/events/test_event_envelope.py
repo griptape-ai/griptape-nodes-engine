@@ -1,8 +1,6 @@
 """Tests for the serialized event envelope.
 
-``converters._envelope`` skips the pydantic walk over Payload-typed fields that the event hooks
-immediately overwrite with converter output. The metadata it injects is a
-wire contract: ``converters.engine.structure`` resolves the concrete payload class from ``{field}_type``, and
+The ``{field}_type`` keys identify concrete payload classes for deserialization, and
 production consumers dispatch on ``event_type`` (``subprocess_workflow_executor``,
 ``request_client``, ``worker_manager``) or derive success from ``result_type`` (``mcp``). Dropping
 either would leave those paths hanging or silently reporting failure, so they are pinned here.
@@ -49,7 +47,6 @@ def _success() -> GetParameterValueResultSuccess:
 
 
 def _events() -> dict[str, BaseEvent]:
-    """One instance of every event class that overrides dict()."""
     return {
         "EventRequest": EventRequest(request=_request(), request_id="r1", response_topic="t"),
         "EventRequestBatch": EventRequestBatch(requests=[EventRequest(request=_request(), request_id="a")]),
@@ -84,7 +81,7 @@ def test_event_type_is_the_class_name(name: str) -> None:
     ],
 )
 def test_payload_type_keys_are_present(name: str, expected_keys: set[str]) -> None:
-    """from_dict resolves the concrete payload class from these keys."""
+    """The converter resolves concrete payload classes from these keys."""
     serialized = converters.engine.unstructure(_events()[name])
     type_keys = {key for key in serialized if key.endswith("_type") and key != "event_type"}
     assert type_keys == expected_keys
@@ -114,7 +111,7 @@ def test_result_type_names_the_concrete_result_class() -> None:
 def test_round_trips_through_json(name: str, cls: type, payload_attr: str, payload_type: type) -> None:
     """A serialized event survives a JSON hop and rebuilds its concrete payload type.
 
-    Only the payload is compared: EventResult.from_dict does not restore request_id or
+    Only the payload is compared: result-event structuring does not restore request_id or
     retained_mode, which is out of scope for this test.
     """
     original = _events()[name]
@@ -139,7 +136,7 @@ def test_batch_round_trips_through_json() -> None:
 
 
 def test_payload_fields_hold_unstructured_output() -> None:
-    """The excluded fields are still populated, by safe_unstructure rather than pydantic."""
+    """Payload fields use converter hooks, not pydantic serialization."""
     serialized = converters.engine.unstructure(_events()["EventResultSuccess"])
     assert serialized["request"]["parameter_name"] == "p"
     assert serialized["result"]["value"] == {"a": [1, 2, {"b": "c"}]}
@@ -156,7 +153,7 @@ def test_non_payload_fields_survive_exclusion() -> None:
 
 
 def test_batch_inner_requests_keep_their_own_metadata() -> None:
-    """Each inner request is serialized by its own dict(), so it carries its own type keys."""
+    """Each inner request carries its own type keys."""
     serialized = converters.engine.unstructure(_events()["EventRequestBatch"])
     inner = serialized["requests"][0]
     assert inner["event_type"] == "EventRequest"
@@ -167,7 +164,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
     """The payload field is serialized last, after the envelope scalars and type metadata.
 
     Excluding the payload from ``model_dump`` moves it from its declared position to the end,
-    where the override assigns it. Nothing parses the wire format positionally, so this is the
+    where the event hook assigns it. Nothing parses the wire format positionally, so this is the
     only place key order is pinned: it documents the ordering as a deliberate, known property
     rather than treating every consumer of the golden fixture as an incidental lock on it.
     """

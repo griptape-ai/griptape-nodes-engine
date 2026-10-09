@@ -67,8 +67,7 @@ TYPE_KEY = "$type"
 VALUE_KEY = "$value"
 
 type Value = Any
-"""Any parameter value. Payload fields annotated with it cross the wire as tagged plain data
-between engines, and as ``untag``-ged data to clients."""
+"""A parameter value: tagged plain data between engines, plain JSON to clients."""
 
 type DisplayValue = Any
 """A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except

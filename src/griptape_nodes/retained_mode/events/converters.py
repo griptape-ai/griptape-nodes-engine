@@ -1,11 +1,3 @@
-"""The converters that write events and payloads for whoever reads them, and read them back.
-
-``engine`` writes for another engine process, which needs parameter values tagged with their type
-to rebuild them exactly. ``client`` writes for a client, such as the editor or an MCP agent, which
-reads plain JSON and sends plain JSON back, which the engine sets as is. Either reads a message,
-since tagged and plain values decode alike.
-"""
-
 from __future__ import annotations
 
 import json
@@ -60,10 +52,9 @@ class EventSerializationError(TypeError):
 
 
 class EventConverter(JsonConverter):
-    """A JSON converter for events and payloads.
+    """``value`` and ``display`` encode fields typed ``Value`` and ``DisplayValue``.
 
-    Fields typed ``Value`` are written with ``value`` and fields typed ``DisplayValue`` with
-    ``display``. Every other hook is the same on every ``EventConverter``.
+    Both tagged and plain JSON values decode with the shared hooks.
     """
 
     def __init__(self, *, value: Callable[[Any], Any], display: Callable[[Any], Any]) -> None:
@@ -73,15 +64,12 @@ class EventConverter(JsonConverter):
         self.register_unstructure_hook(Value, value)
         self.register_unstructure_hook(DisplayValue, display)
         configure_converter(self)
+        # Register after the shared pydantic hooks so event hooks take precedence.
         _configure_event_hooks(self)
         _event_converters.add(self)
 
     def dumps(self, obj: Any, unstructure_as: Any = None, **kwargs: Any) -> str:
-        """Write ``obj`` as JSON text.
-
-        Raises:
-            EventSerializationError: ``obj`` holds a value with no JSON form.
-        """
+        """Raise ``EventSerializationError`` if ``obj`` holds a value with no JSON form."""
         if isinstance(obj, Payload):
             data = _unstructure_payload(obj, self)
         else:
@@ -148,20 +136,12 @@ def _untagged_display_value(value: Any) -> Any:
     return untag(encode_for_display(value))
 
 
-# --- Event hooks ---
-#
-# Registered after `configure_converter`, so they take precedence over its pydantic hooks. Each
-# event serializes the pydantic fields of its envelope as is and its payloads with the converter.
-
-
 def _configure_event_hooks(conv: Converter) -> None:
     def is_event(base: type) -> Callable[[Any], bool]:
         return lambda cls: isinstance(cls, type) and issubclass(cls, base)
 
-    # A field typed `RequestPayload`, such as a node's `element_modification_commands`, can hold any
-    # registered request, so each one is sent with its registered name, the form `EventRequestBatch`
-    # takes: {"request_type": "AddParameterToNodeRequest", "request": {...}}.
-    # Exactly `RequestPayload`: a direct hook would also catch every concrete request.
+    # RequestPayload fields need a type name to select the concrete request when read back.
+    # A direct hook would also catch concrete requests; match exactly RequestPayload.
     def is_any_request(cls: Any) -> bool:
         return cls is RequestPayload
 
@@ -183,7 +163,6 @@ def _configure_event_hooks(conv: Converter) -> None:
     )
     conv.register_structure_hook_func(is_event(AppEvent), lambda data, cls: _structure_payload_event(data, cls, conv))
 
-    # A `list[ResultDetail]` keeps subclasses such as StrictModeViolationDetail and their fields.
     include_subclasses(ResultDetail, conv)
 
 
@@ -204,7 +183,7 @@ def _structure_any_request(data: dict[str, Any], conv: Converter) -> RequestPayl
 
 
 def _envelope(event: BaseEvent, exclude: set[str] | None = None) -> dict[str, Any]:
-    """Serialize ``event``'s own fields, skipping the payloads in ``exclude`` the caller writes.
+    """Exclude payload fields to avoid a pydantic walk that converter hooks would overwrite.
 
     ``event_type`` and the ``{field}_type`` entries are part of the wire format: reading resolves
     the concrete payload class from ``{field}_type``, and consumers dispatch on ``event_type``.
@@ -239,9 +218,8 @@ def _unstructure_result(event: EventResult, conv: Converter) -> dict[str, Any]:
     if event.request.fields is not None and event.result.succeeded():
         tree = build_path_tree(event.request.fields)
         filtered = apply_path_tree(result_dict, tree)
-        # Re-add framework fields unconditionally: callers always need result_details and
-        # altered_workflow_state to handle the response, whatever they put in fields. setdefault
-        # avoids overwriting them if the caller requested them explicitly.
+        # Callers need result_details and altered_workflow_state to handle the response,
+        # even when fields omits them.
         for framework_field in _RESULT_FRAMEWORK_FIELDS:
             if framework_field in result_dict:
                 filtered.setdefault(framework_field, result_dict[framework_field])

@@ -2,8 +2,7 @@
 
 Fields that carry a value to a client are typed ``DisplayValue``, and element trees are
 ``ElementDocument``. Both encode at the wire, and decode when they come back, so a value
-keeps its type across a trip between engines and is never encoded twice. ``client_json`` encodes
-them without tags, as the editor and MCP agents read them.
+keeps its type between engines and is never encoded twice.
 """
 
 from __future__ import annotations

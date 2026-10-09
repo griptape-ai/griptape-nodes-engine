@@ -1391,7 +1391,6 @@ class WorkerManager(EngineScoped):
         publish directly to the session response topic.
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
-        # The event converters add result_type at the outer level (not inside the result dict).
         result_event_type = payload.get("result_type", "")
         if result_event_type == worker_events.WorkerHeartbeatResultSuccess.__name__:
             response_topic = payload.get("response_topic", "")
@@ -1418,7 +1417,6 @@ class WorkerManager(EngineScoped):
 
     @staticmethod
     def _for_clients(payload: dict) -> str:
-        """A worker's result as clients read it, without the type tags engines exchange."""
         untagged = {**payload}
         for section in ("request", "result"):
             if section in untagged:
