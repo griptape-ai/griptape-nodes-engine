@@ -577,6 +577,11 @@ class NodeTypeEntry:
         self._loader = loader
 
     @property
+    def is_lazy(self) -> bool:
+        """Whether the node was registered to import its module on first use, rather than with its class."""
+        return self._loader is not None
+
+    @property
     def is_resolved(self) -> bool:
         """Whether the node's class is already available, so resolving it imports nothing."""
         return self._resolved is not None
@@ -795,12 +800,17 @@ class Library:
         return node_type in self._node_types
 
     def has_loaded_node_types(self) -> bool:
-        """Whether any of this library's node modules has been imported yet.
+        """Whether any of this library's lazily registered node modules has been imported yet.
 
         False only before the library's first node is used under lazy loading. That first import is
-        the slow one, since it brings in the packages the library's nodes share.
+        the slow one, since it brings in the packages the library's nodes share. Node types
+        registered with their class already in hand, such as workflow nodes, do not count: they
+        import nothing. A library with no lazy node types has nothing left to load, so it is True.
         """
-        return any(entry.is_resolved for entry in self._node_types.values())
+        lazy_entries = [entry for entry in self._node_types.values() if entry.is_lazy]
+        if not lazy_entries:
+            return True
+        return any(entry.is_resolved for entry in lazy_entries)
 
     def is_node_type_loaded(self, node_type: str) -> bool:
         """Whether `node_type`'s module is already imported, so creating the node imports nothing.

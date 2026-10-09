@@ -387,6 +387,11 @@ class NodeManager(EngineScoped):
         # task to cancel.
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
+        # First-time node imports `_aprepare_create_node` announced with LOADING and the handler has
+        # not closed yet, by the id of the CreateNodeRequest that announced them. The handler closes
+        # each one on every way out, so no LOADING is left without its COMPLETE or FAILED.
+        self._announced_node_imports: dict[int, Library] = {}
+
         event_manager.register_request_handlers(self)
         event_manager.register_async_request_preparer(CreateNodeRequest, self._aprepare_create_node)
 
@@ -696,7 +701,17 @@ class NodeManager(EngineScoped):
         return "\n\n".join(parts)
 
     @handles(CreateNodeRequest)
-    def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:
+        try:
+            return self._create_node_from_request(request)
+        finally:
+            # Close a LOADING the creation did not: it returned before creating anything, or another
+            # request imported the library's nodes during the preparer's yield.
+            announced_library = self._announced_node_imports.pop(id(request), None)
+            if announced_library is not None:
+                self._close_node_import_announcement(announced_library, request.node_type)
+
+    def _create_node_from_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
         parent_flow = None
@@ -784,8 +799,8 @@ class NodeManager(EngineScoped):
             # A policy denial is refused before anything imports, and LOADING was never sent for it.
             if library_importing_node is not None and not isinstance(err, _NodeInstantiationDeniedError):
                 self._report_node_import_finished(
+                    request,
                     library_importing_node,
-                    request.node_type,
                     error=readable_exception_message(err),
                     elapsed_seconds=time.monotonic() - import_started,
                 )
@@ -827,8 +842,8 @@ class NodeManager(EngineScoped):
         else:
             if library_importing_node is not None:
                 self._report_node_import_finished(
+                    request,
                     library_importing_node,
-                    request.node_type,
                     error=None,
                     elapsed_seconds=time.monotonic() - import_started,
                 )
@@ -1056,17 +1071,40 @@ class NodeManager(EngineScoped):
                 message=f"Loading {library_name} nodes for the first time. This can take a minute.",
             )
         )
+        self._announced_node_imports[id(request)] = library
         await asyncio.sleep(_NODE_IMPORT_ANNOUNCEMENT_SECONDS)
 
+    def _close_node_import_announcement(self, library: Library, node_type: str) -> None:
+        """Answer a LOADING the creation path ended without reporting on."""
+        library_name = library.get_library_data().name
+        if library.has_loaded_node_types():
+            self._send_library_nodes_loading(
+                LibraryNodesLoading(
+                    library_name=library_name, node_type=node_type, status=InitializationStatus.COMPLETE
+                )
+            )
+            return
+        self._send_library_nodes_loading(
+            LibraryNodesLoading(
+                library_name=library_name,
+                node_type=node_type,
+                status=InitializationStatus.FAILED,
+                error=f"Attempted to create a '{node_type}' node. Failed before the library's nodes were loaded.",
+            )
+        )
+
     def _report_node_import_finished(
-        self, library: Library, node_type: str, *, error: str | None, elapsed_seconds: float
+        self, request: CreateNodeRequest, library: Library, *, error: str | None, elapsed_seconds: float
     ) -> None:
         """Say a first-time import of the node's library module has ended, and how.
 
         COMPLETE when the module imported, even if the node itself then failed to build: the
         library's nodes are loaded either way, and the console says how long it took. FAILED, with
-        ``error``, only when the import did not; the handler has already logged why.
+        ``error``, only when the import did not; the handler has already logged why. Closes the
+        preparer's LOADING for this request, if it sent one.
         """
+        self._announced_node_imports.pop(id(request), None)
+        node_type = request.node_type
         library_name = library.get_library_data().name
         if library.is_node_type_loaded(node_type):
             logger.info("Loaded nodes from library '%s' in %.1f s", library_name, elapsed_seconds)

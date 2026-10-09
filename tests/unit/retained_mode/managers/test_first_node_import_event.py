@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     LibraryMetadata,
@@ -81,6 +82,11 @@ class BrokenNode(BaseNode):
     def process(self):
         return None
 """
+
+
+class _EagerNode(BaseNode):
+    def process(self) -> None:
+        return None
 
 
 class _Recorder:
@@ -277,6 +283,41 @@ class TestCreatingTheFirstNode:
         ]
 
     @pytest.mark.asyncio
+    async def test_a_create_that_fails_before_importing_still_closes_its_announcement(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        request = CreateNodeRequest(
+            node_type="SlowNode", specific_library_name=_LIBRARY_NAME, override_parent_flow_name="No Such Flow"
+        )
+
+        await engine.ahandle_request(request)
+
+        assert [event.status for event in recorder.events] == [
+            InitializationStatus.LOADING,
+            InitializationStatus.FAILED,
+        ]
+        assert recorder.events_when_module_imported is None
+        assert engine.node_manager._announced_node_imports == {}
+
+    @pytest.mark.asyncio
+    async def test_a_library_loaded_by_another_request_during_the_yield_still_closes_the_announcement(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        async def another_request_loads_the_library(_seconds: float) -> None:
+            LibraryRegistry.get_library(_LIBRARY_NAME).get_node_class("FastNode")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.node_manager.asyncio.sleep",
+            side_effect=another_request_loads_the_library,
+        ):
+            await engine.ahandle_request(_create("SlowNode"))
+
+        assert [event.status for event in recorder.events] == [
+            InitializationStatus.LOADING,
+            InitializationStatus.COMPLETE,
+        ]
+
+    @pytest.mark.asyncio
     async def test_a_failed_import_is_reported_with_its_reason(self, engine: Engine, recorder: _Recorder) -> None:
         await engine.ahandle_request(_create("BrokenNode"))
 
@@ -338,6 +379,24 @@ class TestIsNodeTypeLoaded:
         library.get_node_class("SlowNode")
 
         assert library.is_node_type_loaded("SlowNode") is True
+
+    def test_a_node_type_registered_with_its_class_does_not_count_as_loaded(self) -> None:
+        library = LibraryRegistry.get_library(_LIBRARY_NAME)
+
+        # Like a workflow node: registered with its class in hand, so it imports nothing.
+        library.register_new_node_type(
+            _EagerNode, NodeMetadata(category="Test", description="test", display_name="Eager")
+        )
+
+        assert library.has_loaded_node_types() is False
+
+    @pytest.mark.usefixtures("recorder")
+    def test_a_library_counts_as_loaded_once_any_lazy_node_type_is(self) -> None:
+        library = LibraryRegistry.get_library(_LIBRARY_NAME)
+
+        library.get_node_class("FastNode")
+
+        assert library.has_loaded_node_types() is True
 
     def test_raises_for_a_node_type_the_library_does_not_have(self) -> None:
         library = LibraryRegistry.get_library(_LIBRARY_NAME)
