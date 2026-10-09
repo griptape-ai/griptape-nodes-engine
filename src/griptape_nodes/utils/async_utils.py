@@ -134,7 +134,9 @@ async def subprocess_run(
     # Convert bytes to string if text=True
     if text:
         stdout = stdout_bytes.decode() if stdout_bytes else ""
-        stderr = stderr_bytes.decode() if stderr_bytes else ""
+        # Replaced rather than strict: stderr is diagnostics, and a build tool can print text in
+        # the system's own encoding, which must not turn a failed process into a decoding error.
+        stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
     else:
         stdout = stdout_bytes or b""
         stderr = stderr_bytes or b""

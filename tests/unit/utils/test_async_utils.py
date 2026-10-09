@@ -116,3 +116,15 @@ class TestSubprocessRunStreamingStderr:
             await subprocess_run([sys.executable, "-c", script], capture_output=True, on_stderr_line=explode)
 
         assert time.monotonic() - started < _PROCESS_STOP_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_stderr_that_is_not_utf8_still_reports_the_failure(self) -> None:
+        lines: list[str] = []
+        # A cp1252 byte (0xE9, "é") on its own is not valid UTF-8.
+        script = "import sys\nsys.stderr.buffer.write(b'build \\xe9 failed\\n')\nsys.exit(2)\n"
+
+        with pytest.raises(subprocess.CalledProcessError) as raised:
+            await subprocess_run([sys.executable, "-c", script], check=True, text=True, on_stderr_line=lines.append)
+
+        assert lines == ["build \ufffd failed"]
+        assert raised.value.stderr == "build \ufffd failed\n"
