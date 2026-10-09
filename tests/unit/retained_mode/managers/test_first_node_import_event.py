@@ -20,9 +20,9 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.app_events import InitializationStatus, LibraryNodesLoading
-from griptape_nodes.retained_mode.events.base_events import AppEvent
+from griptape_nodes.retained_mode.events.base_events import AppEvent, EventResultFailure
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultFailure
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
@@ -45,6 +45,28 @@ from griptape_nodes.exe_types.node_types import BaseNode
 
 
 class SlowNode(BaseNode):
+    def process(self):
+        return None
+"""
+
+_FAST_NODE_SOURCE = """
+from griptape_nodes.exe_types.node_types import BaseNode
+
+
+class FastNode(BaseNode):
+    def process(self):
+        return None
+"""
+
+# Imports fine, then fails to build: the library's nodes did load.
+_INIT_FAILS_NODE_SOURCE = """
+from griptape_nodes.exe_types.node_types import BaseNode
+
+
+class InitFailsNode(BaseNode):
+    def __init__(self, **kwargs):
+        raise RuntimeError("this node cannot be built")
+
     def process(self):
         return None
 """
@@ -98,6 +120,8 @@ def lazy_library(engine: Engine, tmp_path: Path) -> None:
     """Register a library whose node modules have not been imported yet, and a flow to create into."""
     (tmp_path / "slow_node.py").write_text(_SLOW_NODE_SOURCE)
     (tmp_path / "broken_node.py").write_text(_BROKEN_NODE_SOURCE)
+    (tmp_path / "fast_node.py").write_text(_FAST_NODE_SOURCE)
+    (tmp_path / "init_fails_node.py").write_text(_INIT_FAILS_NODE_SOURCE)
     schema = LibrarySchema(
         name=_LIBRARY_NAME,
         library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
@@ -115,6 +139,16 @@ def lazy_library(engine: Engine, tmp_path: Path) -> None:
                 class_name="BrokenNode",
                 file_path="broken_node.py",
                 metadata=NodeMetadata(category="Test", description="test", display_name="Broken"),
+            ),
+            NodeDefinition(
+                class_name="FastNode",
+                file_path="fast_node.py",
+                metadata=NodeMetadata(category="Test", description="test", display_name="Fast"),
+            ),
+            NodeDefinition(
+                class_name="InitFailsNode",
+                file_path="init_fails_node.py",
+                metadata=NodeMetadata(category="Test", description="test", display_name="Init Fails"),
             ),
         ],
     )
@@ -219,6 +253,30 @@ class TestCreatingTheFirstNode:
         assert recorder.events == []
 
     @pytest.mark.asyncio
+    async def test_another_node_type_from_the_same_library_sends_nothing(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        await engine.ahandle_request(_create("SlowNode"))
+        recorder.events.clear()
+
+        # FastNode lives in its own file, so its module still imports, but the library's
+        # shared packages already have.
+        await engine.ahandle_request(_create("FastNode"))
+
+        assert recorder.events == []
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_imports_but_fails_to_build_reports_the_import_complete(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        await engine.ahandle_request(_create("InitFailsNode"))
+
+        assert [event.status for event in recorder.events] == [
+            InitializationStatus.LOADING,
+            InitializationStatus.COMPLETE,
+        ]
+
+    @pytest.mark.asyncio
     async def test_a_failed_import_is_reported_with_its_reason(self, engine: Engine, recorder: _Recorder) -> None:
         await engine.ahandle_request(_create("BrokenNode"))
 
@@ -296,8 +354,53 @@ class TestAsyncRequestPreparer:
         async def preparer(_request: object) -> None:
             calls.append("preparer")
 
-        with patch.dict(engine.event_manager._async_request_preparers, {CreateNodeRequest: preparer}):
-            await engine.ahandle_request(CreateNodeRequest(node_type="NoSuchNode"))
-            engine.handle_request(CreateNodeRequest(node_type="NoSuchNode"))
+        def handler(request: CreateNodeRequest) -> CreateNodeResultFailure:
+            calls.append("handler")
+            return CreateNodeResultFailure(result_details=f"not creating {request.node_type}")
 
-        assert calls == ["preparer"]
+        event_manager = engine.event_manager
+        with (
+            patch.dict(event_manager._async_request_preparers, {CreateNodeRequest: preparer}),
+            patch.dict(event_manager._request_type_to_manager, {CreateNodeRequest: handler}),
+        ):
+            await engine.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
+            engine.handle_request(CreateNodeRequest(node_type="AnyNode"))
+
+        assert calls == ["preparer", "handler", "handler"]
+
+    @pytest.mark.asyncio
+    async def test_a_preparer_that_raises_is_reported_as_the_requests_failure(self, engine: Engine) -> None:
+        async def preparer(_request: object) -> None:
+            raise RuntimeError
+
+        with patch.dict(engine.event_manager._async_request_preparers, {CreateNodeRequest: preparer}):
+            result = await engine.event_manager.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
+
+        assert isinstance(result, EventResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_a_request_a_pre_dispatch_hook_refuses_never_reaches_the_preparer(self, engine: Engine) -> None:
+        calls: list[str] = []
+
+        async def preparer(_request: object) -> None:
+            calls.append("preparer")
+
+        def refuse(_request: object, _context: object) -> CreateNodeResultFailure:
+            return CreateNodeResultFailure(result_details="refused")
+
+        event_manager = engine.event_manager
+        event_manager.add_pre_dispatch_hook(refuse)
+        try:
+            with patch.dict(event_manager._async_request_preparers, {CreateNodeRequest: preparer}):
+                await event_manager.ahandle_request(CreateNodeRequest(node_type="AnyNode"))
+        finally:
+            event_manager.remove_pre_dispatch_hook(refuse)
+
+        assert calls == []
+
+    def test_a_second_preparer_for_the_same_request_type_is_refused(self, engine: Engine) -> None:
+        async def preparer(_request: object) -> None:
+            return None
+
+        with pytest.raises(ValueError, match="already registered"):
+            engine.event_manager.register_async_request_preparer(CreateNodeRequest, preparer)

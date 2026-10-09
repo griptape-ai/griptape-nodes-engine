@@ -404,9 +404,18 @@ class EventManager(EngineScoped):
         and yield so the event leaves the process before the handler starts. It runs after the
         pre-dispatch hooks, so a request they refuse never reaches it. `handle_request` does not
         run preparers, because it can be called from inside a running handler with no loop to
-        yield to. A preparer must not raise. One preparer per request type; registering another
-        replaces it.
+        yield to.
+
+        A preparer that yields lets other requests run before this one's handler, so it must not
+        assume the state it checked is unchanged when the handler starts. An exception it raises is
+        reported as the request's failure, like one from the handler. One preparer per request type.
+
+        Raises:
+            ValueError: If ``request_type`` already has a preparer.
         """
+        if request_type in self._async_request_preparers:
+            msg = f"Attempted to register an async preparer for '{request_type.__name__}'. Failed because one is already registered."
+            raise ValueError(msg)
         self._async_request_preparers[request_type] = preparer
 
     def remove_pre_dispatch_hook(
@@ -1162,13 +1171,14 @@ class EventManager(EngineScoped):
             )
 
         preparer = self._async_request_preparers.get(request_type)
-        if preparer is not None:
-            await preparer(request)
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         try:
             try:
+                # Inside the handler's guard, so a preparer that raises still produces a result.
+                if preparer is not None:
+                    await preparer(request)
                 # Actually make the handler callback (support both sync and async):
                 result_payload: ResultPayload = await call_function(callback, request)
 

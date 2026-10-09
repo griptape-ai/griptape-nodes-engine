@@ -285,9 +285,11 @@ logger = logging.getLogger("griptape_nodes")
 _PARAM_MISSING = object()
 
 # How long to yield after announcing a node module import, so the app's event queue sends the
-# announcement before the import blocks the event loop. The broadcast leaves Python once the queue
-# task hands it to the IPC layer, which takes a few loop turns, so this is generous next to them
-# and nothing next to an import worth announcing.
+# announcement before the import blocks the event loop. The consumer is the app's event queue drain
+# (`_process_event_queue` in griptape-nodes-app), which hands each event to the Rust IPC layer;
+# delivery from there does not need the Python loop. That takes a few loop turns, so this is
+# generous next to them and nothing next to an import worth announcing. It is a grace period, not
+# a delivery guarantee.
 _NODE_IMPORT_ANNOUNCEMENT_SECONDS = 0.05
 
 # A node in one of these states owes the running flow nothing further, so deleting it takes
@@ -1085,8 +1087,10 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _library_that_will_import_node(node_type: str, specific_library_name: str | None) -> Library | None:
-        """The node type's library when creating the node will first import its module, else None.
+        """The node type's library when creating the node is the library's first node import, else None.
 
+        Per library rather than per node type: the first import brings in the packages the library's
+        nodes share, so a later node type from the same library loads quickly and is not announced.
         None also for a node type no registered library provides; the handler reports that.
         """
         try:
@@ -1095,7 +1099,7 @@ class NodeManager(EngineScoped):
             return None
         if not library.has_node_type(node_type):
             return None
-        if library.is_node_type_loaded(node_type):
+        if library.has_loaded_node_types():
             return None
         return library
 

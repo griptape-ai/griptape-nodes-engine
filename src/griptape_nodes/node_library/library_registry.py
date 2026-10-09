@@ -794,6 +794,14 @@ class Library:
     def has_node_type(self, node_type: str) -> bool:
         return node_type in self._node_types
 
+    def has_loaded_node_types(self) -> bool:
+        """Whether any of this library's node modules has been imported yet.
+
+        False only before the library's first node is used under lazy loading. That first import is
+        the slow one, since it brings in the packages the library's nodes share.
+        """
+        return any(entry.is_resolved for entry in self._node_types.values())
+
     def is_node_type_loaded(self, node_type: str) -> bool:
         """Whether `node_type`'s module is already imported, so creating the node imports nothing.
 

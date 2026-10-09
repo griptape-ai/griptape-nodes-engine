@@ -215,8 +215,13 @@ class LibraryNodesLoading(AppPayload):
     With lazy node loading, a library's node modules are imported the first time one of its nodes
     is created, which can take a minute for libraries built on large packages. LOADING is sent
     before the import starts so the editor can say why the new node has not appeared, then
-    COMPLETE or FAILED once it ends. Only `CreateNodeRequest` handled through the asynchronous
-    request path sends LOADING; a node created any other way gets only the COMPLETE or FAILED.
+    COMPLETE or FAILED once it ends. It is sent once per library, for its first node import. Only
+    `CreateNodeRequest` handled through the asynchronous request path sends LOADING; a node created
+    any other way gets only the COMPLETE or FAILED.
+
+    Match it to waiting placeholders by `library_name`: several nodes from one library can wait on
+    the same import. Two creates arriving together can each send LOADING for the same library, so
+    treat a repeated LOADING as the same one.
 
     Args:
         library_name: Name of the library whose nodes are loading
