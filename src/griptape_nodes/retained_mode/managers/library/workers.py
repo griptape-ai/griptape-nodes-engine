@@ -259,13 +259,27 @@ class LibraryWorkers(EngineScoped):
             worker_manager.set_session_ready()
             await self._start_workers()
 
-    async def _start_workers(self) -> None:
+    async def start_worker_for_library(self, library_name: str) -> None:
+        """Start the worker for one library, if it executes in one, leaving every other library alone.
+
+        Without an active session nothing starts here: `on_session_started` starts it with the rest.
+        """
+        if self.engine.library_manager.is_worker or not self.engine.get_session_id():
+            return
+        await self._start_workers(only_library_name=library_name)
+
+    async def _start_workers(self, only_library_name: str | None = None) -> None:
         """Issue StartWorkerRequest for every library whose nodes execute in a worker.
 
         Asks WorkerManager to spawn a subprocess. Used on session start (both initial and
         subsequent) so that worker creation is always tied to an active session.
+
+        Args:
+            only_library_name: Consider only this library, for a caller that stopped one worker.
         """
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
+            if only_library_name is not None and library_info.library_name != only_library_name:
+                continue
             # `enabled` matters: executes_in_worker is set before the lifecycle is overwritten with
             # DISABLED, so without this a library the user turned off still got an idle worker
             # subprocess.
