@@ -1035,7 +1035,7 @@ class VariablesManager(EngineScoped):
 
         resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
 
-        # Only str/int/float/bool/list values can substitute into {VAR} tokens. Everything but
+        # Only str/int/float/bool/dict/list values can substitute into {VAR} tokens. Everything but
         # str and int is listed as its rendered string.
         substitutables: list[Substitutable] = []
         for resolved_variable in resolved:

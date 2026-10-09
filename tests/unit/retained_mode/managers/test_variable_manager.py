@@ -178,7 +178,7 @@ class TestListSubstitutablesRequest:
         assert entries[0].value == "/workspace"
 
     def test_filters_out_non_substitutable_user_vars(self, engine: Engine, flow_name: str) -> None:
-        """User vars that are not str/int/float/bool/list (here None) are excluded."""
+        """User vars that are not str/int/float/bool/dict/list (here None) are excluded."""
         _add_variable(engine, "SHOT", "sc001")
         _add_variable(engine, "META", None)
         with project_macros({}):

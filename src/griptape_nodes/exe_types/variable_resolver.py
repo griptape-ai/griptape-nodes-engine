@@ -331,16 +331,17 @@ class VariableResolver:
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
         """Filter a name→value dict to the values that can substitute into {VAR} tokens.
 
-        str and int (excluding bool) pass through unchanged. Floats, bools, and lists pass as
-        strings, so the substitution and picker code downstream only ever sees str/int. A float
-        or bool is spelled as JSON (`1.5`, `true`), and a list has one item per line.
+        str and int (excluding bool) pass through unchanged. Floats, bools, dicts, and lists pass as
+        strings, so the substitution and picker code downstream only ever sees str/int. A float,
+        bool, or dict is spelled as compact JSON (`1.5`, `true`, `{"a": 1}`), and a list has one
+        item per line.
         """
         filtered: dict[str, str | int] = {}
         for name, value in variables.items():
             if isinstance(value, list):
                 filtered[name] = VariableResolver._render_list(value)
             # bool subclasses int, so it has to be caught before the int branch below.
-            elif isinstance(value, (bool, float)):
+            elif isinstance(value, (bool, float, dict)):
                 filtered[name] = VariableResolver._render_value(value)
             elif isinstance(value, (str, int)):
                 filtered[name] = value

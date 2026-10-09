@@ -1,5 +1,6 @@
 """Tests for inline workflow variable substitution in get_parameter_value()."""
 
+import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
@@ -1172,10 +1173,30 @@ class TestListVariableSubstitution:
 
         assert str(filtered["items"]).startswith("a\n")
 
-    def test_dict_values_are_still_excluded(self) -> None:
-        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1}})
+    def test_dict_renders_as_compact_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1, "b": [True, None]}})
 
-        assert filtered == {}
+        assert filtered == {"d": '{"a": 1, "b": [true, null]}'}
+
+    def test_self_referential_dict_does_not_raise(self) -> None:
+        value: dict = {}
+        value["self"] = value
+
+        filtered = VariableResolver._filter_for_substitution({"d": value})
+
+        assert "d" in filtered
+
+    def test_unquoted_dict_token_in_a_json_template_stays_valid_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"SIZE_CONFIDENCE": {"1": 0.05, "2": 0.47}, "DEPT_CONFIDENCE": 0.99, "SIZE": "M"}
+        )
+        template = '{"Dept": {"Size": "{SIZE}", "Department Confidence": {DEPT_CONFIDENCE}, "Size Confidence": {SIZE_CONFIDENCE}}}'
+
+        resolved = VariableResolver.resolve_string(template, filtered)
+
+        assert json.loads(resolved) == {
+            "Dept": {"Size": "M", "Department Confidence": 0.99, "Size Confidence": {"1": 0.05, "2": 0.47}}
+        }
 
 
 class TestFloatAndBoolVariableSubstitution:
