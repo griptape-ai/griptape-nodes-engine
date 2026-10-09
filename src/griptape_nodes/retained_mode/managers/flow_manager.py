@@ -4683,8 +4683,11 @@ class FlowManager(EngineScoped):
         self._global_flow_queue.queue.clear()
 
         # Request cancellation on all nodes and wait for them to complete
+        run_seconds = None
         if self._global_control_flow_machine is not None:
             await self._global_control_flow_machine.cancel_flow()
+            # Read before the reset below clears the run's start time.
+            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
 
         # Reset control flow machine
         if self._global_control_flow_machine is not None:
@@ -4697,7 +4700,9 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
+            )
         )
 
     async def _abandon_running_flow(self) -> None:
@@ -4726,7 +4731,9 @@ class FlowManager(EngineScoped):
             # cancel_flow_run already reset the machine and told the editor the run is over.
             return
 
+        run_seconds = None
         if self._global_control_flow_machine is not None:
+            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
             self._global_control_flow_machine.reset_machine(cancel=True)
         self._global_single_node_resolution = False
         self._global_dag_builder.clear()
@@ -4734,7 +4741,9 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
+            )
         )
 
     def reset_global_execution_state(self) -> None:
