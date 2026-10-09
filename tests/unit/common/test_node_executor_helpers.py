@@ -20,6 +20,7 @@ import pytest
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
 
@@ -234,13 +235,14 @@ class TestControlFlowResolvedEventWireForm:
 
     def test_values_keep_their_types_across_the_wire(self) -> None:
         from griptape_nodes.retained_mode.events.execution_events import ControlFlowResolvedEvent
-        from griptape_nodes.serialization.converter import converter
+
+        converter = converters.engine
 
         values = {"flag": True, "count": 1, "pair": (1, 2), "blob": b"\x00"}
         event = ControlFlowResolvedEvent(end_node_name="EndFlow", parameter_output_values=values)
 
-        wire = json.loads(json.dumps(converter.unstructure(event)))
-        received = converter.structure(wire, ControlFlowResolvedEvent)
+        sent = json.loads(json.dumps(converter.unstructure(event)))
+        received = converter.structure(sent, ControlFlowResolvedEvent)
 
         assert received.parameter_output_values == values
         assert type(received.parameter_output_values["flag"]) is bool

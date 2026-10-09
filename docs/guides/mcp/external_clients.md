@@ -121,21 +121,22 @@ Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP
 
 ## Parameter values
 
-Every request, result, and event field that holds a parameter or flow variable value uses the form
-below, both in what the engine sends and in what it reads back.
-
-Values of types JSON lacks, such as tuples, enums, and artifacts, carry their Python type under
-`$type`. Artifacts and other objects keep their fields beside `$type`:
+Parameter and flow variable values arrive as plain JSON. Values of types JSON lacks arrive as
+their closest JSON form: tuples and sets as lists, enums as their value, paths as text, and
+artifacts and other objects as their fields:
 
 ```json
-{"$type": "griptape.artifacts.image_url_artifact:ImageUrlArtifact", "type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
+{"type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
 ```
 
-Other values, such as tuples and enums, sit under `$value`:
+Send values back as plain JSON too. Two kinds of dict arrive wrapped instead, and go back as they
+arrived. A dict with its own `"$type"` key is wrapped so the key isn't read as a type. A dict
+whose keys would collide as text, such as `1` and `"1"`, arrives as key-value pairs so no entry is
+lost:
 
 ```json
-{"$type": "builtins:tuple", "$value": [1, "b"]}
-{"$type": "my_library.colors:Color", "$value": "red"}
+{"$type": "builtins:dict", "$value": {"$type": "app.bsky.feed.post", "text": "hi"}}
+{"$type": "builtins:dict", "$value": [[1, "a"], ["1", "b"]]}
 ```
 
 A value that can't be written as JSON, such as an open file, is sent as its Python `str()` in

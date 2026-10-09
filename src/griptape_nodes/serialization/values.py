@@ -45,7 +45,7 @@ import sys
 import uuid
 import weakref
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any, Protocol, Self, overload
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast, overload
 
 import attrs
 from griptape.mixins.serializable_mixin import SerializableMixin
@@ -67,11 +67,15 @@ TYPE_KEY = "$type"
 VALUE_KEY = "$value"
 
 type Value = Any
-"""Any parameter value. Payload fields annotated with it cross the wire as tagged plain data."""
+"""A parameter value: tagged plain data between engines, plain JSON to clients."""
 
 type DisplayValue = Any
 """A parameter value shown to a person, as in the editor. Crosses the wire like ``Value``, except
 that a value with no plain-data form is sent as its text instead of failing."""
+
+type ElementDocument = dict[str, Any]
+"""A node element and its children, as the editor sees them. Parameter values sit under
+``value``, ``default_value``, and ``element_id_to_value``, and cross the wire as display values."""
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
@@ -140,6 +144,45 @@ def encode_for_display(value: Any) -> JsonValue:
     if isinstance(encoded, Unencodable):
         return str(value)
     return encoded
+
+
+def untag(data: JsonValue) -> JsonValue:
+    """Return encoded ``data`` without its type tags, for a client that reads plain JSON.
+
+    Each tagged value becomes its state: a tuple its list, an enum its value, an artifact its
+    fields. A dict key that is not text becomes its JSON text. Not reversible, except that a dict
+    with its own ``"$type"`` key, or with keys whose text collides, stays wrapped, so a client
+    sending it back sets a dict with every entry.
+    """
+    if isinstance(data, list):
+        return [untag(item) for item in data]
+    if not isinstance(data, dict):
+        return data
+    if TYPE_KEY not in data:
+        return {key: untag(item) for key, item in data.items()}
+    return _untag_tagged(data)
+
+
+def _untag_tagged(data: dict[str, JsonValue]) -> JsonValue:
+    if VALUE_KEY not in data:
+        return {key: untag(item) for key, item in data.items() if key != TYPE_KEY}
+    state = data[VALUE_KEY]
+    if data[TYPE_KEY] == _DICT_TYPE_NAME:
+        if isinstance(state, dict):
+            # Wrapped because its own "$type" key is data. Unwrapped, that key would read as a tag.
+            return {TYPE_KEY: _DICT_TYPE_NAME, VALUE_KEY: {key: untag(item) for key, item in state.items()}}
+        if isinstance(state, list):
+            pairs = cast("list[list[JsonValue]]", state)
+            untagged = {_key_text(untag(key)): untag(item) for key, item in pairs}
+            if len(untagged) < len(pairs) or TYPE_KEY in untagged:
+                # Keys collide as text, e.g. 1 and "1", or a "$type" key would read as a tag.
+                return {TYPE_KEY: _DICT_TYPE_NAME, VALUE_KEY: [[key, untag(item)] for key, item in pairs]}
+            return untagged
+    return untag(state)
+
+
+def _key_text(key: JsonValue) -> str:
+    return key if isinstance(key, str) else _canonical_json(key)
 
 
 def decode_value(data: Any) -> Any:
@@ -323,6 +366,9 @@ def _tagged(cls: type, state: JsonValue) -> dict[str, JsonValue]:
 
 def _canonical_json(data: JsonValue) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+_DICT_TYPE_NAME = type_name(dict)
 
 
 def _decode_tagged(data: dict[str, Any]) -> Any:
@@ -585,3 +631,15 @@ _BUILTIN_CODECS: list[tuple[Callable[[type], bool], _Codec]] = [
 # Weak, so classes from a reloaded library file are not kept alive.
 _registered: weakref.WeakKeyDictionary[type, _Registration] = weakref.WeakKeyDictionary()
 _codec_cache: weakref.WeakKeyDictionary[type, _Codec | None] = weakref.WeakKeyDictionary()
+
+
+def dump_json(data: Any, **kwargs: Any) -> str:
+    """Raise ``ValueEncodeError`` for values with no JSON form."""
+    return json.dumps(data, default=_refuse_json_value, **kwargs)
+
+
+# Passed explicitly: griptape swaps `JSONEncoder.default` process-wide for one that sends any object
+# with a `to_dict()` through it, and fails on the rest without naming their type.
+def _refuse_json_value(obj: Any) -> Any:
+    msg = f"A '{type(obj).__qualname__}' value has no plain-data form."
+    raise ValueEncodeError(msg)

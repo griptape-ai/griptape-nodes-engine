@@ -1,52 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
-from griptape_nodes.serialization.converter import converter, dump_json, register_polymorphic_dataclass
-from griptape_nodes.serialization.type_names import TypeNameError
-from griptape_nodes.serialization.values import ValueEncodeError
-
-if TYPE_CHECKING:
-    import builtins
-
-logger = logging.getLogger(__name__)
-
-
-def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
-    """Resolve a payload type from a type-name field in the event data.
-
-    Args:
-        event_data: The event dictionary (mutated: the type-name key is popped if used).
-        type_key: The key in event_data that holds the payload type name (e.g. "request_type").
-
-    Returns:
-        The resolved concrete type.
-
-    Raises:
-        ValueError: If the type cannot be resolved.
-    """
-    # Lazy import to avoid circular dependency: payload_registry imports Payload from this module.
-    from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-
-    type_name = event_data.pop(type_key, None)
-    if type_name is None:
-        msg = f"Cannot resolve payload type: '{type_key}' not found in event data."
-        raise ValueError(msg)
-
-    resolved = PayloadRegistry.get_type(type_name)
-    if resolved is None:
-        msg = f"Cannot resolve payload type: '{type_name}' is not registered."
-        raise ValueError(msg)
-
-    return resolved
 
 
 @dataclass
@@ -122,37 +81,9 @@ class ResultDetails:
         return cls(*[converter.structure(item, ResultDetail) for item in data["result_details"]])
 
 
-class EventSerializationError(TypeError):
-    """A payload holds a value with no JSON form, so it cannot be sent."""
-
-
-def _unstructure(payload: Any) -> Any:
-    try:
-        return converter.unstructure(payload)
-    except (ValueEncodeError, TypeNameError) as error:
-        msg = f"Attempted to send a '{type(payload).__name__}'. Failed because: {error}"
-        raise EventSerializationError(msg) from error
-
-
-def _to_json(data: Any, payload_type: str, **kwargs) -> str:
-    try:
-        return dump_json(data, **kwargs)
-    except (TypeError, ValueError) as error:
-        msg = f"Attempted to send a '{payload_type}'. Failed because: {error}"
-        raise EventSerializationError(msg) from error
-
-
 # The Payload class is a marker interface
 class Payload(ABC):  # noqa: B024
     """Base class for all payload types. Customers will derive from this."""
-
-    def to_json(self, **kwargs) -> str:
-        """Serialize this payload to JSON string.
-
-        Returns:
-            JSON string representation of the payload
-        """
-        return _to_json(_unstructure(self), type(self).__name__, **kwargs)
 
 
 # Request payload base class with optional request ID
@@ -347,53 +278,6 @@ class BaseEvent(BaseModel, ABC):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization and add event_type.
-
-        The signature matches pydantic's ``BaseModel.dict`` for compatibility, but no argument is
-        honored: the overrides below choose their own ``exclude`` set. Raise rather than silently
-        ignore an argument, since a caller passing one would otherwise get the full dict with no
-        indication that its ``exclude``/``include`` was dropped.
-        """
-        self._reject_dict_args(args, kwargs)
-        return self._envelope()
-
-    @staticmethod
-    def _reject_dict_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        """Fail loudly if a caller passes pydantic-style args to an event's dict() override."""
-        if args or kwargs:
-            msg = f"dict() does not accept arguments; got args={args!r}, kwargs={kwargs!r}"
-            raise TypeError(msg)
-
-    def _envelope(self, exclude: set[str] | None = None) -> dict[str, Any]:
-        """Serialize the event, optionally skipping fields the caller re-serializes itself.
-
-        Subclasses that overwrite a Payload-typed field with ``_unstructure`` output pass that
-        field name in ``exclude``: pydantic would otherwise walk the whole payload graph to build a
-        value discarded on the next line.
-
-        ``event_type`` and the ``{field}_type`` entries are injected here rather than by the
-        callers, because the wire format depends on them: ``from_dict`` resolves the concrete
-        payload class from ``{field}_type``, and consumers dispatch on ``event_type``.
-        """
-        result = self.model_dump(exclude=exclude)
-
-        # Add event type based on class name
-        result["event_type"] = self.__class__.__name__
-
-        # Include payload type information in serialized output
-        for field_name, field_value in self.__dict__.items():
-            if isinstance(field_value, Payload):
-                result[f"{field_name}_type"] = field_value.__class__.__name__
-
-        return result
-
-    def json(self, **kwargs) -> str:
-        """Serialize to JSON string."""
-        data = self.dict()
-        described_as = data.get("result_type") or data.get("payload_type") or data.get("request_type")
-        return _to_json(data, described_as or type(self).__name__, **kwargs)
-
     @abstractmethod
     def get_request(self) -> Payload:
         """Get the request payload for this event.
@@ -415,13 +299,6 @@ class EventRequest[P: Payload](BaseEvent):
         # Call the parent class initializer
         super().__init__(**data)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        self._reject_dict_args(args, kwargs)
-        result = self._envelope(exclude={"request"})
-        result["request"] = _unstructure(self.request)
-        return result
-
     def get_request(self) -> P:
         """Get the request payload for this event.
 
@@ -429,16 +306,6 @@ class EventRequest[P: Payload](BaseEvent):
             P: The request payload
         """
         return self.request
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventRequest:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        request_data = event_data.pop("request", {})
-        resolved_type = _resolve_payload_type(event_data, "request_type")
-
-        request_payload = converter.structure(request_data, resolved_type)
-        return cls(request=request_payload, **event_data)
 
 
 class EventRequestBatch(BaseEvent):
@@ -457,28 +324,10 @@ class EventRequestBatch(BaseEvent):
 
     requests: list[EventRequest] = Field(default_factory=list)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Serialize the envelope, recursing into each inner request's own serializer."""
-        self._reject_dict_args(args, kwargs)
-        result = self._envelope(exclude={"requests"})
-        result["requests"] = [inner.dict() for inner in self.requests]
-        return result
-
     def get_request(self) -> Payload:
         """EventRequestBatch is a transport envelope; inspect .requests instead."""
         msg = "EventRequestBatch is a transport envelope; inspect .requests instead."
         raise NotImplementedError(msg)
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventRequestBatch:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create a batch envelope by deserializing each inner request individually."""
-        event_data = data.copy()
-        raw_requests = event_data.pop("requests", [])
-        requests = [EventRequest.from_dict(raw) for raw in raw_requests]
-        return cls(requests=requests, **event_data)
-
-
-_RESULT_FRAMEWORK_FIELDS = frozenset(f.name for f in dataclass_fields(ResultPayload))
 
 
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
@@ -494,67 +343,6 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         """Initialize an EventResult, inferring the generic types if needed."""
         # Call the parent class initializer
         super().__init__(**data)
-
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        self._reject_dict_args(args, kwargs)
-        result = self._envelope(exclude={"request", "result"})
-        result["request"] = _unstructure(self.request)
-        result_dict = _unstructure(self.result)
-        if self.request.fields is not None and self.result.succeeded():
-            tree = build_path_tree(self.request.fields)
-            filtered = apply_path_tree(result_dict, tree)
-            # Re-add framework fields unconditionally — callers always need result_details
-            # and altered_workflow_state to handle the response, regardless of what they put
-            # in fields. setdefault avoids overwriting if the caller explicitly requested them.
-            for fw_field in _RESULT_FRAMEWORK_FIELDS:
-                if fw_field in result_dict:
-                    filtered.setdefault(fw_field, result_dict[fw_field])
-            result_dict = filtered
-        result["result"] = result_dict
-        if self.retained_mode:
-            result["retained_mode"] = self.retained_mode
-        return result
-
-    def json(self, **kwargs) -> str:
-        """Serialize to send. A result that cannot be sent becomes a failure naming why, so the requester hears back."""
-        try:
-            return self.strict_json(**kwargs)
-        except EventSerializationError as error:
-            logger.error("%s", error)
-            return self.failure_json(error, **kwargs)
-
-    def strict_json(self, **kwargs) -> str:
-        """Serialize to send, raising if the result holds a value with no JSON form.
-
-        Raises:
-            EventSerializationError: The request or result holds a value with no JSON form.
-        """
-        return super().json(**kwargs)
-
-    def failure_json(self, error: EventSerializationError, **kwargs) -> str:
-        """The failure ``json()`` sends in place of this result when ``error`` stops it being sent."""
-        # Lazy: generic_events imports this module for its base classes.
-        from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
-
-        try:
-            # Through JSON: unstructuring alone passes some values through for dump_json to reject.
-            request = json.loads(_to_json(_unstructure(self.request), type(self.request).__name__))
-        except EventSerializationError:
-            # The request itself holds the value; send what identifies it.
-            request = {"request_id": self.request.request_id}
-        failure: dict[str, Any] = {
-            "event_type": EventResultFailure.__name__,
-            "request_type": type(self.request).__name__,
-            "request": request,
-            "result_type": GenericResultFailure.__name__,
-            "result": _unstructure(GenericResultFailure(result_details=str(error))),
-            "request_id": self.request_id,
-            "response_topic": self.response_topic,
-        }
-        if self.retained_mode:
-            failure["retained_mode"] = self.retained_mode
-        return _to_json(failure, GenericResultFailure.__name__, **kwargs)
 
     def get_request(self) -> P:
         """Get the request payload for this event.
@@ -579,20 +367,6 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         Returns:
             bool: True if success, False if failure
         """
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventResult:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        request_data = event_data.pop("request", {})
-        result_data = event_data.pop("result", {})
-
-        resolved_req_type = _resolve_payload_type(event_data, "request_type")
-        resolved_res_type = _resolve_payload_type(event_data, "result_type")
-
-        request_payload = converter.structure(request_data, resolved_req_type)
-        result_payload = converter.structure(result_data, resolved_res_type)
-        return cls(request=request_payload, result=result_payload)
 
 
 class EventResultSuccess(EventResult[P, R]):
@@ -634,13 +408,6 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
         # Call the parent class initializer
         super().__init__(**data)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        self._reject_dict_args(args, kwargs)
-        result = self._envelope(exclude={"payload"})
-        result["payload"] = _unstructure(self.payload)
-        return result
-
     def get_request(self) -> E:
         """Get the payload for this event.
 
@@ -648,16 +415,6 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
             E: The execution payload
         """
         return self.payload
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> ExecutionEvent:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        payload_data = event_data.pop("payload", {})
-        resolved_type = _resolve_payload_type(event_data, "payload_type")
-
-        event_payload = converter.structure(payload_data, resolved_type)
-        return cls(payload=event_payload, **event_data)
 
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
@@ -669,13 +426,6 @@ class AppEvent[A: AppPayload](BaseEvent):
         # Call the parent class initializer
         super().__init__(**data)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        self._reject_dict_args(args, kwargs)
-        result = self._envelope(exclude={"payload"})
-        result["payload"] = _unstructure(self.payload)
-        return result
-
     def get_request(self) -> A:
         """Get the payload for this event.
 
@@ -683,16 +433,6 @@ class AppEvent[A: AppPayload](BaseEvent):
             A: The app event payload
         """
         return self.payload
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> AppEvent:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        payload_data = event_data.pop("payload", {})
-        resolved_type = _resolve_payload_type(event_data, "payload_type")
-
-        event_payload = converter.structure(payload_data, resolved_type)
-        return cls(payload=event_payload, **event_data)
 
 
 class GriptapeNodeEvent(BaseEvent):
@@ -716,11 +456,3 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
-
-
-# Register ResultDetail subclasses (e.g. StrictModeViolationDetail) with the
-# converter so a ``list[ResultDetail]`` round-trip preserves subclass identity
-# and subclass-only fields (rule_id, severity, subject, library_name) instead
-# of degrading every entry to a bare ResultDetail. Must run after every
-# subclass is defined.
-register_polymorphic_dataclass(ResultDetail)

@@ -17,9 +17,10 @@ import anyio
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, EventSerializationError
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommandRefusal,
     provisioned_by_environment,
@@ -33,6 +34,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -387,7 +389,7 @@ class WorkerManager(EngineScoped):
                 # and both charging that to the worker and leaving nothing to evict it are the
                 # orchestrator's problem becoming the worker's.
                 try:
-                    await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
+                    await self._tx.send_message("EventRequest", converters.engine.dumps(hb), registration.request_topic)
                 except Exception:
                     logger.warning(
                         "Could not challenge worker %s on '%s'; not counting it against the worker.",
@@ -1108,7 +1110,7 @@ class WorkerManager(EngineScoped):
         worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
-        await self._tx.send_message("EventRequest", forwarded.json(), worker_request_topic)
+        await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)
 
     async def _on_config_changed(self, _event: ConfigChanged) -> None:
         """Fan out a ReloadConfigRequest after the orchestrator's config mutation succeeded.
@@ -1389,7 +1391,6 @@ class WorkerManager(EngineScoped):
         publish directly to the session response topic.
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
-        # BaseEvent.dict() adds result_type at the outer level (not inside the result dict).
         result_event_type = payload.get("result_type", "")
         if result_event_type == worker_events.WorkerHeartbeatResultSuccess.__name__:
             response_topic = payload.get("response_topic", "")
@@ -1412,7 +1413,18 @@ class WorkerManager(EngineScoped):
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
         payload["response_topic"] = session_response_topic
         logger.debug("Relaying %s to %s", payload.get("event_type"), session_response_topic)
-        await self._tx.send_message(dest_socket, json.dumps(payload), session_response_topic)
+        await self._tx.send_message(dest_socket, self._for_clients(payload), session_response_topic)
+
+    @staticmethod
+    def _for_clients(payload: dict) -> str:
+        # Untags the JSON rather than reading the result back, since its payload class may live in a
+        # library only the worker has loaded. Only values carry tags, but a plain field holding its own
+        # "$type" key would lose it here.
+        untagged = {**payload}
+        for section in ("request", "result"):
+            if section in untagged:
+                untagged[section] = untag(untagged[section])
+        return json.dumps(untagged)
 
     def _determine_response_topic(self) -> str:
         """Determine the response topic based on current session and engine IDs."""

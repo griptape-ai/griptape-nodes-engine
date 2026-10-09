@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -877,7 +878,7 @@ class TestProjectVariableSerialization:
 
     def test_get_variable_from_project_serializes(self, engine: Engine, flow_name: str) -> None:
         """The Success payload must survive cattrs unstructure (the broadcast path)."""
-        from griptape_nodes.serialization.converter import converter
+        converter = converters.engine
 
         with project_macros({"workspace_dir": "/proj"}):
             result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))

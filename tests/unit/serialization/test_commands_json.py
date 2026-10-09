@@ -23,6 +23,7 @@ from griptape.rules import Rule, Ruleset
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -55,8 +56,7 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, _serialize_flow
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
-from griptape_nodes.serialization.converter import dump_json
-from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, is_plain_data
+from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, dump_json, is_plain_data
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -375,7 +375,7 @@ class TestLayout:
     def test_commands_sent_in_a_request_come_back_whole(self, flow_commands: SerializedFlowCommands) -> None:
         event = EventRequest(request=DeserializeFlowFromCommandsRequest(serialized_flow_commands=flow_commands))
 
-        restored = EventRequest.from_dict(json.loads(event.json()))
+        restored = converters.engine.structure(json.loads(converters.engine.dumps(event)), EventRequest)
 
         assert isinstance(restored.request, DeserializeFlowFromCommandsRequest)
         assert restored.request.serialized_flow_commands == flow_commands

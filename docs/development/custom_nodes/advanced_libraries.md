@@ -207,8 +207,9 @@ directory lands on the same `sys.path`, so `events.py` risks resolving to anothe
 library's file.
 
 A field that carries a parameter value, such as an artifact, must be annotated `Value` from
-`griptape_nodes.serialization.values` (`image: Value`) so it reads back as the same type. A field
-holding a value JSON can't represent fails to send.
+`griptape_nodes.serialization.values` (`image: Value`) so it reads back as the same type in
+another engine process. Clients, such as the editor, get it as plain JSON. A field holding a value
+JSON can't represent fails to send.
 
 **2. Return the pair from the hook.**
 

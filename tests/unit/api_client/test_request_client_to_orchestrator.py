@@ -10,7 +10,8 @@ import pytest
 import pytest_asyncio
 
 from griptape_nodes.api_client.request_client import RequestClient
-from griptape_nodes.retained_mode.events.base_events import EventRequest, EventSerializationError, RequestPayload
+from griptape_nodes.retained_mode.events.base_events import EventRequest, RequestPayload
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
 
 
 class _NoJsonForm:

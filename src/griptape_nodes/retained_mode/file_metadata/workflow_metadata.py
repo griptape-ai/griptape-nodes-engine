@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -17,8 +18,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultSuccess,
 )
 from griptape_nodes.serialization.commands import encode_commands
-from griptape_nodes.serialization.converter import dump_json
-from griptape_nodes.serialization.values import ValueEncodeError, encode_for_display
+from griptape_nodes.serialization.values import ValueEncodeError, dump_json, encode_for_display
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -54,7 +54,7 @@ def _serialize_node(node_name: str, engine: Engine) -> str | None:
 
     if isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
         # Convert to dict and then to JSON string
-        return serialize_result.to_json()
+        return converters.engine.dumps(serialize_result)
 
     return None
 

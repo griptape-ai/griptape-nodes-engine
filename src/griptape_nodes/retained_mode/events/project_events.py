@@ -21,9 +21,10 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.converter import converter
 
 if TYPE_CHECKING:
+    from cattrs import Converter
+
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
@@ -47,22 +48,13 @@ class MacroPath(NamedTuple):
     parsed_macro: ParsedMacro
     variables: MacroVariables
 
+    # Sent as a dict naming its fields, where cattrs would send a NamedTuple as a list.
+    def _cattrs_unstructure(self, converter: Converter) -> dict[str, Any]:
+        return {"parsed_macro": converter.unstructure(self.parsed_macro), "variables": self.variables}
 
-# Registered here rather than in serialization.converter because that module cannot import this one:
-# project_events -> base_events -> serialization.converter. A NamedTuple has no hook in the JSON preset, so
-# without this cattrs hands the instance back untouched and the ParsedMacro inside it is never
-# reached, leaving the failure to surface from json.dumps.
-converter.register_unstructure_hook(
-    MacroPath,
-    lambda path: {"parsed_macro": converter.unstructure(path.parsed_macro), "variables": path.variables},
-)
-converter.register_structure_hook(
-    MacroPath,
-    lambda data, _: MacroPath(
-        parsed_macro=converter.structure(data["parsed_macro"], ParsedMacro),
-        variables=data["variables"],
-    ),
-)
+    @classmethod
+    def _cattrs_structure(cls, data: dict[str, Any], converter: Converter) -> MacroPath:
+        return cls(parsed_macro=converter.structure(data["parsed_macro"], ParsedMacro), variables=data["variables"])
 
 
 class PathResolutionFailureReason(StrEnum):

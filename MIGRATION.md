@@ -11,19 +11,7 @@ wait for worker libraries, a node waiting for its library's worker, and a projec
 each worker to adopt it. It no longer delays heartbeat enforcement, which is what the old name
 suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
 
-## Parameter values carry their type
-
-**Request API and editor clients.** A parameter value of a type JSON lacks arrives as a dict whose
-`$type` names its Python type. A tuple that arrived as `[1, 2]` now arrives as:
-
-```json
-{"$type": "builtins:tuple", "$value": [1, 2]}
-```
-
-Send a value back in the same form to set that exact type.
-
-[Parameter values](docs/guides/mcp/external_clients.md#parameter-values) lists the forms and which
-fields carry them.
+## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
 values must be annotated `Value`. A field typed `Any` that holds a griptape object, or any value
@@ -70,6 +58,31 @@ class MyLibrary(AdvancedNodeLibrary):
             from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
         )
 ```
+
+## Events are serialized by converters
+
+**Embedders and request API clients written in Python.** Events and payloads no longer have
+wire-format serialization methods. Use the cattrs converters in
+`griptape_nodes.retained_mode.events.converters` for the message's reader:
+
+```python
+from griptape_nodes.retained_mode.events import converters
+
+converters.client.dumps(event)  # was: event.json()
+converters.engine.unstructure(event)  # was: event.dict()
+converters.engine.dumps(result)  # was: result.strict_json()
+converters.engine.failure_dumps(result, error)  # was: result.failure_json(error)
+converters.engine.dumps(payload)  # was: payload.to_json()
+converters.engine.structure(data, EventResultSuccess)  # was: EventResultSuccess.from_dict(data)
+```
+
+`engine` tags parameter values with their type, for another engine process. `client` writes them as
+plain JSON, for the editor and other clients. `dumps` raises `EventSerializationError`, now in
+`converters`, where `json()` sent a failure in place of a result it could not send. Catch it and send
+`failure_dumps` to keep that behavior.
+
+Events are pydantic models, so `event.dict()` and `event.json()` still exist, but they now return
+pydantic's form, not the wire format.
 
 ## `serializable=False` outputs are held in their own process across a worker boundary
 

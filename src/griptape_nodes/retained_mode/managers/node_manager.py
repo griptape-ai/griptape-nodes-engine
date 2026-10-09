@@ -70,6 +70,7 @@ from griptape_nodes.node_library.library_declarations import (
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     ResultDetails,
@@ -247,7 +248,6 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
-from griptape_nodes.serialization.converter import converter, dump_json
 from griptape_nodes.serialization.legacy_pickle import (
     LegacyPickleError,
     read_legacy_clipboard_commands,
@@ -259,6 +259,7 @@ from griptape_nodes.serialization.values import (
     Unencodable,
     ValueEncodeError,
     decode_value,
+    dump_json,
     encodable_default,
     try_encode,
     value_key,
@@ -3508,8 +3509,8 @@ class NodeManager(EngineScoped):
         # worker-frame surfacing in
         # ``NodeExecutor._format_node_failure_message``.
         if result_type_name == ExecuteNodeResultSuccess.__name__:
-            return cast("ExecuteNodeResultSuccess", converter.structure(result_data, ExecuteNodeResultSuccess))
-        return cast("ExecuteNodeResultFailure", converter.structure(result_data, ExecuteNodeResultFailure))
+            return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
+        return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
     async def cancel_worker_execution(self, node_name: str) -> None:
         """Dispatch CancelExecuteNodeRequest to the worker running node_name.

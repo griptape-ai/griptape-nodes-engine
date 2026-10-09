@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     ExecutionEvent,
@@ -174,7 +175,7 @@ class SubflowExecutionComponent:
             return None
 
         payload = event.get("payload", {})
-        return ExecutionEvent.from_dict(data=payload)
+        return converters.engine.structure(payload, ExecutionEvent)
 
     def handle_publishing_event(self, event: dict) -> None:
         """Handle events from SubprocessWorkflowPublisher.
@@ -216,7 +217,7 @@ class SubflowExecutionComponent:
         payload = event.get("payload", {})
         result_data = payload.get("result", {})
 
-        event_result = EventResultSuccess.from_dict(data=payload)
+        event_result = converters.engine.structure(payload, EventResultSuccess)
         if isinstance(event_result.result, PublishWorkflowResultSuccess):
             publish_workflow_result_success = event_result.result
             target_link = (

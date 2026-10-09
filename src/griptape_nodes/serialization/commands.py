@@ -17,6 +17,7 @@ from typing import Any
 from cattrs import BaseValidationError, transform_error
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.converters import EventConverter
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import SerializedSelectedNodesCommands
 from griptape_nodes.retained_mode.events.parameter_events import (
@@ -25,18 +26,15 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AlterParameterDetailsRequest,
     AlterParameterGroupDetailsRequest,
 )
-from griptape_nodes.serialization.converter import converter
-from griptape_nodes.serialization.values import DisplayValue, JsonValue, encode_value
+from griptape_nodes.serialization.values import JsonValue, encode_value
 
 VERSION = 1
 """The layout ``encode_commands`` writes. Raise it when a change to the commands' fields would
 stop an earlier engine's data from reading back, and teach ``decode_commands`` the earlier one."""
 
-# Taken once the event modules have registered their hooks on the event converter.
-_converter = converter.copy()
 # Saved commands must come back as they were, so a value with no plain-data form fails the save
 # instead of being written as its text, the way it is shown in the editor.
-_converter.register_unstructure_hook(DisplayValue, encode_value)
+_converter = EventConverter(value=encode_value, display=encode_value)
 
 # The only request types on_serialize_node_to_commands puts into element_modification_commands
 # (see node_manager.py) or that ErrorProxyNode.record_initialization_request replays. That field

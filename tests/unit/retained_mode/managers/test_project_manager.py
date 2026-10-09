@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -12078,7 +12079,8 @@ class TestImportProject:
             PreviewImportProjectRequest,
             PreviewImportProjectResultSuccess,
         )
-        from griptape_nodes.serialization.converter import converter
+
+        converter = converters.engine
 
         pm = engine.project_manager
         project_yaml = _write_project_base_dir(tmp_path / "proj")
@@ -12564,7 +12566,7 @@ class TestProjectVariableResolution:
 
     def test_resolved_snapshot_serializes_cleanly(self) -> None:
         """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
-        from griptape_nodes.serialization.converter import converter
+        converter = converters.engine
 
         pm = self._pm()
         synthetic_ws = Path("/synthetic/ws")

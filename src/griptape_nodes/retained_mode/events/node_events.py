@@ -23,8 +23,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.converter import ElementDocument
-from griptape_nodes.serialization.values import DisplayValue
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument
 
 
 class NewPosition(NamedTuple):

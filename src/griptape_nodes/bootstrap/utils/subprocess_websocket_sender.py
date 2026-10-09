@@ -9,14 +9,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
-from griptape_nodes.retained_mode.events.base_events import (
-    BaseEvent,
-    EventResultFailure,
-    EventResultSuccess,
-    EventSerializationError,
-)
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import (
+        BaseEvent,
+        EventResultFailure,
+        EventResultSuccess,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +112,7 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
             The error when the event was skipped, for callers that cannot let it go.
         """
         try:
-            payload = event.json()
+            payload = converters.engine.dumps(event)
         except EventSerializationError as error:
             logger.error("Could not send %s: %s", event_type, error)
             return error
@@ -118,10 +122,10 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
     def _send_result(self, event_type: str, event: EventResultSuccess | EventResultFailure) -> None:
         """Send a result, or a GenericResultFailure naming why it could not be sent, so the requester hears back."""
         try:
-            payload = event.strict_json()
+            payload = converters.engine.dumps(event)
         except EventSerializationError as error:
             logger.error("Could not send %s for %s: %s", event_type, type(event.request).__name__, error)
-            self.send_event("failure_result", event.failure_json(error))
+            self.send_event("failure_result", converters.engine.failure_dumps(event, error))
             return
         self.send_event(event_type, payload)
 

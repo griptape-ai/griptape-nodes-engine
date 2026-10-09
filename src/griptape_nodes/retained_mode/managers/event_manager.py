@@ -19,6 +19,7 @@ from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
@@ -41,7 +42,6 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
 )
 from griptape_nodes.retained_mode.request_handlers import handled_request_types
-from griptape_nodes.serialization.converter import converter
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -1015,7 +1015,7 @@ class EventManager(EngineScoped):
             msg = f"Forwarded response 'result_type' is not registered: {result_type_name}"
             raise RuntimeError(msg)
 
-        result_payload = cast("ResultPayload", converter.structure(result_data, resolved_result_type))
+        result_payload = cast("ResultPayload", converters.engine.structure(result_data, resolved_result_type))
 
         event_cls: type[EventResultSuccess | EventResultFailure]
         event_cls = EventResultSuccess if event_type == "EventResultSuccess" else EventResultFailure

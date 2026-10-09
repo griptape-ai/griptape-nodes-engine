@@ -1,18 +1,17 @@
-"""Tests for from_dict() PayloadRegistry integration and _resolve_payload_type."""
-
 import pytest
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
-    _resolve_payload_type,
 )
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
     GetConfigValueResultFailure,
     GetConfigValueResultSuccess,
 )
+from griptape_nodes.retained_mode.events.converters import _resolve_payload_type
 
 
 class TestResolvePayloadType:
@@ -47,7 +46,7 @@ class TestEventRequestFromDict:
             "request_type": "GetConfigValueRequest",
             "request": {"category_and_key": "foo.bar"},
         }
-        event = EventRequest.from_dict(data)
+        event = converters.engine.structure(data, EventRequest)
 
         assert isinstance(event.request, GetConfigValueRequest)
         assert event.request.category_and_key == "foo.bar"
@@ -58,7 +57,7 @@ class TestEventRequestFromDict:
             "request": {"category_and_key": "foo.bar"},
         }
         with pytest.raises(ValueError, match="request_type"):
-            EventRequest.from_dict(data)
+            converters.engine.structure(data, EventRequest)
 
 
 class TestEventResultFromDict:
@@ -70,7 +69,7 @@ class TestEventResultFromDict:
             "request": {"category_and_key": "foo.bar"},
             "result": {"value": 42, "result_details": "ok"},
         }
-        event = EventResultSuccess.from_dict(data)
+        event = converters.engine.structure(data, EventResultSuccess)
 
         assert isinstance(event.request, GetConfigValueRequest)
         assert isinstance(event.result, GetConfigValueResultSuccess)
@@ -86,7 +85,7 @@ class TestEventResultFromDict:
             "request": {"category_and_key": "foo.bar"},
             "result": {"result_details": "not found"},
         }
-        event = EventResultFailure.from_dict(data)
+        event = converters.engine.structure(data, EventResultFailure)
 
         assert isinstance(event.request, GetConfigValueRequest)
         assert isinstance(event.result, GetConfigValueResultFailure)
@@ -100,18 +99,18 @@ class TestEventResultFromDict:
             "result": {"value": 42, "result_details": "ok"},
         }
         with pytest.raises(ValueError, match="result_type"):
-            EventResultSuccess.from_dict(data)
+            converters.engine.structure(data, EventResultSuccess)
 
 
 class TestRoundTrip:
     def test_event_request_round_trip(self) -> None:
         request = GetConfigValueRequest(category_and_key="foo.bar")
         event = EventRequest(request=request)
-        serialized = event.dict()
+        serialized = converters.engine.unstructure(event)
 
         assert serialized["request_type"] == "GetConfigValueRequest"
 
-        restored = EventRequest.from_dict(serialized)
+        restored = converters.engine.structure(serialized, EventRequest)
 
         assert isinstance(restored.request, GetConfigValueRequest)
         assert restored.request.category_and_key == "foo.bar"
@@ -119,9 +118,9 @@ class TestRoundTrip:
     def test_event_request_round_trip_with_defaults(self) -> None:
         request = GetConfigValueRequest(category_and_key="a.b")
         event = EventRequest(request=request, request_id="test-123")
-        serialized = event.dict()
+        serialized = converters.engine.unstructure(event)
 
-        restored = EventRequest.from_dict(serialized)
+        restored = converters.engine.structure(serialized, EventRequest)
 
         assert isinstance(restored.request, GetConfigValueRequest)
         assert restored.request.category_and_key == "a.b"

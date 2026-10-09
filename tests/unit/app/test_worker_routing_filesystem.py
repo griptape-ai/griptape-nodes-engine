@@ -29,11 +29,12 @@ from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
 )
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.retained_mode.events import artifact_events, os_events
+from griptape_nodes.retained_mode.events import artifact_events, converters, os_events
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.serialization.converter import converter
+
+converter = converters.engine
 
 # Sanity floor for the derived list; os_events has 18 request types today.
 _MINIMUM_EXPECTED_REQUESTS = 10
@@ -157,8 +158,8 @@ class TestEveryMacroPathCarrierSurvivesTheWire:
         )
         macro_path = MacroPath(parsed_macro=ParsedMacro("{outputs}/o_{###}.png"), variables={"v": 1})
 
-        wire = json.loads(json.dumps(converter.unstructure(_minimal_instance(request_type, field_name, macro_path))))
-        restored = getattr(converter.structure(wire, request_type), field_name)
+        sent = json.loads(json.dumps(converter.unstructure(_minimal_instance(request_type, field_name, macro_path))))
+        restored = getattr(converter.structure(sent, request_type), field_name)
 
         assert restored.parsed_macro.template == macro_path.parsed_macro.template
         assert restored.variables == macro_path.variables
@@ -205,11 +206,11 @@ class TestTheWireCannotCarryThese:
 
     def test_bytes_come_back_as_a_corrupted_string(self) -> None:
         original = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
-        wire = json.loads(
+        sent = json.loads(
             json.dumps(converter.unstructure(os_events.WriteFileRequest(file_path="x.png", content=original)))
         )
 
-        round_tripped = converter.structure(wire, os_events.WriteFileRequest).content
+        round_tripped = converter.structure(sent, os_events.WriteFileRequest).content
 
         assert round_tripped != original, "if bytes now survive, revisit whether writes may forward"
         assert isinstance(round_tripped, str)
