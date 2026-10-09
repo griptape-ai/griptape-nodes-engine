@@ -580,6 +580,34 @@ class WorkerManager(EngineScoped):
         self._spawns_in_flight.clear()
         self._workers.clear()
 
+    async def stop_worker_for_library(self, library_name: str) -> None:
+        """Terminate the worker serving one library and forget it, leaving every other worker running.
+
+        `reset_workers` for a single library: anything awaiting the worker is failed with the reason,
+        its response topic is unsubscribed, and its claim is dropped so a later spawn is admitted.
+        """
+        proc = self._managed_worker_processes.pop(library_name, None)
+        if proc is not None:
+            await self._terminate_via_spawn_loop(library_name, proc)
+        worker_ids = [wid for wid, registration in self._workers.items() if registration.worker_key == library_name]
+        if self._transport is not None:
+            for wid in worker_ids:
+                await self._tx.request_client.fail_requests_by_tag(
+                    wid,
+                    worker_events.WorkerGoneError(f"worker '{wid}' was shut down to reset library '{library_name}'"),
+                )
+        session_id = self.engine.get_session_id()
+        if session_id and self._transport is not None:
+            for wid in worker_ids:
+                response_topic = f"sessions/{session_id}/workers/{wid}/response"
+                try:
+                    await self._tx.unsubscribe_from_topic(response_topic)
+                except Exception as e:
+                    logger.debug("Failed to unsubscribe from '%s' while stopping a worker: %s", response_topic, e)
+        for wid in worker_ids:
+            del self._workers[wid]
+        self._spawns_in_flight.pop(library_name, None)
+
     async def route_to_worker(
         self,
         event_request: EventRequest,

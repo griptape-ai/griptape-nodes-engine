@@ -1230,6 +1230,76 @@ class TestResetWorkers:
         assert f"sessions/{_SESSION}/workers/eng-2/response" in unsubscribed
 
 
+class TestStopWorkerForLibrary:
+    """Stopping the worker of one library, as a library reset does before deleting its environment."""
+
+    @pytest.mark.asyncio
+    async def test_terminates_only_the_process_of_that_library(self, worker_manager: WorkerManager) -> None:
+        proc_a, proc_b = _managed_proc_mock(), _managed_proc_mock()
+        worker_manager._managed_worker_processes["Lib A"] = proc_a
+        worker_manager._managed_worker_processes["Lib B"] = proc_b
+
+        await worker_manager.stop_worker_for_library("Lib A")
+
+        proc_a.terminate.assert_called_once()
+        proc_b.terminate.assert_not_called()
+        assert list(worker_manager._managed_worker_processes) == ["Lib B"]
+
+    @pytest.mark.asyncio
+    async def test_forgets_only_the_registration_of_that_library(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers["eng-a"] = WorkerRegistration(
+            request_topic=f"sessions/{_SESSION}/workers/eng-a/request", worker_key="Lib A"
+        )
+        worker_manager._workers["eng-b"] = WorkerRegistration(
+            request_topic=f"sessions/{_SESSION}/workers/eng-b/request", worker_key="Lib B"
+        )
+
+        await worker_manager.stop_worker_for_library("Lib A")
+
+        assert list(worker_manager._workers) == ["eng-b"]
+        unsubscribed = [call.args[0] for call in worker_manager._tx.unsubscribe_from_topic.call_args_list]  # type: ignore[union-attr]
+        assert unsubscribed == [f"sessions/{_SESSION}/workers/eng-a/response"]
+
+    @pytest.mark.asyncio
+    async def test_admits_a_later_spawn_for_that_library(self, worker_manager: WorkerManager) -> None:
+        """A claim left behind would refuse the spawn that brings the library's worker back."""
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager._spawns_in_flight["Lib A"] = object()
+
+        await worker_manager.stop_worker_for_library("Lib A")
+
+        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "Lib A")
+
+        mock_exec.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_settles_requests_awaiting_that_worker(self, worker_manager: WorkerManager) -> None:
+        """A node running in the worker fails with the reason instead of waiting on a process that is gone."""
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        worker_manager._workers = {_ENGINE: WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")}
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        async def stop_mid_flight() -> None:
+            await asyncio.sleep(0)
+            await worker_manager.stop_worker_for_library("Lib")
+
+        asyncio.create_task(stop_mid_flight())  # noqa: RUF006
+
+        with pytest.raises(worker_events.WorkerGoneError, match="shut down to reset library 'Lib'"):
+            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_is_a_no_op_for_a_library_without_a_worker(self, worker_manager: WorkerManager) -> None:
+        proc = _managed_proc_mock()
+        worker_manager._managed_worker_processes["Lib B"] = proc
+
+        await worker_manager.stop_worker_for_library("Lib A")
+
+        proc.terminate.assert_not_called()
+        assert list(worker_manager._managed_worker_processes) == ["Lib B"]
+
+
 class TestTerminateViaSpawnLoop:
     """Cross-loop worker termination.
 

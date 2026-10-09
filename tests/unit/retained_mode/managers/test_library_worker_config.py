@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -502,6 +503,19 @@ class TestSpawnSkipForUnmetRequirements:
         cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
         # Nothing standing in the way, so a stale account of a previous attempt is cleared.
         assert manager._library_file_path_to_info["/some/path.json"].execution_unavailable_reason is None
+
+    @pytest.mark.asyncio
+    async def test_starting_the_worker_of_one_library_leaves_the_others_alone(self) -> None:
+        """A reset stops one library's worker and starts only that one again."""
+        manager = self._manager(unmet=False)
+        other = replace(manager._library_file_path_to_info["/some/path.json"], library_name="Other Lib")
+        manager._library_file_path_to_info["/other/path.json"] = other
+
+        await manager.workers._start_workers(only_library_name="Lib")
+
+        ahandle_request = cast("MagicMock", manager._engine).ahandle_request
+        ahandle_request.assert_awaited_once()
+        assert ahandle_request.await_args.args[0].library_name == "Lib"
 
 
 class TestLibraryDependencyResolution:
