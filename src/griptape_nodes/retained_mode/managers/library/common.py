@@ -44,6 +44,19 @@ class LibraryFitness(StrEnum):
     NOT_EVALUATED = "NOT_EVALUATED"  # Library has not been evaluated yet.
 
 
+@dataclass(frozen=True)
+class LibraryLoadProgress:
+    """Where a library sits in the load that is registering it, for its progress events.
+
+    Attributes:
+        current: The library's 1-based position in the load
+        total: How many libraries the load registers
+    """
+
+    current: int
+    total: int
+
+
 @dataclass
 class RegisteredEventHandler[TRegisteredEventData]:
     """Information regarding an event handler from a registered library.

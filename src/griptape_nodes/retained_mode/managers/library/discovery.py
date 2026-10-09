@@ -448,12 +448,15 @@ class LibraryDiscovery(EngineScoped):
                 )
             )
 
-            load_result = await self.engine.library_manager.registration.register_library_from_file_request(
-                RegisterLibraryFromFileRequest(
-                    file_path=lib_path,
-                    load_as_default_library=False,
+            with self.engine.library_manager.track_load_progress(
+                lib_path, current=current_library_index, total=total_libraries
+            ):
+                load_result = await self.engine.library_manager.registration.register_library_from_file_request(
+                    RegisterLibraryFromFileRequest(
+                        file_path=lib_path,
+                        load_as_default_library=False,
+                    )
                 )
-            )
 
             # Get library_name from result for progress events (use path as fallback for failures)
             if isinstance(load_result, RegisterLibraryFromFileResultSuccess):

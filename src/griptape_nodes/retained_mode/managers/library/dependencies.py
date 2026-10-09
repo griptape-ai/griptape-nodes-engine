@@ -7,11 +7,13 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import anyio
+from packaging.requirements import InvalidRequirement, Requirement
 
 from griptape_nodes.node_library.library_declarations import (
     LibraryDependencyDeclaration,
@@ -22,6 +24,12 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineInitializationProgress,
+    InitializationPhase,
+    InitializationStatus,
+)
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
@@ -147,6 +155,28 @@ def describe_dependency_install(
             f"execution environment the orchestrator builds"
         )
     return f"Installed {installed_edit} dependencies for library '{library_name}'"
+
+
+# How many package names an install summary lists before counting the rest.
+_SUMMARY_PACKAGE_LIMIT = 3
+
+
+def summarize_dependencies(pip_dependencies: list[str]) -> str:
+    """Name the first few packages of an install, without version specifiers, and count the rest.
+
+    For example "torch, diffusers, transformers, and 11 more". A requirement that does not parse
+    (a bare URL, say) is shown as written.
+    """
+    names = []
+    for requirement in pip_dependencies[:_SUMMARY_PACKAGE_LIMIT]:
+        try:
+            names.append(Requirement(requirement).name)
+        except InvalidRequirement:
+            names.append(requirement)
+    remaining = len(pip_dependencies) - len(names)
+    if remaining > 0:
+        names.append(f"and {remaining} more")
+    return ", ".join(names)
 
 
 @asynccontextmanager
@@ -688,8 +718,15 @@ class LibraryDependencies(EngineScoped):
         if not pip_dependencies:
             return
 
-        logger.debug("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
+        self._announce_install(
+            library_name=library_name,
+            library_file_path=library_file_path,
+            pip_dependencies=pip_dependencies,
+            venv_kind=venv_kind,
+            fresh_venv=not venv_init.reused,
+        )
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
+        install_started = time.monotonic()
 
         try:
             if venv_init.reused:
@@ -717,6 +754,86 @@ class LibraryDependencies(EngineScoped):
         except RuntimeError as e:
             msg = f"Attempted to rebuild the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
             raise DependencyInstallError(msg) from e
+
+        elapsed_seconds = time.monotonic() - install_started
+        if venv_init.reused:
+            logger.debug(
+                "Checked packages for library '%s' (%s environment) in %.1f s", library_name, venv_kind, elapsed_seconds
+            )
+        else:
+            logger.info(
+                "Installed packages for library '%s' (%s environment) in %.1f s",
+                library_name,
+                venv_kind,
+                elapsed_seconds,
+            )
+
+    def _announce_install(
+        self,
+        *,
+        library_name: str,
+        library_file_path: str,
+        pip_dependencies: list[str],
+        venv_kind: str,
+        fresh_venv: bool,
+    ) -> None:
+        """Log the install that is about to run and report it on the library's progress event.
+
+        A fresh environment gets every package installed, which can take minutes, so it is
+        announced at INFO with a warning about the wait. A reused one usually only needs a quick
+        check that its packages are still there, so it is described as a check and logged at DEBUG.
+        The progress event is only sent during a library load, since an install outside one has no
+        place in the load's count for the editor to show it against.
+        """
+        package_count = len(pip_dependencies)
+        summary = summarize_dependencies(pip_dependencies)
+        if package_count == 1:
+            package_noun = "package"
+        else:
+            package_noun = "packages"
+
+        if fresh_venv:
+            logger.info(
+                "Installing %d %s for library '%s' (%s environment): %s",
+                package_count,
+                package_noun,
+                library_name,
+                venv_kind,
+                summary,
+            )
+            detail = (
+                f"Installing {package_count} {package_noun} for {library_name}: {summary}. "
+                "The first install can take several minutes."
+            )
+        else:
+            logger.debug(
+                "Checking %d %s for library '%s' (%s environment): %s",
+                package_count,
+                package_noun,
+                library_name,
+                venv_kind,
+                summary,
+            )
+            detail = f"Checking packages for {library_name}..."
+
+        progress = self.engine.library_manager.load_progress_for(library_file_path)
+        if progress is None:
+            return
+
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.LIBRARIES,
+                    item_name=library_name,
+                    status=InitializationStatus.LOADING,
+                    current=progress.current,
+                    total=progress.total,
+                    is_worker=self.engine.library_manager.is_worker,
+                    detail=detail,
+                    dependencies=list(pip_dependencies),
+                )
+            )
+        )
 
     async def _install_deps_with_recovery(
         self,

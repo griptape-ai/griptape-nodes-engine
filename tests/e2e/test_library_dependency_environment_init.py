@@ -31,15 +31,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import sys
 import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
+from griptape_nodes.retained_mode.events.app_events import EngineInitializationProgress
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
@@ -230,3 +234,45 @@ class TestInProcessLibraryOnOrchestrator:
         assert (library_dir / ".venv").exists()
         assert DEP_NAME in sys.modules
         assert _hooks_seen("Worker Dep Library InProcess") == [f"before:{DEP_VERSION}", "after"]
+
+
+class TestInstallProgressIsReported:
+    def test_a_first_install_during_a_load_says_what_it_is_installing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A real venv build reports its packages on the load's progress event and in the log."""
+        wheel_dir = tmp_path / "wheels"
+        _build_dep_wheel(wheel_dir)
+        library_json = _materialize_dep_library(
+            tmp_path / "library", wheel_dir=wheel_dir, name="Worker Dep Library Progress", worker_mode=False
+        )
+        engine = current_engine()
+        progress_events: list[EngineInitializationProgress] = []
+
+        def record_event(event: object) -> None:
+            if isinstance(event, AppEvent) and isinstance(event.payload, EngineInitializationProgress):
+                progress_events.append(event.payload)
+
+        with (
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+            patch.object(engine.event_manager, "put_event", side_effect=record_event),
+            engine.library_manager.track_load_progress(str(library_json), current=1, total=1),
+        ):
+            _register(library_json)
+
+        assert [(event.item_name, event.dependencies) for event in progress_events] == [
+            ("Worker Dep Library Progress", [DEP_NAME])
+        ]
+        assert progress_events[0].detail is not None
+        assert progress_events[0].detail.startswith(
+            f"Installing 1 package for Worker Dep Library Progress: {DEP_NAME}."
+        )
+        messages = [record.getMessage() for record in caplog.records]
+        assert (
+            f"Installing 1 package for library 'Worker Dep Library Progress' (edit-time environment): {DEP_NAME}"
+            in messages
+        )
+        assert any(
+            message.startswith("Installed packages for library 'Worker Dep Library Progress' (edit-time environment)")
+            for message in messages
+        )

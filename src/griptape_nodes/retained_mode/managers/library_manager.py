@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.files.path_utils import canonicalize_for_identity_preserving_symlinks
 from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibrarySchema,
@@ -46,6 +48,7 @@ from griptape_nodes.retained_mode.managers.library.common import (
     LibraryFitness,
     LibraryInfo,
     LibraryLifecycleState,
+    LibraryLoadProgress,
     RegisteredEventHandler,
 )
 from griptape_nodes.retained_mode.managers.library.dependencies import LibraryDependencies
@@ -75,7 +78,7 @@ from griptape_nodes.retained_mode.managers.settings import (
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterator
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
@@ -104,6 +107,9 @@ class LibraryManager(EngineScoped):
     ResolvedDiscoveryPath = ResolvedDiscoveryPath
 
     _library_file_path_to_info: dict[str, LibraryInfo]
+    # The libraries a load is registering right now, by path identity, so the dependency install
+    # deep inside registration can report its progress in the same terms as the load's own events.
+    _load_progress_by_library_path: dict[Path, LibraryLoadProgress]
 
     # Libraries whose node modules were already imported when they were unloaded. Python caches
     # modules process-wide, so re-registering such a library cannot replace the code already in
@@ -120,6 +126,7 @@ class LibraryManager(EngineScoped):
         super().__init__(engine)
         self._worker_manager = worker_manager
         self._library_file_path_to_info = {}
+        self._load_progress_by_library_path = {}
         self._libraries_reloaded_after_import = set()
         # Two separate handler registration systems exist in this manager:
         #
@@ -201,6 +208,20 @@ class LibraryManager(EngineScoped):
         reaching into ``_is_worker``.
         """
         return self._is_worker
+
+    def load_progress_for(self, library_file_path: str) -> LibraryLoadProgress | None:
+        """The library's position in the load registering it, or None outside a load."""
+        return self._load_progress_by_library_path.get(canonicalize_for_identity_preserving_symlinks(library_file_path))
+
+    @contextmanager
+    def track_load_progress(self, library_file_path: str, current: int, total: int) -> Iterator[None]:
+        """Record a library's position in a load while the load registers it."""
+        key = canonicalize_for_identity_preserving_symlinks(library_file_path)
+        self._load_progress_by_library_path[key] = LibraryLoadProgress(current=current, total=total)
+        try:
+            yield
+        finally:
+            self._load_progress_by_library_path.pop(key, None)
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
@@ -407,12 +428,13 @@ class LibraryManager(EngineScoped):
             )
         )
 
-        load_result = await self.registration.register_library_from_file_request(
-            RegisterLibraryFromFileRequest(
-                file_path=lib_path,
-                load_as_default_library=False,
+        with self.track_load_progress(lib_path, current=index, total=total):
+            load_result = await self.registration.register_library_from_file_request(
+                RegisterLibraryFromFileRequest(
+                    file_path=lib_path,
+                    load_as_default_library=False,
+                )
             )
-        )
 
         if isinstance(load_result, RegisterLibraryFromFileResultFailure):
             logger.warning("Failed to load library at '%s': %s", lib_path, load_result.result_details)

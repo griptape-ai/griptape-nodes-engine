@@ -197,6 +197,10 @@ class EngineInitializationProgress(AppPayload):
         current: Number of items completed so far
         total: Total number of items to load
         error: Error message if status is failed, None otherwise
+        is_worker: True when a worker process sent the event
+        detail: Artist-readable description of what the item is doing right now, such as which
+            packages a library is installing. None when there is nothing beyond the status.
+        dependencies: The Python package requirements a library is installing, None otherwise
     """
 
     phase: InitializationPhase
@@ -206,6 +210,8 @@ class EngineInitializationProgress(AppPayload):
     total: int
     error: str | None = None
     is_worker: bool = False
+    detail: str | None = None
+    dependencies: list[str] | None = None
 
 
 @dataclass
