@@ -430,7 +430,7 @@ class LibraryDependencies(EngineScoped):
                     on_stderr_line=on_installer_line,
                 )
             except subprocess.CalledProcessError as constrained_error:
-                # stderr is None when output was neither captured nor streamed (debug mode with no
+                # stderr is empty when output was neither captured nor streamed (debug mode with no
                 # installer-line callback), where uv already printed it.
                 reason = (constrained_error.stderr or "").strip()
                 if not reason:
