@@ -451,6 +451,17 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                        following it with a name-keyed call (CheckLibraryUpdate,
                        GetAllInfoForLibrary) that would fail. Keyed on name because those
                        follow-up calls are name-keyed too.
+        lifecycle_state: How far the engine's last attempt to load this file got (a
+                         LibraryLifecycleState value such as "loaded" or "failure"). None when
+                         the engine has no record of the file, which is the case for a library
+                         added to the configuration since libraries were last loaded. Set only by
+                         LoadMetadataForAllLibrariesRequest.
+        fitness: The LibraryFitness value of that attempt, or None alongside a None lifecycle_state.
+        problems: The problems that attempt recorded, collated for display, or None when there were
+                  none. A library that is not registered but has problems failed to load, as
+                  opposed to waiting for a refresh.
+        execution_env_failure: Why the library's execution environment (`.venv-exec`) failed to
+                               build, or None when it built or the library declares none.
     """
 
     library_schema: LibrarySchema
@@ -460,6 +471,10 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     enabled: bool
     is_registered: bool
     registered_path: str | None = None
+    lifecycle_state: str | None = None
+    fitness: str | None = None
+    problems: str | None = None
+    execution_env_failure: str | None = None
 
 
 @dataclass
