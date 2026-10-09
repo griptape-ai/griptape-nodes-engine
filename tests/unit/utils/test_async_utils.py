@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -57,6 +58,8 @@ class TestCallFunction:
 
 
 _FAILING_EXIT_CODE = 2
+# A child stopped after its output stops being read exits well before its 60 s sleep would.
+_PROCESS_STOP_SECONDS = 30
 
 
 class TestSubprocessRunStreamingStderr:
@@ -89,3 +92,27 @@ class TestSubprocessRunStreamingStderr:
         assert lines == ["no solution found"]
         assert raised.value.stderr == "no solution found\n"
         assert raised.value.returncode == _FAILING_EXIT_CODE
+
+    @pytest.mark.asyncio
+    async def test_a_line_longer_than_the_stream_limit_is_still_delivered(self) -> None:
+        lines: list[str] = []
+        long_line_length = 200_000
+        script = f"import sys\nsys.stderr.write('x' * {long_line_length} + '\\nend\\n')\n"
+
+        result = await subprocess_run([sys.executable, "-c", script], text=True, on_stderr_line=lines.append)
+
+        assert [len(line) for line in lines] == [long_line_length, len("end")]
+        assert result.returncode == 0
+
+    @pytest.mark.asyncio
+    async def test_a_callback_that_raises_stops_the_process(self) -> None:
+        def explode(_line: str) -> None:
+            raise RuntimeError
+
+        started = time.monotonic()
+        script = "import sys, time\nsys.stderr.write('go\\n'); sys.stderr.flush()\ntime.sleep(60)\n"
+
+        with pytest.raises(RuntimeError):
+            await subprocess_run([sys.executable, "-c", script], capture_output=True, on_stderr_line=explode)
+
+        assert time.monotonic() - started < _PROCESS_STOP_SECONDS

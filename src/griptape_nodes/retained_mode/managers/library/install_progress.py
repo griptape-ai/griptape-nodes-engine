@@ -30,6 +30,8 @@ _SUMMARY_PACKAGE_LIMIT = 3
 _DOWNLOADING_LINE = re.compile(r"^Downloading (?P<name>\S+) \((?P<size>[\d.]+\s*[KMGT]?i?B)\)$")
 _DOWNLOADED_LINE = re.compile(r"^Downloaded (?P<name>\S+)$")
 _PREPARED_LINE = re.compile(r"^Prepared (?P<count>\d+) packages?\b")
+# Printed at the start of every uv run, including the retry without the engine's version floors.
+_RESOLVED_LINE = re.compile(r"^Resolved \d+ packages?\b")
 # Downloads at least this large are logged at INFO: they are what makes an install take minutes
 # (torch, the CUDA wheels), and there are only a few per install. Smaller ones go to DEBUG, so a
 # console at the default level is not filled with every package. The editor gets them all.
@@ -90,11 +92,6 @@ class LibraryInstallProgress:
         self._pending_downloads: dict[str, str] = {}
         self._last_detail: str | None = None
 
-    @property
-    def venv_kind(self) -> str:
-        """The environment being installed into, as the log names it: "edit-time" or "execution"."""
-        return self._venv_kind
-
     def announce(self, *, fresh_venv: bool) -> None:
         """Log the install that is about to run and report it.
 
@@ -103,6 +100,8 @@ class LibraryInstallProgress:
         check that its packages are still there, so it is logged at DEBUG. Its detail still warns
         about the wait, because a library update can add packages that take as long to install.
         """
+        # A rebuild announces again after a failed attempt, whose downloads will not finish.
+        self._pending_downloads.clear()
         package_count = len(self._dependencies)
         package_noun = _package_noun(package_count)
         summary = summarize_dependencies(self._dependencies)
@@ -177,6 +176,11 @@ class LibraryInstallProgress:
             return
 
         logger.debug("Installer (%s, %s environment): %s", self._library_name, self._venv_kind, text)
+        if _RESOLVED_LINE.match(text) is not None:
+            # A new uv run: anything a failed earlier run was downloading will not finish.
+            self._pending_downloads.clear()
+            return
+
         downloaded = _DOWNLOADED_LINE.match(text)
         if downloaded is not None:
             self._pending_downloads.pop(downloaded.group("name"), None)

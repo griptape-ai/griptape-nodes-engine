@@ -866,6 +866,9 @@ class LibraryDependencies(EngineScoped):
             *pip_install_flags,
             "--python",
             str(library_venv_python_path),
+            # Plain output even when FORCE_COLOR is set, so `LibraryInstallProgress` can read it.
+            "--color",
+            "never",
         ]
 
         on_installer_line = None

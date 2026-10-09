@@ -75,6 +75,10 @@ async def to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     return task_result
 
 
+# How much stderr `_read_stderr_lines` reads at a time.
+_STDERR_CHUNK_BYTES = 64 * 1024
+
+
 class _ProcessOutput(NamedTuple):
     stdout: bytes | None
     stderr: bytes | None
@@ -165,17 +169,39 @@ async def _communicate_streaming_stderr(
     if process.stdout is not None:
         stdout_task = asyncio.create_task(process.stdout.read())
 
-    stderr_chunks = []
-    if process.stderr is not None:
-        while line := await process.stderr.readline():
-            stderr_chunks.append(line)
-            on_stderr_line(line.decode(errors="replace").rstrip("\r\n"))
-
+    stderr_chunks: list[bytes] = []
     stdout_bytes = None
-    if stdout_task is not None:
-        stdout_bytes = await stdout_task
-    await process.wait()
+    try:
+        if process.stderr is not None:
+            await _read_stderr_lines(process.stderr, stderr_chunks, on_stderr_line)
+        if stdout_task is not None:
+            stdout_bytes = await stdout_task
+        await process.wait()
+    finally:
+        # Only reached with work outstanding when reading stopped early, because the caller was
+        # cancelled or the callback raised. Stop the process rather than leave it blocked writing
+        # to a pipe nobody reads, and the stdout reader rather than leave it pending.
+        if stdout_task is not None and not stdout_task.done():
+            stdout_task.cancel()
+        if process.returncode is None:
+            await cancel_subprocess(process, "subprocess whose output stopped being read")
     return _ProcessOutput(stdout=stdout_bytes, stderr=b"".join(stderr_chunks))
+
+
+async def _read_stderr_lines(stream: asyncio.StreamReader, chunks: list[bytes], on_line: Callable[[str], None]) -> None:
+    """Read a stream to its end in chunks, collecting them and handing each line to ``on_line``.
+
+    Splits lines itself instead of using `readline`, which raises on a line longer than the
+    reader's 64 KiB limit. A build tool can print a compiler command line that long.
+    """
+    partial_line = b""
+    while chunk := await stream.read(_STDERR_CHUNK_BYTES):
+        chunks.append(chunk)
+        *complete_lines, partial_line = (partial_line + chunk).split(b"\n")
+        for line in complete_lines:
+            on_line(line.decode(errors="replace").rstrip("\r"))
+    if partial_line:
+        on_line(partial_line.decode(errors="replace").rstrip("\r"))
 
 
 async def cancel_subprocess(process: asyncio.subprocess.Process, name: str = "process") -> None:

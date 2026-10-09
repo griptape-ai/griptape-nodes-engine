@@ -445,6 +445,31 @@ class TestLibraryInstallProgress:
         ]
 
     @pytest.mark.usefixtures("during_load")
+    def test_a_new_uv_run_forgets_the_last_runs_unfinished_downloads(self, engine: Engine) -> None:
+        events: list[EngineInitializationProgress] = []
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event", side_effect=lambda event: events.append(event.payload)):
+            progress.on_installer_line("Downloading torch (2.0GiB)")
+            # The first run fails mid-download, and the retry starts by resolving again.
+            progress.on_installer_line("Resolved 35 packages in 1.1s")
+            progress.on_installer_line("Downloading numpy (5.2MiB)")
+
+        assert events[-1].detail == "Downloading numpy (5.2MiB) for Diffusers..."
+
+    @pytest.mark.usefixtures("during_load")
+    def test_announcing_again_forgets_unfinished_downloads(self, engine: Engine) -> None:
+        events: list[EngineInitializationProgress] = []
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event", side_effect=lambda event: events.append(event.payload)):
+            progress.on_installer_line("Downloading torch (2.0GiB)")
+            progress.announce(fresh_venv=True)
+            progress.on_installer_line("Downloading numpy (5.2MiB)")
+
+        assert events[-1].detail == "Downloading numpy (5.2MiB) for Diffusers..."
+
+    @pytest.mark.usefixtures("during_load")
     def test_lines_that_do_not_say_where_the_install_is_send_nothing(self, engine: Engine) -> None:
         progress = _progress(engine)
 
