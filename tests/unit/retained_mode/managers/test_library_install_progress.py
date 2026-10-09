@@ -17,7 +17,10 @@ from griptape_nodes.retained_mode.events.app_events import (
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
 from griptape_nodes.retained_mode.managers.library.common import LibraryLoadProgress
-from griptape_nodes.retained_mode.managers.library.dependencies import summarize_dependencies
+from griptape_nodes.retained_mode.managers.library.dependencies import (
+    DependencyInstallError,
+    summarize_dependencies,
+)
 from griptape_nodes.retained_mode.managers.library.environment import LibraryVenvInitResult
 
 _LIBRARY_FILE = "/libraries/diffusers/griptape_nodes_library.json"
@@ -169,6 +172,16 @@ class TestAFreshEnvironmentInstall:
 
         assert [(event.detail, event.dependencies) for event in install.progress_events[1:]] == [(None, None)]
         assert install.progress_events[-1].status is InitializationStatus.LOADING
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_clears_the_detail_when_the_install_fails(self, engine: Engine) -> None:
+        install = _Install(engine, reused=False, uv_failures=2)
+
+        with pytest.raises(DependencyInstallError):
+            await install.run(_DEPENDENCIES)
+
+        assert [event.detail is None for event in install.progress_events] == [False, True]
 
 
 class TestAReusedEnvironmentInstall:

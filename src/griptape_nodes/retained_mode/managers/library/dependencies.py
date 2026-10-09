@@ -761,6 +761,13 @@ class LibraryDependencies(EngineScoped):
         except RuntimeError as e:
             msg = f"Attempted to rebuild the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
             raise DependencyInstallError(msg) from e
+        finally:
+            # Clear the install's detail whether it worked or not: registration continues after
+            # it (a failed execution install does not stop the library loading), and the editor
+            # would otherwise keep showing the install message until the library finishes.
+            self._report_install_progress(
+                library_name=library_name, library_file_path=library_file_path, detail=None, dependencies=None
+            )
 
         elapsed_seconds = time.monotonic() - install_started
         if not full_install and elapsed_seconds < _SLOW_INSTALL_SECONDS:
@@ -774,11 +781,6 @@ class LibraryDependencies(EngineScoped):
                 venv_kind,
                 elapsed_seconds,
             )
-        # Clear the install's detail: registration continues after it, and the editor would
-        # otherwise keep showing the install message until the library finishes loading.
-        self._report_install_progress(
-            library_name=library_name, library_file_path=library_file_path, detail=None, dependencies=None
-        )
 
     def _announce_install(
         self,
