@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
@@ -743,6 +744,7 @@ class NodeManager(EngineScoped):
         # OK, let's try and create the Node. When creating it imports its library's node module for
         # the first time, say when that import has finished (see `_aprepare_create_node`).
         library_importing_node = self._library_that_will_import_node(request.node_type, request.specific_library_name)
+        import_started = time.monotonic()
         node = None
         try:
             # License-policy checkpoint: gate instantiating this node type on its
@@ -755,6 +757,13 @@ class NodeManager(EngineScoped):
                 specific_library_name=request.specific_library_name,
                 event_manager=self.engine.event_manager,
             )
+            if library_importing_node is not None:
+                logger.info(
+                    "Loading nodes from library '%s' for the first time, for a '%s' node. This can take a minute.",
+                    library_importing_node.get_library_data().name,
+                    request.node_type,
+                )
+                import_started = time.monotonic()
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
@@ -773,7 +782,10 @@ class NodeManager(EngineScoped):
             # A policy denial is refused before anything imports, and LOADING was never sent for it.
             if library_importing_node is not None and not isinstance(err, _NodeInstantiationDeniedError):
                 self._report_node_import_finished(
-                    library_importing_node, request.node_type, error=readable_exception_message(err)
+                    library_importing_node,
+                    request.node_type,
+                    error=readable_exception_message(err),
+                    elapsed_seconds=time.monotonic() - import_started,
                 )
 
             # Check if we should create an Error Proxy node instead of failing
@@ -812,7 +824,12 @@ class NodeManager(EngineScoped):
                 return CreateNodeResultFailure(result_details=details)
         else:
             if library_importing_node is not None:
-                self._report_node_import_finished(library_importing_node, request.node_type, error=None)
+                self._report_node_import_finished(
+                    library_importing_node,
+                    request.node_type,
+                    error=None,
+                    elapsed_seconds=time.monotonic() - import_started,
+                )
         # Add it to the Flow.
         parent_flow.add_node(node)
 
@@ -1039,14 +1056,18 @@ class NodeManager(EngineScoped):
         )
         await asyncio.sleep(_NODE_IMPORT_ANNOUNCEMENT_SECONDS)
 
-    def _report_node_import_finished(self, library: Library, node_type: str, *, error: str | None) -> None:
+    def _report_node_import_finished(
+        self, library: Library, node_type: str, *, error: str | None, elapsed_seconds: float
+    ) -> None:
         """Say a first-time import of the node's library module has ended, and how.
 
         COMPLETE when the module imported, even if the node itself then failed to build: the
-        library's nodes are loaded either way. FAILED, with ``error``, only when the import did not.
+        library's nodes are loaded either way, and the console says how long it took. FAILED, with
+        ``error``, only when the import did not; the handler has already logged why.
         """
         library_name = library.get_library_data().name
         if library.is_node_type_loaded(node_type):
+            logger.info("Loaded nodes from library '%s' in %.1f s", library_name, elapsed_seconds)
             self._send_library_nodes_loading(
                 LibraryNodesLoading(
                     library_name=library_name, node_type=node_type, status=InitializationStatus.COMPLETE
