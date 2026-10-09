@@ -1,6 +1,7 @@
 """A library's dependency install says what it is installing, in the log and on its progress event."""
 
 import logging
+import subprocess
 from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,9 +35,11 @@ def _config_value(key: str, **_: object) -> object:
 class _Install:
     """Runs one dependency-set install with the venv and uv faked, recording what was reported."""
 
-    def __init__(self, engine: Engine, *, reused: bool) -> None:
+    def __init__(self, engine: Engine, *, reused: bool, uv_failures: int = 0) -> None:
         self.engine = engine
         self.reused = reused
+        # How many uv runs fail before one succeeds, to drive the corrupt-venv rebuild.
+        self.uv_failures = uv_failures
         self.progress_events: list[EngineInitializationProgress] = []
         # Progress events already sent when uv started, to show the report comes before the wait.
         self.progress_events_when_uv_started: list[EngineInitializationProgress] | None = None
@@ -48,6 +51,9 @@ class _Install:
     async def fake_uv(self, *_: object, **__: object) -> MagicMock:
         if self.progress_events_when_uv_started is None:
             self.progress_events_when_uv_started = list(self.progress_events)
+        if self.uv_failures > 0:
+            self.uv_failures -= 1
+            raise subprocess.CalledProcessError(returncode=2, cmd="uv")
         return MagicMock(returncode=0)
 
     async def run(self, pip_dependencies: list[str], *, execution: bool = False) -> None:
@@ -63,6 +69,9 @@ class _Install:
                 return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=self.reused),
             ),
             patch.object(environment, "can_write_to_venv_location", return_value=True),
+            patch.object(
+                dependencies, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
+            ),
             patch(
                 "griptape_nodes.retained_mode.managers.library.dependencies.OSManager.check_available_disk_space",
                 return_value=True,
@@ -97,8 +106,8 @@ class TestAFreshEnvironmentInstall:
 
         await install.run(_DEPENDENCIES)
 
-        assert install.progress_events_when_uv_started == install.progress_events
-        assert install.progress_events == [
+        assert install.progress_events_when_uv_started == install.progress_events[:1]
+        assert install.progress_events[:1] == [
             EngineInitializationProgress(
                 phase=InitializationPhase.LIBRARIES,
                 item_name="Diffusers",
@@ -151,6 +160,16 @@ class TestAFreshEnvironmentInstall:
 
         assert any("(execution environment)" in record.getMessage() for record in caplog.records)
 
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_clears_the_detail_once_the_install_finishes(self, engine: Engine) -> None:
+        install = _Install(engine, reused=False)
+
+        await install.run(_DEPENDENCIES)
+
+        assert [(event.detail, event.dependencies) for event in install.progress_events[1:]] == [(None, None)]
+        assert install.progress_events[-1].status is InitializationStatus.LOADING
+
 
 class TestAReusedEnvironmentInstall:
     @pytest.mark.asyncio
@@ -160,7 +179,10 @@ class TestAReusedEnvironmentInstall:
 
         await install.run(_DEPENDENCIES)
 
-        assert [event.detail for event in install.progress_events] == ["Checking packages for Diffusers..."]
+        assert [event.detail for event in install.progress_events] == [
+            "Checking packages for Diffusers. Installing any that are new can take several minutes.",
+            None,
+        ]
         assert install.progress_events[0].dependencies == _DEPENDENCIES
 
     @pytest.mark.asyncio
@@ -170,6 +192,40 @@ class TestAReusedEnvironmentInstall:
             await _Install(engine, reused=True).run(_DEPENDENCIES)
 
         assert [record for record in caplog.records if record.levelno >= logging.INFO] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_a_slow_install_logs_its_duration_at_info(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The install starts at 100 s and finishes at 400 s on the faked clock.
+        fake_time = MagicMock()
+        fake_time.monotonic.side_effect = [100.0, 400.0]
+        with (
+            patch("griptape_nodes.retained_mode.managers.library.dependencies.time", fake_time),
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+        ):
+            await _Install(engine, reused=True).run(_DEPENDENCIES)
+
+        info_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert info_messages == ["Installed packages for library 'Diffusers' (edit-time environment) in 300.0 s"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_a_rebuild_announces_a_full_install(self, engine: Engine) -> None:
+        install = _Install(engine, reused=True, uv_failures=2)
+
+        await install.run(_DEPENDENCIES)
+
+        details = [event.detail for event in install.progress_events]
+        assert details == [
+            "Checking packages for Diffusers. Installing any that are new can take several minutes.",
+            (
+                "Installing 5 packages for Diffusers: torch, diffusers, transformers, and 2 more. "
+                "The first install can take several minutes."
+            ),
+            None,
+        ]
 
 
 class TestAnInstallOutsideALoad:
@@ -225,8 +281,22 @@ class TestLoadProgressTracking:
     def test_the_progress_is_cleared_when_the_load_raises(self, engine: Engine) -> None:
         library_manager = engine.library_manager
 
-        with pytest.raises(RuntimeError), library_manager.track_load_progress(_LIBRARY_FILE, current=1, total=1):
-            raise RuntimeError
+        def failing_load() -> None:
+            with library_manager.track_load_progress(_LIBRARY_FILE, current=1, total=1):
+                raise RuntimeError
+
+        with pytest.raises(RuntimeError):
+            failing_load()
+
+        assert library_manager.load_progress_for(_LIBRARY_FILE) is None
+
+    def test_a_nested_load_of_the_same_library_restores_the_outer_progress(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+
+        with library_manager.track_load_progress(_LIBRARY_FILE, current=2, total=5):
+            with library_manager.track_load_progress(_LIBRARY_FILE, current=1, total=1):
+                pass
+            assert library_manager.load_progress_for(_LIBRARY_FILE) == LibraryLoadProgress(current=2, total=5)
 
         assert library_manager.load_progress_for(_LIBRARY_FILE) is None
 

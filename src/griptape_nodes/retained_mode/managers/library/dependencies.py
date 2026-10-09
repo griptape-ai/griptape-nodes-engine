@@ -9,6 +9,7 @@ import sysconfig
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -53,7 +54,7 @@ from griptape_nodes.utils.version_utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -159,6 +160,10 @@ def describe_dependency_install(
 
 # How many package names an install summary lists before counting the rest.
 _SUMMARY_PACKAGE_LIMIT = 3
+
+# An install into a reused environment that takes at least this long did real work (a library
+# update adding a package, say), so its duration is logged at INFO like a fresh install's.
+_SLOW_INSTALL_SECONDS = 10.0
 
 
 def summarize_dependencies(pip_dependencies: list[str]) -> str:
@@ -739,6 +744,14 @@ class LibraryDependencies(EngineScoped):
                     pip_dependencies=pip_dependencies,
                     pip_install_flags=pip_install_flags,
                     capture_output=not is_debug,
+                    before_rebuild=partial(
+                        self._announce_install,
+                        library_name=library_name,
+                        library_file_path=library_file_path,
+                        pip_dependencies=pip_dependencies,
+                        venv_kind=venv_kind,
+                        fresh_venv=True,
+                    ),
                 )
             else:
                 # A freshly built venv cannot be corrupt, so an install failure is a genuine
@@ -756,7 +769,7 @@ class LibraryDependencies(EngineScoped):
             raise DependencyInstallError(msg) from e
 
         elapsed_seconds = time.monotonic() - install_started
-        if venv_init.reused:
+        if venv_init.reused and elapsed_seconds < _SLOW_INSTALL_SECONDS:
             logger.debug(
                 "Checked packages for library '%s' (%s environment) in %.1f s", library_name, venv_kind, elapsed_seconds
             )
@@ -767,6 +780,11 @@ class LibraryDependencies(EngineScoped):
                 venv_kind,
                 elapsed_seconds,
             )
+        # Clear the install's detail: registration continues after it, and the editor would
+        # otherwise keep showing the install message until the library finishes loading.
+        self._report_install_progress(
+            library_name=library_name, library_file_path=library_file_path, detail=None, dependencies=None
+        )
 
     def _announce_install(
         self,
@@ -781,9 +799,8 @@ class LibraryDependencies(EngineScoped):
 
         A fresh environment gets every package installed, which can take minutes, so it is
         announced at INFO with a warning about the wait. A reused one usually only needs a quick
-        check that its packages are still there, so it is described as a check and logged at DEBUG.
-        The progress event is only sent during a library load, since an install outside one has no
-        place in the load's count for the editor to show it against.
+        check that its packages are still there, so it is logged at DEBUG. Its detail still warns
+        about the wait, because a library update can add packages that take as long to install.
         """
         package_count = len(pip_dependencies)
         summary = summarize_dependencies(pip_dependencies)
@@ -814,8 +831,29 @@ class LibraryDependencies(EngineScoped):
                 venv_kind,
                 summary,
             )
-            detail = f"Checking packages for {library_name}..."
+            detail = f"Checking packages for {library_name}. Installing any that are new can take several minutes."
 
+        self._report_install_progress(
+            library_name=library_name,
+            library_file_path=library_file_path,
+            detail=detail,
+            dependencies=list(pip_dependencies),
+        )
+
+    def _report_install_progress(
+        self,
+        *,
+        library_name: str,
+        library_file_path: str,
+        detail: str | None,
+        dependencies: list[str] | None,
+    ) -> None:
+        """Send the library's LOADING progress event carrying the install's detail.
+
+        Only sent during a library load: an install outside one has no place in the load's count
+        for the editor to show it against. That includes a library dependency downloaded and
+        registered from inside another library's registration, whose path the load is not tracking.
+        """
         progress = self.engine.library_manager.load_progress_for(library_file_path)
         if progress is None:
             return
@@ -830,12 +868,12 @@ class LibraryDependencies(EngineScoped):
                     total=progress.total,
                     is_worker=self.engine.library_manager.is_worker,
                     detail=detail,
-                    dependencies=list(pip_dependencies),
+                    dependencies=dependencies,
                 )
             )
         )
 
-    async def _install_deps_with_recovery(
+    async def _install_deps_with_recovery(  # noqa: PLR0913 (before_rebuild is the caller's announcement hook)
         self,
         *,
         venv_path: Path,
@@ -843,6 +881,7 @@ class LibraryDependencies(EngineScoped):
         pip_dependencies: list[str],
         pip_install_flags: list[str],
         capture_output: bool,
+        before_rebuild: Callable[[], None] | None = None,
     ) -> None:
         """Install pip dependencies into the venv, rebuilding it once on failure.
 
@@ -850,7 +889,8 @@ class LibraryDependencies(EngineScoped):
         dist-info directory missing its METADATA file), because uv reads installed package
         metadata while planning the install. Retrying into the same venv would hit the same
         broken files, so on the first failure the venv is recreated from scratch and the
-        install is attempted once more against the clean environment.
+        install is attempted once more against the clean environment. ``before_rebuild`` runs
+        first, so the caller can announce that everything is being installed again.
 
         Raises:
             subprocess.CalledProcessError: If the install fails again after the rebuild.
@@ -869,6 +909,8 @@ class LibraryDependencies(EngineScoped):
         else:
             return
 
+        if before_rebuild is not None:
+            before_rebuild()
         library_venv_python_path = await self._reset_and_init_library_venv(venv_path)
         await self._run_uv_pip_install(
             library_venv_python_path, pip_dependencies, pip_install_flags, capture_output=capture_output

@@ -215,13 +215,21 @@ class LibraryManager(EngineScoped):
 
     @contextmanager
     def track_load_progress(self, library_file_path: str, current: int, total: int) -> Iterator[None]:
-        """Record a library's position in a load while the load registers it."""
+        """Record a library's position in a load while the load registers it.
+
+        A load that starts while another is registering the same library (a reload during
+        startup, say) restores the outer load's position when it finishes, instead of clearing it.
+        """
         key = canonicalize_for_identity_preserving_symlinks(library_file_path)
+        outer_progress = self._load_progress_by_library_path.get(key)
         self._load_progress_by_library_path[key] = LibraryLoadProgress(current=current, total=total)
         try:
             yield
         finally:
-            self._load_progress_by_library_path.pop(key, None)
+            if outer_progress is None:
+                self._load_progress_by_library_path.pop(key, None)
+            else:
+                self._load_progress_by_library_path[key] = outer_progress
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
