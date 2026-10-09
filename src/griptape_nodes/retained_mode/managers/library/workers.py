@@ -326,10 +326,5 @@ class LibraryWorkers(EngineScoped):
                 # A fresh attempt, so an account of a previous one no longer applies. Not
                 # conditioned on the result: StartWorkerRequest only SCHEDULES the spawn, so one
                 # that dies records its own reason from _log_spawn_error.
-                #
-                # An unmet requirement is not an account of an attempt -- the machine still lacks the
-                # resource -- and it is the ONLY gate get_worker_for_library has, so clearing it
-                # would dispatch to a worker that cannot load the library.
-                if not has_unmet_requirement:
-                    library_info.execution_unavailable_reason = None
+                library_info.execution_unavailable_reason = None
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))

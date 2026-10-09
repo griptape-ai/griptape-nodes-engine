@@ -155,9 +155,6 @@ class WorkerManager(EngineScoped):
         # Worker-side: monotonic timestamp of last heartbeat received from the orchestrator
         self._worker_heartbeat_last_received_at: float = 0.0
 
-        # Callbacks invoked when a worker is evicted: (worker_engine_id, library_name | None)
-        self._worker_evicted_callbacks: list[Callable[[str, str | None], None]] = []
-
         # Fire-and-forget broadcast tasks scheduled from sync callers; held here so
         # the event loop's weak-ref to tasks does not GC them before completion.
         self._inflight_broadcast_tasks: set[asyncio.Task] = set()
@@ -703,13 +700,6 @@ class WorkerManager(EngineScoped):
                 lib_name, "the worker process that runs it stopped responding and was shut down."
             )
 
-        # Notify registered callbacks that this worker has been evicted.
-        for cb in self._worker_evicted_callbacks:
-            try:
-                cb(worker_engine_id, lib_name)
-            except Exception:
-                logger.warning("Worker-evicted callback raised an exception for worker '%s'", worker_engine_id)
-
     async def _terminate_via_spawn_loop(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
         """Terminate a managed worker on the loop that owns its subprocess.
 
@@ -825,16 +815,6 @@ class WorkerManager(EngineScoped):
             proc.kill()
         except ProcessLookupError:
             return
-
-    def register_worker_evicted_callback(self, callback: Callable[[str, str | None], None]) -> None:
-        """Register a callback invoked when a worker is evicted.
-
-        Callbacks are called synchronously in registration order. Exceptions are logged
-        but do not prevent other callbacks from running.
-
-        Callback signature: (worker_engine_id: str, library_name: str | None) -> None
-        """
-        self._worker_evicted_callbacks.append(callback)
 
     def set_session_ready(self) -> None:
         """Signal that a session is available, unblocking any pending worker spawns."""
