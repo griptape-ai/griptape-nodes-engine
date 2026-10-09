@@ -129,10 +129,14 @@ artifacts and other objects as their fields:
 {"type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
 ```
 
-Send values back as plain JSON too. The one exception is a dict with its own `"$type"` key, which arrives wrapped so the key isn't read as a type. Send it back as it arrived:
+Send values back as plain JSON too. Two kinds of dict arrive wrapped instead, and go back as they
+arrived. A dict with its own `"$type"` key is wrapped so the key isn't read as a type. A dict
+whose keys would collide as text, such as `1` and `"1"`, arrives as key-value pairs so no entry is
+lost:
 
 ```json
 {"$type": "builtins:dict", "$value": {"$type": "app.bsky.feed.post", "text": "hi"}}
+{"$type": "builtins:dict", "$value": [[1, "a"], ["1", "b"]]}
 ```
 
 A value that can't be written as JSON, such as an open file, is sent as its Python `str()` in

@@ -585,6 +585,17 @@ class TestUntag:
     def test_keys_that_are_not_text_become_json_text(self) -> None:
         assert untag(encode_value({1: "one", (2, 3): "x"})) == {"1": "one", "[2,3]": "x"}
 
+    def test_dict_with_colliding_key_text_stays_wrapped_and_keeps_every_entry(self) -> None:
+        value = {1: "a", "1": "b", (2, 3): (4,)}
+
+        untagged = untag(encode_value(value))
+
+        assert untagged == {
+            TYPE_KEY: "builtins:dict",
+            VALUE_KEY: [[1, "a"], ["1", "b"], [{TYPE_KEY: "builtins:tuple", VALUE_KEY: [2, 3]}, [4]]],
+        }
+        assert decode_value(untagged) == {1: "a", "1": "b", (2, 3): [4]}
+
     def test_dict_with_its_own_type_key_stays_wrapped_and_comes_back_a_dict(self) -> None:
         value = {TYPE_KEY: "app.bsky.feed.post", "text": "hi", "at": (1, 2)}
 
