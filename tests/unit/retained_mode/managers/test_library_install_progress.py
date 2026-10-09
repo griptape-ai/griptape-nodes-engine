@@ -411,7 +411,7 @@ class TestInstallerProgressFromUv:
             "Downloading torch (2.0GiB) and 1 more for Diffusers...",
             "Downloading torch (2.0GiB) for Diffusers...",
             "Preparing packages for Diffusers...",
-            "Installing 35 packages for Diffusers...",
+            "Installing packages for Diffusers...",
             None,
         ]
 
@@ -529,7 +529,7 @@ class TestLibraryInstallProgress:
             ("INFO", "Downloading torch (2.0GiB) for library 'Diffusers' (edit-time environment)"),
             ("DEBUG", "Installer (Diffusers, edit-time environment): Downloading pillow (4.6MiB)"),
             ("DEBUG", "Installer (Diffusers, edit-time environment): Downloaded torch"),
-            ("INFO", "Ready to install 7 packages for library 'Diffusers' (edit-time environment)"),
+            ("INFO", "Ready to install packages for library 'Diffusers' (edit-time environment)"),
             ("DEBUG", "Installer (Diffusers, edit-time environment): Installed 7 packages in 14ms"),
         ]
 

@@ -26,10 +26,11 @@ _SUMMARY_PACKAGE_LIMIT = 3
 # The uv lines that say where an install is. uv writes them to stderr when it is not attached to a
 # terminal, one per event, with no progress bars: "Downloading torch (2.0GiB)" only for packages
 # large enough to be worth announcing, " Downloaded torch" when that download finishes, and
-# "Prepared 35 packages in 4m 12s" once everything is downloaded and built.
+# "Prepared 3 packages in 4m 12s" once everything it had to fetch or build is ready. That count
+# leaves out packages taken from uv's cache, so it is not how many packages get installed.
 _DOWNLOADING_LINE = re.compile(r"^Downloading (?P<name>\S+) \((?P<size>\d+(?:\.\d+)?\s*[KMGT]?i?B)\)$")
 _DOWNLOADED_LINE = re.compile(r"^Downloaded (?P<name>\S+)$")
-_PREPARED_LINE = re.compile(r"^Prepared (?P<count>\d+) packages?\b")
+_PREPARED_LINE = re.compile(r"^Prepared \d+ packages?\b")
 # Printed at the start of every uv run, including the retry without the engine's version floors.
 _RESOLVED_LINE = re.compile(r"^Resolved \d+ packages?\b")
 # Downloads at least this large are logged at INFO: they are what makes an install take minutes
@@ -133,8 +134,8 @@ class LibraryInstallProgress:
     def on_installer_line(self, line: str) -> None:
         """Turn one line of uv's output into an updated detail, when it says where the install is.
 
-        A large download starting (100 MiB or more) and uv having every package ready (downloaded or
-        taken from its cache) are logged at INFO, since they only happen during a real install and
+        A large download starting (100 MiB or more) and uv having the packages it fetched or built
+        ready to install are logged at INFO, since they only happen during a real install and
         are what a console user waits on. Every other line, smaller downloads included, is logged
         at DEBUG, so a DEBUG log still shows the installer's own output.
         """
@@ -160,19 +161,13 @@ class LibraryInstallProgress:
             self._report(self._detail_for_downloads())
             return
 
-        prepared = _PREPARED_LINE.match(text)
-        if prepared is not None:
-            package_count = int(prepared.group("count"))
-            package_noun = _package_noun(package_count)
+        if _PREPARED_LINE.match(text) is not None:
+            # No count: uv's leaves out packages taken from its cache, which still get installed.
             logger.info(
-                "Ready to install %d %s for library '%s' (%s environment)",
-                package_count,
-                package_noun,
-                self._library_name,
-                self._venv_kind,
+                "Ready to install packages for library '%s' (%s environment)", self._library_name, self._venv_kind
             )
             self._pending_downloads.clear()
-            self._report(f"Installing {package_count} {package_noun} for {self._purpose}...")
+            self._report(f"Installing packages for {self._purpose}...")
             return
 
         logger.debug("Installer (%s, %s environment): %s", self._library_name, self._venv_kind, text)
