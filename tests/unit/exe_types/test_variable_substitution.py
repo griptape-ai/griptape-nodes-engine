@@ -1194,6 +1194,13 @@ class TestFloatAndBoolVariableSubstitution:
 
         assert filtered == {"n": 1, "zero": 0}
 
+    def test_non_finite_floats_render_as_json_spellings(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"nan": float("nan"), "up": float("inf"), "down": float("-inf")}
+        )
+
+        assert filtered == {"nan": "NaN", "up": "Infinity", "down": "-Infinity"}
+
     def test_numeric_padding_on_a_float_leaves_the_token(self) -> None:
         filtered = VariableResolver._filter_for_substitution({"scale": 1.5})
 

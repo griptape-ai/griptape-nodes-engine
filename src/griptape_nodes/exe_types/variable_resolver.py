@@ -339,8 +339,9 @@ class VariableResolver:
         for name, value in variables.items():
             if isinstance(value, list):
                 filtered[name] = VariableResolver._render_list(value)
+            # bool subclasses int, so it has to be caught before the int branch below.
             elif isinstance(value, (bool, float)):
-                filtered[name] = VariableResolver._render_list_item(value)
+                filtered[name] = VariableResolver._render_value(value)
             elif isinstance(value, (str, int)):
                 filtered[name] = value
         return filtered
@@ -348,10 +349,10 @@ class VariableResolver:
     @staticmethod
     def _render_list(items: list[Any]) -> str:
         """Join list items into one string, one item per line."""
-        return "\n".join(VariableResolver._render_list_item(item) for item in items)
+        return "\n".join(VariableResolver._render_value(item) for item in items)
 
     @staticmethod
-    def _render_list_item(item: Any) -> str:
+    def _render_value(item: Any) -> str:
         """Strings pass through. Every other item is JSON, so a value is spelled the same at any depth."""
         if isinstance(item, str):
             return item
