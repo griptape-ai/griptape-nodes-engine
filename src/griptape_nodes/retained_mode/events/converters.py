@@ -104,7 +104,7 @@ class EventConverter(JsonConverter):
 
 
 def register_polymorphic_dataclass(cls: type) -> None:
-    """Read and write ``cls`` as a union of itself and its subclasses, on every ``EventConverter``, made before or after.
+    """Register ``cls`` and its subclasses on every ``EventConverter``, regardless of construction order.
 
     Without this, a field typed ``list[BaseClass]`` round-trips every entry as the base class and
     silently drops subclass-only fields. Call it once per polymorphic root, after every subclass is

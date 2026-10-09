@@ -634,12 +634,7 @@ _codec_cache: weakref.WeakKeyDictionary[type, _Codec | None] = weakref.WeakKeyDi
 
 
 def dump_json(data: Any, **kwargs: Any) -> str:
-    """Write the converter's output as JSON text.
-
-    Raises:
-        ValueEncodeError: ``data`` holds a value with no JSON form. The converter passes objects it
-            has no hook for through unchanged, so this is where they surface.
-    """
+    """Raise ``ValueEncodeError`` for values with no JSON form."""
     return json.dumps(data, default=_refuse_json_value, **kwargs)
 
 

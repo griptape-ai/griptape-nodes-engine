@@ -1,9 +1,6 @@
 """Tests for the event/payload wire-serialization pipeline.
 
-Covers ``retained_mode/events/converters.py`` (the event envelopes) and
-``serialization/hooks.py`` (the shared cattrs hooks). Complements ``serialization/test_hooks.py``
-and ``test_from_dict.py``, which already cover JSON-primitive unions, the exception wire form,
-``SetParameterValueRequest`` structuring, and reading events back. This file covers the rest: full round trips, ``ResultDetails``, batches, pydantic/Path/float/type/enum-union hooks,
+Covers full round trips, ``ResultDetails``, batches,
 errors for values with no JSON form, unknown-type errors, and a registry-wide sweep.
 """
 
