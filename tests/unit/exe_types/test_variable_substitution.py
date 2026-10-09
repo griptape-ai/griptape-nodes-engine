@@ -1,5 +1,6 @@
 """Tests for inline workflow variable substitution in get_parameter_value()."""
 
+import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
@@ -1172,7 +1173,56 @@ class TestListVariableSubstitution:
 
         assert str(filtered["items"]).startswith("a\n")
 
-    def test_dict_and_bool_values_are_still_excluded(self) -> None:
-        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1}, "b": True})
+    def test_dict_renders_as_compact_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1, "b": [True, None]}})
 
-        assert filtered == {}
+        assert filtered == {"d": '{"a": 1, "b": [true, null]}'}
+
+    def test_self_referential_dict_does_not_raise(self) -> None:
+        value: dict = {}
+        value["self"] = value
+
+        filtered = VariableResolver._filter_for_substitution({"d": value})
+
+        assert "d" in filtered
+
+    def test_unquoted_dict_token_in_a_json_template_stays_valid_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"SIZE_CONFIDENCE": {"1": 0.05, "2": 0.47}, "DEPT_CONFIDENCE": 0.99, "SIZE": "M"}
+        )
+        template = '{"Dept": {"Size": "{SIZE}", "Department Confidence": {DEPT_CONFIDENCE}, "Size Confidence": {SIZE_CONFIDENCE}}}'
+
+        resolved = VariableResolver.resolve_string(template, filtered)
+
+        assert json.loads(resolved) == {
+            "Dept": {"Size": "M", "Department Confidence": 0.99, "Size Confidence": {"1": 0.05, "2": 0.47}}
+        }
+
+
+class TestFloatAndBoolVariableSubstitution:
+    def test_float_substitutes(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5, "whole": 2.0})
+
+        assert VariableResolver.resolve_string("{scale} and {whole}", filtered) == "1.5 and 2.0"
+
+    def test_bool_substitutes_as_lowercase_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"on": True, "off": False})
+
+        assert VariableResolver.resolve_string("{on} {off}", filtered) == "true false"
+
+    def test_int_is_unchanged_and_not_treated_as_bool(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"n": 1, "zero": 0})
+
+        assert filtered == {"n": 1, "zero": 0}
+
+    def test_non_finite_floats_render_as_json_spellings(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"nan": float("nan"), "up": float("inf"), "down": float("-inf")}
+        )
+
+        assert filtered == {"nan": "NaN", "up": "Infinity", "down": "-Infinity"}
+
+    def test_numeric_padding_on_a_float_leaves_the_token(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5})
+
+        assert VariableResolver.resolve_string("{scale:03}", filtered) == "{scale:03}"

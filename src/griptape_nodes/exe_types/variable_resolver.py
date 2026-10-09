@@ -331,24 +331,29 @@ class VariableResolver:
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
         """Filter a name→value dict to the values that can substitute into {VAR} tokens.
 
-        str and int (excluding bool) pass through unchanged. A list passes as a string with one
-        item per line, so the substitution and picker code downstream only ever sees str/int.
+        str and int (excluding bool) pass through unchanged. Floats, bools, dicts, and lists pass as
+        strings, so the substitution and picker code downstream only ever sees str/int. A float,
+        bool, or dict is spelled as compact JSON (`1.5`, `true`, `{"a": 1}`), and a list has one
+        item per line.
         """
         filtered: dict[str, str | int] = {}
         for name, value in variables.items():
             if isinstance(value, list):
                 filtered[name] = VariableResolver._render_list(value)
-            elif isinstance(value, (str, int)) and not isinstance(value, bool):
+            # bool subclasses int, so it has to be caught before the int branch below.
+            elif isinstance(value, (bool, float, dict)):
+                filtered[name] = VariableResolver._render_value(value)
+            elif isinstance(value, (str, int)):
                 filtered[name] = value
         return filtered
 
     @staticmethod
     def _render_list(items: list[Any]) -> str:
         """Join list items into one string, one item per line."""
-        return "\n".join(VariableResolver._render_list_item(item) for item in items)
+        return "\n".join(VariableResolver._render_value(item) for item in items)
 
     @staticmethod
-    def _render_list_item(item: Any) -> str:
+    def _render_value(item: Any) -> str:
         """Strings pass through. Every other item is JSON, so a value is spelled the same at any depth."""
         if isinstance(item, str):
             return item
