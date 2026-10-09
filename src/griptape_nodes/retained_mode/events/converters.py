@@ -75,7 +75,11 @@ class EventConverter(JsonConverter):
         """Raise ``EventSerializationError`` if ``obj`` holds a value with no JSON form."""
         if isinstance(obj, Payload):
             return _to_json(_unstructure_payload(obj, self), type(obj).__name__, **kwargs)
-        data = self.unstructure(obj, unstructure_as=unstructure_as)
+        try:
+            data = self.unstructure(obj, unstructure_as=unstructure_as)
+        except (ValueEncodeError, TypeNameError) as error:
+            msg = f"Attempted to send a '{type(obj).__name__}'. Failed because: {error}"
+            raise EventSerializationError(msg) from error
         described_as = None
         if isinstance(data, dict):
             described_as = data.get("result_type") or data.get("payload_type") or data.get("request_type")

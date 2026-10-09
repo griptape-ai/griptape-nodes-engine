@@ -1,16 +1,23 @@
 import json
 from dataclasses import dataclass
 
+import pytest
+
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventRequestBatch, RequestPayload
 from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.serialization.values import ElementDocument
+from griptape_nodes.serialization.values import ElementDocument, Value
 
 
 @dataclass
 class _HoldsAnyRequest:
     request: RequestPayload
+
+
+@dataclass
+class _HoldsAValue:
+    value: Value
 
 
 @dataclass
@@ -56,6 +63,12 @@ class TestEngineAndClient:
         sent = converters.client.unstructure(batch)
 
         assert sent["requests"][0]["request"]["value"] == [1]
+
+
+class TestDumps:
+    def test_any_object_with_a_value_that_cannot_be_written_raises_a_send_error(self) -> None:
+        with pytest.raises(converters.EventSerializationError, match="_HoldsAValue"):
+            converters.engine.dumps(_HoldsAValue(value=object()))
 
 
 class TestEventConverter:
