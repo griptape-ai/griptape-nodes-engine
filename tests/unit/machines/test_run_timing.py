@@ -53,18 +53,18 @@ class TestNodeRunSeconds:
 
 class TestRunSeconds:
     def test_no_run_started_means_no_run_time(self) -> None:
-        assert _context().run_seconds() is None
+        assert _context().seconds_since_run_started() is None
 
     def test_a_started_run_reports_elapsed_time_until_reset(self) -> None:
         context = _context()
         context.run_started_at = 0.0
 
-        run_seconds = context.run_seconds()
+        run_seconds = context.seconds_since_run_started()
         assert run_seconds is not None
         assert run_seconds > 0
 
         context.reset()
-        assert context.run_seconds() is None
+        assert context.seconds_since_run_started() is None
 
     @pytest.mark.asyncio
     async def test_cancelling_a_run_reports_how_long_it_ran(self) -> None:
@@ -72,9 +72,11 @@ class TestRunSeconds:
         flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
         machine = MagicMock()
         machine.cancel_flow = AsyncMock()
-        machine.context.run_seconds.return_value = 1.5
+        machine.context.seconds_since_run_started.return_value = 1.5
         # Resetting the real machine clears the run's start time, so the time must be read first.
-        machine.reset_machine.side_effect = lambda **_: setattr(machine.context.run_seconds, "return_value", None)
+        machine.reset_machine.side_effect = lambda **_: setattr(
+            machine.context.seconds_since_run_started, "return_value", None
+        )
         flow_manager._global_control_flow_machine = machine
         flow_manager.check_for_existing_running_flow = MagicMock(return_value=True)
 

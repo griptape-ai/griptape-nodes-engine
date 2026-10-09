@@ -4688,7 +4688,7 @@ class FlowManager(EngineScoped):
         if self._global_control_flow_machine is not None:
             await self._global_control_flow_machine.cancel_flow()
             # Read before the reset below clears the run's start time.
-            run_seconds = self._global_control_flow_machine.context.run_seconds()
+            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
 
         # Reset control flow machine
         if self._global_control_flow_machine is not None:
@@ -4734,7 +4734,7 @@ class FlowManager(EngineScoped):
 
         run_seconds = None
         if self._global_control_flow_machine is not None:
-            run_seconds = self._global_control_flow_machine.context.run_seconds()
+            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
             self._global_control_flow_machine.reset_machine(cancel=True)
         self._global_single_node_resolution = False
         self._global_dag_builder.clear()

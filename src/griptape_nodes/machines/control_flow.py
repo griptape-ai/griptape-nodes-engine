@@ -91,7 +91,7 @@ class ControlFlowContext(EngineScoped):
         self.paused = False
         self.run_started_at = None
 
-    def run_seconds(self) -> float | None:
+    def seconds_since_run_started(self) -> float | None:
         """Seconds since the current run started, or None when no run is being timed."""
         if self.run_started_at is None:
             return None
@@ -164,7 +164,7 @@ class CompleteState(State):
                         payload=ControlFlowResolvedEvent(
                             end_node_name=current_node.name,
                             parameter_output_values=NodeManager.result_parameter_values(current_node),
-                            run_seconds=context.run_seconds(),
+                            run_seconds=context.seconds_since_run_started(),
                         )
                     )
                 )
