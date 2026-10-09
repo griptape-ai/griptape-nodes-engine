@@ -23,6 +23,10 @@ class TestLibraryRegistration:
         assert config.libraries_to_register == ["griptape_nodes_library.json"]
 
     def test_path_with_worker_mode_override_is_valid(self) -> None:
+        """A config in the wild still carries this key, and `extra="forbid"` would reject an unknown one.
+
+        It no longer decides anything; the field exists so the entry parses.
+        """
         registration = LibraryRegistration.model_validate({"path": "../shared/lib", "worker_mode_override": "WORKER"})
 
         assert registration.path == "../shared/lib"
@@ -36,7 +40,7 @@ class TestLibraryRegistration:
     def test_missing_path_raises(self) -> None:
         # A register entry's only identity is its path; the object form requires it.
         with pytest.raises(ValidationError):
-            LibraryRegistration.model_validate({"worker_mode_override": "WORKER"})
+            LibraryRegistration.model_validate({"enabled": True})
 
 
 class TestLibraryDownload:

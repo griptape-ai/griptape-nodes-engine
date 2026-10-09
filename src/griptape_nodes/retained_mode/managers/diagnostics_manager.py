@@ -823,7 +823,6 @@ class DiagnosticsManager(EngineScoped):
                     lifecycle_state=lib_info.lifecycle_state.value,
                     enabled=lib_info.enabled,
                     is_sandbox=lib_info.is_sandbox,
-                    requires_worker=lib_info.requires_worker,
                     executes_in_worker=lib_info.executes_in_worker,
                     worker_ready=self._worker_ready(lib_info),
                     worker_unavailable_reason=self._worker_unavailable_reason(lib_info, redactor),

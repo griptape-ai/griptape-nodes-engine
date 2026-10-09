@@ -107,9 +107,8 @@ class WorkerManager(EngineScoped):
     # heartbeat timeout; see `orchestrator_silence_allowed_s` for why the two sides differ.
     MINIMUM_ORCHESTRATOR_SILENCE_S: float = 30.0
     # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
-    # on the boot wait for worker libraries, on `wait_until_executable`, and on each worker's reply to
-    # a project-switch fan-out. Not a heartbeat bound on either side: a worker keeps answering
-    # challenges while it loads.
+    # on `wait_until_executable` and on each worker's reply to a project-switch fan-out. Not a
+    # heartbeat bound on either side: a worker keeps answering challenges while it loads.
     DEFAULT_LIBRARY_LOAD_TIMEOUT_S: float = 600.0
     # How long to wait for a worker to exit after SIGTERM before escalating to
     # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
@@ -155,9 +154,6 @@ class WorkerManager(EngineScoped):
 
         # Worker-side: monotonic timestamp of last heartbeat received from the orchestrator
         self._worker_heartbeat_last_received_at: float = 0.0
-
-        # Callbacks invoked when a worker is evicted: (worker_engine_id, library_name | None)
-        self._worker_evicted_callbacks: list[Callable[[str, str | None], None]] = []
 
         # Fire-and-forget broadcast tasks scheduled from sync callers; held here so
         # the event loop's weak-ref to tasks does not GC them before completion.
@@ -704,13 +700,6 @@ class WorkerManager(EngineScoped):
                 lib_name, "the worker process that runs it stopped responding and was shut down."
             )
 
-        # Notify registered callbacks that this worker has been evicted.
-        for cb in self._worker_evicted_callbacks:
-            try:
-                cb(worker_engine_id, lib_name)
-            except Exception:
-                logger.warning("Worker-evicted callback raised an exception for worker '%s'", worker_engine_id)
-
     async def _terminate_via_spawn_loop(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
         """Terminate a managed worker on the loop that owns its subprocess.
 
@@ -826,16 +815,6 @@ class WorkerManager(EngineScoped):
             proc.kill()
         except ProcessLookupError:
             return
-
-    def register_worker_evicted_callback(self, callback: Callable[[str, str | None], None]) -> None:
-        """Register a callback invoked when a worker is evicted.
-
-        Callbacks are called synchronously in registration order. Exceptions are logged
-        but do not prevent other callbacks from running.
-
-        Callback signature: (worker_engine_id: str, library_name: str | None) -> None
-        """
-        self._worker_evicted_callbacks.append(callback)
 
     def set_session_ready(self) -> None:
         """Signal that a session is available, unblocking any pending worker spawns."""
@@ -1001,22 +980,6 @@ class WorkerManager(EngineScoped):
                 f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
             )
             raise RuntimeError(msg) from None
-
-    async def wait_for_libraries(self, library_names: list[str], timeout_s: float) -> list[str]:
-        """Wait for several libraries at once. Returns the names that did not settle in time.
-
-        Boot uses this rather than `wait_until_executable` per library: one collective ceiling, and
-        the caller decides what an unsettled library means for the rest of initialization.
-        """
-        pending = [name for name in library_names if not self.has_settled(name)]
-        if not pending:
-            return []
-        try:
-            with anyio.fail_after(timeout_s):
-                await asyncio.gather(*[self._execution_ready[name].wait() for name in pending])
-        except TimeoutError:
-            return [name for name in pending if not self.has_settled(name)]
-        return []
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

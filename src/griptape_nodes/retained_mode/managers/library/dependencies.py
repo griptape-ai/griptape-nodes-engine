@@ -565,27 +565,20 @@ class LibraryDependencies(EngineScoped):
     def _this_process_owns_the_edit_venv(self, library_file_path: str) -> bool:
         """Whether this process may write `<library>/.venv`. Exactly one process may.
 
-        An execution-dependency library is loaded on the ORCHESTRATOR (real node classes, not
-        stubs), so the orchestrator builds that venv and keeps it on its own sys.path for the
-        session. A worker for such a library must not touch it: two concurrent `uv pip install`
-        runs at one target is the mild version, and the corrupt-install recovery path rmtrees
-        the directory outright -- so an execution-side retry would delete the environment the
-        orchestrator is importing from, which is the exact inverse of the isolation this design
-        exists to provide. The worker does not need it either way: `.venv-exec` is resolved
-        over BOTH dependency sets, so everything the edit-time set provides is already there.
+        Every library is loaded on the ORCHESTRATOR, so the orchestrator builds that venv and
+        keeps it on its own sys.path for the session. A worker must not touch it: two concurrent
+        `uv pip install` runs at one target is the mild version, and the corrupt-install recovery
+        path rmtrees the directory outright -- so an execution-side retry would delete the
+        environment the orchestrator is importing from, which is the exact inverse of the
+        isolation this design exists to provide. The worker does not need it either way:
+        `.venv-exec` is resolved over BOTH dependency sets, so everything the edit-time set
+        provides is already there.
 
-        A legacy worker-mode library is the other case: the orchestrator skips loading it
-        entirely (WORKER_DELEGATED), so nobody else creates `.venv` and the worker must.
-
-        A worker with NO record for the library cannot tell which case it is in, and guessing
-        wrong re-opens the double-writer hazard -- so it refuses, loudly.
+        A worker with NO record for the library cannot tell whether anything has built it, and
+        guessing wrong re-opens the double-writer hazard -- so it refuses, loudly.
         """
         if not self.engine.library_manager.is_worker:
-            # The worker-mode case above, from the orchestrator's side: it never loads such a
-            # library, so building the edit-time venv here would write a directory this process
-            # has no use for and put two writers on it the moment the worker builds its own.
-            library_info = self.engine.library_manager._library_file_path_to_info.get(library_file_path)
-            return not (library_info is not None and library_info.requires_worker)
+            return True
         library_info = self.engine.library_manager._library_file_path_to_info.get(library_file_path)
         # A library this worker was NOT spawned for arrives through a nested registration (one
         # library declaring another as a dependency), and registration continues here into module
@@ -612,8 +605,7 @@ class LibraryDependencies(EngineScoped):
                 "environment install rather than risk writing a venv another process owns.",
                 library_file_path,
             )
-            return False
-        return library_info.requires_worker
+        return False
 
     async def _retire_execution_env(self, library_name: str, library_file_path: str) -> None:
         """Remove an execution environment the library's manifest no longer declares.

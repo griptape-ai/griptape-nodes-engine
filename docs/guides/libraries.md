@@ -105,39 +105,19 @@ most artists.
 
 The same **Configuration Editor → Libraries** view also shows
 **Library Registration → Libraries To Register**. Each entry in
-that list is a library the engine loads at startup. Three controls
+that list is a library the engine loads at startup. Two controls
 per entry:
 
 - The toggle (left) — flip off to keep the library on disk but stop
     loading it on engine start.
-- The **Shared / Isolated** dropdown (middle) — choose where the
-    library runs (see below).
 - The trash icon (right) — remove the entry entirely. The clone on
     disk stays put; delete its directory manually if you want the
     disk space back.
 
-![Shared/Isolated library mode](../assets/img/libraries/worker_mode_toggle.png)
-
-### Shared vs. Isolated
-
-The dropdown picks the process a library runs in:
-
-- **Shared** — the library runs inside the main engine process,
-    alongside the other shared libraries.
-- **Isolated** — the library runs in its own separate process, so
-    its Python dependencies are walled off from every other library
-    and a crash in it can't take the rest of the engine down.
-
-The dropdown shows the mode the engine will actually use: the
-library author's suggested mode, unless you override it here. Pick
-**Isolated** for a heavy library you want walled off, or **Shared**
-to keep it in-process. Some libraries are marked by their author as
-incompatible with isolation; for those the dropdown is **locked to
-Shared**.
-
-The dropdown only appears when your engine version supports it
-(0.86.0 and later). Changes take effect on the next library
-refresh.
+Where a library's nodes run is not a setting. The library declares
+which of its dependencies are needed only while a node runs, and the
+engine routes execution from that; see
+[Process isolation](#process-isolation) below.
 
 The **Add Library** button below lets you point the engine at a
 `griptape_nodes_library.json` you already have on disk (a library
@@ -157,13 +137,11 @@ pin `torch==2.4.1`; library B can pin `torch==2.0.0`. Both are
 installed into separate `.venv` directories, and each library uses
 its own when its nodes run.
 
-This holds whether a library runs **Shared** or **Isolated** (see
-[Process isolation](#process-isolation-the-isolated-mode)): the
-`.venv` lives on disk next to the library's manifest either way.
-The difference is only which process loads those packages — the
-main engine process for Shared libraries, the library's own process
-for Isolated ones. From the artist's perspective the dependency
-isolation is the same.
+This holds wherever a library's nodes run (see
+[Process isolation](#process-isolation)): the `.venv` lives on disk
+next to the library's manifest either way. The only difference is
+which process loads those packages. From the artist's perspective
+the dependency isolation is the same.
 
 **You can install incompatibly-pinned libraries together without
 pip resolution conflicts.** This is the most important guarantee on
@@ -213,32 +191,25 @@ A library that declares them runs differently, in three ways:
     output with no plain-data form that isn't marked fails the node
     with an error that names it.
 
-### Process isolation: the Isolated mode
+### Process isolation
 
-Running a library **Isolated** (in its own dedicated process,
-instead of inside the engine's main process) gives you:
+A library that declares execution dependencies runs its nodes in its
+own process, which also gives you:
 
-- **Fault tolerance.** If the library crashes, only that library
-    goes down — the rest of the engine keeps running.
+- **Fault tolerance.** If the library crashes while running a node,
+    only that library goes down — the rest of the engine keeps
+    running.
 - **Resource isolation.** Anything the library loads into memory
     (model weights, GPU memory, background threads) lives in the
     library's own process and can't degrade other libraries.
 
-Heavy ML libraries (diffusion, transformers, custom CUDA stacks)
-benefit most; lightweight libraries (simple HTTP / data nodes)
-usually run fine Shared. You control this per library with the
-**Shared / Isolated** dropdown described in
-[Toggling and removing libraries](#shared-vs-isolated). The library
-author sets the suggested starting mode and whether the library is
-allowed to run Isolated at all; your dropdown choice overrides the
-author's suggestion for any library that permits it.
-
-Library authors declare isolation compatibility and a suggested
-mode in their `griptape_nodes_library.json` (the
-`worker_mode_compatibility` and `suggested_worker_mode`
-declarations) — see [Node Isolation with Workers](../development/custom_nodes/node_isolation_with_workers.md)
-for the schema. As an artist, the Shared / Isolated dropdown is the
-only surface you need.
+Heavy ML libraries (diffusion, transformers, custom CUDA stacks) are
+the ones that declare execution dependencies; lightweight libraries
+(simple HTTP / data nodes) have none to declare and run in the main
+engine process. This is the library author's call, made in
+`griptape_nodes_library.json` — see
+[Node Isolation with Workers](../development/custom_nodes/node_isolation_with_workers.md)
+for the schema. There is nothing for an artist to configure.
 
 ### Node-name collisions: not solved
 
@@ -288,8 +259,8 @@ reopening the workflow uses the real node again.
 
 The terminal window where the engine is running (the same window
 you launched the engine from) carries the verbose error log,
-including stack traces. Errors from libraries running Isolated
-appear there with a `Worker-<id>` prefix.
+including stack traces. Errors raised while a node runs in a
+library's own process appear there with a `Worker-<id>` prefix.
 
 ## CLI alternatives
 

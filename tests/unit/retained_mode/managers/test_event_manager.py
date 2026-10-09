@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler
+from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
@@ -38,7 +39,11 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
+from griptape_nodes.retained_mode.managers.event_manager import (
+    EventManager,
+    ResultContext,
+    current_request_type,
+)
 
 
 class TestEventManagerBroadcasting:
@@ -1628,6 +1633,122 @@ class TestPostDispatchHooks:
 
         assert len(hook_threads) == 1
         assert hook_threads[0] != engine_loop_thread
+
+
+class TestPostDispatchHookContextIsolation:
+    """A post-dispatch hook must not inherit the dispatching task's strict-mode scope.
+
+    Hook tasks are created with a *fresh* ``contextvars.Context()`` rather than a copy of
+    the caller's. The scope stack holds mutable ``StrictModeScope`` objects, so a hook
+    that inherited a node's ``RUNTIME_EXECUTE`` scope could append to ``scope.violations``
+    after the node's own scope had already been evaluated, and on a worker an
+    ERROR-severity violation promotes ``ExecuteNodeResultSuccess`` to a failure. A
+    library's telemetry hook must not be able to fail a user's node.
+
+    The fresh context also clears the dispatching request type, so
+    ``current_request_type()`` does not lie inside the hook.
+    """
+
+    @staticmethod
+    def _manager_with_handler() -> EventManager:
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        return event_manager
+
+    @pytest.mark.asyncio
+    async def test_detached_hook_cannot_report_into_the_dispatching_scope(self) -> None:
+        event_manager = self._manager_with_handler()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        seen_request_types: list[type | None] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            await event_manager.ahandle_request(_ProbeRequest())
+            await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
+
+    def test_inline_hook_cannot_report_into_the_dispatching_scope(self) -> None:
+        """Same guarantee on the fallback path, which blocks the caller until the hook returns.
+
+        The hook does not run *on* the caller's thread: a sync callback goes through
+        ``to_thread``, onto a worker of the transient loop ``asyncio.run`` creates here.
+        The isolation has to survive that hop, which is why the fresh context is entered
+        before the loop is started rather than inside the callback.
+        """
+        event_manager = self._manager_with_handler()
+
+        seen_request_types: list[type | None] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            event_manager.handle_request(_ProbeRequest())
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
+
+    @pytest.mark.asyncio
+    async def test_inline_hook_on_the_side_loop_cannot_report_into_the_dispatching_scope(self) -> None:
+        """The inline fallback has two sub-branches; this covers the one taken inside a loop.
+
+        Running the hook on another thread is not isolation by itself. ``ThreadRunner.run``
+        hands the coroutine over with ``run_coroutine_threadsafe``, which has no
+        ``context=`` parameter, and the ``call_soon_threadsafe`` underneath it captures
+        ``copy_context()`` on the *submitting* thread, so without an explicit fresh
+        context the hook inherits this scope and a library hook can fail a user's node.
+        The sync-callback hop to a worker thread does not save it either, because
+        ``to_thread`` propagates the context it was called in.
+
+        A bare ``EventManager`` has no ``_event_loop``, so a sync dispatch from inside this
+        test's running loop takes the fallback and then its ThreadRunner sub-branch.
+        """
+        event_manager = self._manager_with_handler()
+        assert event_manager._event_loop is None
+
+        seen_request_types: list[type | None] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            event_manager.handle_request(_ProbeRequest())
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
 
 
 class TestAuthorizationCheckpointHooks:

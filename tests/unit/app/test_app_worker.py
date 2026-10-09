@@ -127,12 +127,18 @@ async def _sweep_until_evicted(worker_manager: WorkerManager) -> None:
     collection pause or a loaded test runner can hold off the tick that evicts past a short window.
     """
     evicted = asyncio.Event()
-    worker_manager.register_worker_evicted_callback(lambda _wid, _lib: evicted.set())
-    task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(evicted.wait(), timeout=5.0)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    evict_worker = worker_manager.evict_worker
+
+    async def evict_and_signal(worker_engine_id: str) -> None:
+        await evict_worker(worker_engine_id)
+        evicted.set()
+
+    with patch.object(worker_manager, "evict_worker", new=evict_and_signal):
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(evicted.wait(), timeout=5.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class TestHandleRegisterWorkerRequest:
@@ -1461,32 +1467,6 @@ class TestSpawnWhenSessionReady:
             await worker_manager._spawn_when_session_ready("My Library")
 
         mock_spawn.assert_not_called()
-
-
-class TestWorkerEvictedCallbacks:
-    @pytest.mark.asyncio
-    async def test_callback_called_with_worker_id_and_library_name(self, worker_manager: WorkerManager) -> None:
-        callback = MagicMock()
-        worker_manager.register_worker_evicted_callback(callback)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        callback.assert_called_once_with(_ENGINE, "My Library")
-
-    @pytest.mark.asyncio
-    async def test_exception_in_callback_does_not_prevent_others(self, worker_manager: WorkerManager) -> None:
-        first = MagicMock(side_effect=RuntimeError("boom"))
-        second = MagicMock()
-        worker_manager.register_worker_evicted_callback(first)
-        worker_manager.register_worker_evicted_callback(second)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        second.assert_called_once()
 
 
 class TestRouteToWorker:

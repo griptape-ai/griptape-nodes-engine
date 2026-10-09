@@ -33,7 +33,6 @@ from griptape_nodes.retained_mode.events.access_events import (
 from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from tests.unit.exe_types.mocks import MockNode
-from tests.unit.exe_types.param_components.probe_scope import constructing_under_probe
 
 DENIED_REPO = "black-forest-labs/FLUX.1-dev"
 ALLOWED_REPO = "black-forest-labs/FLUX.1-schnell"
@@ -302,78 +301,11 @@ class TestRunPathGate:
         assert "not permitted" in str(errors[0])
 
 
-class TestConstructionDefersBusRequests:
-    """No bus request may be issued from a node __init__ that a strict-mode scope is watching.
-
-    The worker's schema probe constructs every node class during library load, inside a
-    LOAD_PROBE scope; a bus request from inside that construction fires reentrant-bus-in-init
-    and drops the class from the worker schema. So under a scope this component's policy and
-    download queries defer until the first post-construction refresh.
-
-    Construction with no scope open is the ordinary case and must still query -- see
-    ``TestConstructionWithoutAScopeStillQueries``.
-    """
-
-    def _construct_deferred(self, *, gated: bool | None) -> HuggingFaceRepoParameter:
-        with constructing_under_probe():
-            param = _param(gated=gated)
-            param.add_input_parameters()
-        return param
-
-    def test_construction_issues_no_bus_requests(self) -> None:
-        with patch("griptape_nodes.retained_mode.engine.Engine.handle_request") as handle:
-            self._construct_deferred(gated=True)
-        handle.assert_not_called()
-
-    def test_a_deferred_gated_param_denies_nothing(self) -> None:
-        """No denials while deferred -- including the refuse-unrecognized backstop.
-
-        A naive skip that left a plain empty snapshot would refuse EVERY choice as
-        unrecognized and badge the whole dropdown "not permitted" at construction.
-        """
-        param = self._construct_deferred(gated=True)
-        assert param._policy.deferred is True
-        assert param.query_for_denial(DENIED_REPO) is None
-        assert param.query_for_denial(UNDECLARED_REPO) is None
-
-    def test_no_denial_decoration_lands_while_deferred(self) -> None:
-        param = self._construct_deferred(gated=True)
-        data = param._build_data_choices([ALLOWED_REPO, DENIED_REPO])
-        assert all(row.get("icon") != "shield-off" for row in data)
-        parameter = param._node.get_parameter_by_name("model")
-        assert parameter is not None
-        assert parameter.get_badge() is None
-
-    def test_refresh_parameters_heals_after_construction(self) -> None:
-        param = self._construct_deferred(gated=True)
-        param.refresh_parameters()
-        assert param._policy.deferred is False
-        assert param.query_for_denial(DENIED_REPO) is not None
-        assert param.query_for_denial(ALLOWED_REPO) is None
-
-    def test_auto_detect_heals_too(self) -> None:
-        """Pins the `_gate_mode is not False` refresh guard: auto-detect must re-query as well."""
-        param = self._construct_deferred(gated=None)
-        param.refresh_parameters()
-        assert param._policy.deferred is False
-        assert param.query_for_denial(DENIED_REPO) is not None
-
-    def test_the_run_path_still_blocks_a_denied_selection(self) -> None:
-        """validate_before_node_run refreshes first, so deferral cannot weaken run gating."""
-        param = self._construct_deferred(gated=True)
-        param._node.set_parameter_value("model", DENIED_REPO)
-        errors = param.validate_before_node_run()
-        assert errors is not None
-        assert "not permitted" in str(errors[0])
-
-
-class TestConstructionWithoutAScopeStillQueries:
+class TestConstructionQueries:
     """An editor drop or workflow load queries from __init__, so decoration is right immediately.
 
-    Outside a strict-mode scope nothing records a reentrant-bus-in-init violation and there is no
-    probe to drop the class, so deferring there bought nothing -- and cost the shield rows and the
-    download subtitles until the node was run or refreshed by hand. These pin that the deferral
-    keys off the scope and not off being in ``__init__`` at all.
+    The queries go out during construction, which is what puts the shield rows and the
+    download subtitles on the dropdown without waiting for a run or a hand refresh.
     """
 
     def _construct_in_init(self, *, gated: bool | None = True) -> HuggingFaceRepoParameter:
@@ -384,7 +316,6 @@ class TestConstructionWithoutAScopeStillQueries:
 
     def test_policy_is_queried_during_construction(self) -> None:
         param = self._construct_in_init()
-        assert param._policy.deferred is False
         assert param.query_for_denial(DENIED_REPO) is not None
         assert param.query_for_denial(ALLOWED_REPO) is None
 

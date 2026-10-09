@@ -4742,7 +4742,7 @@ class TestLibraryManagerDuplicateEntryHygiene:
         assert info.library_path == "/libs/loaded/griptape_nodes_library.json"
 
     def test_resolver_falls_back_to_first_match_when_none_loaded(self, engine: Engine) -> None:
-        """With no LOADED copy (e.g. discovery / worker-pending), the resolver keeps first-match."""
+        """With no LOADED copy (e.g. mid-discovery), the resolver keeps first-match."""
         library_manager = engine.library_manager
 
         entries = {
@@ -4750,7 +4750,7 @@ class TestLibraryManagerDuplicateEntryHygiene:
                 library_manager,
                 "/libs/copyA/griptape_nodes_library.json",
                 "MyLib",
-                lifecycle_state=_LibraryManager.LibraryLifecycleState.WORKER_PENDING,
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.METADATA_LOADED,
             ),
             "/libs/copyB/griptape_nodes_library.json": self._lib_info(
                 library_manager,
