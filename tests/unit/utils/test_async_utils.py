@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from typing import Any
 
 import pytest
 
-from griptape_nodes.utils.async_utils import call_function
+from griptape_nodes.utils.async_utils import call_function, subprocess_run
 
 INPUT = 21
 DOUBLED = 42
@@ -52,3 +54,38 @@ class TestCallFunction:
         """Only awaitables are awaited; ordinary values pass straight through."""
         sentinel: dict[str, Any] = {"not": "awaitable"}
         assert await call_function(lambda: sentinel) is sentinel
+
+
+_FAILING_EXIT_CODE = 2
+
+
+class TestSubprocessRunStreamingStderr:
+    @pytest.mark.asyncio
+    async def test_hands_each_stderr_line_to_the_callback_and_still_returns_all_output(self) -> None:
+        lines: list[str] = []
+        script = (
+            "import sys\n"
+            "sys.stdout.write('out\\n'); sys.stdout.flush()\n"
+            "sys.stderr.write('first\\n'); sys.stderr.flush()\n"
+            "sys.stderr.write('second\\r\\n'); sys.stderr.flush()\n"
+        )
+
+        result = await subprocess_run(
+            [sys.executable, "-c", script], capture_output=True, text=True, on_stderr_line=lines.append
+        )
+
+        assert lines == ["first", "second"]
+        assert result.stdout == "out\n"
+        assert result.stderr == "first\nsecond\r\n"
+
+    @pytest.mark.asyncio
+    async def test_a_failure_still_carries_the_streamed_stderr(self) -> None:
+        lines: list[str] = []
+        script = "import sys\nsys.stderr.write('no solution found\\n')\nsys.exit(2)\n"
+
+        with pytest.raises(subprocess.CalledProcessError) as raised:
+            await subprocess_run([sys.executable, "-c", script], check=True, text=True, on_stderr_line=lines.append)
+
+        assert lines == ["no solution found"]
+        assert raised.value.stderr == "no solution found\n"
+        assert raised.value.returncode == _FAILING_EXIT_CODE

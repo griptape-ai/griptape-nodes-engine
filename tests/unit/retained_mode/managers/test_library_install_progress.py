@@ -2,7 +2,7 @@
 
 import logging
 import subprocess
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,11 +17,12 @@ from griptape_nodes.retained_mode.events.app_events import (
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
 from griptape_nodes.retained_mode.managers.library.common import LibraryLoadProgress
-from griptape_nodes.retained_mode.managers.library.dependencies import (
-    DependencyInstallError,
+from griptape_nodes.retained_mode.managers.library.dependencies import DependencyInstallError
+from griptape_nodes.retained_mode.managers.library.environment import LibraryVenvInitResult
+from griptape_nodes.retained_mode.managers.library.install_progress import (
+    LibraryInstallProgress,
     summarize_dependencies,
 )
-from griptape_nodes.retained_mode.managers.library.environment import LibraryVenvInitResult
 
 _LIBRARY_FILE = "/libraries/diffusers/griptape_nodes_library.json"
 _DEPENDENCIES = ["torch>=2.4,<3", "diffusers==0.33.0", "transformers", "accelerate", "safetensors"]
@@ -38,9 +39,13 @@ def _config_value(key: str, **_: object) -> object:
 class _Install:
     """Runs one dependency-set install with the venv and uv faked, recording what was reported."""
 
-    def __init__(self, engine: Engine, *, reused: bool, uv_failures: int = 0) -> None:
+    def __init__(
+        self, engine: Engine, *, reused: bool, uv_failures: int = 0, installer_lines: list[str] | None = None
+    ) -> None:
         self.engine = engine
         self.reused = reused
+        # What the faked uv writes to stderr, line by line, on a successful run.
+        self.installer_lines = installer_lines or []
         # How many uv runs fail before one succeeds, to drive the corrupt-venv rebuild.
         self.uv_failures = uv_failures
         self.progress_events: list[EngineInitializationProgress] = []
@@ -51,12 +56,15 @@ class _Install:
         if isinstance(event, AppEvent) and isinstance(event.payload, EngineInitializationProgress):
             self.progress_events.append(event.payload)
 
-    async def fake_uv(self, *_: object, **__: object) -> MagicMock:
+    async def fake_uv(self, *_: object, on_stderr_line: Callable[[str], None] | None = None, **__: object) -> MagicMock:
         if self.progress_events_when_uv_started is None:
             self.progress_events_when_uv_started = list(self.progress_events)
         if self.uv_failures > 0:
             self.uv_failures -= 1
             raise subprocess.CalledProcessError(returncode=2, cmd="uv")
+        if on_stderr_line is not None:
+            for line in self.installer_lines:
+                on_stderr_line(line)
         return MagicMock(returncode=0)
 
     async def run(self, pip_dependencies: list[str], *, execution: bool = False) -> None:
@@ -370,3 +378,125 @@ class TestLoadProgressTracking:
 
         assert progress_during_registration == [LibraryLoadProgress(current=2, total=4)]
         assert library_manager.load_progress_for(_LIBRARY_FILE) is None
+
+
+class TestInstallerProgressFromUv:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
+    async def test_uv_lines_update_the_detail_while_it_runs(self, engine: Engine) -> None:
+        install = _Install(
+            engine,
+            reused=False,
+            installer_lines=[
+                "Using Python 3.12.13 environment at: /libraries/diffusers/.venv",
+                "Resolved 35 packages in 1.2s",
+                "Downloading pillow (4.6MiB)",
+                "Downloading torch (2.0GiB)",
+                " Downloaded pillow",
+                " Downloaded torch",
+                "Prepared 35 packages in 4m 12s",
+                "Installed 35 packages in 2.1s",
+                " + torch==2.9.0",
+            ],
+        )
+
+        await install.run(_DEPENDENCIES)
+
+        assert [event.detail for event in install.progress_events] == [
+            (
+                "Installing 5 packages for Diffusers: torch, diffusers, transformers, and 2 more. "
+                "This can take several minutes."
+            ),
+            "Downloading pillow (4.6MiB) for Diffusers...",
+            "Downloading torch (2.0GiB) and 1 more for Diffusers...",
+            "Downloading torch (2.0GiB) for Diffusers...",
+            "Installing 35 packages for Diffusers...",
+            None,
+        ]
+
+
+def _progress(engine: Engine, *, execution: bool = False) -> LibraryInstallProgress:
+    return LibraryInstallProgress(
+        engine,
+        library_name="Diffusers",
+        library_file_path=_LIBRARY_FILE,
+        pip_dependencies=_DEPENDENCIES,
+        execution=execution,
+    )
+
+
+class TestLibraryInstallProgress:
+    @pytest.mark.usefixtures("during_load")
+    def test_shows_the_largest_download_in_flight(self, engine: Engine) -> None:
+        events: list[EngineInitializationProgress] = []
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event", side_effect=lambda event: events.append(event.payload)):
+            progress.on_installer_line("Downloading numpy (5.2MiB)")
+            progress.on_installer_line("Downloading torch (2.0GiB)")
+            progress.on_installer_line("Downloading scipy (512.3KiB)")
+            progress.on_installer_line(" Downloaded torch")
+
+        assert [event.detail for event in events] == [
+            "Downloading numpy (5.2MiB) for Diffusers...",
+            "Downloading torch (2.0GiB) and 1 more for Diffusers...",
+            "Downloading torch (2.0GiB) and 2 more for Diffusers...",
+            "Downloading numpy (5.2MiB) and 1 more for Diffusers...",
+        ]
+
+    @pytest.mark.usefixtures("during_load")
+    def test_lines_that_do_not_say_where_the_install_is_send_nothing(self, engine: Engine) -> None:
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event") as put_event:
+            for line in [
+                "",
+                "Using Python 3.12.13 environment at: /x/.venv",
+                "Resolved 7 packages in 404ms",
+                "Audited 35 packages in 10ms",
+                "Installed 7 packages in 14ms",
+                " + numpy==2.5.3",
+                "warning: something uv wanted to mention",
+            ]:
+                progress.on_installer_line(line)
+
+        put_event.assert_not_called()
+
+    @pytest.mark.usefixtures("during_load")
+    def test_an_unchanged_detail_is_not_sent_again(self, engine: Engine) -> None:
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event") as put_event:
+            progress.on_installer_line("Prepared 3 packages in 1s")
+            progress.on_installer_line("Prepared 3 packages in 1s")
+
+        assert put_event.call_count == 1
+
+    @pytest.mark.usefixtures("during_load")
+    def test_an_execution_install_says_it_is_for_running_the_nodes(self, engine: Engine) -> None:
+        events: list[EngineInitializationProgress] = []
+        progress = _progress(engine, execution=True)
+
+        with patch.object(engine.event_manager, "put_event", side_effect=lambda event: events.append(event.payload)):
+            progress.on_installer_line("Downloading torch (2.0GiB)")
+
+        assert events[0].detail == "Downloading torch (2.0GiB) for running nodes from Diffusers..."
+
+    def test_logs_every_installer_line_at_debug(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        progress = _progress(engine)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            progress.on_installer_line("Resolved 7 packages in 404ms")
+
+        assert "Installer (Diffusers, edit-time environment): Resolved 7 packages in 404ms" in [
+            record.getMessage() for record in caplog.records
+        ]
+
+    def test_sends_nothing_outside_a_load(self, engine: Engine) -> None:
+        progress = _progress(engine)
+
+        with patch.object(engine.event_manager, "put_event") as put_event:
+            progress.on_installer_line("Downloading torch (2.0GiB)")
+            progress.clear()
+
+        put_event.assert_not_called()

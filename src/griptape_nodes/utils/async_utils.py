@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import logging
 import subprocess
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -75,12 +75,18 @@ async def to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     return task_result
 
 
+class _ProcessOutput(NamedTuple):
+    stdout: bytes | None
+    stderr: bytes | None
+
+
 async def subprocess_run(
     args: Sequence[str],
     *,
     capture_output: bool = False,
     text: bool = False,
     check: bool = False,
+    on_stderr_line: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str | bytes]:
     """Run a subprocess asynchronously with an interface similar to subprocess.run().
 
@@ -89,6 +95,9 @@ async def subprocess_run(
         capture_output: Whether to capture stdout and stderr
         text: Whether to decode output as text
         check: Whether to raise CalledProcessError on non-zero exit
+        on_stderr_line: Called with each line the process writes to stderr, as it is written,
+            without its line ending. Stderr is captured whenever this is set, so the result and
+            any CalledProcessError still carry all of it.
 
     Returns:
         CompletedProcess with the result
@@ -102,6 +111,8 @@ async def subprocess_run(
     else:
         stdout_arg = None
         stderr_arg = None
+    if on_stderr_line is not None:
+        stderr_arg = asyncio.subprocess.PIPE
 
     process = await asyncio.create_subprocess_exec(
         *args,
@@ -109,7 +120,12 @@ async def subprocess_run(
         stderr=stderr_arg,
     )
 
-    stdout_bytes, stderr_bytes = await process.communicate()
+    if on_stderr_line is None:
+        stdout_bytes, stderr_bytes = await process.communicate()
+    else:
+        output = await _communicate_streaming_stderr(process, on_stderr_line)
+        stdout_bytes = output.stdout
+        stderr_bytes = output.stderr
 
     # Convert bytes to string if text=True
     if text:
@@ -135,6 +151,31 @@ async def subprocess_run(
         )
 
     return completed_process
+
+
+async def _communicate_streaming_stderr(
+    process: asyncio.subprocess.Process, on_stderr_line: Callable[[str], None]
+) -> _ProcessOutput:
+    """Wait for the process like `communicate`, handing each stderr line to the callback as it arrives.
+
+    Stdout, when piped, is read alongside so a process that fills it cannot stall waiting for a
+    reader while this one waits on stderr.
+    """
+    stdout_task = None
+    if process.stdout is not None:
+        stdout_task = asyncio.create_task(process.stdout.read())
+
+    stderr_chunks = []
+    if process.stderr is not None:
+        while line := await process.stderr.readline():
+            stderr_chunks.append(line)
+            on_stderr_line(line.decode(errors="replace").rstrip("\r\n"))
+
+    stdout_bytes = None
+    if stdout_task is not None:
+        stdout_bytes = await stdout_task
+    await process.wait()
+    return _ProcessOutput(stdout=stdout_bytes, stderr=b"".join(stderr_chunks))
 
 
 async def cancel_subprocess(process: asyncio.subprocess.Process, name: str = "process") -> None:

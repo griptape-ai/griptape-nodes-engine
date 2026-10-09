@@ -198,12 +198,12 @@ class TestInstallProgressIsReported:
         ):
             _register(library_json)
 
-        # The install's announcement, then the update that clears it once uv finishes.
-        assert [(event.item_name, event.dependencies) for event in progress_events] == [
-            ("Worker Dep Library Progress", [DEP_NAME]),
-            ("Worker Dep Library Progress", None),
-        ]
-        assert progress_events[1].detail is None
+        # The install's announcement first and the update that clears it last. In between, uv's own
+        # output can update the detail, depending on what it prints for this install.
+        assert {event.item_name for event in progress_events} == {"Worker Dep Library Progress"}
+        assert progress_events[0].dependencies == [DEP_NAME]
+        assert progress_events[-1].detail is None
+        assert progress_events[-1].dependencies is None
         assert progress_events[0].detail is not None
         assert progress_events[0].detail.startswith(
             f"Installing 1 package for Worker Dep Library Progress: {DEP_NAME}."
