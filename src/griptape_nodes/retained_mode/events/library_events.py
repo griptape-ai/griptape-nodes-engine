@@ -462,6 +462,10 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                   opposed to waiting for a refresh.
         execution_env_failure: Why the library's execution environment (`.venv-exec`) failed to
                                build, or None when it built or the library declares none.
+        reset_requires_restart: Whether a ResetLibraryRequest for this library would wait for the
+                                next engine start, because this engine has already loaded
+                                packages from the library's environment. Lets a client say so
+                                before the artist confirms.
     """
 
     library_schema: LibrarySchema
@@ -475,6 +479,7 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     fitness: str | None = None
     problems: str | None = None
     execution_env_failure: str | None = None
+    reset_requires_restart: bool = False
 
 
 @dataclass
@@ -1294,6 +1299,56 @@ class InstallLibraryDependenciesResultSuccess(ResultPayloadSuccess):
 @PayloadRegistry.register
 class InstallLibraryDependenciesResultFailure(ResultPayloadFailure):
     """Library dependency installation failed. Common causes: library not found, no dependencies defined, venv initialization failed, pip install error."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ResetLibraryRequest(RequestPayload):
+    """Delete a library's Python environments and build them again from its manifest.
+
+    Removes the library's edit-time environment (`.venv`) and execution environment
+    (`.venv-exec`), stopping the library's worker first, then registers the library again, which
+    rebuilds both. The library's files and its configuration are left alone. Works on a library
+    that failed to load.
+
+    When this engine has already imported packages from the library's `.venv`, nothing is removed
+    now: the removal is recorded and runs the next time the engine starts, before any library
+    loads, and the result reports restart_required.
+
+    Use when: A library fails to load or misbehaves because its installed packages are broken,
+    half-installed, or were changed by hand.
+
+    Args:
+        library_name: Name of the library to reset
+
+    Results: ResetLibraryResultSuccess | ResetLibraryResultFailure (library not found, disabled, environment provides the libraries)
+    """
+
+    library_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ResetLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Library environments reset, or scheduled to reset at the next engine start.
+
+    Args:
+        library_name: Name of the library that was reset
+        restart_required: True when some or all of the environments are removed at the next engine
+            start rather than now. The library keeps running on its current packages until then.
+        removed_paths: The environment directories removed now. Empty when the whole reset waits
+            for the next start.
+    """
+
+    library_name: str
+    restart_required: bool = False
+    removed_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ResetLibraryResultFailure(ResultPayloadFailure):
+    """Library reset failed. Common causes: library not found, library disabled, the environment provides the libraries, the library failed to load again after its environments were rebuilt."""
 
 
 @dataclass
