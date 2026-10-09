@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from typing import TYPE_CHECKING
@@ -13,6 +14,7 @@ from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     LibraryMetadata,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
@@ -173,6 +175,41 @@ class TestCreatingTheFirstNode:
         assert recorder.events_when_module_imported is not None
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("recorder")
+    async def test_logs_the_import_and_how_long_it_took(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await engine.ahandle_request(_create("SlowNode"))
+
+        info_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert (
+            f"Loading nodes from library '{_LIBRARY_NAME}' for the first time, for a 'SlowNode' node. "
+            "This can take a minute."
+        ) in info_messages
+        assert any(message.startswith(f"Loaded nodes from library '{_LIBRARY_NAME}' in ") for message in info_messages)
+
+    def test_logs_the_import_on_the_sync_path_too(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            engine.handle_request(_create("SlowNode"))
+
+        assert any(
+            record.getMessage().startswith(f"Loading nodes from library '{_LIBRARY_NAME}' for the first time")
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("recorder")
+    async def test_a_policy_denied_node_logs_no_loading_line(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            patch.object(NodeManager, "_evaluate_instantiation_checkpoint", return_value=MagicMock()),
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+        ):
+            await engine.ahandle_request(_create("SlowNode"))
+
+        assert not any("for the first time" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_a_second_node_sends_nothing(self, engine: Engine, recorder: _Recorder) -> None:
         await engine.ahandle_request(_create("SlowNode"))
         recorder.events.clear()
@@ -212,6 +249,43 @@ class TestCreatingTheFirstNode:
         await engine.ahandle_request(_create("NoSuchNode"))
 
         assert recorder.events == []
+
+
+@pytest.mark.usefixtures("lazy_library")
+class TestNothingIsAnnouncedWithoutAnImport:
+    @pytest.mark.asyncio
+    async def test_a_library_that_is_not_registered(self, engine: Engine, recorder: _Recorder) -> None:
+        await engine.ahandle_request(CreateNodeRequest(node_type="SlowNode", specific_library_name="No Such Library"))
+
+        assert recorder.events == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_that_is_not_a_node_creation(self, engine: Engine, recorder: _Recorder) -> None:
+        await engine.node_manager._aprepare_create_node(CreateFlowRequest(parent_flow_name=None))
+
+        assert recorder.events == []
+
+
+@pytest.mark.usefixtures("lazy_library")
+class TestIsNodeTypeLoaded:
+    def test_is_false_until_the_node_type_is_first_used(self) -> None:
+        library = LibraryRegistry.get_library(_LIBRARY_NAME)
+
+        assert library.is_node_type_loaded("SlowNode") is False
+
+    @pytest.mark.usefixtures("recorder")
+    def test_is_true_once_the_node_type_has_been_used(self) -> None:
+        library = LibraryRegistry.get_library(_LIBRARY_NAME)
+
+        library.get_node_class("SlowNode")
+
+        assert library.is_node_type_loaded("SlowNode") is True
+
+    def test_raises_for_a_node_type_the_library_does_not_have(self) -> None:
+        library = LibraryRegistry.get_library(_LIBRARY_NAME)
+
+        with pytest.raises(LibraryRegistryError):
+            library.is_node_type_loaded("NoSuchNode")
 
 
 class TestAsyncRequestPreparer:
