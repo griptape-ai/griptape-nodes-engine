@@ -1172,7 +1172,29 @@ class TestListVariableSubstitution:
 
         assert str(filtered["items"]).startswith("a\n")
 
-    def test_dict_and_bool_values_are_still_excluded(self) -> None:
-        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1}, "b": True})
+    def test_dict_values_are_still_excluded(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1}})
 
         assert filtered == {}
+
+
+class TestFloatAndBoolVariableSubstitution:
+    def test_float_substitutes(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5, "whole": 2.0})
+
+        assert VariableResolver.resolve_string("{scale} and {whole}", filtered) == "1.5 and 2.0"
+
+    def test_bool_substitutes_as_lowercase_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"on": True, "off": False})
+
+        assert VariableResolver.resolve_string("{on} {off}", filtered) == "true false"
+
+    def test_int_is_unchanged_and_not_treated_as_bool(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"n": 1, "zero": 0})
+
+        assert filtered == {"n": 1, "zero": 0}
+
+    def test_numeric_padding_on_a_float_leaves_the_token(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5})
+
+        assert VariableResolver.resolve_string("{scale:03}", filtered) == "{scale:03}"
