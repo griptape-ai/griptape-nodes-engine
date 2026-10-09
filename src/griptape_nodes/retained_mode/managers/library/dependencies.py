@@ -828,7 +828,6 @@ class LibraryDependencies(EngineScoped):
             detail = (
                 f"Installing {package_count} {package_noun} for {purpose}: {summary}. This can take several minutes."
             )
-
         else:
             logger.debug(
                 "Checking %d %s for library '%s' (%s environment): %s",
