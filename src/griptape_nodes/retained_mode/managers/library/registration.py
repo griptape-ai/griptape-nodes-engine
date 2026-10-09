@@ -497,6 +497,12 @@ class LibraryRegistrar(EngineScoped):
                     library_info.executes_in_worker = resolve_executes_in_worker(
                         metadata=metadata_result.library_schema.metadata,
                     )
+                    self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
+                        library_name=metadata_result.library_schema.name,
+                        registered_path=library_info.registered_path,
+                        declarations=metadata_result.library_schema.metadata.declarations,
+                        executes_in_worker=library_info.executes_in_worker,
+                    )
                     library_info.lifecycle_state = LibraryLifecycleState.METADATA_LOADED
 
                 case LibraryLifecycleState.METADATA_LOADED:

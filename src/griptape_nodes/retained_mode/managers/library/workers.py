@@ -132,7 +132,7 @@ class LibraryWorkers(EngineScoped):
 
         INFO rather than a warning: the library loads and runs correctly, so there is
         nothing for the author to chase unless its dependencies genuinely conflict. Called
-        from the sites that create a library's record, so it is one line per library per
+        wherever a record first reaches METADATA_LOADED, so it is one line per library per
         load rather than one per registration attempt.
 
         Silent on a worker, which discovers every configured library and would otherwise

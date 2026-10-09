@@ -1083,6 +1083,38 @@ class TestLegacyWorkerModeIsInertOnFilePathRegistration:
 
         assert [r for r in caplog.records if "legacy worker mode" in r.getMessage()] == []
 
+    @pytest.mark.asyncio
+    async def test_a_manifest_fixed_after_discovery_is_advised_on(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A manifest that failed at discovery leaves a DISCOVERED record for the lifecycle to load."""
+        mgr = engine.library_manager
+        caplog.set_level(logging.INFO, logger="griptape_nodes")
+        lib_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name=None,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+        )
+
+        with (
+            patch.object(
+                mgr.metadata_loading,
+                "load_library_metadata_from_file_request",
+                side_effect=[_metadata_success(self._worker_mode_schema()), _METADATA_STOP],
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr.registration._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=self._request(),
+            )
+
+        advisories = [r for r in caplog.records if "legacy worker mode" in r.getMessage()]
+        assert len(advisories) == 1
+
 
 class TestPipInstallFailureIsRecordedOnTheLibrary:
     """A failed dependency install must leave an account of itself on the LibraryInfo.
