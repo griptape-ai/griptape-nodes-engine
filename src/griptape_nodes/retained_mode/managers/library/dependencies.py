@@ -732,13 +732,15 @@ class LibraryDependencies(EngineScoped):
         )
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
         install_started = time.monotonic()
+        # Whether every package was installed, not just checked: a new venv, or a rebuilt one.
+        full_install = not venv_init.reused
 
         try:
             if venv_init.reused:
                 # A reused venv may be corrupt (e.g. a dist-info directory missing its
                 # METADATA file), which makes uv fail while planning the install. Rebuild it
                 # once and retry against a clean environment.
-                await self._install_deps_with_recovery(
+                full_install = await self._install_deps_with_recovery(
                     venv_path=venv_path,
                     library_venv_python_path=library_venv_python_path,
                     pip_dependencies=pip_dependencies,
@@ -769,7 +771,7 @@ class LibraryDependencies(EngineScoped):
             raise DependencyInstallError(msg) from e
 
         elapsed_seconds = time.monotonic() - install_started
-        if venv_init.reused and elapsed_seconds < _SLOW_INSTALL_SECONDS:
+        if not full_install and elapsed_seconds < _SLOW_INSTALL_SECONDS:
             logger.debug(
                 "Checked packages for library '%s' (%s environment) in %.1f s", library_name, venv_kind, elapsed_seconds
             )
@@ -882,7 +884,7 @@ class LibraryDependencies(EngineScoped):
         pip_install_flags: list[str],
         capture_output: bool,
         before_rebuild: Callable[[], None] | None = None,
-    ) -> None:
+    ) -> bool:
         """Install pip dependencies into the venv, rebuilding it once on failure.
 
         A plain ``uv pip install`` fails hard when the reused venv is corrupt (e.g. a
@@ -891,6 +893,9 @@ class LibraryDependencies(EngineScoped):
         broken files, so on the first failure the venv is recreated from scratch and the
         install is attempted once more against the clean environment. ``before_rebuild`` runs
         first, so the caller can announce that everything is being installed again.
+
+        Returns:
+            True when the venv was rebuilt and every package installed into it again.
 
         Raises:
             subprocess.CalledProcessError: If the install fails again after the rebuild.
@@ -907,7 +912,7 @@ class LibraryDependencies(EngineScoped):
                 first_error.returncode,
             )
         else:
-            return
+            return False
 
         if before_rebuild is not None:
             before_rebuild()
@@ -915,6 +920,7 @@ class LibraryDependencies(EngineScoped):
         await self._run_uv_pip_install(
             library_venv_python_path, pip_dependencies, pip_install_flags, capture_output=capture_output
         )
+        return True
 
     async def _reset_and_init_library_venv(self, venv_path: Path) -> Path:
         """Delete the venv (if present) and recreate it from scratch.

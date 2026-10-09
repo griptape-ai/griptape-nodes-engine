@@ -212,6 +212,19 @@ class TestAReusedEnvironmentInstall:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("during_load")
+    async def test_a_quick_rebuild_still_logs_its_completion_at_info(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            await _Install(engine, reused=True, uv_failures=2).run(_DEPENDENCIES)
+
+        assert any(
+            record.levelno == logging.INFO and record.getMessage().startswith("Installed packages for library")
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("during_load")
     async def test_a_rebuild_announces_a_full_install(self, engine: Engine) -> None:
         install = _Install(engine, reused=True, uv_failures=2)
 
@@ -298,6 +311,20 @@ class TestLoadProgressTracking:
                 pass
             assert library_manager.load_progress_for(_LIBRARY_FILE) == LibraryLoadProgress(current=2, total=5)
 
+        assert library_manager.load_progress_for(_LIBRARY_FILE) is None
+
+    def test_overlapping_loads_can_finish_in_either_order(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        startup_load = library_manager.track_load_progress(_LIBRARY_FILE, current=2, total=5)
+        reload = library_manager.track_load_progress(_LIBRARY_FILE, current=1, total=1)
+
+        startup_load.__enter__()
+        reload.__enter__()
+        startup_load.__exit__(None, None, None)
+        progress_while_reload_runs = library_manager.load_progress_for(_LIBRARY_FILE)
+        reload.__exit__(None, None, None)
+
+        assert progress_while_reload_runs == LibraryLoadProgress(current=1, total=1)
         assert library_manager.load_progress_for(_LIBRARY_FILE) is None
 
     @pytest.mark.asyncio

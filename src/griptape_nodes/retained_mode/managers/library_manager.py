@@ -109,7 +109,8 @@ class LibraryManager(EngineScoped):
     _library_file_path_to_info: dict[str, LibraryInfo]
     # The libraries a load is registering right now, by path identity, so the dependency install
     # deep inside registration can report its progress in the same terms as the load's own events.
-    _load_progress_by_library_path: dict[Path, LibraryLoadProgress]
+    # A list per path, newest last, because loads of the same library can overlap.
+    _load_progress_by_library_path: dict[Path, list[LibraryLoadProgress]]
 
     # Libraries whose node modules were already imported when they were unloaded. Python caches
     # modules process-wide, so re-registering such a library cannot replace the code already in
@@ -210,26 +211,34 @@ class LibraryManager(EngineScoped):
         return self._is_worker
 
     def load_progress_for(self, library_file_path: str) -> LibraryLoadProgress | None:
-        """The library's position in the load registering it, or None outside a load."""
-        return self._load_progress_by_library_path.get(canonicalize_for_identity_preserving_symlinks(library_file_path))
+        """The library's position in the newest load registering it, or None outside a load."""
+        entries = self._load_progress_by_library_path.get(
+            canonicalize_for_identity_preserving_symlinks(library_file_path)
+        )
+        if not entries:
+            return None
+        return entries[-1]
 
     @contextmanager
     def track_load_progress(self, library_file_path: str, current: int, total: int) -> Iterator[None]:
         """Record a library's position in a load while the load registers it.
 
-        A load that starts while another is registering the same library (a reload during
-        startup, say) restores the outer load's position when it finishes, instead of clearing it.
+        Loads of the same library can overlap (a reload during startup, say) and finish in either
+        order. Each load removes only its own entry, and the newest remaining one is reported.
         """
         key = canonicalize_for_identity_preserving_symlinks(library_file_path)
-        outer_progress = self._load_progress_by_library_path.get(key)
-        self._load_progress_by_library_path[key] = LibraryLoadProgress(current=current, total=total)
+        progress = LibraryLoadProgress(current=current, total=total)
+        self._load_progress_by_library_path.setdefault(key, []).append(progress)
         try:
             yield
         finally:
-            if outer_progress is None:
-                self._load_progress_by_library_path.pop(key, None)
+            # By identity: two overlapping loads can record equal positions.
+            entries = self._load_progress_by_library_path.get(key, [])
+            remaining = [entry for entry in entries if entry is not progress]
+            if remaining:
+                self._load_progress_by_library_path[key] = remaining
             else:
-                self._load_progress_by_library_path[key] = outer_progress
+                self._load_progress_by_library_path.pop(key, None)
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
