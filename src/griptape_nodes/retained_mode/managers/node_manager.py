@@ -388,8 +388,9 @@ class NodeManager(EngineScoped):
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
         # First-time node imports `_aprepare_create_node` announced with LOADING and the handler has
-        # not closed yet, by the id of the CreateNodeRequest that announced them. The handler closes
-        # each one on every way out, so no LOADING is left without its COMPLETE or FAILED.
+        # not closed yet, by the id of the CreateNodeRequest that announced them. An id is only a
+        # valid key while its request is in flight, so every entry is removed before the request
+        # ends: by the handler on every way out, or by the preparer if it is cancelled first.
         self._announced_node_imports: dict[int, Library] = {}
 
         event_manager.register_request_handlers(self)
@@ -1072,7 +1073,13 @@ class NodeManager(EngineScoped):
             )
         )
         self._announced_node_imports[id(request)] = library
-        await asyncio.sleep(_NODE_IMPORT_ANNOUNCEMENT_SECONDS)
+        try:
+            await asyncio.sleep(_NODE_IMPORT_ANNOUNCEMENT_SECONDS)
+        except asyncio.CancelledError:
+            # The handler will not run to close it, and the id could be reused by a later request.
+            del self._announced_node_imports[id(request)]
+            self._close_node_import_announcement(library, request.node_type)
+            raise
 
     def _close_node_import_announcement(self, library: Library, node_type: str) -> None:
         """Answer a LOADING the creation path ended without reporting on."""
@@ -1136,6 +1143,9 @@ class NodeManager(EngineScoped):
         except LibraryRegistryError:
             return None
         if not library.has_node_type(node_type):
+            return None
+        # A node type registered with its class in hand (a workflow node) imports nothing.
+        if library.is_node_type_loaded(node_type):
             return None
         if library.has_loaded_node_types():
             return None

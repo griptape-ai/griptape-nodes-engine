@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import types
@@ -316,6 +317,37 @@ class TestCreatingTheFirstNode:
             InitializationStatus.LOADING,
             InitializationStatus.COMPLETE,
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_create_cancelled_during_the_yield_closes_its_announcement(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.node_manager.asyncio.sleep",
+                side_effect=asyncio.CancelledError,
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await engine.ahandle_request(_create("SlowNode"))
+
+        assert [event.status for event in recorder.events] == [
+            InitializationStatus.LOADING,
+            InitializationStatus.FAILED,
+        ]
+        assert engine.node_manager._announced_node_imports == {}
+
+    @pytest.mark.asyncio
+    async def test_a_node_type_registered_with_its_class_is_not_announced(
+        self, engine: Engine, recorder: _Recorder
+    ) -> None:
+        LibraryRegistry.get_library(_LIBRARY_NAME).register_new_node_type(
+            _EagerNode, NodeMetadata(category="Test", description="test", display_name="Eager")
+        )
+
+        await engine.ahandle_request(_create("_EagerNode"))
+
+        assert recorder.events == []
 
     @pytest.mark.asyncio
     async def test_a_failed_import_is_reported_with_its_reason(self, engine: Engine, recorder: _Recorder) -> None:
