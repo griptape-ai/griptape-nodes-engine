@@ -1413,11 +1413,11 @@ class WorkerManager(EngineScoped):
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
         payload["response_topic"] = session_response_topic
         logger.debug("Relaying %s to %s", payload.get("event_type"), session_response_topic)
-        await self._tx.send_message(dest_socket, self._for_gui(payload), session_response_topic)
+        await self._tx.send_message(dest_socket, self._for_clients(payload), session_response_topic)
 
     @staticmethod
-    def _for_gui(payload: dict) -> str:
-        """A worker's result as the GUI reads it, without the type tags engines exchange."""
+    def _for_clients(payload: dict) -> str:
+        """A worker's result as clients read it, without the type tags engines exchange."""
         untagged = {**payload}
         for section in ("request", "result"):
             if section in untagged:
