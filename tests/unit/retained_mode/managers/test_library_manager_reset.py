@@ -136,7 +136,7 @@ def reload_mock(engine: Engine) -> Generator[AsyncMock, None, None]:
     reload = AsyncMock(return_value="1.0.0")
     with (
         patch.object(library_manager.git_operations, "_reload_library_after_git_operation", new=reload),
-        patch.object(library_manager._worker_manager, "stop_worker_for_library", new=AsyncMock()),
+        patch.object(library_manager.workers, "stop_worker_for_library", new=AsyncMock()),
         patch.object(library_manager.workers, "start_worker_for_library", new=AsyncMock()),
     ):
         yield reload
@@ -224,7 +224,7 @@ class TestResetNow:
         async def record_stop(_library_name: str) -> None:
             exec_env_present_at_stop.append(await anyio.Path(exec_env).exists())
 
-        library_manager._worker_manager.stop_worker_for_library.side_effect = record_stop  # type: ignore[attr-defined]
+        library_manager.workers.stop_worker_for_library.side_effect = record_stop  # type: ignore[attr-defined]
 
         await engine.ahandle_request(ResetLibraryRequest(library_name=LIBRARY_NAME))
 
@@ -294,6 +294,27 @@ class TestResetNow:
         assert "git operation" not in str(result.result_details)
         library_manager.workers.start_worker_for_library.assert_not_awaited()  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_failing_to_load_after_a_locked_directory_still_asks_for_a_restart(
+        self, engine: Engine, manifest: Path, library_dir: Path, reload_mock: AsyncMock
+    ) -> None:
+        """A directory left for the next start is still there, so the failure must not claim it was removed."""
+        library_manager = engine.library_manager
+        _track(library_manager, manifest)
+        exec_env = _make_env(library_dir / ".venv-exec")
+        reload_mock.return_value = ResetLibraryResultFailure(result_details="Failed to reload Library.")
+
+        async def locked(_env_path: Path) -> str | None:
+            return "the file is in use"
+
+        with patch.object(library_manager.reset, "_remove_env_dir", side_effect=locked):
+            result = await engine.ahandle_request(ResetLibraryRequest(library_name=LIBRARY_NAME))
+
+        assert isinstance(result, ResetLibraryResultFailure)
+        assert "were removed" not in str(result.result_details)
+        assert "restart the engine" in str(result.result_details)
+        assert _pending_record(library_manager.reset) == {"env_paths": [str(exec_env)]}
+
 
 class TestResetAtNextStart:
     @pytest.mark.asyncio
@@ -322,7 +343,7 @@ class TestResetAtNextStart:
         pending = _pending_record(library_manager.reset)
         assert pending == {"env_paths": [str(edit_env), str(exec_env)]}
         reload_mock.assert_not_awaited()
-        library_manager._worker_manager.stop_worker_for_library.assert_not_awaited()  # type: ignore[attr-defined]
+        library_manager.workers.stop_worker_for_library.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_resetting_twice_records_each_directory_once(

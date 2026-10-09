@@ -102,7 +102,7 @@ class LibraryReset(EngineScoped):
             )
 
         # The worker has the execution environment on its import path.
-        await library_manager._worker_manager.stop_worker_for_library(library_name)
+        await library_manager.workers.stop_worker_for_library(library_name)
 
         removed_paths: list[str] = []
         locked_paths: list[Path] = []
@@ -130,9 +130,7 @@ class LibraryReset(EngineScoped):
             failure_result_class=ResetLibraryResultFailure,
         )
         if isinstance(reload_result, ResetLibraryResultFailure):
-            problems = library_manager.catalog.get_collated_problems_for_library(library_name)
-            reason = problems if problems is not None else "the engine log has the details"
-            details = f"Attempted to reset Library '{library_name}'. Its environments were removed, but it failed to load again: {reason}"
+            details = self._reload_failure_details(library_name, has_locked_paths=bool(locked_paths))
             return ResetLibraryResultFailure(result_details=details)
 
         await library_manager.workers.start_worker_for_library(library_name)
@@ -210,7 +208,8 @@ class LibraryReset(EngineScoped):
     def reset_requires_restart(self, library_name: str, library_path: str) -> bool:
         """Whether resetting this library now would wait for the next engine start.
 
-        The one rule both the reset and the metadata clients read before offering it follow.
+        Both the reset and `LoadLibraryMetadataFromFileResultSuccess.reset_requires_restart` use this
+        check, so they agree.
         """
         edit_env_path = self.engine.library_manager.environment.get_library_venv_path(
             library_name, library_path, execution=False
@@ -219,6 +218,18 @@ class LibraryReset(EngineScoped):
 
     def pending_resets_path(self) -> Path:
         return engine_state_dir() / PENDING_RESETS_FILENAME
+
+    def _reload_failure_details(self, library_name: str, *, has_locked_paths: bool) -> str:
+        """Why the library did not load again, and whether part of the reset is still waiting for a restart."""
+        problems = self.engine.library_manager.catalog.get_collated_problems_for_library(library_name)
+        reason = problems if problems is not None else "the engine log has the details"
+        if has_locked_paths:
+            return (
+                f"Attempted to reset Library '{library_name}'. Failed because it did not load again after its "
+                f"environments were rebuilt: {reason} Some of its files were in use and are removed the next "
+                f"time the engine starts, so restart the engine to finish the reset."
+            )
+        return f"Attempted to reset Library '{library_name}'. Its environments were removed, but it failed to load again: {reason}"
 
     async def _remove_env_dir(self, env_path: Path) -> str | None:
         """Delete an environment directory, returning why it is still there, or None once it is gone.

@@ -259,6 +259,10 @@ class LibraryWorkers(EngineScoped):
             worker_manager.set_session_ready()
             await self._start_workers()
 
+    async def stop_worker_for_library(self, library_name: str) -> None:
+        """Stop the worker for one library, including one whose spawn is still under way."""
+        await self.engine.library_manager._worker_manager.stop_worker_for_library(library_name)
+
     async def start_worker_for_library(self, library_name: str) -> None:
         """Start the worker for one library, if it executes in one, leaving every other library alone.
 
