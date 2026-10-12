@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -153,6 +154,11 @@ class WorkflowManager(EngineScoped):
         problems: list[WorkflowProblem] = field(default_factory=list)
 
     _workflow_file_path_to_info: dict[str, WorkflowInfo]
+    # FlowManager reads the top of this stack to tag each new flow with the workflow being imported.
+    # A ContextVar keeps concurrent imports apart (Workflow nodes in PARALLEL mode run as separate
+    # tasks), and it lives on the instance so each engine has its own. A balanced set/reset removes
+    # the entry from the Context that set it.
+    _referenced_workflow_stack: contextvars.ContextVar[tuple[str, ...]]
 
     # Track how many contexts we have that intend to squelch (set to False) altered_workflow_state event values.
     class WorkflowSquelchContext:
@@ -179,11 +185,20 @@ class WorkflowManager(EngineScoped):
         """Context manager for tracking workflow import operations."""
 
         def __init__(self, manager: WorkflowManager, workflow_name: str):
-            self.manager = manager
-            self.workflow_name = workflow_name
+            self._manager = manager
+            self._workflow_name = workflow_name
+            self._token: contextvars.Token[tuple[str, ...]] | None = None
 
         def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            self.manager._referenced_workflow_stack.append(self.workflow_name)
+            if self._token is not None:
+                msg = (
+                    f"Attempted to enter the referenced workflow context for '{self._workflow_name}'. "
+                    "Failed because this context is already active. Create a new context for each import."
+                )
+                raise RuntimeError(msg)
+
+            stack = self._manager._referenced_workflow_stack
+            self._token = stack.set((*stack.get(), self._workflow_name))
             return self
 
         def __exit__(
@@ -192,15 +207,18 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._referenced_workflow_stack.pop()
+            if self._token is None:
+                return
 
-    _referenced_workflow_stack: list[str] = field(default_factory=list)
+            token = self._token
+            self._token = None
+            self._manager._referenced_workflow_stack.reset(token)
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
+        self._referenced_workflow_stack = contextvars.ContextVar("referenced_workflow_stack", default=())
         self._squelch_workflow_altered_count = 0
-        self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -222,7 +240,7 @@ class WorkflowManager(EngineScoped):
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
-        return len(self._referenced_workflow_stack) > 0
+        return len(self._referenced_workflow_stack.get()) > 0
 
     def get_current_referenced_workflow(self) -> str:
         """Get the current workflow source path from the context stack.
@@ -230,7 +248,7 @@ class WorkflowManager(EngineScoped):
         Raises:
             IndexError: If no referenced workflow context is active.
         """
-        return self._referenced_workflow_stack[-1]
+        return self._referenced_workflow_stack.get()[-1]
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # Clear everything, library-provided workflows included, before re-registering. Workflows

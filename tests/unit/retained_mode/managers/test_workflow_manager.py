@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import contextvars
 import logging
 import re
 from datetime import UTC, datetime
@@ -32,7 +33,11 @@ from griptape_nodes.node_library.workflow_registry import (
 )
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails, ResultPayload
-from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    SerializedFlowCommands,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultFailure,
@@ -5702,6 +5707,88 @@ class TestExecuteWorkflowImport:
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
+
+
+class TestReferencedWorkflowTagging:
+    """Flows created while a referenced workflow is importing are tagged with that workflow."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_imports_tag_flows_with_their_own_workflow(self, engine: Engine) -> None:
+        """Workflow nodes importing at the same time each tag their flows with their own workflow."""
+        workflow_manager = engine.workflow_manager
+        flow_manager = engine.flow_manager
+        timeout = 5.0
+        x_entered = asyncio.Event()
+        y_entered = asyncio.Event()
+        x_done = asyncio.Event()
+        engine.context_manager.push_workflow(workflow_name="tagging_workflow")
+        # Only one top-level flow is allowed, so both imports create children of this one.
+        parent_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
+        )
+        assert isinstance(parent_result, CreateFlowResultSuccess)
+
+        # Models PARALLEL mode, where sibling nodes import as separate tasks. Both imports are
+        # open when X creates its flow, and X exits before Y creates its own.
+        async def import_x() -> str:
+            with workflow_manager.referenced_workflow("workflow_x"):
+                x_entered.set()
+                await asyncio.wait_for(y_entered.wait(), timeout=timeout)
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name="ParentFlow", flow_name="FlowX", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+            x_done.set()
+            return result.flow_name
+
+        async def import_y() -> str:
+            await asyncio.wait_for(x_entered.wait(), timeout=timeout)
+            with workflow_manager.referenced_workflow("workflow_y"):
+                y_entered.set()
+                await asyncio.wait_for(x_done.wait(), timeout=timeout)
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name="ParentFlow", flow_name="FlowY", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+            return result.flow_name
+
+        flow_x_name, flow_y_name = await asyncio.gather(import_x(), import_y())
+
+        flow_x = flow_manager.get_flow_by_name(flow_x_name)
+        flow_y = flow_manager.get_flow_by_name(flow_y_name)
+        assert flow_manager.get_referenced_workflow_name(flow_x) == "workflow_x"
+        assert flow_manager.get_referenced_workflow_name(flow_y) == "workflow_y"
+
+    def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
+        """An import running in one engine does not tag flows created in another engine."""
+        other_engine = Engine()
+        other_engine.context_manager.push_workflow(workflow_name="other_workflow")
+
+        with engine.workflow_manager.referenced_workflow("workflow_a"):
+            assert engine.workflow_manager.has_current_referenced_workflow()
+            assert engine.workflow_manager.get_current_referenced_workflow() == "workflow_a"
+            assert not other_engine.workflow_manager.has_current_referenced_workflow()
+
+            result = other_engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name="OtherFlow", set_as_new_context=False)
+            )
+            assert isinstance(result, CreateFlowResultSuccess)
+            other_flow = other_engine.flow_manager.get_flow_by_name(result.flow_name)
+            assert other_engine.flow_manager.get_referenced_workflow_name(other_flow) is None
+
+    def test_entering_the_same_import_context_twice_is_refused(self, engine: Engine) -> None:
+        """Re-entering an import that is already running fails without disturbing it."""
+        workflow_manager = engine.workflow_manager
+        context = workflow_manager.referenced_workflow("workflow_x")
+
+        with context:
+            with pytest.raises(RuntimeError, match="already active"):
+                context.__enter__()
+
+            assert workflow_manager.get_current_referenced_workflow() == "workflow_x"
+
+        assert not workflow_manager.has_current_referenced_workflow()
+        assert workflow_manager._referenced_workflow_stack not in contextvars.copy_context()
 
 
 class TestSaveWorkflowOverwriteProtection:
