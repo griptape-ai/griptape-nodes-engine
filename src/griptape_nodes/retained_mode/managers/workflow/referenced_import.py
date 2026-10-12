@@ -103,7 +103,33 @@ class ReferencedWorkflowImport(EngineScoped):
                 details = f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. Failed because target flow does not exist"
                 return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
+        # Refuse when the target flow is already inside an import of this workflow. That is how a
+        # Workflow node pointing back at its own workflow, directly or through other workflows,
+        # shows up at run time; allowing it would re-run the workflow's file forever.
+        if flow_name is None:
+            flow_name = self.engine.context_manager.get_current_flow().name
+        if self._is_flow_inside_import_of(flow_name, request.workflow_name):
+            details = (
+                f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. "
+                f"Failed because '{request.workflow_name}' contains itself: a Workflow node inside it "
+                "points back to it, directly or through another workflow. Change that Workflow node to a "
+                "different workflow."
+            )
+            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+
         return None
+
+    def _is_flow_inside_import_of(self, flow_name: str, workflow_name: str) -> bool:
+        """Whether `flow_name`, or any flow above it, was created by importing `workflow_name`."""
+        flow_manager = self.engine.flow_manager
+        object_manager = self.engine.object_manager
+        current: str | None = flow_name
+        while current is not None:
+            flow = object_manager.attempt_get_object_by_name_as_type(current, ControlFlow)
+            if flow is not None and flow_manager.get_referenced_workflow_name(flow) == workflow_name:
+                return True
+            current = flow_manager.get_parent_flow(current)
+        return False
 
     def _get_workflow_by_name(self, workflow_name: str) -> Workflow:
         """Get workflow by name from the registry."""

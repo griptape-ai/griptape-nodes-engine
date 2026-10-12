@@ -3,7 +3,7 @@
 # 
 # [tool.griptape-nodes]
 # name = "shout_workflow"
-# schema_version = "0.20.0"
+# schema_version = "0.21.0"
 # engine_version_created_with = "0.0.0"
 # node_libraries_referenced = [["Workflow Node Library", "0.1.0"]]
 # node_types_used = []
@@ -19,7 +19,6 @@ import argparse
 import asyncio
 import json
 import logging
-import pickle
 from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalWorkflowExecutor
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.node_library.library_registry import IconVariant, NodeDeprecationMetadata, NodeMetadata
@@ -29,6 +28,7 @@ from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFr
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, AlterParameterDetailsRequest, SetParameterValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.serialization.values import decode_value
 from typing import Any
 
 async def build_workflow() -> None:
@@ -36,13 +36,9 @@ async def build_workflow() -> None:
     context_manager = GriptapeNodes.ContextManager()
     if not context_manager.has_current_workflow():
         context_manager.push_workflow(file_path=__file__)
-    # 1. We've collated all of the unique parameter values into a dictionary so that we do not have to duplicate them.
-    #    This minimizes the size of the code, especially for large objects like serialized image files.
-    # 2. We're using a prefix so that it's clear which Flow these values are associated with.
-    # 3. The values are serialized using pickle, which is a binary format. This makes them harder to read, but makes
-    #    them consistently save and load. It allows us to serialize complex objects like custom classes, which otherwise
-    #    would be difficult to serialize.
-    top_level_unique_values_dict = {'cd1932ee-7ec7-46ea-840e-6ce4d28f2977': pickle.loads(b'\x80\x04\x95\x04\x00\x00\x00\x00\x00\x00\x00\x8c\x00\x94.'), '3dec5129-d017-46f5-b814-a4d76da064ed': pickle.loads(b'\x80\x04\x89.')}
+    # Every unique parameter value, stored once and keyed by a hash of its content.
+    # Values that aren't plain data carry a '$type' naming their class; decode_value rebuilds them.
+    top_level_unique_values_dict = {'12ae32cb1ec02d01eda3581b127c1fee': '', 'fcbcf165908dd18a9e49f7ff27810176': False}
     # Create the Flow, then do work within it as context.
     flow0_name = (await GriptapeNodes.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name='ControlFlow_1', set_as_new_context=False, metadata={}))).flow_name
     with GriptapeNodes.ContextManager().flow(flow0_name):
@@ -54,11 +50,11 @@ async def build_workflow() -> None:
         await GriptapeNodes.ahandle_request(CreateConnectionRequest(source_node_name=node0_name, source_parameter_name='text', target_node_name=node1_name, target_parameter_name='text', initial_setup=True))
         await GriptapeNodes.ahandle_request(CreateConnectionRequest(source_node_name=node1_name, source_parameter_name='shouted', target_node_name=node2_name, target_parameter_name='result', initial_setup=True))
         with GriptapeNodes.ContextManager().node(node0_name):
-            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='text', node_name=node0_name, value=top_level_unique_values_dict['cd1932ee-7ec7-46ea-840e-6ce4d28f2977'], initial_setup=True, is_output=False))
+            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='text', node_name=node0_name, value=decode_value(top_level_unique_values_dict['12ae32cb1ec02d01eda3581b127c1fee']), initial_setup=True, is_output=False))
         with GriptapeNodes.ContextManager().node(node1_name):
-            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='shouted', node_name=node1_name, value=top_level_unique_values_dict['cd1932ee-7ec7-46ea-840e-6ce4d28f2977'], initial_setup=True, is_output=False))
+            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='shouted', node_name=node1_name, value=decode_value(top_level_unique_values_dict['12ae32cb1ec02d01eda3581b127c1fee']), initial_setup=True, is_output=False))
         with GriptapeNodes.ContextManager().node(node2_name):
-            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='was_successful', node_name=node2_name, value=top_level_unique_values_dict['3dec5129-d017-46f5-b814-a4d76da064ed'], initial_setup=True, is_output=False))
+            await GriptapeNodes.ahandle_request(SetParameterValueRequest(parameter_name='was_successful', node_name=node2_name, value=decode_value(top_level_unique_values_dict['fcbcf165908dd18a9e49f7ff27810176']), initial_setup=True, is_output=False))
 
 async def _ensure_workflow_context():
     context_manager = GriptapeNodes.ContextManager()
@@ -74,19 +70,18 @@ def execute_workflow(input: dict, *, workflow_executor: WorkflowExecutor | None=
     return asyncio.run(aexecute_workflow(input=input, workflow_executor=workflow_executor, **kwargs))
 
 async def aexecute_workflow(input: dict, *, workflow_executor: WorkflowExecutor | None=None, **kwargs: Any) -> dict | None:
-    await build_workflow()
-    await _ensure_workflow_context()
     if workflow_executor is None:
-        kwargs.setdefault('pickle_control_flow_result', False)
         workflow_executor = LocalWorkflowExecutor(skip_library_loading=True, workflows_to_register=[__file__], **kwargs)
     async with workflow_executor as executor:
+        await build_workflow()
+        await _ensure_workflow_context()
         await executor.arun(flow_input=input, **kwargs)
     return executor.output
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
-    LocalWorkflowExecutor.add_cli_arguments(parser, pickle_control_flow_result_default=False)
+    LocalWorkflowExecutor.add_cli_arguments(parser)
     parser.add_argument('--json-input', default=None, help='JSON string containing parameter values. Takes precedence over individual parameter arguments if provided.')
     parser.add_argument('--exec_out', dest='exec_out', default=None, help='Connection to the next node in the execution chain')
     parser.add_argument('--text', dest='text', default=None, help='Text handed to the workflow')
