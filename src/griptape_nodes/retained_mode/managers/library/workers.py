@@ -7,10 +7,12 @@ from griptape_nodes.node_library.library_declarations import (
     SuggestedWorkerMode,
     WorkerMode,
 )
+from griptape_nodes.retained_mode.beta_features import PRIVATE_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppSessionStartedEvent,
     LibraryLoadedNotification,
+    ReportGeneralPurposeWorkerReadyRequest,
     ReportLibraryLoadedRequest,
     ReportLibraryLoadedResultFailure,
     ReportLibraryLoadedResultSuccess,
@@ -55,18 +57,24 @@ class LibraryWorkers(EngineScoped):
     # How a worker reaches the orchestrator to report a load. Registered by whatever owns the
     # transport, because this manager has no way to send a request to another process. Stays None
     # on the orchestrator and on a single-process engine, where there is nobody to report to.
-    _library_load_reporter: Callable[[ReportLibraryLoadedRequest], Awaitable[None]] | None = None
+    _library_load_reporter: (
+        Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]] | None
+    ) = None
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    def register_library_load_reporter(self, reporter: Callable[[ReportLibraryLoadedRequest], Awaitable[None]]) -> None:
+    def register_library_load_reporter(
+        self,
+        reporter: Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]],
+    ) -> None:
         """Register how this worker reports a library load to the orchestrator.
 
         Registered by whatever owns the transport between the two processes, since this manager can
         build the report but has no way to send it. Absent on the orchestrator and on a
-        single-process engine, where there is nobody to report to.
+        single-process engine, where there is nobody to report to. A general-purpose worker sends
+        its one ready report through it too.
         """
         self._library_load_reporter = reporter
 
@@ -80,6 +88,16 @@ class LibraryWorkers(EngineScoped):
             )
             return
         await self._library_load_reporter(request)
+
+    async def report_general_purpose_worker_ready(self) -> None:
+        """Tell the orchestrator this general-purpose worker has loaded its libraries."""
+        if self._library_load_reporter is None:
+            logger.error(
+                "No load reporter is registered, so the orchestrator will not learn that this "
+                "general-purpose worker is ready and will wait out its startup grace before giving up on it."
+            )
+            return
+        await self._library_load_reporter(ReportGeneralPurposeWorkerReadyRequest())
 
     @handles(ReportLibraryLoadedRequest)
     async def on_report_library_loaded_request(self, request: ReportLibraryLoadedRequest) -> ResultPayload:
@@ -345,3 +363,16 @@ class LibraryWorkers(EngineScoped):
                 # worker coming, or does nothing when one already is.
                 library_info.execution_unavailable_reason = None
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
+        # Only on a full start, never as one library finishes registering: it loads every library and
+        # builds none of their environments, so it has to start after this process has built them all.
+        if only_library_name is None:
+            await self._start_general_purpose_worker()
+
+    async def _start_general_purpose_worker(self) -> None:
+        """Ask for the worker that runs the nodes of Private Execution groups, if that beta feature is on.
+
+        WorkerManager declines the request when one is already starting or running.
+        """
+        if not is_beta_enabled(PRIVATE_EXECUTION_IN_WORKER, self.engine.config_manager):
+            return
+        await self.engine.ahandle_request(StartWorkerRequest(library_name=None))

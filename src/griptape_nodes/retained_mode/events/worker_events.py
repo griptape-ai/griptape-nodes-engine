@@ -138,10 +138,11 @@ class StartWorkerRequest(RequestPayload):
     spawning the worker subprocess.
 
     Args:
-        library_name: The library the worker will serve.
+        library_name: The library the worker will serve, or None for the general-purpose worker,
+            which serves no single library and runs the nodes of Private Execution groups.
     """
 
-    library_name: str
+    library_name: str | None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 

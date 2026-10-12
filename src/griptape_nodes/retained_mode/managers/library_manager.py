@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     InitializationPhase,
     InitializationStatus,
     LibraryLoadStatus,
+    ReportGeneralPurposeWorkerReadyRequest,
     ReportLibraryLoadedRequest,
 )
 
@@ -144,6 +145,8 @@ class LibraryManager(EngineScoped):
         self._pre_reload_callbacks: list[Callable[[], Awaitable[None]]] = []
         # True when this process is a dedicated worker
         self._is_worker: bool = False
+        # True when this process is a worker that serves no single library (see AppInitializationComplete)
+        self._is_general_purpose_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
         self.module_loading = LibraryModuleLoading(engine)
@@ -202,6 +205,16 @@ class LibraryManager(EngineScoped):
         reaching into ``_is_worker``.
         """
         return self._is_worker
+
+    @property
+    def is_general_purpose_worker(self) -> bool:
+        """True when this process is a worker that serves no single library.
+
+        It loads every enabled library so it can run whatever node the orchestrator routes to it,
+        but it is no library's worker: it does not report library loads, and it builds no
+        environment another process owns.
+        """
+        return self._is_general_purpose_worker
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
@@ -357,7 +370,10 @@ class LibraryManager(EngineScoped):
         finally:
             self._is_initializing = False
 
-    def register_library_load_reporter(self, reporter: Callable[[ReportLibraryLoadedRequest], Awaitable[None]]) -> None:
+    def register_library_load_reporter(
+        self,
+        reporter: Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]],
+    ) -> None:
         """Kept for the app that calls it. See `LibraryWorkers.register_library_load_reporter`."""
         self.workers.register_library_load_reporter(reporter)
 
@@ -490,12 +506,19 @@ class LibraryManager(EngineScoped):
         # Now load all libraries from config (including newly downloaded ones).
         # When running as a dedicated library worker, restrict loading to those libraries.
         self._is_worker = payload.is_worker
-        self._target_library_names = payload.libraries_to_register if payload.is_worker else None
+        self._is_general_purpose_worker = payload.is_worker and payload.is_general_purpose_worker
+        # A general-purpose worker is not restricted: it loads every library, like the orchestrator.
+        if payload.is_worker and not self._is_general_purpose_worker:
+            self._target_library_names = payload.libraries_to_register
+        else:
+            self._target_library_names = None
         # Before anything loads, since a loaded library holds its environment open. The
         # orchestrator only: its workers start after it, and two processes must not race to delete.
         if not self._is_worker and not payload.defer_pending_library_resets:
             await self.reset.apply_pending_resets()
         reconcile_failures = await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+        if self._is_general_purpose_worker:
+            await self.workers.report_general_purpose_worker_ready()
         # Soft boot: log reconcile failures and continue so the engine still starts and the
         # user can switch to a working project. Interactive activation hard-fails instead
         # (see reload_libraries_request).
