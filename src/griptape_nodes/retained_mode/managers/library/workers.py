@@ -8,7 +8,7 @@ from griptape_nodes.node_library.library_declarations import (
     SuggestedWorkerMode,
     WorkerMode,
 )
-from griptape_nodes.retained_mode.beta_features import PRIVATE_EXECUTION_IN_WORKER, is_beta_enabled
+from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppSessionStartedEvent,
@@ -376,11 +376,11 @@ class LibraryWorkers(EngineScoped):
             await self._start_general_purpose_worker()
 
     async def _start_general_purpose_worker(self) -> None:
-        """Ask for the worker that runs the nodes of Private Execution groups, if that beta feature is on.
+        """Ask for the worker that runs the nodes of Isolated Execution groups, if that beta feature is on.
 
         WorkerManager declines the request when one is already starting or running.
         """
-        if not is_beta_enabled(PRIVATE_EXECUTION_IN_WORKER, self.engine.config_manager):
+        if not is_beta_enabled(ISOLATED_EXECUTION_IN_WORKER, self.engine.config_manager):
             return
         worker_manager = self.engine.library_manager._worker_manager
         # Recorded only for a request WorkerManager will accept: a worker already starting or running

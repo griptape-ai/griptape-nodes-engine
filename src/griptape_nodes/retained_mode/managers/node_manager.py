@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
-from griptape_nodes.common.private_execution_scope import PrivateExecutionScope, current_private_execution_scope
+from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
@@ -47,8 +47,8 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
+    ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
-    PRIVATE_EXECUTION,
     BaseNode,
     EndNode,
     ErrorProxyNode,
@@ -3337,15 +3337,15 @@ class NodeManager(EngineScoped):
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
             # A library's own worker comes first: that is where its dependencies are installed. Only a
-            # node that would otherwise run here moves to the worker its Private Execution names.
+            # node that would otherwise run here moves to the worker its Isolated Execution names.
             #
             # A packaged flow's StartFlow and EndFlow stay here. They are the flow's boundary and only
             # pass values in and out, and the packager gives them their parameters by request, which
             # the fresh copy a worker builds from metadata does not have. The body goes.
-            private_scope = current_private_execution_scope.get()
+            isolated_scope = current_isolated_execution_scope.get()
             is_flow_boundary = isinstance(node, (StartNode, EndNode))
-            if wm is not None and private_scope is not None and not is_flow_boundary:
-                return await self._execute_node_in_private_execution_worker(request, wm, private_scope)
+            if wm is not None and isolated_scope is not None and not is_flow_boundary:
+                return await self._execute_node_in_isolated_execution_worker(request, wm, isolated_scope)
 
         async with STRICT_MODE.scoped_execution(
             kind=StrictModeScopeKind.RUNTIME_EXECUTE,
@@ -3475,12 +3475,12 @@ class NodeManager(EngineScoped):
             return None
         return library_manager.catalog.get_collated_problems_for_library(library_name)
 
-    async def _execute_node_in_private_execution_worker(
-        self, request: ExecuteNodeRequest, wm: WorkerManager, scope: PrivateExecutionScope
+    async def _execute_node_in_isolated_execution_worker(
+        self, request: ExecuteNodeRequest, wm: WorkerManager, scope: IsolatedExecutionScope
     ) -> ResultPayload:
-        """Run the node on the worker its Private Execution scope names.
+        """Run the node on the worker its Isolated Execution scope names.
 
-        The scope is set by NodeExecutor, which decided this run uses Private Execution, so nothing
+        The scope is set by NodeExecutor, which decided this run uses Isolated Execution, so nothing
         here infers it from where the node sits in the graph.
         """
         try:
@@ -3490,16 +3490,16 @@ class NodeManager(EngineScoped):
         unavailable = wm.worker_unavailable_reason(scope.worker_key)
         if unavailable is not None:
             details = (
-                f"Attempted to run '{request.node_name}' with the Private Execution set on '{scope.owner_name}'. "
+                f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
                 f"Failed because {unavailable}"
             )
             return ExecuteNodeResultFailure(result_details=details)
         worker = wm.get_worker_for_key(scope.worker_key)
         if worker is None:
             details = (
-                f"Attempted to run '{request.node_name}' with the Private Execution set on '{scope.owner_name}'. "
-                "Failed because the background process that runs Private Execution is not running. It starts "
-                "with the session while the 'Private Execution in a worker' beta feature is on."
+                f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
+                "Failed because the background process that runs Isolated Execution is not running. It starts "
+                "with the session while the 'Isolated Execution in a worker' beta feature is on."
             )
             return ExecuteNodeResultFailure(result_details=details)
         return await self._execute_node_via_worker(request, wm, worker)
@@ -4095,7 +4095,7 @@ class NodeManager(EngineScoped):
             execution_env_library_details = None
             if isinstance(node, SubflowNodeGroup):
                 execution_env = node.get_parameter_value(node.execution_environment.name)
-                if execution_env not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
+                if execution_env not in (LOCAL_EXECUTION, ISOLATED_EXECUTION):
                     # Get library details for the execution environment library
                     exec_env_metadata_request = GetLibraryMetadataRequest(library=execution_env)
                     exec_env_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(

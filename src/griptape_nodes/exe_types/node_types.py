@@ -111,7 +111,10 @@ class TransformedParameterValue(NamedTuple):
 AsyncResult = Generator[Callable[[], T], T]
 
 LOCAL_EXECUTION = "Local Execution"
-PRIVATE_EXECUTION = "Private Execution"
+ISOLATED_EXECUTION = "Isolated Execution"
+# What Isolated Execution was called before it was renamed. Workflows saved before then hold this
+# value, so a group's execution_environment reads it as ISOLATED_EXECUTION.
+LEGACY_PRIVATE_EXECUTION = "Private Execution"
 CONTROL_INPUT_PARAMETER = "Control Input Selection"
 
 
@@ -301,7 +304,7 @@ def get_library_names_with_publish_handlers(engine: Engine) -> list[str]:
     event_handlers = engine.library_manager.get_registered_event_handlers(PublishWorkflowRequest)
 
     # Always include "local" and "private" as the first options
-    library_names = [LOCAL_EXECUTION, PRIVATE_EXECUTION]
+    library_names = [LOCAL_EXECUTION, ISOLATED_EXECUTION]
 
     # Add all registered library names that can handle PublishWorkflowRequest
     library_names.extend(sorted(event_handlers.keys()))

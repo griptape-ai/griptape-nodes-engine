@@ -1063,7 +1063,7 @@ class WorkerManager(EngineScoped):
 
         Started with the engine's own interpreter and environment, and without
         `worker.command_prefix`: the prefix prepares an environment for one library, and this
-        worker serves none. It runs where the engine runs, as Private Execution's separate process
+        worker serves none. It runs where the engine runs, as Isolated Execution's separate process
         always has.
         """
         if not self.engine.get_session_id():
@@ -1178,7 +1178,7 @@ class WorkerManager(EngineScoped):
         except TimeoutError:
             if library_name is None:
                 msg = (
-                    "Attempted to run a node with Private Execution. Failed because the background process "
+                    "Attempted to run a node with Isolated Execution. Failed because the background process "
                     f"that runs it did not finish loading libraries within {self.library_load_timeout_s:.0f} seconds."
                 )
             else:
