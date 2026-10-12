@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
+from griptape_nodes.common.private_execution_scope import private_execution_scope
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -737,3 +738,134 @@ class TestExecuteNodeWorkerValues:
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "'handle'" in str(result.result_details)
         assert "'text'" not in str(result.result_details)
+
+
+class TestExecuteNodePrivateExecutionRoute:
+    """Orchestrator-side routing of a node run inside a Private Execution scope to the worker it names."""
+
+    _LIBRARY_WORKER = ("library-eng-id", "library-topic")
+    _PRIVATE_WORKER = ("private-eng-id", "private-topic")
+
+    def _make_node(self) -> MagicMock:
+        node = _make_mock_node()
+        node.metadata = {"library": "some_library"}
+        return node
+
+    def _make_worker_manager(
+        self, private_worker: tuple[str, str] | None, unavailable_reason: str | None = None
+    ) -> MagicMock:
+        wm = MagicMock()
+        wm.worker_unavailable_reason.return_value = unavailable_reason
+        wm.get_worker_for_key.return_value = private_worker
+        wm.route_to_worker = AsyncMock(
+            return_value={
+                "result_type": ExecuteNodeResultSuccess.__name__,
+                "result": {"parameter_output_values": {"out": 1}, "result_details": "ok"},
+            }
+        )
+        return wm
+
+    async def _execute(
+        self,
+        node: MagicMock,
+        wm: MagicMock,
+        *,
+        scope_owner: str | None = "My Group",
+        library_worker: tuple[str, str] | None = None,
+        load_failure: str | None = None,
+    ) -> ExecuteNodeResultSuccess | ExecuteNodeResultFailure:
+        lib_mgr = _make_mock_library_manager(is_worker=False)
+        lib_mgr.workers.get_worker_for_library.return_value = library_worker
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=node), library_manager=lib_mgr, worker_manager=wm
+        )
+
+        # Set after the node manager is built, which installs its own mock. The library's own wait
+        # comes first and passes; only the Private Execution worker's wait can fail here.
+        async def wait_until_executable(key: str | None) -> None:
+            if key is None and load_failure is not None:
+                raise RuntimeError(load_failure)
+
+        wm.wait_until_executable = AsyncMock(side_effect=wait_until_executable)
+        request = ExecuteNodeRequest(
+            node_name=node.name,
+            node_metadata=cast("NodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}),
+        )
+        if scope_owner is None:
+            result = await node_manager.on_execute_node_request(request)
+        else:
+            with private_execution_scope(scope_owner):
+                result = await node_manager.on_execute_node_request(request)
+        assert isinstance(result, ExecuteNodeResultSuccess | ExecuteNodeResultFailure)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_a_node_run_in_the_scope_goes_to_the_general_purpose_worker(self) -> None:
+        node = self._make_node()
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.wait_until_executable.assert_any_await(None)
+        wm.get_worker_for_key.assert_called_once_with(None)
+        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_library_worker_takes_precedence_over_the_private_execution_worker(self) -> None:
+        node = self._make_node()
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm, library_worker=self._LIBRARY_WORKER)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert wm.route_to_worker.await_args.args[1:] == self._LIBRARY_WORKER
+        wm.get_worker_for_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fails_naming_the_owner_when_the_worker_is_not_running(self) -> None:
+        node = self._make_node()
+        wm = self._make_worker_manager(None)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "'My Group'" in str(result.result_details)
+        assert f"'{node.name}'" in str(result.result_details)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fails_with_the_recorded_reason_when_the_worker_cannot_run(self) -> None:
+        node = self._make_node()
+        wm = self._make_worker_manager(self._PRIVATE_WORKER, unavailable_reason="it stopped responding.")
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "it stopped responding." in str(result.result_details)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fails_when_the_worker_never_finishes_loading(self) -> None:
+        node = self._make_node()
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+        result = await self._execute(node, wm, load_failure="did not finish loading libraries")
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "did not finish loading libraries" in str(result.result_details)
+        wm.route_to_worker.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_node_run_outside_the_scope_runs_locally(self) -> None:
+        """Where a node sits in the graph does not matter; only the run that set the scope does."""
+        node = self._make_node()
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm, scope_owner=None)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
