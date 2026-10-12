@@ -29,6 +29,8 @@ DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
 DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+MAX_WORKFLOW_RECURSION_DEPTH_KEY = "max_workflow_recursion_depth"
+DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH = 10
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
 # agrees on both the key and what a missing value means.
@@ -134,6 +136,34 @@ def coerce_refresh_previews_max_files(value: Any) -> int:
         f"Watching up to {DEFAULT_REFRESH_PREVIEWS_MAX_FILES} files for preview refreshes.",
     )
     return DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+
+
+def coerce_max_workflow_recursion_depth(value: Any) -> int:
+    """The max_workflow_recursion_depth value to use from a config file.
+
+    A whole number below 1 becomes 1, since a low limit was clearly meant. Anything
+    else that is not a whole number of at least 1 becomes the default. Used by the
+    Settings validator and by ConfigManager, which reads the merged config, where raw
+    values are kept. Warns once per bad value instead of failing, so a typo can't
+    reset the rest of the config.
+    """
+    if _is_whole_number_of_at_least_one(value):
+        return value
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        _warn_once(
+            (MAX_WORKFLOW_RECURSION_DEPTH_KEY, repr(value)),
+            f"{MAX_WORKFLOW_RECURSION_DEPTH_KEY} is {value!r}, below its minimum of 1. "
+            "Using 1, so a workflow can run inside itself only once.",
+        )
+        return 1
+
+    _warn_once(
+        (MAX_WORKFLOW_RECURSION_DEPTH_KEY, repr(value)),
+        f"Ignoring {MAX_WORKFLOW_RECURSION_DEPTH_KEY} = {value!r}: expected a whole number of at least 1. "
+        f"Using the default of {DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH}.",
+    )
+    return DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH
 
 
 def _is_whole_number_of_at_least_one(value: Any) -> bool:
@@ -759,6 +789,32 @@ class Settings(BaseModel):
         default=0,
         description="Maximum number of loop iterations running at a time when a loop runs all items at once. 0 means no limit.",
     )
+    max_workflow_recursion_depth: int = Field(
+        category=EXECUTION,
+        default=DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
+        ge=1,
+        description=(
+            "How many times a workflow can run inside itself through its own Workflow node before the "
+            "engine stops it. Each level runs a full copy of the workflow. In a config file, a whole number "
+            "below 1 is treated as 1, and a value that is not a whole number is ignored with a warning and the "
+            "default is used."
+        ),
+    )
+
+    @field_validator("max_workflow_recursion_depth", mode="before")
+    @classmethod
+    def validate_max_workflow_recursion_depth(cls, v: Any, info: ValidationInfo) -> Any:
+        """Replace a bad value from a config file with a usable one, so it cannot reset the whole config.
+
+        From a GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH variable the value is left alone,
+        so the field rejects a bad one and the env loader reports the variable and
+        ignores it.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if from_env:
+            return v
+        return coerce_max_workflow_recursion_depth(v)
+
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,
