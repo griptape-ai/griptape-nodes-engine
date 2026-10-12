@@ -126,7 +126,7 @@ class ReferencedWorkflowImport(EngineScoped):
         flows_before = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
 
         # Execute the workflow within the target flow context.
-        # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
+        # When track_as_referenced is True, wrap in `referenced_workflow` so the flow
         # serializes as an import command. When False, the flow serializes as inline content.
         workflow_manager = self.engine.workflow_manager
         with self.engine.context_manager.flow(flow_name):
