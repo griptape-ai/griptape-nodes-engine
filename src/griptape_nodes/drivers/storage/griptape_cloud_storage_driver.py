@@ -5,7 +5,7 @@ import os
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx2
 
@@ -20,6 +20,21 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
+
+
+def join_cloud_url(base_url: str, path: str) -> str:
+    """Append a path to a Griptape Cloud base URL, keeping any path the base URL already has.
+
+    `urljoin` is not used here because an absolute path replaces the base URL's path.
+
+    Args:
+        base_url: Griptape Cloud base URL, optionally with a path (e.g. https://example.com/prefix).
+        path: Path to append (e.g. /api/buckets).
+
+    Returns:
+        The joined URL.
+    """
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 class GriptapeCloudStorageDriver(BaseStorageDriver):
@@ -78,7 +93,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         self._create_asset(normalized_path.as_posix())
 
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
         try:
             response = self._request("POST", url, json={"operation": "PUT"})
         except httpx2.HTTPStatusError as e:
@@ -155,7 +170,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         # Parse cloud asset URLs before normalizing
         parsed_path = self._parse_cloud_asset_path(path)
         normalized_path = get_workspace_relative_path(parsed_path, self.workspace_directory)
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
         try:
             response = self._request("POST", url, json={"method": "GET"})
         except httpx2.HTTPStatusError as e:
@@ -215,10 +230,10 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             raise RuntimeError(msg) from e
 
         # Return the full asset URL
-        return urljoin(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        return join_cloud_url(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
     def _create_asset(self, asset_name: str) -> str:
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
         try:
             response = self._request("PUT", url, json={"name": asset_name})
         except httpx2.HTTPStatusError as e:
@@ -244,7 +259,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If bucket creation fails.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/buckets")
+        url = join_cloud_url(base_url, "/api/buckets")
         payload = {"name": bucket_name}
 
         try:
@@ -268,7 +283,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Raises:
             RuntimeError: If file listing fails.
         """
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
         try:
             response = self._request("GET", url, params={"prefix": self.workspace_directory.name or ""})
         except httpx2.HTTPStatusError as e:
@@ -302,7 +317,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         # Parse cloud asset URLs before normalizing
         parsed_path = self._parse_cloud_asset_path(path)
         normalized_path = get_workspace_relative_path(parsed_path, self.workspace_directory)
-        return urljoin(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        return join_cloud_url(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
     @staticmethod
     def list_buckets(*, base_url: str, api_key: str, timeout: float | None = None) -> list[dict]:
@@ -317,7 +332,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             A list of dictionaries containing bucket information.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/buckets")
+        url = join_cloud_url(base_url, "/api/buckets")
 
         try:
             response = request_with_retry("GET", url, headers=headers, timeout=timeout)
@@ -349,7 +364,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If the organizations request fails.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/organizations")
+        url = join_cloud_url(base_url, "/api/organizations")
 
         try:
             response = request_with_retry("GET", url, headers=headers, timeout=timeout)
@@ -385,7 +400,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If the existence check fails for a reason other than a 404.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, f"/api/buckets/{bucket_id}")
+        url = join_cloud_url(base_url, f"/api/buckets/{bucket_id}")
 
         try:
             request_with_retry("GET", url, headers=headers, timeout=timeout)
@@ -410,7 +425,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             path: The path of the file to delete.
         """
         normalized_path = get_workspace_relative_path(path, self.workspace_directory)
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
         try:
             self._request("DELETE", url)
@@ -506,7 +521,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             return None
 
         # Build API URL for signed download URL
-        api_url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{workspace_path}")
 
         # Make API request to get signed URL
         try:

@@ -1,12 +1,12 @@
 """File driver for Griptape Cloud asset locations."""
 
 import os
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx2
 
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
-from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
+from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver, join_cloud_url
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 
 # HTTP status code threshold for success
@@ -115,7 +115,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             async with httpx2.AsyncClient() as client:
@@ -148,7 +148,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             async with httpx2.AsyncClient() as client:
@@ -178,7 +178,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             with httpx2.Client() as client:
