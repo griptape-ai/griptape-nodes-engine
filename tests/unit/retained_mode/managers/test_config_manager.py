@@ -1154,6 +1154,40 @@ class TestConfigManager:
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
+class TestMaxWorkflowRecursionDepth:
+    """The recursion limit reads as the setting, and a value below 1 reads as 1 without resetting the rest of the config."""
+
+    def test_default_is_ten(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            assert ConfigManager().max_workflow_recursion_depth == 10  # noqa: PLR2004
+
+    def test_configured_value_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"max_workflow_recursion_depth": 3}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.max_workflow_recursion_depth == 3  # noqa: PLR2004
+
+    def test_zero_in_config_file_is_read_as_one_without_resetting_other_settings(self) -> None:
+        """A 0 in a config file reads as 1 and does not reset the rest of the config to defaults."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(
+                json.dumps({"max_workflow_recursion_depth": 0, "max_nodes_in_parallel": 7})
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.max_workflow_recursion_depth == 1
+                assert manager.get_config_value("max_nodes_in_parallel") == 7  # noqa: PLR2004
+
+
 class TestConfigManagerBlankValues:
     """A blank string means the layer holding it does not set that setting.
 

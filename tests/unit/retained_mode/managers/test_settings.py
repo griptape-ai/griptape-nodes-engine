@@ -7,7 +7,9 @@ import logging
 import pytest
 from pydantic import ValidationError
 
+from griptape_nodes.retained_mode.managers import settings as settings_module
 from griptape_nodes.retained_mode.managers.settings import (
+    FROM_ENV_CONTEXT,
     AppInitializationComplete,
     LibraryDependencyInstallBehavior,
     LibraryDownload,
@@ -105,6 +107,30 @@ class TestThreadStorageBackend:
 
     def test_default_is_local(self) -> None:
         assert Settings().thread_storage_backend == "local"
+
+
+class TestMaxWorkflowRecursionDepth:
+    """The recursion limit defaults to 10 and cannot be set below 1."""
+
+    def test_default_is_ten(self) -> None:
+        assert Settings().max_workflow_recursion_depth == 10  # noqa: PLR2004
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_values_below_one_from_a_file_become_one(self, value: int, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger=settings_module.logger.name):
+            result = Settings.model_validate({"max_workflow_recursion_depth": value})
+
+        assert result.max_workflow_recursion_depth == 1
+        assert "below its minimum of 1" in caplog.text
+
+    @pytest.mark.parametrize("value", [0, -1, "0", "-1"])
+    def test_values_below_one_from_env_are_rejected(self, value: int | str) -> None:
+        with pytest.raises(ValidationError):
+            Settings.model_validate({"max_workflow_recursion_depth": value}, context={FROM_ENV_CONTEXT: True})
+
+    @pytest.mark.parametrize("value", [1, 500])
+    def test_valid_values_pass_unchanged(self, value: int) -> None:
+        assert Settings.model_validate({"max_workflow_recursion_depth": value}).max_workflow_recursion_depth == value
 
 
 class TestLibraryDependencyInstallBehavior:

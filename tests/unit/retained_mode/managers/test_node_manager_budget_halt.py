@@ -12,7 +12,9 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from griptape_nodes.exe_types.workflow_node_errors import NestedWorkflowNodeError
 from griptape_nodes.retained_mode.events.event_converter import converter
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.utils.budget_refusal import (
     BUDGET_HALT_PREFIX,
@@ -105,3 +107,56 @@ class TestExecutionFailureNamesTheRefusedNode:
 
         assert failure.exception is error
         assert str(failure.result_details) == "Attempted to execute node 'Blur'. Failed with error: the image was empty"
+
+
+class TestHaltDeepInsideNestedWorkflowNodes:
+    """A halt under Workflow nodes still stops the run, and the failure keeps the path to the refused node."""
+
+    @pytest.fixture
+    def halt(self) -> BudgetExceededError:
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        return BudgetExceededError(describe(refusal, node_name="Spender"), refusal, node_name="Spender")
+
+    @pytest.fixture
+    def nested(self, halt: BudgetExceededError) -> NestedWorkflowNodeError:
+        root = NodeErrorDetails(message=str(halt), exception_type="builtins.RuntimeError")
+        error = NestedWorkflowNodeError("Middle", root_details=root, node_path=["Inner", "Spender"], root_cause=halt)
+        error.__cause__ = halt
+        return error
+
+    def test_the_halt_is_still_what_the_run_reports(
+        self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
+    ) -> None:
+        failure = _node_manager()._execution_failure(nested, "Outer")
+
+        assert str(failure.result_details) == str(halt)
+        assert str(failure.result_details).startswith(BUDGET_HALT_PREFIX)
+
+    def test_the_nested_failure_travels_up_so_the_next_level_extends_its_path(
+        self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
+    ) -> None:
+        failure = _node_manager()._execution_failure(nested, "Outer")
+
+        assert failure.exception is nested
+        assert nested.__cause__ is halt
+
+    def test_the_path_to_the_refused_node_is_attached_without_rewording_the_halt(
+        self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
+    ) -> None:
+        failure = _node_manager()._execution_failure(nested, "Outer")
+
+        assert failure.error is not None
+        assert failure.error.message == str(halt)
+        assert failure.error.fields == {
+            "Failed node path": NestedWorkflowNodeError.PATH_SEPARATOR.join(["Inner", "Spender"])
+        }
+
+    def test_a_halt_not_under_a_workflow_node_is_reported_as_before(self, halt: BudgetExceededError) -> None:
+        wrapped = RuntimeError("the subflow failed")
+        wrapped.__cause__ = halt
+
+        failure = _node_manager()._execution_failure(wrapped, "Group")
+
+        assert failure.exception is halt
+        assert failure.error is None

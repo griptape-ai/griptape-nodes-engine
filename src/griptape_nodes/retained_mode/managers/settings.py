@@ -25,6 +25,8 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+MAX_WORKFLOW_RECURSION_DEPTH_KEY = "max_workflow_recursion_depth"
+DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH = 10
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
 # agrees on both the key and what a missing value means.
@@ -696,6 +698,38 @@ class Settings(BaseModel):
         default=5,
         description="Maximum number of nodes executing at a time for parallel execution.",
     )
+    max_workflow_recursion_depth: int = Field(
+        category=EXECUTION,
+        default=DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
+        ge=1,
+        description=(
+            "How many times a workflow can run inside itself through its own Workflow node before the "
+            "engine stops it. Each level runs a full copy of the workflow. Values below 1 in a config file are treated as 1."
+        ),
+    )
+
+    @field_validator("max_workflow_recursion_depth", mode="before")
+    @classmethod
+    def validate_max_workflow_recursion_depth(cls, v: Any, info: ValidationInfo) -> Any:
+        """Treat an integer below 1 from a config file as 1, so it cannot reset the whole config.
+
+        From a GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH variable the value is left alone, so the
+        minimum rejects it and the env loader reports the variable and ignores it.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if from_env:
+            return v
+        if isinstance(v, bool) or not isinstance(v, int):
+            return v
+        if v >= 1:
+            return v
+        _warn_once(
+            (MAX_WORKFLOW_RECURSION_DEPTH_KEY, repr(v)),
+            f"{MAX_WORKFLOW_RECURSION_DEPTH_KEY} is {v!r}, below its minimum of 1. "
+            "Using 1, so a workflow can run inside itself only once.",
+        )
+        return 1
+
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,

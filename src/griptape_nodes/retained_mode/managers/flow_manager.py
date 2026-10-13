@@ -314,6 +314,7 @@ class DeserializedFlowNodes:
 class FlowManager(EngineScoped):
     _name_to_parent_name: dict[str, str | None]
     _flow_to_referenced_workflow_name: dict[ControlFlow, str]
+    _iteration_flow_to_owner_flow_name: dict[str, str]
     _connections: Connections
 
     # Global execution state (moved from individual ControlFlows)
@@ -329,6 +330,7 @@ class FlowManager(EngineScoped):
 
         self._name_to_parent_name = {}
         self._flow_to_referenced_workflow_name = {}
+        self._iteration_flow_to_owner_flow_name = {}
         self._connections = Connections()
 
         # Initialize global execution state
@@ -450,6 +452,25 @@ class FlowManager(EngineScoped):
             return self._name_to_parent_name[flow_name]
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
+
+    def get_enclosing_flow(self, flow_name: str) -> str | None:
+        """Return the flow that `flow_name` runs inside, for walking upward through nested runs.
+
+        That is the flow of the loop that owns it when it is a loop iteration flow whose owner still
+        exists, otherwise its parent.
+        """
+        owner = self._iteration_flow_to_owner_flow_name.get(flow_name)
+        if owner is not None and owner in self._name_to_parent_name:
+            return owner
+        return self.get_parent_flow(flow_name)
+
+    def record_iteration_flow_owner(self, iteration_flow_name: str, owner_flow_name: str) -> None:
+        """Remember which flow holds the loop that runs `iteration_flow_name`.
+
+        Iteration flows are parented to whatever flow was current when they were created, which says
+        nothing about the loop that runs them; this records that instead. Held in memory only.
+        """
+        self._iteration_flow_to_owner_flow_name[iteration_flow_name] = owner_flow_name
 
     def reparent_flow(self, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
@@ -790,6 +811,12 @@ class FlowManager(EngineScoped):
             # Clean up referenced workflow tracking
             if flow in self._flow_to_referenced_workflow_name:
                 del self._flow_to_referenced_workflow_name[flow]
+            self._iteration_flow_to_owner_flow_name.pop(flow.name, None)
+            self._iteration_flow_to_owner_flow_name = {
+                iteration_flow: owner
+                for iteration_flow, owner in self._iteration_flow_to_owner_flow_name.items()
+                if owner != flow.name
+            }
 
             # Clean up ControlFlowMachine and DAG orchestrator only if this is the global flow.
             # Isolated subflows have their own machines and should not clear the global state.
@@ -910,6 +937,16 @@ class FlowManager(EngineScoped):
         for flow_name, parent_name in self._name_to_parent_name.items():
             if parent_name == old_name:
                 self._name_to_parent_name[flow_name] = new_name
+
+        # The same name may be recorded as an iteration flow, or as the owner of one.
+        renamed_owners: dict[str, str] = {}
+        for iteration_flow, owner in self._iteration_flow_to_owner_flow_name.items():
+            if iteration_flow == old_name:
+                iteration_flow = new_name  # noqa: PLW2901
+            if owner == old_name:
+                owner = new_name  # noqa: PLW2901
+            renamed_owners[iteration_flow] = owner
+        self._iteration_flow_to_owner_flow_name = renamed_owners
 
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
@@ -3131,7 +3168,10 @@ class FlowManager(EngineScoped):
         if subflow_machine.resolution_machine.is_errored():
             error_message = subflow_machine.resolution_machine.get_error_message()
             # Pass through the error message directly without wrapping
-            return StartLocalSubflowResultFailure(result_details=error_message or "Subflow errored during execution")
+            return StartLocalSubflowResultFailure(
+                result_details=error_message or "Subflow errored during execution",
+                exception=subflow_machine.resolution_machine.take_error_exception(),
+            )
 
         return StartLocalSubflowResultSuccess(result_details=f"Successfully executed local subflow '{flow_name}'")
 

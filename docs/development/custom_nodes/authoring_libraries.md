@@ -167,6 +167,11 @@ the node's input values onto the Start Flow nodes, runs it, and copies the End F
 as the node's outputs. The subflow is reused for later runs in the same session and is never written
 into a saved workflow, so your users' files carry the node, not a copy of the workflow behind it.
 
+A workflow may contain a Workflow node that points back to itself, directly or through another
+workflow. It only recurses when that node actually runs, so put it behind a branch that stops the
+recursion. Beyond `max_workflow_recursion_depth` levels the run fails. See
+[Workflow Node Recursion Depth](../../guides/configuration.md#workflow-node-recursion-depth-max_workflow_recursion_depth).
+
 **Save the workflow from the editor before shipping it.** The parameter shape is read out of the
 metadata header at the top of the workflow file, which the editor writes on save. A workflow with no
 saved shape (no Start Flow and End Flow nodes, or a hand-written file with no header) is reported as

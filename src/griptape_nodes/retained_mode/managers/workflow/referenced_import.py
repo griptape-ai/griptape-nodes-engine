@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import NODE_GROUP_FLOW
+from griptape_nodes.exe_types.workflow_node_errors import WorkflowRecursionLimitError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -17,6 +19,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.settings import MAX_WORKFLOW_RECURSION_DEPTH_KEY
 from griptape_nodes.retained_mode.managers.workflow.loading import is_loading_workflow
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -103,33 +106,70 @@ class ReferencedWorkflowImport(EngineScoped):
                 details = f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. Failed because target flow does not exist"
                 return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        # Refuse when the target flow is already inside an import of this workflow. That is how a
-        # Workflow node pointing back at its own workflow, directly or through other workflows,
-        # shows up at run time; allowing it would re-run the workflow's file forever.
+        # Refuse when this workflow already appears inside itself as deep as the recursion limit
+        # allows. That is how a Workflow node pointing back at its own workflow, directly or through
+        # other workflows, shows up at run time; without a limit it would re-run the file forever.
         if flow_name is None:
             flow_name = self.engine.context_manager.get_current_flow().name
-        if self._is_flow_inside_import_of(flow_name, request.workflow_name):
+        return self._validate_recursion_depth(flow_name, request.workflow_name)
+
+    def _validate_recursion_depth(self, flow_name: str, workflow_name: str) -> ResultPayload | None:
+        """Return a failure when importing `workflow_name` into `flow_name` would nest it too deeply."""
+        depth = self._count_enclosing_imports_of(flow_name, workflow_name)
+        limit = self.engine.config_manager.max_workflow_recursion_depth
+        if depth > limit:
+            if limit == 1:
+                level_word = "level"
+            else:
+                level_word = "levels"
             details = (
-                f"Attempted to import workflow '{request.workflow_name}' into flow '{flow_name}'. "
-                f"Failed because '{request.workflow_name}' contains itself: a Workflow node inside it "
-                "points back to it, directly or through another workflow. Change that Workflow node to a "
-                "different workflow."
+                f"Attempted to import workflow '{workflow_name}' into flow '{flow_name}'. "
+                f"Failed because '{workflow_name}' contains itself more than {limit} {level_word} deep, "
+                f"the limit set by the `{MAX_WORKFLOW_RECURSION_DEPTH_KEY}` setting. A Workflow node inside it "
+                "keeps pointing back to it, directly or through another workflow. Make sure the recursion "
+                "stops, or raise the setting."
             )
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=details, exception=WorkflowRecursionLimitError(details)
+            )
 
         return None
 
-    def _is_flow_inside_import_of(self, flow_name: str, workflow_name: str) -> bool:
-        """Whether `flow_name`, or any flow above it, was created by importing `workflow_name`."""
+    def _count_enclosing_imports_of(self, flow_name: str, workflow_name: str) -> int:
+        """Count the copies of `workflow_name` that `flow_name` is already inside.
+
+        That is the flows from `flow_name` up through the flows enclosing it that were created by
+        importing the workflow, plus one when it is also the workflow that was opened at the top level.
+        Group subflows are skipped: the Workflow node they hold is what nests, not the group.
+        """
         flow_manager = self.engine.flow_manager
         object_manager = self.engine.object_manager
+        count = 0
+        seen: set[str] = set()
         current: str | None = flow_name
-        while current is not None:
+        while current is not None and current not in seen:
+            seen.add(current)
             flow = object_manager.attempt_get_object_by_name_as_type(current, ControlFlow)
-            if flow is not None and flow_manager.get_referenced_workflow_name(flow) == workflow_name:
-                return True
-            current = flow_manager.get_parent_flow(current)
-        return False
+            if (
+                flow is not None
+                and flow.metadata.get("flow_type") != NODE_GROUP_FLOW
+                and flow_manager.get_referenced_workflow_name(flow) == workflow_name
+            ):
+                count += 1
+            current = flow_manager.get_enclosing_flow(current)
+        if self._is_opened_workflow(workflow_name):
+            count += 1
+        return count
+
+    def _is_opened_workflow(self, workflow_name: str) -> bool:
+        """Whether `workflow_name` is the workflow opened at the top level.
+
+        The opened workflow's own top flow is never tagged as an import, so it is counted separately.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return False
+        return context_manager.get_current_workflow_name() == workflow_name
 
     def _get_workflow_by_name(self, workflow_name: str) -> Workflow:
         """Get workflow by name from the registry."""

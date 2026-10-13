@@ -14,6 +14,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
@@ -58,6 +59,13 @@ def _node_error_details(node_name: str, exc: BaseException) -> NodeErrorDetails:
     return build_node_error_details(node_name, exc)
 
 
+def _exception_behind(exc: BaseException) -> BaseException:
+    """The exception the node itself raised, or `exc` when the failure never came from one."""
+    if isinstance(exc, ExecuteNodeFailedError) and exc.__cause__ is not None:
+        return exc.__cause__
+    return exc
+
+
 class NodeStatesResult(NamedTuple):
     """Result of building node states from the DAG networks.
 
@@ -74,6 +82,11 @@ class ParallelResolutionContext(EngineScoped):
     paused: bool
     flow_name: str
     error_message: str | None
+    # The first node to fail in this run, the details of its failure and the exception it raised, set and
+    # reset with error_message.
+    error_node_name: str | None
+    error_details: NodeErrorDetails | None
+    error_exception: BaseException | None
     workflow_state: WorkflowState
     # Execution fields
     max_nodes_in_parallel: int
@@ -96,6 +109,9 @@ class ParallelResolutionContext(EngineScoped):
         self.flow_name = flow_name
         self.paused = False
         self.error_message = None
+        self.error_node_name = None
+        self.error_details = None
+        self.error_exception = None
         self.workflow_state = WorkflowState.NO_ERROR
         self.dag_builder = dag_builder
         self.last_resolved_node = None
@@ -136,6 +152,27 @@ class ParallelResolutionContext(EngineScoped):
         """
         return self.generation != generation
 
+    def record_error(
+        self,
+        message: str,
+        *,
+        node_name: str | None = None,
+        details: NodeErrorDetails | None = None,
+        exception: BaseException | None = None,
+    ) -> None:
+        """Record why the run failed, with the failing node, its details and its exception when known.
+
+        The exception is only kept for an isolated subflow run, whose caller takes it. The top-level run
+        has no taker, and a kept exception would hold its traceback frames until the next reset.
+        """
+        self.error_message = message
+        self.error_node_name = node_name
+        self.error_details = details
+        if self.is_isolated_run():
+            self.error_exception = exception
+        else:
+            self.error_exception = None
+
     def signal_new_work(self) -> None:
         """Announce that this run's priority queue changed, unparking the driver.
 
@@ -166,6 +203,9 @@ class ParallelResolutionContext(EngineScoped):
         else:
             self.workflow_state = WorkflowState.NO_ERROR
             self.error_message = None
+            self.error_node_name = None
+            self.error_details = None
+            self.error_exception = None
             self.last_resolved_node = None
 
         # Both paths: an abandoning driver no longer drains this, and a leftover
@@ -189,6 +229,11 @@ class ParallelResolutionContext(EngineScoped):
         # Clear DAG builder state to allow re-adding nodes on subsequent runs
         if self.dag_builder:
             self.dag_builder.clear()
+
+    def is_isolated_run(self) -> bool:
+        """Whether this run uses its own DAG rather than the global one."""
+        global_dag_builder = self.engine.flow_manager.global_dag_builder
+        return self.dag_builder is not global_dag_builder
 
 
 class ExecuteDagState(State):
@@ -372,7 +417,7 @@ class ExecuteDagState(State):
         if network is None:
             msg = f"Network {network_name} not found in DAG builder"
             raise ValueError(msg)
-        is_isolated = context.dag_builder is not flow_manager.global_dag_builder
+        is_isolated = context.is_isolated_run()
         if flow_manager.global_single_node_resolution and not is_isolated:
             # Clean up nodes from emptied graphs in single node resolution mode
             if len(network) == 0 and context.dag_builder is not None:
@@ -695,13 +740,14 @@ class ExecuteDagState(State):
                 context.running_tasks_count -= 1  # Decrement on error
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
                 error_node_name = node_reference.node_reference.name
+                error_details = _node_error_details(error_node_name, e)
                 await context.engine.event_manager.aput_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(
                             payload=NodeErrorEvent(
                                 node_name=error_node_name,
                                 error_message=str(e),
-                                error=_node_error_details(error_node_name, e),
+                                error=error_details,
                             )
                         )
                     )
@@ -709,7 +755,12 @@ class ExecuteDagState(State):
                 if context.was_reset_since(generation):
                     ExecuteDagState._log_abandoned(context)
                     return None
-                context.error_message = f"Parameter passthrough failed for node '{error_node_name}': {e}"
+                context.record_error(
+                    f"Parameter passthrough failed for node '{error_node_name}': {e}",
+                    node_name=error_node_name,
+                    details=error_details,
+                    exception=e,
+                )
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
 
@@ -726,13 +777,14 @@ class ExecuteDagState(State):
                 validation_node_name = node_reference.node_reference.name
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
                 logger.error("Canceling flow run. %s", msg)
+                validation_details = build_node_error_details(validation_node_name, exceptions)
                 await context.engine.event_manager.aput_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(
                             payload=NodeErrorEvent(
                                 node_name=validation_node_name,
                                 error_message=str(exceptions),
-                                error=build_node_error_details(validation_node_name, exceptions),
+                                error=validation_details,
                             )
                         )
                     )
@@ -740,7 +792,7 @@ class ExecuteDagState(State):
                 if context.was_reset_since(generation):
                     ExecuteDagState._log_abandoned(context)
                     return None
-                context.error_message = msg
+                context.record_error(msg, node_name=validation_node_name, details=validation_details)
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
 
@@ -757,7 +809,7 @@ class ExecuteDagState(State):
                         f"Cannot have a Start Loop Node without an End Loop Node: {node_reference.node_reference.name}"
                     )
                     logger.error(msg)
-                    context.error_message = msg
+                    context.record_error(msg)
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
                 # We're going to skip straight to the end node here instead.
@@ -861,13 +913,14 @@ class ExecuteDagState(State):
                     else:
                         msg = f"Node '{node_name}' encountered a problem: {exc}"
 
+                    error_details = _node_error_details(node_name, exc)
                     await context.engine.event_manager.aput_event(
                         ExecutionGriptapeNodeEvent(
                             wrapped_event=ExecutionEvent(
                                 payload=NodeErrorEvent(
                                     node_name=node_name,
                                     error_message=str(exc),
-                                    error=_node_error_details(node_name, exc),
+                                    error=error_details,
                                     run_seconds=dag_node.run_seconds,
                                 )
                             )
@@ -876,7 +929,11 @@ class ExecuteDagState(State):
                     if context.was_reset_since(generation):
                         ExecuteDagState._log_abandoned(context)
                         return None
-                    context.error_message = msg
+                    # The loop returns here, so the failure kept is the first one this loop reaches among
+                    # the finished tasks, not necessarily the earliest to fail.
+                    context.record_error(
+                        msg, node_name=node_name, details=error_details, exception=_exception_behind(exc)
+                    )
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
 
@@ -1141,3 +1198,16 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
 
     def get_error_message(self) -> str | None:
         return self._context.error_message
+
+    def take_error_exception(self) -> SubflowNodeFailedError | None:
+        """Hand over the first failing node and what it raised, once, or None when the failure names no node.
+
+        The raised exception is let go of here: it holds its traceback frames, and the details recorded
+        beside it are all the run needs afterwards.
+        """
+        context = self._context
+        if context.error_node_name is None or context.error_details is None:
+            return None
+        cause = context.error_exception
+        context.error_exception = None
+        return SubflowNodeFailedError(context.error_node_name, context.error_details, cause)

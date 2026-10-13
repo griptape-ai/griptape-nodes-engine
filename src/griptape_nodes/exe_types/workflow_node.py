@@ -20,11 +20,18 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 from griptape_nodes.exe_types.core_types import WORKFLOW_NODE_KEY, Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
+from griptape_nodes.exe_types.workflow_node_errors import (
+    NestedWorkflowNodeError,
+    SubflowNodeFailedError,
+    WorkflowRecursionLimitError,
+    next_failure_link,
+)
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity_preserving_symlinks,
     derive_registry_key,
     relative_to_keeping_or_following_links,
 )
+from griptape_nodes.retained_mode.events.base_events import ResultPayload, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
     StartLocalSubflowResultSuccess,
@@ -34,6 +41,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     ImportWorkflowAsReferencedSubFlowRequest,
 )
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import GetFlowForNodeRequest, GetFlowForNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -347,6 +355,9 @@ class WorkflowNode(ControlNode):
 
         result = await self.engine.ahandle_request(StartLocalSubflowRequest(flow_name=subflow_name))
         if not isinstance(result, StartLocalSubflowResultSuccess):
+            nested = self._nested_subflow_failure(_failure_exception(result))
+            if nested is not None:
+                raise nested from nested.root_cause
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
                 f"Failed because the workflow did not finish: {result.result_details}"
@@ -354,6 +365,34 @@ class WorkflowNode(ControlNode):
             raise RuntimeError(msg)  # noqa: TRY004 - the workflow failed at run time; this is not a type error
 
         self._collect_outputs(subflow_name, live_routes)
+
+    def _nested_subflow_failure(self, failure: Exception | None) -> NestedWorkflowNodeError | None:
+        """Describe a failed subflow as one nested failure, or None when it can only be reported as text.
+
+        A group or loop between this node and the failing one re-raises the failure it was handed, so
+        the walk follows the cause chain through them: each adds its name to the path, and the root
+        message is kept once from the innermost failure.
+        """
+        if not isinstance(failure, SubflowNodeFailedError):
+            return None
+        node_path = [failure.node_name]
+        innermost = failure
+        link = next_failure_link(failure.cause)
+        while isinstance(link, SubflowNodeFailedError):
+            node_path.append(link.node_name)
+            innermost = link
+            link = next_failure_link(link.cause)
+        if isinstance(link, NestedWorkflowNodeError):
+            return NestedWorkflowNodeError(
+                self.name,
+                root_details=link.root_details,
+                node_path=[*node_path, *link.node_path],
+                root_cause=link.root_cause,
+                workflow_depth=link.workflow_depth + link.workflow_nodes_containing_failure(),
+            )
+        return NestedWorkflowNodeError(
+            self.name, root_details=innermost.details, node_path=node_path, root_cause=innermost.cause
+        )
 
     def _publish_workflow_registry_key(self) -> None:
         """Register the backing workflow and record its key so the editor can preview it.
@@ -407,6 +446,14 @@ class WorkflowNode(ControlNode):
             )
         )
         if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            refusal = _failure_exception(import_result)
+            if isinstance(refusal, WorkflowRecursionLimitError):
+                raise NestedWorkflowNodeError(
+                    self.name,
+                    root_details=build_node_error_details(self.name, refusal),
+                    node_path=[],
+                    root_cause=refusal,
+                ) from refusal
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
                 f"Failed because the workflow could not be loaded: {import_result.result_details}"
@@ -617,6 +664,12 @@ def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeS
         allowed_modes=allowed_modes,
         ui_options=definition.get("ui_options"),
     )
+
+
+def _failure_exception(result: ResultPayload) -> Exception | None:
+    if isinstance(result, ResultPayloadFailure):
+        return result.exception
+    return None
 
 
 def _get_flow_or_none(engine: Engine, flow_name: str) -> ControlFlow | None:

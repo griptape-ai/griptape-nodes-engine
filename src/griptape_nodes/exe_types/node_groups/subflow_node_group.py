@@ -1342,9 +1342,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             if isinstance(result, StartLocalSubflowResultFailure):
                 # Clear partial outputs to prevent inconsistent state
                 self.parameter_output_values.clear()
-                # Re-raise the error message directly without wrapping
+                # Re-raise the error message directly without wrapping. The failure behind it rides
+                # along as the cause, so a Workflow node above can name this group in its path and
+                # report the root failure once instead of embedding this text.
                 msg = result.result_details
-                raise RuntimeError(msg)
+                raise RuntimeError(msg) from result.exception
 
         self._propagate_output_values_from_internal_nodes()
 

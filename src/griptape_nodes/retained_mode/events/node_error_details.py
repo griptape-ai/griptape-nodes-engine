@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
+from griptape_nodes.exe_types.workflow_node_errors import NestedWorkflowNodeError
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -77,6 +78,8 @@ def build_node_error_details(node_name: str, error: BaseException | list[Excepti
     """
     if isinstance(error, list):
         return _from_validation(node_name, error)
+    if isinstance(error, NestedWorkflowNodeError):
+        return _from_nested_workflow_failure(node_name, error)
     return _from_exception(node_name, error)
 
 
@@ -145,6 +148,17 @@ def _from_exception(node_name: str, exc: BaseException) -> NodeErrorDetails:
     details.fields = attachments.fields
     details.response = attachments.response
     details.links = attachments.links
+    return details
+
+
+def _from_nested_workflow_failure(node_name: str, nested: NestedWorkflowNodeError) -> NodeErrorDetails:
+    """Describe a Workflow node's failure by the node that failed inside it, not by the wrapper type.
+
+    The root's validation `messages` are left off: their presence tells the editor the node never ran,
+    which is false for the Workflow node, whose inner workflow did run.
+    """
+    details = _from_exception(node_name, nested)
+    details.exception_type = nested.root_details.exception_type
     return details
 
 

@@ -60,6 +60,7 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.exe_types.workflow_node_errors import NestedWorkflowNodeError
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
@@ -3783,6 +3784,8 @@ class NodeManager(EngineScoped):
     def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
         budget_halt = self._budget_halt_for(exc, node_name)
+        if isinstance(exc, NestedWorkflowNodeError) and budget_halt is not None:
+            return self._nested_budget_halt_failure(exc, budget_halt)
         if budget_halt is not None:
             # The engine words the halt, so it carries no node-built details.
             return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
@@ -3793,6 +3796,18 @@ class NodeManager(EngineScoped):
             exception=exc,
             error=build_node_error_details(node_name, exc),
         )
+
+    def _nested_budget_halt_failure(
+        self, nested: NestedWorkflowNodeError, budget_halt: BudgetExceededError
+    ) -> ExecuteNodeResultFailure:
+        """Report a halt found under Workflow nodes as the halt, still carrying the path to the refused node.
+
+        The run reports the halt's own wording, so it stops exactly as a halt at the top level does. The
+        nested failure stays the exception, so a Workflow node above adds itself to the path instead of
+        starting a new one, and the path field names how deep the refused node was.
+        """
+        details = dataclasses.replace(nested.root_details, message=str(budget_halt), fields=dict(nested.fields))
+        return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=nested, error=details)
 
     def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
         """Return the halt for a node whose call Griptape Cloud refused over budget, or None.
