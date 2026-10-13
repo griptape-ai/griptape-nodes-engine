@@ -53,7 +53,11 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
-from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
+from griptape_nodes.retained_mode.managers.os_manager import (
+    MAX_INDEXED_CANDIDATES,
+    OSManager,
+    StagingFailedError,
+)
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
@@ -1334,6 +1338,21 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
         assert not (outputs_dir / "render_v001.png").exists()
         assert not (outputs_dir / "render_v002.png").exists()
 
+    def test_walk_scans_coerced_suffix_past_existing_saves(self, outputs_dir: Path) -> None:
+        """More than MAX_INDEXED_CANDIDATES coerced saves must not exhaust the walk.
+
+        The walk writes ``.jpg``, so its start-index scan must look for ``.jpg`` files, not
+        the template's ``.png``.
+        """
+        for i in range(1, MAX_INDEXED_CANDIDATES + 2):
+            (outputs_dir / f"render_v{i:03}.jpg").write_bytes(b"taken")
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        payload = _jpeg_bytes()
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(payload)
+
+        assert (outputs_dir / f"render_v{MAX_INDEXED_CANDIDATES + 2:03}.jpg").read_bytes() == payload
+
     def test_plain_path_create_new_with_mismatched_bytes_does_not_clobber(
         self, engine: Engine, outputs_dir: Path
     ) -> None:
@@ -1912,8 +1931,6 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         Defensive contract: rather than busy-loop forever, the candidate loop gives up
         and the caller sees a real error.
         """
-        from griptape_nodes.retained_mode.managers.os_manager import MAX_INDEXED_CANDIDATES
-
         # Pre-create v001..vMAX so every candidate the walk tries is taken. The walk
         # starts at 2 (the seed already tried 1 and saw it exist), so we need
         # MAX_INDEXED_CANDIDATES + 1 files to fully exhaust.
@@ -1922,7 +1939,16 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
 
         macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-        with pytest.raises(FileWriteError) as excinfo:
+        # Blind the start-index scan so the walk probes every taken candidate, as it would
+        # when racers keep claiming the slots the scan reported free.
+        with (
+            patch.object(
+                OSManager,
+                "_find_walk_start_index",
+                side_effect=lambda _macro_path, _index_var, floor, _swapped_ext: floor,
+            ),
+            pytest.raises(FileWriteError) as excinfo,
+        ):
             FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
                 b"should not land"
             )
@@ -1935,6 +1961,49 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         survivors = sorted(p.name for p in outputs_dir.iterdir())
         expected = sorted(f"render_v{i:03}.png" for i in range(1, MAX_INDEXED_CANDIDATES + 2))
         assert survivors == expected, f"Unexpected files: {set(survivors) - set(expected)}"
+
+    @pytest.mark.parametrize(
+        ("macro_path", "existing_names", "expected_name"),
+        [
+            pytest.param(
+                MacroPath(
+                    ParsedMacro(
+                        "{outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}"
+                    ),
+                    {"file_name_base": "text_image", "file_extension": "png"},
+                ),
+                # `{file_extension_directory?:/}` resolves to `images/` for a png.
+                [f"images/text_image_v{i:03}.png" for i in range(1, MAX_INDEXED_CANDIDATES + 2)],
+                f"images/text_image_v{MAX_INDEXED_CANDIDATES + 2:03}.png",
+                id="seeded-required-slot",
+            ),
+            pytest.param(
+                MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {}),
+                ["file.png", *(f"file{i:03}.png" for i in range(1, MAX_INDEXED_CANDIDATES + 1))],
+                f"file{MAX_INDEXED_CANDIDATES + 1:03}.png",
+                id="optional-slot",
+            ),
+            pytest.param(
+                MacroPath(ParsedMacro("{outputs}/file{###?:^_v}.png"), {"_index": 7}),
+                # The free v003 sits below the walk's start of v008, so the walk must not use it.
+                [f"file_v{i:03}.png" for i in range(1, MAX_INDEXED_CANDIDATES + 9) if i != 3],  # noqa: PLR2004
+                f"file_v{MAX_INDEXED_CANDIDATES + 9:03}.png",
+                id="bound-slot-with-gap-below",
+            ),
+        ],
+    )
+    def test_walk_starts_past_existing_files(
+        self, outputs_dir: Path, macro_path: MacroPath, existing_names: list[str], expected_name: str
+    ) -> None:
+        """More than MAX_INDEXED_CANDIDATES prior saves under one base name must not exhaust the walk."""
+        for name in existing_names:
+            existing_path = outputs_dir / name
+            existing_path.parent.mkdir(parents=True, exist_ok=True)
+            existing_path.write_bytes(b"taken")
+
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(b"new")
+
+        assert (outputs_dir / expected_name).read_bytes() == b"new"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific path stressors")
