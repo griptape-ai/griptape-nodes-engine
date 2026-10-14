@@ -5,6 +5,7 @@ import pytest
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.clamp import Clamp
 from griptape_nodes.traits.color_picker import ColorPicker
+from griptape_nodes.traits.date_picker import DatePicker
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
 from griptape_nodes.traits.minmax import MinMax
 from griptape_nodes.traits.multi_options import MultiOptions
@@ -21,6 +22,10 @@ from griptape_nodes.traits.widget import Widget
         (Clamp(min_val=1, max_val=9), {"min_val": 1, "max_val": 9}),
         (MinMax(min_val=1, max_val=9), {"min_val": 1, "max_val": 9}),
         (ColorPicker(format="rgb"), {"format": "rgb"}),
+        (
+            DatePicker(include_time=True, max="2026-12-31T23:59"),
+            {"include_time": True, "min": None, "max": "2026-12-31T23:59"},
+        ),
         (
             Options(choices=["a"], show_search=False, search_filter="x", allow_custom=True),
             {"choices": ["a"], "show_search": False, "search_filter": "x", "allow_custom": True},
