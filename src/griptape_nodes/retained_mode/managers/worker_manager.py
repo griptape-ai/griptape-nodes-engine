@@ -635,7 +635,20 @@ class WorkerManager(EngineScoped):
         await self._stop_workers(library_names={library_name}, action="reset")
         self.note_worker_unavailable(library_name, "its worker process was stopped while the library is being reset.")
 
-    async def _stop_workers(self, *, library_names: set[str] | None, action: str) -> None:
+    async def stop_general_purpose_worker(self, reason: str) -> None:
+        """Terminate the general-purpose worker and forget it, leaving every library worker running.
+
+        A spawn already under way is waited out first and its process stopped with the rest, so once
+        this returns no general-purpose worker is running or about to start. Anything waiting on it is
+        released with the reason.
+        """
+        claim = self._spawns_in_flight.get(None)
+        if claim is not None:
+            await claim.wait()
+        await self._stop_workers(library_names={None}, action="restart")
+        self.note_worker_unavailable(None, reason)
+
+    async def _stop_workers(self, *, library_names: set[str | None] | None, action: str) -> None:
         """Terminate the named libraries' workers (every worker when None) and forget them.
 
         Anything awaiting one of them is failed with the reason, and its response topic is
@@ -690,7 +703,7 @@ class WorkerManager(EngineScoped):
         for wid in worker_ids:
             self._workers.pop(wid, None)
 
-    def _withdraw_spawn_requests(self, *, library_names: set[str] | None, action: str) -> None:
+    def _withdraw_spawn_requests(self, *, library_names: set[str | None] | None, action: str) -> None:
         """Forget the named libraries' spawn requests (every library's when None), so a later one is honored.
 
         A spawn that has not begun is cancelled, or it would start a worker after the stop, and a run

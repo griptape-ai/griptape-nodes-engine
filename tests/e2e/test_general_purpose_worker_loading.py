@@ -12,7 +12,7 @@ import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
+    UnloadLibraryFromRegistryRequest,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.utils.version_utils import engine_version
@@ -93,3 +94,19 @@ def test_a_library_worker_still_reports_the_library_it_serves(tmp_path: Path) ->
 
     report.assert_awaited_once()
     assert report.call_args.args[0].library_name == "Dedicated Echo"
+
+
+def test_registering_and_unloading_a_library_here_records_the_change(tmp_path: Path) -> None:
+    """Every way a library changes mid-session ends in one of these two requests, so they are where it is noted."""
+    library_manager = current_engine().library_manager
+    library_manager._is_worker = False
+    note = MagicMock()
+
+    with patch.object(library_manager.workers, "note_library_set_changed", note):
+        _register_echo_library(tmp_path, "Changing Echo")
+        registered = note.call_count
+        result = current_engine().handle_request(UnloadLibraryFromRegistryRequest(library_name="Changing Echo"))
+
+    assert result.succeeded(), result
+    assert registered == 1
+    assert note.call_count == 2  # noqa: PLR2004 (once for the register, once for the unload)

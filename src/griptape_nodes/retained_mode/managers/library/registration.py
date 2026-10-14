@@ -152,6 +152,7 @@ class LibraryRegistrar(EngineScoped):
         # FAILURE CHECK
         if isinstance(progression_result, RegisterLibraryFromFileResultFailure):
             return progression_result
+        self.engine.library_manager.workers.note_library_set_changed()
 
         # Phase 3: Return appropriate result based on fitness
         # At this point, library_name must be set (it's set during METADATA_LOADED phase)
@@ -275,6 +276,7 @@ class LibraryRegistrar(EngineScoped):
         except Exception as e:
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
+        self.engine.library_manager.workers.note_library_set_changed()
 
         # Release anything this library was holding in THIS process, so it cannot come back holding
         # objects its previous code built.

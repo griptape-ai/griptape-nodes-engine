@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -64,6 +65,12 @@ class LibraryWorkers(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         event_manager.register_request_handlers(self)
+        # Counts the libraries registered and unloaded in this process. The general-purpose worker loads
+        # every library once, when it starts, so the count it started at says whether it still has the
+        # libraries this process has.
+        self._library_set_generation = 0
+        self._general_purpose_worker_generation: int | None = None
+        self._general_purpose_restart: asyncio.Task | None = None
 
     def register_library_load_reporter(
         self,
@@ -375,4 +382,57 @@ class LibraryWorkers(EngineScoped):
         """
         if not is_beta_enabled(PRIVATE_EXECUTION_IN_WORKER, self.engine.config_manager):
             return
+        worker_manager = self.engine.library_manager._worker_manager
+        # Recorded only for a request WorkerManager will accept: a worker already starting or running
+        # loaded the libraries of its own start, and recording now would pass a stale one as current.
+        if worker_manager.is_worker_running_or_starting(None):
+            return
+        self._general_purpose_worker_generation = self._library_set_generation
         await self.engine.ahandle_request(StartWorkerRequest(library_name=None))
+
+    def note_library_set_changed(self) -> None:
+        """Record that a library was registered or unloaded here, and restart a general-purpose worker it leaves behind.
+
+        Nothing tells a worker that one library changed. A full reload restarts every worker, but updating a
+        library, switching its ref, resetting it, refreshing the sandbox, or adding one mid-session does not,
+        and the general-purpose worker would keep running the libraries it started with.
+        """
+        self._library_set_generation += 1
+        if self.engine.library_manager.is_worker:
+            return
+        if self._general_purpose_restart is not None and not self._general_purpose_restart.done():
+            return
+        if not self.engine.library_manager._worker_manager.is_worker_running_or_starting(None):
+            return
+        self._general_purpose_restart = asyncio.get_running_loop().create_task(
+            self._restart_stale_general_purpose_worker()
+        )
+        self._general_purpose_restart.add_done_callback(self._log_general_purpose_restart_error)
+
+    async def _restart_stale_general_purpose_worker(self) -> None:
+        """Once any library load under way has finished, restart the general-purpose worker if it predates it.
+
+        Waiting first folds every change of one operation (an unload and a register, or a whole reload) into a
+        single restart. A full reload has stopped the worker and asked for a new one by then, so it is left alone.
+        """
+        library_manager = self.engine.library_manager
+        # Loop because another coroutine may close the gate between it opening and this resuming.
+        while not library_manager._libraries_loading_complete.is_set():
+            await library_manager._libraries_loading_complete.wait()
+        worker_manager = library_manager._worker_manager
+        if not worker_manager.is_worker_running_or_starting(None):
+            return
+        if self._general_purpose_worker_generation == self._library_set_generation:
+            return
+        logger.info("Restarting the general-purpose worker so it loads the libraries that changed.")
+        await worker_manager.stop_general_purpose_worker("it was restarted to load libraries that changed.")
+        await self._start_general_purpose_worker()
+
+    def _log_general_purpose_restart_error(self, task: asyncio.Task) -> None:
+        """Report a restart that raised, which nothing awaits."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("Failed to restart the general-purpose worker after libraries changed: %s", exc)
