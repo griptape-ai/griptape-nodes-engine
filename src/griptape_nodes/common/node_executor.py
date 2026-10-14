@@ -297,7 +297,7 @@ class NodeExecutor(EngineScoped):
         msg = f"Could not find PublishWorkflowRequest handler for library {library_name}"
         raise ValueError(msg)
 
-    async def execute(self, node: BaseNode) -> None:  # noqa: PLR0911 (one early return per kind of node)
+    async def execute(self, node: BaseNode) -> None:
         """Execute the given node.
 
         Args:
@@ -320,14 +320,11 @@ class NodeExecutor(EngineScoped):
 
             if isinstance(node, SubflowNodeGroup):
                 execution_type = node.get_parameter_value(node.execution_environment.name)
-                if execution_type == LOCAL_EXECUTION:
-                    # Just execute the node normally! This means we aren't doing any special packaging.
-                    await node.aprocess()
-                    return
-                if self._runs_private_execution_in_worker(execution_type):
-                    # The local path, as for Local Execution, with each of the group's nodes sent to
-                    # the worker. Nothing is packaged, so there is no subprocess state to clear.
-                    with private_execution_scope(node.name):
+                if self._runs_locally(execution_type):
+                    # Just execute the node normally! This means we aren't doing any special packaging,
+                    # so there is no subprocess state to clear. Private Execution in the worker runs here
+                    # too, inside the scope that sends each of the group's nodes to the worker.
+                    with self._local_execution_scope(execution_type, node.name):
                         await node.aprocess()
                     return
                 # Clear execution state before subprocess execution starts
@@ -2422,7 +2419,7 @@ class NodeExecutor(EngineScoped):
 
         # Execute all iterations based on execution environment
         match execution_type:
-            case node_types.LOCAL_EXECUTION | node_types.PRIVATE_EXECUTION if self._runs_locally(execution_type):
+            case _ if self._runs_locally(execution_type):
                 with self._local_execution_scope(execution_type, node.name):
                     (
                         iteration_results,
@@ -2523,7 +2520,7 @@ class NodeExecutor(EngineScoped):
         break_occurred = False
         iteration_failures: list[IterationFailure] = []
         match execution_type:
-            case node_types.LOCAL_EXECUTION | node_types.PRIVATE_EXECUTION if self._runs_locally(execution_type):
+            case _ if self._runs_locally(execution_type):
                 with self._local_execution_scope(execution_type, node.name):
                     (
                         iteration_results,
