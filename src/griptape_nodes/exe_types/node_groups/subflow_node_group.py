@@ -783,6 +783,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         Mapped here, ahead of every converter: the Options converter replaces a value it does not
         offer with its first choice, so a group saved with Private Execution would otherwise open
         as Local Execution.
+
+        Not a `SetParameterVersionCompatibilityCheck`, although those also run before the converters.
+        A check is handed only the node, name and value, and when it applies its result replaces the
+        rest of `SetParameterValueRequest`'s handling. Rewriting the value there would either run
+        this node's value hooks during a workflow load, since `initial_setup` does not reach the
+        check, or skip the connection checks and the unresolving of downstream nodes that follow it.
+        This only renames a value, so the normal path has to carry on. It also covers a direct
+        `set_parameter_value` call, which never reaches the manager.
         """
         if param_name == self.execution_environment.name and value == LEGACY_PRIVATE_EXECUTION:
             value = ISOLATED_EXECUTION

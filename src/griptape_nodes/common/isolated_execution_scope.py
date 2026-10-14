@@ -1,4 +1,4 @@
-"""Where the nodes of a Isolated Execution run go, recorded where that is decided.
+"""Where the nodes of an Isolated Execution run go, recorded where that is decided.
 
 `NodeExecutor` decides that a group or loop runs with Isolated Execution. With the
 `isolated_execution_in_worker` beta feature on, it runs the group's nodes through the local path
@@ -44,7 +44,7 @@ current_isolated_execution_scope: ContextVar[IsolatedExecutionScope | None] = Co
 def isolated_execution_scope(owner_name: str) -> Iterator[None]:
     """Send the nodes run inside this block to the general-purpose worker.
 
-    The innermost scope wins, so a Isolated Execution group nested in another names itself.
+    The innermost scope wins, so an Isolated Execution group nested in another names itself.
     """
     token = current_isolated_execution_scope.set(IsolatedExecutionScope(owner_name=owner_name))
     try:

@@ -1,6 +1,6 @@
 """A Isolated Execution group runs through the local path and sends its nodes to the worker.
 
-With the `private_execution_in_worker` beta feature on, `NodeExecutor` no longer packages the group
+With the `isolated_execution_in_worker` beta feature on, `NodeExecutor` no longer packages the group
 and starts a process for it. It runs the group like Local Execution, inside a scope naming the
 general-purpose worker, and `NodeManager` sends every node the group runs to that worker.
 
@@ -121,7 +121,7 @@ def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
 def _build_group(engine: Engine, library_json: Path, *, execution_environment: str) -> tuple[str, str, list[str]]:
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
-    engine.context_manager.push_workflow(workflow_name="private_execution_in_worker_wf")
+    engine.context_manager.push_workflow(workflow_name="isolated_execution_in_worker_wf")
 
     parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)

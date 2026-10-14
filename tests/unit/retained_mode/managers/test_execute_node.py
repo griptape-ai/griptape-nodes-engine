@@ -741,7 +741,7 @@ class TestExecuteNodeWorkerValues:
 
 
 class TestExecuteNodePrivateExecutionRoute:
-    """Orchestrator-side routing of a node run inside a Isolated Execution scope to the worker it names."""
+    """Orchestrator-side routing of a node run inside an Isolated Execution scope to the worker it names."""
 
     _LIBRARY_WORKER = ("library-eng-id", "library-topic")
     _PRIVATE_WORKER = ("private-eng-id", "private-topic")

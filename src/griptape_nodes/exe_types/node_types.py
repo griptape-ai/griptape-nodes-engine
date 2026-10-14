@@ -303,7 +303,7 @@ def get_library_names_with_publish_handlers(engine: Engine) -> list[str]:
 
     event_handlers = engine.library_manager.get_registered_event_handlers(PublishWorkflowRequest)
 
-    # Always include "local" and "private" as the first options
+    # Always include Local and Isolated Execution as the first options
     library_names = [LOCAL_EXECUTION, ISOLATED_EXECUTION]
 
     # Add all registered library names that can handle PublishWorkflowRequest

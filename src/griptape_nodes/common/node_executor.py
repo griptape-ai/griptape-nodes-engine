@@ -592,7 +592,7 @@ class NodeExecutor(EngineScoped):
         self._apply_parameter_values_to_node(node, parameter_output_values, package_result)
 
     def _runs_isolated_execution_in_worker(self, execution_type: str) -> bool:
-        """Whether a Isolated Execution run sends its nodes to the worker rather than starting a process."""
+        """Whether an Isolated Execution run sends its nodes to the worker rather than starting a process."""
         if execution_type != ISOLATED_EXECUTION:
             return False
         return is_beta_enabled(ISOLATED_EXECUTION_IN_WORKER, self.engine.config_manager)

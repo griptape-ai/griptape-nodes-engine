@@ -147,7 +147,7 @@ _IS_BETA_ENABLED_PATH = "griptape_nodes.common.node_executor.is_beta_enabled"
 
 
 class TestPrivateExecutionInWorker:
-    """With the beta feature on, a Isolated Execution group runs locally and names the worker for its nodes."""
+    """With the beta feature on, an Isolated Execution group runs locally and names the worker for its nodes."""
 
     @pytest.mark.asyncio
     async def test_runs_the_group_locally_inside_the_scope(self) -> None:
