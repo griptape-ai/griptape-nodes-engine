@@ -14,6 +14,7 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
+from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
 from tests.unit.exe_types.mocks import MockNode
@@ -378,3 +379,27 @@ class _OldLibraryStyleGroup(_MiniSubflowGroup):
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
         self.metadata[RIGHT_PARAMETERS_KEY].extend(["old_a", "old_b"])
+
+
+class TestExecutionEnvironmentLegacyName:
+    """A group saved with the old "Private Execution" setting keeps it under its new name.
+
+    The Options converter replaces a value it does not offer with its first choice, Local
+    Execution, so without the mapping a saved group would quietly leave isolation.
+    """
+
+    @pytest.mark.parametrize("initial_setup", [True, False], ids=["loading a saved workflow", "setting it by hand"])
+    def test_the_old_name_is_read_as_isolated_execution(self, *, initial_setup: bool) -> None:
+        group = _MiniSubflowGroup(name="G")
+
+        group.set_parameter_value("execution_environment", LEGACY_PRIVATE_EXECUTION, initial_setup=initial_setup)
+
+        assert group.get_parameter_value("execution_environment") == ISOLATED_EXECUTION
+
+    @pytest.mark.parametrize("value", [LOCAL_EXECUTION, ISOLATED_EXECUTION])
+    def test_other_values_pass_through(self, value: str) -> None:
+        group = _MiniSubflowGroup(name="G")
+
+        group.set_parameter_value("execution_environment", value)
+
+        assert group.get_parameter_value("execution_environment") == value
