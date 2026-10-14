@@ -187,15 +187,18 @@ class ReferencedWorkflowImport(EngineScoped):
             details = f"Attempted to import unsaved workflow '{request.workflow_name}' as a referenced sub flow."
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        # Get current flows before importing
-        obj_manager = self.engine.object_manager
-        flows_before = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
-
-        # Execute the workflow within the target flow context.
+        # Execute the workflow within the target flow context, on this task's own copy of the flow
+        # stack so concurrent imports cannot push onto each other's. Only the flows this import
+        # creates are recorded, so flows created by other tasks are never mistaken for ours.
         # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
         # serializes as an import command. When False, the flow serializes as inline content.
         workflow_manager = self.engine.workflow_manager
-        with self.engine.context_manager.flow(flow_name):
+        context_manager = self.engine.context_manager
+        with (
+            self.engine.flow_manager.record_created_flows() as new_flows,
+            context_manager.isolated_flow_stack(),
+            context_manager.flow(flow_name),
+        ):
             if request.track_as_referenced:
                 with workflow_manager.referenced_workflow(request.workflow_name):
                     workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
@@ -208,16 +211,21 @@ class ReferencedWorkflowImport(EngineScoped):
                 result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
             )
 
-        # Get flows after importing to find the new referenced sub flow
-        flows_after = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
-        new_flows = flows_after - flows_before
+        # The record only grows, so drop flows deleted or renamed before the import returned.
+        # It holds names, so a flow renamed during the import is dropped and can't be recovered here.
+        object_manager = self.engine.object_manager
+        surviving_flows = {
+            name
+            for name in new_flows
+            if object_manager.attempt_get_object_by_name_as_type(name, ControlFlow) is not None
+        }
 
-        if not new_flows:
+        if not surviving_flows:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
         created_flow_name = self._select_top_level_imported_flow(
-            new_flows, flow_name, request.workflow_name, self.engine
+            surviving_flows, flow_name, request.workflow_name, self.engine
         )
 
         # Apply imported flow metadata if provided

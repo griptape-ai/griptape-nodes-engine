@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import contextlib
 import contextvars
 import logging
 import re
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+
+from collections.abc import Iterator
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -58,6 +61,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowMetadataResultFailure,
     GetWorkflowMetadataResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
+    ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultFailure,
@@ -5665,34 +5669,76 @@ class TestWorkflowShapeStartFlowDefaults:
 class TestExecuteWorkflowImport:
     """ReferencedWorkflowImport._execute_workflow_import tests."""
 
-    @pytest.mark.asyncio
-    async def test_returns_top_level_imported_flow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        workflow_manager = engine.workflow_manager
-
+    @pytest.fixture
+    def request_and_workflow(self) -> tuple[ImportWorkflowAsReferencedSubFlowRequest, Mock]:
         request = ImportWorkflowAsReferencedSubFlowRequest(
             workflow_name="wf", flow_name="ParentFlow", imported_flow_metadata=None, track_as_referenced=False
         )
         workflow = Mock(spec=Workflow)
         workflow.file_path = "workflows/wf.py"
+        return request, workflow
 
-        # The import creates two new flows (a top-level flow + a group's body flow). The dict
-        # values are never inspected -- only the keys form the new-flows set.
+    @pytest.fixture
+    def recorded_flows(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Replace the FlowManager with a mock whose per-import record is the returned list."""
+        recorded: list[str] = []
+
+        @contextlib.contextmanager
+        def record_created_flows() -> Iterator[list[str]]:
+            yield recorded
+
+        flow_manager = Mock(spec=FlowManager)
+        flow_manager.record_created_flows.side_effect = record_created_flows
+        monkeypatch.setattr(engine, "_flow_manager", flow_manager)
+        return recorded
+
+    @pytest.fixture
+    def existing_flows(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> set[str]:
+        """Replace the ObjectManager with a mock that only knows the flows named in the returned set."""
+        existing: set[str] = set()
+
+        def attempt_get_object_by_name_as_type(name: str, cast_type: type) -> Mock | None:
+            if name in existing:
+                return Mock(spec=cast_type)
+            return None
+
         object_manager = Mock(spec=ObjectManager)
-        object_manager.get_filtered_subset.side_effect = [
-            {"ParentFlow": object()},
-            {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
-        ]
+        object_manager.attempt_get_object_by_name_as_type.side_effect = attempt_get_object_by_name_as_type
         monkeypatch.setattr(engine, "_object_manager", object_manager)
+        return existing
 
+    @pytest.fixture
+    def run_workflow_mock(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         # ContextManager().flow(...) is used purely as a context manager wrapping the import.
         context_manager = MagicMock(spec=ContextManager)
         monkeypatch.setattr(engine, "_context_manager", context_manager)
 
-        monkeypatch.setattr(
-            workflow_manager.runner,
-            "run_workflow",
-            AsyncMock(return_value=WorkflowExecutionResult(execution_successful=True, execution_details="ok")),
-        )
+        run_workflow = AsyncMock(spec=engine.workflow_manager.runner.run_workflow)
+        monkeypatch.setattr(engine.workflow_manager.runner, "run_workflow", run_workflow)
+        return run_workflow
+
+    @pytest.mark.asyncio
+    async def test_returns_top_level_imported_flow(  # noqa: PLR0913, PLR0917
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        request_and_workflow: tuple[ImportWorkflowAsReferencedSubFlowRequest, Mock],
+        recorded_flows: list[str],
+        existing_flows: set[str],
+        run_workflow_mock: AsyncMock,
+    ) -> None:
+        workflow_manager = engine.workflow_manager
+        request, workflow = request_and_workflow
+
+        # The import creates two new flows (a top-level flow + a group's body flow), which the
+        # FlowManager's per-import record collects.
+        existing_flows.update(["ControlFlow_2", "Group_subflow"])
+
+        async def run_workflow(_path: str) -> WorkflowExecutionResult:
+            recorded_flows.extend(["ControlFlow_2", "Group_subflow"])
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        run_workflow_mock.side_effect = run_workflow
 
         # Spy the selection helper (its own logic is covered by TestSelectTopLevelImportedFlow).
         select_mock = create_autospec(
@@ -5707,6 +5753,65 @@ class TestExecuteWorkflowImport:
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
+
+    @pytest.mark.asyncio
+    async def test_ignores_flows_deleted_before_the_import_returns(
+        self,
+        engine: Engine,
+        request_and_workflow: tuple[ImportWorkflowAsReferencedSubFlowRequest, Mock],
+        recorded_flows: list[str],
+        existing_flows: set[str],
+        run_workflow_mock: AsyncMock,
+    ) -> None:
+        workflow_manager = engine.workflow_manager
+        request, workflow = request_and_workflow
+
+        # A flow the import created and then deleted stays in the record but is gone from the
+        # object manager, and the flow manager can no longer name its parent.
+        existing_flows.add("ControlFlow_2")
+
+        async def run_workflow(_path: str) -> WorkflowExecutionResult:
+            recorded_flows.extend(["Deleted_flow", "ControlFlow_2"])
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        run_workflow_mock.side_effect = run_workflow
+
+        def get_parent_flow(flow_name: str) -> str | None:
+            if flow_name == "Deleted_flow":
+                msg = f"Flow '{flow_name}' not found"
+                raise ValueError(msg)
+            return "ParentFlow"
+
+        engine.flow_manager.get_parent_flow.side_effect = get_parent_flow  # type: ignore[attr-defined]
+
+        result = await workflow_manager.referenced_import._execute_workflow_import(request, workflow, "ParentFlow")
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
+        assert result.created_flow_name == "ControlFlow_2"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("existing_flows")  # left empty on purpose: no flow survives
+    async def test_fails_when_every_created_flow_was_deleted(
+        self,
+        engine: Engine,
+        request_and_workflow: tuple[ImportWorkflowAsReferencedSubFlowRequest, Mock],
+        recorded_flows: list[str],
+        run_workflow_mock: AsyncMock,
+    ) -> None:
+        request, workflow = request_and_workflow
+
+        async def run_workflow(_path: str) -> WorkflowExecutionResult:
+            recorded_flows.append("Deleted_flow")
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        run_workflow_mock.side_effect = run_workflow
+
+        result = await engine.workflow_manager.referenced_import._execute_workflow_import(
+            request, workflow, "ParentFlow"
+        )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
+        assert "no new flow was created" in str(result.result_details)
 
 
 class TestReferencedWorkflowTagging:

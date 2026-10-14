@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
@@ -189,6 +191,8 @@ from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_l
 from griptape_nodes.serialization.values import Unencodable, decode_value, encodable_default, try_encode, value_key
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -315,6 +319,7 @@ class FlowManager(EngineScoped):
     _name_to_parent_name: dict[str, str | None]
     _flow_to_referenced_workflow_name: dict[ControlFlow, str]
     _iteration_flow_to_owner_flow_name: dict[str, str]
+    _flow_creation_record: contextvars.ContextVar[list[str] | None]
     _connections: Connections
 
     # Global execution state (moved from individual ControlFlows)
@@ -331,6 +336,8 @@ class FlowManager(EngineScoped):
         self._name_to_parent_name = {}
         self._flow_to_referenced_workflow_name = {}
         self._iteration_flow_to_owner_flow_name = {}
+        # Per instance, and task-local, so concurrent recorders each see only their own flows.
+        self._flow_creation_record = contextvars.ContextVar("flow_creation_record", default=None)
         self._connections = Connections()
 
         # Initialize global execution state
@@ -356,9 +363,28 @@ class FlowManager(EngineScoped):
     def node_executor(self) -> NodeExecutor:
         return self._node_executor
 
+    @contextmanager
+    def record_created_flows(self) -> Iterator[list[str]]:
+        """Collect the names of flows created by the current task during the `with` block.
+
+        Flows created by other tasks running at the same time are not collected.
+        """
+        created: list[str] = []
+        token = self._flow_creation_record.set(created)
+        try:
+            yield created
+        finally:
+            self._flow_creation_record.reset(token)
+
     def get_connections(self) -> Connections:
         """Get the connections instance."""
         return self._connections
+
+    def _note_created_flow(self, flow_name: str) -> None:
+        """Add a newly created flow to the current task's creation record, if one is active."""
+        creation_record = self._flow_creation_record.get()
+        if creation_record is not None:
+            creation_record.append(flow_name)
 
     def _cleanup_flow_on_failed_deserialization(self, flow_name: str, *, pushed_flow_context: bool) -> None:
         """Clean up a flow that failed during deserialization.
@@ -697,6 +723,7 @@ class FlowManager(EngineScoped):
         flow = ControlFlow(name=final_flow_name, engine=self.engine, metadata=request.metadata)
         self.engine.object_manager.add_object_by_name(name=final_flow_name, obj=flow)
         self._name_to_parent_name[final_flow_name] = parent_name
+        self._note_created_flow(final_flow_name)
 
         # Track referenced workflow if this flow was created within a referenced workflow context
         if workflow_manager.has_current_referenced_workflow():

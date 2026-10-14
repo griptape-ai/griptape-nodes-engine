@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import uuid
 from pathlib import Path
@@ -21,6 +22,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import BaseNodeElement
@@ -41,6 +43,7 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _flow_overlay: contextvars.ContextVar[tuple[ContextManager.FlowContextState, ...] | None]
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -93,19 +96,6 @@ class ContextManager(EngineScoped):
             flow_context = self._flow_stack.pop()
             return flow_context._flow
 
-        def has_current_flow(self) -> bool:
-            """Check if this workflow has an active flow."""
-            return len(self._flow_stack) > 0
-
-        def get_current_flow(self) -> ControlFlow:
-            """Get the current flow in this workflow."""
-            if not self._flow_stack:
-                msg = f"No active Flow in Workflow '{self._name}'"
-                raise ContextManager.EmptyStackError(msg)
-
-            flow_context = self._flow_stack[-1]
-            return flow_context._flow
-
     class WorkflowContext:
         """A context manager for a Workflow."""
 
@@ -136,6 +126,12 @@ class ContextManager(EngineScoped):
         def __init__(self, flow: ControlFlow):
             self._flow = flow
             self._node_stack = []
+
+        def copy(self) -> ContextManager.FlowContextState:
+            """Copy this flow state with its own node and element stacks."""
+            flow_copy = ContextManager.FlowContextState(self._flow)
+            flow_copy._node_stack = [node_state.copy() for node_state in self._node_stack]
+            return flow_copy
 
         def push_node(self, node: BaseNode) -> BaseNode:
             """Push a node name onto this flow's node stack."""
@@ -175,6 +171,12 @@ class ContextManager(EngineScoped):
             self.node = node
             self._element_stack = []
 
+        def copy(self) -> ContextManager.NodeContextState:
+            """Copy this node state with its own element stack."""
+            node_copy = ContextManager.NodeContextState(self.node)
+            node_copy._element_stack = list(self._element_stack)
+            return node_copy
+
         def push_element(self, element: BaseNodeElement) -> BaseNodeElement:
             """Push an element name onto this node's element stack."""
             self._element_stack.append(element)
@@ -207,12 +209,15 @@ class ContextManager(EngineScoped):
 
         _manager: ContextManager
         _flow: ControlFlow
+        _saved_overlay: tuple[ContextManager.FlowContextState, ...] | None
 
         def __init__(self, manager: ContextManager, flow: ControlFlow):
             self._manager = manager
             self._flow = flow
+            self._saved_overlay = None
 
         def __enter__(self) -> ControlFlow:
+            self._saved_overlay = self._manager._flow_overlay.get()
             return self._manager.push_flow(self._flow)
 
         def __exit__(
@@ -221,7 +226,49 @@ class ContextManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
+            # Inside an isolated flow stack, restore exactly what was there on entry. This also drops
+            # any bare pushes made inside the block, such as a flow created with set_as_new_context.
+            if self._saved_overlay is not None:
+                self._manager._flow_overlay.set(self._saved_overlay)
+                return
             self._manager.pop_flow()
+
+    class IsolatedFlowStackContext:
+        """A context manager that gives the current task its own copy of the flow stack."""
+
+        _manager: ContextManager
+        _token: contextvars.Token[tuple[ContextManager.FlowContextState, ...] | None] | None
+
+        def __init__(self, manager: ContextManager):
+            self._manager = manager
+            self._token = None
+
+        def __enter__(self) -> None:
+            if self._token is not None:
+                msg = (
+                    "Attempted to isolate the flow stack for the current task. "
+                    "Failed because this context is already active. Create a new context for each use."
+                )
+                raise RuntimeError(msg)
+
+            # Tasks spawned inside the block inherit this tuple and share its FlowContextState
+            # objects. Flow push/pop stays isolated because it replaces the tuple, but node and
+            # element pushes mutate those shared lists, so don't rely on node isolation across them.
+            snapshot = tuple(flow_state.copy() for flow_state in self._manager._effective_flow_stack())
+            self._token = self._manager._flow_overlay.set(snapshot)
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            exc_traceback: TracebackType | None,
+        ) -> None:
+            if self._token is None:
+                return
+
+            token = self._token
+            self._token = None
+            self._manager._flow_overlay.reset(token)
 
     class NodeContext:
         """A context manager for a Node within a Flow."""
@@ -266,6 +313,11 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        # Per instance, so each engine's overlay is independent of any other engine's. An overlay
+        # rather than a replacement of the shared stack: the editor's current flow must persist
+        # across requests that may run in separate tasks, so only code that holds the stack across
+        # an await (a referenced workflow import) opts in to a task-local copy.
+        self._flow_overlay = contextvars.ContextVar("flow_overlay", default=None)
         event_manager.register_request_handlers(self)
 
     @handles(SetWorkflowContextRequest)
@@ -436,6 +488,14 @@ class ContextManager(EngineScoped):
                 raise ValueError(msg) from e
         return self.FlowContext(self, flow)
 
+    def isolated_flow_stack(self) -> ContextManager.IsolatedFlowStackContext:
+        """Give the current task its own copy of the flow stack for the `with` block.
+
+        The copy starts as a snapshot of the current stack, so flows already entered stay visible.
+        Pushes and pops inside the block never touch the stack shared with other tasks.
+        """
+        return self.IsolatedFlowStackContext(self)
+
     def node(self, node: str | BaseNode) -> ContextManager.NodeContext:
         """Create a context manager for a Node context.
 
@@ -516,16 +576,14 @@ class ContextManager(EngineScoped):
         if not self.has_current_workflow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.has_current_flow()
+        return len(self._effective_flow_stack()) > 0
 
     def has_current_node(self) -> bool:
         """Check if there is an active Node within the current Flow."""
         if not self.has_current_flow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         return current_flow.has_current_node()
 
     def has_current_element(self) -> bool:
@@ -533,8 +591,7 @@ class ContextManager(EngineScoped):
         if not self.has_current_node():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         current_node = current_flow._node_stack[-1]
         return current_node.has_current_element()
 
@@ -650,8 +707,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.get_current_flow()
+        return self._current_flow_state()._flow
 
     def get_current_node(self) -> BaseNode:
         """Get the name of the current Node within the current Flow.
@@ -667,8 +723,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         return current_flow.get_current_node()
 
     def get_current_element(self) -> BaseNodeElement:
@@ -685,8 +740,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "No active Node context"
@@ -793,6 +847,11 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
             raise self.NoActiveWorkflowError(msg)
 
+        overlay = self._flow_overlay.get()
+        if overlay is not None:
+            self._flow_overlay.set((*overlay, self.FlowContextState(flow)))
+            return flow
+
         current_workflow = self._workflow_stack[-1]
         return current_workflow.push_flow(flow)
 
@@ -808,6 +867,14 @@ class ContextManager(EngineScoped):
         if not self.has_current_workflow():
             msg = "Cannot pop Flow: stack is empty"
             raise self.EmptyStackError(msg)
+
+        overlay = self._flow_overlay.get()
+        if overlay is not None:
+            if not overlay:
+                msg = f"Cannot pop Flow: no active Flows in Workflow '{self.get_current_workflow_name()}'"
+                raise self.EmptyStackError(msg)
+            self._flow_overlay.set(overlay[:-1])
+            return overlay[-1]._flow
 
         current_workflow = self._workflow_stack[-1]
         return current_workflow.pop_flow()
@@ -828,8 +895,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Node context '{node.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         result = current_flow.push_node(node)
         return result
 
@@ -847,8 +913,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Node: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         result = current_flow.pop_node()
         return result
 
@@ -869,8 +934,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter an Element context '{element.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot enter an Element context without an active Node context"
@@ -893,8 +957,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Element: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot pop Element: no active Node context"
@@ -902,3 +965,16 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _effective_flow_stack(self) -> Sequence[ContextManager.FlowContextState]:
+        """Return this task's flow stack: the isolated overlay if set, else the workflow's shared stack."""
+        overlay = self._flow_overlay.get()
+        if overlay is not None:
+            return overlay
+        if not self.has_current_workflow():
+            return ()
+        return self._workflow_stack[-1]._flow_stack
+
+    def _current_flow_state(self) -> ContextManager.FlowContextState:
+        """Return the top flow state of the effective flow stack."""
+        return self._effective_flow_stack()[-1]

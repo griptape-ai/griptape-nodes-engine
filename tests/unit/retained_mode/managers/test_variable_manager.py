@@ -886,3 +886,35 @@ class TestProjectVariableSerialization:
         serialized = converter.unstructure(result)
         assert serialized["variable"]["name"] == "workspace_dir"
         assert serialized["variable"]["value"] == "/proj"
+
+
+class TestGetFlowHierarchy:
+    """`_get_flow_hierarchy` walks from a flow up to the root and stops on a parent cycle."""
+
+    def test_walks_up_to_the_root(self, engine: Engine, flow_name: str) -> None:
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        hierarchy = engine.variables_manager._get_flow_hierarchy(child.flow_name)
+
+        assert hierarchy == [child.flow_name, flow_name]
+
+    def test_stops_when_the_parents_form_a_cycle(
+        self, engine: Engine, flow_name: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+        engine.flow_manager._name_to_parent_name[flow_name] = child.flow_name
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            hierarchy = engine.variables_manager._get_flow_hierarchy(child.flow_name)
+
+        assert hierarchy == [child.flow_name, flow_name]
+        assert (
+            f"Attempted to collect the parent flows of '{child.flow_name}'. "
+            f"Stopped because flow '{child.flow_name}' appears twice in its parent chain."
+        ) in caplog.text

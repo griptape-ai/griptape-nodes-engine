@@ -612,16 +612,6 @@ class TestSubflowImportCycle:
         assert outer.error is not None, outer
         assert root_cause in outer.error.message, outer.error
 
-    # Skipped rather than xfail: with method="thread" a hang makes pytest-timeout call os._exit, which an
-    # xfail cannot absorb, so one hang would end the whole e2e session.
-    @pytest.mark.skip(
-        reason=(
-            "Concurrent referenced imports share the ContextManager flow stack, so an import can be parented "
-            "under another task's flow. The run can then fail on mismatched Start nodes before any import "
-            "reaches the recursion limit, so the refusal may not be raised. "
-            "Remove this mark once the flow-stack race is fixed. TODO: link the tracking issue."
-        ),
-    )
     @pytest.mark.timeout(60, method="thread")
     @pytest.mark.usefixtures("loop_library")
     @pytest.mark.asyncio

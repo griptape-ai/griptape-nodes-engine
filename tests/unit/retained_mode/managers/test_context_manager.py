@@ -1,15 +1,19 @@
 """Tests for ContextManager.push_workflow."""
 
 import ast
+import asyncio
 import logging
 import tempfile
+from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.context_events import (
@@ -17,6 +21,8 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
@@ -593,3 +599,145 @@ class TestEnsureWorkflowAndFlowRequest:
         assert result.created_flow is True
 
         self._cleanup(engine)
+
+
+WAIT_SECONDS = 5
+
+
+class FlowStackFixtures:
+    """Fixtures that build ParentFlow with two children, FA and FB, and ParentFlow as the shared current flow."""
+
+    @pytest.fixture
+    def flows(self, engine: Engine) -> Generator[dict[str, ControlFlow]]:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow("flow_stack_wf")
+        result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=True)
+        )
+        assert isinstance(result, CreateFlowResultSuccess)
+        for name in ("FA", "FB"):
+            child = engine.handle_request(
+                CreateFlowRequest(parent_flow_name="ParentFlow", flow_name=name, set_as_new_context=False)
+            )
+            assert isinstance(child, CreateFlowResultSuccess)
+        created: dict[str, ControlFlow] = {}
+        for name in ("ParentFlow", "FA", "FB"):
+            flow = engine.object_manager.attempt_get_object_by_name_as_type(name, ControlFlow)
+            assert flow is not None
+            created[name] = flow
+        yield created
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    def shared_stack_names(self, engine: Engine) -> list[str]:
+        workflow_state = engine.context_manager._workflow_stack[-1]
+        return [flow_state._flow.name for flow_state in workflow_state._flow_stack]
+
+
+class TestIsolatedFlowStack(FlowStackFixtures):
+    """Tests for ContextManager.isolated_flow_stack."""
+
+    def test_reentering_the_same_context_raises(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:  # noqa: ARG002
+        isolation = engine.context_manager.isolated_flow_stack()
+
+        with isolation, pytest.raises(RuntimeError, match="already active"):
+            isolation.__enter__()
+
+    def test_snapshot_keeps_the_existing_flows_visible(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        with engine.context_manager.isolated_flow_stack():
+            assert engine.context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_pushes_and_pops_leave_the_shared_stack_untouched(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+
+        with context_manager.isolated_flow_stack():
+            context_manager.push_flow(flows["FA"])
+            assert context_manager.get_current_flow() is flows["FA"]
+            assert self.shared_stack_names(engine) == before
+            assert context_manager.pop_flow() is flows["FA"]
+            assert context_manager.pop_flow() is flows["ParentFlow"]
+            assert not context_manager.has_current_flow()
+            with pytest.raises(context_manager.EmptyStackError):
+                context_manager.pop_flow()
+
+        assert self.shared_stack_names(engine) == before
+        assert context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_overlay_is_invisible_outside_the_block(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        context_manager = engine.context_manager
+
+        with context_manager.isolated_flow_stack():
+            context_manager.push_flow(flows["FA"])
+
+        assert context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_node_stacks_are_not_shared_with_the_shared_stack(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        node = Mock(spec=BaseNode)
+        node.name = "SomeNode"
+
+        with context_manager.isolated_flow_stack():
+            context_manager.push_node(node)
+            assert context_manager.has_current_node()
+
+        assert not context_manager.has_current_node()
+        assert flows["ParentFlow"] is context_manager.get_current_flow()
+
+    def test_exiting_a_flow_context_restores_the_stack_it_entered_with(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+
+        with context_manager.isolated_flow_stack():
+            with context_manager.flow(flows["FA"]):
+                # A bare push, as CreateFlowRequest(set_as_new_context=True) does.
+                context_manager.push_flow(flows["FB"])
+            assert context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_flow_context_without_isolation_pops_the_shared_stack(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+
+        with context_manager.flow(flows["FA"]):
+            assert self.shared_stack_names(engine) == ["ParentFlow", "FA"]
+
+        assert self.shared_stack_names(engine) == ["ParentFlow"]
+
+
+class TestConcurrentIsolatedFlowStacks(FlowStackFixtures):
+    """Concurrent tasks that isolate their flow stacks do not see each other's flows."""
+
+    @pytest.mark.asyncio
+    async def test_interleaved_tasks_each_keep_their_own_flow(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        before = self.shared_stack_names(engine)
+        entered = {"FA": asyncio.Event(), "FB": asyncio.Event()}
+        created = {"FA": asyncio.Event(), "FB": asyncio.Event()}
+        created_parents: dict[str, str | None] = {}
+
+        async def run_task(own: str, other: str) -> None:
+            with engine.context_manager.isolated_flow_stack(), engine.context_manager.flow(flows[own]):
+                entered[own].set()
+                await asyncio.wait_for(entered[other].wait(), WAIT_SECONDS)
+                assert engine.context_manager.get_current_flow() is flows[own]
+
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=None, flow_name=f"{own}_child", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+                created_parents[own] = engine.flow_manager.get_parent_flow(result.flow_name)
+
+                created[own].set()
+                await asyncio.wait_for(created[other].wait(), WAIT_SECONDS)
+                assert engine.context_manager.get_current_flow() is flows[own]
+
+        await asyncio.gather(run_task("FA", "FB"), run_task("FB", "FA"))
+
+        assert created_parents == {"FA": "FA", "FB": "FB"}
+        assert self.shared_stack_names(engine) == before

@@ -207,9 +207,18 @@ class VariablesManager(EngineScoped):
         flow_manager = self.engine.flow_manager
 
         hierarchy = []
+        seen: set[str] = set()
         current_flow = starting_flow
 
         while current_flow:
+            if current_flow in seen:
+                logger.warning(
+                    "Attempted to collect the parent flows of '%s'. Stopped because flow '%s' appears twice in its parent chain.",
+                    starting_flow,
+                    current_flow,
+                )
+                break
+            seen.add(current_flow)
             hierarchy.append(current_flow)
             try:
                 parent = flow_manager.get_parent_flow(current_flow)
