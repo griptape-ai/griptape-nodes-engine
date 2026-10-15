@@ -210,11 +210,12 @@ class LibraryModuleLoading(EngineScoped):
             if stable_namespace in sys.modules:
                 del sys.modules[stable_namespace]
 
-            # Find and remove from dynamic mapping
+            # The stable module name stays registered: the open workflow can still hold values
+            # whose classes came from this module, and saving them needs that name. The name
+            # depends only on the file's path and library, so a reload registers the same one.
             dynamic_module_name = self._stable_to_dynamic_module_mapping.get(stable_namespace)
             if dynamic_module_name:
                 self._dynamic_to_stable_module_mapping.pop(dynamic_module_name, None)
-                forget_stable_module_name(dynamic_module_name)
             self._stable_to_dynamic_module_mapping.pop(stable_namespace, None)
 
         # Clear the library's module set
