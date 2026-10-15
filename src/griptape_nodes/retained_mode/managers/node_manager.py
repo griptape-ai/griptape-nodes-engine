@@ -880,6 +880,7 @@ class NodeManager(EngineScoped):
                     log_level = logging.WARNING
 
         # Special handling for paired classes (e.g., create a Start node and it automatically creates a corresponding End node already connected).
+        paired_node_name = None
         if isinstance(node, BaseIterativeStartNode) and not request.initial_setup:
             # If it's StartLoop, create an EndLoop and connect it to the StartLoop.
             # Get the class name of the node
@@ -913,7 +914,7 @@ class NodeManager(EngineScoped):
                     logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
                 else:
                     # Create Loop between output and input to the start node.
-                    self.engine.handle_request(
+                    loop_connection = self.engine.handle_request(
                         CreateConnectionRequest(
                             source_node_name=node.name,
                             source_parameter_name="loop",
@@ -931,6 +932,13 @@ class NodeManager(EngineScoped):
                         # create the connection - only when we've confirmed correct types
                         node.end_node = end_node
                         end_node.start_node = node
+                        # Name the End node so clients use it instead of creating their own.
+                        paired_node_name = end_node.name
+                        if loop_connection.failed():
+                            details = f"{details}. Also created its End node '{paired_node_name}', but failed to connect '{node.name}.loop' to '{paired_node_name}.from_start'. Connect them by hand"
+                            log_level = logging.WARNING
+                        else:
+                            details = f"{details}. Also created its End node '{paired_node_name}' and connected it"
 
         # Handle subflow_name for BaseNodeGroup nodes
         if request.subflow_name:
@@ -979,6 +987,7 @@ class NodeManager(EngineScoped):
             specific_library_name=request.specific_library_name,
             parent_flow_name=parent_flow_name,
             parent_group_name=node.parent_group.name if node.parent_group else None,
+            paired_node_name=paired_node_name,
             result_details=ResultDetails(message=details, level=log_level),
         )
 

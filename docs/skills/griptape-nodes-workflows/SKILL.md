@@ -294,6 +294,10 @@ against stale state.
     the authoritative handle for every later call. Pass it verbatim into
     `SetParameterValueRequest`, `CreateConnectionRequest`, and
     `GetParameterValueRequest`.
+- **A loop Start node brings its End node.** Creating a For Each or For Loop Start
+    node also creates the matching End node, already connected. Its name is
+    `CreateNodeResultSuccess.paired_node_name`; don't create another End node. If
+    the connection failed, `details` says so and you connect `loop` to `from_start`.
 
 ## Response Shape
 
