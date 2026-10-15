@@ -240,6 +240,29 @@ class TestStartRequestHandling:
         manager.expect_worker.assert_not_called()
         spawn.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_requested_again_after_a_reload_kills_it_while_it_loads(self) -> None:
+        """The reload kills the worker before its ready report, so its gate is never settled.
+
+        Nothing else settles it either: the registry is already empty when the killed worker
+        unregisters. Judged by that gate, the worker would read as still starting and be gone for
+        the rest of the session.
+        """
+        manager = _worker_manager()
+        manager._spawn_general_purpose_worker_when_session_ready = AsyncMock()  # type: ignore[method-assign]
+        await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
+        await asyncio.sleep(0)
+        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        manager._managed_worker_processes[None] = _managed_proc()
+
+        await manager.reset_workers()
+        assert not manager.has_settled(None), "the premise: a reload leaves this gate unsettled"
+        manager._spawn_general_purpose_worker_when_session_ready.reset_mock()
+        await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
+        await asyncio.sleep(0)
+
+        manager._spawn_general_purpose_worker_when_session_ready.assert_awaited_once()
+
 
 def _initializing_library_manager() -> LibraryManager:
     """A LibraryManager whose app-init steps around the library load are inert."""

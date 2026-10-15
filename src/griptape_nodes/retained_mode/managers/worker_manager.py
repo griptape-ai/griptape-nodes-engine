@@ -445,6 +445,18 @@ class WorkerManager(EngineScoped):
                 logger.warning(msg)
                 raise RuntimeError(msg)
 
+    def is_worker_running_or_starting(self, worker_key: str | None) -> bool:
+        """Whether a worker for worker_key has been requested, is a process this orchestrator spawned, or is registered.
+
+        Read from the records that stopping a worker clears, not from its readiness gate: a reload
+        kills a worker that is still loading without settling the gate, and that worker is gone.
+        """
+        if worker_key in self._requested_spawns:
+            return True
+        if worker_key in self._managed_worker_processes:
+            return True
+        return self.get_worker_for_key(worker_key) is not None
+
     def get_worker_for_key(self, key: str | None) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for a worker registered under key, or None.
 
@@ -950,11 +962,7 @@ class WorkerManager(EngineScoped):
         # Checked, declared, and scheduled with no await between, so two requests cannot both pass.
         # Declaring again would be worse than redundant: expect_worker replaces the readiness gate, and
         # a run already waiting on the old one would wait out the whole load timeout.
-        if (
-            library_name in self._requested_spawns
-            or library_name in self._managed_worker_processes
-            or self.get_worker_for_key(library_name) is not None
-        ):
+        if self.is_worker_running_or_starting(library_name):
             logger.debug("Not starting another worker for library '%s': one is starting or running.", library_name)
             return worker_events.StartWorkerResultSuccess(
                 result_details=f"A worker for library '{library_name}' is already starting or running."
