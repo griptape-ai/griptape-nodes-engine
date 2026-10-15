@@ -11,6 +11,7 @@ including PARALLEL resolution, whose concurrent node tasks are what has to carry
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
@@ -71,18 +72,34 @@ def parallel_mode(engine: Engine) -> Iterator[None]:
     config_manager.set_config_value("max_nodes_in_parallel", prior_max)
 
 
+@dataclass
+class _StandInWorker:
+    """A general-purpose worker that records what it is sent and runs it in this process."""
+
+    engine: Engine
+    received: list[tuple[str, PrivateExecutionScope | None]] = field(default_factory=list)
+
+    def start(self) -> None:
+        """Register it as up, at the library count it would have loaded.
+
+        Called once the test's libraries are registered: a real worker starts after the libraries
+        load, and one registered before a library change is stale and gets restarted.
+        """
+        self.engine.worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(
+            request_topic=f"sessions/test/workers/{_GENERAL_PURPOSE_WORKER}/request", worker_key=None
+        )
+        workers = self.engine.library_manager.workers
+        workers._general_purpose_worker_generation = workers._library_set_generation
+
+
 @pytest.fixture
-def general_purpose_worker(engine: Engine) -> Iterator[list[tuple[str, PrivateExecutionScope | None]]]:
-    """Register a general-purpose worker that records what it is sent and runs it here."""
-    worker_manager = engine.worker_manager
-    worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(
-        request_topic=f"sessions/test/workers/{_GENERAL_PURPOSE_WORKER}/request", worker_key=None
-    )
-    received: list[tuple[str, PrivateExecutionScope | None]] = []
+def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
+    """Stand in for the general-purpose worker at the hand-off, so everything before it is the real engine."""
+    worker = _StandInWorker(engine=engine)
     node_manager = engine.node_manager
 
     async def run_on_worker(request: ExecuteNodeRequest, *_args: Any) -> Any:
-        received.append((request.node_name, current_private_execution_scope.get()))
+        worker.received.append((request.node_name, current_private_execution_scope.get()))
         # The worker has no scope of its own: run the node here, as it would run there.
         token = current_private_execution_scope.set(None)
         try:
@@ -91,8 +108,8 @@ def general_purpose_worker(engine: Engine) -> Iterator[list[tuple[str, PrivateEx
             current_private_execution_scope.reset(token)
 
     with patch.object(node_manager, "_execute_node_via_worker", side_effect=run_on_worker):
-        yield received
-    worker_manager._workers.pop(_GENERAL_PURPOSE_WORKER, None)
+        yield worker
+    engine.worker_manager._workers.pop(_GENERAL_PURPOSE_WORKER, None)
 
 
 def _build_group(engine: Engine, library_json: Path, *, execution_environment: str) -> tuple[str, str, list[str]]:
@@ -145,7 +162,7 @@ async def test_every_node_of_the_group_runs_on_the_worker(
     tmp_path: Path,
     engine: Engine,
     materialize_library: Callable[..., Path],
-    general_purpose_worker: list[tuple[str, PrivateExecutionScope | None]],
+    general_purpose_worker: _StandInWorker,
 ) -> None:
     """Each node the group runs reaches the worker with the group's scope, and no process is started."""
     library_json = materialize_library(
@@ -157,6 +174,7 @@ async def test_every_node_of_the_group_runs_on_the_worker(
         parent_flow, group_name, node_names = _build_group(
             engine, library_json, execution_environment=PRIVATE_EXECUTION
         )
+        general_purpose_worker.start()
         with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as private_workflow:
             run_result = await engine.ahandle_request(
                 StartFlowRequest(flow_name=parent_flow, flow_node_name=group_name)
@@ -168,7 +186,7 @@ async def test_every_node_of_the_group_runs_on_the_worker(
     private_workflow.assert_not_awaited()
     # Every node the group ran reached the worker, each still carrying the group's scope, including
     # the ones PARALLEL resolution ran as concurrent tasks.
-    assert sorted(general_purpose_worker) == sorted(
+    assert sorted(general_purpose_worker.received) == sorted(
         (name, PrivateExecutionScope(owner_name=group_name)) for name in node_names
     )
     for i, name in enumerate(node_names):
@@ -187,7 +205,7 @@ async def test_with_the_feature_off_the_group_still_starts_its_own_process(
     tmp_path: Path,
     engine: Engine,
     materialize_library: Callable[..., Path],
-    general_purpose_worker: list[tuple[str, PrivateExecutionScope | None]],
+    general_purpose_worker: _StandInWorker,
 ) -> None:
     """Off, Private Execution packages the group and starts a process for it, as before."""
     library_json = materialize_library(
@@ -224,13 +242,14 @@ async def test_with_the_feature_off_the_group_still_starts_its_own_process(
         )
     )
 
+    general_purpose_worker.start()
     with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as private_workflow:
         await engine.ahandle_request(
             StartFlowRequest(flow_name=parent_result.flow_name, flow_node_name=group_result.node_name)
         )
 
     private_workflow.assert_awaited_once()
-    assert general_purpose_worker == []
+    assert general_purpose_worker.received == []
 
 
 LOOP_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "iterative_group_library"
@@ -244,7 +263,7 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
     tmp_path: Path,
     engine: Engine,
     materialize_library: Callable[..., Path],
-    general_purpose_worker: list[tuple[str, PrivateExecutionScope | None]],
+    general_purpose_worker: _StandInWorker,
     execution_mode: str,
 ) -> None:
     """A loop needs nothing special: its iterations take the local loop path, inside the scope."""
@@ -302,6 +321,7 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
 
     config_manager = engine.config_manager
     config_manager.set_config_value(PRIVATE_EXECUTION_IN_WORKER.config_key, True)
+    general_purpose_worker.start()
     try:
         with (
             patch.object(NodeExecutor, "_execute_loop_iterations_privately", new_callable=AsyncMock) as parallel,
@@ -319,7 +339,7 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
     one.assert_not_awaited()
     # The body runs as a packaged copy per iteration, so count what reached the worker rather than
     # naming it: at least one node per iteration, every one carrying the loop's scope.
-    scopes = {scope for _name, scope in general_purpose_worker}
-    assert scopes == {PrivateExecutionScope(owner_name=group_name)}, general_purpose_worker
-    body_runs = [name for name, _scope in general_purpose_worker if name.startswith("Body")]
-    assert len(body_runs) >= len(("first", "second", "third")), general_purpose_worker
+    scopes = {scope for _name, scope in general_purpose_worker.received}
+    assert scopes == {PrivateExecutionScope(owner_name=group_name)}, general_purpose_worker.received
+    body_runs = [name for name, _scope in general_purpose_worker.received if name.startswith("Body")]
+    assert len(body_runs) >= len(("first", "second", "third")), general_purpose_worker.received
