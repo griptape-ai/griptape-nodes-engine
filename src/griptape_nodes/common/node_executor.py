@@ -1302,24 +1302,25 @@ class NodeExecutor(EngineScoped):
 
         source_that_reached_end = self._get_control_source_that_reached_end(end_node_mapping, node_name_mappings)
 
-        # Check each control parameter to see if its source node has fired
-        # Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
-        break_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
-        skip_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
-        loop_complete_source = self._find_source_for_control_param(
+        # Check each control parameter to see if one of its sources is the exit the body took.
+        # Several body paths can converge on one input, so every source is checked, not just the
+        # first wire drawn. Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
+        break_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
+        skip_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
+        loop_complete_sources = self._find_sources_for_control_param(
             incoming_connections, IterationControlParam.LOOP_COMPLETE
         )
 
         # Check if break was triggered
-        if self._check_control_source_fired(break_source, source_that_reached_end):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in break_sources):
             return IterationControlAction.BREAK
 
         # Check if skip was triggered
-        if self._check_control_source_fired(skip_source, source_that_reached_end):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in skip_sources):
             return IterationControlAction.SKIP
 
         # Check if loop_complete was triggered
-        if self._check_control_source_fired(loop_complete_source, source_that_reached_end):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in loop_complete_sources):
             return IterationControlAction.ADD
 
         # If none of the control parameters were triggered, default to ADD
@@ -1411,23 +1412,6 @@ class NodeExecutor(EngineScoped):
             return False
 
         return tuple(source_that_reached_end) == source
-
-    def _find_source_for_control_param(
-        self,
-        incoming_connections: list,
-        control_param_name: str,
-    ) -> tuple[str, str] | None:
-        """Find the first source node and parameter that connects to a control parameter.
-
-        Args:
-            incoming_connections: List of incoming connections to the group
-            control_param_name: Name of the control parameter to find (e.g., "break_loop")
-
-        Returns:
-            Tuple of (source_node_name, source_parameter_name), or None if not found
-        """
-        sources = self._find_sources_for_control_param(incoming_connections, control_param_name)
-        return sources[0] if sources else None
 
     async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
@@ -2413,9 +2397,9 @@ class NodeExecutor(EngineScoped):
     ) -> list[tuple[str, str]]:
         """Find all source nodes and parameters that connect to a control parameter.
 
-        Returns all matching sources. Used by retry groups where multiple nodes
-        may connect to the same control input, and by iterative groups (via
-        _find_source_for_control_param) which only need the first match.
+        Returns all matching sources, in the order their connections were made. Several body
+        nodes can connect to the same control input, so callers check every source rather than
+        trusting the first.
 
         Args:
             incoming_connections: List of incoming connections to the group

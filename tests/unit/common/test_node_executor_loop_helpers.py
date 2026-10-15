@@ -10,8 +10,6 @@ These tests cover small, near-pure helpers that decide loop control flow:
   read and clear the body exit that handed control to the packaged End node.
 * ``_check_control_source_fired`` - decide whether a (source_node, source_param)
   pair is the exit that handed control to the packaged End node.
-* ``_find_source_for_control_param`` - return the first source for a given
-  control parameter name, or None.
 * ``_format_loop_failure_message`` / ``_format_iteration_failure_lines`` - compose
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
@@ -294,33 +292,10 @@ class TestForgetControlSourceThatReachedEnd:
         mock_engine.node_manager.get_node_by_name.assert_not_called()
 
 
-class TestFindSourceForControlParam:
-    """_find_source_for_control_param returns the first source from the multi-source helper."""
-
-    def test_returns_first_source_when_multiple_present(self) -> None:
-        executor = _make_executor()
-        with patch.object(
-            NodeExecutor,
-            "_find_sources_for_control_param",
-            return_value=[("A", "out"), ("B", "out")],
-        ) as mock_multi:
-            result = executor._find_source_for_control_param([], "break_loop")
-
-        assert result == ("A", "out")
-        mock_multi.assert_called_once_with([], "break_loop")
-
-    def test_returns_none_when_no_sources(self) -> None:
-        executor = _make_executor()
-        with patch.object(NodeExecutor, "_find_sources_for_control_param", return_value=[]):
-            result = executor._find_source_for_control_param([], "break_loop")
-
-        assert result is None
-
-
 class TestGetIterationControlActionEndToEnd:
     """Real name-matching tests for _get_iteration_control_action.
 
-    _find_source_for_control_param, _get_control_source_that_reached_end and
+    _find_sources_for_control_param, _get_control_source_that_reached_end and
     _check_control_source_fired are NOT mocked, so a regression in parameter-name
     matching will fail these tests.
     """

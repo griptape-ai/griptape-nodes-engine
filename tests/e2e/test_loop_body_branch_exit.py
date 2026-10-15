@@ -111,6 +111,30 @@ class TestForEachGroup:
         assert isinstance(result, StartFlowResultSuccess), result
         assert len(_runs_of(engine, BRANCH_NAME)) == FOR_EACH_ITEM_COUNT
 
+    @pytest.mark.parametrize("step_wired_first", [True, False])
+    @pytest.mark.asyncio
+    async def test_break_loop_with_two_wires_follows_the_branch_taken_in_either_wiring_order(
+        self, engine: Engine, flow: str, *, step_wired_first: bool
+    ) -> None:
+        # Branch.no -> break_loop directly, Branch.yes -> Step -> break_loop. Two wires reach
+        # break_loop, and taking "no" must break after the first item whichever was drawn first.
+        _create_node(engine, flow, "ProbeForEachGroupNode", GROUP_NAME)
+        _create_node(engine, flow, "BranchNode", BRANCH_NAME, group=GROUP_NAME, take="no")
+        _create_node(engine, flow, "StepNode", STEP_NAME, group=GROUP_NAME)
+        _connect(engine, GROUP_NAME, "on_each", BRANCH_NAME, "exec_in")
+        _connect(engine, BRANCH_NAME, "yes", STEP_NAME, "exec_in")
+        if step_wired_first:
+            _connect(engine, STEP_NAME, "exec_out", GROUP_NAME, "break_loop")
+            _connect(engine, BRANCH_NAME, "no", GROUP_NAME, "break_loop")
+        else:
+            _connect(engine, BRANCH_NAME, "no", GROUP_NAME, "break_loop")
+            _connect(engine, STEP_NAME, "exec_out", GROUP_NAME, "break_loop")
+
+        result = await _run(engine, flow)
+
+        assert isinstance(result, StartFlowResultSuccess), result
+        assert len(_runs_of(engine, BRANCH_NAME)) == 1
+
     @pytest.mark.asyncio
     async def test_a_pass_that_never_reaches_an_exit_does_not_repeat_the_previous_passes_exit(
         self, engine: Engine, flow: str
