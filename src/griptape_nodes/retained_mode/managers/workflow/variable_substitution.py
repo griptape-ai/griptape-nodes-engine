@@ -49,6 +49,14 @@ class VariableSubstitution(EngineScoped):
         if old_key in self._enabled:
             self._enabled[new_key] = self._enabled.pop(old_key)
 
+    def copy(self, source_key: str, destination_key: str) -> None:
+        """Give `destination_key` the substitution flag of `source_key`, which keeps its own.
+
+        Like `rekey`, only copies a flag that was explicitly set.
+        """
+        if source_key in self._enabled:
+            self._enabled[destination_key] = self._enabled[source_key]
+
     def is_enabled(self) -> bool:
         """Return whether variable substitution is enabled for the current workflow.
 

@@ -177,7 +177,12 @@ class WorkflowBranching(EngineScoped):
 
     @handles(CreateWorkflowFromTemplateRequest)
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
-        """Create a new workflow file from a template (Griptape-provided or user-provided)."""
+        """Create a new workflow file from a template or from a workflow a library provides.
+
+        A workflow a library provides is always used by copying it, whatever its `is_template` says:
+        editing the library's own file in place would be overwritten by the next library update, and
+        for a workflow behind one of the library's nodes it would change what that node does.
+        """
         try:
             template_workflow = self.engine.workflow_registry.get_workflow_by_name(request.template_name)
         except KeyError:
@@ -187,10 +192,11 @@ class WorkflowBranching(EngineScoped):
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        if not template_workflow.metadata.is_template:
+        is_library_workflow = bool(template_workflow.metadata.is_griptape_provided)
+        if not template_workflow.metadata.is_template and not is_library_workflow:
             details = (
                 f"Attempted to create workflow from template '{request.template_name}'. "
-                "Failed because workflow is not marked as a template (is_template must be True)."
+                "Failed because the workflow is neither marked as a template nor provided by a library."
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
