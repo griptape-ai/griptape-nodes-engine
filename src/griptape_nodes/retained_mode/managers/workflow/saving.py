@@ -456,7 +456,11 @@ class WorkflowSaver(EngineScoped):
 
         # Saving an open library workflow wrote a copy instead of the library's file. Move the
         # current context onto the copy, so the next save lands in it rather than in yet another copy.
-        if self._is_open_library_workflow(save_target.scenario, current_workflow_name, registry_key):
+        if current_workflow_name is not None and self._is_open_library_workflow(
+            save_target.scenario, current_workflow_name, registry_key
+        ):
+            # The library workflow stays registered, so its substitution flag is copied, not moved.
+            self.engine.workflow_manager.variable_substitution.copy(current_workflow_name, registry_key)
             for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == current_workflow_name:
                     workflow_context_state._name = registry_key
@@ -470,12 +474,12 @@ class WorkflowSaver(EngineScoped):
         )
 
     def _is_open_library_workflow(
-        self, scenario: SaveWorkflowScenario, current_workflow_name: str | None, saved_registry_key: str
+        self, scenario: SaveWorkflowScenario, current_workflow_name: str, saved_registry_key: str
     ) -> bool:
         """Whether this save copied the library-provided workflow open in the current context."""
         if scenario != SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
             return False
-        if current_workflow_name is None or current_workflow_name == saved_registry_key:
+        if current_workflow_name == saved_registry_key:
             return False
         if not self.engine.workflow_registry.has_workflow_with_name(current_workflow_name):
             return False

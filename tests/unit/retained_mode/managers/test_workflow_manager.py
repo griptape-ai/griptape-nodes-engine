@@ -4336,6 +4336,27 @@ class TestWorkflowCreationOnTheDefaultProject:
             "library_workflow_1.py",
         ]
 
+    def test_saving_a_library_workflow_keeps_substitution_disabled(self, engine: Engine) -> None:
+        """A library workflow with variable substitution off stays off in its copy across saves."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+            SetVariableSubstitutionEnabledRequest,
+        )
+
+        library_key = self._make_library_workflow(engine, "library_workflow")
+        engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
+
+        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=library_key)))
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
+
+        assert engine.workflow_manager.variable_substitution.is_enabled() is False
+        assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
+        # The library workflow keeps its own setting.
+        assert engine.workflow_manager.variable_substitution._enabled[library_key] is False
+
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
         """Only library-provided workflows are copied on save; the user's own file is saved in place."""
         from griptape_nodes.retained_mode.events.workflow_events import (
