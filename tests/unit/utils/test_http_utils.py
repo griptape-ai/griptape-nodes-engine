@@ -255,3 +255,18 @@ class TestRequestWithRetry:
             )
         assert captured_kwargs["json"] == {"key": "value"}
         assert captured_kwargs["headers"] == {"Authorization": "Bearer token"}
+
+    def test_should_retry_decides_what_is_retried(self) -> None:
+        responses = [
+            httpx2.Response(429, request=httpx2.Request("POST", "https://example.com")),
+            httpx2.Response(200, request=httpx2.Request("POST", "https://example.com")),
+        ]
+
+        def retry_429(exc: BaseException) -> bool:
+            return isinstance(exc, httpx2.HTTPStatusError) and exc.response.status_code == 429  # noqa: PLR2004
+
+        with patch("griptape_nodes.utils.http_utils.httpx2.request", side_effect=responses) as request:
+            response = request_with_retry("POST", "https://example.com", wait=wait_none(), should_retry=retry_429)
+
+        assert response.status_code == HTTP_OK
+        assert request.call_count == EXPECTED_CALLS_AFTER_ONE_FAILURE

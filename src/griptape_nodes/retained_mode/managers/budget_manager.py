@@ -1,9 +1,10 @@
-"""BudgetManager - Describes which project an outbound call should be attributed to.
+"""BudgetManager - Attributes outbound calls to a project, and gates and reports direct provider spend.
 
-Holds no state: the project chain is read from the project manager per request, so a project
-switch between two calls shows up on the second. This module makes no network call and reads no
-credential; it labels a call, it does not decide whether the call is allowed. Cloud decides that,
-and `griptape_nodes.utils.budget_refusal` turns its refusal into something an artist can act on.
+The project chain is read from the project manager per request, so a project switch between two
+calls shows up on the second. Calls through Griptape Cloud carry the attribution header and Cloud
+enforces budgets itself; `griptape_nodes.utils.budget_refusal` turns its refusal into something
+an artist can act on. A direct provider call bypasses Cloud, so this manager asks
+`POST /api/budget-checks` before it and posts `POST /api/spend` after it.
 
 Project ids travel exactly as stored -- unstripped, uncut, never repaired.
 
@@ -14,27 +15,68 @@ full result, and worker forwarding puts the Success payload on the response topi
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
+import queue
+import threading
+import uuid
+from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin
 
+import httpx2
+
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_SCHEMA_VERSION,
+    BudgetAccessRequest,
+    BudgetAccessResultFailure,
+    BudgetAccessResultSuccess,
     GetAttributionContextRequest,
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
+    ReportUsageRequest,
+    ReportUsageResultFailure,
+    ReportUsageResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.utils.budget_refusal import (
+    BudgetExceededError,
+    describe,
+    log_line,
+    refusal_from_check,
+)
+from griptape_nodes.utils.http_utils import is_retryable_httpx_error, request_with_retry
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
+
+BUDGET_CHECKS_PATH = "/api/budget-checks"
+SPEND_PATH = "/api/spend"
+
+# The check blocks the node, so it gets one short attempt and fails open rather than retrying.
+CHECK_TIMEOUT_SECONDS = 5.0
+REPORT_TIMEOUT_SECONDS = 10.0
+REPORT_MAX_ATTEMPTS = 3
+
+# Cloud's length caps on the free-text descriptors. A value over its cap is left out rather than
+# sent, so one long name cannot get the whole report rejected.
+_DESCRIPTOR_CAPS = {"provider": 64, "model": 255, "activity_type": 255}
 
 
 def _build_attribution_payload(project_chain: list[str]) -> dict[str, Any]:
@@ -70,7 +112,7 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
 
 
 class BudgetManager(EngineScoped):
-    """Composes the attribution context for a credit-consuming call."""
+    """Attributes credit-consuming calls, and checks and reports direct provider spend with Cloud."""
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         """Initialize the BudgetManager.
@@ -80,6 +122,9 @@ class BudgetManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
+        # Reports post off the caller's thread. Not an asyncio task: a sync dispatch runs the
+        # handler under a short-lived loop that would take the task down with it.
+        self._report_executor = _DaemonQueue("budget-report")
         event_manager.register_request_handlers(self)
 
     @handles(GetAttributionContextRequest)
@@ -134,6 +179,96 @@ class BudgetManager(EngineScoped):
             ),
         )
 
+    @handles(BudgetAccessRequest)
+    async def on_budget_access_request(
+        self, request: BudgetAccessRequest
+    ) -> BudgetAccessResultSuccess | BudgetAccessResultFailure:
+        """Ask Cloud whether a direct provider call fits its budgets; fail open unless Cloud says no."""
+        correlation_id = uuid.uuid4().hex
+        body: dict[str, Any] = {
+            "tags": self._build_tags(request.node_type, request.node_id),
+            "model": request.model,
+            "correlation_id": correlation_id,
+        }
+        if request.estimated_cost_micro_usd is not None:
+            body["estimated_cost_micro_usd"] = request.estimated_cost_micro_usd
+
+        try:
+            # Off the event loop: a slow Cloud would otherwise freeze the engine for the timeout.
+            response = await asyncio.to_thread(
+                self._post, BUDGET_CHECKS_PATH, body, timeout=CHECK_TIMEOUT_SECONDS, max_attempts=1
+            )
+        except _NoCredentialError:
+            return self._unchecked(request.model, correlation_id, f"Failed because {MISSING_CREDENTIAL_MESSAGE}")
+        except httpx2.HTTPStatusError as exc:
+            return self._refused_over_http(request.model, correlation_id, exc.response.status_code)
+        # InvalidURL is not an HTTPError: a mistyped GT_CLOUD_BASE_URL must still fail open.
+        except (httpx2.HTTPError, httpx2.InvalidURL):
+            return self._unchecked(request.model, correlation_id, "Failed because Griptape Cloud could not be reached.")
+
+        result = _decision(response)
+        if result is None:
+            return self._unchecked(
+                request.model, correlation_id, "Failed because Griptape Cloud's answer could not be read."
+            )
+
+        if result["allowed"] is False:
+            refusal = refusal_from_check(result)
+            message = describe(refusal)
+            logger.warning(log_line(refusal))
+            blocked_by = result.get("blocked_by")
+            if not isinstance(blocked_by, list):
+                blocked_by = []
+            return BudgetAccessResultFailure(
+                blocked_by=[entry for entry in blocked_by if isinstance(entry, dict)],
+                correlation_id=correlation_id,
+                result_details=message,
+                exception=BudgetExceededError(message, refusal),
+            )
+
+        remaining = result.get("effective_remaining_credits")
+        if isinstance(remaining, bool) or not isinstance(remaining, int):
+            remaining = None
+        return BudgetAccessResultSuccess(
+            correlation_id=correlation_id,
+            checked=True,
+            effective_remaining_credits=remaining,
+            result_details=f"Griptape Cloud cleared a direct call to model '{request.model}' against its budgets.",
+        )
+
+    @handles(ReportUsageRequest)
+    def on_report_usage_request(
+        self, request: ReportUsageRequest
+    ) -> ReportUsageResultSuccess | ReportUsageResultFailure:
+        """Queue a usage report for a direct provider call and return without waiting on Cloud."""
+        if request.declared_cost_micro_usd < 0:
+            return self._report_not_sent(
+                request.model, f"Failed because the declared cost {request.declared_cost_micro_usd} is negative."
+            )
+        if resolve_cloud_credential(self.engine.secrets_manager) is None:
+            return self._report_not_sent(request.model, f"Failed because {MISSING_CREDENTIAL_MESSAGE}")
+
+        # Minted once and captured in `body`, so every retry sends the same key.
+        idempotency_key = uuid.uuid4().hex
+        body: dict[str, Any] = {
+            "idempotency_key": idempotency_key,
+            "declared_cost_micro_usd": request.declared_cost_micro_usd,
+            "tags": self._build_tags(request.node_type, request.node_id),
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
+        for name, cap in _DESCRIPTOR_CAPS.items():
+            value = getattr(request, name)
+            if value is not None and len(value) <= cap:
+                body[name] = value
+        if request.correlation_id is not None:
+            body["correlation_id"] = request.correlation_id
+
+        self._report_executor.submit(self._send_report, body)
+        return ReportUsageResultSuccess(
+            idempotency_key=idempotency_key,
+            result_details=f"Queued a usage report for {_describe_call(request.model)}.",
+        )
+
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first.
 
@@ -151,3 +286,163 @@ class BudgetManager(EngineScoped):
             return None
 
         return [entry.id for entry in chain if entry.id.strip() != SYSTEM_DEFAULTS_KEY]
+
+    def _build_tags(self, node_type: str | None, node_id: str | None) -> dict[str, Any]:
+        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown."""
+        tags: dict[str, Any] = {}
+        project_chain = self._resolve_project_chain()
+        if project_chain:
+            tags["project"] = project_chain
+        context_manager = self.engine.context_manager
+        if context_manager.has_current_workflow():
+            tags["workflow"] = context_manager.get_current_workflow_name()
+        candidates = {
+            "node_type": node_type,
+            "node_id": node_id,
+            "engine_id": self.engine.get_engine_id(),
+            "session_id": self.engine.get_session_id(),
+        }
+        tags.update({key: value for key, value in candidates.items() if value is not None})
+        return tags
+
+    def _post(self, path: str, body: dict[str, Any], *, timeout: float, max_attempts: int) -> httpx2.Response:
+        """POST to Griptape Cloud. Raises `_NoCredentialError` or `httpx2.HTTPError`."""
+        secrets_manager = self.engine.secrets_manager
+        credential = resolve_cloud_credential(secrets_manager)
+        if credential is None:
+            raise _NoCredentialError
+        return request_with_retry(
+            "POST",
+            urljoin(resolve_cloud_base_url(secrets_manager), path),
+            max_attempts=max_attempts,
+            should_retry=_is_retryable_report_error,
+            json=body,
+            headers={"Authorization": f"Bearer {credential}"},
+            timeout=timeout,
+        )
+
+    def _send_report(self, body: dict[str, Any]) -> None:
+        """Post a usage report with bounded retries; log and drop it if Cloud cannot take it."""
+        try:
+            self._post(SPEND_PATH, body, timeout=REPORT_TIMEOUT_SECONDS, max_attempts=REPORT_MAX_ATTEMPTS)
+        except _NoCredentialError:
+            logger.warning("Dropped a usage report: %s", MISSING_CREDENTIAL_MESSAGE)
+        except httpx2.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (HTTPStatus.BAD_REQUEST, HTTPStatus.CONFLICT):
+                # The engine built a body Cloud rejects, or reused a key: a bug here, not in Cloud.
+                logger.error(
+                    "Griptape Cloud rejected usage report %s with HTTP %s: %s",
+                    body["idempotency_key"],
+                    status,
+                    exc.response.text,
+                )
+                return
+            logger.warning(
+                "Dropped usage report %s: Griptape Cloud answered HTTP %s: %s",
+                body["idempotency_key"],
+                status,
+                exc.response.text,
+            )
+        except (httpx2.HTTPError, httpx2.InvalidURL) as exc:
+            logger.warning("Dropped usage report %s: %s", body["idempotency_key"], exc)
+
+    def _unchecked(
+        self, model: str, correlation_id: str, reason: str, *, level: int = logging.WARNING
+    ) -> BudgetAccessResultSuccess:
+        """Clear a call Cloud could not be asked about. WARNING by default, since the work goes ahead."""
+        return BudgetAccessResultSuccess(
+            correlation_id=correlation_id,
+            checked=False,
+            result_details=ResultDetails(
+                message=(
+                    f"Attempted to check a direct call to model '{model}' against your budgets. {reason} "
+                    "The call will proceed without a budget check."
+                ),
+                level=level,
+            ),
+        )
+
+    def _refused_over_http(self, model: str, correlation_id: str, status: int) -> BudgetAccessResultSuccess:
+        """Clear a call Cloud answered with an HTTP error rather than a decision."""
+        if status == HTTPStatus.NOT_FOUND:
+            # The deployment has reporting switched off: the steady state there, not news.
+            return self._unchecked(
+                model,
+                correlation_id,
+                "Failed because this Griptape Cloud deployment does not offer budget checks.",
+                level=logging.DEBUG,
+            )
+        return self._unchecked(
+            model, correlation_id, f"Failed because Griptape Cloud refused the check (HTTP {status})."
+        )
+
+    def _report_not_sent(self, model: str | None, reason: str) -> ReportUsageResultFailure:
+        return ReportUsageResultFailure(
+            result_details=ResultDetails(
+                message=f"Attempted to report the cost of {_describe_call(model)}. {reason} The node is unaffected.",
+                level=logging.WARNING,
+            )
+        )
+
+
+def _decision(response: httpx2.Response) -> dict[str, Any] | None:
+    """Return a budget check's answer, or None when it is not JSON or carries no boolean `allowed`."""
+    try:
+        result = response.json()
+    except ValueError:
+        return None
+    if not isinstance(result, dict) or not isinstance(result.get("allowed"), bool):
+        return None
+    return result
+
+
+def _describe_call(model: str | None) -> str:
+    """Name a direct call by its model when the caller gave one."""
+    if model is None:
+        return "a direct model call"
+    return f"a direct call to model '{model}'"
+
+
+class _DaemonQueue:
+    """Runs submitted work in order on one daemon thread.
+
+    Daemon, unlike `ThreadPoolExecutor`'s workers, which interpreter exit waits on: with Cloud
+    hanging, every queued report would hold the engine open for its full retry budget. Reports
+    are best-effort, so the ones still pending at exit are dropped instead.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._work: queue.SimpleQueue[tuple[Callable[..., object], tuple[Any, ...]]] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._started = False
+
+    def submit(self, fn: Callable[..., object], *args: Any) -> None:
+        # Started on first use, so an engine that never reports never holds a thread.
+        with self._lock:
+            if not self._started:
+                threading.Thread(target=self._run, name=self._name, daemon=True).start()
+                self._started = True
+        self._work.put((fn, args))
+
+    def _run(self) -> None:
+        while True:
+            fn, args = self._work.get()
+            # One report failing in a way nothing anticipated must not end the thread and
+            # silently drop every report after it.
+            try:
+                fn(*args)
+            except Exception:
+                logger.exception("A usage report failed unexpectedly and was dropped.")
+
+
+class _NoCredentialError(Exception):
+    """No Griptape Cloud credential is configured."""
+
+
+def _is_retryable_report_error(exc: BaseException) -> bool:
+    """Retry transient failures, and 429 too: Cloud throttles reports per license."""
+    if isinstance(exc, httpx2.HTTPStatusError) and exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+        return True
+    return is_retryable_httpx_error(exc)

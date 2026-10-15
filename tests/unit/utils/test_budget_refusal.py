@@ -27,6 +27,7 @@ from griptape_nodes.utils.budget_refusal import (
     halt_message,
     log_line,
     refusal_from_body,
+    refusal_from_check,
     refusal_from_exception,
 )
 
@@ -661,3 +662,31 @@ class TestFindingTheHaltUnderItsWrappers:
         second.__cause__ = first
 
         assert halt_message(first) is None
+
+
+class TestADeniedBudgetCheck:
+    """`POST /api/budget-checks` answers 200 with `allowed: false`, not a 403 with a code."""
+
+    def test_reads_every_budget_and_the_receipt(self) -> None:
+        body = {
+            "allowed": False,
+            "blocked_by": [a_rejection(budget_name="a"), a_rejection(budget_name="b")],
+            "effective_remaining_credits": 0,
+            "spend_id": "receipt",
+        }
+
+        refusal = refusal_from_check(body)
+
+        assert [budget.budget_name for budget in refusal.budgets] == ["a", "b"]
+        assert refusal.effective_remaining_credits == 0
+        assert refusal.spend_id == "receipt"
+
+    @pytest.mark.parametrize("blocked_by", [[], [{"no": "name"}], "not a list", None])
+    def test_a_deny_naming_no_budget_still_refuses(self, blocked_by: object) -> None:
+        refusal = refusal_from_check({"allowed": False, "blocked_by": blocked_by})
+
+        assert refusal.budgets == ()
+        assert (
+            describe(refusal)
+            == f"{BUDGET_HALT_PREFIX} The next call was blocked by a budget. Contact your Griptape administrator."
+        )

@@ -9,6 +9,7 @@ from griptape_nodes.drivers.cloud_credentials import (
     BASE_URL_SETTING_NAME,
     LICENSE_SECRET_NAME,
     is_license_credential,
+    resolve_cloud_base_url,
     resolve_cloud_credential,
     resolve_cloud_host,
 )
@@ -122,6 +123,18 @@ class TestIsLicenseCredential:
     def test_classifies_credential(self, credential: str | None, expected: bool) -> None:  # noqa: FBT001
         """Only a three-segment JWT counts as a license."""
         assert is_license_credential(credential) is expected
+
+
+class TestResolveCloudBaseUrl:
+    """The deployment the engine posts budget checks and usage reports to."""
+
+    def test_no_override_is_production(self) -> None:
+        assert resolve_cloud_base_url() == "https://cloud.griptape.ai"
+
+    def test_a_workspace_env_override_wins(self) -> None:
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "https://dev.cloud.griptape.ai"})
+
+        assert resolve_cloud_base_url(secrets) == "https://dev.cloud.griptape.ai"  # type: ignore[arg-type]
 
 
 class TestResolveCloudHost:
