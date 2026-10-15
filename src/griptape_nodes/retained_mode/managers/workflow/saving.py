@@ -794,21 +794,16 @@ class WorkflowSaver(EngineScoped):
             )
 
         # Determine scenario and build target info
-        # Only treat as SAVE_FROM_TEMPLATE if this is a Griptape-provided template.
-        # User-marked templates (is_template=True but is_griptape_provided=False) should be saved normally.
-        target_is_griptape_template = (
-            target_workflow and target_workflow.metadata.is_template and target_workflow.metadata.is_griptape_provided
-        )
-        current_is_griptape_template = (
-            current_workflow
-            and current_workflow.metadata.is_template
-            and current_workflow.metadata.is_griptape_provided
-        )
+        # A workflow a library provides is never saved over: saving it writes a new copy
+        # (SAVE_FROM_TEMPLATE), whether or not it is marked as a template. User-marked templates
+        # (is_template=True but is_griptape_provided=False) are the user's own files and save normally.
+        target_is_library_workflow = target_workflow and target_workflow.metadata.is_griptape_provided
+        current_is_library_workflow = current_workflow and current_workflow.metadata.is_griptape_provided
         destination: ProjectFileDestination | None = None
         file_path: Path | None = None
-        if target_is_griptape_template or current_is_griptape_template:
-            # Griptape-provided template workflows always create new copies with unique names.
-            # Griptape-provided templates are always disk-backed, so file_path is guaranteed.
+        if target_is_library_workflow or current_is_library_workflow:
+            # Library-provided workflows always create new copies with unique names.
+            # Library-provided workflows are always disk-backed, so file_path is guaranteed.
             scenario = SaveWorkflowScenario.SAVE_FROM_TEMPLATE
             template_workflow = target_workflow or current_workflow
             if template_workflow is None or template_workflow.file_path is None:
