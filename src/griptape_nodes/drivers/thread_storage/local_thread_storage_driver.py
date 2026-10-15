@@ -5,7 +5,8 @@ Each thread lives in three files inside ``threads_directory``:
   * ``thread_{id}.json``       - the message history, encoded by
     :class:`pydantic_ai.messages.ModelMessagesTypeAdapter`.
   * ``thread_{id}.meta.json``  - a small metadata dict (title, timestamps,
-    archived flag, optional ``local_id``, optional ``tool_grants``).
+    archived flag, optional ``local_id``, ``tool_grants``, and
+    ``harness_sessions``).
   * ``thread_{id}.runs.json``  - per-run provider/model records; absent until
     the first run completes (old threads without this file are unaffected).
 
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
+from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver, HarnessSession
 from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 
@@ -90,6 +91,28 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             raw = []
         raw.append(asdict(record))
         atomic_write_bytes(runs_path, json.dumps(raw, indent=2).encode("utf-8"))
+
+    def get_harness_session(self, thread_id: str, harness_id: str) -> HarnessSession | None:
+        sessions = self._read_meta(thread_id).get("harness_sessions")
+        if not isinstance(sessions, dict):
+            return None
+        entry = sessions.get(harness_id)
+        if not isinstance(entry, dict):
+            return None
+        session_id = entry.get("session_id")
+        message_count = entry.get("message_count")
+        if not isinstance(session_id, str) or not session_id or not isinstance(message_count, int):
+            return None
+        return HarnessSession(session_id=session_id, message_count=message_count)
+
+    def set_harness_session(self, thread_id: str, harness_id: str, session: HarnessSession) -> None:
+        meta = self._read_meta(thread_id)
+        sessions = meta.get("harness_sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        sessions[harness_id] = asdict(session)
+        meta["harness_sessions"] = sessions
+        self._write_meta(thread_id, meta)
 
     def get_thread_metadata(self, thread_id: str) -> ThreadMetadata:
         meta = self._read_meta(thread_id)

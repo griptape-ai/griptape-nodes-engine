@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 from pydantic_ai.messages import ImageUrl, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 
+from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import HarnessSession
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import RunRecord
 
@@ -203,3 +204,25 @@ def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadSto
     assert thread.runs is not None
     assert len(thread.runs) == 1
     assert thread.runs[0].message_index == 1
+
+
+def test_harness_sessions_are_kept_per_harness(storage: LocalThreadStorageDriver) -> None:
+    """Update each CLI session independently."""
+    thread_id, _ = storage.create_thread()
+
+    storage.set_harness_session(thread_id, "claude_code", HarnessSession(session_id="a", message_count=2))
+    storage.set_harness_session(thread_id, "other_cli", HarnessSession(session_id="b", message_count=4))
+    storage.set_harness_session(thread_id, "claude_code", HarnessSession(session_id="a", message_count=6))
+
+    assert storage.get_harness_session(thread_id, "claude_code") == HarnessSession(session_id="a", message_count=6)
+    assert storage.get_harness_session(thread_id, "other_cli") == HarnessSession(session_id="b", message_count=4)
+    assert storage.get_harness_session(thread_id, "unused_cli") is None
+
+
+def test_malformed_harness_session_reads_as_none(storage: LocalThreadStorageDriver) -> None:
+    """Treat malformed session entries as absent."""
+    thread_id, _ = storage.create_thread()
+    storage.update_thread_metadata(thread_id, harness_sessions={"claude_code": {"session_id": ""}, "other_cli": "x"})
+
+    assert storage.get_harness_session(thread_id, "claude_code") is None
+    assert storage.get_harness_session(thread_id, "other_cli") is None

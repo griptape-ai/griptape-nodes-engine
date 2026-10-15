@@ -7,6 +7,7 @@ Griptape Cloud, etc.) but they all expose the same surface here.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
@@ -15,6 +16,14 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 if TYPE_CHECKING:
     from pydantic_ai.messages import ModelMessage
+
+
+@dataclass(frozen=True)
+class HarnessSession:
+    """``message_count`` marks the history prefix seen by the CLI; later messages need catch-up."""
+
+    session_id: str
+    message_count: int
 
 
 class BaseThreadStorageDriver(ABC):
@@ -123,4 +132,12 @@ class BaseThreadStorageDriver(ABC):
         history every time. Implementations are also responsible for bumping
         ``updated_at`` in metadata so the thread floats to the top of listings.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_harness_session(self, thread_id: str, harness_id: str) -> HarnessSession | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_harness_session(self, thread_id: str, harness_id: str, session: HarnessSession) -> None:
         raise NotImplementedError

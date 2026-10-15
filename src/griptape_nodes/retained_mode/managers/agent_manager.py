@@ -37,6 +37,7 @@ from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapt
 from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import UsageLimits
 
+from griptape_nodes.agents.cli import CLI_HARNESSES, CliHarnessError
 from griptape_nodes.agents.harness import (
     GTN_SERVER_NAME,
     AgentHarness,
@@ -613,7 +614,11 @@ class AgentManager(EngineScoped):
             err_msg = message
         else:
             err_msg = f"Error running agent: {message}"
-        logger.error(err_msg, exc_info=exc)
+        if isinstance(exc, CliHarnessError):
+            # Already worded for the user, such as a CLI that is not installed; a traceback adds nothing.
+            logger.error(err_msg)
+        else:
+            logger.error(err_msg, exc_info=exc)
         return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
 
     def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
@@ -1133,6 +1138,12 @@ class AgentManager(EngineScoped):
                     models=list(MODEL_CHOICES),
                     result_details="Griptape Cloud model list retrieved.",
                 )
+            if (harness_class := CLI_HARNESSES.get(request.provider)) is not None:
+                # The CLI decides which models it accepts; these are the common names.
+                return ListProviderModelsResultSuccess(
+                    models=list(harness_class.suggested_models),
+                    result_details=f"{harness_class.display_name} model suggestions retrieved.",
+                )
 
             base_url = request.base_url.rstrip("/")
             if not base_url:
@@ -1194,7 +1205,25 @@ class AgentManager(EngineScoped):
         return {result.header_name: result.header_value}
 
     def _build_harness(self, provider_name: str | None, model_name: str | None) -> AgentHarness:
-        return self._build_runner(provider_name=provider_name, model_name=model_name)
+        """CLI state lives in its session, so only Pydantic AI runners need caching."""
+        provider = self._get_provider(provider_name)
+        harness_class = CLI_HARNESSES.get(provider.type)
+        if harness_class is None:
+            return self._build_runner(provider_name=provider_name, model_name=model_name)
+
+        commands = config_manager.get_config_value("agent.cli_commands", default={})
+        command = commands.get(provider.type) if isinstance(commands, dict) else None
+        harness = harness_class(
+            workspace_root=Path(config_manager.workspace_path),
+            storage=self._thread_storage,
+            engine_mcp_url=self._engine_mcp_url(),
+            model=model_name or provider.model or None,
+            command=command or None,
+            max_turns=DEFAULT_AGENT_USAGE_LIMITS.request_limit,
+        )
+        base_instructions = _build_agent_instructions(include_image_tool=False, tool_name=harness.mcp_tool_name)
+        harness.instructions = "\n\n".join(part for part in (base_instructions, self._system_prompt_extra) if part)
+        return harness
 
     def _engine_mcp_url(self) -> str:
         return f"http://localhost:{self._mcp_server_port}/mcp/"

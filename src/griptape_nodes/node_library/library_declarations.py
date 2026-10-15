@@ -178,6 +178,14 @@ class ModelCatalogLibraryProperty(BaseModel):
     providers: dict[str, ModelProvider] = Field(default_factory=dict)
 
 
+class SidebarProviderKind(StrEnum):
+    MODEL = "model"
+    """The engine's own agent loop calls the provider's models."""
+
+    CLI_HARNESS = "cli_harness"
+    """The engine runs a coding-agent CLI installed on the user's computer, which calls its own models."""
+
+
 class SidebarModelProvider(ModelProvider):
     """Extends ModelProvider with UI fields used by the engine's chat sidebar.
 
@@ -188,6 +196,7 @@ class SidebarModelProvider(ModelProvider):
     default_base_url: str | None = None
     has_model_list: bool = False
     default_model: str = ""
+    kind: SidebarProviderKind = SidebarProviderKind.MODEL
 
 
 class ModelCatalogSidebarProperty(BaseModel):

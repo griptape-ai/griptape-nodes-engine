@@ -21,6 +21,7 @@ from griptape_nodes.node_library.library_declarations import (
     KeySupport,
     ModelCatalogSidebarProperty,
     SidebarModelProvider,
+    SidebarProviderKind,
 )
 
 
@@ -29,6 +30,7 @@ class ProviderID(StrEnum):
     OLLAMA = "ollama"
     LMSTUDIO = "lmstudio"
     CUSTOM = "custom"
+    CLAUDE_CODE = "claude_code"
 
 
 # --- Per-family arg presets ---
@@ -250,6 +252,13 @@ PROVIDER_CATALOG = ModelCatalogSidebarProperty(
             has_model_list=False,
             default_model="",
         ),
+        ProviderID.CLAUDE_CODE: SidebarModelProvider(
+            display_name="Claude Code",
+            terms_url="https://www.anthropic.com/legal/consumer-terms",
+            notes="Runs the Claude Code CLI installed on this computer, with its own sign-in and settings.",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            kind=SidebarProviderKind.CLI_HARNESS,
+        ),
     }
 )
 
@@ -266,6 +275,7 @@ class ProviderCatalogEntry(BaseModel):
     default_base_url: str | None = None
     has_model_list: bool = False
     default_model: str = ""
+    kind: SidebarProviderKind = SidebarProviderKind.MODEL
 
 
 def provider_accepts_customer_key(provider_id: str) -> bool:

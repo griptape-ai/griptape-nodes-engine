@@ -1,6 +1,7 @@
 import pytest
 from pydantic_ai.settings import ModelSettings
 
+from griptape_nodes.agents.cli import CLI_HARNESSES
 from griptape_nodes.drivers.cloud_models import (
     _PRESET_KEY_KINDS,
     DEPRECATED_MODELS,
@@ -10,7 +11,9 @@ from griptape_nodes.drivers.cloud_models import (
     MODEL_CHOICES_ARGS,
     MODEL_SETTINGS,
     O_SERIES_MODELS,
+    PROVIDER_CATALOG,
     VISION_MODEL_CHOICES,
+    SidebarProviderKind,
     _PresetKeyKind,
     model_settings_for,
 )
@@ -119,3 +122,14 @@ class TestModelSettings:
         assert settings is not None
         settings["max_tokens"] = 1
         assert MODEL_SETTINGS["claude-opus-5"]["max_tokens"] == 64000  # noqa: PLR2004
+
+
+def test_every_cli_provider_has_a_harness() -> None:
+    """Match catalog CLI providers to registered harnesses."""
+    cli_providers = {
+        provider_id
+        for provider_id, provider in PROVIDER_CATALOG.providers.items()
+        if provider.kind == SidebarProviderKind.CLI_HARNESS
+    }
+
+    assert cli_providers == set(CLI_HARNESSES)

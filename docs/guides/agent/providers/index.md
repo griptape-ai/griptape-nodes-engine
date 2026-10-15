@@ -6,12 +6,13 @@ Griptape Nodes supports multiple AI providers for the [Agent](../index.md) and t
 
 ## Available Providers
 
-| Provider                                  | Type                   | API Key Required |
-| ----------------------------------------- | ---------------------- | ---------------- |
-| [Griptape Cloud](./griptape_cloud.md)     | Hosted proxy (default) | Griptape API key |
-| [Ollama](./ollama.md)                     | Local                  | No               |
-| [LM Studio](./lm_studio.md)               | Local                  | No               |
-| [Custom (OpenAI-compatible)](./custom.md) | Hosted or local        | Yes              |
+| Provider                                                  | Type                       | API Key Required                 |
+| --------------------------------------------------------- | -------------------------- | -------------------------------- |
+| [Griptape Cloud](./griptape_cloud.md)                     | Hosted proxy (default)     | Griptape API key                 |
+| [Ollama](./ollama.md)                                     | Local                      | No                               |
+| [LM Studio](./lm_studio.md)                               | Local                      | No                               |
+| [Custom (OpenAI-compatible)](./custom.md)                 | Hosted or local            | Yes                              |
+| [Coding agent CLIs](./coding_agent_clis.md) (Claude Code) | Installed on your computer | No, the CLI uses its own sign-in |
 
 ## Adding a Provider
 

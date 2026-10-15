@@ -19,6 +19,8 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.cli import CLI_HARNESSES
+from griptape_nodes.agents.cli.claude_code import ClaudeCodeHarness
 from griptape_nodes.agents.harness import (
     AgentRunResult,
     MCPServerSpec,
@@ -39,6 +41,7 @@ from griptape_nodes.drivers.cloud_models import (
     ProviderCatalogEntry,
     provider_catalog_entries,
 )
+from griptape_nodes.node_library.library_declarations import SidebarProviderKind
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -70,12 +73,14 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListProviderModelsResultSuccess,
     PromptDriverConfig,
     ProviderConfig,
+    ResolveToolApprovalsRequest,
     RunAgentRequest,
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
     RunRecord,
     ThreadMetadata,
+    ToolApprovalDecision,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
@@ -97,6 +102,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _SKILLS_README,
     _UNAVAILABLE_IMAGE_PLACEHOLDER,
     _VALID_PROVIDER_TYPES,
+    DEFAULT_AGENT_USAGE_LIMITS,
     AgentManager,
     ComposedPrompt,
     _ActiveRun,
@@ -1636,3 +1642,106 @@ class TestGetThreadMetadataHandler:
         result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="t1"))
         assert isinstance(result, GetThreadMetadataResultSuccess)
         assert result.thread is thread
+
+
+class TestCliHarnessProviders:
+    @staticmethod
+    def _with_claude_provider(manager: AgentManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        manager._providers.append(ProviderConfig(name="my-claude", type="claude_code", model="opus"))
+        manager._mcp_server_port = 4321
+        manager._system_prompt_extra = "Prefer short replies."
+        manager._thread_storage = object()  # type: ignore[assignment]
+        settings = {"agent.cli_commands": {"claude_code": "/opt/claude"}}
+        monkeypatch.setattr(
+            _AGENT_MANAGER_MODULE + ".config_manager",
+            SimpleNamespace(
+                workspace_path=str(tmp_path),
+                get_config_value=lambda key, default=None: settings.get(key, default),
+            ),
+        )
+
+    def test_cli_provider_gets_its_harness(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Build the CLI harness with provider and engine settings."""
+        self._with_claude_provider(providers_manager, monkeypatch, tmp_path)
+
+        harness = providers_manager._build_harness(provider_name="my-claude", model_name=None)
+
+        assert isinstance(harness, ClaudeCodeHarness)
+        assert harness.model == "opus"
+        assert harness.command == "/opt/claude"
+        assert harness.engine_mcp_url == "http://localhost:4321/mcp/"
+        assert harness.workspace_root == tmp_path
+        assert harness.max_turns == DEFAULT_AGENT_USAGE_LIMITS.request_limit
+
+    def test_cli_instructions_name_tools_the_cli_way_and_keep_the_users_prompt(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Use CLI tool names and retain the user's system instructions."""
+        self._with_claude_provider(providers_manager, monkeypatch, tmp_path)
+
+        harness = providers_manager._build_harness(provider_name="my-claude", model_name="sonnet")
+
+        assert isinstance(harness, ClaudeCodeHarness)
+        assert harness.model == "sonnet"
+        assert harness.instructions is not None
+        assert "mcp__GriptapeNodes__ListRegisteredLibrariesRequest" in harness.instructions
+        assert "generate_image" not in harness.instructions
+        assert harness.instructions.endswith("Prefer short replies.")
+
+    def test_model_provider_gets_the_pydantic_runner(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Use the Pydantic runner for model providers."""
+        sentinel = object()
+        monkeypatch.setattr(providers_manager, "_build_runner", lambda **_k: sentinel)
+
+        assert providers_manager._build_harness(provider_name="my-ollama", model_name=None) is sentinel
+
+    @pytest.mark.asyncio
+    async def test_cli_provider_lists_suggested_models(self, providers_manager: AgentManager) -> None:
+        """Offer the CLI's suggested model names."""
+        result = await providers_manager.on_handle_list_provider_models_request(
+            ListProviderModelsRequest(provider="claude_code")
+        )
+
+        assert isinstance(result, ListProviderModelsResultSuccess)
+        assert result.models == list(ClaudeCodeHarness.suggested_models)
+
+    def test_every_cli_provider_in_the_catalog_has_a_harness(self) -> None:
+        """Match catalog CLI providers to registered harnesses."""
+        cli_providers = {
+            provider_id
+            for provider_id, provider in PROVIDER_CATALOG.providers.items()
+            if provider.kind == SidebarProviderKind.CLI_HARNESS
+        }
+
+        assert cli_providers == set(CLI_HARNESSES)
+
+    @pytest.mark.asyncio
+    async def test_approval_for_a_harness_that_never_asks_saves_no_grants(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Refuse before saving "Approve for conversation" grants."""
+        manager = AgentManager.__new__(AgentManager)
+        updates: list[dict[str, object]] = []
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [],
+            update_thread_metadata=lambda _t, **kwargs: updates.append(kwargs),
+        )
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".pending_tool_calls", lambda _history: [object()])
+        cli_harness = ClaudeCodeHarness(
+            workspace_root=tmp_path, storage=manager._thread_storage, engine_mcp_url="http://localhost:1/mcp/"
+        )
+        monkeypatch.setattr(manager, "_build_harness", lambda **_k: cli_harness)
+        request = ResolveToolApprovalsRequest(
+            thread_id="t1",
+            decisions=[ToolApprovalDecision(tool_call_id="call-1", decision="approve_for_conversation")],
+        )
+
+        result = await manager._resolve_tool_approvals_on_claimed_thread(request, "t1", active=None)  # type: ignore[arg-type]
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "runs its tools without asking" in result.error["message"]
+        assert updates == []
