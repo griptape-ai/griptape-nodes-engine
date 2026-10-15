@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
@@ -14,8 +15,6 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 if TYPE_CHECKING:
     import pytest
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestEngineHeartbeatOrchestratorId:
@@ -63,3 +62,31 @@ class TestEngineHeartbeatOperatingSystem:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.engine_os == "sentinel-os"
+
+
+class TestEngineHeartbeatInstanceId:
+    """Heartbeat reports an instance_id that changes when the engine restarts.
+
+    engine_id and session_id both survive a restart, so without this a client that reconnects
+    to a restarted engine within its heartbeat budget can't tell that the engine lost its state.
+    """
+
+    def test_stays_the_same_for_one_engine(self, engine: Engine) -> None:
+        first = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-1"))
+        second = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-2"))
+
+        assert isinstance(first, EngineHeartbeatResultSuccess)
+        assert isinstance(second, EngineHeartbeatResultSuccess)
+        assert first.instance_id
+        assert first.instance_id == second.instance_id
+
+    def test_differs_for_a_restarted_engine(self, engine: Engine) -> None:
+        restarted = Engine()
+
+        before = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-before"))
+        after = restarted.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-after"))
+
+        assert isinstance(before, EngineHeartbeatResultSuccess)
+        assert isinstance(after, EngineHeartbeatResultSuccess)
+        assert after.instance_id
+        assert after.instance_id != before.instance_id

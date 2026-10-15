@@ -447,6 +447,8 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
+        instance_id: Random id generated each time the engine starts, so a client can detect a
+            restart that kept the same engine_id and session_id
         orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
             worker process, or None when this engine IS the orchestrator. A discovery client
             treats a non-None value as "this is a worker engine, nest it under that orchestrator".
@@ -485,6 +487,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # always fills this in, so the "" default means the heartbeat came from an engine too old
     # to report it -- a client should show nothing rather than guess.
     engine_os: str = ""
+    # Random id generated each time the engine starts. engine_id and session_id survive a
+    # restart, so a client that sees this change knows the engine restarted and that anything
+    # it loaded from the old process is stale, even if its connection never dropped.
+    # Defaulted for backward compatibility with older clients.
+    instance_id: str | None = None
 
 
 @dataclass

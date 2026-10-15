@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -176,6 +177,7 @@ class Engine:
     _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
     _workflow_registry: _WorkflowRegistry
+    _instance_id: str
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -221,6 +223,8 @@ class Engine:
             WorkflowManager,
         )
 
+        # Fresh on every start, unlike engine_id and session_id, which survive a restart.
+        self._instance_id = str(uuid.uuid4())
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -643,6 +647,7 @@ class Engine:
                 engine_name=engine_name,
                 engine_os=self._os_manager.platform_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
+                instance_id=self._instance_id,
                 session_id=self._session_manager.active_session_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
                 user=user,
