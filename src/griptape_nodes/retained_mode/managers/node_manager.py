@@ -897,13 +897,17 @@ class NodeManager(EngineScoped):
             else:
                 # Place the paired End node in the same group as the Start node (if any).
                 paired_parent_group_name = node.parent_group.name if node.parent_group else None
+                # Place the End node to the right of the Start node. A Start node created without a
+                # position (e.g. over the API) leaves the End node's placement to the client as well.
+                end_metadata = {}
+                start_position = node.metadata.get("position")
+                if start_position is not None:
+                    end_metadata["position"] = {"x": start_position["x"] + 650, "y": start_position["y"]}
                 # Create the EndNode
                 end_loop = self.engine.handle_request(
                     CreateNodeRequest(
                         node_type=end_class_name,
-                        metadata={
-                            "position": {"x": node.metadata["position"]["x"] + 650, "y": node.metadata["position"]["y"]}
-                        },
+                        metadata=end_metadata,
                         override_parent_flow_name=parent_flow_name,
                         parent_group_name=paired_parent_group_name,
                     )
