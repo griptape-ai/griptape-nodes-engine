@@ -37,28 +37,30 @@ from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapt
 from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import UsageLimits
 
-from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
-from griptape_nodes.agents.pydantic_ai.mcp_servers import grant_keys_for_call, streamable_http_local
-from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
-    MCPToolsetCache,
-    MCPToolsetLease,
-)
-from griptape_nodes.agents.pydantic_ai.runner import (
-    DEFAULT_SKILLS_DIRECTORY,
+from griptape_nodes.agents.harness import (
+    GTN_SERVER_NAME,
+    AgentHarness,
     AgentRunResult,
-    PydanticAgentRunner,
+    AgentTurn,
+    MCPServerSpec,
     RunEvent,
     TextDelta,
     ThinkingDelta,
+    ToolApprovalHarness,
     ToolCall,
     ToolResult,
+    UserMessage,
 )
-from griptape_nodes.agents.pydantic_ai.tool_approval import (
-    TOOL_DENIED_BY_NEW_MESSAGE,
-    TOOL_DENIED_BY_USER_MESSAGE,
-    ToolApprovalDeps,
-    pending_tool_calls,
+from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
+from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    grant_keys_for_call,
+    prefixed_tool_name,
+    streamable_http_local,
 )
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
+from griptape_nodes.agents.pydantic_ai.runner import DEFAULT_SKILLS_DIRECTORY, PydanticAgentRunner
+from griptape_nodes.agents.pydantic_ai.tool_approval import TOOL_DENIED_BY_USER_MESSAGE
+from griptape_nodes.agents.thread_history import pending_tool_calls
 from griptape_nodes.drivers.cloud_credentials import (
     BASE_URL_SETTING_NAME,
     DEFAULT_CLOUD_BASE_URL,
@@ -171,7 +173,7 @@ from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from pydantic_ai.messages import ModelMessage, ToolCallPart, UserContent
     from pydantic_ai.toolsets import AbstractToolset
@@ -200,7 +202,7 @@ secrets_manager = SecretsManager(config_manager)
 _AGENT_INSTRUCTIONS_BASE = (
     "You are a coding assistant embedded in Griptape Nodes. You operate by calling tools.\n\n"
     "Tools available to you:\n"
-    "  - GriptapeNodes MCP tools (prefixed `GriptapeNodes_`). Use these to interact with the "
+    "  - GriptapeNodes MCP tools (prefixed `{engine_tool_prefix}`). Use these to interact with the "
     "engine: list libraries and node types, create nodes, set parameter values, wire "
     "connections, save and run workflows.\n"
     "{image_tool_line}"
@@ -210,8 +212,8 @@ _AGENT_INSTRUCTIONS_BASE = (
     "     task requires tool work, call the relevant tools in the SAME turn as your "
     "     acknowledgment. A response of the form 'I'll do X' with no tool calls is wrong.\n"
     "  2. When the user asks you to build, create, modify, inspect, or run something, "
-    "     start with discovery tool calls (e.g. GriptapeNodes_ListRegisteredLibrariesRequest, "
-    "     GriptapeNodes_ListNodeTypesInLibraryRequest) before doing anything that "
+    "     start with discovery tool calls (e.g. {list_libraries_tool}, "
+    "     {list_node_types_tool}) before doing anything that "
     "     mutates state.\n"
     "  3. Make multiple tool calls in parallel when they don't depend on each other.\n"
     "  4. Only after you have actually completed the user's task should you produce a final "
@@ -237,12 +239,17 @@ _TOOL_APPROVAL_INSTRUCTIONS = (
 )
 
 
-def _build_agent_instructions(*, include_image_tool: bool) -> str:
+def _build_agent_instructions(*, include_image_tool: bool, tool_name: Callable[[str, str], str]) -> str:
     image_tool_line = _IMAGE_TOOL_INSTRUCTION if include_image_tool else ""
-    return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
+    return _AGENT_INSTRUCTIONS_BASE.format(
+        image_tool_line=image_tool_line,
+        engine_tool_prefix=tool_name(GTN_SERVER_NAME, ""),
+        list_libraries_tool=tool_name(GTN_SERVER_NAME, "ListRegisteredLibrariesRequest"),
+        list_node_types_tool=tool_name(GTN_SERVER_NAME, "ListNodeTypesInLibraryRequest"),
+    )
 
 
-def _compose_server_rules(configs: Sequence[Mapping[str, Any]]) -> str:
+def _compose_server_rules(servers: Sequence[MCPServerSpec]) -> str:
     """Collect the per-server guidance for the MCP servers attached to one run.
 
     Composed per run rather than baked into the agent so editing a server's
@@ -251,16 +258,17 @@ def _compose_server_rules(configs: Sequence[Mapping[str, Any]]) -> str:
     same as when these were concatenated at construction time.
     """
     parts = [
-        f"Rules for MCP server '{config['name']}':\n{config['rules'].strip()}"
-        for config in configs
-        if isinstance(config.get("rules"), str) and config["rules"].strip()
+        f"Rules for MCP server '{server.name}':\n{server.config['rules'].strip()}"
+        for server in servers
+        if isinstance(server.config.get("rules"), str) and server.config["rules"].strip()
     ]
     return "\n\n".join(parts)
 
 
-def _compose_run_instructions(server_rules: str) -> str:
-    """Join the instructions that apply to one run: MCP server rules, then approval rules."""
-    parts = [server_rules, _TOOL_APPROVAL_INSTRUCTIONS]
+def _compose_run_instructions(server_rules: str, *, include_approval_rules: bool) -> str:
+    parts = [server_rules]
+    if include_approval_rules:
+        parts.append(_TOOL_APPROVAL_INSTRUCTIONS)
     return "\n\n".join(part for part in parts if part)
 
 
@@ -476,13 +484,7 @@ class _RunnerCacheKey(NamedTuple):
 
 @dataclass
 class _MCPAttachment:
-    """The MCP toolsets and guidance to attach to a single agent run.
-
-    ``lease`` must be released once the run is done - use it as an async context
-    manager - or the servers it names can never be torn down.
-    """
-
-    lease: MCPToolsetLease
+    servers: list[MCPServerSpec]
     instructions: str
 
 
@@ -658,29 +660,18 @@ class AgentManager(EngineScoped):
         history = self._thread_storage.load_history(thread_id)
         is_first_run = len(history) == 0
 
-        # Sending a message instead of answering an approval card declines every
-        # call the card was asking about, in the same request as the message.
-        deferred_tool_results: DeferredToolResults | None = None
-        waiting = pending_tool_calls(history)
-        if waiting:
-            deferred_tool_results = DeferredToolResults(
-                approvals={call.tool_call_id: ToolDenied(TOOL_DENIED_BY_NEW_MESSAGE) for call in waiting}
-            )
-
-        granted = frozenset(self._thread_storage.get_thread_metadata(thread_id).tool_grants)
-
         composed = await _compose_prompt(request.input, request.url_artifacts)
-        result = await self._run_turn(
+        harness = self._build_harness(provider_name=request.provider_name, model_name=request.model_name)
+        turn = await self._build_turn(
+            harness,
             thread_id=thread_id,
             active=active,
             provider_name=request.provider_name,
-            model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
-            prompt=composed.live,
-            persist_prompt=composed.persist,
-            approval=ToolApprovalDeps(granted=granted),
-            deferred_tool_results=deferred_tool_results,
         )
+        # Sending a message instead of answering an approval card declines every
+        # call the card was asking about; the harness does that with the message.
+        result = await harness.run_turn(turn, UserMessage(content=composed.live, persist_content=composed.persist))
 
         # A first run creates the thread; title it from the input even when the
         # turn is cancelled, so a quick send-then-cancel doesn't leave a
@@ -725,6 +716,16 @@ class AgentManager(EngineScoped):
             details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the agent is not waiting for approval there."
             return RunAgentResultFailure(error={"message": details}, result_details=details)
 
+        harness = self._build_harness(provider_name=request.provider_name, model_name=request.model_name)
+        # Checked before saving grants, which would otherwise outlive the refusal.
+        if not isinstance(harness, ToolApprovalHarness):
+            details = (
+                f"Attempted to answer the approval request in conversation {thread_id}. Failed because the "
+                "selected provider runs its tools without asking, so it cannot continue this approval. "
+                "Send a new message instead."
+            )
+            return RunAgentResultFailure(error={"message": details}, result_details=details)
+
         granted_before = frozenset(self._thread_storage.get_thread_metadata(thread_id).tool_grants)
         try:
             plan = _plan_tool_approvals(waiting, request.decisions, granted_before)
@@ -732,20 +733,18 @@ class AgentManager(EngineScoped):
             details = str(e)
             return RunAgentResultFailure(error={"message": details}, result_details=details)
 
+        # Saved before resuming: the harness reads the thread's grants from storage.
         if plan.granted != granted_before:
             self._thread_storage.update_thread_metadata(thread_id, tool_grants=sorted(plan.granted))
 
-        result = await self._run_turn(
+        turn = await self._build_turn(
+            harness,
             thread_id=thread_id,
             active=active,
             provider_name=request.provider_name,
-            model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
-            prompt=None,
-            persist_prompt=None,
-            approval=ToolApprovalDeps(granted=plan.granted),
-            deferred_tool_results=plan.results,
         )
+        result = await harness.resume_turn(turn, plan.results)
         return self._finish_turn(
             result,
             provider_name=request.provider_name,
@@ -753,28 +752,20 @@ class AgentManager(EngineScoped):
             mcp_server_names=request.additional_mcp_servers,
         )
 
-    async def _run_turn(  # noqa: PLR0913
+    async def _build_turn(
         self,
+        harness: AgentHarness,
         *,
         thread_id: str,
         active: _ActiveRun,
         provider_name: str | None,
-        model_name: str | None,
         mcp_server_names: list[str],
-        prompt: str | list[UserContent] | None,
-        persist_prompt: str | list[UserContent] | None,
-        approval: ToolApprovalDeps,
-        deferred_tool_results: DeferredToolResults | None,
-    ) -> AgentRunResult:
-        """Run one agent turn on ``thread_id``, streaming its events.
+    ) -> AgentTurn:
+        """Describe one agent turn on ``thread_id``, streaming its events to the editor.
 
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
         is what ``CancelAgentRequest`` sets.
         """
-        runner = self._build_runner(
-            provider_name=provider_name,
-            model_name=model_name,
-        )
         attribution_headers = await self._attribution_headers(provider_name)
 
         event_manager = self.engine.event_manager
@@ -789,23 +780,17 @@ class AgentManager(EngineScoped):
                 ),
             )
 
-        # Nothing may sit between this and the `async with` that releases
-        # it: a server left with a stray use count is never shut down.
-        mcp = await self._acquire_mcp_toolsets(mcp_server_names)
-        async with mcp.lease:
-            return await runner.run(
-                prompt,
-                thread_id=thread_id,
-                event_sink=emit,
-                cancel_event=active.cancel_event,
-                persist_prompt=persist_prompt,
-                history_rehydrator=_rehydrate_history,
-                extra_toolsets=mcp.lease.toolsets,
-                extra_instructions=_compose_run_instructions(mcp.instructions),
-                extra_headers=attribution_headers,
-                approval=approval,
-                deferred_tool_results=deferred_tool_results,
-            )
+        mcp = await self._resolve_mcp_servers(mcp_server_names)
+        return AgentTurn(
+            thread_id=thread_id,
+            event_sink=emit,
+            cancel_event=active.cancel_event,
+            instructions=_compose_run_instructions(
+                mcp.instructions, include_approval_rules=isinstance(harness, ToolApprovalHarness)
+            ),
+            mcp_servers=mcp.servers,
+            extra_headers=attribution_headers,
+        )
 
     def _claim_thread(self, thread_id: str) -> _ActiveRun | None:
         """Mark ``thread_id`` as running a turn, or return ``None`` when it already is.
@@ -1208,6 +1193,12 @@ class AgentManager(EngineScoped):
             return {}
         return {result.header_name: result.header_value}
 
+    def _build_harness(self, provider_name: str | None, model_name: str | None) -> AgentHarness:
+        return self._build_runner(provider_name=provider_name, model_name=model_name)
+
+    def _engine_mcp_url(self) -> str:
+        return f"http://localhost:{self._mcp_server_port}/mcp/"
+
     def _build_runner(
         self,
         provider_name: str | None = None,
@@ -1263,7 +1254,7 @@ class AgentManager(EngineScoped):
         # The engine's own MCP server is the only one baked into the agent: the
         # engine owns its lifetime and its address cannot change mid-session.
         mcp_servers: list[AbstractToolset[Any]] = [
-            streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/"),
+            streamable_http_local(self._engine_mcp_url()),
         ]
 
         runner = PydanticAgentRunner(
@@ -1273,12 +1264,16 @@ class AgentManager(EngineScoped):
             base_url=model_base_url,
             workspace_root=workspace_root,
             storage=self._thread_storage,
-            instructions=_build_agent_instructions(include_image_tool=image_config is not None),
+            instructions=_build_agent_instructions(
+                include_image_tool=image_config is not None, tool_name=prefixed_tool_name
+            ),
             system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
+            mcp_toolset_cache=self._mcp_toolsets,
+            history_rehydrator=_rehydrate_history,
         )
         self._runner_cache[cache_key] = runner
         return runner
@@ -1471,18 +1466,17 @@ class AgentManager(EngineScoped):
         if gc and gc.model != default_model:
             config_manager.set_config_value("agent.griptape_cloud_model", gc.model)
 
-    async def _acquire_mcp_toolsets(self, server_names: list[str]) -> _MCPAttachment:
-        """Lease a live toolset for each requested MCP server, plus its rules.
+    async def _resolve_mcp_servers(self, server_names: list[str]) -> _MCPAttachment:
+        """Look up the current config of each requested MCP server, plus its rules.
 
         Runs on every agent run, and reads the servers' current configuration
         each time, which is what lets an edit take effect without an engine
-        restart. Servers whose config is unchanged keep their warm connection;
-        an edited one is restarted, and one that has been deleted or disabled is
-        shut down here rather than lingering for the session.
+        restart. Live connections to servers that have been deleted or disabled
+        are shut down here rather than lingering for the session.
         """
         enabled = self._lookup_enabled_mcp_servers()
         if enabled is None:
-            return _MCPAttachment(lease=await self._mcp_toolsets.acquire([]), instructions="")
+            return _MCPAttachment(servers=[], instructions="")
 
         await self._mcp_toolsets.retain_only(enabled)
 
@@ -1494,17 +1488,9 @@ class AgentManager(EngineScoped):
                 ", ".join(sorted(unavailable)),
             )
 
-        configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
-        lease = await self._mcp_toolsets.acquire(configs)
-        instructions = _compose_server_rules(configs)
-        # Config digests answer "my edit didn't take effect": a digest that moved
-        # between runs says the new config really was read. The rules text is
-        # never logged - free-text the user may have pasted anything into.
-        logger.debug(
-            "Agent run attached MCP server(s) %s",
-            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
-        )
-        return _MCPAttachment(lease=lease, instructions=instructions)
+        servers = [MCPServerSpec(name=name, config=enabled[name]) for name in server_names if name in enabled]
+        # Never log free-text rules; they may contain secrets.
+        return _MCPAttachment(servers=servers, instructions=_compose_server_rules(servers))
 
     def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
         """Current config of every enabled MCP server, or ``None`` if unreadable.

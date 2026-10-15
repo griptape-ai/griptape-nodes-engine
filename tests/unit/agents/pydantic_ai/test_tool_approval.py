@@ -18,9 +18,6 @@ from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
-    ModelResponse,
-    TextPart,
-    ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
@@ -28,22 +25,22 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.tools import DeferredToolResults, ToolDenied
 from pydantic_ai.toolsets import FunctionToolset
 
+from griptape_nodes.agents.harness import GTN_SERVER_NAME, PendingApproval, RunEvent, ToolResult
 from griptape_nodes.agents.pydantic_ai.mcp_servers import (
     GTN_APPROVAL_REQUIRED_REQUESTS,
     GTN_BATCH_TOOL_NAME,
-    GTN_SERVER_NAME,
     _compose,
     _gtn_tool_requires_approval,
     _user_tool_requires_approval,
     grant_keys_for_call,
 )
-from griptape_nodes.agents.pydantic_ai.runner import PendingApproval, PydanticAgentRunner, RunEvent, ToolResult
+from griptape_nodes.agents.pydantic_ai.runner import PydanticAgentRunner
 from griptape_nodes.agents.pydantic_ai.tool_approval import (
     TOOL_STOPPED_WHILE_RUNNING_MESSAGE,
     ToolApprovalDeps,
     needs_approval,
-    pending_tool_calls,
 )
+from griptape_nodes.agents.thread_history import TOOL_DENIED_BY_NEW_MESSAGE, pending_tool_calls
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.servers.mcp import EVENT_REQUEST_BATCH_TOOL_NAME, SUPPORTED_REQUEST_EVENTS
 
@@ -166,54 +163,6 @@ class TestUserToolRequiresApproval:
         deps = ToolApprovalDeps(granted=frozenset({"brave_search"}))
 
         assert _user_tool_requires_approval(_ctx(deps), _tool("brave_search"), {}) is False
-
-
-def _call(tool_call_id: str, tool_name: str = "GriptapeNodes_StartFlowRequest") -> ToolCallPart:
-    return ToolCallPart(tool_name=tool_name, args={}, tool_call_id=tool_call_id)
-
-
-def _return(tool_call_id: str) -> ToolReturnPart:
-    return ToolReturnPart(
-        tool_name="GriptapeNodes_ListFlowsInCurrentContextRequest", content="ok", tool_call_id=tool_call_id
-    )
-
-
-class TestPendingToolCalls:
-    def test_a_completed_turn_has_nothing_pending(self) -> None:
-        history: list[ModelMessage] = [
-            ModelRequest(parts=[UserPromptPart(content="hi")]),
-            ModelResponse(parts=[TextPart(content="hello")]),
-        ]
-
-        assert pending_tool_calls(history) == []
-
-    def test_a_response_ending_in_calls_is_waiting_on_all_of_them(self) -> None:
-        history: list[ModelMessage] = [
-            ModelRequest(parts=[UserPromptPart(content="run it")]),
-            ModelResponse(parts=[_call("a"), _call("b")]),
-        ]
-
-        assert [call.tool_call_id for call in pending_tool_calls(history)] == ["a", "b"]
-
-    def test_calls_that_already_ran_are_not_pending(self) -> None:
-        history: list[ModelMessage] = [
-            ModelRequest(parts=[UserPromptPart(content="run it")]),
-            ModelResponse(parts=[_call("list"), _call("start")]),
-            ModelRequest(parts=[_return("list")]),
-        ]
-
-        assert [call.tool_call_id for call in pending_tool_calls(history)] == ["start"]
-
-    def test_a_trailing_user_prompt_is_not_a_paused_turn(self) -> None:
-        history: list[ModelMessage] = [
-            ModelResponse(parts=[_call("a")]),
-            ModelRequest(parts=[UserPromptPart(content="orphan")]),
-        ]
-
-        assert pending_tool_calls(history) == []
-
-    def test_empty_history_has_nothing_pending(self) -> None:
-        assert pending_tool_calls([]) == []
 
 
 class ScriptedModel:
@@ -396,14 +345,25 @@ class TestRunnerPauseAndResume:
         assert ran == []
 
     @pytest.mark.asyncio
-    async def test_a_paused_thread_refuses_a_run_that_does_not_answer_it(self, tmp_path: Path) -> None:
+    async def test_a_prompt_alone_declines_what_the_thread_was_waiting_on(self, tmp_path: Path) -> None:
         ran: list[str] = []
-        model = ScriptedModel([("GriptapeNodes_StartFlowRequest", {}, "c1")])
+        model = ScriptedModel([("GriptapeNodes_StartFlowRequest", {}, "c1")], "Okay.")
         runner = runner_with(tmp_path, model, ran)
         paused = await runner.run("Run the flow.", approval=ON)
 
-        with pytest.raises(ValueError, match="waiting for approval"):
-            await runner.run("Something else.", thread_id=paused.thread_id, approval=ON)
+        await runner.run("Something else.", thread_id=paused.thread_id, approval=ON)
+
+        history = runner.storage.load_history(paused.thread_id)
+        assert ran == []
+        assert _results_by_call(history) == {"c1": TOOL_DENIED_BY_NEW_MESSAGE}
+        assert pending_tool_calls(history) == []
+
+    @pytest.mark.asyncio
+    async def test_running_with_neither_a_prompt_nor_answers_fails(self, tmp_path: Path) -> None:
+        runner = runner_with(tmp_path, ScriptedModel("Hi."), [])
+
+        with pytest.raises(ValueError, match="no message to send"):
+            await runner.run(None, approval=ON)
 
 
 def _results_by_call(messages: list[ModelMessage]) -> dict[str, str]:

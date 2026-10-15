@@ -16,14 +16,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, RetryPromptPart, ToolReturnPart
 from pydantic_ai.tools import ToolDenied
+
+from griptape_nodes.agents.thread_history import answered_ids, tool_call_tail
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from collections.abc import Set as AbstractSet
 
-    from pydantic_ai.messages import ModelMessage, ModelRequestPart, ToolCallPart
+    from pydantic_ai.messages import ModelMessage, ModelRequestPart
     from pydantic_ai.tools import DeferredToolResults
 
 
@@ -32,9 +34,6 @@ TOOL_DENIED_BY_USER_MESSAGE = (
     "Answer in text, or ask the user before trying again."
 )
 """What the model reads in place of a tool result the user denied."""
-
-TOOL_DENIED_BY_NEW_MESSAGE = "The user sent a new message instead of answering this approval request."
-"""What the model reads for a pending call the user skipped by sending another message."""
 
 TOOL_STOPPED_WHILE_RUNNING_MESSAGE = (
     "The user stopped the reply after this started. It may still be running or may have finished. "
@@ -77,30 +76,6 @@ def needs_approval(deps: object, grant_keys: Sequence[str]) -> bool:
     return not deps.granted.issuperset(grant_keys)
 
 
-def pending_tool_calls(history: Sequence[ModelMessage]) -> list[ToolCallPart]:
-    """Return the tool calls a paused turn is still waiting on, in call order.
-
-    A turn that paused for approval ends in the ``ModelResponse`` carrying the
-    calls, optionally followed by a ``ModelRequest`` holding only tool results:
-    those of the calls that ran without asking, and any a cancelled resume
-    saved. The pending calls are the ones with no result. Any other shape,
-    including a trailing request with a user prompt in it, has nothing pending.
-    """
-    tail = _tool_call_tail(history)
-    if tail is None:
-        return []
-    answered = _answered_ids(tail.results)
-    return [call for call in tail.response.tool_calls if call.tool_call_id not in answered]
-
-
-def ends_in_tool_results(history: Sequence[ModelMessage]) -> bool:
-    """Whether history ends in a response's tool calls followed by a request of only their results."""
-    tail = _tool_call_tail(history)
-    if tail is None:
-        return False
-    return tail.results is not None
-
-
 @dataclass(frozen=True)
 class SettledResume:
     """History after saving what a cancelled resume did, and the results it added.
@@ -135,10 +110,10 @@ def settle_cancelled_resume(
     as validation is also treated as started. That errs toward telling the user
     to check rather than offering to run it twice.
     """
-    tail = _tool_call_tail(history)
+    tail = tool_call_tail(history)
     if tail is None:
         return None
-    answered = _answered_ids(tail.results)
+    answered = answered_ids(tail.results)
     decisions = deferred_tool_results.to_tool_call_results()
 
     added: list[ToolReturnPart | RetryPromptPart] = []
@@ -176,32 +151,3 @@ def settle_cancelled_resume(
         kept = kept[:-1]
         existing_parts = list(tail.results.parts)
     return SettledResume(messages=[*kept, ModelRequest(parts=[*existing_parts, *added])], added_parts=synthesized)
-
-
-@dataclass(frozen=True)
-class _ToolCallTail:
-    """The response a turn ended on, and the request of results after it, if any."""
-
-    response: ModelResponse
-    results: ModelRequest | None
-
-
-def _tool_call_tail(history: Sequence[ModelMessage]) -> _ToolCallTail | None:
-    if not history:
-        return None
-    last = history[-1]
-    if isinstance(last, ModelResponse):
-        return _ToolCallTail(response=last, results=None)
-    if not isinstance(last, ModelRequest) or len(history) < 2:  # noqa: PLR2004
-        return None
-    previous = history[-2]
-    only_results = all(isinstance(part, (ToolReturnPart, RetryPromptPart)) for part in last.parts)
-    if not isinstance(previous, ModelResponse) or not only_results:
-        return None
-    return _ToolCallTail(response=previous, results=last)
-
-
-def _answered_ids(results: ModelRequest | None) -> set[str]:
-    if results is None:
-        return set()
-    return {part.tool_call_id for part in results.parts if isinstance(part, (ToolReturnPart, RetryPromptPart))}

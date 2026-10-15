@@ -19,15 +19,17 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
-from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
-from griptape_nodes.agents.pydantic_ai.runner import (
+from griptape_nodes.agents.harness import (
     AgentRunResult,
+    MCPServerSpec,
     RunEvent,
     TextDelta,
     ThinkingDelta,
     ToolCall,
     ToolResult,
 )
+from griptape_nodes.agents.pydantic_ai.mcp_servers import prefixed_tool_name
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -101,6 +103,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _build_agent_instructions,
     _cloud_http_status_of,
     _compose_prompt,
+    _compose_run_instructions,
     _compose_server_rules,
     _friendly_list_models_error,
     _message_has_image_url,
@@ -171,13 +174,19 @@ class TestBuildAgentInstructions:
     """The agent's baked-in instructions describe only what cannot change mid-session."""
 
     def test_base_instructions_describe_the_engine_tools(self) -> None:
-        result = _build_agent_instructions(include_image_tool=False)
-        assert "GriptapeNodes" in result
+        result = _build_agent_instructions(include_image_tool=False, tool_name=prefixed_tool_name)
+        assert "GriptapeNodes_ListRegisteredLibrariesRequest" in result
         assert "generate_image" not in result
 
     def test_image_tool_included_when_requested(self) -> None:
-        result = _build_agent_instructions(include_image_tool=True)
+        result = _build_agent_instructions(include_image_tool=True, tool_name=prefixed_tool_name)
         assert "generate_image" in result
+
+    def test_engine_tools_are_named_the_way_the_harness_shows_them(self) -> None:
+        result = _build_agent_instructions(include_image_tool=False, tool_name=lambda s, t: f"mcp__{s}__{t}")
+        assert "`mcp__GriptapeNodes__`" in result
+        assert "mcp__GriptapeNodes__ListNodeTypesInLibraryRequest" in result
+        assert "GriptapeNodes_List" not in result
 
 
 class TestComposeServerRules:
@@ -188,15 +197,38 @@ class TestComposeServerRules:
 
     def test_each_server_is_labelled_with_its_name(self) -> None:
         composed = _compose_server_rules(
-            [{"name": "a", "rules": "be terse"}, {"name": "b", "rules": "be kind"}],
+            [
+                MCPServerSpec(name="a", config={"rules": "be terse"}),
+                MCPServerSpec(name="b", config={"rules": "be kind"}),
+            ],
         )
         assert composed == "Rules for MCP server 'a':\nbe terse\n\nRules for MCP server 'b':\nbe kind"
 
     def test_servers_without_rules_are_skipped(self) -> None:
         composed = _compose_server_rules(
-            [{"name": "a"}, {"name": "b", "rules": "   "}, {"name": "c", "rules": None}, {"name": "d", "rules": "go"}],
+            [
+                MCPServerSpec(name="a", config={}),
+                MCPServerSpec(name="b", config={"rules": "   "}),
+                MCPServerSpec(name="c", config={"rules": None}),
+                MCPServerSpec(name="d", config={"rules": "go"}),
+            ],
         )
         assert composed == "Rules for MCP server 'd':\ngo"
+
+
+class TestComposeRunInstructions:
+    """Approval rules apply only to a harness that pauses for the user to approve tool calls."""
+
+    def test_approval_rules_follow_the_server_rules(self) -> None:
+        composed = _compose_run_instructions("Server rules.", include_approval_rules=True)
+
+        assert composed.startswith("Server rules.")
+        assert "Tool approval rules" in composed
+
+    def test_approval_rules_are_left_out_for_a_harness_that_never_asks(self) -> None:
+        composed = _compose_run_instructions("Server rules.", include_approval_rules=False)
+
+        assert composed == "Server rules."
 
 
 class _RecordingEngine:
@@ -1203,6 +1235,7 @@ class TestBuildRunnerCredential:
         providers_manager._system_prompt_extra = ""
         providers_manager._thread_storage = object()  # type: ignore[assignment]
         providers_manager.static_files_manager = None  # type: ignore[assignment]
+        providers_manager._mcp_toolsets = MCPToolsetCache()
 
         providers_manager._build_runner(provider_name="griptape_cloud")
 
@@ -1449,13 +1482,16 @@ class TestRunAgentResultPayloadContract:
             return result
 
         monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
-        monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: SimpleNamespace(run=fake_run))
+        monkeypatch.setattr(
+            manager,
+            "_build_harness",
+            lambda *_a, **_k: SimpleNamespace(run_turn=fake_run),
+        )
         manager._active_provider_name = "griptape_cloud"
         manager._providers = []
         # A non-empty history keeps `is_first_run` False, so the title update is skipped.
         manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
             load_history=lambda _t: [object()],
-            get_thread_metadata=lambda _t: SimpleNamespace(tool_grants=[]),
             update_thread_metadata=lambda _t, **_kw: {},
             append_run_record=lambda thread_id, record: None,  # noqa: ARG005
         )

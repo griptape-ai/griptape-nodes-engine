@@ -27,12 +27,14 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.toolsets import FunctionToolset
 
-from griptape_nodes.agents.pydantic_ai.runner import (
-    PydanticAgentRunner,
+from griptape_nodes.agents.harness import (
     RunEvent,
     TextDelta,
     ToolCall,
     ToolResult,
+)
+from griptape_nodes.agents.pydantic_ai.runner import (
+    PydanticAgentRunner,
 )
 from griptape_nodes.drivers.cloud_models import MODEL_SETTINGS
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver

@@ -17,10 +17,10 @@ from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
 
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.tool_approval import (
-    TOOL_DENIED_BY_NEW_MESSAGE,
     TOOL_DENIED_BY_USER_MESSAGE,
     TOOL_STOPPED_WHILE_RUNNING_MESSAGE,
 )
+from griptape_nodes.agents.thread_history import TOOL_DENIED_BY_NEW_MESSAGE
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import (
     CancelAgentRequest,
@@ -273,6 +273,18 @@ class TestResolvingFailures:
 
         assert isinstance(result, RunAgentResultFailure)
         assert "'maybe' is not a choice" in result.error["message"]
+        assert harness.storage.get_thread_metadata(thread_id).tool_grants == []
+
+    async def test_a_harness_that_never_asks_refuses_without_saving_grants(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness, thread_id = await self._paused(tmp_path, monkeypatch)
+        monkeypatch.setattr(harness.manager, "_build_harness", lambda **_k: SimpleNamespace(run_turn=None))
+
+        result = await harness.resolve(thread_id, c1="approve_for_conversation", c2="approve_once")
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "runs its tools without asking" in result.error["message"]
         assert harness.storage.get_thread_metadata(thread_id).tool_grants == []
 
     async def test_a_thread_that_is_not_paused_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
