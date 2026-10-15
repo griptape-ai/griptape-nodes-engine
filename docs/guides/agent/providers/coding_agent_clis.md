@@ -1,6 +1,6 @@
 # Coding Agent CLIs
 
-The [Agent](../index.md) can run on a coding agent you already have installed: Claude Code. Griptape Nodes starts the CLI for each message, connects it to your project through the Griptape Nodes MCP server, and shows its replies and tool calls in the chat like any other provider.
+The [Agent](../index.md) can run on a coding agent you already have installed: Claude Code or pi. Griptape Nodes starts the CLI for each message, connects it to your project through the Griptape Nodes MCP server, and shows its replies and tool calls in the chat like any other provider.
 
 The CLI uses its own sign-in, models, and settings. Usage is billed by the CLI's provider, not by Griptape Cloud. Griptape Nodes doesn't pass `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` to Claude Code, so it bills your Claude sign-in even when a key is set for your Anthropic nodes.
 
@@ -9,6 +9,7 @@ The CLI uses its own sign-in, models, and settings. Usage is billed by the CLI's
 | Provider    | Command  | Install                                                                                                     |
 | ----------- | -------- | ----------------------------------------------------------------------------------------------------------- |
 | Claude Code | `claude` | [claude.com/product/claude-code](https://claude.com/product/claude-code), then run `claude` once to sign in |
+| pi          | `pi`     | `npm install -g @earendil-works/pi-coding-agent`, then run `pi` once to sign in                             |
 
 Sign in once in a terminal before adding the provider. Griptape Nodes can't answer a CLI's sign-in prompts for you.
 
@@ -16,7 +17,7 @@ Sign in once in a terminal before adding the provider. Griptape Nodes can't answ
 
 1. Open **Settings → Agent Settings**
 1. Click **+ Add Provider**
-1. Select **Claude Code**
+1. Select the CLI, for example **Claude Code**
 
 - **Name**: leave as is or enter a custom label
 - **Base URL**: leave empty. The CLI connects to its own service.
@@ -46,7 +47,7 @@ If the Agent reports that a command was not found, the engine can't see the CLI 
 }
 ```
 
-The provider type is `claude_code`. Run `which claude` (or `where claude` on Windows) in a terminal to find the path.
+The provider types are `claude_code` and `pi`. Run `which claude` (or `where claude` on Windows) in a terminal to find the path.
 
 ## Related
 

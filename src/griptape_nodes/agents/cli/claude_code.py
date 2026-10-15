@@ -14,8 +14,10 @@ from griptape_nodes.agents.cli.base import (
     CliTurnContext,
     SessionStarted,
     TurnEnded,
+    tool_result_text,
+    write_private,
 )
-from griptape_nodes.agents.harness import TextDelta, ThinkingDelta, ToolCall, ToolResult, stringify
+from griptape_nodes.agents.harness import TextDelta, ThinkingDelta, ToolCall, ToolResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -66,7 +68,7 @@ class ClaudeCodeHarness(CliHarness):
             args += ["--max-turns", str(context.max_turns)]
         if context.instructions:
             # MCP server rules in the instructions may hold secrets.
-            instructions_path = _write_private(context.scratch_dir / _INSTRUCTIONS_FILE_NAME, context.instructions)
+            instructions_path = write_private(context.scratch_dir / _INSTRUCTIONS_FILE_NAME, context.instructions)
             args += ["--append-system-prompt-file", str(instructions_path)]
         if context.resume_session_id:
             args += ["--resume", context.resume_session_id]
@@ -162,7 +164,7 @@ class ClaudeCodeStreamParser(CliStreamParser):
                 ToolResult(
                     tool_call_id=tool_call_id,
                     tool_name=self._tool_names.get(tool_call_id, "?"),
-                    content=_tool_result_text(block.get("content")),
+                    content=tool_result_text(block.get("content")),
                     is_error=bool(block.get("is_error")),
                 )
             )
@@ -188,20 +190,6 @@ def _turn_ended(record: dict[str, Any]) -> TurnEnded:
     return TurnEnded(truncated=record.get("stop_reason") == "max_tokens")
 
 
-def _tool_result_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text") or ""))
-            elif isinstance(item, dict):
-                parts.append(f"[{item.get('type', 'content')}]")
-        return "\n".join(parts)
-    return stringify(content)
-
-
 def _content_blocks(text: str, images: Sequence[PromptImage]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     if text:
@@ -223,13 +211,7 @@ def _content_blocks(text: str, images: Sequence[PromptImage]) -> list[dict[str, 
 def _write_mcp_config(context: CliTurnContext) -> Path:
     """Write the config to a file, since the command line is readable by other local users."""
     config = json.dumps({"mcpServers": _mcp_config(context.mcp_servers)})
-    return _write_private(context.scratch_dir / _MCP_CONFIG_FILE_NAME, config)
-
-
-def _write_private(path: Path, content: str) -> Path:
-    path.write_text(content, encoding="utf-8")
-    path.chmod(0o600)
-    return path
+    return write_private(context.scratch_dir / _MCP_CONFIG_FILE_NAME, config)
 
 
 def _mcp_config(servers: Sequence[CliMCPServer]) -> dict[str, dict[str, Any]]:

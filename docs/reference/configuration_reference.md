@@ -118,10 +118,10 @@ Settings for artifact providers and preview generation
 
 Agent behavior and system prompt
 
-| Setting               | Type   | Default | Environment variable                    | Description                                                                                                                   |
-| --------------------- | ------ | ------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `agent.system_prompt` | string | `""`    | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`       | Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context. |
-| `agent.cli_commands`  | object | `{}`    | `GTN_CONFIG_AGENT__CLI_COMMANDS__<KEY>` | CLI command paths keyed by provider type (`claude_code`). Set a path when the engine can't find the command on its `PATH`.    |
+| Setting               | Type   | Default | Environment variable                    | Description                                                                                                                      |
+| --------------------- | ------ | ------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `agent.system_prompt` | string | `""`    | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`       | Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.    |
+| `agent.cli_commands`  | object | `{}`    | `GTN_CONFIG_AGENT__CLI_COMMANDS__<KEY>` | CLI command paths keyed by provider type (`claude_code`, `pi`). Set a path when the engine can't find the command on its `PATH`. |
 
 ## Libraries
 

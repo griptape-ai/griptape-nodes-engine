@@ -28,6 +28,7 @@ from griptape_nodes.agents.harness import (
     ToolResult,
     args_json,
     push_event,
+    stringify,
     truncate,
 )
 from griptape_nodes.agents.thread_history import TOOL_DENIED_BY_NEW_MESSAGE, pending_tool_calls
@@ -491,3 +492,23 @@ def _write_images(prompt: str | Sequence[UserContent], scratch_dir: Path) -> lis
         path.write_bytes(item.data)
         images.append(PromptImage(data=item.data, media_type=item.media_type, path=path))
     return images
+
+
+def tool_result_text(content: Any) -> str:
+    """Render an MCP-style content list as text, with a placeholder for each non-text block."""
+    if not isinstance(content, list):
+        return stringify(content)
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            parts.append(str(item.get("text") or ""))
+        elif isinstance(item, dict):
+            parts.append(f"[{item.get('type', 'content')}]")
+    return "\n".join(parts)
+
+
+def write_private(path: Path, content: str) -> Path:
+    """Write a file only its owner can read, for CLI inputs that may hold secrets."""
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+    return path

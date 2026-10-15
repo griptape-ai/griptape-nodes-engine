@@ -126,7 +126,7 @@ plugins:
           - guides/agent/providers/ollama.md: Ollama local provider setup
           - guides/agent/providers/lm_studio.md: LM Studio local provider setup
           - guides/agent/providers/custom.md: Custom OpenAI-compatible endpoint setup
-          - guides/agent/providers/coding_agent_clis.md: Coding agent CLIs (Claude Code)
+          - guides/agent/providers/coding_agent_clis.md: Coding agent CLIs (Claude Code, pi)
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
           - guides/libraries.md: Installing and managing node libraries

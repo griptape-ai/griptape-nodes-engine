@@ -450,7 +450,7 @@ class AgentSettings(BaseModel):
     )
     cli_commands: dict[str, str] = Field(
         default_factory=dict,
-        description="Path to the command to run for a coding-agent CLI provider, keyed by provider type (claude_code). Set one when the agent can't find the CLI on its own, for example when it is installed somewhere outside the PATH the engine starts with.",
+        description="Path to the command to run for a coding-agent CLI provider, keyed by provider type (claude_code, pi). Set one when the agent can't find the CLI on its own, for example when it is installed somewhere outside the PATH the engine starts with.",
     )
 
 

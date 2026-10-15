@@ -31,6 +31,7 @@ class ProviderID(StrEnum):
     LMSTUDIO = "lmstudio"
     CUSTOM = "custom"
     CLAUDE_CODE = "claude_code"
+    PI = "pi"
 
 
 # --- Per-family arg presets ---
@@ -256,6 +257,12 @@ PROVIDER_CATALOG = ModelCatalogSidebarProperty(
             display_name="Claude Code",
             terms_url="https://www.anthropic.com/legal/consumer-terms",
             notes="Runs the Claude Code CLI installed on this computer, with its own sign-in and settings.",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            kind=SidebarProviderKind.CLI_HARNESS,
+        ),
+        ProviderID.PI: SidebarModelProvider(
+            display_name="pi",
+            notes="Runs the pi coding agent installed on this computer, with its own sign-in and settings.",
             key_support=KeySupport.NO_KEY_REQUIRED,
             kind=SidebarProviderKind.CLI_HARNESS,
         ),
