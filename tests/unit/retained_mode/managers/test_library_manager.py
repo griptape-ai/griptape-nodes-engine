@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
@@ -2445,6 +2445,16 @@ class _DescribeNodeTypeProbe(BaseNode):
         )
         self.add_parameter(temperature)
 
+        images = ParameterList(
+            name="images",
+            input_types=["ImageArtifact"],
+            type="ImageArtifact",
+            tooltip="Images to combine",
+            max_items=4,
+            allowed_modes={ParameterMode.INPUT},
+        )
+        self.add_parameter(images)
+
 
 class _RaisingProbe(BaseNode):
     """Stand-in for node types whose __init__ performs failing I/O (auth, network, disk)."""
@@ -2611,6 +2621,25 @@ class TestDescribeNodeTypeRequest:
             )
             is None
         )
+
+    def test_distinguishes_parameter_list_from_plain_parameter(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        self._register_probe_library()
+
+        result = library_manager.catalog.describe_node_type_request(
+            DescribeNodeTypeRequest(node_type=_DescribeNodeTypeProbe.__name__, library=self._LIBRARY_NAME),
+        )
+
+        assert isinstance(result, DescribeNodeTypeResultSuccess)
+        by_name = {param.name: param for param in result.parameters}
+
+        images = by_name["images"]
+        assert images.element_type == "ParameterList"
+        assert images.max_items == 4  # noqa: PLR2004
+
+        prompt = by_name["prompt"]
+        assert prompt.element_type == "Parameter"
+        assert prompt.max_items is None
 
     def test_resolves_library_when_node_type_is_unambiguous(self, engine: Engine) -> None:
         library_manager = engine.library_manager

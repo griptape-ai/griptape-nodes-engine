@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -227,6 +228,9 @@ class ParameterDescription:
         settable: Whether the parameter can be set directly by the user
         ui_options: UI configuration options (includes display_name when set)
         parent_container_name: Name of the parent ParameterGroup, if any
+        element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
+            "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
+        max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
     """
 
     name: str
@@ -244,6 +248,8 @@ class ParameterDescription:
     settable: bool
     ui_options: dict | None
     parent_container_name: str | None
+    element_type: str
+    max_items: int | None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -253,6 +259,7 @@ class ParameterDescription:
         serialization used elsewhere (e.g. workflow shape extraction).
         """
         param_dict = param.to_dict()
+        max_items = param.max_items if isinstance(param, ParameterList) else None
 
         return cls(
             name=param_dict["name"],
@@ -270,6 +277,8 @@ class ParameterDescription:
             settable=param_dict["settable"],
             ui_options=param_dict["ui_options"],
             parent_container_name=param_dict["parent_container_name"],
+            element_type=param_dict["element_type"],
+            max_items=max_items,
         )
 
 
