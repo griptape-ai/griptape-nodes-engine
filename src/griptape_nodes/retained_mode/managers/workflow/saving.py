@@ -453,12 +453,34 @@ class WorkflowSaver(EngineScoped):
         # Ensure file_path is populated even for pre-existing entries (defensive).
         if existing_workflow.file_path is None:
             existing_workflow.file_path = relative_file_path
+
+        # Saving an open library workflow wrote a copy instead of the library's file. Move the
+        # current context onto the copy, so the next save lands in it rather than in yet another copy.
+        if self._is_open_library_workflow(save_target.scenario, current_workflow_name, registry_key):
+            for workflow_context_state in self.engine.context_manager._workflow_stack:
+                if workflow_context_state._name == current_workflow_name:
+                    workflow_context_state._name = registry_key
+                    workflow_context_state._file_path = str(save_file_result.file_path)
+
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_name=registry_key,
             result_details=details,
         )
+
+    def _is_open_library_workflow(
+        self, scenario: SaveWorkflowScenario, current_workflow_name: str | None, saved_registry_key: str
+    ) -> bool:
+        """Whether this save copied the library-provided workflow open in the current context."""
+        if scenario != SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
+            return False
+        if current_workflow_name is None or current_workflow_name == saved_registry_key:
+            return False
+        if not self.engine.workflow_registry.has_workflow_with_name(current_workflow_name):
+            return False
+        current_workflow = self.engine.workflow_registry.get_workflow_by_name(current_workflow_name)
+        return bool(current_workflow.metadata.is_griptape_provided)
 
     def generate_unique_filename(self, base_name: str) -> str:
         """Generate a unique filename for a workflow, avoiding collisions.
