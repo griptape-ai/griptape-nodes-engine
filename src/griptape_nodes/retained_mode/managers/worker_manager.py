@@ -574,7 +574,7 @@ class WorkerManager(EngineScoped):
             claim.set()
         logger.debug("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
-    async def _settle_when_worker_exits_early(self, worker_key: str, proc: asyncio.subprocess.Process) -> None:
+    async def _settle_when_worker_exits_early(self, worker_key: str | None, proc: asyncio.subprocess.Process) -> None:
         """Release the runs waiting on `worker_key` if its process exits before it has loaded.
 
         Every other way a worker ends is noticed through the registry: it unregisters, or it stops
@@ -1168,7 +1168,10 @@ class WorkerManager(EngineScoped):
         """
         if self.has_settled(library_name):
             return
-        logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
+        if library_name is None:
+            logger.info("Waiting for the general-purpose worker to finish loading before executing")
+        else:
+            logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
         try:
             with anyio.fail_after(self.library_load_timeout_s):
                 await self._execution_ready[library_name].wait()
