@@ -3234,6 +3234,11 @@ class NodeManager(EngineScoped):
             errormsg = f"This workflow is already in progress. Please wait for the current control process to finish before starting {node.name} again."
             return ResolveNodeResultFailure(validation_exceptions=[RuntimeError(errormsg)], result_details=errormsg)
 
+        # Checked before anything below unresolves the node, so a rejected request leaves it as it was.
+        if flow_mgr.running_flow_is_stopping_after_failure():
+            errormsg = f"Attempted to run {node.name}. Failed because a node in the current run failed, and the run is waiting for its other nodes to finish. Try again once the run ends."
+            return ResolveNodeResultFailure(validation_exceptions=[RuntimeError(errormsg)], result_details=errormsg)
+
         # Check if the node is already in the DAG - if so, skip this resolution. It's already queued or has been resolved.
         if node.name in flow_mgr._global_dag_builder.node_to_reference:
             return ResolveNodeResultFailure(

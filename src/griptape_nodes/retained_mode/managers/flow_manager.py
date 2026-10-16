@@ -4675,6 +4675,12 @@ class FlowManager(EngineScoped):
             and self._global_control_flow_machine.context.resolution_machine.is_started()
         )
 
+    def running_flow_is_stopping_after_failure(self) -> bool:
+        """True while the running flow has failed and is waiting for its other nodes to finish."""
+        if self._global_control_flow_machine is None:
+            return False
+        return self._global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
 
