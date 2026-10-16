@@ -162,3 +162,51 @@ class StartWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker spawn could not be scheduled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class RegisterOriginatorRequest(RequestPayload):
+    """Sent by an orchestrator to another machine's orchestrator before asking it to start any worker.
+
+    Sent once per session for each machine the distribution settings assign a library to. The
+    serving orchestrator refuses an originator whose engine version differs from its own, because
+    the wire shape of every event is tied to the engine build, and refuses each library whose
+    version differs or that it does not have.
+
+    Args:
+        originator_session_id: The originating orchestrator's session, which its workers there join.
+        schema_version: The version of the distributed execution contract the originator speaks.
+        engine_version: The originator's engine version.
+        library_versions: The version of each library the originator will send to that machine.
+        license_token: The originator's Griptape Nodes license, which workers started for it run
+            under, or None when it has none.
+        static_server_base_url: Where the originator serves the shared workspace, so the asset URLs
+            its workers mint are ones the originator's editor can open.
+    """
+
+    originator_session_id: str
+    schema_version: str
+    engine_version: str
+    library_versions: dict[str, str]
+    license_token: str | None = None
+    static_server_base_url: str | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class RegisterOriginatorResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The serving orchestrator accepted the originator.
+
+    Args:
+        refused_libraries: Each library it will not start workers for, with the reason.
+    """
+
+    refused_libraries: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class RegisterOriginatorResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The serving orchestrator refused the originator, and will start no workers for it."""

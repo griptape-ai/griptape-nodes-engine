@@ -205,6 +205,26 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 
 A value of `0` scans only the top-level directory (no subdirectories).
 
+## Running a Library's Nodes on Another Machine
+
+This is a beta feature. Turn on **Distributed execution** on the Beta settings page on both machines: the artist's workstation and the machine that runs the nodes, such as a shared GPU machine. Then, on the workstation, assign each library to the machine that runs it with `distributed_execution.libraries`, a map of library name to that machine's `host:port`:
+
+```json
+{
+  "distributed_execution": {
+    "libraries": {
+      "Griptape Nodes Diffusers Library": "gpu-01:18125"
+    }
+  }
+}
+```
+
+The address is the other machine's `websocket_direct` transport, so that machine must serve it on an address the workstation can reach. Nodes from a library with no entry run on the workstation, as before. The setting is read when the engine starts.
+
+Both machines must run the same engine version and the same version of each assigned library, and see the same workspace. A node from a library the other machine refuses, or cannot reach, fails with the reason, such as the two versions that differ. Its worker on the other machine runs under the workstation's Griptape Nodes license, and asks the workstation for secrets.
+
+Library names are case-sensitive, so set this in a `griptape_nodes_config.json` file rather than an environment variable, whose name is lowercased before it becomes a config key.
+
 ## Workspace Directory
 
 During `gtn init`, you specify a Workspace Directory. This is the root for your projects, saved flows, and potentially project-specific settings.

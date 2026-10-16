@@ -464,8 +464,8 @@ class DistributedExecutionSettings(BaseModel):
             "Where each library's nodes run, as a map of library name to the address of the machine "
             "that runs them, written host:port, for example "
             '{"Griptape Nodes Diffusers Library": "gpu-01:18125"}. The address is that machine\'s '
-            "engine's websocket_direct transport. A library with no entry runs on this machine. Read "
-            "when the engine starts."
+            "engine's websocket_direct transport. A library with no entry runs on this machine. Needs "
+            "the Distributed execution beta feature on both machines. Read when the engine starts."
         ),
     )
 

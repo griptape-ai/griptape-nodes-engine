@@ -24,6 +24,7 @@ import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.retained_mode.beta_features import DISTRIBUTED_EXECUTION
 from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess
@@ -35,6 +36,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.machine_links import DISTRIBUTED_EXECUTION_SCHEMA_VERSION
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
@@ -42,6 +44,7 @@ from griptape_nodes.retained_mode.managers.worker_manager import (
     WorkerManager,
     WorkerRegistration,
 )
+from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
 _SESSION = "sess-abc"
@@ -91,7 +94,7 @@ def worker_manager() -> WorkerManager:
     # WorkerManager reads several float config values at construction; hand back
     # the declared default so asyncio.wait_for / time arithmetic gets a real number. A spawn reads
     # worker.command_prefix and library.provisioned_by too, uncast, and gets their defaults.
-    gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=None: (
+    gtn.config_manager.get_config_value.side_effect = lambda _key, default=None, cast_type=None, **_kwargs: (
         default if cast_type is None else cast_type(default)
     )
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
@@ -2376,20 +2379,50 @@ class TestChallengeAllowanceRounding:
 
 _MACHINE = "gpu-01:18125"
 _LIBRARY = "Heavy Library"
+_LICENSE = "artist-license"
 
 
-def _send_library_to_machine(worker_manager: WorkerManager) -> MagicMock:
-    """Assign `_LIBRARY` to `_MACHINE` in the distribution settings, and attach mock machine links."""
+def _turn_on_distributed_execution(worker_manager: WorkerManager) -> None:
+    """Turn the beta feature on and assign `_LIBRARY` to `_MACHINE` in the distribution settings."""
     read_default = worker_manager.engine.config_manager.get_config_value.side_effect  # type: ignore[union-attr]
 
-    def get_config_value(key: str, default: object = None, cast_type: type | None = None) -> object:
+    def get_config_value(key: str, default: object = None, cast_type: type | None = None, **kwargs: object) -> object:
+        if key == DISTRIBUTED_EXECUTION.config_key:
+            return True
         if key == DISTRIBUTED_EXECUTION_LIBRARIES_KEY:
             return {_LIBRARY: _MACHINE}
-        return read_default(key, default, cast_type)
+        return read_default(key, default, cast_type, **kwargs)
 
     worker_manager.engine.config_manager.get_config_value.side_effect = get_config_value  # type: ignore[union-attr]
+    worker_manager.engine.secrets_manager.get_secret.return_value = _LICENSE  # type: ignore[union-attr]
+    worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = MagicMock(  # type: ignore[union-attr]
+        library_version="1.0.0"
+    )
+
+
+def _machine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = None) -> MagicMock:
+    """Attach machine links whose machine answers like a serving orchestrator, refusing what `refuse` names.
+
+    `refuse` maps a request type to the reason that machine gives for refusing it.
+    """
+    _turn_on_distributed_execution(worker_manager)
+    refuse = refuse or {}
+    request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
+
+    async def answer(_address: str, _event_type: str, payload: str, _topic: str) -> None:
+        sent = json.loads(payload)
+        request_type = sent["request_type"]
+        result_type = request_type.replace("Request", "ResultSuccess")
+        result: dict[str, object] = {"result_details": "ok"}
+        if request_type in refuse:
+            result_type = request_type.replace("Request", "ResultFailure")
+            result = {"result_details": refuse[request_type]}
+        pending = request_client._pending_requests.pop(sent["request_id"], None)
+        if pending is not None:
+            pending.future.set_result({"result_type": result_type, "result": result})
+
     links = MagicMock()
-    links.publish = AsyncMock()
+    links.publish = AsyncMock(side_effect=answer)
     links.subscribe = AsyncMock()
     links.route = AsyncMock()
     links.relay = AsyncMock()
@@ -2397,38 +2430,98 @@ def _send_library_to_machine(worker_manager: WorkerManager) -> MagicMock:
     return links
 
 
+def _sent(links: MagicMock) -> list[dict]:
+    """The requests published to the machine, in order."""
+    return [json.loads(published.args[2]) for published in links.publish.await_args_list]
+
+
+async def _start_on_machine(worker_manager: WorkerManager, library_name: str = _LIBRARY) -> None:
+    with patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)):
+        await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
+        await worker_manager._requested_spawns[library_name]
+
+
 class TestStartingAWorkerOnAnotherMachine:
     @pytest.mark.asyncio
-    async def test_a_library_assigned_to_a_machine_asks_that_machine_to_start_its_worker(
+    async def test_the_originator_registers_then_asks_the_machine_to_start_the_worker(
         self, worker_manager: WorkerManager
     ) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
-            await worker_manager._requested_spawns[_LIBRARY]
+            await _start_on_machine(worker_manager)
 
         spawn.assert_not_awaited()
         links.subscribe.assert_has_awaits(
             [call(_MACHINE, f"sessions/{_SESSION}/request"), call(_MACHINE, f"sessions/{_SESSION}/response")]
         )
-        address, event_type, payload, topic = links.publish.await_args.args
-        assert (address, event_type, topic) == (_MACHINE, "EventRequest", "request")
-        sent = json.loads(payload)["request"]
-        assert sent["library_name"] == _LIBRARY
-        assert sent["originator_session_id"] == _SESSION
+        registration, start = _sent(links)
+        assert registration["request_type"] == "RegisterOriginatorRequest"
+        assert registration["request"]["engine_version"] == engine_version
+        assert registration["request"]["library_versions"] == {_LIBRARY: "1.0.0"}
+        assert registration["request"]["license_token"] == _LICENSE
+        assert start["request_type"] == "StartWorkerRequest"
+        assert start["request"]["originator_session_id"] == _SESSION
+        assert worker_manager.worker_unavailable_reason(_LIBRARY) is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_registration_makes_the_library_unavailable_with_the_reason(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _machine(worker_manager, refuse={"RegisterOriginatorRequest": "engine version 9.9.9 differs"})
+
+        await _start_on_machine(worker_manager)
+
+        assert [sent["request_type"] for sent in _sent(links)] == ["RegisterOriginatorRequest"]
+        reason = worker_manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert "engine version 9.9.9 differs" in reason
+        assert worker_manager.has_settled(_LIBRARY)
+
+    @pytest.mark.asyncio
+    async def test_a_refused_start_makes_the_library_unavailable_with_the_reason(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _machine(worker_manager, refuse={"StartWorkerRequest": "no room"})
+
+        await _start_on_machine(worker_manager)
+
+        reason = worker_manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert "no room" in reason
+        assert _LIBRARY not in worker_manager._remote_libraries
+
+    @pytest.mark.asyncio
+    async def test_two_libraries_on_one_machine_register_with_it_once(self, worker_manager: WorkerManager) -> None:
+        links = _machine(worker_manager)
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, **_: (
+                True
+                if key == DISTRIBUTED_EXECUTION.config_key
+                else {_LIBRARY: _MACHINE, "Other": _MACHINE}
+                if key == DISTRIBUTED_EXECUTION_LIBRARIES_KEY
+                else default
+            )
+        )
+
+        await _start_on_machine(worker_manager, _LIBRARY)
+        await _start_on_machine(worker_manager, "Other")
+
+        assert [sent["request_type"] for sent in _sent(links)] == [
+            "RegisterOriginatorRequest",
+            "StartWorkerRequest",
+            "StartWorkerRequest",
+        ]
 
     @pytest.mark.asyncio
     async def test_without_machine_links_the_library_is_unavailable_rather_than_run_here(
         self, worker_manager: WorkerManager
     ) -> None:
         """Running it here would run it in the one place it was assigned away from."""
-        _send_library_to_machine(worker_manager)
-        worker_manager._machine_links = None
+        _turn_on_distributed_execution(worker_manager)
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
-            await worker_manager._requested_spawns[_LIBRARY]
+            await _start_on_machine(worker_manager)
 
         spawn.assert_not_awaited()
         reason = worker_manager.worker_unavailable_reason(_LIBRARY)
@@ -2437,29 +2530,101 @@ class TestStartingAWorkerOnAnotherMachine:
 
     @pytest.mark.asyncio
     async def test_a_library_with_no_assignment_still_spawns_here(self, worker_manager: WorkerManager) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Local Lib"))
-            await worker_manager._requested_spawns["Local Lib"]
+            await _start_on_machine(worker_manager, "Local Lib")
+
+        spawn.assert_awaited_once()
+        links.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_with_the_beta_feature_off_an_assigned_library_spawns_here(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _machine(worker_manager)
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, **_: (
+                {_LIBRARY: _MACHINE} if key == DISTRIBUTED_EXECUTION_LIBRARIES_KEY else default
+            )
+        )
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            await _start_on_machine(worker_manager)
 
         spawn.assert_awaited_once()
         links.publish.assert_not_awaited()
 
 
+def _register_originator(worker_manager: WorkerManager, **overrides: object) -> object:
+    fields: dict[str, object] = {
+        "originator_session_id": "origin-sess",
+        "schema_version": DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+        "engine_version": engine_version,
+        "library_versions": {_LIBRARY: "1.0.0"},
+        "license_token": _LICENSE,
+        "static_server_base_url": "http://workstation:8124",
+    }
+    fields.update(overrides)
+    return worker_manager.handle_register_originator_request(
+        worker_events.RegisterOriginatorRequest(**fields)  # type: ignore[arg-type]
+    )
+
+
 class TestServingAnotherMachinesOrchestrator:
+    def test_an_originator_on_the_same_versions_is_accepted(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+
+        result = _register_originator(worker_manager)
+
+        assert isinstance(result, worker_events.RegisterOriginatorResultSuccess)
+        assert result.refused_libraries == {}
+
+    def test_a_different_engine_version_is_refused_naming_both(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+
+        result = _register_originator(worker_manager, engine_version="0.0.1")
+
+        assert isinstance(result, worker_events.RegisterOriginatorResultFailure)
+        assert "0.0.1" in str(result.result_details)
+        assert engine_version in str(result.result_details)
+
+    def test_a_different_library_version_refuses_only_that_library(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+
+        result = _register_originator(worker_manager, library_versions={_LIBRARY: "2.0.0"})
+
+        assert isinstance(result, worker_events.RegisterOriginatorResultSuccess)
+        assert "2.0.0" in result.refused_libraries[_LIBRARY]
+        assert "1.0.0" in result.refused_libraries[_LIBRARY]
+
+    def test_a_library_this_machine_lacks_is_refused(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+        worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = None  # type: ignore[union-attr]
+
+        result = _register_originator(worker_manager)
+
+        assert isinstance(result, worker_events.RegisterOriginatorResultSuccess)
+        assert "not installed" in result.refused_libraries[_LIBRARY]
+
+    def test_with_the_beta_feature_off_every_originator_is_refused(self, worker_manager: WorkerManager) -> None:
+        result = _register_originator(worker_manager)
+
+        assert isinstance(result, worker_events.RegisterOriginatorResultFailure)
+
     @pytest.mark.asyncio
-    async def test_the_worker_joins_the_originators_session_and_its_traffic_is_relayed_first(
+    async def test_the_worker_joins_the_originators_session_under_its_license_and_relays_first(
         self, worker_manager: WorkerManager
     ) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
+        _register_originator(worker_manager)
         order: list[str] = []
         links.relay.side_effect = lambda prefix: order.append(f"relay {prefix}")
+        spawned: dict[str, object] = {}
 
-        async def record_spawn(args: list[str], worker_key: str, **kwargs: str) -> None:
+        async def record_spawn(args: list[str], worker_key: str, **kwargs: object) -> None:
             order.append(f"spawn {worker_key}")
-            record_spawn.args = args  # type: ignore[attr-defined]
-            record_spawn.kwargs = kwargs  # type: ignore[attr-defined]
+            spawned.update(kwargs, args=args)
 
         with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
             result = await worker_manager.handle_start_worker_request(
@@ -2467,18 +2632,23 @@ class TestServingAnotherMachinesOrchestrator:
             )
 
         assert isinstance(result, worker_events.StartWorkerResultSuccess), result.result_details
-        worker_engine_id = record_spawn.kwargs["worker_engine_id"]  # type: ignore[attr-defined]
         assert order == [
             "relay sessions/origin-sess/",
-            f"relay engines/{worker_engine_id}/",
+            f"relay engines/{spawned['worker_engine_id']}/",
             f"spawn origin-sess/{_LIBRARY}",
         ]
-        args = record_spawn.args  # type: ignore[attr-defined]
+        args = cast("list[str]", spawned["args"])
         assert args[args.index("--session-id") + 1] == "origin-sess"
-        assert record_spawn.kwargs["library_name"] == _LIBRARY  # type: ignore[attr-defined]
+        assert spawned["library_name"] == _LIBRARY
+        assert spawned["environ_overrides"] == {
+            "GRIPTAPE_NODES_LICENSE": _LICENSE,
+            ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124",
+        }
 
     @pytest.mark.asyncio
-    async def test_without_machine_links_the_request_fails(self, worker_manager: WorkerManager) -> None:
+    async def test_a_start_for_an_unregistered_originator_fails(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
             result = await worker_manager.handle_start_worker_request(
                 worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
@@ -2487,11 +2657,34 @@ class TestServingAnotherMachinesOrchestrator:
         assert isinstance(result, worker_events.StartWorkerResultFailure)
         spawn.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_a_start_for_a_refused_library_fails_with_the_refusal(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+        _register_originator(worker_manager, library_versions={_LIBRARY: "2.0.0"})
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert isinstance(result, worker_events.StartWorkerResultFailure)
+        assert "2.0.0" in str(result.result_details)
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_exited_is_forgotten_so_another_can_start(self, worker_manager: WorkerManager) -> None:
+        proc = _managed_proc_mock()
+        worker_manager._managed_worker_processes["origin-sess/Lib"] = proc
+
+        await worker_manager._forget_when_exited("origin-sess/Lib", proc)
+
+        assert "origin-sess/Lib" not in worker_manager._managed_worker_processes
+
 
 class TestARemoteWorkerIsReachedThroughItsMachine:
     @pytest.mark.asyncio
     async def test_registration_subscribes_and_routes_on_the_machine(self, worker_manager: WorkerManager) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
         worker_manager._remote_libraries[_LIBRARY] = _MACHINE
 
         await worker_manager.handle_register_worker_request(
@@ -2507,7 +2700,8 @@ class TestARemoteWorkerIsReachedThroughItsMachine:
 
     @pytest.mark.asyncio
     async def test_requests_to_it_go_through_the_machine(self, worker_manager: WorkerManager) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
+        links.publish.side_effect = None
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, machine=_MACHINE
         )
@@ -2524,7 +2718,7 @@ class TestARemoteWorkerIsReachedThroughItsMachine:
 
     @pytest.mark.asyncio
     async def test_a_local_worker_is_still_reached_directly(self, worker_manager: WorkerManager) -> None:
-        links = _send_library_to_machine(worker_manager)
+        links = _machine(worker_manager)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
 
         await worker_manager.forward_event_to_worker(

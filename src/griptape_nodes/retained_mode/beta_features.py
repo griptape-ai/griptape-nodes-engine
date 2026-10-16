@@ -340,3 +340,18 @@ def _entry_label(index: int, entry: Any) -> str:
 
 def _today() -> date:
     return datetime.now(tz=UTC).date()
+
+
+DISTRIBUTED_EXECUTION = register_beta_feature(
+    BetaFeature(
+        id="distributed_execution",
+        name="Distributed execution",
+        description=(
+            "Runs a library's nodes on another machine running Griptape Nodes, such as a shared GPU machine, "
+            "when distributed_execution.libraries in your settings assigns the library to it. Turn it on on "
+            "both machines. Takes effect when the engine restarts."
+        ),
+        owner="@cjkindel",
+        remove_by=date(2027, 4, 1),
+    )
+)

@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from typing import Protocol
 
+# The version of the requests orchestrators on different machines exchange. While it is 0.x, any
+# difference is refused, since both machines also have to run the same engine version.
+DISTRIBUTED_EXECUTION_SCHEMA_VERSION = "0.1.0"
+
 
 class MachineLinks(Protocol):
     """The transport operations an orchestrator needs to reach, and to serve, other machines.
@@ -39,8 +43,10 @@ class MachineLinks(Protocol):
 
 
 def session_topic_prefix(session_id: str) -> str:
+    """The prefix of every topic in `session_id`: its requests, responses, and its workers' topics."""
     return f"sessions/{session_id}/"
 
 
 def engine_topic_prefix(engine_id: str) -> str:
+    """The prefix of every topic addressed to the engine `engine_id`, such as replies to its requests."""
     return f"engines/{engine_id}/"
