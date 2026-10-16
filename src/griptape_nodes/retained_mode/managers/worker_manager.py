@@ -1045,41 +1045,65 @@ class WorkerManager(EngineScoped):
             logger.error("Not starting a worker for library '%s': %s", library_name, reason)
             self.note_worker_unavailable(library_name, reason)
             return
+        result = await self._ask_machine_to_start_worker(library_name, machine, session_id)
+        if result is not None and result.get("result", {}).get("originator_unknown"):
+            # The machine restarted since this orchestrator registered with it, so register again, once.
+            self._machine_registrations.pop((machine, session_id), None)
+            result = await self._ask_machine_to_start_worker(library_name, machine, session_id)
+        if result is None or result.get("result_type") == worker_events.StartWorkerResultSuccess.__name__:
+            return
+        reason = f"{machine} did not start its worker: {_result_details(result)}"
+        logger.error("Not starting a worker for library '%s': %s", library_name, reason)
+        self._remote_libraries.pop(library_name, None)
+        self.note_worker_unavailable(library_name, reason)
+
+    async def _ask_machine_to_start_worker(self, library_name: str, machine: str, session_id: str) -> dict | None:
+        """Register with `machine` if needed, then ask it to start the library's worker.
+
+        Returns the machine's raw result, or None if it refused this orchestrator or the library,
+        which is then recorded as the reason the library cannot run.
+        """
         refusal = await self._register_with_machine(machine, session_id)
         if refusal is None:
             refusal = self._machine_refusals(machine, session_id).get(library_name)
         if refusal is not None:
             logger.error("Not starting a worker for library '%s' on %s: %s", library_name, machine, refusal)
             self.note_worker_unavailable(library_name, refusal)
-            return
+            return None
         self._remote_libraries[library_name] = machine
         logger.info("Asking %s to start the worker for library '%s'.", machine, library_name)
-        result = await self._request_machine(
+        return await self._request_machine(
             machine,
             session_id,
             worker_events.StartWorkerRequest(library_name=library_name, originator_session_id=session_id),
         )
-        if result.get("result_type") != worker_events.StartWorkerResultSuccess.__name__:
-            reason = f"{machine} did not start its worker: {_result_details(result)}"
-            logger.error("Not starting a worker for library '%s': %s", library_name, reason)
-            self._remote_libraries.pop(library_name, None)
-            self.note_worker_unavailable(library_name, reason)
 
     async def _register_with_machine(self, machine: str, session_id: str) -> str | None:
         """Register this orchestrator with `machine` for `session_id`, once, and return why it refused, if it did.
 
         Every library assigned to `machine` awaits the one registration, so the machine is asked once
-        per session however many of its libraries start.
+        per session however many of its libraries start. Only an accepted registration is kept: a
+        refusal, an unanswered request, or an error is asked again by the next start.
         """
         key = (machine, session_id)
         registration = self._machine_registrations.get(key)
         if registration is None:
             registration = asyncio.get_running_loop().create_task(self._send_registration(machine, session_id))
+            registration.add_done_callback(lambda task: self._forget_unaccepted_registration(key, task))
             self._machine_registrations[key] = registration
         result = await asyncio.shield(registration)
         if result.get("result_type") == worker_events.RegisterOriginatorResultSuccess.__name__:
             return None
         return f"{machine} refused to run work for this machine: {_result_details(result)}"
+
+    def _forget_unaccepted_registration(self, key: tuple[str, str], task: asyncio.Task[dict]) -> None:
+        accepted = (
+            not task.cancelled()
+            and task.exception() is None
+            and task.result().get("result_type") == worker_events.RegisterOriginatorResultSuccess.__name__
+        )
+        if not accepted and self._machine_registrations.get(key) is task:
+            del self._machine_registrations[key]
 
     def _machine_refusals(self, machine: str, session_id: str) -> dict[str, str]:
         """The libraries `machine` refused when this orchestrator registered with it, with the reasons."""
@@ -1180,16 +1204,24 @@ class WorkerManager(EngineScoped):
     ) -> worker_events.StartWorkerResultSuccess | worker_events.StartWorkerResultFailure:
         """Start a worker for an orchestrator on another machine, in that orchestrator's session."""
         worker_key = f"{originator_session_id}/{library_name}"
-        if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
+        if worker_key in self._spawns_in_flight:
             return worker_events.StartWorkerResultSuccess(
-                result_details=f"A worker for library '{library_name}' is already running for that session."
+                result_details=f"A worker for library '{library_name}' is already starting for that session."
             )
         refusal = self._refusal_to_serve(library_name, originator_session_id)
         if refusal is not None:
-            return worker_events.StartWorkerResultFailure(result_details=refusal)
+            return worker_events.StartWorkerResultFailure(
+                result_details=refusal, originator_unknown=originator_session_id not in self._originators
+            )
         resolved = self._worker_command(library_name, originator_session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerResultFailure(result_details=resolved.reason)
+        # The originator asks only once it has no worker for the library, so a running one is a
+        # worker it already stopped using, such as after a library reset, and would never register.
+        stale = self._managed_worker_processes.pop(worker_key, None)
+        if stale is not None:
+            logger.info("Replacing the worker for key '%s' that its orchestrator stopped using.", worker_key)
+            await self._terminate_via_spawn_loop(worker_key, stale)
         originator = self._originators[originator_session_id]
         links = self._links_for("another machine")
         environ_overrides: dict[str, str] = {}

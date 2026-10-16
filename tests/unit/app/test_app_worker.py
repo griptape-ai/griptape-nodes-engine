@@ -2479,6 +2479,55 @@ class TestStartingAWorkerOnAnotherMachine:
         assert worker_manager.has_settled(_LIBRARY)
 
     @pytest.mark.asyncio
+    async def test_a_refused_registration_is_asked_again_by_the_next_start(self, worker_manager: WorkerManager) -> None:
+        refuse = {"RegisterOriginatorRequest": "the machine was busy restarting"}
+        links = _machine(worker_manager, refuse=refuse)
+        await _start_on_machine(worker_manager)
+        refuse.clear()
+
+        await _start_on_machine(worker_manager)
+
+        assert [sent["request_type"] for sent in _sent(links)] == [
+            "RegisterOriginatorRequest",
+            "RegisterOriginatorRequest",
+            "StartWorkerRequest",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_machine_that_forgot_this_orchestrator_is_registered_with_again(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A machine that restarted no longer knows the originator its earlier registration accepted."""
+        links = _machine(worker_manager)
+        answer = links.publish.side_effect
+        request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
+        forgotten = {"once": True}
+
+        async def forget_once(address: str, event_type: str, payload: str, topic: str) -> None:
+            sent = json.loads(payload)
+            if sent["request_type"] == "StartWorkerRequest" and forgotten.pop("once", False):
+                request_client._pending_requests.pop(sent["request_id"]).future.set_result(
+                    {
+                        "result_type": "StartWorkerResultFailure",
+                        "result": {"result_details": "never registered", "originator_unknown": True},
+                    }
+                )
+                return
+            await answer(address, event_type, payload, topic)
+
+        links.publish.side_effect = forget_once
+
+        await _start_on_machine(worker_manager)
+
+        assert [sent["request_type"] for sent in _sent(links)] == [
+            "RegisterOriginatorRequest",
+            "StartWorkerRequest",
+            "RegisterOriginatorRequest",
+            "StartWorkerRequest",
+        ]
+        assert worker_manager.worker_unavailable_reason(_LIBRARY) is None
+
+    @pytest.mark.asyncio
     async def test_a_refused_start_makes_the_library_unavailable_with_the_reason(
         self, worker_manager: WorkerManager
     ) -> None:
@@ -2655,7 +2704,28 @@ class TestServingAnotherMachinesOrchestrator:
             )
 
         assert isinstance(result, worker_events.StartWorkerResultFailure)
+        assert result.originator_unknown
         spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_start_for_a_running_worker_replaces_it(self, worker_manager: WorkerManager) -> None:
+        """The originator asks only once it stopped using that worker, so the old one would never register."""
+        _machine(worker_manager)
+        _register_originator(worker_manager)
+        stale = _managed_proc_mock()
+        worker_manager._managed_worker_processes[f"origin-sess/{_LIBRARY}"] = stale
+
+        with (
+            patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()) as terminate,
+            patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn,
+        ):
+            result = await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert isinstance(result, worker_events.StartWorkerResultSuccess), result.result_details
+        terminate.assert_awaited_once_with(f"origin-sess/{_LIBRARY}", stale)
+        spawn.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_start_for_a_refused_library_fails_with_the_refusal(self, worker_manager: WorkerManager) -> None:
@@ -2669,6 +2739,7 @@ class TestServingAnotherMachinesOrchestrator:
 
         assert isinstance(result, worker_events.StartWorkerResultFailure)
         assert "2.0.0" in str(result.result_details)
+        assert not result.originator_unknown
         spawn.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -161,7 +161,14 @@ class StartWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Worker spawn could not be scheduled."""
+    """Worker spawn could not be scheduled.
+
+    Args:
+        originator_unknown: The request came from an orchestrator on another machine that has not
+            registered with this one, as after this machine restarts. It may register and ask again.
+    """
+
+    originator_unknown: bool = False
 
 
 @dataclass
