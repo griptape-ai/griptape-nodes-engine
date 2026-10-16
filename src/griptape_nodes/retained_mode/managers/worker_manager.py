@@ -462,7 +462,7 @@ class WorkerManager(EngineScoped):
                 # and both charging that to the worker and leaving nothing to evict it are the
                 # orchestrator's problem becoming the worker's.
                 try:
-                    await self._tx.send_message("EventRequest", converters.engine.dumps(hb), registration.request_topic)
+                    await self._send_to_worker(wid, converters.engine.dumps(hb), registration.request_topic)
                 except Exception:
                     logger.warning(
                         "Could not challenge worker %s on '%s'; not counting it against the worker.",
@@ -1482,7 +1482,10 @@ class WorkerManager(EngineScoped):
         worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
-        payload = converters.engine.dumps(forwarded)
+        await self._send_to_worker(worker_engine_id, converters.engine.dumps(forwarded), worker_request_topic)
+
+    async def _send_to_worker(self, worker_engine_id: str, payload: str, worker_request_topic: str) -> None:
+        """Send an EventRequest to a worker, over its machine's link when another machine hosts it."""
         registration = self._workers.get(worker_engine_id)
         if registration is not None and registration.machine is not None:
             machine = registration.machine

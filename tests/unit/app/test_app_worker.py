@@ -2729,3 +2729,24 @@ class TestARemoteWorkerIsReachedThroughItsMachine:
 
         links.publish.assert_not_awaited()
         worker_manager._tx.send_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_challenges_go_through_the_machine(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        links = _machine(worker_manager)
+        links.publish.side_effect = None
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, machine=_MACHINE
+        )
+
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        address, event_type, _payload, topic = links.publish.await_args.args
+        assert (address, event_type, topic) == (_MACHINE, "EventRequest", _WORKER_REQUEST_TOPIC)
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
