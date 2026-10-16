@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     FinalResultEvent,
@@ -84,6 +84,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 DEFAULT_SKILLS_DIRECTORY = ".agents/skills"
+
+USAGE_LIMIT_NOTICE = (
+    "I stopped before finishing because I reached the limit on how much work I can do for one message. "
+    'What I did so far is kept. Send another message, such as "continue", and I\'ll pick up where I left off.'
+)
+"""Closes a turn that reached its usage limit, so the user knows it stopped and how to go on."""
 
 
 TokenSink = "Callable[[str], Awaitable[None] | None]"
@@ -486,32 +492,40 @@ class PydanticAgentRunner:
         async def event_handler(_ctx: RunContext[Any], events: AsyncIterable[Any]) -> None:
             await counters.consume(events, token_sink, event_sink, text_buffer)
 
-        run_task = asyncio.ensure_future(
-            self._agent.run(
-                prompt,
-                # Passed per run rather than at construction so an agent built
-                # elsewhere (tests swap one in) still accepts a paused turn.
-                output_type=[str, DeferredToolRequests],
-                message_history=model_history,
-                deferred_tool_results=deferred_tool_results,
-                deps=approval or ToolApprovalDeps(),
-                usage_limits=self.usage_limits,
-                event_stream_handler=event_handler,
-                capabilities=capabilities or None,
-                toolsets=list(extra_toolsets) if extra_toolsets else None,
-                instructions=extra_instructions or None,
-                model_settings={"extra_headers": dict(extra_headers)} if extra_headers else None,
+        # The task copies the current context, so it must be created inside
+        # `capture_run_messages` for the capture to see the run's messages.
+        with capture_run_messages() as captured_messages:
+            run_task = asyncio.ensure_future(
+                self._agent.run(
+                    prompt,
+                    # Passed per run rather than at construction so an agent built
+                    # elsewhere (tests swap one in) still accepts a paused turn.
+                    output_type=[str, DeferredToolRequests],
+                    message_history=model_history,
+                    deferred_tool_results=deferred_tool_results,
+                    deps=approval or ToolApprovalDeps(),
+                    usage_limits=self.usage_limits,
+                    event_stream_handler=event_handler,
+                    capabilities=capabilities or None,
+                    toolsets=list(extra_toolsets) if extra_toolsets else None,
+                    instructions=extra_instructions or None,
+                    model_settings={"extra_headers": dict(extra_headers)} if extra_headers else None,
+                )
             )
-        )
         try:
             agent_result = await self._await_run(run_task, cancel_event)
         except UsageLimitExceeded as exc:
-            logger.warning(
-                "[run %s] usage limit exceeded: %s. Aborting run; no history saved for this turn.",
-                run_id,
+            return await self._finish_stopped_at_limit(
                 exc,
+                thread_id=thread_id,
+                history=history,
+                captured_messages=captured_messages,
+                persist_prompt=persist_prompt,
+                token_sink=token_sink,
+                event_sink=event_sink,
+                text="".join(text_buffer),
+                counters=counters,
             )
-            raise
 
         if agent_result is None:
             text = "".join(text_buffer)
@@ -585,6 +599,54 @@ class PydanticAgentRunner:
             image_urls=list(counters.image_urls),
             truncated=truncated,
             pending_approvals=pending_approvals,
+        )
+
+    async def _finish_stopped_at_limit(  # noqa: PLR0913
+        self,
+        exc: UsageLimitExceeded,
+        *,
+        thread_id: str,
+        history: list[ModelMessage],
+        captured_messages: list[ModelMessage],
+        persist_prompt: str | Sequence[UserContent] | None,
+        token_sink: Callable[[str], Awaitable[None] | None] | None,
+        event_sink: Callable[[RunEvent], Awaitable[None] | None] | None,
+        text: str,
+        counters: _RunCounters,
+    ) -> AgentRunResult:
+        """Save a turn that stopped at its usage limit, closed with a notice saying so.
+
+        The turn's messages are the run's own: the trailing ones carrying its
+        ``run_id``, which leaves out the loaded history (possibly rehydrated, so
+        never written back) and a resumed turn's earlier request. Saved only when
+        the turn ends in the results of its last tool calls, which is where a
+        limit checked before a request stops it. Any other shape saves nothing
+        and re-raises ``exc``.
+        """
+        turn_messages = _run_messages(captured_messages)
+        if not turn_messages or not ends_in_tool_results(turn_messages) or pending_tool_calls(turn_messages):
+            logger.warning(
+                "[run %s] usage limit exceeded: %s. Aborting run; no history saved for this turn.",
+                counters.run_id,
+                exc,
+            )
+            raise exc
+        logger.warning("[run %s] usage limit exceeded: %s. Saved the turn up to the limit.", counters.run_id, exc)
+        if persist_prompt is not None:
+            _apply_persist_prompt(turn_messages, persist_prompt)
+        saved = [*history, *turn_messages, ModelResponse(parts=[TextPart(content=USAGE_LIMIT_NOTICE)])]
+        self.storage.save_history(thread_id, saved)
+        # Set apart from any text the turn already streamed, which ends mid-task.
+        notice = USAGE_LIMIT_NOTICE
+        if text:
+            notice = f"\n\n{USAGE_LIMIT_NOTICE}"
+        await _push_token(token_sink, notice)
+        await _push_event(event_sink, TextDelta(delta=notice))
+        return AgentRunResult(
+            thread_id=thread_id,
+            output=text + notice,
+            message_count=len(saved),
+            image_urls=list(counters.image_urls),
         )
 
     async def _save_cancelled_resume(
@@ -832,6 +894,22 @@ def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Se
             new_parts[index] = replace(part, content=persist_prompt)
             message.parts = new_parts
             return
+
+
+def _run_messages(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+    """Return the trailing messages that carry the last message's ``run_id``.
+
+    Pydantic AI stamps every message a run creates with the run's id, while the
+    loaded history keeps the ids of earlier runs. Empty when the last message
+    has no ``run_id``.
+    """
+    if not messages or messages[-1].run_id is None:
+        return []
+    run_id = messages[-1].run_id
+    start = len(messages)
+    while start > 0 and messages[start - 1].run_id == run_id:
+        start -= 1
+    return list(messages[start:])
 
 
 def _log_run_outcome(  # noqa: PLR0913
