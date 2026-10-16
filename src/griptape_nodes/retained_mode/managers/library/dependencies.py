@@ -557,7 +557,12 @@ class LibraryDependencies(EngineScoped):
         `_this_process_owns_the_edit_venv`, which claims it only when nothing has built it yet.
         What it never gets is this worker's execution environment, which belongs to the library
         this worker was spawned for and reaches it as PYTHONPATH.
+
+        A general-purpose worker loads every library but was spawned for none of them, so every
+        library it loads takes the nested-registration path above.
         """
+        if self.engine.library_manager.is_general_purpose_worker:
+            return False
         if self.engine.library_manager._target_library_names is None:
             return True
         return library_name in self.engine.library_manager._target_library_names

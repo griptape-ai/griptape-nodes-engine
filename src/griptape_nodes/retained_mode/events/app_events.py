@@ -122,6 +122,10 @@ class AppInitializationComplete(AppPayload):
     # Set by short-lived engines (workflow subprocesses and script runs) that can run beside a live
     # orchestrator, which owns any library resets still waiting for a restart.
     defer_pending_library_resets: bool = False
+    # When True, this worker serves no single library: it loads every enabled library and runs the
+    # nodes the orchestrator routes to it, such as the members of a Private Execution group. Only
+    # meaningful together with is_worker; libraries_to_register is ignored.
+    is_general_purpose_worker: bool = False
     # URL of the static file server the host process runs for this workspace. The engine serves
     # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
@@ -263,6 +267,29 @@ class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The orchestrator had no record of the library the worker reported on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportGeneralPurposeWorkerReadyRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by a general-purpose worker to the orchestrator once it has loaded its libraries.
+
+    A worker registers before it loads anything, so registration alone does not mean it can create
+    the nodes routed to it. A library worker reports each library it serves through
+    ``ReportLibraryLoadedRequest``; a general-purpose worker serves none of them, so it reports
+    once, for itself.
+
+    ``SkipTheLineMixin`` for the same reason as ``ReportLibraryLoadedRequest``: a node already
+    executing on the orchestrator can be waiting on this report.
+    """
+
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportGeneralPurposeWorkerReadyResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The orchestrator recorded that its general-purpose worker is ready."""
 
 
 @dataclass
