@@ -652,6 +652,22 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(doomed)
         return len(doomed)
 
+    def drop_library_named_local_objects(self) -> int:
+        """Release the objects libraries named themselves, such as a loaded model, returning how many went.
+
+        Parked entries stay: they hold a value one node handed the next, which a later node of a run in
+        progress may still need and which nothing could rebuild. A library-named entry is one the library
+        rebuilds on a miss, at the cost of a reload.
+        """
+        with self._local_objects_lock:
+            doomed = {key: entry for key, entry in self._local_objects.items() if not entry.is_slot_bound}
+            for key in doomed:
+                del self._local_objects[key]
+            to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
+
+        self._invoke_hooks_once_per_object(to_release)
+        return len(doomed)
+
     def drop_objects_for_group(self, group: str | None) -> int:
         """Release everything one group parked in this process, leaving its co-tenants' objects alone.
 

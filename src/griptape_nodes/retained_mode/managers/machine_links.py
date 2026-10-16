@@ -8,7 +8,12 @@ the serving orchestrator, which relays it without handling it.
 
 from __future__ import annotations
 
-from typing import Protocol
+import functools
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 # The version of the requests orchestrators on different machines exchange. While it is 0.x, any
 # difference is refused, since both machines also have to run the same engine version.
@@ -70,3 +75,23 @@ def session_topic_prefix(session_id: str) -> str:
 def engine_topic_prefix(engine_id: str) -> str:
     """The prefix of every topic addressed to the engine `engine_id`, such as replies to its requests."""
     return f"engines/{engine_id}/"
+
+
+# The run the code executing now belongs to, set for the length of a request that starts one. Tasks
+# copy it when they are created, so every node the run executes, nested subflows included, sees it.
+current_run_id: ContextVar[str | None] = ContextVar("distributed_execution_run_id", default=None)
+
+
+def runs_as_one_run[H: Callable[..., Awaitable[Any]]](handler: H) -> H:
+    """Make a request handler's request one run: everything it executes counts as that run.
+
+    For the requests an artist starts a run with: running a workflow, a subflow, or a single node.
+    One already inside a run joins it. The handler's object reaches its engine as `self.engine`.
+    """
+
+    @functools.wraps(handler)
+    async def run(self: Any, request: Any) -> Any:
+        async with self.engine.worker_manager.run_scope():
+            return await handler(self, request)
+
+    return run  # type: ignore[return-value]

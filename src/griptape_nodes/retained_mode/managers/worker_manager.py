@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -11,7 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 
@@ -21,8 +22,13 @@ from griptape_nodes.retained_mode.beta_features import DISTRIBUTED_EXECUTION, is
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, ExecutionEvent
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
+from griptape_nodes.retained_mode.events.execution_events import (
+    ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
+    NodeQueuedEvent,
+)
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommand,
     WorkerCommandRefusal,
@@ -34,11 +40,17 @@ from griptape_nodes.retained_mode.managers.external_environment import (
 from griptape_nodes.retained_mode.managers.machine_links import (
     DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
     MachineNotFoundError,
+    current_run_id,
     engine_topic_prefix,
     session_topic_prefix,
 )
+from griptape_nodes.retained_mode.managers.machine_queue import MachineQueue, NodeNotAdmittedError
 from griptape_nodes.retained_mode.managers.settings import (
+    DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY,
     DISTRIBUTED_EXECUTION_LIBRARIES_KEY,
+    DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY,
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
@@ -49,7 +61,7 @@ from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_EN
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
@@ -80,6 +92,14 @@ class _OriginatorRegistration:
     license_token: str | None
     static_server_base_url: str | None
     refused_libraries: dict[str, str]
+
+
+@dataclass
+class _HostedWorker:
+    """A worker a serving orchestrator started for an orchestrator on another machine."""
+
+    worker_engine_id: str
+    request_topic: str
 
 
 def _result_details(result: dict) -> str:
@@ -198,6 +218,20 @@ class WorkerManager(EngineScoped):
         # How many workers started for each other machine's session have not exited, which is how
         # long this machine relays that session's topics.
         self._session_relays: dict[str, int] = {}
+
+        # Every machine a run sent a node to, by run, so the run's end reaches each of them.
+        self._run_machines: dict[str, set[str]] = {}
+
+        # Workers this machine started for other machines' orchestrators, by originator session, then
+        # by worker key.
+        self._hosted_workers: dict[str, dict[str, _HostedWorker]] = {}
+
+        # Keys of workers stopped to free the machine for another run, whose exit is not their
+        # orchestrator going away.
+        self._recycling: set[str] = set()
+
+        # The queue of other machines' nodes, made when the first of them arrives.
+        self._machine_queue: MachineQueue | None = None
 
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
@@ -653,6 +687,7 @@ class WorkerManager(EngineScoped):
             len(self._managed_worker_processes),
             list(self._managed_worker_processes.keys()),
         )
+        await self._release_machines()
         await self._stop_workers(library_names=None, action="reload")
         # Cleared with the registry, not left behind: a spawn still inside its awaits holds this
         # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
@@ -754,7 +789,62 @@ class WorkerManager(EngineScoped):
         Registers a Future via RequestClient keyed by request_id and resolves it when
         the worker response arrives. The caller is responsible for deserializing the
         returned dict into the appropriate result type.
+
+        A node for a worker on another machine waits for that machine to admit it first.
         """
+        registration = self._workers.get(worker_engine_id)
+        if (
+            registration is not None
+            and registration.machine is not None
+            and isinstance(event_request.request, ExecuteNodeRequest)
+        ):
+            return await self._route_to_remote_worker(
+                event_request, worker_engine_id, worker_request_topic, registration.machine
+            )
+        return await self._forward_and_await(event_request, worker_engine_id, worker_request_topic)
+
+    async def _route_to_remote_worker(
+        self, event_request: EventRequest, worker_engine_id: str, worker_request_topic: str, machine: str
+    ) -> dict:
+        """Run a node in another machine's worker once that machine admits it, telling the machine when it ends."""
+        request = cast("ExecuteNodeRequest", event_request.request)
+        session_id = self.engine.get_session_id() or ""
+        run_id = current_run_id.get()
+        if run_id is not None:
+            self._run_machines.setdefault(run_id, set()).add(machine)
+        admission_id = str(uuid.uuid4())
+        try:
+            # Unbounded, like the node itself: another artist's run may hold the machine for as long as
+            # it runs. Tagged with the worker, so the worker going away fails the wait with the reason.
+            admission = await self._request_machine(
+                machine,
+                session_id,
+                worker_events.AdmitNodeRequest(
+                    originator_session_id=session_id,
+                    admission_id=admission_id,
+                    run_id=run_id,
+                    node_name=request.node_name,
+                ),
+                tag=worker_engine_id,
+                timeout_s=None,
+            )
+            if admission.get("result_type") != worker_events.AdmitNodeResultSuccess.__name__:
+                details = (
+                    f"Attempted to run node '{request.node_name}' on {machine}. "
+                    f"Failed because {_result_details(admission)}"
+                )
+                return {"result_type": ExecuteNodeResultFailure.__name__, "result": {"result_details": details}}
+            return await self._forward_and_await(event_request, worker_engine_id, worker_request_topic)
+        finally:
+            await self._tell_machine(
+                machine,
+                worker_events.NodeExecutionEndedRequest(originator_session_id=session_id, admission_id=admission_id),
+            )
+
+    async def _forward_and_await(
+        self, event_request: EventRequest, worker_engine_id: str, worker_request_topic: str
+    ) -> dict:
+        """Forward event_request to the named worker and await the raw result payload."""
         request_id = event_request.request_id or str(uuid.uuid4())
         # Opt into structured-failure delivery so a worker-side
         # ResultPayloadFailure arrives as the raw payload dict rather
@@ -1170,18 +1260,30 @@ class WorkerManager(EngineScoped):
             return {"result_type": _MACHINE_NOT_FOUND, "result": {"result_details": details}}
         return result
 
-    async def _request_machine(self, machine: str, session_id: str, request: RequestPayload) -> dict:
+    async def _request_machine(
+        self,
+        machine: str,
+        session_id: str,
+        request: RequestPayload,
+        *,
+        tag: str | None = None,
+        timeout_s: float | None = _MACHINE_REQUEST_TIMEOUT_S,
+    ) -> dict:
         """Send `request` to the orchestrator at `machine` and return its raw result payload.
 
-        Bounded, unlike a request to a worker: a link queues what it is given while its machine is
-        unreachable, so an unbounded wait for a machine that is down would never end.
+        Bounded by default, unlike a request to a worker: a link queues what it is given while its
+        machine is unreachable, so an unbounded wait for a machine that is down would never end. A
+        caller that waits on purpose passes no timeout and a `tag` that fails the wait when what it
+        waits for goes away.
         """
         request_id = str(uuid.uuid4())
-        future = await self._tx.request_client.track_request(request_id, tag=machine, resolve_failures_as_payload=True)
+        future = await self._tx.request_client.track_request(
+            request_id, tag=tag or machine, resolve_failures_as_payload=True
+        )
         event = EventRequest(request=request, request_id=request_id, response_topic=f"sessions/{session_id}/response")
         try:
             await self._links_for(machine).publish(machine, "EventRequest", converters.engine.dumps(event), "request")
-            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=_MACHINE_REQUEST_TIMEOUT_S)
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout_s)
         except TimeoutError:
             self._tx.request_client.discard_request(request_id)
             return {
@@ -1193,6 +1295,60 @@ class WorkerManager(EngineScoped):
         except BaseException:
             self._tx.request_client.discard_request(request_id)
             raise
+
+    async def _tell_machine(self, machine: str, request: RequestPayload) -> None:
+        """Send `request` to the orchestrator at `machine`, expecting no answer."""
+        event = EventRequest(request=request, response_topic=None)
+        try:
+            await self._links_for(machine).publish(machine, "EventRequest", converters.engine.dumps(event), "request")
+        except RuntimeError as e:
+            # The link stops with the engine, and a run or reset ending at shutdown has nowhere to say so.
+            logger.debug("Could not tell %s about %s: %s", machine, type(request).__name__, e)
+
+    @contextlib.asynccontextmanager
+    async def run_scope(self) -> AsyncIterator[None]:
+        """Count everything executed inside as one run, ended on every machine it used once it returns.
+
+        Inside a run already, joins it: a nested request is part of the run that issued it.
+        """
+        if current_run_id.get() is not None:
+            yield
+            return
+        run_id = str(uuid.uuid4())
+        token = current_run_id.set(run_id)
+        try:
+            yield
+        finally:
+            current_run_id.reset(token)
+            await self._end_run(run_id)
+
+    async def _end_run(self, run_id: str) -> None:
+        session_id = self.engine.get_session_id() or ""
+        for machine in self._run_machines.pop(run_id, set()):
+            await self._tell_machine(
+                machine, worker_events.EndRunRequest(originator_session_id=session_id, run_id=run_id)
+            )
+
+    async def _release_machines(self) -> None:
+        """Tell every machine this orchestrator registered with to stop its workers here."""
+        if self._machine_links is None:
+            return
+        for machine, session_id in list(self._machine_registrations):
+            await self._tell_machine(
+                machine, worker_events.ReleaseOriginatorWorkersRequest(originator_session_id=session_id)
+            )
+
+    async def _start_remote_worker_if_stopped(self, library_name: str) -> None:
+        """Start a library's worker on its machine again, if that machine stopped it, before a node of it runs.
+
+        A machine stops another machine's workers to free its GPU for a different run, and the worker
+        comes back the next time one of its nodes runs.
+        """
+        if self._machine_for_library(library_name) is None:
+            return
+        if self.get_worker_for_key(library_name) is not None or library_name in self._requested_spawns:
+            return
+        await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
 
     @handles(worker_events.RegisterOriginatorRequest)
     def handle_register_originator_request(
@@ -1252,15 +1408,24 @@ class WorkerManager(EngineScoped):
             return worker_events.StartWorkerResultFailure(
                 result_details=refusal, originator_unknown=originator_session_id not in self._originators
             )
-        resolved = self._worker_command(library_name, originator_session_id)
-        if isinstance(resolved, WorkerCommandRefusal):
-            return worker_events.StartWorkerResultFailure(result_details=resolved.reason)
         # The originator asks only once it has no worker for the library, so a running one is a
         # worker it already stopped using, such as after a library reset, and would never register.
         stale = self._managed_worker_processes.pop(worker_key, None)
         if stale is not None:
             logger.info("Replacing the worker for key '%s' that its orchestrator stopped using.", worker_key)
+            # Its exit is not the originator leaving: the replacement takes its place.
+            self._recycling.add(worker_key)
             await self._terminate_via_spawn_loop(worker_key, stale)
+        max_workers = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY, default=None)
+        if max_workers is not None and len(self._managed_worker_processes) >= max_workers:
+            return worker_events.StartWorkerResultFailure(
+                result_details=(
+                    f"this machine already runs {len(self._managed_worker_processes)} of its {max_workers} workers."
+                )
+            )
+        resolved = self._worker_command(library_name, originator_session_id)
+        if isinstance(resolved, WorkerCommandRefusal):
+            return worker_events.StartWorkerResultFailure(result_details=resolved.reason)
         originator = self._originators[originator_session_id]
         links = self._links_for("another machine")
         environ_overrides: dict[str, str] = {}
@@ -1287,12 +1452,17 @@ class WorkerManager(EngineScoped):
         except BaseException:
             await self._stop_relaying(originator_session_id, worker_engine_id)
             raise
+        self._hosted_workers.setdefault(originator_session_id, {})[worker_key] = _HostedWorker(
+            worker_engine_id=worker_engine_id,
+            request_topic=f"sessions/{originator_session_id}/workers/{worker_engine_id}/request",
+        )
         proc = self._managed_worker_processes.get(worker_key)
         if proc is None:
             await self._stop_relaying(originator_session_id, worker_engine_id)
         else:
             # It registers with the originator, not here, so its unregistration never reaches this
-            # engine. Watching the process is what lets a later request for the session start another.
+            # engine. Watching the process is what lets a later request for the session start another,
+            # and what tells this machine the originator is gone: its workers stop when it does.
             watcher = asyncio.get_running_loop().create_task(
                 self._forget_when_exited(worker_key, proc, worker_engine_id)
             )
@@ -1316,11 +1486,23 @@ class WorkerManager(EngineScoped):
     async def _forget_when_exited(
         self, worker_key: str, proc: asyncio.subprocess.Process, worker_engine_id: str
     ) -> None:
+        """Forget a worker started for another machine once it exits, and that machine once all of them have.
+
+        A worker exits when its orchestrator stops answering, the same heartbeat rule as a local worker,
+        so the last of an orchestrator's workers exiting is how this machine learns it is gone.
+        """
         await proc.wait()
         if self._managed_worker_processes.get(worker_key) is proc:
             del self._managed_worker_processes[worker_key]
             logger.debug("Worker for key '%s' exited (pid %s)", worker_key, proc.pid)
-        await self._stop_relaying(worker_key.partition("/")[0], worker_engine_id)
+        originator_session_id = worker_key.partition("/")[0]
+        hosted = self._hosted_workers.get(originator_session_id, {})
+        hosted.pop(worker_key, None)
+        recycled = worker_key in self._recycling
+        self._recycling.discard(worker_key)
+        if not recycled and not hosted:
+            self._forget_originator(originator_session_id)
+        await self._stop_relaying(originator_session_id, worker_engine_id)
 
     async def _stop_relaying(self, originator_session_id: str, worker_engine_id: str) -> None:
         """Stop relaying a gone worker's topics, and its session's once none of the session's workers is left."""
@@ -1335,6 +1517,134 @@ class WorkerManager(EngineScoped):
         # A worker started for the session while that awaited relayed the prefix itself, maybe first.
         if originator_session_id in self._session_relays:
             await links.relay(session_topic_prefix(originator_session_id))
+
+    def _forget_originator(self, originator_session_id: str) -> None:
+        """Stop holding anything for an orchestrator that went away: its run, and its waiting nodes."""
+        self._hosted_workers.pop(originator_session_id, None)
+        if self._machine_queue is not None:
+            self._machine_queue.originator_gone(originator_session_id)
+        logger.info("Stopped running work for session %s; none of its workers are left here.", originator_session_id)
+
+    def _queue(self) -> MachineQueue:
+        if self._machine_queue is None:
+            self._machine_queue = MachineQueue(
+                idle_timeout_s=self.engine.config_manager.get_config_value(
+                    DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY, default=300.0, cast_type=float
+                ),
+                on_handoff=self._free_for_handoff,
+                on_position=self._tell_position,
+            )
+        return self._machine_queue
+
+    @handles(worker_events.AdmitNodeRequest)
+    async def handle_admit_node_request(
+        self, request: worker_events.AdmitNodeRequest
+    ) -> worker_events.AdmitNodeResultSuccess | worker_events.AdmitNodeResultFailure:
+        """Answer once another machine's node may run here, which waits while another run has the machine."""
+        if request.originator_session_id not in self._originators:
+            return worker_events.AdmitNodeResultFailure(
+                result_details="the orchestrator asking never registered with this machine."
+            )
+        try:
+            run_id = await self._queue().admit(
+                admission_id=request.admission_id,
+                originator=request.originator_session_id,
+                run_id=request.run_id,
+                node_name=request.node_name,
+            )
+        except NodeNotAdmittedError as e:
+            return worker_events.AdmitNodeResultFailure(result_details=str(e))
+        return worker_events.AdmitNodeResultSuccess(run_id=run_id, result_details="Admitted the node.")
+
+    @handles(worker_events.NodeExecutionEndedRequest)
+    def handle_node_execution_ended_request(
+        self, request: worker_events.NodeExecutionEndedRequest
+    ) -> worker_events.NodeExecutionEndedResultSuccess:
+        self._queue().node_ended(request.admission_id)
+        return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
+
+    @handles(worker_events.EndRunRequest)
+    def handle_end_run_request(self, request: worker_events.EndRunRequest) -> worker_events.EndRunResultSuccess:
+        self._queue().end_run(request.originator_session_id, request.run_id)
+        return worker_events.EndRunResultSuccess(result_details="Ended the run.")
+
+    @handles(worker_events.ReleaseOriginatorWorkersRequest)
+    async def handle_release_originator_workers_request(
+        self, request: worker_events.ReleaseOriginatorWorkersRequest
+    ) -> worker_events.ReleaseOriginatorWorkersResultSuccess:
+        """Stop every worker this machine runs for an orchestrator that reset, and forget it."""
+        session_id = request.originator_session_id
+        self._originators.pop(session_id, None)
+        hosted = self._hosted_workers.pop(session_id, {})
+        if self._machine_queue is not None:
+            self._machine_queue.originator_gone(session_id)
+        for worker_key in hosted:
+            proc = self._managed_worker_processes.get(worker_key)
+            if proc is not None:
+                await self._terminate_via_spawn_loop(worker_key, proc)
+        return worker_events.ReleaseOriginatorWorkersResultSuccess(
+            result_details=f"Stopped {len(hosted)} worker(s) for the orchestrator that reset."
+        )
+
+    async def _free_for_handoff(self, incoming_originator: str) -> None:
+        """Apply the release policy before the machine passes to a run from `incoming_originator`."""
+        which = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default="others")
+        how = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default="drop_cache")
+        if which == "none":
+            return
+        for originator, workers in list(self._hosted_workers.items()):
+            if which == "others" and originator == incoming_originator:
+                continue
+            for worker_key, worker in list(workers.items()):
+                if how == "recycle":
+                    await self._recycle(worker_key)
+                else:
+                    await self._drop_library_named_objects(worker)
+
+    async def _recycle(self, worker_key: str) -> None:
+        proc = self._managed_worker_processes.get(worker_key)
+        if proc is None:
+            return
+        self._recycling.add(worker_key)
+        logger.info("Stopping worker '%s' to free this machine for another run.", worker_key)
+        await self._terminate_via_spawn_loop(worker_key, proc)
+
+    async def _drop_library_named_objects(self, worker: _HostedWorker) -> None:
+        """Have a worker drop what its libraries keep across runs, waiting until it has."""
+        # Lazy import required: worker_routing imports from this module's dependency graph at engine boot.
+        from griptape_nodes.app.worker_routing import DropLibraryNamedLocalObjectsRequest
+
+        request_id = str(uuid.uuid4())
+        future = await self._tx.request_client.track_request(
+            request_id, tag=worker.worker_engine_id, resolve_failures_as_payload=True
+        )
+        event = EventRequest(
+            request=DropLibraryNamedLocalObjectsRequest(),
+            request_id=request_id,
+            response_topic=f"engines/{self.engine.get_engine_id()}/response",
+        )
+        try:
+            await self._tx.send_message("EventRequest", converters.engine.dumps(event), worker.request_topic)
+            result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=_MACHINE_REQUEST_TIMEOUT_S)
+        except TimeoutError:
+            self._tx.request_client.discard_request(request_id)
+            logger.warning(
+                "Worker %s did not free its models within %.0f seconds.",
+                worker.worker_engine_id,
+                _MACHINE_REQUEST_TIMEOUT_S,
+            )
+            return
+        except BaseException:
+            self._tx.request_client.discard_request(request_id)
+            raise
+        logger.info("Worker %s: %s", worker.worker_engine_id, _result_details(result))
+
+    async def _tell_position(self, originator_session_id: str, node_name: str, position: int) -> None:
+        """Tell a waiting node's editor its place in line, on the session topic its orchestrator listens on."""
+        event = ExecutionEvent(payload=NodeQueuedEvent(node_name=node_name, position=position))
+        await self._tx.send_message(
+            "execution_event", converters.client.dumps(event), f"sessions/{originator_session_id}/response"
+        )
 
     async def _wait_for_session(self, library_name: str) -> str | None:
         """Return the active session's id once there is one, or None, recorded, if none came."""
@@ -1475,7 +1785,11 @@ class WorkerManager(EngineScoped):
         worker evicted). Bounded anyway, because "every" is a claim about code that will keep
         changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
         timeout is a bug report; an unbounded wait is a mystery.
+
+        A library whose worker another machine stopped, to free its GPU for a different run, has that
+        worker started there again first.
         """
+        await self._start_remote_worker_if_stopped(library_name)
         if self.has_settled(library_name):
             return
         logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)

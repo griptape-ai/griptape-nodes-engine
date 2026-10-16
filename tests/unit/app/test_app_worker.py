@@ -41,11 +41,17 @@ from griptape_nodes.retained_mode.managers.machine_links import (
     MachineNotFoundError,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
+from griptape_nodes.retained_mode.managers.settings import (
+    DISTRIBUTED_EXECUTION_LIBRARIES_KEY,
+    DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY,
+)
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _STATIC_URL_SETTLE_TIMEOUT_S,
     WorkerManager,
     WorkerRegistration,
+    _HostedWorker,
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -2930,3 +2936,222 @@ class TestARemoteWorkerIsReachedThroughItsMachine:
         address, event_type, _payload, topic = links.publish.await_args.args
         assert (address, event_type, topic) == (_MACHINE, "EventRequest", _WORKER_REQUEST_TOPIC)
         worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+
+def _remote_worker(worker_manager: WorkerManager) -> MagicMock:
+    """Register `_ENGINE` as `_LIBRARY`'s worker on `_MACHINE`, which answers like a serving orchestrator."""
+    links = _machine(worker_manager)
+    worker_manager._workers[_ENGINE] = WorkerRegistration(
+        request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, machine=_MACHINE
+    )
+    return links
+
+
+def _execute(node_name: str = "heavy") -> EventRequest:
+    return EventRequest(
+        request=ExecuteNodeRequest(node_name=node_name, parameter_values={}),
+        request_id=f"exec-{node_name}",
+    )
+
+
+class TestANodeForAnotherMachineIsAdmittedFirst:
+    @pytest.mark.asyncio
+    async def test_it_is_admitted_then_sent_then_reported_ended(self, worker_manager: WorkerManager) -> None:
+        links = _remote_worker(worker_manager)
+
+        result = await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        assert result["result_type"] == "ExecuteNodeResultSuccess"
+        sent = _sent(links)
+        assert [entry["request_type"] for entry in sent] == [
+            "AdmitNodeRequest",
+            "ExecuteNodeRequest",
+            "NodeExecutionEndedRequest",
+        ]
+        assert sent[0]["request"]["admission_id"] == sent[2]["request"]["admission_id"]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_admission_fails_the_node_without_sending_it(self, worker_manager: WorkerManager) -> None:
+        links = _remote_worker(worker_manager)
+        refusing = _machine(worker_manager, refuse={"AdmitNodeRequest": "its run ended before the machine was free."})
+        links.publish.side_effect = refusing.publish.side_effect
+
+        result = await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        assert result["result_type"] == "ExecuteNodeResultFailure"
+        assert "its run ended" in result["result"]["result_details"]
+        assert [entry["request_type"] for entry in _sent(refusing)] == [
+            "AdmitNodeRequest",
+            "NodeExecutionEndedRequest",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_local_workers_node_is_not_admitted(self, worker_manager: WorkerManager) -> None:
+        links = _machine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
+        request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
+
+        async def answer(_event_type: str, payload: str, _topic: str | None) -> None:
+            pending = request_client._pending_requests.pop(json.loads(payload)["request_id"])
+            pending.future.set_result({"result_type": "ExecuteNodeResultSuccess", "result": {}})
+
+        worker_manager._tx.send_message.side_effect = answer  # type: ignore[union-attr]
+
+        await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        links.publish.assert_not_awaited()
+
+
+class TestARunEndsOnEveryMachineItUsed:
+    @pytest.mark.asyncio
+    async def test_nodes_in_a_run_carry_it_and_its_end_reaches_their_machine(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _remote_worker(worker_manager)
+
+        async with worker_manager.run_scope():
+            await worker_manager.route_to_worker(_execute("first"), _ENGINE, _WORKER_REQUEST_TOPIC)
+            await worker_manager.route_to_worker(_execute("second"), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        sent = _sent(links)
+        admissions = [entry for entry in sent if entry["request_type"] == "AdmitNodeRequest"]
+        run_id = admissions[0]["request"]["run_id"]
+        assert run_id is not None
+        assert admissions[1]["request"]["run_id"] == run_id
+        assert sent[-1]["request_type"] == "EndRunRequest"
+        assert sent[-1]["request"]["run_id"] == run_id
+
+    @pytest.mark.asyncio
+    async def test_a_run_started_inside_a_run_joins_it(self, worker_manager: WorkerManager) -> None:
+        links = _remote_worker(worker_manager)
+
+        async with worker_manager.run_scope(), worker_manager.run_scope():
+            await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        assert [entry["request_type"] for entry in _sent(links)].count("EndRunRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_outside_any_run_is_sent_without_one(self, worker_manager: WorkerManager) -> None:
+        links = _remote_worker(worker_manager)
+
+        await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+
+        assert _sent(links)[0]["request"]["run_id"] is None
+        assert "EndRunRequest" not in [entry["request_type"] for entry in _sent(links)]
+
+    @pytest.mark.asyncio
+    async def test_a_reset_tells_each_machine_to_stop_its_workers_here(self, worker_manager: WorkerManager) -> None:
+        links = _machine(worker_manager)
+        await _start_on_machine(worker_manager)
+
+        await worker_manager.reset_workers()
+
+        released = [entry for entry in _sent(links) if entry["request_type"] == "ReleaseOriginatorWorkersRequest"]
+        assert [entry["request"]["originator_session_id"] for entry in released] == [_SESSION]
+
+
+def _host(worker_manager: WorkerManager, session: str, library: str) -> MagicMock:
+    """Record a worker this machine runs for `session`, returning its process."""
+    if worker_manager._machine_links is None:
+        links = MagicMock()
+        links.relay = AsyncMock()
+        links.unrelay = AsyncMock()
+        worker_manager.attach_machine_links(links)
+    proc = _managed_proc_mock()
+    worker_key = f"{session}/{library}"
+    worker_manager._managed_worker_processes[worker_key] = proc
+    worker_manager._hosted_workers.setdefault(session, {})[worker_key] = _HostedWorker(
+        worker_engine_id=f"w-{session}", request_topic=f"sessions/{session}/workers/w-{session}/request"
+    )
+    return proc
+
+
+class TestFreeingTheMachineBetweenOrchestrators:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("which", "freed"),
+        [("others", ["sess-a"]), ("all", ["sess-a", "sess-b"]), ("none", [])],
+    )
+    async def test_the_setting_decides_whose_workers_are_freed(
+        self, worker_manager: WorkerManager, which: str, freed: list[str]
+    ) -> None:
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, **_: which if key == DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY else default
+        )
+        _host(worker_manager, "sess-a", _LIBRARY)
+        _host(worker_manager, "sess-b", _LIBRARY)
+
+        with patch.object(worker_manager, "_drop_library_named_objects", new=AsyncMock()) as drop:
+            await worker_manager._free_for_handoff("sess-b")
+
+        assert [dropped.args[0].worker_engine_id for dropped in drop.await_args_list] == [f"w-{s}" for s in freed]
+
+    @pytest.mark.asyncio
+    async def test_recycling_stops_the_worker_without_counting_its_orchestrator_gone(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, **_: "recycle" if key == DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY else default
+        )
+        proc = _host(worker_manager, "sess-a", _LIBRARY)
+        queue = MagicMock()
+        worker_manager._machine_queue = queue
+
+        with patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()) as terminate:
+            await worker_manager._free_for_handoff("sess-b")
+        await worker_manager._forget_when_exited(f"sess-a/{_LIBRARY}", proc, "w-sess-a")
+
+        terminate.assert_awaited_once()
+        queue.originator_gone.assert_not_called()
+
+
+class TestAnOriginatorWithNoWorkersLeftIsGone:
+    @pytest.mark.asyncio
+    async def test_its_run_and_waiting_nodes_are_dropped_when_its_last_worker_exits(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        first = _host(worker_manager, "sess-a", "Lib One")
+        second = _host(worker_manager, "sess-a", "Lib Two")
+        queue = MagicMock()
+        worker_manager._machine_queue = queue
+
+        await worker_manager._forget_when_exited("sess-a/Lib One", first, "w-sess-a")
+        queue.originator_gone.assert_not_called()
+        await worker_manager._forget_when_exited("sess-a/Lib Two", second, "w-sess-a")
+
+        queue.originator_gone.assert_called_once_with("sess-a")
+
+    @pytest.mark.asyncio
+    async def test_a_release_request_stops_its_workers(self, worker_manager: WorkerManager) -> None:
+        _host(worker_manager, "sess-a", _LIBRARY)
+
+        with patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()) as terminate:
+            await worker_manager.handle_release_originator_workers_request(
+                worker_events.ReleaseOriginatorWorkersRequest(originator_session_id="sess-a")
+            )
+
+        terminate.assert_awaited_once()
+        assert "sess-a" not in worker_manager._hosted_workers
+
+
+class TestTheWorkerLimit:
+    @pytest.mark.asyncio
+    async def test_a_worker_beyond_the_limit_is_refused_naming_it(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
+        _register_originator(worker_manager)
+        read = worker_manager.engine.config_manager.get_config_value.side_effect  # type: ignore[union-attr]
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, cast_type=None, **kwargs: (
+                1 if key == DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY else read(key, default, cast_type, **kwargs)
+            )
+        )
+        _host(worker_manager, "sess-other", "Other Lib")
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert isinstance(result, worker_events.StartWorkerResultFailure)
+        assert "1 of its 1" in str(result.result_details)
+        spawn.assert_not_awaited()

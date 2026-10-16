@@ -220,3 +220,104 @@ class RegisterOriginatorResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class RegisterOriginatorResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The serving orchestrator refused the originator, and will start no workers for it."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeRequest(RequestPayload):
+    """Sent by an orchestrator to the machine whose worker will run a node, before sending the node.
+
+    The machine answers once the node may run: at once while it is free or already running this run,
+    otherwise when the run holding it ends. Waiting nodes are told their place in line.
+
+    Args:
+        originator_session_id: The session of the orchestrator the node belongs to.
+        admission_id: Names this admission, so the node's NodeExecutionEndedRequest can say which ended.
+        run_id: The run the node belongs to, or None for a node run on its own.
+        node_name: The node, named in the waiting status the artist sees.
+    """
+
+    originator_session_id: str
+    admission_id: str
+    run_id: str | None
+    node_name: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The node may run.
+
+    Args:
+        run_id: The run the machine counts it in, minted for a node sent without one.
+    """
+
+    run_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The node will not run on that machine."""
+
+
+@dataclass
+@PayloadRegistry.register
+class NodeExecutionEndedRequest(RequestPayload):
+    """Sent by an orchestrator when a node it was admitted to run on another machine finishes, or is cancelled.
+
+    Args:
+        originator_session_id: The session of the orchestrator the node belongs to.
+        admission_id: The `admission_id` of the node's AdmitNodeRequest.
+    """
+
+    originator_session_id: str
+    admission_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class NodeExecutionEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The machine recorded the node as ended."""
+
+
+@dataclass
+@PayloadRegistry.register
+class EndRunRequest(RequestPayload):
+    """Sent by an orchestrator to every machine a run used, when the run finishes, fails, or is cancelled.
+
+    Args:
+        originator_session_id: The session of the orchestrator the run belongs to.
+        run_id: The run that ended.
+    """
+
+    originator_session_id: str
+    run_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class EndRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The machine no longer holds itself for the run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseOriginatorWorkersRequest(RequestPayload):
+    """Sent by an orchestrator to each machine it uses when it resets, so their workers for it stop.
+
+    Args:
+        originator_session_id: The session whose workers stop.
+    """
+
+    originator_session_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseOriginatorWorkersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The machine stopped the originator's workers."""

@@ -507,6 +507,23 @@ class InvolvedNodesEvent(ExecutionPayload):
 
 @dataclass
 @PayloadRegistry.register
+class NodeQueuedEvent(ExecutionPayload):
+    """A node is waiting for another machine, which is running someone else's work.
+
+    Sent by that machine to the editor of the artist whose node waits, each time its place in line
+    changes. The node starts like any other once the machine takes it.
+
+    Args:
+        node_name: The waiting node.
+        position: Its run's place in line, 1 being next.
+    """
+
+    node_name: str
+    position: int
+
+
+@dataclass
+@PayloadRegistry.register
 class GriptapeEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
