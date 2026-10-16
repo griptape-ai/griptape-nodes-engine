@@ -28,11 +28,13 @@ the minimal fixtures did not cover:
   ``after_value_set`` -- all of which now run orchestrator-side on the real class instead of
   being lost to a schema stub.
 - ``ProcessInfoNode``: reports the process that ran it and that process's parent, so a test
-  driving real engine processes can tell which process executed the node.
+  driving real engine processes can tell which process executed the node. Logs a line starting
+  with ``PROCESS_INFO_LOG_PREFIX`` so such a test can see where its logs arrive.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -51,6 +53,9 @@ from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueReq
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 MEDIA_BYTES = b"\x89PNG\r\n\x1a\n" + b"fixture-media-payload"
+PROCESS_INFO_LOG_PREFIX = "ProcessInfoNode"
+
+logger = logging.getLogger("griptape_nodes")
 
 
 class SaveMediaNode(DataNode):
@@ -445,6 +450,7 @@ class ProcessInfoNode(DataNode):
     def process(self) -> None:
         self.parameter_output_values["pid"] = os.getpid()
         self.parameter_output_values["parent_pid"] = os.getppid()
+        logger.info("%s '%s' ran in process %s", PROCESS_INFO_LOG_PREFIX, self.name, os.getpid())
 
 
 class UnshippableOutputNode(DataNode):

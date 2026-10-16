@@ -205,6 +205,41 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 
 A value of `0` scans only the top-level directory (no subdirectories).
 
+## Running a Library's Nodes on Another Machine
+
+This is a beta feature. Turn on **Distributed execution** on the Beta settings page on both machines: the artist's workstation and the machine that runs the nodes, such as a shared GPU machine. Then, on the workstation, assign each library to the machine that runs it with `distributed_execution.libraries`, a map of library name to that machine's engine ID:
+
+```json
+{
+  "distributed_execution": {
+    "libraries": {
+      "Griptape Nodes Diffusers Library": "3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70"
+    }
+  }
+}
+```
+
+The workstation finds the other machine through the engine registry, at the admin server or Griptape Cloud its `GT_CLOUD_BASE_URL` names, where each engine with **Distributed execution** on reports where it listens. So the other machine must serve its `websocket_direct` transport on an address the workstation can reach, and name that address in `transports.websocket_direct.advertise_url`:
+
+```json
+{
+  "transports": {
+    "websocket_direct": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 18125,
+      "advertise_url": "ws://gpu-01:18125"
+    }
+  }
+}
+```
+
+An engine keeps its ID across restarts, so the other machine can move to a new address without a change on the workstation. Its ID changes only if its data directory is deleted, unless `GTN_ENGINE_ID` sets it. Nodes from a library with no entry run on the workstation, as before. A change to the setting takes effect from the next session.
+
+Both machines must run the same engine version and the same version of each assigned library, and see the same workspace. A node from a library the other machine refuses, or cannot reach, fails with the reason, such as the two versions that differ. Its worker on the other machine runs under the workstation's Griptape Nodes license, and asks the workstation for secrets.
+
+Library names are case-sensitive, so set this in a `griptape_nodes_config.json` file rather than an environment variable, whose name is lowercased before it becomes a config key.
+
 ## Workspace Directory
 
 During `gtn init`, you specify a Workspace Directory. This is the root for your projects, saved flows, and potentially project-specific settings.
