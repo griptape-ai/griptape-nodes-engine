@@ -2,7 +2,7 @@ import json
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, ValidationInfo, field_validator
 from pydantic import Field as PydanticField
@@ -444,40 +444,26 @@ class WorkerSettings(BaseModel):
             raise ValueError(msg) from e
 
 
-class MachineAddress(NamedTuple):
-    host: str
-    port: int
-
-
-def parse_machine_address(address: str) -> MachineAddress | None:
-    """Split a machine address written host:port, or return None if it is not one."""
-    host, separator, port = address.rpartition(":")
-    if not separator or not host or not port.isdigit():
-        return None
-    return MachineAddress(host=host, port=int(port))
-
-
 class DistributedExecutionSettings(BaseModel):
     libraries: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Where each library's nodes run, as a map of library name to the address of the machine "
-            "that runs them, written host:port, for example "
-            '{"Griptape Nodes Diffusers Library": "gpu-01:18125"}. The address is that machine\'s '
-            "engine's websocket_direct transport. A library with no entry runs on this machine. Needs "
-            "the Distributed execution beta feature on both machines. Read when the engine starts."
+            "Where each library's nodes run, as a map of library name to the engine ID of the machine "
+            "that runs them, for example "
+            '{"Griptape Nodes Diffusers Library": "3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70"}. This engine '
+            "finds that machine through the engine registry, so the machine must set "
+            "transports.websocket_direct.advertise_url to an address this machine can reach. A library "
+            "with no entry runs on this machine. Needs the Distributed execution beta feature on both "
+            "machines."
         ),
     )
 
     @field_validator("libraries", mode="after")
     @classmethod
     def validate_libraries(cls, v: dict[str, str]) -> dict[str, str]:
-        for library_name, address in v.items():
-            if parse_machine_address(address) is None:
-                msg = (
-                    f"{DISTRIBUTED_EXECUTION_LIBRARIES_KEY} entry for '{library_name}' must be host:port, "
-                    f"got {address!r}"
-                )
+        for library_name, engine_id in v.items():
+            if not engine_id.strip():
+                msg = f"{DISTRIBUTED_EXECUTION_LIBRARIES_KEY} entry for '{library_name}' must be an engine ID"
                 raise ValueError(msg)
         return v
 

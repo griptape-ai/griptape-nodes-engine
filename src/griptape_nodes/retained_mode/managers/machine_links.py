@@ -12,29 +12,41 @@ from typing import Protocol
 
 # The version of the requests orchestrators on different machines exchange. While it is 0.x, any
 # difference is refused, since both machines also have to run the same engine version.
-DISTRIBUTED_EXECUTION_SCHEMA_VERSION = "0.1.0"
+DISTRIBUTED_EXECUTION_SCHEMA_VERSION = "0.2.0"
+
+
+class MachineNotFoundError(Exception):
+    """Raised when a machine cannot be reached, carrying why, written for an artist."""
 
 
 class MachineLinks(Protocol):
     """The transport operations an orchestrator needs to reach, and to serve, other machines.
 
-    A machine is named by its address, `host:port`, as written in the distribution settings.
+    A machine is named by the engine ID of its orchestrator, as written in the distribution settings.
     """
 
-    async def publish(self, address: str, event_type: str, payload: str, topic: str) -> None:
-        """Send a frame to the orchestrator at `address`."""
+    async def connect(self, machine: str) -> None:
+        """Find the machine through the engine registry and link to it, or follow it to a new address.
+
+        Raises:
+            MachineNotFoundError: The registry has no running engine `machine` that this one can reach.
+        """
         ...
 
-    async def subscribe(self, address: str, topic: str) -> None:
-        """Receive the frames published on `topic` at the orchestrator at `address`."""
+    async def publish(self, machine: str, event_type: str, payload: str, topic: str) -> None:
+        """Send a frame to the orchestrator of `machine`."""
         ...
 
-    async def route(self, address: str, topic_prefix: str) -> None:
-        """Also send this engine's broadcasts on topics under `topic_prefix` to `address`."""
+    async def subscribe(self, machine: str, topic: str) -> None:
+        """Receive the frames published on `topic` at the orchestrator of `machine`."""
         ...
 
-    async def unroute(self, address: str, topic_prefix: str) -> None:
-        """Stop sending this engine's broadcasts on topics under `topic_prefix` to `address`."""
+    async def route(self, machine: str, topic_prefix: str) -> None:
+        """Also send this engine's broadcasts on topics under `topic_prefix` to `machine`."""
+        ...
+
+    async def unroute(self, machine: str, topic_prefix: str) -> None:
+        """Stop sending this engine's broadcasts on topics under `topic_prefix` to `machine`."""
         ...
 
     async def relay(self, topic_prefix: str) -> None:

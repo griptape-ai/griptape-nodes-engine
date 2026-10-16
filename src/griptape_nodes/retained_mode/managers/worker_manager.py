@@ -33,6 +33,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (
 )
 from griptape_nodes.retained_mode.managers.machine_links import (
     DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+    MachineNotFoundError,
     engine_topic_prefix,
     session_topic_prefix,
 )
@@ -67,6 +68,9 @@ _STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 # How long an orchestrator waits for another machine's orchestrator to answer a request. Starting a
 # worker answers once its process exists, so this bounds a machine that is down or unreachable.
 _MACHINE_REQUEST_TIMEOUT_S = 60.0
+
+# The result type of a registration that never reached the machine it was for.
+_MACHINE_NOT_FOUND = "MachineNotFound"
 
 
 @dataclass
@@ -1106,9 +1110,13 @@ class WorkerManager(EngineScoped):
         result = await asyncio.shield(registration)
         if result.get("result_type") == worker_events.RegisterOriginatorResultSuccess.__name__:
             return None
+        if result.get("result_type") == _MACHINE_NOT_FOUND:
+            return _result_details(result)
         return f"{machine} refused to run work for this machine: {_result_details(result)}"
 
     def _forget_unaccepted_registration(self, key: tuple[str, str], task: asyncio.Task[dict]) -> None:
+        # Forgetting is also what finds a machine again: the next start looks it up afresh, so a
+        # machine that moved to a new address is followed there.
         accepted = (
             not task.cancelled()
             and task.exception() is None
@@ -1125,6 +1133,10 @@ class WorkerManager(EngineScoped):
 
     async def _send_registration(self, machine: str, session_id: str) -> dict:
         links = self._links_for(machine)
+        try:
+            await links.connect(machine)
+        except MachineNotFoundError as e:
+            return {"result_type": _MACHINE_NOT_FOUND, "result": {"result_details": str(e)}}
         # Subscribed before anything is asked: the replies arrive as session responses, and once a
         # worker starts, its registration and library load report arrive as session requests.
         await links.subscribe(machine, f"sessions/{session_id}/request")
@@ -1143,7 +1155,20 @@ class WorkerManager(EngineScoped):
             license_token=self.engine.secrets_manager.get_secret(LICENSE_SECRET_NAME, should_error_on_not_found=False),
             static_server_base_url=await self._orchestrator_static_server_base_url(),
         )
-        return await self._request_machine(machine, session_id, request)
+        result = await self._request_machine(machine, session_id, request)
+        answered_as = result.get("result", {}).get("engine_id")
+        # Catches a registry record or address that leads to the wrong machine. It cannot catch one
+        # that claims to be `machine`, since the answer is the serving orchestrator's own word.
+        if (
+            result.get("result_type") == worker_events.RegisterOriginatorResultSuccess.__name__
+            and answered_as != machine
+        ):
+            details = (
+                f"Attempted to reach machine {machine}. Failed because the engine at its address is "
+                f"{answered_as or 'one that did not say which engine it is'}."
+            )
+            return {"result_type": _MACHINE_NOT_FOUND, "result": {"result_details": details}}
+        return result
 
     async def _request_machine(self, machine: str, session_id: str, request: RequestPayload) -> dict:
         """Send `request` to the orchestrator at `machine` and return its raw result payload.
@@ -1208,7 +1233,9 @@ class WorkerManager(EngineScoped):
             refused_libraries=refused,
         )
         return worker_events.RegisterOriginatorResultSuccess(
-            refused_libraries=refused, result_details="Accepted the orchestrator from another machine."
+            engine_id=self.engine.get_engine_id() or "",
+            refused_libraries=refused,
+            result_details="Accepted the orchestrator from another machine.",
         )
 
     async def _start_worker_for_originator(

@@ -207,9 +207,12 @@ class RegisterOriginatorResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
     """The serving orchestrator accepted the originator.
 
     Args:
+        engine_id: The serving orchestrator's engine ID, so the originator can tell it reached the
+            machine its distribution settings name.
         refused_libraries: Each library it will not start workers for, with the reason.
     """
 
+    engine_id: str = ""
     refused_libraries: dict[str, str] = field(default_factory=dict)
 
 

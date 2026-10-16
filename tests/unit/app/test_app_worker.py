@@ -36,7 +36,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.machine_links import DISTRIBUTED_EXECUTION_SCHEMA_VERSION
+from griptape_nodes.retained_mode.managers.machine_links import (
+    DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+    MachineNotFoundError,
+)
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
@@ -2377,7 +2380,7 @@ class TestChallengeAllowanceRounding:
         assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
 
 
-_MACHINE = "gpu-01:18125"
+_MACHINE = "gpu-01-engine-id"
 _LIBRARY = "Heavy Library"
 _LICENSE = "artist-license"
 
@@ -2414,6 +2417,8 @@ def _machine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = N
         request_type = sent["request_type"]
         result_type = request_type.replace("Request", "ResultSuccess")
         result: dict[str, object] = {"result_details": "ok"}
+        if request_type == "RegisterOriginatorRequest":
+            result["engine_id"] = _MACHINE
         if request_type in refuse:
             result_type = request_type.replace("Request", "ResultFailure")
             result = {"result_details": refuse[request_type]}
@@ -2422,6 +2427,7 @@ def _machine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = N
             pending.future.set_result({"result_type": result_type, "result": result})
 
     links = MagicMock()
+    links.connect = AsyncMock()
     links.publish = AsyncMock(side_effect=answer)
     links.subscribe = AsyncMock()
     links.route = AsyncMock()
@@ -2541,6 +2547,46 @@ class TestStartingAWorkerOnAnotherMachine:
         assert reason is not None
         assert "no room" in reason
         assert _LIBRARY not in worker_manager._remote_libraries
+
+    @pytest.mark.asyncio
+    async def test_a_machine_that_cannot_be_found_makes_the_library_unavailable_and_is_looked_up_again(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _machine(worker_manager)
+        links.connect.side_effect = MachineNotFoundError("gpu-01 is not running.")
+
+        await _start_on_machine(worker_manager)
+
+        assert worker_manager.worker_unavailable_reason(_LIBRARY) == "gpu-01 is not running."
+        links.publish.assert_not_awaited()
+        assert worker_manager._machine_registrations == {}
+
+    @pytest.mark.asyncio
+    async def test_a_machine_that_answers_as_another_engine_is_refused_naming_it(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _machine(worker_manager)
+        answer = links.publish.side_effect
+
+        async def answer_as_another(address: str, event_type: str, payload: str, topic: str) -> None:
+            request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
+            sent = json.loads(payload)
+            if sent["request_type"] != "RegisterOriginatorRequest":
+                await answer(address, event_type, payload, topic)
+                return
+            pending = request_client._pending_requests.pop(sent["request_id"])
+            pending.future.set_result(
+                {"result_type": "RegisterOriginatorResultSuccess", "result": {"engine_id": "someone-else"}}
+            )
+
+        links.publish.side_effect = answer_as_another
+
+        await _start_on_machine(worker_manager)
+
+        reason = worker_manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert "someone-else" in reason
+        assert [sent["request_type"] for sent in _sent(links)] == ["RegisterOriginatorRequest"]
 
     @pytest.mark.asyncio
     async def test_two_libraries_on_one_machine_register_with_it_once(self, worker_manager: WorkerManager) -> None:
