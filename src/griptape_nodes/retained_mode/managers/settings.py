@@ -25,6 +25,10 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARIES_KEY = "distributed_execution.libraries"
+DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
+DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
+DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY = "distributed_execution.idle_timeout_s"
+DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -444,6 +448,25 @@ class WorkerSettings(BaseModel):
             raise ValueError(msg) from e
 
 
+class ReleaseSettings(BaseModel):
+    which: Literal["none", "others", "all"] = Field(
+        default="others",
+        description=(
+            "Whose workers this machine frees when it passes from one machine's run to another's. 'none' frees "
+            "nothing, for a machine dedicated to one pipeline. 'others' frees every other machine's workers, so "
+            "the incoming run's own models stay loaded. 'all' frees the incoming run's workers too."
+        ),
+    )
+    how: Literal["drop_cache", "recycle"] = Field(
+        default="drop_cache",
+        description=(
+            "How it frees them. 'drop_cache' has each worker drop what its libraries keep across runs, such as "
+            "a loaded model, and keeps values a later node of the same run still needs. 'recycle' stops the "
+            "worker, which starts again the next time its machine needs it; the only guaranteed reset."
+        ),
+    )
+
+
 class DistributedExecutionSettings(BaseModel):
     libraries: dict[str, str] = Field(
         default_factory=dict,
@@ -455,6 +478,23 @@ class DistributedExecutionSettings(BaseModel):
             "transports.websocket_direct.advertise_url to an address this machine can reach. A library "
             "with no entry runs on this machine. Needs the Distributed execution beta feature on both "
             "machines."
+        ),
+    )
+
+    release: ReleaseSettings = Field(default_factory=ReleaseSettings)
+    idle_timeout_s: float = Field(
+        default=300.0,
+        description=(
+            "On a machine running nodes for other machines: seconds a run keeps the machine after its last "
+            "node finished, if the machine that sent it never says the run ended. Must be longer than the "
+            "slowest stretch of a run between two of its nodes that run here."
+        ),
+    )
+    max_workers: int | None = Field(
+        default=None,
+        description=(
+            "On a machine running nodes for other machines: the most workers it runs at once. A machine that "
+            "needs another worker beyond this is refused with the reason. Empty (the default) sets no limit."
         ),
     )
 

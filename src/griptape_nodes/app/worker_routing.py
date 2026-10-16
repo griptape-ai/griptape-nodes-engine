@@ -149,6 +149,29 @@ class DropLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
+class DropLibraryNamedLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent to a worker to release what its libraries keep across runs, such as a loaded model.
+
+    Sent by a machine running nodes for other machines, to the workers of every machine but the one
+    whose run is starting, so that run has the GPU to itself. Values the engine holds for a node's
+    parameters stay: a later node of the same run may still need them, and nothing could rebuild them.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker released what its libraries kept across runs."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed while releasing what its libraries kept across runs."""
+
+
+@dataclass
+@PayloadRegistry.register
 class DropLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Worker released whichever of the named objects it was holding."""
 
@@ -357,6 +380,7 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # a RemoteHandler forwards.
         DropAllLocalObjectsRequest,
         DropLocalObjectsRequest,
+        DropLibraryNamedLocalObjectsRequest,
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
@@ -536,6 +560,24 @@ async def _handle_drop_local_objects(
     return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
 
 
+async def _handle_drop_library_named_local_objects(
+    request: DropLibraryNamedLocalObjectsRequest,  # noqa: ARG001
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release the objects this process's libraries named themselves, keeping what the engine parked."""
+    resource_manager = event_manager.engine.resource_manager
+
+    try:
+        # Off the loop for the same reason as its siblings: a release hook is `del model` plus a CUDA
+        # cache flush, and a worker whose loop is blocked past the heartbeat timeout is evicted.
+        dropped = await to_thread(resource_manager.drop_library_named_local_objects)
+    except Exception as e:
+        details = f"Attempted to release what this worker's libraries keep across runs. Failed because of {type(e).__name__}: {e}."
+        return DropLibraryNamedLocalObjectsResultFailure(result_details=details)
+    return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
+
+
 def register_broadcast_handlers(
     event_manager: EventManager,
     *,
@@ -639,7 +681,7 @@ def register_broadcast_handlers(
 
 
 def _register_local_object_handlers(event_manager: EventManager) -> None:
-    """Wire the two teardown requests that free objects this worker is holding."""
+    """Wire the teardown requests that free objects this worker is holding."""
 
     async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)
@@ -650,3 +692,10 @@ def _register_local_object_handlers(event_manager: EventManager) -> None:
         return await _handle_drop_local_objects(request, event_manager=event_manager)
 
     event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)
+
+    async def handle_drop_library_named_local_objects(request: DropLibraryNamedLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_library_named_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(
+        DropLibraryNamedLocalObjectsRequest, handle_drop_library_named_local_objects
+    )

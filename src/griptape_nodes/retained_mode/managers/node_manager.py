@@ -245,6 +245,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.machine_links import runs_as_one_run
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
@@ -3194,6 +3195,7 @@ class NodeManager(EngineScoped):
         return self._name_to_parent_flow_name[node_name]
 
     @handles(ResolveNodeRequest)
+    @runs_as_one_run
     async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         node_name = request.node_name
         debug_mode = request.debug_mode
@@ -3324,15 +3326,26 @@ class NodeManager(EngineScoped):
             #
             # The wait comes first: a worker is routable the moment it registers but loads its
             # library after, and forwarding into that window fails node creation over there.
-            try:
-                if library_name:
-                    await self.engine.worker_manager.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
-            except RuntimeError as err:
-                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
+            #
+            # A worker on another machine also waits for that machine to admit the node, and is
+            # picked only after: the machine may stop it while the node waits, and the second
+            # wait starts it again.
             wm = self.engine.worker_manager
-            if wm is not None and worker is not None:
-                return await self._execute_node_via_worker(request, wm, worker)
+            admission = None
+            try:
+                try:
+                    if library_name:
+                        await wm.wait_until_executable(library_name)
+                        admission = await wm.admit_on_machine(library_name, request.node_name)
+                        await wm.wait_until_executable(library_name)
+                    worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                except RuntimeError as err:
+                    return ExecuteNodeResultFailure(result_details=str(err), exception=err)
+                if wm is not None and worker is not None:
+                    return await self._execute_node_via_worker(request, wm, worker)
+            finally:
+                if admission is not None:
+                    await wm.end_admission(admission)
 
         async with STRICT_MODE.scoped_execution(
             kind=StrictModeScopeKind.RUNTIME_EXECUTE,

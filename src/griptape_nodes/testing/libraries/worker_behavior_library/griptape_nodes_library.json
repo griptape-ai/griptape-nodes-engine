@@ -125,6 +125,24 @@
       }
     },
     {
+      "class_name": "WaitNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Waits a given time and reports when it started and finished",
+        "display_name": "WaitNode"
+      }
+    },
+    {
+      "class_name": "CachedModelNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Keeps an object across runs and reports whether it was still held",
+        "display_name": "CachedModelNode"
+      }
+    },
+    {
       "class_name": "UnshippableOutputNode",
       "file_path": "worker_behavior_nodes.py",
       "metadata": {

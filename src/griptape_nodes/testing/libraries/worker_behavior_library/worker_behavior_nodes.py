@@ -30,12 +30,17 @@ the minimal fixtures did not cover:
 - ``ProcessInfoNode``: reports the process that ran it and that process's parent, so a test
   driving real engine processes can tell which process executed the node. Logs a line starting
   with ``PROCESS_INFO_LOG_PREFIX`` so such a test can see where its logs arrive.
+- ``WaitNode``: waits a given time and reports when it started and finished, so a test can tell
+  whether two runs overlapped.
+- ``CachedModelNode``: keeps an object across runs under a key it names itself, the way a library
+  keeps a loaded model, and reports whether it found the one it kept last time.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
@@ -451,6 +456,84 @@ class ProcessInfoNode(DataNode):
         self.parameter_output_values["pid"] = os.getpid()
         self.parameter_output_values["parent_pid"] = os.getppid()
         logger.info("%s '%s' ran in process %s", PROCESS_INFO_LOG_PREFIX, self.name, os.getpid())
+
+
+class WaitNode(DataNode):
+    """Waits `seconds`, outputting the wall-clock times it started and finished.
+
+    `after` is ignored; connecting another node's output to it makes this one run second.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="after",
+                type="float",
+                default_value=0.0,
+                tooltip="Connect another node's output here to run after it",
+                allowed_modes={ParameterMode.INPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="seconds",
+                type="float",
+                default_value=0.0,
+                tooltip="How long to wait",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        for output in ("started_at", "finished_at"):
+            self.add_parameter(
+                Parameter(
+                    name=output,
+                    type="float",
+                    default_value=0.0,
+                    tooltip="Seconds since the epoch",
+                    allowed_modes={ParameterMode.OUTPUT},
+                )
+            )
+
+    def process(self) -> None:
+        self.parameter_output_values["started_at"] = time.time()
+        time.sleep(float(self.get_parameter_value("seconds") or 0.0))
+        self.parameter_output_values["finished_at"] = time.time()
+
+
+class CachedModelNode(DataNode):
+    """Keeps a stand-in for a loaded model across runs, and reports whether it was still there."""
+
+    MODEL_KEY = "fixture-model"
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="reused",
+                type="bool",
+                default_value=False,
+                tooltip="Whether the model kept by an earlier run was still held",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="pid",
+                type="int",
+                default_value=0,
+                tooltip="Id of the process holding the model",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+
+    def process(self) -> None:
+        key = self.local_objects.key_for(self.MODEL_KEY)
+        reused = self.local_objects.get(key) is not None
+        if not reused:
+            self.local_objects.put(object(), key=self.MODEL_KEY)
+        self.parameter_output_values["reused"] = reused
+        self.parameter_output_values["pid"] = os.getpid()
 
 
 class UnshippableOutputNode(DataNode):

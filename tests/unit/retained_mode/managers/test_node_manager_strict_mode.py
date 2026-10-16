@@ -44,6 +44,7 @@ class TestExecuteNodeStrictMode:
         # engine cannot be in. Routing awaits it, so it needs to be awaitable.
         worker_manager = worker_manager or MagicMock()
         worker_manager.wait_until_executable = AsyncMock()
+        worker_manager.admit_on_machine = AsyncMock(return_value=None)
         mock_engine.worker_manager = worker_manager
         return NodeManager(MagicMock(), engine=mock_engine)
 
