@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.common.private_execution_scope import PrivateExecutionScope, current_private_execution_scope
 from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION
 from griptape_nodes.retained_mode.events import converters
@@ -140,6 +141,151 @@ class TestExecuteSubflowNodeGroupBranches:
         await _make_executor().execute(node)
 
         node.subflow_execution_component.clear_execution_state.assert_not_called()
+
+
+_IS_BETA_ENABLED_PATH = "griptape_nodes.common.node_executor.is_beta_enabled"
+
+
+class TestPrivateExecutionInWorker:
+    """With the beta feature on, a Private Execution group runs locally and names the worker for its nodes."""
+
+    @pytest.mark.asyncio
+    async def test_runs_the_group_locally_inside_the_scope(self) -> None:
+        node = _make_subflow_node(PRIVATE_EXECUTION)
+        seen: list[PrivateExecutionScope | None] = []
+        node.aprocess = AsyncMock(side_effect=lambda: seen.append(current_private_execution_scope.get()))
+
+        with (
+            patch(_IS_BETA_ENABLED_PATH, return_value=True),
+            patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
+        ):
+            await _make_executor().execute(node)
+
+        assert seen == [PrivateExecutionScope(owner_name="Subflow")]
+        mock_private.assert_not_awaited()
+        # Nothing is packaged for a subprocess, so there is no subprocess state to clear.
+        node.subflow_execution_component.clear_execution_state.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_scope_ends_with_the_group(self) -> None:
+        node = _make_subflow_node(PRIVATE_EXECUTION)
+
+        with patch(_IS_BETA_ENABLED_PATH, return_value=True):
+            await _make_executor().execute(node)
+
+        assert current_private_execution_scope.get() is None
+
+    @pytest.mark.asyncio
+    async def test_the_subprocess_path_is_kept_when_the_feature_is_off(self) -> None:
+        node = _make_subflow_node(PRIVATE_EXECUTION)
+
+        with (
+            patch(_IS_BETA_ENABLED_PATH, return_value=False),
+            patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
+        ):
+            await _make_executor().execute(node)
+
+        mock_private.assert_awaited_once_with(node)
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("execution_type", [LOCAL_EXECUTION, "some_library_name"])
+    async def test_other_environments_set_no_scope(self, execution_type: str) -> None:
+        node = _make_subflow_node(execution_type)
+        seen: list[PrivateExecutionScope | None] = []
+        node.aprocess = AsyncMock(side_effect=lambda: seen.append(current_private_execution_scope.get()))
+
+        with (
+            patch(_IS_BETA_ENABLED_PATH, return_value=True),
+            patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock),
+        ):
+            await _make_executor().execute(node)
+
+        assert all(scope is None for scope in seen)
+
+    @pytest.mark.parametrize(
+        ("execution_type", "beta_enabled", "runs_locally"),
+        [
+            (LOCAL_EXECUTION, False, True),
+            (PRIVATE_EXECUTION, True, True),
+            (PRIVATE_EXECUTION, False, False),
+            ("some_library_name", True, False),
+        ],
+    )
+    def test_which_loops_run_through_the_local_path(
+        self, execution_type: str, *, beta_enabled: bool, runs_locally: bool
+    ) -> None:
+        with patch(_IS_BETA_ENABLED_PATH, return_value=beta_enabled):
+            assert _make_executor()._runs_locally(execution_type) is runs_locally
+
+    def test_a_private_loop_runs_inside_the_scope_and_a_local_one_does_not(self) -> None:
+        executor = _make_executor()
+
+        with executor._local_execution_scope(PRIVATE_EXECUTION, "Loop End"):
+            assert current_private_execution_scope.get() == PrivateExecutionScope(owner_name="Loop End")
+        with executor._local_execution_scope(LOCAL_EXECUTION, "Loop End"):
+            assert current_private_execution_scope.get() is None
+
+
+class _LoopBodyRan(Exception):  # noqa: N818 (a signal that the body ran, not an error)
+    """Stops a loop run once its body has been dispatched; what follows is not under test."""
+
+
+class TestPrivateExecutionStartEndLoop:
+    """A start/end loop whose body is one Private Execution group runs its iterations in that scope."""
+
+    def _end_node(self, *, run_in_order: bool) -> MagicMock:
+        start_node = MagicMock()
+        start_node.name = "Loop Start"
+        start_node._get_total_iterations.return_value = 3
+        start_node.get_parameter_value.return_value = run_in_order
+        end_node = MagicMock()
+        end_node.name = "Loop End"
+        end_node.start_node = start_node
+        return end_node
+
+    async def _run(self, *, run_in_order: bool, beta_enabled: bool) -> dict[str, list[PrivateExecutionScope | None]]:
+        """Run the loop and return which body runner was called, with the scope each one saw."""
+        calls: dict[str, list[PrivateExecutionScope | None]] = {}
+
+        def runner(name: str) -> AsyncMock:
+            def record(**_kwargs: Any) -> None:
+                calls.setdefault(name, []).append(current_private_execution_scope.get())
+                raise _LoopBodyRan
+
+            return AsyncMock(side_effect=record)
+
+        executor = _make_executor()
+        with (
+            patch(_IS_BETA_ENABLED_PATH, return_value=beta_enabled),
+            patch.object(NodeExecutor, "_package_loop_body", AsyncMock(return_value=(MagicMock(), PRIVATE_EXECUTION))),
+            patch.object(NodeExecutor, "_get_merged_parameter_values_for_iterations", return_value={}),
+            patch.object(NodeExecutor, "get_parameter_values_per_iteration", return_value={}),
+            patch.object(NodeExecutor, "get_resolved_upstream_values", return_value={}),
+            patch.object(NodeExecutor, "_execute_loop_iterations_locally", runner("locally")),
+            patch.object(NodeExecutor, "_execute_loop_iterations_sequentially", runner("sequentially")),
+            patch.object(NodeExecutor, "_execute_loop_iterations_privately", runner("privately")),
+            patch.object(NodeExecutor, "_execute_loop_iterations_sequentially_private", runner("sequentially_private")),
+            pytest.raises(_LoopBodyRan),
+        ):
+            await executor.handle_loop_execution(self._end_node(run_in_order=run_in_order))
+        return calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("run_in_order", "local_runner"), [(True, "sequentially"), (False, "locally")])
+    async def test_runs_the_local_loop_path_inside_the_scope(self, *, run_in_order: bool, local_runner: str) -> None:
+        calls = await self._run(run_in_order=run_in_order, beta_enabled=True)
+
+        assert calls == {local_runner: [PrivateExecutionScope(owner_name="Loop End")]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("run_in_order", "private_runner"), [(True, "sequentially_private"), (False, "privately")])
+    async def test_keeps_the_subprocess_path_when_the_feature_is_off(
+        self, *, run_in_order: bool, private_runner: str
+    ) -> None:
+        calls = await self._run(run_in_order=run_in_order, beta_enabled=False)
+
+        assert calls == {private_runner: [None]}
 
 
 class TestExecuteUnexpectedResultType:

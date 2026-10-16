@@ -25,10 +25,11 @@ class StartFlow(StartNode):
 
 
 class EndFlow(EndNode):
-    """The packaged body's exit node."""
+    """The packaged body's exit node.
 
-    def process(self) -> None:
-        return None
+    ``EndNode.process`` is left in place: it copies the node's inputs into its outputs, and that is
+    where the loop reads each iteration's result from.
+    """
 
 
 class LoopBodyControlNode(ControlNode):
@@ -62,7 +63,7 @@ class LoopBodyControlNode(ControlNode):
         )
 
     def process(self) -> None:
-        self.parameter_output_values["result"] = str(self.get_parameter_value("text") or "")
+        self.parameter_output_values["result"] = str(self.get_parameter_value("text"))
 
 
 class ProbeForEachGroupNode(BaseIterativeNodeGroup):

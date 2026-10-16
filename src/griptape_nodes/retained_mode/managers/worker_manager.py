@@ -1153,7 +1153,7 @@ class WorkerManager(EngineScoped):
         ready = self._execution_ready.get(library_name)
         return ready is None or ready.is_set()
 
-    async def wait_until_executable(self, library_name: str) -> None:
+    async def wait_until_executable(self, library_name: str | None) -> None:
         """Block until `library_name` can be executed, or until it is settled that it cannot.
 
         A worker registers BEFORE it loads libraries -- registration is what carries the
@@ -1176,10 +1176,16 @@ class WorkerManager(EngineScoped):
             with anyio.fail_after(self.library_load_timeout_s):
                 await self._execution_ready[library_name].wait()
         except TimeoutError:
-            msg = (
-                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
-                f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
-            )
+            if library_name is None:
+                msg = (
+                    "Attempted to run a node with Private Execution. Failed because the background process "
+                    f"that runs it did not finish loading libraries within {self.library_load_timeout_s:.0f} seconds."
+                )
+            else:
+                msg = (
+                    f"Attempted to run a node from library '{library_name}'. Failed because its worker "
+                    f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
+                )
             raise RuntimeError(msg) from None
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
