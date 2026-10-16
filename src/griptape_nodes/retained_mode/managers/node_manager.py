@@ -3491,15 +3491,15 @@ class NodeManager(EngineScoped):
         if unavailable is not None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
-                f"Failed because {unavailable}"
+                f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
         worker = wm.get_worker_for_key(scope.worker_key)
         if worker is None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
-                "Failed because the background process that runs Isolated Execution is not running. It starts "
-                "with the session while the 'Isolated Execution in a worker' beta feature is on."
+                "Failed because the background process that runs Isolated Execution is not running. Reload your "
+                "libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
         return await self._execute_node_via_worker(request, wm, worker)
