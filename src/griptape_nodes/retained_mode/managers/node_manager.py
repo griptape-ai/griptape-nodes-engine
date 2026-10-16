@@ -32,6 +32,9 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
 )
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
+    ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
     Parameter,
     ParameterContainer,
     ParameterGroup,
@@ -1929,7 +1932,7 @@ class NodeManager(EngineScoped):
             # Handle ParameterGroup parentage with potential to expand in future to other element types.
             if isinstance(parent_element, ParameterGroup):
                 parent_group = parent_element
-        if request.parameter_name is None or request.tooltip is None:
+        if request.parameter_name is None:
             details = f"Attempted to add Parameter to node '{node_name}'. Failed because default_value, tooltip, or parameter_name was not defined."
             result = AddParameterToNodeResultFailure(result_details=details)
             return result
@@ -1970,6 +1973,13 @@ class NodeManager(EngineScoped):
             result = AddParameterToNodeResultFailure(result_details=details)
             return result
 
+        if request.tooltip is None and not has_control_type:
+            details = f"Attempted to add Parameter to node '{node_name}'. Failed because default_value, tooltip, or parameter_name was not defined."
+            result = AddParameterToNodeResultFailure(result_details=details)
+            return result
+
+        # A control proxy bridges the group wall to an internal port, so its UI modes cover both
+        # sides. ControlParameterInput/Output shape and graph validation still enforce direction.
         allowed_modes = set()
         if request.mode_allowed_input:
             allowed_modes.add(ParameterMode.INPUT)
@@ -1978,26 +1988,113 @@ class NodeManager(EngineScoped):
         if request.mode_allowed_output:
             allowed_modes.add(ParameterMode.OUTPUT)
 
-        # Let's roll, I guess.
-        new_param = Parameter(
-            name=final_param_name,
-            type=request.type,
-            input_types=request.input_types,
-            output_type=request.output_type,
-            default_value=request.default_value,
-            user_defined=request.is_user_defined,
-            tooltip=request.tooltip,
-            tooltip_as_input=request.tooltip_as_input,
-            tooltip_as_property=request.tooltip_as_property,
-            tooltip_as_output=request.tooltip_as_output,
-            allowed_modes=allowed_modes,
-            ui_options=request.ui_options,
-            parent_container_name=request.parent_container_name,
-            parent_element_name=parent_group.name if parent_group is not None else None,
-            settable=request.settable,
-            allow_variable_substitution=request.allow_variable_substitution,
-            serializable=request.serializable,
-        )
+        # Let's roll, I guess. Preserve the control parameter element type when a request is
+        # replayed (for example, while rebuilding a node-group boundary). A plain Parameter has
+        # the right type information but loses the control-port shape the editor and executor use.
+        if has_control_type:
+            # Older serialized control parameters exposed their effective type on both sides,
+            # even though their mode flags remained directional. Keep those workflows rendering
+            # as the original convenience subclass while new proxy requests use one declared side.
+            input_shaped = (
+                (request.input_types is not None and request.output_type is None)
+                or (
+                    request.input_types is not None
+                    and request.output_type is not None
+                    and ParameterMode.INPUT in allowed_modes
+                    and ParameterMode.OUTPUT not in allowed_modes
+                )
+                or (
+                    request.input_types is None
+                    and request.output_type is None
+                    and ParameterMode.INPUT in allowed_modes
+                    and ParameterMode.OUTPUT not in allowed_modes
+                )
+            )
+            output_shaped = (
+                (request.output_type is not None and request.input_types is None)
+                or (
+                    request.output_type is not None
+                    and request.input_types is not None
+                    and ParameterMode.OUTPUT in allowed_modes
+                    and ParameterMode.INPUT not in allowed_modes
+                )
+                or (
+                    request.input_types is None
+                    and request.output_type is None
+                    and ParameterMode.OUTPUT in allowed_modes
+                    and ParameterMode.INPUT not in allowed_modes
+                )
+            )
+
+            if input_shaped:
+                new_param = ControlParameterInput(
+                    name=final_param_name,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    user_defined=request.is_user_defined,
+                )
+                if request.tooltip is not None:
+                    new_param.tooltip = request.tooltip
+            elif output_shaped:
+                new_param = ControlParameterOutput(
+                    name=final_param_name,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    user_defined=request.is_user_defined,
+                )
+                if request.tooltip is not None:
+                    new_param.tooltip = request.tooltip
+            else:
+                new_param = ControlParameter(
+                    name=final_param_name,
+                    tooltip=request.tooltip or "",
+                    input_types=request.input_types,
+                    output_type=request.output_type,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    allowed_modes=allowed_modes,
+                    ui_options=request.ui_options,
+                    user_defined=request.is_user_defined,
+                )
+            # ControlParameter's convenience subclasses intentionally expose a small, purpose-
+            # built constructor. Apply the request-only lifecycle fields after construction so
+            # dynamic control parameters retain the same persistence semantics as data parameters.
+            # Boundary proxies bridge an external edge and an internal edge, so they allow
+            # both modes. Their concrete input/output subclass retains the declared port shape.
+            new_param.allowed_modes = allowed_modes
+            if request.ui_options is not None:
+                merged_ui_options = new_param.ui_options.copy()
+                merged_ui_options.update(request.ui_options)
+                new_param.ui_options = merged_ui_options
+            new_param.default_value = request.default_value
+            new_param.settable = request.settable
+            new_param.allow_variable_substitution = request.allow_variable_substitution
+            new_param.serializable = request.serializable
+            new_param.parent_container_name = request.parent_container_name
+            new_param.parent_element_name = parent_group.name if parent_group is not None else None
+        else:
+            new_param = Parameter(
+                name=final_param_name,
+                type=request.type,
+                input_types=request.input_types,
+                output_type=request.output_type,
+                default_value=request.default_value,
+                user_defined=request.is_user_defined,
+                tooltip=request.tooltip,
+                tooltip_as_input=request.tooltip_as_input,
+                tooltip_as_property=request.tooltip_as_property,
+                tooltip_as_output=request.tooltip_as_output,
+                allowed_modes=allowed_modes,
+                ui_options=request.ui_options,
+                parent_container_name=request.parent_container_name,
+                parent_element_name=parent_group.name if parent_group is not None else None,
+                settable=request.settable,
+                allow_variable_substitution=request.allow_variable_substitution,
+                serializable=request.serializable,
+            )
         # Hand saved state to the traits so their converters, validators, and rendered
         # options match what was saved.
         if request.traits:

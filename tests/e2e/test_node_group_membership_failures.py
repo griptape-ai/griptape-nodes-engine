@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
+from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
@@ -270,6 +271,167 @@ class TestFailedRemove:
         assert member.parent_group is None
         # It went back out to the flow holding the group, not left inside the subflow.
         assert _flow_of(engine, member_name) == flow.flow_name
+
+    def test_restores_connections_when_a_connected_node_leaves_the_group(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """Removing a connected child restores its direct edges and removes the wall proxies."""
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ConnectedRemoveFlow", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            group_name = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            source_name = _create_node(engine, "EchoNode", "Source", library_name)
+            member_name = _create_node(engine, "EchoNode", "Member", library_name)
+            sink_name = _create_node(engine, "EchoNode", "Sink", library_name)
+
+            for source_node_name, target_node_name in (
+                (source_name, member_name),
+                (member_name, sink_name),
+            ):
+                connection_result = engine.handle_request(
+                    CreateConnectionRequest(
+                        source_node_name=source_node_name,
+                        source_parameter_name="text",
+                        target_node_name=target_node_name,
+                        target_parameter_name="text",
+                    )
+                )
+                assert isinstance(connection_result, CreateConnectionResultSuccess), connection_result
+
+            add_result = engine.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+            assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
+
+            remove_result = engine.handle_request(
+                RemoveNodeFromNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+
+        assert isinstance(remove_result, RemoveNodeFromNodeGroupResultSuccess), remove_result
+
+        group = _get_group(engine, group_name)
+        assert member_name not in group.nodes
+        assert group.metadata.get("node_names_in_group") == []
+        assert group.metadata.get("left_parameters") == ["group_exec_in"]
+        assert group.metadata.get("right_parameters") == ["group_exec_out"]
+
+        edges = {
+            f"{connection.source_node.name}.{connection.source_parameter.name}"
+            f"->{connection.target_node.name}.{connection.target_parameter.name}"
+            for connection in engine.flow_manager.get_connections().connections.values()
+        }
+        assert {
+            f"{source_name}.text->{member_name}.text",
+            f"{member_name}.text->{sink_name}.text",
+        } <= edges
+        assert not any(group_name in edge for edge in edges)
+
+    def test_restores_control_connections_when_a_connected_node_leaves_the_group(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """Control-flow wall proxies are also removed without a false failure."""
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ConnectedControlRemoveFlow", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            group_name = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            source_name = _create_node(engine, "EchoNode", "Source", library_name)
+            member_name = _create_node(engine, "EchoNode", "Member", library_name)
+            sink_name = _create_node(engine, "EchoNode", "Sink", library_name)
+
+            for source_node_name, target_node_name in (
+                (source_name, member_name),
+                (member_name, sink_name),
+            ):
+                connection_result = engine.handle_request(
+                    CreateConnectionRequest(
+                        source_node_name=source_node_name,
+                        source_parameter_name="exec_out",
+                        target_node_name=target_node_name,
+                        target_parameter_name="exec_in",
+                    )
+                )
+                assert isinstance(connection_result, CreateConnectionResultSuccess), connection_result
+
+            add_result = engine.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+            assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
+
+            remove_result = engine.handle_request(
+                RemoveNodeFromNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+
+        assert isinstance(remove_result, RemoveNodeFromNodeGroupResultSuccess), remove_result
+
+        group = _get_group(engine, group_name)
+        assert member_name not in group.nodes
+        assert group.metadata.get("left_parameters") == ["group_exec_in"]
+        assert group.metadata.get("right_parameters") == ["group_exec_out"]
+
+        edges = {
+            f"{connection.source_node.name}.{connection.source_parameter.name}"
+            f"->{connection.target_node.name}.{connection.target_parameter.name}"
+            for connection in engine.flow_manager.get_connections().connections.values()
+        }
+        assert {
+            f"{source_name}.exec_out->{member_name}.exec_in",
+            f"{member_name}.exec_out->{sink_name}.exec_in",
+        } <= edges
+        assert not any(group_name in edge for edge in edges)
+
+    def test_restores_an_outgoing_connection_when_a_connected_node_leaves_the_group(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """A member with only an outgoing boundary edge leaves no stale output proxy behind."""
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="OutgoingControlRemoveFlow", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            group_name = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            member_name = _create_node(engine, "EchoNode", "Member", library_name)
+            sink_name = _create_node(engine, "EchoNode", "Sink", library_name)
+
+            connection_result = engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=member_name,
+                    source_parameter_name="exec_out",
+                    target_node_name=sink_name,
+                    target_parameter_name="exec_in",
+                )
+            )
+            assert isinstance(connection_result, CreateConnectionResultSuccess), connection_result
+
+            add_result = engine.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+            assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
+
+            remove_result = engine.handle_request(
+                RemoveNodeFromNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
+            )
+
+        assert isinstance(remove_result, RemoveNodeFromNodeGroupResultSuccess), remove_result
+
+        group = _get_group(engine, group_name)
+        assert member_name not in group.nodes
+        assert group.metadata.get("left_parameters") == ["group_exec_in"]
+        assert group.metadata.get("right_parameters") == ["group_exec_out"]
+
+        edges = {
+            f"{connection.source_node.name}.{connection.source_parameter.name}"
+            f"->{connection.target_node.name}.{connection.target_parameter.name}"
+            for connection in engine.flow_manager.get_connections().connections.values()
+        }
+        assert f"{member_name}.exec_out->{sink_name}.exec_in" in edges
+        assert not any(group_name in edge for edge in edges)
 
     def test_moves_a_nested_group_subflow_back_out_with_it(self, engine: Engine, library_name: str) -> None:
         """Removing a nested group has to take its contents along, or a save loses them."""
