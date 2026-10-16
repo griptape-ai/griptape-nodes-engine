@@ -2426,6 +2426,8 @@ def _machine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = N
     links.subscribe = AsyncMock()
     links.route = AsyncMock()
     links.relay = AsyncMock()
+    links.unroute = AsyncMock()
+    links.unrelay = AsyncMock()
     worker_manager.attach_machine_links(links)
     return links
 
@@ -2744,12 +2746,54 @@ class TestServingAnotherMachinesOrchestrator:
 
     @pytest.mark.asyncio
     async def test_a_worker_that_exited_is_forgotten_so_another_can_start(self, worker_manager: WorkerManager) -> None:
+        _machine(worker_manager)
         proc = _managed_proc_mock()
         worker_manager._managed_worker_processes["origin-sess/Lib"] = proc
 
-        await worker_manager._forget_when_exited("origin-sess/Lib", proc)
+        await worker_manager._forget_when_exited("origin-sess/Lib", proc, "w1")
 
         assert "origin-sess/Lib" not in worker_manager._managed_worker_processes
+
+    @pytest.mark.asyncio
+    async def test_a_workers_topics_stop_being_relayed_and_its_sessions_with_the_last_one(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise a machine serving many sessions relays every topic it ever served, for good."""
+        links = _machine(worker_manager)
+        _register_originator(worker_manager, library_versions={_LIBRARY: "1.0.0", "Other": "1.0.0"})
+        started: dict[str, str] = {}
+
+        async def record_spawn(_args: list[str], worker_key: str, **kwargs: object) -> None:
+            started[worker_key] = cast("str", kwargs["worker_engine_id"])
+            worker_manager._managed_worker_processes[worker_key] = _managed_proc_mock()
+
+        with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
+            for library in (_LIBRARY, "Other"):
+                await worker_manager.handle_start_worker_request(
+                    worker_events.StartWorkerRequest(library_name=library, originator_session_id="origin-sess")
+                )
+        first, second = (f"origin-sess/{library}" for library in (_LIBRARY, "Other"))
+
+        await worker_manager._forget_when_exited(first, worker_manager._managed_worker_processes[first], started[first])
+        assert links.unrelay.await_args_list == [call(f"engines/{started[first]}/")]
+
+        await worker_manager._forget_when_exited(
+            second, worker_manager._managed_worker_processes[second], started[second]
+        )
+        assert links.unrelay.await_args_list[1:] == [call(f"engines/{started[second]}/"), call("sessions/origin-sess/")]
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_that_produced_no_worker_stops_relaying_at_once(self, worker_manager: WorkerManager) -> None:
+        links = _machine(worker_manager)
+        _register_originator(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()):
+            await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert call("sessions/origin-sess/") in links.unrelay.await_args_list
+        assert worker_manager._session_relays == {}
 
 
 class TestARemoteWorkerIsReachedThroughItsMachine:
@@ -2786,6 +2830,25 @@ class TestARemoteWorkerIsReachedThroughItsMachine:
         address, event_type, _payload, topic = links.publish.await_args.args
         assert (address, event_type, topic) == (_MACHINE, "EventRequest", _WORKER_REQUEST_TOPIC)
         worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("leaves", ["unregisters", "is evicted"])
+    async def test_its_topics_stop_going_to_the_machine_once_it_leaves(
+        self, worker_manager: WorkerManager, leaves: str
+    ) -> None:
+        links = _machine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, machine=_MACHINE
+        )
+
+        if leaves == "unregisters":
+            await worker_manager.handle_unregister_worker_request(
+                worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
+            )
+        else:
+            await worker_manager.evict_worker(_ENGINE)
+
+        links.unroute.assert_awaited_once_with(_MACHINE, f"engines/{_ENGINE}/")
 
     @pytest.mark.asyncio
     async def test_a_local_worker_is_still_reached_directly(self, worker_manager: WorkerManager) -> None:

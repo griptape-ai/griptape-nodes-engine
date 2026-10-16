@@ -191,6 +191,10 @@ class WorkerManager(EngineScoped):
         # garbage-collected while they wait.
         self._exit_watchers: set[asyncio.Task] = set()
 
+        # How many workers started for each other machine's session have not exited, which is how
+        # long this machine relays that session's topics.
+        self._session_relays: dict[str, int] = {}
+
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
 
@@ -422,6 +426,7 @@ class WorkerManager(EngineScoped):
         worker_key = registration.worker_key if registration else None
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.unsubscribe_from_topic(response_topic)
+        await self._stop_routing(wid, registration)
         # Remove the managed process entry so a new worker can be spawned for this key.
         if worker_key:
             removed = self._managed_worker_processes.pop(worker_key, None)
@@ -436,6 +441,12 @@ class WorkerManager(EngineScoped):
                 self.note_worker_unavailable(worker_key, "the worker process that runs it shut down before loading it.")
         logger.debug("Worker unregistered: %s", wid)
         return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
+
+    async def _stop_routing(self, worker_engine_id: str, registration: WorkerRegistration | None) -> None:
+        """Stop sending a gone worker's topics to the machine that ran it, if another machine did."""
+        if registration is None or registration.machine is None:
+            return
+        await self._links_for(registration.machine).unroute(registration.machine, engine_topic_prefix(worker_engine_id))
 
     async def orchestrator_heartbeat_loop(self) -> None:
         """Challenge each registered worker on an interval; evict those that stop answering."""
@@ -828,6 +839,7 @@ class WorkerManager(EngineScoped):
         lib_name = registration.worker_key if registration else None
         topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         await self._tx.unsubscribe_from_topic(topic)
+        await self._stop_routing(worker_engine_id, registration)
         logger.warning("Worker evicted: %s", worker_engine_id)
         # Terminate the managed subprocess for this worker, if any.
         if lib_name:
@@ -1233,21 +1245,30 @@ class WorkerManager(EngineScoped):
             environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = originator.static_server_base_url
         worker_engine_id = str(uuid.uuid4())
         # Relayed before the worker exists, so its registration, sent the moment it connects, already
-        # reaches the originator.
+        # reaches the originator. Counted first, so a worker of the session exiting meanwhile keeps it.
+        self._session_relays[originator_session_id] = self._session_relays.get(originator_session_id, 0) + 1
         await links.relay(session_topic_prefix(originator_session_id))
         await links.relay(engine_topic_prefix(worker_engine_id))
-        await self.spawn_worker(
-            resolved.args,
-            worker_key,
-            library_name=library_name,
-            worker_engine_id=worker_engine_id,
-            environ_overrides=environ_overrides,
-        )
+        try:
+            await self.spawn_worker(
+                resolved.args,
+                worker_key,
+                library_name=library_name,
+                worker_engine_id=worker_engine_id,
+                environ_overrides=environ_overrides,
+            )
+        except BaseException:
+            await self._stop_relaying(originator_session_id, worker_engine_id)
+            raise
         proc = self._managed_worker_processes.get(worker_key)
-        if proc is not None:
+        if proc is None:
+            await self._stop_relaying(originator_session_id, worker_engine_id)
+        else:
             # It registers with the originator, not here, so its unregistration never reaches this
             # engine. Watching the process is what lets a later request for the session start another.
-            watcher = asyncio.get_running_loop().create_task(self._forget_when_exited(worker_key, proc))
+            watcher = asyncio.get_running_loop().create_task(
+                self._forget_when_exited(worker_key, proc, worker_engine_id)
+            )
             self._exit_watchers.add(watcher)
             watcher.add_done_callback(self._exit_watchers.discard)
         return worker_events.StartWorkerResultSuccess(
@@ -1265,11 +1286,28 @@ class WorkerManager(EngineScoped):
             return "the orchestrator asking for it never registered with this machine."
         return originator.refused_libraries.get(library_name)
 
-    async def _forget_when_exited(self, worker_key: str, proc: asyncio.subprocess.Process) -> None:
+    async def _forget_when_exited(
+        self, worker_key: str, proc: asyncio.subprocess.Process, worker_engine_id: str
+    ) -> None:
         await proc.wait()
         if self._managed_worker_processes.get(worker_key) is proc:
             del self._managed_worker_processes[worker_key]
             logger.debug("Worker for key '%s' exited (pid %s)", worker_key, proc.pid)
+        await self._stop_relaying(worker_key.partition("/")[0], worker_engine_id)
+
+    async def _stop_relaying(self, originator_session_id: str, worker_engine_id: str) -> None:
+        """Stop relaying a gone worker's topics, and its session's once none of the session's workers is left."""
+        links = self._links_for("another machine")
+        await links.unrelay(engine_topic_prefix(worker_engine_id))
+        remaining = self._session_relays.get(originator_session_id, 0) - 1
+        if remaining > 0:
+            self._session_relays[originator_session_id] = remaining
+            return
+        self._session_relays.pop(originator_session_id, None)
+        await links.unrelay(session_topic_prefix(originator_session_id))
+        # A worker started for the session while that awaited relayed the prefix itself, maybe first.
+        if originator_session_id in self._session_relays:
+            await links.relay(session_topic_prefix(originator_session_id))
 
     async def _wait_for_session(self, library_name: str) -> str | None:
         """Return the active session's id once there is one, or None, recorded, if none came."""

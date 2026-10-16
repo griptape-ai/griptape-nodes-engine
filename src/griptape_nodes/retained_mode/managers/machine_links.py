@@ -33,12 +33,20 @@ class MachineLinks(Protocol):
         """Also send this engine's broadcasts on topics under `topic_prefix` to `address`."""
         ...
 
+    async def unroute(self, address: str, topic_prefix: str) -> None:
+        """Stop sending this engine's broadcasts on topics under `topic_prefix` to `address`."""
+        ...
+
     async def relay(self, topic_prefix: str) -> None:
         """Pass frames clients publish under `topic_prefix` to the other subscribed clients.
 
         Such frames reach the other side without this engine handling them, which is how a serving
         orchestrator carries traffic between a worker and the originator it serves.
         """
+        ...
+
+    async def unrelay(self, topic_prefix: str) -> None:
+        """Stop passing frames clients publish under `topic_prefix` to the other clients."""
         ...
 
 
