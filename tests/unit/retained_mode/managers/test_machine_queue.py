@@ -67,6 +67,7 @@ class TestMachineQueue:
 
         assert await waiting == "r9"
         assert queue.holder == (_B, "r9")
+        assert recorder.positions[-1] == (_B, "node-2", 0), "B was not told its wait was over"
 
     @pytest.mark.asyncio
     async def test_the_holding_runs_later_nodes_run_while_another_run_waits(self) -> None:

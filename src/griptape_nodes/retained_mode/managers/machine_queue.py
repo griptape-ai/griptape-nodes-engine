@@ -67,7 +67,7 @@ class MachineQueue:
             on_handoff: Awaited with the incoming run's orchestrator before the machine passes to a run
                 from a different orchestrator than the last one, to free what the previous one left.
             on_position: Awaited with a waiting node's orchestrator, name, and its run's place in line,
-                1 being next, whenever that place changes.
+                1 being next, whenever that place changes, and with 0 once the machine takes it.
         """
         self._idle_timeout_s = idle_timeout_s
         self._on_handoff = on_handoff
@@ -185,6 +185,7 @@ class MachineQueue:
         if self._advancing:
             return
         self._advancing = True
+        admitted_after_waiting: list[_WaitingNode] = []
         try:
             while self._holder is None and self._waiting:
                 head = self._waiting[0]
@@ -207,8 +208,12 @@ class MachineQueue:
                     self._start_running(holder, waiting.admission_id)
                     if not waiting.admitted.done():
                         waiting.admitted.set_result(None)
+                    if waiting.position:
+                        admitted_after_waiting.append(waiting)
         finally:
             self._advancing = False
+        for waiting in admitted_after_waiting:
+            await self._on_position(waiting.originator, waiting.node_name, 0)
         await self._report_positions()
 
     async def _report_positions(self) -> None:
