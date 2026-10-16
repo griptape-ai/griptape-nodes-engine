@@ -79,6 +79,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeserializeFlowFromCommandsRequest,
     DeserializeFlowFromCommandsResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
+    OriginalNodeParameter,
     PackagedNodeParameterMapping,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
@@ -125,6 +126,7 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
@@ -990,6 +992,10 @@ class NodeExecutor(EngineScoped):
         flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
 
+        # Data dependency collection skips RESOLVED nodes. A node fed by the start node's per-pass
+        # outputs is still RESOLVED from the previous run, and must be packaged to re-evaluate per pass.
+        connections.unresolve_future_nodes(start_node)
+
         # Collect all nodes in the forward control path from start to end
         nodes_in_control_flow = DagBuilder.collect_nodes_in_forward_control_path(start_node, end_node, connections)
 
@@ -1056,8 +1062,10 @@ class NodeExecutor(EngineScoped):
             if node:
                 node.state = NodeResolutionState.RESOLVED
 
-        # Remove packaged nodes from global queue since they will be copied into loop iterations
-        self._remove_packaged_nodes_from_queue(all_nodes)
+        # Remove packaged nodes from global queue since they will be copied into loop iterations.
+        # end_node stays in the outer DAG and is where the real values land once copied back, so
+        # any outside consumer of a packaged node waits on end_node instead of losing the edge.
+        self._remove_packaged_nodes_from_queue(all_nodes, replacement_node_name=end_node.name)
 
         return package_result, execution_type
 
@@ -1121,18 +1129,19 @@ class NodeExecutor(EngineScoped):
     def _get_iteration_control_action(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> IterationControlAction:
         """Determine which control action was taken during an iteration.
 
-        Checks if any nodes whose control outputs connect to the loop end node's
-        skip_iteration, break_loop, or loop_complete inputs have fired. Works for both
-        the legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path —
-        both expose identically-named control inputs and the detection is purely
-        connection/name based.
+        Checks whether control left the body through a node output connected to the loop end
+        node's skip_iteration, break_loop, or loop_complete inputs. Works for both the legacy
+        BaseIterativeEndNode path and the BaseIterativeNodeGroup path — both expose
+        identically-named control inputs and the detection is purely connection/name based.
 
         Args:
             end_loop_node: The loop end node (BaseIterativeEndNode or BaseIterativeNodeGroup)
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
@@ -1147,102 +1156,118 @@ class NodeExecutor(EngineScoped):
 
         incoming_connections = list_connections_result.incoming_connections
 
-        # Check each control parameter to see if its source node has fired
-        # Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
-        break_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
-        skip_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
-        loop_complete_source = self._find_source_for_control_param(
+        source_that_reached_end = self._get_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
+        # Check each control parameter to see if one of its sources is the exit the body took.
+        # Several body paths can converge on one input, so every source is checked, not just the
+        # first wire drawn. Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
+        break_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
+        skip_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
+        loop_complete_sources = self._find_sources_for_control_param(
             incoming_connections, IterationControlParam.LOOP_COMPLETE
         )
 
         # Check if break was triggered
-        if self._check_control_source_fired(break_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in break_sources):
             return IterationControlAction.BREAK
 
         # Check if skip was triggered
-        if self._check_control_source_fired(skip_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in skip_sources):
             return IterationControlAction.SKIP
 
         # Check if loop_complete was triggered
-        if self._check_control_source_fired(loop_complete_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in loop_complete_sources):
             return IterationControlAction.ADD
 
         # If none of the control parameters were triggered, default to ADD
         # This preserves backward compatibility for workflows without explicit loop_complete connections
         return IterationControlAction.ADD
 
-    def _check_control_source_fired(
+    def _get_control_source_that_reached_end(
         self,
-        source: tuple[str, str] | None,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
-    ) -> bool:
-        """Check if a control source node has fired its control output.
+    ) -> OriginalNodeParameter | None:
+        """Return the body node and control output that handed control to the packaged End node.
+
+        The End node records the control input it was entered on, and the packager gives it one
+        control input per body control output that leaves the group, so that input names exactly
+        which exit the body took. A body node's own next control output cannot answer this: a
+        node on a branch that was not taken can still run, pulled in to supply the End node's
+        data, and it reports the output it would follow even though control never reached it.
 
         Args:
-            source: Tuple of (source_node_name, source_parameter_name) or None
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
-            True if the source node's next control output matches the specified parameter
+            The original node and control output that reached the End node, or None if control
+            never reached it
+        """
+        end_node = self._get_packaged_end_node(end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return None
+
+        entry_parameter = end_node._entry_control_parameter
+        if entry_parameter is None:
+            return None
+
+        return end_node_mapping.parameter_mappings.get(entry_parameter.name)
+
+    def _forget_control_source_that_reached_end(
+        self,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> None:
+        """Clear the packaged End node's recorded entry before a pass runs.
+
+        Every pass reuses the same End node, and a pass whose control never reaches it leaves the
+        previous pass's entry in place, which would read as this pass taking the same exit.
+        """
+        end_node = self._get_packaged_end_node(end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return
+
+        end_node.set_entry_control_parameter(None)
+
+    def _get_packaged_end_node(
+        self,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> BaseNode | None:
+        deserialized_end_node_name = node_name_mappings.get(end_node_mapping.node_name)
+        if deserialized_end_node_name is None:
+            logger.debug("No deserialized name for packaged End node '%s'", end_node_mapping.node_name)
+            return None
+
+        try:
+            return self.engine.node_manager.get_node_by_name(deserialized_end_node_name)
+        except ValueError:
+            logger.debug("Packaged End node '%s' not found", deserialized_end_node_name)
+            return None
+
+    def _check_control_source_fired(
+        self,
+        source: tuple[str, str] | None,
+        source_that_reached_end: OriginalNodeParameter | None,
+    ) -> bool:
+        """Check if control left the body through a given control output.
+
+        Args:
+            source: Tuple of (source_node_name, source_parameter_name) or None
+            source_that_reached_end: The node and control output that reached the packaged End
+                node, from _get_control_source_that_reached_end
+
+        Returns:
+            True if source is the control output that reached the End node
         """
         if source is None:
             return False
 
-        source_node_name, source_param_name = source
-        deserialized_source_name = node_name_mappings.get(source_node_name)
-        if deserialized_source_name is None:
-            logger.debug("_check_control_source_fired: no deserialized name for '%s'", source_node_name)
+        if source_that_reached_end is None:
             return False
 
-        node_manager = self.engine.node_manager
-        try:
-            deserialized_source_node = node_manager.get_node_by_name(deserialized_source_name)
-        except ValueError:
-            logger.debug("_check_control_source_fired: node '%s' not found", deserialized_source_name)
-            return False
-
-        if deserialized_source_node is None:
-            return False
-
-        # Check if the node's next control output matches the source parameter
-        next_control_output = deserialized_source_node.get_next_control_output()
-        if next_control_output is None:
-            logger.debug(
-                "_check_control_source_fired: node '%s' next_control_output is None (state=%s, output_values=%s)",
-                deserialized_source_name,
-                deserialized_source_node.state,
-                deserialized_source_node.parameter_output_values,
-            )
-            return False
-
-        # Get the parameter object to compare
-        source_param = deserialized_source_node.get_parameter_by_name(source_param_name)
-        result = next_control_output == source_param
-        logger.debug(
-            "_check_control_source_fired: node '%s' next_control_output='%s' vs source_param='%s' -> %s",
-            deserialized_source_name,
-            next_control_output.name if next_control_output else None,
-            source_param.name if source_param else None,
-            result,
-        )
-        return result
-
-    def _find_source_for_control_param(
-        self,
-        incoming_connections: list,
-        control_param_name: str,
-    ) -> tuple[str, str] | None:
-        """Find the first source node and parameter that connects to a control parameter.
-
-        Args:
-            incoming_connections: List of incoming connections to the group
-            control_param_name: Name of the control parameter to find (e.g., "break_loop")
-
-        Returns:
-            Tuple of (source_node_name, source_parameter_name), or None if not found
-        """
-        sources = self._find_sources_for_control_param(incoming_connections, control_param_name)
-        return sources[0] if sources else None
+        return tuple(source_that_reached_end) == source
 
     async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
@@ -1303,6 +1328,7 @@ class NodeExecutor(EngineScoped):
             start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
             start_node_name = start_node_mapping.node_name
             packaged_start_node_name = node_name_mappings.get(start_node_name)
+            end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
 
             iteration_results: dict[int, Any] = {}
             successful_iterations: list[int] = []
@@ -1327,6 +1353,8 @@ class NodeExecutor(EngineScoped):
                     total_iterations,
                     end_loop_node.name,
                 )
+                self._forget_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
                 # Set input values for this iteration
                 parameter_values = parameter_values_per_iteration[iteration_index]
 
@@ -1380,7 +1408,7 @@ class NodeExecutor(EngineScoped):
                     successful_iterations.append(iteration_index)
 
                 # Check control action to handle skip/break for both group and legacy end nodes
-                control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
+                control_action = self._get_iteration_control_action(end_loop_node, end_node_mapping, node_name_mappings)
 
                 if control_action == IterationControlAction.SKIP:
                     logger.debug(
@@ -1787,6 +1815,7 @@ class NodeExecutor(EngineScoped):
         iteration_startflow_params = self._get_while_iteration_param_mappings(
             node, start_node_mapping.parameter_mappings
         )
+        end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
@@ -1808,6 +1837,7 @@ class NodeExecutor(EngineScoped):
                 node=node,
                 flow_name=flow_name,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 packaged_start_node_name=packaged_start_node_name,
                 resolved_upstream_values=resolved_upstream_values,
                 iteration_startflow_params=iteration_startflow_params,
@@ -1898,6 +1928,7 @@ class NodeExecutor(EngineScoped):
         node: BaseWhileNodeGroup,
         flow_name: str,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         packaged_start_node_name: str,
         resolved_upstream_values: dict[str, Any],
         iteration_startflow_params: list[str],
@@ -1922,6 +1953,8 @@ class NodeExecutor(EngineScoped):
 
             if iteration > 0:
                 node._before_loop_iteration(iteration, flow_name)
+
+            self._forget_control_source_that_reached_end(end_node_mapping, node_name_mappings)
 
             await self._set_while_iteration_parameters(
                 packaged_start_node_name=packaged_start_node_name,
@@ -1952,6 +1985,7 @@ class NodeExecutor(EngineScoped):
                 node=node,
                 execution_failed=execution_failed,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 iteration=iteration,
                 max_iterations=max_iterations,
             )
@@ -1992,12 +2026,13 @@ class NodeExecutor(EngineScoped):
                     set_value_result.result_details,
                 )
 
-    def _evaluate_while_iteration_result(
+    def _evaluate_while_iteration_result(  # noqa: PLR0913
         self,
         *,
         node: BaseWhileNodeGroup,
         execution_failed: bool,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         iteration: int,
         max_iterations: int,
     ) -> bool | None:
@@ -2028,7 +2063,7 @@ class NodeExecutor(EngineScoped):
             return False
 
         # Check which control input was triggered
-        loop_action = self._get_while_control_action(node, node_name_mappings)
+        loop_action = self._get_while_control_action(node, end_node_mapping, node_name_mappings)
 
         if loop_action == WhileControlParam.DONE:
             logger.debug("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
@@ -2143,16 +2178,18 @@ class NodeExecutor(EngineScoped):
     def _get_while_control_action(
         self,
         while_node: BaseWhileNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> WhileControlParam | None:
         """Determine which control action was taken during while group execution.
 
-        Checks if internal nodes have triggered the 'done' or 'continue_loop' control
-        inputs on the while group. Multiple nodes may connect to the same control input,
-        so all sources are checked.
+        Checks whether control left the body through a node output connected to the 'done' or
+        'continue_loop' control inputs on the while group. Multiple nodes may connect to the
+        same control input, so all sources are checked.
 
         Args:
             while_node: The BaseWhileNodeGroup being executed
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
@@ -2170,11 +2207,13 @@ class NodeExecutor(EngineScoped):
         done_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.DONE)
         continue_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.CONTINUE)
 
+        source_that_reached_end = self._get_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
         # Check if any done source fired
-        done_fired = any(self._check_control_source_fired(source, node_name_mappings) for source in done_sources)
+        done_fired = any(self._check_control_source_fired(source, source_that_reached_end) for source in done_sources)
         # Check if any continue source fired
         continue_fired = any(
-            self._check_control_source_fired(source, node_name_mappings) for source in continue_sources
+            self._check_control_source_fired(source, source_that_reached_end) for source in continue_sources
         )
 
         logger.debug(
@@ -2201,9 +2240,9 @@ class NodeExecutor(EngineScoped):
     ) -> list[tuple[str, str]]:
         """Find all source nodes and parameters that connect to a control parameter.
 
-        Returns all matching sources. Used by retry groups where multiple nodes
-        may connect to the same control input, and by iterative groups (via
-        _find_source_for_control_param) which only need the first match.
+        Returns all matching sources, in the order their connections were made. Several body
+        nodes can connect to the same control input, so callers check every source rather than
+        trusting the first.
 
         Args:
             incoming_connections: List of incoming connections to the group
@@ -2340,7 +2379,9 @@ class NodeExecutor(EngineScoped):
             if node_reference:
                 node_reference.state = NodeResolutionState.RESOLVED
 
-        self._remove_packaged_nodes_from_queue(set(node_names))
+        # node (the group) stays in the outer DAG, so an outside consumer of a packaged child
+        # waits on it instead of losing the edge -- see _remove_packaged_nodes_from_queue.
+        self._remove_packaged_nodes_from_queue(set(node_names), replacement_node_name=node.name)
 
         return package_result
 
@@ -3833,15 +3874,25 @@ class NodeExecutor(EngineScoped):
             parameter_output_values.update(end_node_values)
         return parameter_output_values
 
-    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str]) -> None:
+    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str], replacement_node_name: str) -> None:
         """Remove nodes from global flow queue after they've been packaged for loop execution.
 
         When nodes are packaged for For Each loops, they will be deserialized into separate
         flow instances. We need to remove them from the global queue to prevent them from
         being executed in the main flow while also being copied into loop iterations.
 
+        A packaged node can still have a data consumer outside the package (a loose sink, or a
+        node pulled in only because it reads one of these nodes). Dropping the packaged node from
+        a network drops that edge too, so the consumer's in-degree reaches zero and it can run
+        before this node's real value is copied back onto ``replacement_node_name`` (the node that
+        stays in the outer DAG standing in for the whole package -- the loop's End node, or the
+        group node itself). Re-pointing the edge at that stand-in instead keeps the consumer
+        waiting until the copy-back has happened.
+
         Args:
             packaged_node_names: Set of node names that were packaged
+            replacement_node_name: The node left in the outer DAG to carry packaged nodes'
+                outside-facing data edges once the package's real values land on it
         """
         flow_manager = self.engine.flow_manager
         node_manager = self.engine.node_manager
@@ -3867,10 +3918,28 @@ class NodeExecutor(EngineScoped):
                 if node_name in dag_builder.node_to_reference:
                     dag_builder.node_to_reference.pop(node_name)
 
-                # Remove from all networks and check if any become empty
-                for network in list(dag_builder.graphs.values()):
-                    if node_name in network.nodes():
-                        network.remove_node(node_name)
+            for network in list(dag_builder.graphs.values()):
+                self._redirect_packaged_edges_and_remove(network, packaged_node_names, replacement_node_name)
+
+    @staticmethod
+    def _redirect_packaged_edges_and_remove(
+        network: DirectedGraph, packaged_node_names: set[str], replacement_node_name: str
+    ) -> None:
+        """Drop every packaged node from one network, keeping its outside-facing edges alive.
+
+        An outside consumer's edge from a packaged node is re-pointed to `replacement_node_name`
+        instead of being dropped, so the consumer still waits for the real value. An edge whose
+        successor is the replacement node itself is left alone rather than turned into a self-loop
+        that would never clear -- that is simply the replacement node's own existing dependency.
+        """
+        for node_name in packaged_node_names:
+            if node_name not in network.nodes():
+                continue
+            for successor in network.get_successors(node_name):
+                if successor in packaged_node_names or successor == replacement_node_name:
+                    continue
+                network.add_edge(replacement_node_name, successor)
+            network.remove_node(node_name)
 
     def _apply_parameter_values_to_node(
         self,
