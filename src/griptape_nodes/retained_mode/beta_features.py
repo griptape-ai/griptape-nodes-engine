@@ -342,12 +342,12 @@ def _today() -> date:
     return datetime.now(tz=UTC).date()
 
 
-PRIVATE_EXECUTION_IN_WORKER = register_beta_feature(
+ISOLATED_EXECUTION_IN_WORKER = register_beta_feature(
     BetaFeature(
-        id="private_execution_in_worker",
-        name="Private Execution in a worker",
+        id="isolated_execution_in_worker",
+        name="Isolated Execution in a worker",
         description=(
-            "Runs the nodes of a group or loop set to Private Execution in one background process that stays "
+            "Runs the nodes of a group or loop set to Isolated Execution in one background process that stays "
             "open for the session, instead of starting a new process each time the group or loop runs."
         ),
         owner="@kateforsberg13",

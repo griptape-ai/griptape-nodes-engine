@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION
+from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LOCAL_EXECUTION
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
@@ -140,7 +140,7 @@ class SubflowExecutionComponent:
             value: The new value of the parameter
         """
         if parameter.name == "execution_environment":
-            if value in {LOCAL_EXECUTION, PRIVATE_EXECUTION}:
+            if value in {LOCAL_EXECUTION, ISOLATED_EXECUTION}:
                 self._node.hide_parameter_by_name("publishing_progress")
                 self._node.hide_parameter_by_name("publishing_target_link")
             else:
@@ -149,7 +149,7 @@ class SubflowExecutionComponent:
         if parameter.name == "publishing_target_link":
             if value and self._node.get_parameter_value("execution_environment") not in {
                 LOCAL_EXECUTION,
-                PRIVATE_EXECUTION,
+                ISOLATED_EXECUTION,
             }:
                 self._node.show_parameter_by_name("publishing_target_link")
             else:

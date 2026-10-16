@@ -1,6 +1,6 @@
 """Tests for the general-purpose worker: the worker that serves no single library.
 
-It runs the nodes of Private Execution groups, so it loads every library -- but it is no library's
+It runs the nodes of Isolated Execution groups, so it loads every library -- but it is no library's
 worker, so it neither reports their loads nor builds their environments. The orchestrator learns it
 is ready from one report of its own.
 """

@@ -139,7 +139,7 @@ class StartWorkerRequest(RequestPayload):
 
     Args:
         library_name: The library the worker will serve, or None for the general-purpose worker,
-            which serves no single library and runs the nodes of Private Execution groups.
+            which serves no single library and runs the nodes of Isolated Execution groups.
     """
 
     library_name: str | None

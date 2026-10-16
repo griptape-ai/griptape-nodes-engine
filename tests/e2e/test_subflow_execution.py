@@ -9,7 +9,7 @@ This guards the serialization/deserialization path exercised by
 NodeExecutor._extract_parameter_output_values and
 NodeExecutor._apply_parameter_values_to_node - the code fixed in
 fix/subprocess-cattrs-bytes-deserialization - without requiring the cloud
-WebSocket relay that the Private Execution (SubprocessWorkflowExecutor) path needs.
+WebSocket relay that the Isolated Execution (SubprocessWorkflowExecutor) path needs.
 """
 
 from __future__ import annotations

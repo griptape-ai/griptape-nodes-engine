@@ -123,7 +123,7 @@ class AppInitializationComplete(AppPayload):
     # orchestrator, which owns any library resets still waiting for a restart.
     defer_pending_library_resets: bool = False
     # When True, this worker serves no single library: it loads every enabled library and runs the
-    # nodes the orchestrator routes to it, such as the members of a Private Execution group. Only
+    # nodes the orchestrator routes to it, such as the members of an Isolated Execution group. Only
     # meaningful together with is_worker; libraries_to_register is ignored.
     is_general_purpose_worker: bool = False
     # URL of the static file server the host process runs for this workspace. The engine serves

@@ -1,6 +1,6 @@
-"""A Private Execution group runs through the local path and sends its nodes to the worker.
+"""A Isolated Execution group runs through the local path and sends its nodes to the worker.
 
-With the `private_execution_in_worker` beta feature on, `NodeExecutor` no longer packages the group
+With the `isolated_execution_in_worker` beta feature on, `NodeExecutor` no longer packages the group
 and starts a process for it. It runs the group like Local Execution, inside a scope naming the
 general-purpose worker, and `NodeManager` sends every node the group runs to that worker.
 
@@ -18,10 +18,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.common.node_executor import NodeExecutor
-from griptape_nodes.common.private_execution_scope import PrivateExecutionScope, current_private_execution_scope
-from griptape_nodes.exe_types.node_types import PRIVATE_EXECUTION, NodeResolutionState
-from griptape_nodes.retained_mode.beta_features import PRIVATE_EXECUTION_IN_WORKER
+from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, NodeResolutionState
+from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
@@ -54,7 +54,7 @@ FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.js
 FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
 # Distinct from the other tests registering this fixture in-process; see
 # test_subflow_group_parallel_execution.py for why a shared name fails.
-LIBRARY_NAME = "Private Execution Worker Library"
+LIBRARY_NAME = "Isolated Execution Worker Library"
 _NODE_COUNT = 3
 _DELAY_SECONDS = 0.3
 _GENERAL_PURPOSE_WORKER = "general-purpose-worker"
@@ -78,7 +78,7 @@ class _StandInWorker:
     """A general-purpose worker that records what it is sent and runs it in this process."""
 
     engine: Engine
-    received: list[tuple[str, PrivateExecutionScope | None]] = field(default_factory=list)
+    received: list[tuple[str, IsolatedExecutionScope | None]] = field(default_factory=list)
 
     def start(self) -> None:
         """Register it as up, at the library count it would have loaded.
@@ -100,18 +100,18 @@ def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
     node_manager = engine.node_manager
 
     async def run_on_worker(request: ExecuteNodeRequest, *_args: Any) -> Any:
-        worker.received.append((request.node_name, current_private_execution_scope.get()))
+        worker.received.append((request.node_name, current_isolated_execution_scope.get()))
         # Run the node as a worker does: on a fresh copy built from the request's metadata, which has
         # only the parameters its type declares, with the request's values applied to it. The worker
         # has no scope of its own.
-        token = current_private_execution_scope.set(None)
+        token = current_isolated_execution_scope.set(None)
         try:
             fresh_copy = node_manager._materialize_transient_node_from_metadata(request)
             if isinstance(fresh_copy, ExecuteNodeResultFailure):
                 return fresh_copy
             return await node_manager._hydrate_and_run_node(fresh_copy, request)
         finally:
-            current_private_execution_scope.reset(token)
+            current_isolated_execution_scope.reset(token)
 
     with patch.object(node_manager, "_execute_node_via_worker", side_effect=run_on_worker):
         yield worker
@@ -121,7 +121,7 @@ def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
 def _build_group(engine: Engine, library_json: Path, *, execution_environment: str) -> tuple[str, str, list[str]]:
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
-    engine.context_manager.push_workflow(workflow_name="private_execution_in_worker_wf")
+    engine.context_manager.push_workflow(workflow_name="isolated_execution_in_worker_wf")
 
     parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
@@ -175,10 +175,10 @@ async def test_every_node_of_the_group_runs_on_the_worker(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
     )
     config_manager = engine.config_manager
-    config_manager.set_config_value(PRIVATE_EXECUTION_IN_WORKER.config_key, True)
+    config_manager.set_config_value(ISOLATED_EXECUTION_IN_WORKER.config_key, True)
     try:
         parent_flow, group_name, node_names = _build_group(
-            engine, library_json, execution_environment=PRIVATE_EXECUTION
+            engine, library_json, execution_environment=ISOLATED_EXECUTION
         )
         general_purpose_worker.start()
         with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as private_workflow:
@@ -186,14 +186,14 @@ async def test_every_node_of_the_group_runs_on_the_worker(
                 StartFlowRequest(flow_name=parent_flow, flow_node_name=group_name)
             )
     finally:
-        config_manager.set_config_value(PRIVATE_EXECUTION_IN_WORKER.config_key, False)
+        config_manager.set_config_value(ISOLATED_EXECUTION_IN_WORKER.config_key, False)
 
     assert isinstance(run_result, StartFlowResultSuccess), run_result
     private_workflow.assert_not_awaited()
     # Every node the group ran reached the worker, each still carrying the group's scope, including
     # the ones PARALLEL resolution ran as concurrent tasks.
     assert sorted(general_purpose_worker.received) == sorted(
-        (name, PrivateExecutionScope(owner_name=group_name)) for name in node_names
+        (name, IsolatedExecutionScope(owner_name=group_name)) for name in node_names
     )
     for i, name in enumerate(node_names):
         node = engine.node_manager.get_node_by_name(name)
@@ -213,7 +213,7 @@ async def test_with_the_feature_off_the_group_still_starts_its_own_process(
     materialize_library: Callable[..., Path],
     general_purpose_worker: _StandInWorker,
 ) -> None:
-    """Off, Private Execution packages the group and starts a process for it, as before."""
+    """Off, Isolated Execution packages the group and starts a process for it, as before."""
     library_json = materialize_library(
         tmp_path / "library",
         template=FIXTURE_LIBRARY_JSON_TEMPLATE,
@@ -244,7 +244,7 @@ async def test_with_the_feature_off_the_group_still_starts_its_own_process(
         assert isinstance(node_result, CreateNodeResultSuccess), node_result
     engine.handle_request(
         SetParameterValueRequest(
-            parameter_name="execution_environment", node_name=group_result.node_name, value=PRIVATE_EXECUTION
+            parameter_name="execution_environment", node_name=group_result.node_name, value=ISOLATED_EXECUTION
         )
     )
 
@@ -322,13 +322,13 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
             )
         )
         assert isinstance(connection_result, CreateConnectionResultSuccess), connection_result
-    for parameter_name, value in (("execution_mode", execution_mode), ("execution_environment", PRIVATE_EXECUTION)):
+    for parameter_name, value in (("execution_mode", execution_mode), ("execution_environment", ISOLATED_EXECUTION)):
         engine.handle_request(
             SetParameterValueRequest(parameter_name=parameter_name, node_name=group_name, value=value)
         )
 
     config_manager = engine.config_manager
-    config_manager.set_config_value(PRIVATE_EXECUTION_IN_WORKER.config_key, True)
+    config_manager.set_config_value(ISOLATED_EXECUTION_IN_WORKER.config_key, True)
     general_purpose_worker.start()
     try:
         with (
@@ -340,7 +340,7 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
                 StartFlowRequest(flow_name=parent_flow, flow_node_name=group_name)
             )
     finally:
-        config_manager.set_config_value(PRIVATE_EXECUTION_IN_WORKER.config_key, False)
+        config_manager.set_config_value(ISOLATED_EXECUTION_IN_WORKER.config_key, False)
 
     assert isinstance(run_result, StartFlowResultSuccess), run_result
     parallel.assert_not_awaited()
@@ -348,7 +348,7 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
     # The body runs as a packaged copy per iteration, so count what reached the worker rather than
     # naming it: at least one node per iteration, every one carrying the loop's scope.
     scopes = {scope for _name, scope in general_purpose_worker.received}
-    assert scopes == {PrivateExecutionScope(owner_name=group_name)}, general_purpose_worker.received
+    assert scopes == {IsolatedExecutionScope(owner_name=group_name)}, general_purpose_worker.received
     body_runs = [name for name, _scope in general_purpose_worker.received if name.startswith("Body")]
     assert len(body_runs) >= len(_LOOP_ITEMS), general_purpose_worker.received
     # The packaged flow's StartFlow and EndFlow stayed here: the packager gives them their parameters

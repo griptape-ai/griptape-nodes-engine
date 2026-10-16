@@ -16,6 +16,8 @@ from griptape_nodes.exe_types.core_types import (
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
+    ISOLATED_EXECUTION,
+    LEGACY_PRIVATE_EXECUTION,
     LOCAL_EXECUTION,
     get_library_names_with_publish_handlers,
 )
@@ -766,6 +768,39 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._cleanup_proxy_parameter(target_parameter, metadata_key)
         self._refresh_proxy_serializable(target_parameter)
         return super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        """Set a parameter, reading execution_environment's old Private Execution name as Isolated Execution.
+
+        Mapped here, ahead of every converter: the Options converter replaces a value it does not
+        offer with its first choice, so a group saved with Private Execution would otherwise open
+        as Local Execution.
+
+        Not a `SetParameterVersionCompatibilityCheck`, although those also run before the converters.
+        A check is handed only the node, name and value, and when it applies its result replaces the
+        rest of `SetParameterValueRequest`'s handling. Rewriting the value there would either run
+        this node's value hooks during a workflow load, since `initial_setup` does not reach the
+        check, or skip the connection checks and the unresolving of downstream nodes that follow it.
+        This only renames a value, so the normal path has to carry on. It also covers a direct
+        `set_parameter_value` call, which never reaches the manager.
+        """
+        if param_name == self.execution_environment.name and value == LEGACY_PRIVATE_EXECUTION:
+            value = ISOLATED_EXECUTION
+        super().set_parameter_value(
+            param_name,
+            value,
+            initial_setup=initial_setup,
+            emit_change=emit_change,
+            skip_before_value_set=skip_before_value_set,
+        )
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         super().after_value_set(parameter, value)

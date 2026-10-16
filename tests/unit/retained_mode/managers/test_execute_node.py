@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
-from griptape_nodes.common.private_execution_scope import private_execution_scope
+from griptape_nodes.common.isolated_execution_scope import isolated_execution_scope
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -741,7 +741,7 @@ class TestExecuteNodeWorkerValues:
 
 
 class TestExecuteNodePrivateExecutionRoute:
-    """Orchestrator-side routing of a node run inside a Private Execution scope to the worker it names."""
+    """Orchestrator-side routing of a node run inside an Isolated Execution scope to the worker it names."""
 
     _LIBRARY_WORKER = ("library-eng-id", "library-topic")
     _PRIVATE_WORKER = ("private-eng-id", "private-topic")
@@ -781,7 +781,7 @@ class TestExecuteNodePrivateExecutionRoute:
         )
 
         # Set after the node manager is built, which installs its own mock. The library's own wait
-        # comes first and passes; only the Private Execution worker's wait can fail here.
+        # comes first and passes; only the Isolated Execution worker's wait can fail here.
         async def wait_until_executable(key: str | None) -> None:
             if key is None and load_failure is not None:
                 raise RuntimeError(load_failure)
@@ -794,7 +794,7 @@ class TestExecuteNodePrivateExecutionRoute:
         if scope_owner is None:
             result = await node_manager.on_execute_node_request(request)
         else:
-            with private_execution_scope(scope_owner):
+            with isolated_execution_scope(scope_owner):
                 result = await node_manager.on_execute_node_request(request)
         assert isinstance(result, ExecuteNodeResultSuccess | ExecuteNodeResultFailure)
         return result

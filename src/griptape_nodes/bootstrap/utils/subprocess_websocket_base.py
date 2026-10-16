@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ATTEMPTED_SUBPROCESS_RUN = (
-    "Attempted to run a node group with Private Execution or in a library execution environment."
+    "Attempted to run a node group with Isolated Execution or in a library execution environment."
 )
 
 
@@ -95,7 +95,7 @@ class SubprocessWebSocketBaseMixin:
         if not api_key:
             msg = (
                 f"{_ATTEMPTED_SUBPROCESS_RUN} Failed due to no {API_KEY_SECRET_NAME} being set. "
-                f"Run 'gtn init', set {API_KEY_SECRET_NAME}, or run the group without Private Execution."
+                f"Run 'gtn init', set {API_KEY_SECRET_NAME}, or run the group without Isolated Execution."
             )
             raise SubprocessWebSocketUnavailableError(msg)
 
