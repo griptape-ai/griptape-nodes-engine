@@ -654,6 +654,24 @@ class TestBinaryFileWritesFromAWorker:
         assert registered.get_parameter_by_name("dynamic_extra") is not None
 
 
+class TestTheRebuildBeforeARun:
+    """A worker refuses graph edits while it rebuilds a node, so the rebuild must cover exactly the hooks.
+
+    Covering too little lets a value hook that drops wires delete the orchestrator's connections.
+    Covering too much refuses the edits a node makes on purpose while it runs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_value_hooks_run_inside_the_rebuild_and_process_outside_it(self) -> None:
+        current_engine().library_manager._is_worker = True
+        _make("ReportsHydrationNode", "Rebuilt")
+
+        result = await _execute("ReportsHydrationNode", "Rebuilt", trigger="set")
+
+        assert result.parameter_output_values["hook_saw_hydration"] is True
+        assert result.parameter_output_values["process_saw_hydration"] is False
+
+
 class TestStructureDerivesFromValues:
     """The authoring contract: parameter structure is a deterministic function of values.
 

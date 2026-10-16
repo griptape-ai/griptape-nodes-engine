@@ -3648,7 +3648,8 @@ class NodeManager(EngineScoped):
         node_name = request.node_name
         with self.engine.event_manager.node_execution_scope():
             hydrated_values = hydrate_parameter_values(request.parameter_values)
-            hydration_failure = self._apply_hydrated_values(node, node_name, hydrated_values)
+            with self.engine.event_manager.hydration_scope():
+                hydration_failure = self._apply_hydrated_values(node, node_name, hydrated_values)
             if hydration_failure is not None:
                 return hydration_failure
             # Materialize parameter defaults into parameter_values so that user

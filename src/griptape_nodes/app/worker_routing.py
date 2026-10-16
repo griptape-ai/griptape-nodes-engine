@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard, cast
 from griptape_nodes.retained_mode.events import artifact_events, os_events
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
+    ResultDetails,
     ResultPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -45,6 +46,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     ExecuteNodeRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
@@ -407,6 +409,31 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 )
 
 
+def result_type_for(request_type: type[RequestPayload], outcome: str) -> type[ResultPayload] | None:
+    """The registered result class for `request_type`, where `outcome` is "Success" or "Failure".
+
+    Results are named after their request, as `<Name>Result<Outcome>` or, in the older modules,
+    `<Name><Outcome>`.
+    """
+    stem = request_type.__name__.removesuffix("Request")
+    for name in (f"{stem}Result{outcome}", f"{stem}{outcome}"):
+        result_type = PayloadRegistry.get_type(name)
+        if result_type is not None:
+            return cast("type[ResultPayload]", result_type)
+    return None
+
+
+def forwards_during_hydration(request_type: type[RequestPayload]) -> bool:
+    """Whether a worker rebuilding a node may forward `request_type` to the orchestrator.
+
+    Hydration replays each value through the node's hooks as if a user had edited it, and the orchestrator
+    already made whatever edits those hooks make when that edit happened. So only a request whose success
+    result guarantees it leaves the workflow alone forwards; one that declares nothing is refused as well.
+    """
+    success_type = result_type_for(request_type, "Success")
+    return success_type is not None and issubclass(success_type, WorkflowNotAlteredMixin)
+
+
 @dataclass
 class RemoteHandler:
     """Worker-side dispatch shim.
@@ -415,6 +442,7 @@ class RemoteHandler:
     LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
+    During hydration it refuses every request ``forwards_during_hydration`` rejects.
 
     ``original`` is the handler this shim replaced and MUST be retained so the
     out-of-scope fallback can still service requests that bootstrap code makes
@@ -427,9 +455,25 @@ class RemoteHandler:
 
     async def __call__(self, request: RequestPayload) -> ResultPayload:
         if self.event_manager.in_node_execution():
+            if self.event_manager.in_hydration() and not forwards_during_hydration(type(request)):
+                return self._refuse(request)
             event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
             return cast("ResultPayload", event_result.result)
         return await call_function(self.original, request)
+
+    @staticmethod
+    def _refuse(request: RequestPayload) -> ResultPayload:
+        details = (
+            f"Attempted to send {type(request).__name__} to the orchestrator while setting up a node to run "
+            "in this process. Failed because it may change the workflow, and the orchestrator already made "
+            "any change a value's hooks make when that value was first set."
+        )
+        result_details = ResultDetails(message=details, level=logging.WARNING)
+        failure_type = result_type_for(type(request), "Failure")
+        if failure_type is None:
+            # A request with no failure class of its own still has to be answered with a failure.
+            return GenericResultFailure(result_details=result_details)
+        return failure_type(result_details=result_details)
 
 
 def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:

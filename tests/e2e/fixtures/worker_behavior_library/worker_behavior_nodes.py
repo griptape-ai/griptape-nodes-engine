@@ -27,6 +27,8 @@ the minimal fixtures did not cover:
 - ``EditorBehaviorNode``: converters, validators, and parameters added and removed from
   ``after_value_set`` -- all of which now run orchestrator-side on the real class instead of
   being lost to a schema stub.
+- ``ReportsHydrationNode``: reports whether its value hook and its ``process`` ran inside the
+  rebuild a worker does before running a node, during which graph edits are refused.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterList, Parame
 from griptape_nodes.exe_types.node_types import AsyncResult, DataNode
 from griptape_nodes.files.file import File
 from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -573,6 +576,45 @@ class DerivedStructureNode(DataNode):
         self.parameter_output_values["echo"] = derived
         deep = self.get_parameter_value("derived_deep") if self.get_parameter_by_name("derived_deep") else ""
         self.parameter_output_values["deep_echo"] = deep
+
+
+class ReportsHydrationNode(DataNode):
+    """Reports whether its value hook and its process() each ran while the node was being rebuilt.
+
+    A worker refuses graph edits only while it rebuilds a node from the values it was sent, so the
+    rebuild has to cover the value hooks and end before process() runs.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self._hook_saw_hydration = False
+        self.add_parameter(
+            Parameter(
+                name="trigger",
+                type="str",
+                default_value="",
+                tooltip="Any value runs the hook",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        for output_name in ("hook_saw_hydration", "process_saw_hydration"):
+            self.add_parameter(
+                Parameter(
+                    name=output_name,
+                    type="bool",
+                    default_value=False,
+                    tooltip="",
+                    allowed_modes={ParameterMode.OUTPUT},
+                )
+            )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:  # noqa: ARG002
+        if parameter.name == "trigger":
+            self._hook_saw_hydration = current_engine().event_manager.in_hydration()
+
+    def process(self) -> None:
+        self.parameter_output_values["hook_saw_hydration"] = self._hook_saw_hydration
+        self.parameter_output_values["process_saw_hydration"] = current_engine().event_manager.in_hydration()
 
 
 class WriteProjectFileNode(DataNode):

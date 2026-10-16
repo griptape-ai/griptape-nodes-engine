@@ -159,6 +159,15 @@
         "description": "Echoes an input list",
         "display_name": "ReadsAnInputListNode"
       }
+    },
+    {
+      "class_name": "ReportsHydrationNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reports whether its hook and process ran while the node was being rebuilt",
+        "display_name": "ReportsHydrationNode"
+      }
     }
   ]
 }

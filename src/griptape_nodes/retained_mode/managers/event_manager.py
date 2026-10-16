@@ -62,6 +62,11 @@ _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
     "_event_manager_active_request_type", default=None
 )
 
+# Whether the current logical chain is rebuilding a node from the values it was sent. Per chain rather
+# than process-wide, unlike the node-execution refcount: another node's aprocess can run in this
+# process at the same time, and its requests are not part of the rebuild.
+_in_hydration: ContextVar[bool] = ContextVar("_event_manager_in_hydration", default=False)
+
 # (request_type, callback) pairs for the post-dispatch hooks running above this point
 # in the current logical chain. A hook task is created with this marker set, and every
 # request the hook issues inherits it, so any hook already running further up the chain
@@ -888,6 +893,24 @@ class EventManager(EngineScoped):
         """Return True when this process is currently inside a node-execution scope."""
         with self._node_execution_lock:
             return self._node_execution_depth > 0
+
+    @contextmanager
+    def hydration_scope(self) -> Iterator[None]:
+        """Mark the current chain as rebuilding a node from the values it was sent.
+
+        Hydration replays each value through `set_parameter_value`, so a node's value hooks run as if a
+        user had edited it. On a worker the node is a copy, and the worker-side RemoteHandler reads this
+        to keep those hooks from editing the orchestrator's graph.
+        """
+        token = _in_hydration.set(True)
+        try:
+            yield
+        finally:
+            _in_hydration.reset(token)
+
+    def in_hydration(self) -> bool:
+        """Return True when the current chain is inside a hydration scope."""
+        return _in_hydration.get()
 
     def get_manager_for_request_type(self, request_type: type[RP]) -> Callable | None:
         """Return the currently-registered handler callback for a request type, or None."""

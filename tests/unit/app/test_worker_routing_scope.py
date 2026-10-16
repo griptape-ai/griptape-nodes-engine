@@ -8,6 +8,8 @@ delegates to the handler it replaced, so a node's ``__init__`` can still call ``
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -16,17 +18,37 @@ import pytest
 from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
     RemoteHandler,
+    forwards_during_hydration,
     register_remote_handlers,
+    result_type_for,
 )
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
     ResultPayloadSuccess,
 )
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
+    SetConfigValueRequest,
+    SetConfigValueResultFailure,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
+    DeleteConnectionRequest,
+    DeleteConnectionResultFailure,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.events.context_events import GetWorkflowContextRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultFailure,
+    GetParameterValueRequest,
+    SetParameterValueRequest,
+    SetParameterValueResultFailure,
+)
+from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
@@ -202,3 +224,172 @@ class TestRemoteHandlerRouting:
         assert isinstance(result, ListConnectionsForNodeResultSuccess)
         assert len(forwarded_calls) == 1
         assert isinstance(forwarded_calls[0], ListConnectionsForNodeRequest)
+
+
+def _delete_connection() -> DeleteConnectionRequest:
+    return DeleteConnectionRequest(
+        source_node_name="Load Component",
+        source_parameter_name="component_output",
+        target_node_name="Pipeline Builder",
+        target_parameter_name="component_vae",
+    )
+
+
+def _handler_recording_forwards(event_manager: EventManager, forwarded: list[RequestPayload]) -> RemoteHandler:
+    async def original(_request: RequestPayload) -> ResultPayloadSuccess:
+        return ListConnectionsForNodeResultSuccess(
+            incoming_connections=[], outgoing_connections=[], result_details="local"
+        )
+
+    async def fake_forward(
+        request: RequestPayload,
+        result_context: ResultContext,  # noqa: ARG001
+    ) -> EventResultSuccess:
+        forwarded.append(request)
+        return EventResultSuccess(
+            request=request,
+            result=ListConnectionsForNodeResultSuccess(
+                incoming_connections=[], outgoing_connections=[], result_details="forwarded"
+            ),
+        )
+
+    event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
+    return RemoteHandler(original=original, event_manager=event_manager)
+
+
+class TestGraphEditsDuringHydration:
+    """A worker rebuilding a node must not edit the orchestrator's graph.
+
+    Hydration replays each value through the node's hooks. A hook that drops or rebuilds wires when its
+    value changes did that on the orchestrator when the user made the change, so a forwarded replay
+    deletes real connections from a copy that has none of its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_graph_edit_is_refused_during_hydration(self) -> None:
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+
+        with event_manager.node_execution_scope(), event_manager.hydration_scope():
+            delete_result = await handler(_delete_connection())
+            add_result = await handler(AddParameterToNodeRequest(node_name="Generate", parent_container_name="items"))
+
+        assert isinstance(delete_result, DeleteConnectionResultFailure)
+        assert isinstance(add_result, AddParameterToNodeResultFailure)
+        assert forwarded == []
+
+    @pytest.mark.asyncio
+    async def test_a_value_set_is_refused_during_hydration(self) -> None:
+        """On the orchestrator a set runs the real node's hooks and unresolves it and everything downstream."""
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+
+        with event_manager.node_execution_scope(), event_manager.hydration_scope():
+            result = await handler(SetParameterValueRequest(parameter_name="status", node_name="Tracker", value="x"))
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert forwarded == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_whose_result_declares_nothing_is_refused_during_hydration(self) -> None:
+        """Nothing says it leaves the workflow alone, so it is treated as a change."""
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+
+        with event_manager.node_execution_scope(), event_manager.hydration_scope():
+            result = await handler(SetConfigValueRequest(category_and_key="a.b", value=1))
+
+        assert isinstance(result, SetConfigValueResultFailure)
+        assert forwarded == []
+
+    @pytest.mark.asyncio
+    async def test_a_read_still_forwards_during_hydration(self) -> None:
+        """Hooks still need the orchestrator's answers while hydrating, such as whether a list is connected."""
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+
+        with event_manager.node_execution_scope(), event_manager.hydration_scope():
+            await handler(ListConnectionsForNodeRequest(node_name="Pipeline Builder"))
+
+        assert len(forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_graph_edit_still_forwards_while_the_node_runs(self) -> None:
+        """Once hydration is over, an edit is the node's own and belongs to the orchestrator."""
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+
+        with event_manager.node_execution_scope():
+            await handler(_delete_connection())
+
+        assert len(forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_sync_hook_is_refused_although_the_handler_runs_on_another_loop(self) -> None:
+        """Value hooks call `handle_request` synchronously, which runs the handler on the websocket loop.
+
+        The hydration flag is a context variable, so this holds only while that hop carries the caller's
+        context with it.
+        """
+        event_manager = EventManager()
+        forwarded: list[RequestPayload] = []
+        handler = _handler_recording_forwards(event_manager, forwarded)
+        event_manager.assign_manager_to_request_type(DeleteConnectionRequest, handler)
+
+        ws_loop = asyncio.new_event_loop()
+        ws_thread = threading.Thread(target=ws_loop.run_forever, daemon=True)
+        ws_thread.start()
+        event_manager._websocket_event_loop = ws_loop
+        try:
+            with event_manager.node_execution_scope(), event_manager.hydration_scope():
+                result = event_manager.handle_request(_delete_connection())
+        finally:
+            ws_loop.call_soon_threadsafe(ws_loop.stop)
+            ws_thread.join(timeout=1.0)
+            ws_loop.close()
+
+        assert isinstance(result.result, DeleteConnectionResultFailure)
+        assert forwarded == []
+
+
+def _every_registered_request_type() -> list[type[RequestPayload]]:
+    """Every request type, once the engine's managers have imported the modules that register them."""
+    current_engine()
+    return [
+        payload_type
+        for payload_type in PayloadRegistry.get_registry().values()
+        if issubclass(payload_type, RequestPayload)
+    ]
+
+
+class TestWhatForwardsDuringHydration:
+    """Whether a request forwards during hydration is read off its success result, not kept in a list."""
+
+    @pytest.mark.parametrize(
+        "request_type",
+        [
+            ListConnectionsForNodeRequest,
+            GetConfigValueRequest,
+            GetSecretValueRequest,
+            GetParameterValueRequest,
+            GetWorkflowContextRequest,
+        ],
+    )
+    def test_the_reads_hooks_make_while_hydrating_forward(self, request_type: type[RequestPayload]) -> None:
+        assert forwards_during_hydration(request_type)
+
+    def test_every_request_type_names_its_success_result(self) -> None:
+        """A result named off the convention would be refused during hydration whatever it declares."""
+        unnamed = sorted(
+            request_type.__name__
+            for request_type in _every_registered_request_type()
+            if result_type_for(request_type, "Success") is None
+        )
+
+        # Answers with the turn's own results, and a value hook has no reason to send it.
+        assert unnamed == ["ResolveToolApprovalsRequest"]
