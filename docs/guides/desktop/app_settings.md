@@ -101,7 +101,8 @@ workflow first.
 and the app dials when it talks to the engine directly. The default,
 `ws://127.0.0.1:18125`, is a loopback socket that only your machine can
 reach. Change it only if your engine listens somewhere else, then restart
-the engine to apply it.
+the engine to apply it. The engine side of this connection is the
+`websocket_direct` transport; see [Transports](../transports.md).
 
 ## License
 

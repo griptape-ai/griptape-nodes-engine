@@ -311,6 +311,7 @@ nav:
                   - Custom (OpenAI-compatible): guides/agent/providers/custom.md
       - Engine:
           - Configuration: guides/configuration.md
+          - Transports: guides/transports.md
           - Libraries: guides/libraries.md
           - Managed Environment: guides/managed_environment.md
       - Projects:
