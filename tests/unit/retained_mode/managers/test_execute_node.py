@@ -6,7 +6,7 @@ from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.common.private_execution_scope import private_execution_scope
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
@@ -865,6 +865,27 @@ class TestExecuteNodePrivateExecutionRoute:
         wm = self._make_worker_manager(self._PRIVATE_WORKER)
 
         result = await self._execute(node, wm, scope_owner=None)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary_type", [StartNode, EndNode])
+    async def test_a_packaged_flows_boundary_node_runs_locally_inside_the_scope(
+        self, boundary_type: type[BaseNode]
+    ) -> None:
+        """StartFlow/EndFlow carry parameters added by request, which a worker's fresh copy lacks."""
+        node = MagicMock(spec=boundary_type)
+        node.name = "StartFlow"
+        node.aprocess = AsyncMock()
+        node.parameter_values = {}
+        node.parameter_output_values = {}
+        node.metadata = {"library": "some_library"}
+        node.validate_in_execution_environment = MagicMock(return_value=None)
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         wm.route_to_worker.assert_not_awaited()

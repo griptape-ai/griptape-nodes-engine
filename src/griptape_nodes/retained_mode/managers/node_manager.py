@@ -50,9 +50,11 @@ from griptape_nodes.exe_types.node_types import (
     LOCAL_EXECUTION,
     PRIVATE_EXECUTION,
     BaseNode,
+    EndNode,
     ErrorProxyNode,
     NodeDependencies,
     NodeResolutionState,
+    StartNode,
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
@@ -3336,8 +3338,13 @@ class NodeManager(EngineScoped):
                 return await self._execute_node_via_worker(request, wm, worker)
             # A library's own worker comes first: that is where its dependencies are installed. Only a
             # node that would otherwise run here moves to the worker its Private Execution names.
+            #
+            # A packaged flow's StartFlow and EndFlow stay here. They are the flow's boundary and only
+            # pass values in and out, and the packager gives them their parameters by request, which
+            # the fresh copy a worker builds from metadata does not have. The body goes.
             private_scope = current_private_execution_scope.get()
-            if wm is not None and private_scope is not None:
+            is_flow_boundary = isinstance(node, (StartNode, EndNode))
+            if wm is not None and private_scope is not None and not is_flow_boundary:
                 return await self._execute_node_in_private_execution_worker(request, wm, private_scope)
 
         async with STRICT_MODE.scoped_execution(

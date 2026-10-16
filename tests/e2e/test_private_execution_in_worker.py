@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     StartFlowRequest,
     StartFlowResultSuccess,
 )
@@ -100,10 +101,15 @@ def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
 
     async def run_on_worker(request: ExecuteNodeRequest, *_args: Any) -> Any:
         worker.received.append((request.node_name, current_private_execution_scope.get()))
-        # The worker has no scope of its own: run the node here, as it would run there.
+        # Run the node as a worker does: on a fresh copy built from the request's metadata, which has
+        # only the parameters its type declares, with the request's values applied to it. The worker
+        # has no scope of its own.
         token = current_private_execution_scope.set(None)
         try:
-            return await node_manager.on_execute_node_request(request)
+            fresh_copy = node_manager._materialize_transient_node_from_metadata(request)
+            if isinstance(fresh_copy, ExecuteNodeResultFailure):
+                return fresh_copy
+            return await node_manager._hydrate_and_run_node(fresh_copy, request)
         finally:
             current_private_execution_scope.reset(token)
 
@@ -255,6 +261,8 @@ async def test_with_the_feature_off_the_group_still_starts_its_own_process(
 LOOP_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "iterative_group_library"
 # The packaged iteration flows take their StartFlow/EndFlow nodes from a library with exactly this name.
 LOOP_LIBRARY_NAME = "Griptape Nodes Library"
+# What ProbeForEachGroupNode iterates.
+_LOOP_ITEMS = ("first", "second", "third")
 
 
 @pytest.mark.parametrize("execution_mode", ["Run Group Items One at a Time", "Run Group Items All at Once"])
@@ -342,4 +350,11 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
     scopes = {scope for _name, scope in general_purpose_worker.received}
     assert scopes == {PrivateExecutionScope(owner_name=group_name)}, general_purpose_worker.received
     body_runs = [name for name, _scope in general_purpose_worker.received if name.startswith("Body")]
-    assert len(body_runs) >= len(("first", "second", "third")), general_purpose_worker.received
+    assert len(body_runs) >= len(_LOOP_ITEMS), general_purpose_worker.received
+    # The packaged flow's StartFlow and EndFlow stayed here: the packager gives them their parameters
+    # by request, and a worker's fresh copy would not have them.
+    boundary_runs = [name for name, _scope in general_purpose_worker.received if "Flow" in name]
+    assert boundary_runs == [], general_purpose_worker.received
+    # The loop collected a result from every iteration: the body echoes the index it was handed.
+    group = engine.node_manager.get_node_by_name(group_name)
+    assert group.parameter_output_values.get("results") == [str(i) for i in range(len(_LOOP_ITEMS))]
