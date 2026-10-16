@@ -200,6 +200,7 @@ class ListRows:
             for item in items:
                 row = parameter_list.add_child_parameter()
                 node.set_parameter_value(row.name, item)
+            self._check_held_within_max_items(parameter_list, list_label)
             self._notify(parameter_list, initial_setup=False)
         except Exception:
             # Converters, validators and hooks may raise anything. Undo, then let it propagate unchanged.
@@ -207,6 +208,18 @@ class ListRows:
             raise
         finally:
             self._being_replaced.discard(parameter_list.name)
+
+    def _check_held_within_max_items(self, parameter_list: ParameterList, list_label: str) -> None:
+        """Raise if the rows hold more than `max_items`, which a row holding a list can do with fewer rows.
+
+        Raises:
+            ValueError: if the list holds more items than `max_items`.
+        """
+        max_items = parameter_list.max_items
+        held_count = len(handle_container_parameter(self._node, parameter_list))
+        if max_items is not None and held_count > max_items:
+            msg = f"Attempted to set list {list_label}. Failed because the list would hold {held_count} items after its nested lists are added, and holds at most {max_items} items."
+            raise ValueError(msg)
 
     def _restore(self, parameter_list: ParameterList, rows: list[Parameter], values: dict[str, Any]) -> None:
         """Put back the rows `_replace` removed, with their values, and remove the ones it added."""
@@ -275,6 +288,11 @@ def handle_container_parameter(current_node: BaseNode, parameter: ParameterConta
         # would put a live object in it and send it to a worker as JSON. The node still sees objects:
         # its read resolves the whole list on the way out.
         value = current_node._get_raw_parameter_value(child.name)
-        if value is not None:
+        if value is None:
+            continue
+        # A row fed a whole list adds its items, so the list ends up the concatenation of its rows.
+        if isinstance(value, list) and isinstance(parameter, ParameterList) and parameter.concatenates_list_rows:
+            build_parameter_value.extend(value)
+        else:
             build_parameter_value.append(value)
     return build_parameter_value

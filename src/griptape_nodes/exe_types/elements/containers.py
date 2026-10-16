@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter import Parameter
-from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType
+from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType, ParameterTypeBuiltin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -288,11 +288,38 @@ class ParameterList(ParameterContainer):
         super()._custom_setter_for_property_type(value)
 
     def _custom_setter_for_property_input_types(self, value: list[str] | None) -> None:
-        # If we are setting a type, we need to propagate this to our children as well.
-        for child in self._children:
-            if isinstance(child, Parameter):
-                child.input_types = value
-        return super()._custom_setter_for_property_input_types(value)
+        super()._custom_setter_for_property_input_types(value)
+        rows = [child for child in self._children if isinstance(child, Parameter)]
+        if not rows:
+            # Also the case while the list is being constructed, before its types are all set.
+            return
+        # Existing rows get what add_child_parameter gives a new row. Read after the value is stored, so a
+        # cleared value resolves to the same default for both.
+        row_input_types = self._with_list_variants(super()._custom_getter_for_property_input_types())
+        for row in rows:
+            row.input_types = row_input_types
+
+    @property
+    def concatenates_list_rows(self) -> bool:
+        """Whether a row holding a list contributes its items to this list, rather than being one item.
+
+        False when the list's own items may be lists (or anything), where a list in a row is a legitimate item.
+        """
+        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
+        item_types = super()._custom_getter_for_property_input_types()
+        return all(
+            ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
+        )
+
+    @staticmethod
+    def _with_list_variants(item_types: list[str]) -> list[str]:
+        """Each item type followed by its `list[...]` form, then a bare `list`.
+
+        Lets a row take one item or a whole list of them. A bare `list` is accepted for the same reason the
+        container accepts it: a source that builds a list at runtime cannot always declare one element type,
+        so element-type correctness is deferred to the consuming node.
+        """
+        return [*item_types, *(f"list[{item_type}]" for item_type in item_types), "list"]
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
@@ -365,7 +392,8 @@ class ParameterList(ParameterContainer):
             name=name,
             tooltip=self.tooltip,
             type=self._type,
-            input_types=self._input_types,
+            # The unwidened getter: `self.input_types` is the container's own list-shaped set.
+            input_types=self._with_list_variants(super()._custom_getter_for_property_input_types()),
             output_type=self._output_type,
             default_value=self.default_value,
             tooltip_as_input=self.tooltip_as_input,

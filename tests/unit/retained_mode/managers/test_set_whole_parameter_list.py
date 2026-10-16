@@ -165,6 +165,26 @@ class TestWholeListSetOnAnUnconnectedList:
         assert isinstance(result, SetParameterValueResultFailure)
         assert node.get_parameter_value("items") == ["a"]
 
+    def test_a_nested_list_adds_its_items(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+
+        result = _set_items(engine, [["a", "b"], "c"])
+
+        assert isinstance(result, SetParameterValueResultSuccess)
+        assert node.get_parameter_value("items") == ["a", "b", "c"]
+        assert [node.get_parameter_value(row.name) for row in _rows(node)] == [["a", "b"], "c"]
+
+    def test_more_items_than_max_items_after_nested_lists_is_rejected_and_keeps_the_rows(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        node = _add(engine, _ListNode(name="Lister", max_items=2), flow_name)
+        _set_items(engine, ["a"])
+
+        result = _set_items(engine, [["x", "y"], "z"])
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert node.get_parameter_value("items") == ["a"]
+
     def test_clearing_a_resolved_node_unresolves_it(self, engine: Engine, flow_name: str) -> None:
         """No row is set when the list is cleared, so the row path cannot be what unresolves the node."""
         node = _add(engine, _ListNode(name="Lister"), flow_name)
@@ -578,6 +598,14 @@ class TestDispatch:
 
         assert values["items"] == ["a", "b"]
         assert not set(rows) & set(values)
+
+    def test_a_list_with_nested_lists_is_sent_concatenated(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+        _set_items(engine, [["a", "b"], "c"])
+
+        values = node._list_rows.values_for_dispatch()
+
+        assert values["items"] == ["a", "b", "c"]
 
     def test_a_list_built_from_its_rows_is_sent(self, engine: Engine, flow_name: str) -> None:
         node = _add(engine, _ListNode(name="Lister"), flow_name)
