@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
@@ -24,11 +24,7 @@ from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest, ExecutionEvent
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
-from griptape_nodes.retained_mode.events.execution_events import (
-    ExecuteNodeRequest,
-    ExecuteNodeResultFailure,
-    NodeQueuedEvent,
-)
+from griptape_nodes.retained_mode.events.execution_events import NodeQueuedEvent
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommand,
     WorkerCommandRefusal,
@@ -100,6 +96,15 @@ class _HostedWorker:
 
     worker_engine_id: str
     request_topic: str
+
+
+@dataclass
+class MachineAdmission:
+    """A node another machine admitted, or was asked to, which that machine must be told has ended."""
+
+    machine: str
+    session_id: str
+    admission_id: str
 
 
 def _result_details(result: dict) -> str:
@@ -789,57 +794,63 @@ class WorkerManager(EngineScoped):
         Registers a Future via RequestClient keyed by request_id and resolves it when
         the worker response arrives. The caller is responsible for deserializing the
         returned dict into the appropriate result type.
-
-        A node for a worker on another machine waits for that machine to admit it first.
         """
-        registration = self._workers.get(worker_engine_id)
-        if (
-            registration is not None
-            and registration.machine is not None
-            and isinstance(event_request.request, ExecuteNodeRequest)
-        ):
-            return await self._route_to_remote_worker(
-                event_request, worker_engine_id, worker_request_topic, registration.machine
-            )
         return await self._forward_and_await(event_request, worker_engine_id, worker_request_topic)
 
-    async def _route_to_remote_worker(
-        self, event_request: EventRequest, worker_engine_id: str, worker_request_topic: str, machine: str
-    ) -> dict:
-        """Run a node in another machine's worker once that machine admits it, telling the machine when it ends."""
-        request = cast("ExecuteNodeRequest", event_request.request)
-        session_id = self.engine.get_session_id() or ""
+    async def admit_on_machine(self, library_name: str, node_name: str) -> MachineAdmission | None:
+        """Wait until the machine running `library_name`'s worker admits the node, or None if it runs here.
+
+        Unbounded, like the node itself: another artist's run may hold the machine for as long as it
+        runs. The machine may stop this orchestrator's worker to free itself for that run, so pick the
+        worker only once this returns, through `wait_until_executable`, which starts it again.
+        Pass the admission to `end_admission` once the node ends, however it ends.
+
+        Raises:
+            RuntimeError: The machine will not run the node, with why.
+        """
+        found = self.get_worker_for_key(library_name)
+        registration = self._workers.get(found[0]) if found is not None else None
+        if registration is None or registration.machine is None:
+            return None
+        admission = MachineAdmission(
+            machine=registration.machine, session_id=self.engine.get_session_id() or "", admission_id=str(uuid.uuid4())
+        )
         run_id = current_run_id.get()
         if run_id is not None:
-            self._run_machines.setdefault(run_id, set()).add(machine)
-        admission_id = str(uuid.uuid4())
+            self._run_machines.setdefault(run_id, set()).add(admission.machine)
         try:
-            # Unbounded, like the node itself: another artist's run may hold the machine for as long as
-            # it runs. Tagged with the worker, so the worker going away fails the wait with the reason.
-            admission = await self._request_machine(
-                machine,
-                session_id,
+            result = await self._request_machine(
+                admission.machine,
+                admission.session_id,
                 worker_events.AdmitNodeRequest(
-                    originator_session_id=session_id,
-                    admission_id=admission_id,
+                    originator_session_id=admission.session_id,
+                    admission_id=admission.admission_id,
                     run_id=run_id,
-                    node_name=request.node_name,
+                    node_name=node_name,
                 ),
-                tag=worker_engine_id,
                 timeout_s=None,
             )
-            if admission.get("result_type") != worker_events.AdmitNodeResultSuccess.__name__:
-                details = (
-                    f"Attempted to run node '{request.node_name}' on {machine}. "
-                    f"Failed because {_result_details(admission)}"
-                )
-                return {"result_type": ExecuteNodeResultFailure.__name__, "result": {"result_details": details}}
-            return await self._forward_and_await(event_request, worker_engine_id, worker_request_topic)
-        finally:
-            await self._tell_machine(
-                machine,
-                worker_events.NodeExecutionEndedRequest(originator_session_id=session_id, admission_id=admission_id),
+        except BaseException:
+            await self.end_admission(admission)
+            raise
+        if result.get("result_type") != worker_events.AdmitNodeResultSuccess.__name__:
+            await self.end_admission(admission)
+            msg = (
+                f"Attempted to run node '{node_name}' on {admission.machine}. Failed because {_result_details(result)}"
             )
+            raise RuntimeError(msg)
+        return admission
+
+    async def end_admission(self, admission: MachineAdmission | None) -> None:
+        """Tell the machine that admitted a node, or was asked to, that the node ended."""
+        if admission is None:
+            return
+        await self._tell_machine(
+            admission.machine,
+            worker_events.NodeExecutionEndedRequest(
+                originator_session_id=admission.session_id, admission_id=admission.admission_id
+            ),
+        )
 
     async def _forward_and_await(
         self, event_request: EventRequest, worker_engine_id: str, worker_request_topic: str
@@ -1266,20 +1277,16 @@ class WorkerManager(EngineScoped):
         session_id: str,
         request: RequestPayload,
         *,
-        tag: str | None = None,
         timeout_s: float | None = _MACHINE_REQUEST_TIMEOUT_S,
     ) -> dict:
         """Send `request` to the orchestrator at `machine` and return its raw result payload.
 
         Bounded by default, unlike a request to a worker: a link queues what it is given while its
         machine is unreachable, so an unbounded wait for a machine that is down would never end. A
-        caller that waits on purpose passes no timeout and a `tag` that fails the wait when what it
-        waits for goes away.
+        caller that waits on purpose passes no timeout.
         """
         request_id = str(uuid.uuid4())
-        future = await self._tx.request_client.track_request(
-            request_id, tag=tag or machine, resolve_failures_as_payload=True
-        )
+        future = await self._tx.request_client.track_request(request_id, tag=machine, resolve_failures_as_payload=True)
         event = EventRequest(request=request, request_id=request_id, response_topic=f"sessions/{session_id}/response")
         try:
             await self._links_for(machine).publish(machine, "EventRequest", converters.engine.dumps(event), "request")
@@ -1597,17 +1604,27 @@ class WorkerManager(EngineScoped):
                 continue
             for worker_key, worker in list(workers.items()):
                 if how == "recycle":
-                    await self._recycle(worker_key)
+                    await self._recycle(worker_key, worker, originator)
                 else:
                     await self._drop_library_named_objects(worker)
 
-    async def _recycle(self, worker_key: str) -> None:
+    async def _recycle(self, worker_key: str, worker: _HostedWorker, originator_session_id: str) -> None:
+        """Stop a worker to free this machine, and tell its originator, which starts it again when it next runs here."""
         proc = self._managed_worker_processes.get(worker_key)
         if proc is None:
             return
         self._recycling.add(worker_key)
         logger.info("Stopping worker '%s' to free this machine for another run.", worker_key)
         await self._terminate_via_spawn_loop(worker_key, proc)
+        # Told rather than left to notice: an originator that only stops hearing from the worker
+        # evicts it, failing the node that is waiting for this machine to run it there.
+        event = EventRequest(
+            request=worker_events.UnregisterWorkerRequest(worker_engine_id=worker.worker_engine_id),
+            response_topic=None,
+        )
+        await self._tx.send_message(
+            "EventRequest", converters.engine.dumps(event), f"sessions/{originator_session_id}/request"
+        )
 
     async def _drop_library_named_objects(self, worker: _HostedWorker) -> None:
         """Have a worker drop what its libraries keep across runs, waiting until it has."""

@@ -133,6 +133,26 @@ class TestMachineQueue:
         assert recorder.handoffs == [_B]
 
     @pytest.mark.asyncio
+    async def test_a_handoff_that_fails_still_hands_the_machine_over(self) -> None:
+        recorder = _Recorder()
+
+        async def fail_to_free(incoming: str) -> None:
+            recorder.handoffs.append(incoming)
+            msg = "the connection is re-establishing"
+            raise ConnectionError(msg)
+
+        queue = MachineQueue(idle_timeout_s=60.0, on_handoff=fail_to_free, on_position=recorder.on_position)
+        await queue.admit(admission_id="1", originator=_A, run_id="r1", node_name="n")
+        waiting = _admit(queue, "2", _B, "r9")
+        await _settle()
+
+        queue.end_run(_A, "r1")
+
+        assert await asyncio.wait_for(waiting, timeout=1.0) == "r9"
+        assert recorder.handoffs == [_B]
+        assert queue.holder == (_B, "r9")
+
+    @pytest.mark.asyncio
     async def test_a_run_with_no_node_running_lets_go_after_the_idle_timeout(self) -> None:
         queue = _queue(_Recorder(), idle_timeout_s=0.05)
         await queue.admit(admission_id="1", originator=_A, run_id="r1", node_name="n")

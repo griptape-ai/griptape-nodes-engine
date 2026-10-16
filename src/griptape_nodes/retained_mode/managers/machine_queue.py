@@ -193,7 +193,12 @@ class MachineQueue:
                     logger.info(
                         "Freeing this machine before handing it from %s to %s.", self._last_originator, head.originator
                     )
-                    await self._on_handoff(head.originator)
+                    # Freeing is best effort: a failure here must not leave the machine with no holder
+                    # and every waiting node stuck until another node arrives.
+                    try:
+                        await self._on_handoff(head.originator)
+                    except Exception:
+                        logger.exception("Could not free this machine before the handoff; handing it over anyway.")
                     # Awaiting the handoff gave the head's orchestrator time to go away or end its run.
                     if not self._waiting or self._waiting[0] is not head:
                         continue

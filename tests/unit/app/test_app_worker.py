@@ -2954,12 +2954,21 @@ def _execute(node_name: str = "heavy") -> EventRequest:
     )
 
 
+async def _run_remote(worker_manager: WorkerManager, node_name: str = "heavy") -> dict:
+    """Run a node the way NodeManager runs one for another machine's worker: admitted, sent, then ended."""
+    admission = await worker_manager.admit_on_machine(_LIBRARY, node_name)
+    try:
+        return await worker_manager.route_to_worker(_execute(node_name), _ENGINE, _WORKER_REQUEST_TOPIC)
+    finally:
+        await worker_manager.end_admission(admission)
+
+
 class TestANodeForAnotherMachineIsAdmittedFirst:
     @pytest.mark.asyncio
     async def test_it_is_admitted_then_sent_then_reported_ended(self, worker_manager: WorkerManager) -> None:
         links = _remote_worker(worker_manager)
 
-        result = await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+        result = await _run_remote(worker_manager)
 
         assert result["result_type"] == "ExecuteNodeResultSuccess"
         sent = _sent(links)
@@ -2976,10 +2985,9 @@ class TestANodeForAnotherMachineIsAdmittedFirst:
         refusing = _machine(worker_manager, refuse={"AdmitNodeRequest": "its run ended before the machine was free."})
         links.publish.side_effect = refusing.publish.side_effect
 
-        result = await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+        with pytest.raises(RuntimeError, match="its run ended"):
+            await worker_manager.admit_on_machine(_LIBRARY, "heavy")
 
-        assert result["result_type"] == "ExecuteNodeResultFailure"
-        assert "its run ended" in result["result"]["result_details"]
         assert [entry["request_type"] for entry in _sent(refusing)] == [
             "AdmitNodeRequest",
             "NodeExecutionEndedRequest",
@@ -2989,16 +2997,8 @@ class TestANodeForAnotherMachineIsAdmittedFirst:
     async def test_a_local_workers_node_is_not_admitted(self, worker_manager: WorkerManager) -> None:
         links = _machine(worker_manager)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
-        request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
 
-        async def answer(_event_type: str, payload: str, _topic: str | None) -> None:
-            pending = request_client._pending_requests.pop(json.loads(payload)["request_id"])
-            pending.future.set_result({"result_type": "ExecuteNodeResultSuccess", "result": {}})
-
-        worker_manager._tx.send_message.side_effect = answer  # type: ignore[union-attr]
-
-        await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
-
+        assert await worker_manager.admit_on_machine("Lib", "n") is None
         links.publish.assert_not_awaited()
 
 
@@ -3010,8 +3010,8 @@ class TestARunEndsOnEveryMachineItUsed:
         links = _remote_worker(worker_manager)
 
         async with worker_manager.run_scope():
-            await worker_manager.route_to_worker(_execute("first"), _ENGINE, _WORKER_REQUEST_TOPIC)
-            await worker_manager.route_to_worker(_execute("second"), _ENGINE, _WORKER_REQUEST_TOPIC)
+            await _run_remote(worker_manager, "first")
+            await _run_remote(worker_manager, "second")
 
         sent = _sent(links)
         admissions = [entry for entry in sent if entry["request_type"] == "AdmitNodeRequest"]
@@ -3026,7 +3026,7 @@ class TestARunEndsOnEveryMachineItUsed:
         links = _remote_worker(worker_manager)
 
         async with worker_manager.run_scope(), worker_manager.run_scope():
-            await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+            await _run_remote(worker_manager)
 
         assert [entry["request_type"] for entry in _sent(links)].count("EndRunRequest") == 1
 
@@ -3034,7 +3034,7 @@ class TestARunEndsOnEveryMachineItUsed:
     async def test_a_node_outside_any_run_is_sent_without_one(self, worker_manager: WorkerManager) -> None:
         links = _remote_worker(worker_manager)
 
-        await worker_manager.route_to_worker(_execute(), _ENGINE, _WORKER_REQUEST_TOPIC)
+        await _run_remote(worker_manager)
 
         assert _sent(links)[0]["request"]["run_id"] is None
         assert "EndRunRequest" not in [entry["request_type"] for entry in _sent(links)]
@@ -3103,6 +3103,23 @@ class TestFreeingTheMachineBetweenOrchestrators:
 
         terminate.assert_awaited_once()
         queue.originator_gone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recycling_tells_the_originator_its_worker_stopped(self, worker_manager: WorkerManager) -> None:
+        """Otherwise the originator evicts the worker for going quiet, failing its node waiting here."""
+        worker_manager.engine.config_manager.get_config_value.side_effect = (  # type: ignore[union-attr]
+            lambda key, default=None, **_: "recycle" if key == DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY else default
+        )
+        _host(worker_manager, "sess-a", _LIBRARY)
+
+        with patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()):
+            await worker_manager._free_for_handoff("sess-b")
+
+        event_type, payload, topic = worker_manager._tx.send_message.await_args.args  # type: ignore[union-attr]
+        sent = json.loads(payload)
+        assert (event_type, topic) == ("EventRequest", "sessions/sess-a/request")
+        assert sent["request_type"] == "UnregisterWorkerRequest"
+        assert sent["request"]["worker_engine_id"] == "w-sess-a"
 
 
 class TestAnOriginatorWithNoWorkersLeftIsGone:
