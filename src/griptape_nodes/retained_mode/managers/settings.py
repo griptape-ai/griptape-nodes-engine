@@ -2,7 +2,7 @@ import json
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, ValidationInfo, field_validator
 from pydantic import Field as PydanticField
@@ -24,6 +24,7 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
+DISTRIBUTED_EXECUTION_LIBRARIES_KEY = "distributed_execution.libraries"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -443,6 +444,44 @@ class WorkerSettings(BaseModel):
             raise ValueError(msg) from e
 
 
+class MachineAddress(NamedTuple):
+    host: str
+    port: int
+
+
+def parse_machine_address(address: str) -> MachineAddress | None:
+    """Split a machine address written host:port, or return None if it is not one."""
+    host, separator, port = address.rpartition(":")
+    if not separator or not host or not port.isdigit():
+        return None
+    return MachineAddress(host=host, port=int(port))
+
+
+class DistributedExecutionSettings(BaseModel):
+    libraries: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Where each library's nodes run, as a map of library name to the address of the machine "
+            "that runs them, written host:port, for example "
+            '{"Griptape Nodes Diffusers Library": "gpu-01:18125"}. The address is that machine\'s '
+            "engine's websocket_direct transport. A library with no entry runs on this machine. Read "
+            "when the engine starts."
+        ),
+    )
+
+    @field_validator("libraries", mode="after")
+    @classmethod
+    def validate_libraries(cls, v: dict[str, str]) -> dict[str, str]:
+        for library_name, address in v.items():
+            if parse_machine_address(address) is None:
+                msg = (
+                    f"{DISTRIBUTED_EXECUTION_LIBRARIES_KEY} entry for '{library_name}' must be host:port, "
+                    f"got {address!r}"
+                )
+                raise ValueError(msg)
+        return v
+
+
 class AgentSettings(BaseModel):
     system_prompt: str = Field(
         default="",
@@ -699,6 +738,10 @@ class Settings(BaseModel):
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,
+    )
+    distributed_execution: DistributedExecutionSettings = Field(
+        category=EXECUTION,
+        default_factory=DistributedExecutionSettings,
     )
     storage_backend: Literal["local", "gtc"] = Field(
         category=STORAGE,

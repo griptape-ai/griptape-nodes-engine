@@ -137,11 +137,18 @@ class StartWorkerRequest(RequestPayload):
     orchestrator. WorkerManager handles this by waiting for an active session then
     spawning the worker subprocess.
 
+    Also sent by an orchestrator to the machine its distribution settings assign the library
+    to, with `originator_session_id` set. That machine's orchestrator then starts the worker
+    in the originator's session, so the worker registers with the originator and serves it.
+
     Args:
         library_name: The library the worker will serve.
+        originator_session_id: The session of the orchestrator on another machine that the
+            worker serves, or None for a worker of this orchestrator's own session.
     """
 
     library_name: str
+    originator_session_id: str | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 

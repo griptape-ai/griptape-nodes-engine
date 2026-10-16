@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _STATIC_URL_SETTLE_TIMEOUT_S,
     WorkerManager,
@@ -2371,3 +2372,166 @@ class TestChallengeAllowanceRounding:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
 
         assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
+
+
+_MACHINE = "gpu-01:18125"
+_LIBRARY = "Heavy Library"
+
+
+def _send_library_to_machine(worker_manager: WorkerManager) -> MagicMock:
+    """Assign `_LIBRARY` to `_MACHINE` in the distribution settings, and attach mock machine links."""
+    read_default = worker_manager.engine.config_manager.get_config_value.side_effect  # type: ignore[union-attr]
+
+    def get_config_value(key: str, default: object = None, cast_type: type | None = None) -> object:
+        if key == DISTRIBUTED_EXECUTION_LIBRARIES_KEY:
+            return {_LIBRARY: _MACHINE}
+        return read_default(key, default, cast_type)
+
+    worker_manager.engine.config_manager.get_config_value.side_effect = get_config_value  # type: ignore[union-attr]
+    links = MagicMock()
+    links.publish = AsyncMock()
+    links.subscribe = AsyncMock()
+    links.route = AsyncMock()
+    links.relay = AsyncMock()
+    worker_manager.attach_machine_links(links)
+    return links
+
+
+class TestStartingAWorkerOnAnotherMachine:
+    @pytest.mark.asyncio
+    async def test_a_library_assigned_to_a_machine_asks_that_machine_to_start_its_worker(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _send_library_to_machine(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
+            await worker_manager._requested_spawns[_LIBRARY]
+
+        spawn.assert_not_awaited()
+        links.subscribe.assert_has_awaits(
+            [call(_MACHINE, f"sessions/{_SESSION}/request"), call(_MACHINE, f"sessions/{_SESSION}/response")]
+        )
+        address, event_type, payload, topic = links.publish.await_args.args
+        assert (address, event_type, topic) == (_MACHINE, "EventRequest", "request")
+        sent = json.loads(payload)["request"]
+        assert sent["library_name"] == _LIBRARY
+        assert sent["originator_session_id"] == _SESSION
+
+    @pytest.mark.asyncio
+    async def test_without_machine_links_the_library_is_unavailable_rather_than_run_here(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Running it here would run it in the one place it was assigned away from."""
+        _send_library_to_machine(worker_manager)
+        worker_manager._machine_links = None
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
+            await worker_manager._requested_spawns[_LIBRARY]
+
+        spawn.assert_not_awaited()
+        reason = worker_manager.worker_unavailable_reason(_LIBRARY)
+        assert reason is not None
+        assert _MACHINE in reason
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_no_assignment_still_spawns_here(self, worker_manager: WorkerManager) -> None:
+        links = _send_library_to_machine(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Local Lib"))
+            await worker_manager._requested_spawns["Local Lib"]
+
+        spawn.assert_awaited_once()
+        links.publish.assert_not_awaited()
+
+
+class TestServingAnotherMachinesOrchestrator:
+    @pytest.mark.asyncio
+    async def test_the_worker_joins_the_originators_session_and_its_traffic_is_relayed_first(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _send_library_to_machine(worker_manager)
+        order: list[str] = []
+        links.relay.side_effect = lambda prefix: order.append(f"relay {prefix}")
+
+        async def record_spawn(args: list[str], worker_key: str, **kwargs: str) -> None:
+            order.append(f"spawn {worker_key}")
+            record_spawn.args = args  # type: ignore[attr-defined]
+            record_spawn.kwargs = kwargs  # type: ignore[attr-defined]
+
+        with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
+            result = await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert isinstance(result, worker_events.StartWorkerResultSuccess), result.result_details
+        worker_engine_id = record_spawn.kwargs["worker_engine_id"]  # type: ignore[attr-defined]
+        assert order == [
+            "relay sessions/origin-sess/",
+            f"relay engines/{worker_engine_id}/",
+            f"spawn origin-sess/{_LIBRARY}",
+        ]
+        args = record_spawn.args  # type: ignore[attr-defined]
+        assert args[args.index("--session-id") + 1] == "origin-sess"
+        assert record_spawn.kwargs["library_name"] == _LIBRARY  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_without_machine_links_the_request_fails(self, worker_manager: WorkerManager) -> None:
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await worker_manager.handle_start_worker_request(
+                worker_events.StartWorkerRequest(library_name=_LIBRARY, originator_session_id="origin-sess")
+            )
+
+        assert isinstance(result, worker_events.StartWorkerResultFailure)
+        spawn.assert_not_awaited()
+
+
+class TestARemoteWorkerIsReachedThroughItsMachine:
+    @pytest.mark.asyncio
+    async def test_registration_subscribes_and_routes_on_the_machine(self, worker_manager: WorkerManager) -> None:
+        links = _send_library_to_machine(worker_manager)
+        worker_manager._remote_libraries[_LIBRARY] = _MACHINE
+
+        await worker_manager.handle_register_worker_request(
+            worker_events.RegisterWorkerRequest(
+                worker_engine_id=_ENGINE, engine_version=engine_version, library_name=_LIBRARY
+            )
+        )
+
+        assert worker_manager._workers[_ENGINE].machine == _MACHINE
+        links.subscribe.assert_awaited_once_with(_MACHINE, _WORKER_RESPONSE_TOPIC)
+        links.route.assert_awaited_once_with(_MACHINE, f"engines/{_ENGINE}/")
+        worker_manager._tx.subscribe_to_topic.assert_not_called()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_requests_to_it_go_through_the_machine(self, worker_manager: WorkerManager) -> None:
+        links = _send_library_to_machine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, machine=_MACHINE
+        )
+
+        await worker_manager.forward_event_to_worker(
+            EventRequest(request=GetParameterValueRequest(node_name="n", parameter_name="p")),
+            worker_engine_id=_ENGINE,
+            worker_request_topic=_WORKER_REQUEST_TOPIC,
+        )
+
+        address, event_type, _payload, topic = links.publish.await_args.args
+        assert (address, event_type, topic) == (_MACHINE, "EventRequest", _WORKER_REQUEST_TOPIC)
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_a_local_worker_is_still_reached_directly(self, worker_manager: WorkerManager) -> None:
+        links = _send_library_to_machine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
+
+        await worker_manager.forward_event_to_worker(
+            EventRequest(request=GetParameterValueRequest(node_name="n", parameter_name="p")),
+            worker_engine_id=_ENGINE,
+            worker_request_topic=_WORKER_REQUEST_TOPIC,
+        )
+
+        links.publish.assert_not_awaited()
+        worker_manager._tx.send_message.assert_awaited_once()  # type: ignore[union-attr]
