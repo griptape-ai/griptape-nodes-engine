@@ -95,6 +95,15 @@
       }
     },
     {
+      "class_name": "SlowSourceControlNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Control-typed node left with no control wires; awaits asyncio.sleep(seconds)",
+        "display_name": "Slow Source"
+      }
+    },
+    {
       "class_name": "LoopEndNode",
       "file_path": "loop_nodes.py",
       "metadata": {

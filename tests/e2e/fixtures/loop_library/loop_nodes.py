@@ -11,11 +11,12 @@ packager asks for its flow endpoints by.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
+from griptape_nodes.exe_types.node_types import ControlNode, DataNode, EndNode, StartNode
 
 
 class StartFlow(StartNode):
@@ -157,6 +158,40 @@ class OutsideCounterDataNode(DataNode):
     def process(self) -> None:
         self.run_count += 1
         self.parameter_output_values["value"] = f"outside-run-{self.run_count}"
+
+
+class SlowSourceControlNode(ControlNode):
+    """A control-typed node left with no control wires, so it classifies as a data node.
+
+    Simulates an async upstream call (an Agent or image generator): ``aprocess`` really
+    awaits, and its output changes between runs when ``seconds`` is edited.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="seconds",
+                tooltip="How long to sleep",
+                type="float",
+                default_value=0.1,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="result_details",
+                tooltip="Describes how long this run slept",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    async def aprocess(self) -> None:
+        seconds = self.get_parameter_value("seconds") or 0.0
+        await asyncio.sleep(seconds)
+        self.parameter_output_values["result_details"] = f"Slept for {seconds} seconds"
 
 
 class AnySinkDataNode(DataNode):

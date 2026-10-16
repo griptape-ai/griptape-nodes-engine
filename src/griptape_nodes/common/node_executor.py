@@ -147,6 +147,7 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
@@ -1208,8 +1209,10 @@ class NodeExecutor(EngineScoped):
             if node:
                 node.state = NodeResolutionState.RESOLVED
 
-        # Remove packaged nodes from global queue since they will be copied into loop iterations
-        self._remove_packaged_nodes_from_queue(all_nodes)
+        # Remove packaged nodes from global queue since they will be copied into loop iterations.
+        # end_node stays in the outer DAG and is where the real values land once copied back, so
+        # any outside consumer of a packaged node waits on end_node instead of losing the edge.
+        self._remove_packaged_nodes_from_queue(all_nodes, replacement_node_name=end_node.name)
 
         return package_result, execution_type
 
@@ -2536,7 +2539,9 @@ class NodeExecutor(EngineScoped):
             if node_reference:
                 node_reference.state = NodeResolutionState.RESOLVED
 
-        self._remove_packaged_nodes_from_queue(set(node_names))
+        # node (the group) stays in the outer DAG, so an outside consumer of a packaged child
+        # waits on it instead of losing the edge -- see _remove_packaged_nodes_from_queue.
+        self._remove_packaged_nodes_from_queue(set(node_names), replacement_node_name=node.name)
 
         return package_result
 
@@ -4064,15 +4069,25 @@ class NodeExecutor(EngineScoped):
             parameter_output_values.update(end_node_values)
         return parameter_output_values
 
-    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str]) -> None:
+    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str], replacement_node_name: str) -> None:
         """Remove nodes from global flow queue after they've been packaged for loop execution.
 
         When nodes are packaged for For Each loops, they will be deserialized into separate
         flow instances. We need to remove them from the global queue to prevent them from
         being executed in the main flow while also being copied into loop iterations.
 
+        A packaged node can still have a data consumer outside the package (a loose sink, or a
+        node pulled in only because it reads one of these nodes). Dropping the packaged node from
+        a network drops that edge too, so the consumer's in-degree reaches zero and it can run
+        before this node's real value is copied back onto ``replacement_node_name`` (the node that
+        stays in the outer DAG standing in for the whole package -- the loop's End node, or the
+        group node itself). Re-pointing the edge at that stand-in instead keeps the consumer
+        waiting until the copy-back has happened.
+
         Args:
             packaged_node_names: Set of node names that were packaged
+            replacement_node_name: The node left in the outer DAG to carry packaged nodes'
+                outside-facing data edges once the package's real values land on it
         """
         flow_manager = self.engine.flow_manager
         node_manager = self.engine.node_manager
@@ -4098,10 +4113,28 @@ class NodeExecutor(EngineScoped):
                 if node_name in dag_builder.node_to_reference:
                     dag_builder.node_to_reference.pop(node_name)
 
-                # Remove from all networks and check if any become empty
-                for network in list(dag_builder.graphs.values()):
-                    if node_name in network.nodes():
-                        network.remove_node(node_name)
+            for network in list(dag_builder.graphs.values()):
+                self._redirect_packaged_edges_and_remove(network, packaged_node_names, replacement_node_name)
+
+    @staticmethod
+    def _redirect_packaged_edges_and_remove(
+        network: DirectedGraph, packaged_node_names: set[str], replacement_node_name: str
+    ) -> None:
+        """Drop every packaged node from one network, keeping its outside-facing edges alive.
+
+        An outside consumer's edge from a packaged node is re-pointed to `replacement_node_name`
+        instead of being dropped, so the consumer still waits for the real value. An edge whose
+        successor is the replacement node itself is left alone rather than turned into a self-loop
+        that would never clear -- that is simply the replacement node's own existing dependency.
+        """
+        for node_name in packaged_node_names:
+            if node_name not in network.nodes():
+                continue
+            for successor in network.get_successors(node_name):
+                if successor in packaged_node_names or successor == replacement_node_name:
+                    continue
+                network.add_edge(replacement_node_name, successor)
+            network.remove_node(node_name)
 
     def _apply_parameter_values_to_node(
         self,
