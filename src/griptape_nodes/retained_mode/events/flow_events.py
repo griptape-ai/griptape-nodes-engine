@@ -173,8 +173,8 @@ class ListNodesInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 
 @dataclass
-class CanvasSummaryNode:
-    """One node in a canvas summary.
+class FlowSummaryNode:
+    """One node in a flow summary.
 
     Args:
         name: Node name, the value to pass as `node_name` in other requests
@@ -200,8 +200,8 @@ class CanvasSummaryNode:
 
 
 @dataclass
-class CanvasSummaryConnection:
-    """One connection in a canvas summary, each end written as "<node name>.<parameter name>".
+class FlowSummaryConnection:
+    """One connection in a flow summary, each end written as "<node name>.<parameter name>".
 
     A connection that crosses into or out of a node group passes through a proxy parameter on the
     group, named after the parameter it stands in for, so it appears as two connections: one to the
@@ -214,18 +214,18 @@ class CanvasSummaryConnection:
 
 @dataclass
 @PayloadRegistry.register
-class GetCanvasSummaryRequest(RequestPayload):
+class GetFlowSummaryRequest(RequestPayload):
     """Summarize a flow's nodes, the values set on them, and their connections, in one call.
 
-    Use when: planning an edit to a workflow the user already has open, or checking what is on
-    the canvas before adding to it. One call replaces ListNodesInFlowRequest followed by
+    Use when: planning an edit to a workflow the user already has open, or checking what is in
+    a flow before adding to it. One call replaces ListNodesInFlowRequest followed by
     GetAllNodeInfoRequest per node, and leaves out outputs, run results, and UI state. Read-only.
     For a parameter's full details, follow up with GetAllNodeInfoRequest.
 
     Args:
         flow_name: Name of the flow to summarize (None for the current context flow)
 
-    Results: GetCanvasSummaryResultSuccess (with the summary) | GetCanvasSummaryResultFailure (flow not found, no current context)
+    Results: GetFlowSummaryResultSuccess (with the summary) | GetFlowSummaryResultFailure (flow not found, no current context)
     """
 
     flow_name: str | None = None
@@ -233,8 +233,8 @@ class GetCanvasSummaryRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetCanvasSummaryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Canvas summary retrieved successfully.
+class GetFlowSummaryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Flow summary retrieved successfully.
 
     Args:
         workflow_name: Name of the current workflow, or None when no workflow is open
@@ -245,14 +245,14 @@ class GetCanvasSummaryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 
     workflow_name: str | None
     flow_name: str
-    nodes: list[CanvasSummaryNode]
-    connections: list[CanvasSummaryConnection]
+    nodes: list[FlowSummaryNode]
+    connections: list[FlowSummaryConnection]
 
 
 @dataclass
 @PayloadRegistry.register
-class GetCanvasSummaryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Canvas summary failed. Common causes: flow not found, no current context."""
+class GetFlowSummaryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Flow summary failed. Common causes: flow not found, no current context."""
 
 
 # We have two different ways to list flows:

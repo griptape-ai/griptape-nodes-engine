@@ -1,10 +1,12 @@
-"""GetCanvasSummaryRequest returns a flow's nodes, the values set on them, and their connections."""
+"""GetFlowSummaryRequest returns a flow's nodes, the values set on them, and their connections."""
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.local_objects import make_reference
@@ -16,13 +18,13 @@ from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
-    CanvasSummaryConnection,
-    CanvasSummaryNode,
     CreateFlowRequest,
     CreateFlowResultSuccess,
-    GetCanvasSummaryRequest,
-    GetCanvasSummaryResultFailure,
-    GetCanvasSummaryResultSuccess,
+    FlowSummaryConnection,
+    FlowSummaryNode,
+    GetFlowSummaryRequest,
+    GetFlowSummaryResultFailure,
+    GetFlowSummaryResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
@@ -35,7 +37,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.canvas_summary import (
+from griptape_nodes.retained_mode.managers.flow_summary import (
     MAX_VALUE_ITEMS,
     MAX_VALUE_TEXT_LENGTH,
     summarize_value,
@@ -46,7 +48,11 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
 
-_LIBRARY_NAME = "Canvas Summary Library"
+_LIBRARY_NAME = "Flow Summary Library"
+
+
+class _Size(Enum):
+    LARGE = "large"
 
 
 class _Thing:
@@ -163,7 +169,7 @@ def summary_flow(engine: Engine) -> Iterator[None]:
     library.register_new_node_type(
         _PlainGroup, NodeMetadata(category="test", description="d", display_name="Plain Group")
     )
-    engine.context_manager.push_workflow(workflow_name="canvas_summary_wf")
+    engine.context_manager.push_workflow(workflow_name="flow_summary_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     for name, x in (("source", 0), ("target", 400)):
@@ -205,25 +211,25 @@ def _add_item(engine: Engine, node_name: str) -> str:
     return items.add_child_parameter().name
 
 
-def _summary(engine: Engine, flow_name: str | None = None) -> GetCanvasSummaryResultSuccess:
-    result = engine.handle_request(GetCanvasSummaryRequest(flow_name=flow_name))
-    assert isinstance(result, GetCanvasSummaryResultSuccess), result
+def _summary(engine: Engine, flow_name: str | None = None) -> GetFlowSummaryResultSuccess:
+    result = engine.handle_request(GetFlowSummaryRequest(flow_name=flow_name))
+    assert isinstance(result, GetFlowSummaryResultSuccess), result
     return result
 
 
-def _node(summary: GetCanvasSummaryResultSuccess, name: str) -> CanvasSummaryNode:
+def _node(summary: GetFlowSummaryResultSuccess, name: str) -> FlowSummaryNode:
     return next(node for node in summary.nodes if node.name == name)
 
 
 @pytest.mark.usefixtures("summary_flow")
-class TestGetCanvasSummary:
+class TestGetFlowSummary:
     def test_untouched_nodes_have_no_values(self, engine: Engine) -> None:
         summary = _summary(engine)
 
-        assert summary.workflow_name == "canvas_summary_wf"
+        assert summary.workflow_name == "flow_summary_wf"
         assert summary.flow_name == "main"
         assert summary.nodes == [
-            CanvasSummaryNode(
+            FlowSummaryNode(
                 name="source",
                 type="_SummaryNode",
                 library=_LIBRARY_NAME,
@@ -232,7 +238,7 @@ class TestGetCanvasSummary:
                 multi_inputs=["items"],
                 position={"x": 0, "y": 10},
             ),
-            CanvasSummaryNode(
+            FlowSummaryNode(
                 name="target",
                 type="_SummaryNode",
                 library=_LIBRARY_NAME,
@@ -273,8 +279,8 @@ class TestGetCanvasSummary:
 
         assert "prompt" not in _node(summary, "target").values
         assert sorted(summary.connections, key=lambda c: c.source) == [
-            CanvasSummaryConnection(source="source.exec_out", target="target.exec_in"),
-            CanvasSummaryConnection(source="source.output", target="target.prompt"),
+            FlowSummaryConnection(source="source.exec_out", target="target.exec_in"),
+            FlowSummaryConnection(source="source.output", target="target.prompt"),
         ]
 
     def test_connection_into_a_list_item_names_the_item(self, engine: Engine) -> None:
@@ -283,7 +289,7 @@ class TestGetCanvasSummary:
 
         summary = _summary(engine)
 
-        assert summary.connections == [CanvasSummaryConnection(source="source.output", target=f"target.{item}")]
+        assert summary.connections == [FlowSummaryConnection(source="source.output", target=f"target.{item}")]
         assert "items" not in _node(summary, "target").values
 
     def test_list_shows_typed_items_beside_a_connected_one(self, engine: Engine) -> None:
@@ -317,8 +323,8 @@ class TestGetCanvasSummary:
             ("target", "loop"),
         ]
         assert sorted(summary.connections, key=lambda c: c.source) == [
-            CanvasSummaryConnection(source="loop.output", target="target.prompt"),
-            CanvasSummaryConnection(source="source.output", target="loop.output"),
+            FlowSummaryConnection(source="loop.output", target="target.prompt"),
+            FlowSummaryConnection(source="source.output", target="loop.output"),
         ]
 
     def test_members_of_a_group_that_keeps_them_in_the_flow_are_listed_under_it(self, engine: Engine) -> None:
@@ -353,9 +359,9 @@ class TestGetCanvasSummary:
         assert _summary(engine, flow_name="main").flow_name == "main"
 
     def test_unknown_flow_fails_naming_it(self, engine: Engine) -> None:
-        result = engine.handle_request(GetCanvasSummaryRequest(flow_name="nope"))
+        result = engine.handle_request(GetFlowSummaryRequest(flow_name="nope"))
 
-        assert isinstance(result, GetCanvasSummaryResultFailure)
+        assert isinstance(result, GetFlowSummaryResultFailure)
         assert "'nope'" in str(result.result_details)
 
 
@@ -375,14 +381,22 @@ class TestSummarizeValue:
     def test_object_becomes_its_type_name(self) -> None:
         assert summarize_value(_Thing()) == "<_Thing>"
 
-    def test_serialized_artifact_text_becomes_its_type(self) -> None:
-        assert summarize_value('{"type": "ImageArtifact", "value": "..."}') == "<ImageArtifact>"
-        assert summarize_value('[{"type": "TextArtifact"}]') == "<TextArtifact list>"
+    def test_artifact_becomes_its_type(self) -> None:
+        assert summarize_value(ImageUrlArtifact("https://example.com/cat.png")) == "<ImageUrlArtifact>"
 
-    def test_artifact_dict_becomes_its_type(self) -> None:
-        assert summarize_value({"type": "ImageArtifact", "value": "x" * 1000}) == "<ImageArtifact>"
+    def test_artifact_dict_from_a_client_becomes_its_type(self) -> None:
+        artifact = {"type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
 
-    def test_json_text_that_only_mentions_an_agent_is_kept(self) -> None:
-        text = '{"task": "research", "tools": [{"type": "ResearchAgent"}]}'
+        assert summarize_value(artifact) == "<ImageUrlArtifact>"
+
+    def test_dict_with_a_type_key_that_is_not_an_artifact_is_kept(self) -> None:
+        assert summarize_value({"type": "portrait", "width": 3}) == {"type": "portrait", "width": 3}
+
+    def test_value_with_a_simple_form_shows_that_form(self) -> None:
+        assert summarize_value((1, "b")) == [1, "b"]
+        assert summarize_value(_Size.LARGE) == "large"
+
+    def test_text_that_holds_json_is_kept_as_text(self) -> None:
+        text = '{"type": "ImageArtifact", "value": "..."}'
 
         assert summarize_value(text) == text
