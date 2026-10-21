@@ -172,6 +172,89 @@ class ListNodesInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """Flow nodes listing failed. Common causes: flow not found, no current context."""
 
 
+@dataclass
+class CanvasSummaryNode:
+    """One node in a canvas summary.
+
+    Args:
+        name: Node name, the value to pass as `node_name` in other requests
+        type: Node type name
+        library: Name of the library the node type comes from
+        group: Name of the node group (such as a loop) the node sits in, or None at the top level
+        values: Values the user set: settable, unconnected inputs and properties whose value
+            differs from the parameter's default. Runtime objects such as artifacts are shown as
+            "<TypeName>", and long text and long lists are shortened. A ParameterList lists only
+            the items not fed by a connection, as {item parameter name: value}.
+        multi_inputs: Names of the node's ParameterList inputs. Each item of one is its own
+            parameter, so a connection into an item names the item's parameter.
+        position: Editor position as {"x": ..., "y": ...}, or None if the node has none
+    """
+
+    name: str
+    type: str
+    library: str
+    group: str | None
+    values: dict[str, Any]
+    multi_inputs: list[str]
+    position: dict[str, float] | None
+
+
+@dataclass
+class CanvasSummaryConnection:
+    """One connection in a canvas summary, each end written as "<node name>.<parameter name>".
+
+    A connection that crosses into or out of a node group passes through a proxy parameter on the
+    group, named after the parameter it stands in for, so it appears as two connections: one to the
+    group and one from it.
+    """
+
+    source: str
+    target: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetCanvasSummaryRequest(RequestPayload):
+    """Summarize a flow's nodes, the values set on them, and their connections, in one call.
+
+    Use when: planning an edit to a workflow the user already has open, or checking what is on
+    the canvas before adding to it. One call replaces ListNodesInFlowRequest followed by
+    GetAllNodeInfoRequest per node, and leaves out outputs, run results, and UI state. Read-only.
+    For a parameter's full details, follow up with GetAllNodeInfoRequest.
+
+    Args:
+        flow_name: Name of the flow to summarize (None for the current context flow)
+
+    Results: GetCanvasSummaryResultSuccess (with the summary) | GetCanvasSummaryResultFailure (flow not found, no current context)
+    """
+
+    flow_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetCanvasSummaryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Canvas summary retrieved successfully.
+
+    Args:
+        workflow_name: Name of the current workflow, or None when no workflow is open
+        flow_name: Name of the summarized flow
+        nodes: The flow's nodes in the order they were added, each node group followed by its members
+        connections: Connections between those nodes, data and control
+    """
+
+    workflow_name: str | None
+    flow_name: str
+    nodes: list[CanvasSummaryNode]
+    connections: list[CanvasSummaryConnection]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetCanvasSummaryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Canvas summary failed. Common causes: flow not found, no current context."""
+
+
 # We have two different ways to list flows:
 # 1. ListFlowsInFlowRequest - List flows in a specific flow, or if parent_flow_name=None, list canvas/top-level flows
 # 2. ListFlowsInCurrentContext - List flows in whatever flow is at the top of the Current Context

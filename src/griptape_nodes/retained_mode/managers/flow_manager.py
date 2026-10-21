@@ -102,6 +102,9 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     DeleteFlowResultFailure,
     DeleteFlowResultSuccess,
+    GetCanvasSummaryRequest,
+    GetCanvasSummaryResultFailure,
+    GetCanvasSummaryResultSuccess,
     GetFlowDetailsRequest,
     GetFlowDetailsResultFailure,
     GetFlowDetailsResultSuccess,
@@ -138,6 +141,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateFlowDependenciesResultFailure,
     ValidateFlowDependenciesResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.canvas_summary import summarize_flow
 from griptape_nodes.retained_mode.managers.event_manager import current_request_id
 from griptape_nodes.retained_mode.managers.flow.packaging import FlowPackaging
 from griptape_nodes.retained_mode.managers.flow.serialization import FlowSerialization
@@ -794,6 +798,33 @@ class FlowManager(EngineScoped):
 
         result = ListNodesInFlowResultSuccess(node_names=ret_list, result_details=details)
         return result
+
+    @handles(GetCanvasSummaryRequest)
+    def on_get_canvas_summary_request(self, request: GetCanvasSummaryRequest) -> ResultPayload:
+        context_manager = self.engine.context_manager
+        if request.flow_name is None:
+            if not context_manager.has_current_flow():
+                details = "Attempted to summarize the Flow in the Current Context. Failed because the Current Context was empty."
+                return GetCanvasSummaryResultFailure(result_details=details)
+            flow = context_manager.get_current_flow()
+        else:
+            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(request.flow_name, ControlFlow)
+            if flow is None:
+                details = f"Attempted to summarize Flow '{request.flow_name}'. Failed because no Flow with that name could be found."
+                return GetCanvasSummaryResultFailure(result_details=details)
+
+        workflow_name = None
+        if context_manager.has_current_workflow():
+            workflow_name = context_manager.get_current_workflow_name()
+        summary = summarize_flow(flow, self.get_connections())
+        details = f"Successfully summarized Flow '{flow.name}': {len(summary.nodes)} Nodes and {len(summary.connections)} Connections."
+        return GetCanvasSummaryResultSuccess(
+            workflow_name=workflow_name,
+            flow_name=flow.name,
+            nodes=summary.nodes,
+            connections=summary.connections,
+            result_details=details,
+        )
 
     @handles(ListFlowsInFlowRequest)
     def on_list_flows_in_flow_request(self, request: ListFlowsInFlowRequest) -> ResultPayload:
