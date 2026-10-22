@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,9 +26,9 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.agent_manager import (
-    _LIBRARIES_LOADING_INSTRUCTION,
     _MAX_NODE_DESCRIPTION_LENGTH,
     _NO_FLOW_INSTRUCTION,
+    _NODE_TYPES_NOT_LISTED_INSTRUCTION,
     _TOOL_APPROVAL_INSTRUCTIONS,
     AgentManager,
     _build_agent_instructions,
@@ -78,8 +79,14 @@ class TestAgentInstructions:
         instructions = _build_agent_instructions(include_image_tool=False)
 
         assert "start with discovery" not in instructions
-        assert "node types and the current flow are given below" in instructions
+        assert "Work from the node types and the current flow given below" in instructions
         assert "GriptapeNodes_EventRequestBatch" in instructions
+
+    def test_base_instructions_say_what_to_do_rather_than_what_not_to(self) -> None:
+        instructions = _build_agent_instructions(include_image_tool=False)
+
+        assert "Do not" not in instructions
+        assert "NEVER" not in instructions
 
     def test_run_instructions_put_the_node_types_first_and_the_flow_last(self) -> None:
         composed = _compose_run_instructions(_WorkflowContext(node_types="NODE TYPES", flow="FLOW"), "RULES")
@@ -185,20 +192,43 @@ class TestWorkflowContext:
     async def test_no_flow_open_gives_the_node_types_and_says_there_is_no_flow(
         self, chat_manager: AgentManager
     ) -> None:
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(asyncio.Event())
 
         assert f"Library '{_LIBRARY_NAME}':\n  text:\n    - _ContextNode: Holds a prompt" in context.node_types
         assert context.flow == _NO_FLOW_INSTRUCTION
 
     @pytest.mark.asyncio
-    async def test_node_types_are_left_out_while_libraries_load(
+    async def test_waits_for_libraries_that_are_still_loading(self, engine: Engine, chat_manager: AgentManager) -> None:
+        loading_complete = engine.library_manager._libraries_loading_complete
+        loading_complete.clear()
+        asyncio.get_running_loop().call_later(0.05, loading_complete.set)
+
+        context = await chat_manager._workflow_context(asyncio.Event())
+
+        assert f"Library '{_LIBRARY_NAME}':" in context.node_types
+
+    @pytest.mark.asyncio
+    async def test_says_how_to_get_the_node_types_when_libraries_take_too_long(
+        self, engine: Engine, chat_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine.library_manager._libraries_loading_complete.clear()
+        monkeypatch.setattr(f"{AgentManager.__module__}._LIBRARY_LOADING_WAIT_SECONDS", 0.01)
+
+        context = await chat_manager._workflow_context(asyncio.Event())
+
+        assert context.node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
+
+    @pytest.mark.asyncio
+    async def test_stops_waiting_for_libraries_when_the_run_is_cancelled(
         self, engine: Engine, chat_manager: AgentManager
     ) -> None:
         engine.library_manager._libraries_loading_complete.clear()
+        cancel_event = asyncio.Event()
+        cancel_event.set()
 
-        context = await chat_manager._workflow_context()
+        context = await asyncio.wait_for(chat_manager._workflow_context(cancel_event), timeout=1)
 
-        assert context.node_types == _LIBRARIES_LOADING_INSTRUCTION
+        assert context.node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
 
     @pytest.mark.asyncio
     async def test_open_flow_gives_its_summary(self, engine: Engine, chat_manager: AgentManager) -> None:
@@ -210,7 +240,7 @@ class TestWorkflowContext:
         created = engine.handle_request(CreateNodeRequest(node_type="_ContextNode", node_name="writer"))
         assert isinstance(created, CreateNodeResultSuccess), created
 
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(asyncio.Event())
 
         assert context.flow.startswith("Current flow: 'main',")
         assert f"  - writer (_ContextNode from '{_LIBRARY_NAME}')" in context.flow
@@ -231,6 +261,6 @@ class TestWorkflowContext:
 
         monkeypatch.setattr(f"{AgentManager.__module__}._render_flow", unrenderable)
 
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(asyncio.Event())
 
         assert context.flow == ""

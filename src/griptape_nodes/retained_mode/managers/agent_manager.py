@@ -216,26 +216,30 @@ _AGENT_INSTRUCTIONS_BASE = (
     "connections, save and run workflows.\n"
     "{image_tool_line}"
     "  - Additional MCP tools may be available, each prefixed with its server name.\n\n"
-    "Behavior rules (these are non-negotiable):\n"
-    "  1. NEVER respond with only a plan or a description of what you intend to do. If a "
-    "     task requires tool work, call the relevant tools in the SAME turn as your "
-    "     acknowledgment. A response of the form 'I'll do X' with no tool calls is wrong.\n"
-    "  2. The available node types and the current flow are given below, and they are complete. Do not "
-    "     call discovery tools (e.g. GriptapeNodes_ListRegisteredLibrariesRequest, "
-    "     GriptapeNodes_ListNodeTypesInLibraryRequest, GriptapeNodes_ListNodesInFlowRequest) to "
-    "     learn them again. Look up only what they leave out, such as the parameters of the node "
-    "     types you will use: put one GriptapeNodes_DescribeNodeTypeRequest per type in a single "
-    "     GriptapeNodes_EventRequestBatch call.\n"
-    "  3. Plan the whole change before making it, then apply it in as few calls as possible: one "
-    "     GriptapeNodes_EventRequestBatch call can create the nodes, set their values, and connect "
-    "     them, in that order. Node names are unique across all flows, so the engine renames a node "
-    "     whose requested name is taken; check each created node's returned name and use it from "
-    "     then on. Keep requests that run or resolve nodes out of build batches. Then check the "
-    "     results and fix only what failed, deleting any placeholder node a failed create left.\n"
-    "  4. Make independent tool calls in parallel when they cannot go in one batch.\n"
-    "  5. Only after you have actually completed the user's task should you produce a final "
-    "     text response. That final response should be a short summary of what you did, "
-    "     including the names of any nodes you created or changed.\n"
+    "Behavior rules:\n"
+    "  1. When a task needs tool work, call the tools in the same turn you acknowledge it, and keep "
+    "calling them until the task is done. Describe a plan only alongside the calls that carry it out.\n"
+    "  2. Work from the node types and the current flow given below; they are complete. Look up only the "
+    "parameters of the node types you will use: put one GriptapeNodes_DescribeNodeTypeRequest per type "
+    "in a single GriptapeNodes_EventRequestBatch call, covering every type in your plan, including list "
+    "and helper nodes.\n"
+    "  3. Plan the whole change, then apply it as one GriptapeNodes_EventRequestBatch call that creates the "
+    "nodes, sets their values, and connects them, in that order. The engine keeps each requested node "
+    "name unless another node already has it, and the results give every created node's name. Then send "
+    "one more batch with only the calls that failed, using the returned names, and delete any "
+    "placeholder node a failed create left.\n"
+    "  4. An input that takes a list (its type is list or list[...], such as MergeImages.Images or "
+    "Agent.rulesets) takes either a whole list or one item per slot. To connect single items, add a slot "
+    "for each with GriptapeNodes_AddParameterToNodeRequest, setting parent_container_name to the input, "
+    "then connect each item to a slot name those calls return.\n"
+    "  5. A model sees an image only through an input whose input types include an image type. To have a "
+    "model look at, describe, or critique an image, use a node with such an input, such as DescribeImage, "
+    "which answers a prompt about the images it is given, even when the user calls it an agent. Text "
+    "inputs, such as an Agent's prompt or additional_context, receive an image only as text.\n"
+    "  6. Build and edit workflows; run, resolve, or save them when the user asks for that.\n"
+    "  7. Make independent tool calls in parallel when they cannot go in one batch.\n"
+    "  8. When the task is done, reply with a short summary of what you did, including the names of any "
+    "nodes you created or changed.\n"
 )
 
 _IMAGE_TOOL_INSTRUCTION = (
@@ -247,11 +251,15 @@ _IMAGE_TOOL_INSTRUCTION = (
 
 _NO_FLOW_INSTRUCTION = "No flow is open yet. Call GriptapeNodes_EnsureWorkflowAndFlowRequest before creating nodes."
 
-_LIBRARIES_LOADING_INSTRUCTION = (
-    "Libraries are still loading, so the available node types are not included. Once you need them, "
-    "call GriptapeNodes_ListNodeTypesInLibraryRequest with include_metadata set, one per library from "
-    "GriptapeNodes_ListRegisteredLibrariesRequest, in a single GriptapeNodes_EventRequestBatch call."
+_NODE_TYPES_NOT_LISTED_INSTRUCTION = (
+    "The node types are not listed here. To get them, call GriptapeNodes_ListRegisteredLibrariesRequest, then "
+    "put one GriptapeNodes_ListNodeTypesInLibraryRequest per library, with include_metadata set, in a single "
+    "GriptapeNodes_EventRequestBatch call."
 )
+
+# How long a run waits for libraries that are still loading before it starts without the node types.
+# Loading normally finishes within seconds of startup; installing a library's dependencies can take minutes.
+_LIBRARY_LOADING_WAIT_SECONDS = 20.0
 
 # Long enough for a node's one-line purpose, short enough that the node type list stays a few tokens per node.
 _MAX_NODE_DESCRIPTION_LENGTH = 160
@@ -341,7 +349,8 @@ def _render_flow(summary: GetFlowSummaryResultSuccess) -> str:
     lines = [
         (
             f"Current flow: '{summary.flow_name}', read when this run started (a new message or "
-            "an answered approval). Changes you make after that are not shown. Values not listed are the defaults."
+            "an answered approval). Changes you make after that are not shown. Values not listed are the defaults. "
+            "New nodes go into this flow."
         )
     ]
     if not summary.nodes:
@@ -880,7 +889,7 @@ class AgentManager(EngineScoped):
             model_name=model_name,
         )
         attribution_headers = await self._attribution_headers(provider_name)
-        workflow_context = await self._workflow_context()
+        workflow_context = await self._workflow_context(active.cancel_event)
 
         event_manager = self.engine.event_manager
 
@@ -912,7 +921,7 @@ class AgentManager(EngineScoped):
                 deferred_tool_results=deferred_tool_results,
             )
 
-    async def _workflow_context(self) -> _WorkflowContext:
+    async def _workflow_context(self, cancel_event: asyncio.Event) -> _WorkflowContext:
         """The available node types and the current flow, rendered for one run's instructions.
 
         Read fresh every run rather than cached, so a library loaded or a node added
@@ -920,34 +929,57 @@ class AgentManager(EngineScoped):
         are not broadcast, and a failure costs the run some context rather than
         showing the user an error.
         """
-        return _WorkflowContext(node_types=await self._node_types_context(), flow=await self._flow_context())
+        node_types, flow = await asyncio.gather(self._node_types_context(cancel_event), self._flow_context())
+        return _WorkflowContext(node_types=node_types, flow=flow)
 
-    async def _node_types_context(self) -> str:
-        # Listing libraries waits for them to finish loading, which would hold up the
-        # turn with no way to cancel it.
-        if not self.engine.library_manager._libraries_loading_complete.is_set():
-            return _LIBRARIES_LOADING_INSTRUCTION
+    async def _node_types_context(self, cancel_event: asyncio.Event) -> str:
+        if not await self._wait_for_libraries(cancel_event):
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
         registered = await self.engine.ahandle_request(
             ListRegisteredLibrariesRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
         )
         if not isinstance(registered, ListRegisteredLibrariesResultSuccess):
             logger.info("Left the node types out of the chat's instructions: %s", registered.result_details)
-            return ""
-        libraries: dict[str, dict[str, NodeMetadata]] = {}
-        for library_name in registered.libraries:
-            listed = await self.engine.ahandle_request(
-                ListNodeTypesInLibraryRequest(
-                    library=library_name,
-                    include_metadata=True,
-                    broadcast_result=False,
-                    failure_log_level=logging.DEBUG,
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        listed = await asyncio.gather(
+            *(
+                self.engine.ahandle_request(
+                    ListNodeTypesInLibraryRequest(
+                        library=library_name,
+                        include_metadata=True,
+                        broadcast_result=False,
+                        failure_log_level=logging.DEBUG,
+                    )
                 )
+                for library_name in registered.libraries
             )
-            if not isinstance(listed, ListNodeTypesInLibraryResultSuccess) or listed.node_metadata is None:
-                logger.info("Left library '%s' out of the chat's node types: %s", library_name, listed.result_details)
+        )
+        libraries: dict[str, dict[str, NodeMetadata]] = {}
+        for library_name, result in zip(registered.libraries, listed, strict=True):
+            if not isinstance(result, ListNodeTypesInLibraryResultSuccess) or result.node_metadata is None:
+                logger.info("Left library '%s' out of the chat's node types: %s", library_name, result.result_details)
                 continue
-            libraries[library_name] = listed.node_metadata
+            libraries[library_name] = result.node_metadata
         return _render_node_types(libraries)
+
+    async def _wait_for_libraries(self, cancel_event: asyncio.Event) -> bool:
+        """Wait for libraries that are still loading, so the run's instructions list every node type.
+
+        Gives up after ``_LIBRARY_LOADING_WAIT_SECONDS`` or as soon as the user cancels the
+        run, so a slow load cannot hold up the turn. Returns whether loading has finished.
+        """
+        loading_complete = self.engine.library_manager._libraries_loading_complete
+        if loading_complete.is_set():
+            return True
+        waits = [asyncio.ensure_future(loading_complete.wait()), asyncio.ensure_future(cancel_event.wait())]
+        try:
+            await asyncio.wait(waits, timeout=_LIBRARY_LOADING_WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                wait.cancel()
+        if not loading_complete.is_set():
+            logger.info("Left the node types out of the chat's instructions because libraries are still loading.")
+        return loading_complete.is_set()
 
     async def _flow_context(self) -> str:
         if not self.engine.context_manager.has_current_flow():

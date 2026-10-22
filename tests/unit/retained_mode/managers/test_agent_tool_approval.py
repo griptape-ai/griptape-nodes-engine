@@ -114,6 +114,8 @@ def _manager_on(
     manager._active_provider_name = "griptape_cloud"
     monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: runner)
     monkeypatch.setattr(_AGENT_MANAGER_MODULE + "._compose_prompt", _plain_prompt)
+    # Don't wait for the fake's libraries, which never finish loading.
+    monkeypatch.setattr(_AGENT_MANAGER_MODULE + "._LIBRARY_LOADING_WAIT_SECONDS", 0)
     manager._engine = SimpleNamespace(  # type: ignore[assignment]
         event_manager=SimpleNamespace(put_event=lambda _e: None),
         handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
