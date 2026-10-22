@@ -99,6 +99,20 @@ class TestWholeListInput:
 
             assert node.get_parameter_value("nums") == [9, 8, 1, 2, 3, 4, 5, 6]
 
+    @pytest.mark.usefixtures("connected")
+    def test_dispatching_the_list_as_read_does_not_store_the_rows_again(self, node: MockNode) -> None:
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+        node.set_parameter_value("refs", ["a", "b"])
+        dispatched = node._list_rows.values_for_dispatch()["refs"]
+
+        assert node._list_rows.set_as_rows_if_unconnected(refs, dispatched)
+
+        assert node.parameter_values["refs"] == ["a", "b"]
+        assert node.get_parameter_value("refs") == ["a", "b", "manual"]
+
     def test_removed_row_value_does_not_resurrect(self, node: MockNode) -> None:
         """An unconnected list keeps no value of its own, so nothing is left behind to read."""
         refs = node.get_parameter_by_name("refs")

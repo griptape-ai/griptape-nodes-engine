@@ -110,8 +110,9 @@ class ListRows:
             # Already what the rows hold.
             return False
         if self._node._param_has_incoming_connection(parameter.name):
-            # A connected list is read whole, and keeps the value as it arrived.
-            return False
+            # A connected list keeps the value as it arrived. A dispatch sends the list as the node reads
+            # it, the rows' items included, so storing that would add the rows a second time.
+            return value == self._node._get_raw_parameter_value(parameter.name)
         self._replace(parameter, value)
         return True
 
