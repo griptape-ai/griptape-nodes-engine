@@ -1,4 +1,4 @@
-"""A ParameterList fed by a connection to the list itself yields the whole incoming list.
+"""A ParameterList fed by a connection to the list itself yields the incoming list, then its own rows.
 
 Without a connection the list keeps no value of its own: it is built from its child rows, and a whole
 list set on it becomes rows.
@@ -73,15 +73,31 @@ class TestWholeListInput:
         assert node.get_parameter_value("refs") == ["one", "two"]
 
     @pytest.mark.usefixtures("connected")
-    def test_connection_wins_over_child_rows(self, node: MockNode) -> None:
-        """Ordering between a whole list and manual rows is unrepresentable, so the list wins."""
+    def test_connection_is_followed_by_child_rows(self, node: MockNode) -> None:
         refs = node.get_parameter_by_name("refs")
         assert isinstance(refs, ParameterList)
         child = refs.add_child_parameter()
         node.set_parameter_value(child.name, "manual")
         node.set_parameter_value("refs", ["a", "b"])
 
-        assert node.get_parameter_value("refs") == ["a", "b"]
+        assert node.get_parameter_value("refs") == ["a", "b", "manual"]
+
+    def test_connection_then_mixed_rows_keep_their_order(self) -> None:
+        node = MockNode()
+        node.add_parameter(
+            ParameterList(name="nums", tooltip="t", input_types=["int"], allowed_modes={ParameterMode.INPUT})
+        )
+        nums = node.get_parameter_by_name("nums")
+        assert isinstance(nums, ParameterList)
+        rows = [nums.add_child_parameter() for _ in range(4)]
+        node.set_parameter_value(rows[0].name, 1)
+        node.set_parameter_value(rows[1].name, [2, 3])
+        node.set_parameter_value(rows[2].name, 4)
+        node.set_parameter_value(rows[3].name, [5, 6])
+        with patch.object(MockNode, "_param_has_incoming_connection", return_value=True):
+            node.set_parameter_value("nums", [9, 8])
+
+            assert node.get_parameter_value("nums") == [9, 8, 1, 2, 3, 4, 5, 6]
 
     def test_removed_row_value_does_not_resurrect(self, node: MockNode) -> None:
         """An unconnected list keeps no value of its own, so nothing is left behind to read."""
@@ -105,19 +121,6 @@ class TestWholeListInput:
 
 
 class TestWholeListWarnings:
-    @pytest.mark.usefixtures("connected")
-    def test_warns_when_manual_rows_are_ignored(self, node: MockNode) -> None:
-        refs = node.get_parameter_by_name("refs")
-        assert isinstance(refs, ParameterList)
-        child = refs.add_child_parameter()
-        node.set_parameter_value(child.name, "manual")
-        node.set_parameter_value("refs", ["a"])
-
-        with patch("griptape_nodes.exe_types.node_types.logger") as mock_logger:
-            node.get_parameter_value("refs")
-
-        assert mock_logger.warning.called
-
     @pytest.mark.usefixtures("connected")
     def test_warns_when_incoming_list_exceeds_max_items(self) -> None:
         node = MockNode()
