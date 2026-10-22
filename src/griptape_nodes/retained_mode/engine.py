@@ -130,8 +130,7 @@ class EngineWorkflowInfo(TypedDict):
     """The workflow the engine has open, if any."""
 
     current_workflow: str | None
-    # An absolute local path that names the user's directories; a consumer publishing beyond
-    # this machine should leave it out.
+    # Absolute local path; names the user's directories.
     workflow_file_path: str | None
     has_active_flow: bool
 
