@@ -1,4 +1,4 @@
-"""Build the compact, model-facing view of a flow that GetFlowSummaryRequest returns."""
+"""Answer GetFlowSummaryRequest with a compact, model-facing view of a flow."""
 
 from __future__ import annotations
 
@@ -13,17 +13,28 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
+from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup
-from griptape_nodes.retained_mode.events.flow_events import FlowSummaryConnection, FlowSummaryNode
+from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.flow_events import (
+    FlowSummaryConnection,
+    FlowSummaryNode,
+    GetFlowSummaryRequest,
+    GetFlowSummaryResultFailure,
+    GetFlowSummaryResultSuccess,
+)
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.serialization.values import TYPE_KEY, VALUE_KEY, Unencodable, try_encode, untag, value_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from griptape_nodes.exe_types.connections import Connections
-    from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.serialization.values import JsonValue
 
 # Long enough for a typical prompt or path, short enough that a pasted document doesn't fill the summary.
@@ -42,6 +53,41 @@ class SummarizedFlow:
 
     nodes: list[FlowSummaryNode]
     connections: list[FlowSummaryConnection]
+
+
+class FlowSummarizer(EngineScoped):
+    """Summarize a flow's nodes, non-default values and connections in one result."""
+
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
+        event_manager.register_request_handlers(self)
+
+    @handles(GetFlowSummaryRequest)
+    def on_get_flow_summary_request(self, request: GetFlowSummaryRequest) -> ResultPayload:
+        context_manager = self.engine.context_manager
+        if request.flow_name is None:
+            if not context_manager.has_current_flow():
+                details = "Attempted to summarize the Flow in the Current Context. Failed because the Current Context was empty."
+                return GetFlowSummaryResultFailure(result_details=details)
+            flow = context_manager.get_current_flow()
+        else:
+            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(request.flow_name, ControlFlow)
+            if flow is None:
+                details = f"Attempted to summarize Flow '{request.flow_name}'. Failed because no Flow with that name could be found."
+                return GetFlowSummaryResultFailure(result_details=details)
+
+        workflow_name = None
+        if context_manager.has_current_workflow():
+            workflow_name = context_manager.get_current_workflow_name()
+        summary = summarize_flow(flow, self.engine.flow_manager.get_connections())
+        details = f"Successfully summarized Flow '{flow.name}': {len(summary.nodes)} Nodes and {len(summary.connections)} Connections."
+        return GetFlowSummaryResultSuccess(
+            workflow_name=workflow_name,
+            flow_name=flow.name,
+            nodes=summary.nodes,
+            connections=summary.connections,
+            result_details=details,
+        )
 
 
 def summarize_flow(flow: ControlFlow, connections: Connections) -> SummarizedFlow:

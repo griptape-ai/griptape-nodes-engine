@@ -37,7 +37,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.flow_summary import (
+from griptape_nodes.retained_mode.managers.flow.summary import (
     MAX_VALUE_ITEMS,
     MAX_VALUE_TEXT_LENGTH,
     summarize_value,
