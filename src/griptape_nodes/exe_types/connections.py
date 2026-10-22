@@ -308,14 +308,24 @@ class Connections:
 
         return internal_connections
 
-    def unresolve_future_nodes(self, node: BaseNode) -> None:
+    def unresolve_future_nodes(self, node: BaseNode, visited: set[str] | None = None) -> None:
         """Mark every RESOLVED node downstream of ``node`` through data connections as UNRESOLVED.
 
         The walk goes on through nodes that are already unresolved: resolution state is set per
         node (on workflow load, by locks, on cancel), so an unresolved node can sit upstream of a
         resolved one. Iterative, so a long chain cannot exhaust the recursion limit.
+
+        ``visited`` guards against cycles. A caller that passes its own set makes the walk
+        incremental: a root already in the set is not walked, and the walk does not descend past a
+        node already in the set (it still marks that node when it crosses the edge into it). A
+        scheduler that unresolves downstream of every node it executes can hand it one set per run
+        and have each node's subtree walked once instead of once per upstream execution.
         """
-        visited = {node.name}
+        if visited is None:
+            visited = set()
+        if node.name in visited:
+            return
+        visited.add(node.name)
         pending = [node]
         while pending:
             current = pending.pop()

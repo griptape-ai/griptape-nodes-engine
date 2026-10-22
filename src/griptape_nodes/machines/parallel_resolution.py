@@ -82,6 +82,9 @@ class ParallelResolutionContext(EngineScoped):
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
     generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
     new_work_event: asyncio.Event  # Set when the priority queue changes, so a parked driver wakes
+    # Nodes this run has already marked stale downstream of an executing node and that have not
+    # executed since. Shared across every unresolve walk in the run so each node is visited once.
+    unresolved_this_run: set[str]
 
     def __init__(  # noqa: PLR0913
         self,
@@ -110,6 +113,7 @@ class ParallelResolutionContext(EngineScoped):
         self.task_to_node = {}
         self.generation = 0
         self.new_work_event = asyncio.Event()
+        self.unresolved_this_run = set()
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -177,6 +181,7 @@ class ParallelResolutionContext(EngineScoped):
 
         # Reset task counter
         self.running_tasks_count = 0
+        self.unresolved_this_run.clear()
 
         # Clear the priority queue when resetting
         # Create a new instance to ensure clean state
@@ -215,6 +220,9 @@ class ExecuteDagState(State):
 
         # Remove the node from the priority queue now that it's done
         context.node_priority_queue.remove_node(current_node.name)
+        # It has new outputs now, so if something upstream runs again later in this run, the
+        # stale-marking walk must be allowed to reach it a second time.
+        context.unresolved_this_run.discard(current_node.name)
 
         # Check if node was already resolved (shouldn't happen)
         if current_node.state == NodeResolutionState.RESOLVED and not current_node.lock:
@@ -809,8 +817,12 @@ class ExecuteDagState(State):
             # This node is about to produce new outputs, so anything resolved against its previous
             # outputs is stale. Without this, a re-run (pressing Run again, or the next pass of a
             # loop) leaves downstream data nodes RESOLVED, and the upstream walk that gathers a
-            # later node's inputs skips them and hands on the previous run's values.
-            context.engine.flow_manager.get_connections().unresolve_future_nodes(node_reference.node_reference)
+            # later node's inputs skips them and hands on the previous run's values. The run's shared
+            # visited set keeps this walk incremental: a node already marked stale (and not run
+            # since) is not walked again, so a chain of N nodes costs O(N) per run, not O(N^2).
+            context.engine.flow_manager.get_connections().unresolve_future_nodes(
+                node_reference.node_reference, visited=context.unresolved_this_run
+            )
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
             node_reference.node_reference.clear_cancellation()
