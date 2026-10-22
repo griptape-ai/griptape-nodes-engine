@@ -176,6 +176,23 @@ class ParameterList(ParameterContainer):
         return self._max_items
 
     @property
+    def row_input_types(self) -> list[str]:
+        """What a row, or a drop on the list's header, accepts: each item type, a list of it, and a bare `list`."""
+        return self._with_list_variants(super()._custom_getter_for_property_input_types())
+
+    @property
+    def rows_add_list_items(self) -> bool:
+        """Whether a list handed to a row adds its items.
+
+        False when the list's items may themselves be lists (`any`, `all` or `list`), where it is one item.
+        """
+        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
+        item_types = super()._custom_getter_for_property_input_types()
+        return all(
+            ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
+        )
+
+    @property
     def collapsed(self) -> bool | None:
         return self._collapsed
 
@@ -273,6 +290,7 @@ class ParameterList(ParameterContainer):
         """Override to_dict to use the merged ui_options."""
         data = super().to_dict()
         data["ui_options"] = self.ui_options
+        data["row_input_types"] = self.row_input_types
         return data
 
     def _custom_getter_for_property_type(self) -> str:
@@ -294,17 +312,8 @@ class ParameterList(ParameterContainer):
         self._widen_all_row_input_types()
 
     def row_value_is_items(self, value: Any) -> bool:
-        """Return whether a row's `value` contributes its items rather than one item.
-
-        False for every value when the list's items may themselves be lists (`any`, `all` or `list`).
-        """
-        if not isinstance(value, list):
-            return False
-        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
-        item_types = super()._custom_getter_for_property_input_types()
-        return all(
-            ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
-        )
+        """Return whether a row's `value` contributes its items rather than one item."""
+        return isinstance(value, list) and self.rows_add_list_items
 
     def _widen_all_row_input_types(self) -> None:
         rows = [child for child in self._children if isinstance(child, Parameter)]
@@ -316,7 +325,7 @@ class ParameterList(ParameterContainer):
 
     def _widen_row_input_types(self, row: Parameter) -> None:
         # `self.input_types` is the container's list-shaped set, not its item types.
-        row.input_types = self._with_list_variants(super()._custom_getter_for_property_input_types())
+        row.input_types = self.row_input_types
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
