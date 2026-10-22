@@ -18,7 +18,7 @@ import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict
 
 import semver
 
@@ -115,6 +115,46 @@ _root_engine: Engine | None = None
 # the building thread reaches the guard in `current_engine` instead of deadlocking.
 _root_engine_lock = threading.RLock()
 _root_engine_building = False
+
+
+class EngineInstanceInfo(TypedDict):
+    """Where the engine is deployed, read from the GTN_INSTANCE_* environment variables."""
+
+    instance_type: str | None
+    instance_region: str | None
+    instance_provider: str | None
+    deployment_type: str
+
+
+class EngineWorkflowInfo(TypedDict):
+    """The workflow the engine has open, if any."""
+
+    current_workflow: str | None
+    # An absolute local path that names the user's directories; a consumer publishing beyond
+    # this machine should leave it out.
+    workflow_file_path: str | None
+    has_active_flow: bool
+
+
+class EngineDescription(EngineInstanceInfo, EngineWorkflowInfo):
+    """What this engine reports about itself to anything that discovers it.
+
+    The heartbeat and the app's discovery registry record both publish these fields, so a
+    client reading either sees the same engine. Fields that only one of them carries (the
+    heartbeat's user and timestamp, the record's transports) are added by that consumer.
+    A consumer may publish any of these beyond this machine, so a field that names local
+    paths or the user's files says so, as `workflow_file_path` does.
+    """
+
+    engine_id: str | None
+    engine_name: str
+    engine_version: str
+    engine_os: str
+    session_id: str | None
+    # Set on worker processes (injected at spawn by WorkerManager), unset on the orchestrator.
+    # Lets a discovery client tell workers apart and nest them.
+    orchestrator_engine_id: str | None
+    is_initializing: bool
 
 
 class EngineScoped:
@@ -557,6 +597,20 @@ class Engine:
     def get_engine_id(self) -> str | None:
         return self._engine_identity_manager.active_engine_id
 
+    def describe_self(self) -> EngineDescription:
+        """Describe this engine for discovery: identity, session, startup state, and workflow."""
+        return EngineDescription(
+            engine_id=self._engine_identity_manager.active_engine_id,
+            engine_name=self._engine_identity_manager.engine_name,
+            engine_version=engine_version,
+            engine_os=self._os_manager.platform_name(),
+            session_id=self._session_manager.active_session_id,
+            orchestrator_engine_id=os.getenv("GTN_ORCHESTRATOR_ENGINE_ID"),
+            is_initializing=self._lifecycle.is_initializing(),
+            **self._get_instance_info(),
+            **self._get_current_workflow_info(),
+        )
+
     def clear_current_workflow_data(self) -> None:  # noqa: C901
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
@@ -635,67 +689,50 @@ class Engine:
         Returns engine status information including version, session state, and system metrics.
         """
         try:
-            # Get instance information based on environment variables
-            instance_info = self._get_instance_info()
-
-            # Get current workflow information
-            workflow_info = self._get_current_workflow_info()
-
-            # Get engine name
-            engine_name = self._engine_identity_manager.engine_name
-
-            # Get user and organization
-            user = self._user_manager.user
-            user_organization = self._user_manager.user_organization
-
             return EngineHeartbeatResultSuccess(
                 heartbeat_id=request.heartbeat_id,
-                engine_version=engine_version,
-                engine_name=engine_name,
-                engine_os=self._os_manager.platform_name(),
-                engine_id=self._engine_identity_manager.active_engine_id,
-                session_id=self._session_manager.active_session_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
-                user=user,
-                user_organization=user_organization,
-                is_initializing=self._lifecycle.is_initializing(),
-                # Set on worker processes (injected at spawn by WorkerManager), unset on the
-                # orchestrator. Lets a discovery client tell workers apart and nest them.
-                orchestrator_engine_id=os.getenv("GTN_ORCHESTRATOR_ENGINE_ID"),
+                user=self._user_manager.user,
+                user_organization=self._user_manager.user_organization,
                 result_details="Engine heartbeat successful",
-                **instance_info,
-                **workflow_info,
+                **self.describe_self(),
             )
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
 
-    def _get_instance_info(self) -> dict[str, str | None]:
+    def _get_instance_info(self) -> EngineInstanceInfo:
         """Get instance information from environment variables.
 
-        Returns instance type, region, provider, and public IP information if available.
+        Returns instance type, region, and provider if available.
         """
-        instance_info: dict[str, str | None] = {
-            "instance_type": os.getenv("GTN_INSTANCE_TYPE"),
-            "instance_region": os.getenv("GTN_INSTANCE_REGION"),
-            "instance_provider": os.getenv("GTN_INSTANCE_PROVIDER"),
-        }
+        instance_type = os.getenv("GTN_INSTANCE_TYPE")
+        instance_region = os.getenv("GTN_INSTANCE_REGION")
+        instance_provider = os.getenv("GTN_INSTANCE_PROVIDER")
 
         # Determine deployment type based on presence of instance environment variables
-        instance_info["deployment_type"] = "griptape_hosted" if any(instance_info.values()) else "local"
+        if instance_type or instance_region or instance_provider:
+            deployment_type = "griptape_hosted"
+        else:
+            deployment_type = "local"
 
-        return instance_info
+        return EngineInstanceInfo(
+            instance_type=instance_type,
+            instance_region=instance_region,
+            instance_provider=instance_provider,
+            deployment_type=deployment_type,
+        )
 
-    def _get_current_workflow_info(self) -> dict[str, Any]:
+    def _get_current_workflow_info(self) -> EngineWorkflowInfo:
         """Get information about the currently loaded workflow.
 
         Returns workflow name, file path, and status information if available.
         """
-        workflow_info = {
-            "current_workflow": None,
-            "workflow_file_path": None,
-            "has_active_flow": False,
-        }
+        workflow_info = EngineWorkflowInfo(
+            current_workflow=None,
+            workflow_file_path=None,
+            has_active_flow=False,
+        )
 
         try:
             context_manager = self._context_manager

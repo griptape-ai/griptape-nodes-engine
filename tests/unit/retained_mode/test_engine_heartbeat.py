@@ -63,3 +63,31 @@ class TestEngineHeartbeatOperatingSystem:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.engine_os == "sentinel-os"
+
+
+class TestEngineHeartbeatDescribesSelf:
+    """The heartbeat publishes describe_self() unchanged, so it cannot drift from other consumers."""
+
+    def test_heartbeat_carries_every_described_field(self, engine: Engine) -> None:
+        with patch.dict(os.environ, {"GTN_ORCHESTRATOR_ENGINE_ID": "eng-orchestrator"}):
+            description = engine.describe_self()
+            result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-describe"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert {key: getattr(result, key) for key in description} == description
+
+
+class TestEngineDescribeSelf:
+    """describe_self() is what discovery publishes, so a broken detail must not hide the engine."""
+
+    def test_survives_an_unreadable_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom() -> bool:
+            msg = "context unavailable"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(engine.context_manager, "has_current_workflow", _boom)
+
+        description = engine.describe_self()
+
+        assert description["current_workflow"] is None
+        assert description["has_active_flow"] is False
