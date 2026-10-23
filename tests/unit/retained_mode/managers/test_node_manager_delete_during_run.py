@@ -339,4 +339,4 @@ async def test_a_delete_that_cannot_cancel_the_run_fails_rather_than_proceeding(
 
     # The queue must not be cleared on the way out: the run is still going, and clearing the work it
     # has yet to reach would break it in a second way.
-    parent_flow.clear_execution_queue.assert_not_called()
+    engine.flow_manager.clear_execution_queue_in.assert_not_called()
