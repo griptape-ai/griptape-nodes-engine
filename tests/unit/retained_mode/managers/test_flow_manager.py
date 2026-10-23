@@ -369,11 +369,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
             patch.object(ctx, "has_current_node", return_value=True),
             patch.object(ctx, "get_current_node", return_value=fake_node),
             patch.object(workflow.objects, "get_as_type", return_value=fake_node),
-            patch.object(
-                engine.node_manager,
-                "get_node_parent_flow_by_name",
-                return_value="derived_parent_flow",
-            ) as get_parent_flow,
+            patch.object(workflow.nodes, "parent_flow_name", return_value="derived_parent_flow") as get_parent_flow,
             patch.object(flow_manager, "get_flow_by_name_in", side_effect=KeyError("stop here")) as get_flow,
         ):
             result = await flow_manager.on_start_flow_from_node_request(StartFlowFromNodeRequest(), workflow)
