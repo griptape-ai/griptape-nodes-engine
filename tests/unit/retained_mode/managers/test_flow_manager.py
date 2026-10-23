@@ -197,6 +197,17 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
+    def test_deserializing_needs_a_workflow_to_load_into(self, engine: Engine, image_with_flow_commands: str) -> None:
+        engine.context_manager.pop_workflow()
+        request = ExtractFlowCommandsFromImageMetadataRequest(
+            file_url_or_path=image_with_flow_commands, deserialize=True
+        )
+
+        result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert "Failed to deserialize" in str(result.result_details)
+
     def test_returns_commands_when_flow_commands_key_present(
         self, engine: Engine, image_with_flow_commands: str, empty_flow_commands: SerializedFlowCommands
     ) -> None:
