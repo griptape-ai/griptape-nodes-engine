@@ -2215,19 +2215,20 @@ class NodeManager(EngineScoped):
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
-    def remove_parameter_from_node(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
+    def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
         """Remove a parameter from a node of the open workflow, outside dispatch.
 
-        Edge method for code not handed a workflow; code holding one calls the handler with it.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{request.node_name}'. Failed because no workflow is open."
             return RemoveParameterFromNodeResultFailure(result_details=details)
-        return self.on_remove_parameter_from_node_request(request, workflow)
+        return self.on_remove_parameter_from_node_request_in_workflow(request, workflow)
 
     @handles(RemoveParameterFromNodeRequest, scope=RequestScope.WORKFLOW)
-    def on_remove_parameter_from_node_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_remove_parameter_from_node_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: RemoveParameterFromNodeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2802,20 +2803,21 @@ class NodeManager(EngineScoped):
         value: Any
         modified: bool
 
-    def set_parameter_value(self, request: SetParameterValueRequest) -> ResultPayload:
+    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
         """Set a parameter value on a node of the open workflow, outside dispatch.
 
-        Edge method for code not handed a workflow; code holding one calls the handler with it.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             details = f"Attempted to set parameter value for '{request.node_name}.{request.parameter_name}'. Failed because no workflow is open."
             return SetParameterValueResultFailure(result_details=details)
-        return self.on_set_parameter_value_request(request, workflow)
+        return self.on_set_parameter_value_request_in_workflow(request, workflow)
 
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
     @handles(SetParameterValueRequest, scope=RequestScope.WORKFLOW)
-    def on_set_parameter_value_request(
+    def on_set_parameter_value_request_in_workflow(
         self, request: SetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         if not request.initial_setup:

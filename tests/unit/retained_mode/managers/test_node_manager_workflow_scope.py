@@ -35,8 +35,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueResultSuccess,
     RemoveParameterFromNodeRequest,
     RemoveParameterFromNodeResultFailure,
+    RemoveParameterFromNodeResultSuccess,
     SetParameterValueRequest,
     SetParameterValueResultFailure,
+    SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -265,56 +267,39 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         explicit.assert_called_once_with(engine.current_workflow(), "node")
         assert returned is explicit.return_value
 
+    def test_get_node_by_name_fails_with_no_workflow_open(self, engine: Engine) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            engine.node_manager.get_node_by_name("node")
+
+
+class TestHandlersNodeLibrariesCallDirectly:
+    """Engine, `exe_types` and node library code call these by name with only a request, so those calls keep working."""
+
     @pytest.mark.parametrize(
-        ("edge_name", "handler_name", "request_payload"),
+        ("handler_name", "request_payload"),
         [
             (
-                "set_parameter_value",
                 "on_set_parameter_value_request",
                 SetParameterValueRequest(parameter_name="value", value="hi", node_name="node"),
             ),
             (
-                "remove_parameter_from_node",
                 "on_remove_parameter_from_node_request",
                 RemoveParameterFromNodeRequest(parameter_name="value", node_name="node"),
             ),
-            (
-                "on_get_parameter_value_request",
-                "on_get_parameter_value_request_in_workflow",
-                GetParameterValueRequest(parameter_name="value", node_name="node"),
-            ),
+            ("on_get_parameter_value_request", GetParameterValueRequest(parameter_name="value", node_name="node")),
         ],
     )
-    def test_an_edge_method_hands_the_open_workflow_to_the_handler(
-        self, engine: Engine, edge_name: str, handler_name: str, request_payload: Any
+    def test_a_handler_called_with_only_a_request_acts_on_the_open_workflow(
+        self, engine: Engine, handler_name: str, request_payload: Any
     ) -> None:
         _open_workflow(engine)
         node_manager = engine.node_manager
 
-        with patch.object(node_manager, handler_name, return_value=MagicMock()) as handler:
-            returned = getattr(node_manager, edge_name)(request_payload)
+        with patch.object(node_manager, f"{handler_name}_in_workflow", return_value=MagicMock()) as handler:
+            returned = getattr(node_manager, handler_name)(request=request_payload)
 
         handler.assert_called_once_with(request_payload, engine.current_workflow())
         assert returned is handler.return_value
-
-    def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
-        node_manager = engine.node_manager
-
-        set_result = node_manager.set_parameter_value(
-            SetParameterValueRequest(parameter_name="value", value="hi", node_name="node")
-        )
-        removed = node_manager.remove_parameter_from_node(
-            RemoveParameterFromNodeRequest(parameter_name="value", node_name="node")
-        )
-
-        assert isinstance(set_result, SetParameterValueResultFailure)
-        assert isinstance(removed, RemoveParameterFromNodeResultFailure)
-        with pytest.raises(ValueError, match="not found"):
-            node_manager.get_node_by_name("node")
-
-
-class TestHandlersNodeLibrariesCallDirectly:
-    """Shipped node libraries call these by name with only a request, so those calls keep working."""
 
     def _workflow_with_a_node(self, engine: Engine) -> str:
         _open_workflow(engine)
@@ -345,6 +330,41 @@ class TestHandlersNodeLibrariesCallDirectly:
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == "hi"
+
+    def test_set_parameter_value_takes_only_a_request(self, engine: Engine) -> None:
+        node_name = self._workflow_with_a_node(engine)
+
+        result = engine.node_manager.on_set_parameter_value_request(
+            SetParameterValueRequest(parameter_name="value", value="bye", node_name=node_name)
+        )
+
+        assert isinstance(result, SetParameterValueResultSuccess), result.result_details
+        assert engine.node_manager.get_node_by_name(node_name).get_parameter_value("value") == "bye"
+
+    def test_remove_parameter_from_node_takes_the_request_by_keyword(self, engine: Engine) -> None:
+        node_name = self._workflow_with_a_node(engine)
+        node = engine.node_manager.get_node_by_name(node_name)
+        node.add_parameter(Parameter(name="extra", tooltip="Removable", type="str", user_defined=True))
+
+        result = engine.node_manager.on_remove_parameter_from_node_request(
+            request=RemoveParameterFromNodeRequest(parameter_name="extra", node_name=node_name)
+        )
+
+        assert isinstance(result, RemoveParameterFromNodeResultSuccess), result.result_details
+        assert node.get_parameter_by_name("extra") is None
+
+    def test_handlers_called_with_only_a_request_fail_with_no_workflow_open(self, engine: Engine) -> None:
+        node_manager = engine.node_manager
+
+        set_result = node_manager.on_set_parameter_value_request(
+            SetParameterValueRequest(parameter_name="value", value="hi", node_name="node")
+        )
+        removed = node_manager.on_remove_parameter_from_node_request(
+            RemoveParameterFromNodeRequest(parameter_name="value", node_name="node")
+        )
+
+        assert isinstance(set_result, SetParameterValueResultFailure)
+        assert isinstance(removed, RemoveParameterFromNodeResultFailure)
 
     def test_get_parameter_value_fails_with_no_workflow_open(self, engine: Engine) -> None:
         result = engine.node_manager.on_get_parameter_value_request(
