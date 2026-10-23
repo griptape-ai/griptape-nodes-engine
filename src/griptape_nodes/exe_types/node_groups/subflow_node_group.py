@@ -22,6 +22,10 @@ from griptape_nodes.exe_types.node_types import (
     get_library_names_with_publish_handlers,
 )
 from griptape_nodes.exe_types.param_components.subflow_execution_component import SubflowExecutionComponent
+from griptape_nodes.node_library.workflow_start_end_nodes import (
+    WorkflowStartEndNodesNotFoundError,
+    resolve_workflow_start_end_nodes,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     DeleteConnectionRequest,
@@ -112,10 +116,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._proxy_param_to_connections = {}
         if "execution_environment" not in self.metadata:
             self.metadata["execution_environment"] = {}
-        self.metadata["execution_environment"]["Griptape Nodes Library"] = {
-            "start_flow_node": "StartFlow",
-            "parameter_names": {},
-        }
+        self._seed_local_execution_environment()
         self.metadata["executable"] = True
 
         # Don't create subflow in __init__ - it will be created on-demand when nodes are added
@@ -185,6 +186,27 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if not context_manager.has_current_flow():
             return None
         return context_manager.get_current_flow().name
+
+    def _seed_local_execution_environment(self) -> None:
+        """Record the start node that local and isolated execution will package this group with.
+
+        Packaging reads ``metadata["execution_environment"][<start node library>]`` to pass the
+        group's values to the start node, so this entry has to name the same library and node type
+        that ``NodeExecutor`` resolves when there is no target library. Libraries with a publish
+        handler overwrite their entry with real parameter names in ``_add_start_flow_parameters``.
+
+        When no library provides start and end nodes, nothing is recorded: the group can still be
+        built and edited, and running it reports the missing nodes by name.
+        """
+        try:
+            start_end_nodes = resolve_workflow_start_end_nodes(self.engine.library_manager)
+        except WorkflowStartEndNodesNotFoundError as err:
+            logger.debug("%s has no start node to record for local execution: %s", self.name, err)
+            return
+        self.metadata["execution_environment"][start_end_nodes.start_flow_node_library_name] = {
+            "start_flow_node": start_end_nodes.start_flow_node_type,
+            "parameter_names": {},
+        }
 
     def _add_start_flow_parameters(self) -> None:
         """Add parameters from all registered StartFlow nodes to this SubflowNodeGroup.

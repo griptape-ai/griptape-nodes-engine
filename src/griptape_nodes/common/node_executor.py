@@ -40,14 +40,16 @@ from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
     BaseNode,
-    EndNode,
     NodeResolutionState,
-    StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
+from griptape_nodes.node_library.workflow_start_end_nodes import (
+    WorkflowStartEndNodes,
+    resolve_workflow_start_end_nodes,
+)
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
@@ -133,7 +135,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     LoadWorkflowMetadata,
     LoadWorkflowMetadataResultSuccess,
     PublishWorkflowProgressEvent,
-    PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
     SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
@@ -263,12 +264,8 @@ EXECUTION_EVENTS_TO_SUPPRESS = {
 }
 
 
-@dataclass
-class PublishWorkflowStartEndNodes:
-    start_flow_node_type: str
-    start_flow_node_library_name: str
-    end_flow_node_type: str
-    end_flow_node_library_name: str
+# Kept under its old name for callers that import it from here.
+PublishWorkflowStartEndNodes = WorkflowStartEndNodes
 
 
 class PublishLocalWorkflowResult(NamedTuple):
@@ -855,38 +852,12 @@ class NodeExecutor(EngineScoped):
                 await self._delete_workflow(workflow_path=published_workflow_filename)
 
     async def _get_workflow_start_end_nodes(self, library: Library | None) -> PublishWorkflowStartEndNodes:
-        library_name = "Griptape Nodes Library"
-        start_node_type = "StartFlow"
-        end_node_type = "EndFlow"
+        """Resolve the start and end node types used to package a workflow for ``library``.
 
-        if library is not None:
-            # Attempt to get start and end nodes from the registered handler
-            library_name = library.get_library_data().name
-            registered_event_handler = self.get_workflow_handler(library_name)
-            registered_event_data = registered_event_handler.event_data
-            if registered_event_data is not None and isinstance(
-                registered_event_data, PublishWorkflowRegisteredEventData
-            ):
-                return PublishWorkflowStartEndNodes(
-                    start_flow_node_type=registered_event_data.start_flow_node_type,
-                    start_flow_node_library_name=registered_event_data.start_flow_node_library_name,
-                    end_flow_node_type=registered_event_data.end_flow_node_type,
-                    end_flow_node_library_name=registered_event_data.end_flow_node_library_name,
-                )
-
-            start_nodes = library.get_nodes_by_base_type(StartNode)
-            end_nodes = library.get_nodes_by_base_type(EndNode)
-            if len(start_nodes) > 0 and len(end_nodes) > 0:
-                start_node_type = start_nodes[0]
-                end_node_type = end_nodes[0]
-                library_name = library.get_library_data().name
-
-        return PublishWorkflowStartEndNodes(
-            start_flow_node_type=start_node_type,
-            start_flow_node_library_name=library_name,
-            end_flow_node_type=end_node_type,
-            end_flow_node_library_name=library_name,
-        )
+        Raises:
+            WorkflowStartEndNodesNotFoundError: If no registered library provides start and end nodes.
+        """
+        return resolve_workflow_start_end_nodes(self.engine.library_manager, library)
 
     async def _publish_local_workflow(
         self, node: BaseNode, library: Library | None = None
@@ -898,9 +869,13 @@ class NodeExecutor(EngineScoped):
         """
         sanitized_node_name = node.name.replace(" ", "_")
         output_parameter_prefix = f"{sanitized_node_name}_packaged_node_"
-        # We have to make our defaults strings because the PackageNodesAsSerializedFlowRequest doesn't accept None types.
-        library_name = library.get_library_data().name if library is not None else "Griptape Nodes Library"
         workflow_start_end_nodes = await self._get_workflow_start_end_nodes(library)
+        # Local and isolated execution have no target library, so name the file after the library
+        # that provides the start node instead.
+        if library is not None:
+            library_name = library.get_library_data().name
+        else:
+            library_name = workflow_start_end_nodes.start_flow_node_library_name
 
         sanitized_library_name = library_name.replace(" ", "_")
         # If we are packaging a SubflowNodeGroup, that means that we are packaging multiple nodes together, so we have to get the list of nodes from the group node.
@@ -3625,7 +3600,9 @@ class NodeExecutor(EngineScoped):
             library = LibraryRegistry.get_library(execution_type)
             node_details = await self._get_workflow_start_end_nodes(library)
             start_node_type = node_details.start_flow_node_type
-            node_metadata = library.get_node_metadata(start_node_type)
+            # The start node can come from a different library than the one publishing the loop.
+            start_node_library = LibraryRegistry.get_library(node_details.start_flow_node_library_name)
+            node_metadata = start_node_library.get_node_metadata(start_node_type)
             start_node_name = node_metadata.display_name
 
         mode_str = "sequentially" if run_sequentially else "concurrently"
