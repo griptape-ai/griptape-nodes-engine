@@ -334,7 +334,7 @@ class FlowManager(EngineScoped):
             workflow.context.pop_flow()
 
         delete_flow_request = DeleteFlowRequest(flow_name=flow_name)
-        delete_result = self.engine.handle_request(delete_flow_request)
+        delete_result = workflow.handle_request(delete_flow_request)
         if delete_result.failed():
             logger.warning(
                 "Failed to clean up flow '%s' after deserialization failure: %s",
@@ -730,7 +730,7 @@ class FlowManager(EngineScoped):
             and running_machine is not None
             and running_machine.context.flow_name == flow.name
         ):
-            result = self.engine.handle_request(CancelFlowRequest(flow_name=flow.name))
+            result = workflow.handle_request(CancelFlowRequest(flow_name=flow.name))
             if result.failed():
                 details = f"Attempted to delete flow '{flow_name}'. Failed because running flow could not cancel."
                 return DeleteFlowResultFailure(result_details=details)
@@ -742,7 +742,7 @@ class FlowManager(EngineScoped):
             # because None in ListFlowsInFlowRequest means "get canvas/top-level flows". We want the flows in the
             # current context, which is the flow we're deleting.
             list_flows_request = ListFlowsInCurrentContextRequest()
-            list_flows_result = self.engine.handle_request(list_flows_request)
+            list_flows_result = workflow.handle_request(list_flows_request)
             if not isinstance(list_flows_result, ListFlowsInCurrentContextResultSuccess):
                 details = f"Attempted to delete Flow '{flow_name}', but failed while attempting to get the list of Flows owned by this Flow."
                 result = DeleteFlowResultFailure(result_details=details)
@@ -759,14 +759,14 @@ class FlowManager(EngineScoped):
                 with workflow.context.flow(child_flow):
                     # Delete them.
                     delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
-                    delete_flow_result = self.engine.handle_request(delete_flow_request)
+                    delete_flow_result = workflow.handle_request(delete_flow_request)
                     if isinstance(delete_flow_result, DeleteFlowResultFailure):
                         details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
                         result = DeleteFlowResultFailure(result_details=details)
                         return result
             # Delete all child nodes in this Flow.
             list_nodes_request = ListNodesInFlowRequest()
-            list_nodes_result = self.engine.handle_request(list_nodes_request)
+            list_nodes_result = workflow.handle_request(list_nodes_request)
             if not isinstance(list_nodes_result, ListNodesInFlowResultSuccess):
                 details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to get the list of Nodes owned by this Flow."
                 result = DeleteFlowResultFailure(result_details=details)
@@ -774,7 +774,7 @@ class FlowManager(EngineScoped):
             node_names = list_nodes_result.node_names
             for node_name in node_names:
                 delete_node_request = DeleteNodeRequest(node_name=node_name)
-                delete_node_result = self.engine.handle_request(delete_node_request)
+                delete_node_result = workflow.handle_request(delete_node_request)
                 if isinstance(delete_node_result, DeleteNodeResultFailure):
                     details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Node '{node_name}'."
                     result = DeleteFlowResultFailure(result_details=details)
@@ -1129,7 +1129,7 @@ class FlowManager(EngineScoped):
                 target_node_name=old_target_node_name,
                 target_parameter_name=old_target_param_name,
             )
-            delete_old_result = self.engine.handle_request(delete_old_request)
+            delete_old_result = workflow.handle_request(delete_old_request)
             if delete_old_result.failed():
                 details = f"Attempted to connect '{source_node_name}.{request.source_parameter_name}'. Failed because there was a previous connection from '{old_source_node_name}.{old_source_param_name}' to '{old_target_node_name}.{old_target_param_name}' that could not be deleted."
                 return CreateConnectionResultFailure(result_details=details)
@@ -1187,7 +1187,7 @@ class FlowManager(EngineScoped):
                     target_parameter_name=old_target_param_name,
                     initial_setup=request.initial_setup,
                 )
-                create_old_connection_result = self.engine.handle_request(create_old_connection_request)
+                create_old_connection_result = workflow.handle_request(create_old_connection_request)
                 if create_old_connection_result.failed():
                     details = "Failed attempting to restore the old Connection after failing the replacement. A thousand pardons."
             return CreateConnectionResultFailure(result_details=details)
@@ -1286,7 +1286,7 @@ class FlowManager(EngineScoped):
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
-            self.engine.handle_request(
+            workflow.handle_request(
                 SetParameterValueRequest(
                     parameter_name=target_param.name,
                     node_name=target_node.name,
@@ -2270,12 +2270,12 @@ class FlowManager(EngineScoped):
             for row_idx, name in enumerate(sorted(layers[layer_idx])):
                 x = request.origin_x + layer_idx * request.layer_spacing
                 y = request.origin_y + row_idx * request.row_spacing
-                # Dispatch the position update through self.engine.ahandle_request so the
+                # Dispatch the position update through workflow.ahandle_request so the
                 # per-node SetNodeMetadataResultSuccess event is broadcast to subscribers.
                 # The editor listens on that event to move nodes on the canvas live; mutating
                 # node.metadata directly here would update the engine state but leave the UI
                 # stale until a reload.
-                set_metadata_result = await self.engine.ahandle_request(
+                set_metadata_result = await workflow.ahandle_request(
                     SetNodeMetadataRequest(node_name=name, metadata={"position": {"x": x, "y": y}})
                 )
                 if not isinstance(set_metadata_result, SetNodeMetadataResultSuccess):
