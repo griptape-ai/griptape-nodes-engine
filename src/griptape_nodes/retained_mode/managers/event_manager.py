@@ -1282,6 +1282,15 @@ class EventManager(EngineScoped):
                 exc_info = None
 
     @staticmethod
+    def _is_crash(result: ResultPayload) -> bool:
+        """Whether `result` is a failure dispatch built from an exception a handler or hook raised.
+
+        A `GenericResultFailure` without an exception is not one: dispatch also builds those for a
+        request that names no workflow it can act on, which is the caller's routine miss.
+        """
+        return isinstance(result, GenericResultFailure) and result.exception is not None
+
+    @staticmethod
     def _exception_for_logging(result: ResultPayload) -> Exception | None:
         """The exception to attach as `exc_info`, or None to log the message alone.
 
@@ -1316,13 +1325,13 @@ class EventManager(EngineScoped):
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
 
-            # Override failure log level if requested, except for a synthesized failure:
-            # `failure_log_level` silences failures its caller EXPECTS, so honoring it for an
-            # unhandled exception would hide a crash behind a level chosen for a routine miss.
+            # Override failure log level if requested, except for a crash: `failure_log_level`
+            # silences failures its caller EXPECTS, so honoring it for an exception a handler or
+            # hook raised would hide a crash behind a level chosen for a routine miss.
             if (
                 callback_result.failed()
                 and request.failure_log_level is not None
-                and not isinstance(callback_result, GenericResultFailure)
+                and not self._is_crash(callback_result)
             ):
                 self._override_result_log_level(callback_result, request.failure_log_level)
 
