@@ -5,6 +5,7 @@ list set on it becomes rows.
 """
 
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -112,6 +113,40 @@ class TestWholeListInput:
 
         assert node.parameter_values["refs"] == ["a", "b"]
         assert node.get_parameter_value("refs") == ["a", "b", "manual"]
+
+    @pytest.mark.usefixtures("connected")
+    @pytest.mark.parametrize("upstream", [[], None])
+    def test_dispatching_an_empty_connected_list_does_not_store_the_rows(self, node: MockNode, upstream: Any) -> None:
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+        node.parameter_values["refs"] = upstream
+        dispatched = node._list_rows.values_for_dispatch()["refs"]
+
+        assert node._list_rows.set_as_rows_if_unconnected(refs, dispatched)
+
+        assert node.parameter_values["refs"] == upstream
+        assert node.get_parameter_value("refs") == ["manual"]
+
+    @pytest.mark.usefixtures("connected")
+    def test_row_edits_on_a_connected_list_run_validators_and_hooks_with_the_combined_list(
+        self, node: MockNode
+    ) -> None:
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        validated: list[Any] = []
+        refs._validators.append(lambda _param, value: validated.append(value))
+        node.set_parameter_value("refs", ["a", "b"])
+        row = refs.add_child_parameter()
+
+        node.set_parameter_value(row.name, "manual")
+
+        assert validated[-1] == ["a", "b", "manual"]
+
+        refs.remove_child(row)
+
+        assert validated[-1] == ["a", "b"]
 
     def test_removed_row_value_does_not_resurrect(self, node: MockNode) -> None:
         """An unconnected list keeps no value of its own, so nothing is left behind to read."""

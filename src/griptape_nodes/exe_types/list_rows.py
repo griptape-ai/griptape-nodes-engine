@@ -106,13 +106,14 @@ class ListRows:
             return False
         if not _accepts_whole_list(parameter):
             return False
+        if self._node._param_has_incoming_connection(parameter.name):
+            # A connected list keeps the value as it arrived. A dispatch sends the list as the node reads
+            # it, the rows' items included, so storing that would add the rows a second time. This runs
+            # before the rows check below, which an empty or missing connected value would also satisfy.
+            return value == self._node._get_raw_parameter_value(parameter.name)
         if isinstance(value, list) and value == handle_container_parameter(self._node, parameter):
             # Already what the rows hold.
             return False
-        if self._node._param_has_incoming_connection(parameter.name):
-            # A connected list keeps the value as it arrived. A dispatch sends the list as the node reads
-            # it, the rows' items included, so storing that would add the rows a second time.
-            return value == self._node._get_raw_parameter_value(parameter.name)
         self._replace(parameter, value)
         return True
 
@@ -153,9 +154,6 @@ class ListRows:
         may not have made yet, and the list was checked when it was saved.
         """
         if container.name in self._being_replaced or initial_setup:
-            return
-        if not self.holds_no_value(container):
-            # A connected list holds the value its connection delivered, which the rows don't change.
             return
         self._notify(container)
 
@@ -234,13 +232,13 @@ class ListRows:
         node.parameter_values.update(values)
 
     def _notify(self, container: ParameterContainer) -> None:
-        """Run the container's validators and hooks on the value its rows now build.
+        """Run the container's validators and hooks on the value the node now reads, the connected list included.
 
         Its converters don't run: each row ran them on its own item. The value isn't stored, since
         reading the list builds it again. A running node records it as its result.
         """
         node = self._node
-        value = handle_container_parameter(node, container)
+        value = node._get_raw_parameter_value(container.name)
         for validator in container.validators:
             validator(container, value)
         node._also_record_as_result(container, value)
