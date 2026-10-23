@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -386,6 +386,34 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             result = await engine.ahandle_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+
+
+class TestExecuteNodeForwardedToAWorker:
+    @pytest.mark.asyncio
+    async def test_the_request_a_worker_receives_names_no_workflow(self, engine: Engine) -> None:
+        """A worker opens no workflow, so a request naming one would fail there as not open."""
+        entry = _open_workflow(engine)
+        flow_name = _create_canvas(engine)
+        node_name = _create_node(engine, flow_name, "node")
+        engine.node_manager.get_node_by_name(node_name).metadata["library"] = _LIBRARY_NAME
+        route_to_worker = AsyncMock(
+            return_value={"result_type": "ExecuteNodeResultFailure", "result": {"result_details": "stopped"}}
+        )
+
+        with (
+            patch.object(engine.worker_manager, "wait_until_executable", AsyncMock()),
+            patch.object(engine.library_manager.workers, "get_worker_for_library", return_value=("worker", "topic")),
+            patch.object(engine.worker_manager, "route_to_worker", route_to_worker),
+        ):
+            await engine.event_manager.ahandle_request(
+                ExecuteNodeRequest(node_name=node_name, parameter_values={}),
+                result_context=ResultContext(open_workflow_id=entry.workflow_id),
+            )
+
+        route_to_worker.assert_awaited_once()
+        forwarded = route_to_worker.call_args.args[0]
+        assert isinstance(forwarded.request, ExecuteNodeRequest)
+        assert forwarded.open_workflow_id is None
 
 
 class TestNestedRequestsCarryTheHandlersWorkflow:
