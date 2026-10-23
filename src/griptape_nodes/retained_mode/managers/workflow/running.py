@@ -169,7 +169,7 @@ class WorkflowRunner(EngineScoped):
 
             # Run the file, goddamn it
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
-            opened = self._workflow_a_file_run_left_open()
+            opened = self._open_workflow_for_file_run()
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
@@ -193,7 +193,7 @@ class WorkflowRunner(EngineScoped):
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
-        open_workflow = self._workflow_a_file_run_left_open()
+        open_workflow = self._open_workflow_for_file_run()
         if open_workflow is not None and open_workflow.context.has_current_flow():
             # Disallow opening a workflow inside another workflow this way. It would
             # become an invisible child flow (no way to reach it in the UI), persisted
@@ -213,7 +213,7 @@ class WorkflowRunner(EngineScoped):
         execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
         if execution_result.execution_successful:
-            opened = self._workflow_a_file_run_left_open()
+            opened = self._open_workflow_for_file_run()
             return RunWorkflowWithCurrentStateResultSuccess(
                 status=execution_result.status,
                 workflow_id=self._workflow_id_of(opened),
@@ -250,7 +250,7 @@ class WorkflowRunner(EngineScoped):
 
         # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
         # Refused before anything is registered or run.
-        already_open = self._workflow_a_file_run_left_open()
+        already_open = self._open_workflow_for_file_run()
         if not request.run_with_clean_slate and already_open is not None:
             details = (
                 f"Attempted to run workflow '{workflow_name}'. Failed because workflow "
@@ -431,7 +431,7 @@ class WorkflowRunner(EngineScoped):
             return workflow
         return self.engine.workflow_registry.register_unsaved_copy(workflow)
 
-    def _workflow_a_file_run_left_open(self) -> WorkflowRuntime | None:
+    def _open_workflow_for_file_run(self) -> WorkflowRuntime | None:
         """The open workflow a workflow file runs into or opened, or None when none is open.
 
         A workflow file opens itself through the ambient context (`push_workflow(file_path=__file__)`)
@@ -455,7 +455,7 @@ class WorkflowRunner(EngineScoped):
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""
         # First check: Do we have a current workflow? If not, that's a critical failure.
-        workflow = self._workflow_a_file_run_left_open()
+        workflow = self._open_workflow_for_file_run()
         if workflow is None:
             error_message = "Workflow execution completed but no current workflow is established in context"
             raise RuntimeError(error_message)
