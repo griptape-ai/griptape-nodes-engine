@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 
+from collections.abc import Iterator
+
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NodeDependencies, StartNode
@@ -87,7 +89,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidTomlFormatProblem,
     LibraryNotRegisteredProblem,
@@ -3552,11 +3553,13 @@ class TestRunWorkflowWithCurrentStateRequest:
     _OPEN_FLOW_NAME = "ControlFlow_1"
 
     @pytest.fixture
-    def context_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
-        """The engine's ContextManager, so each test states the flow stack it is loading into."""
-        context_manager = Mock(spec=ContextManager)
-        monkeypatch.setattr(engine, "_context_manager", context_manager)
-        return context_manager
+    def open_workflow(self, engine: Engine) -> Iterator[WorkflowRuntime]:
+        """An open workflow, so each test states the flow stack it is loading into."""
+        push_unsaved_workflow(engine)
+        try:
+            yield engine.open_workflows.sole_workflow()
+        finally:
+            engine.context_manager.pop_workflow()
 
     @pytest.fixture
     def run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
@@ -3591,15 +3594,14 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_refuses_while_a_flow_is_open(
         self,
         engine: Engine,
-        context_manager: Mock,
+        open_workflow: WorkflowRuntime,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
         open_flow = Mock(spec=ControlFlow)
         open_flow.name = self._OPEN_FLOW_NAME
-        context_manager.has_current_flow.return_value = True
-        context_manager.get_current_flow.return_value = open_flow
+        open_workflow.context.push_flow(open_flow)
 
         result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
             RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
@@ -3614,13 +3616,11 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_allows_a_workflow_context_with_no_open_flow(
         self,
         engine: Engine,
-        context_manager: Mock,
+        open_workflow: WorkflowRuntime,  # noqa: ARG002
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
-        context_manager.has_current_flow.return_value = False
-
         await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
             RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
         )

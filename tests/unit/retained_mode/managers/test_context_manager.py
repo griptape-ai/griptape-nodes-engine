@@ -708,9 +708,7 @@ class TestEnsureWorkflowAndFlowRequest:
         assert isinstance(first, EnsureWorkflowAndFlowResultSuccess)
 
         # Calling again with different names should be a no-op: existing context wins.
-        second = context_manager.on_ensure_workflow_and_flow_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored")
-        )
+        second = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored"))
 
         assert isinstance(second, EnsureWorkflowAndFlowResultSuccess)
         assert second.workflow_name == first.workflow_name

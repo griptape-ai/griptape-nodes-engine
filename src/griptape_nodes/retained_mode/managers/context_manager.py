@@ -228,14 +228,17 @@ class ContextManager(EngineScoped):
             result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
         )
 
-    @handles(EnsureWorkflowAndFlowRequest)
-    def on_ensure_workflow_and_flow_request(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
+    @handles(EnsureWorkflowAndFlowRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    def on_ensure_workflow_and_flow_request(
+        self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Delegates the workflow side to SetWorkflowContextRequest so the unsaved-registry-key
-        scheme ("unsaved:<workflow id>") stays the single source of truth for scratch workflows;
-        composes that with CreateFlowRequest so callers can go from a blank engine to
-        CreateNode in a single round trip.
+        Uses the open `workflow` when there is one, and otherwise opens one. Delegates opening
+        to SetWorkflowContextRequest so the unsaved-registry-key scheme ("unsaved:<workflow id>")
+        stays the single source of truth for scratch workflows; composes that with
+        CreateFlowRequest so callers can go from a blank engine to CreateNode in a single round
+        trip.
         """
         # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -243,28 +246,33 @@ class ContextManager(EngineScoped):
             CreateFlowResultSuccess,
         )
 
-        # An id names one workflow, so a different workflow in context is not an answer. A name
-        # keeps the older, lenient rule: the workflow in context is reused. The id is parsed first
-        # because a request may spell it as a dashed UUID.
+        # An id names one workflow, so a different open workflow is not an answer. A name keeps
+        # the older, lenient rule: the open workflow is reused. The id is parsed first because a
+        # request may spell it as a dashed UUID.
         if (
             request.workflow_id is not None
-            and self.has_current_workflow()
-            and self.get_current_workflow_id() != parse_workflow_id(request.workflow_id)
+            and workflow is not None
+            and workflow.workflow_id != parse_workflow_id(request.workflow_id)
         ):
+            open_name = self.engine.workflow_registry.get(workflow.workflow_id).name
             return EnsureWorkflowAndFlowResultFailure(
                 result_details=(
                     f"Attempted to ensure workflow '{request.workflow_id}'. Failed because workflow "
-                    f"'{self.get_current_workflow_name()}' is in the Current Context."
+                    f"'{open_name}' is in the Current Context."
                 )
             )
 
         created_workflow = False
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            workflow_id = self.get_current_workflow_id()
+        if workflow is not None:
+            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+            workflow_id = workflow.workflow_id
         else:
             set_workflow_result = self.engine.handle_request(self._set_workflow_request_for_ensure(request))
-            if not isinstance(set_workflow_result, SetWorkflowContextSuccess):
+            # The success names the workflow it opened; its id field is optional only for older engines.
+            if (
+                not isinstance(set_workflow_result, SetWorkflowContextSuccess)
+                or set_workflow_result.workflow_id is None
+            ):
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while setting the workflow: "
@@ -273,13 +281,14 @@ class ContextManager(EngineScoped):
                 )
             workflow_name = set_workflow_result.workflow_name
             workflow_id = set_workflow_result.workflow_id
+            workflow = self.engine.open_workflows.get(workflow_id)
             created_workflow = True
 
         created_flow = False
-        if self.has_current_flow():
-            flow_name = self.get_current_flow().name
+        if workflow.context.has_current_flow():
+            flow_name = workflow.context.get_current_flow().name
         else:
-            create_flow_result = self.engine.handle_request(
+            create_flow_result = workflow.handle_request(
                 CreateFlowRequest(
                     parent_flow_name=None,
                     flow_name=request.flow_name,
@@ -287,9 +296,9 @@ class ContextManager(EngineScoped):
                 )
             )
             if not isinstance(create_flow_result, CreateFlowResultSuccess):
-                # Roll the workflow push back so a partial failure does not leave hanging state.
+                # Close the workflow this request opened so a partial failure does not leave hanging state.
                 if created_workflow:
-                    self.pop_workflow()
+                    self.engine.open_workflows.close(workflow)
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while creating the flow: "
