@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -125,9 +126,13 @@ class WorkflowFileOperations(EngineScoped):
             if str(source_dir) not in ("", "."):
                 requested_file_name = f"{source_dir}/{sanitized_stem}"
 
-        if self.engine.workflow_registry.is_open(source.workflow_id):
+        open_source = self.engine.open_workflows.find_by_id(source.workflow_id)
+        if open_source is not None:
             return await self._rename_open_workflow(
-                source=source, requested_file_name=requested_file_name, display_name=display_name
+                open_source,
+                source=source,
+                requested_file_name=requested_file_name,
+                display_name=display_name,
             )
         return await self._rename_closed_workflow(
             source=source, sanitized_stem=sanitized_stem, display_name=display_name
@@ -135,21 +140,24 @@ class WorkflowFileOperations(EngineScoped):
 
     async def _rename_open_workflow(
         self,
+        open_source: WorkflowRuntime,
         *,
         source: Workflow,
         requested_file_name: str,
         display_name: str,
     ) -> ResultPayload:
-        """Rename the open workflow: save its live graph to the new file under its own id, then delete the old file.
+        """Rename an open workflow: save its live graph to the new file under its own id, then delete the old file.
 
-        The workflow stays open and keeps its id; only its file and name change. The open workflow
-        is never a library's: a library workflow opens as an unsaved copy, which a rename saves.
+        `open_source` is the runtime of `source`. The workflow stays open and keeps its id; only its
+        file and name change. An open workflow is never a library's: a library workflow opens as an
+        unsaved copy, which a rename saves.
         """
         previous_absolute_path = source.absolute_path
         previous_file_path = source.file_path
         previous_name = source.name
 
         save_result = await self.engine.workflow_manager.saver.save_open_workflow(
+            open_source,
             SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name),
             keep_open_workflow_identity=True,
         )

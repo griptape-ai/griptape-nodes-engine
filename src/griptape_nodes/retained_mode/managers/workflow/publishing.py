@@ -89,7 +89,8 @@ class WorkflowPublishing(EngineScoped):
             return PublishWorkflowResultFailure(exception=err, result_details=str(err))
         # Publishers read the open graph (its nodes, shape and StartFlow settings), so publishing
         # any other workflow would package a mix of the two.
-        if not self.engine.workflow_registry.is_open(workflow.workflow_id):
+        open_workflow = self.engine.open_workflows.find_by_id(workflow.workflow_id)
+        if open_workflow is None:
             details = f"Attempted to publish workflow '{workflow.name}'. Failed because it is not open. Open it, then publish it."
             return PublishWorkflowResultFailure(exception=ValueError(details), result_details=details)
         # Unsaved (registry-only) workflows cannot be published because publish emits a file
@@ -111,7 +112,7 @@ class WorkflowPublishing(EngineScoped):
 
             # Save before publishing, so the latest changes in memory are included. A failed save
             # would leave the publisher packaging the stale file.
-            save_result = await self.engine.ahandle_request(
+            save_result = await open_workflow.ahandle_request(
                 SaveWorkflowRequest(file_name=derive_registry_key(workflow.file_path))
             )
             if save_result.failed():

@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -248,24 +249,23 @@ class WorkflowSaver(EngineScoped):
             )
         return WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
-    @handles(SaveWorkflowRequest)
-    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:
-        return await self.save_open_workflow(request)
+    @handles(SaveWorkflowRequest, scope=RequestScope.WORKFLOW)
+    async def on_save_workflow_request(self, request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> ResultPayload:
+        return await self.save_open_workflow(workflow, request)
 
     async def save_open_workflow(  # noqa: C901, PLR0912, PLR0915
-        self, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
+        self, workflow: WorkflowRuntime, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
     ) -> ResultPayload:
-        """Save the open workflow as `request` describes.
+        """Save the open `workflow` as `request` describes.
 
-        Where the file lands decides which workflow it is. The open workflow's own file, and the
-        first save of an unsaved workflow, keep the open workflow's id; anything else is a copy
-        with an id of its own. `keep_open_workflow_identity` makes the save move the open
-        workflow to the new file instead of copying it, which is what a rename is.
+        Where the file lands decides which workflow it is. The workflow's own file, and the first
+        save of an unsaved workflow, keep the workflow's id; anything else is a copy with an id of
+        its own. `keep_open_workflow_identity` makes the save move the workflow to the new file
+        instead of copying it, which is what a rename is.
         """
         # Determine save target (file path, name, metadata)
-        context_manager = self.engine.context_manager
-        current_workflow = context_manager.get_current_workflow() if context_manager.has_current_workflow() else None
-        current_workflow_name = current_workflow.name if current_workflow is not None else None
+        current_workflow = self.engine.workflow_registry.get(workflow.workflow_id)
+        current_workflow_name = current_workflow.name
 
         try:
             save_target = self._determine_save_target(
@@ -330,13 +330,13 @@ class WorkflowSaver(EngineScoped):
         )
 
         # Serialize current flow and get shape
-        top_level_flow_result = await self.engine.ahandle_request(GetTopLevelFlowRequest())
+        top_level_flow_result = await workflow.ahandle_request(GetTopLevelFlowRequest())
         if not isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess):
             details = f"Attempted to save workflow '{relative_file_path}'. Failed when requesting top level flow."
             return SaveWorkflowResultFailure(result_details=details)
         top_level_flow_name = top_level_flow_result.flow_name
 
-        serialized_flow_result = await self.engine.ahandle_request(
+        serialized_flow_result = await workflow.ahandle_request(
             SerializeFlowToCommandsRequest(flow_name=top_level_flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
@@ -346,7 +346,9 @@ class WorkflowSaver(EngineScoped):
 
         # Extract workflow shape if available; ignore failures
         try:
-            workflow_shape_dict = self.engine.workflow_manager.extract_workflow_shape(workflow_name=registry_key)
+            workflow_shape_dict = self.engine.workflow_manager.extract_workflow_shape_in(
+                workflow, workflow_name=registry_key
+            )
             workflow_shape = WorkflowShape(
                 inputs=workflow_shape_dict[WorkflowShapeType.INPUT],
                 outputs=workflow_shape_dict[WorkflowShapeType.OUTPUT],
@@ -590,20 +592,22 @@ class WorkflowSaver(EngineScoped):
             workflow_shape=request.workflow_shape,
         )
 
-    @handles(SaveSubflowToWorkflowRequest)
-    async def on_save_subflow_to_workflow(self, request: SaveSubflowToWorkflowRequest) -> ResultPayload:
-        """Save a subflow back to its original workflow file."""
+    @handles(SaveSubflowToWorkflowRequest, scope=RequestScope.WORKFLOW)
+    async def on_save_subflow_to_workflow(
+        self, request: SaveSubflowToWorkflowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        """Save a subflow of the open `workflow` back into the file of the saved workflow the request names."""
         try:
-            workflow = self.engine.workflow_registry.resolve_address(
+            target = self.engine.workflow_registry.resolve_address(
                 workflow_id=request.workflow_id,
                 workflow_name=request.workflow_name,
                 operation=f"save subflow '{request.flow_name}' into",
             )
         except WorkflowAddressError as err:
             return SaveSubflowToWorkflowResultFailure(result_details=str(err))
-        registry_key = workflow.name
+        registry_key = target.name
 
-        if workflow.absolute_path is None:
+        if target.absolute_path is None:
             # Saving a subflow back into its parent requires that parent to have a file.
             # Unsaved workflows have no destination to write into.
             details = (
@@ -612,11 +616,11 @@ class WorkflowSaver(EngineScoped):
                 "Save the parent workflow before saving a subflow into it."
             )
             return SaveSubflowToWorkflowResultFailure(result_details=details)
-        file_path = str(workflow.absolute_path)
-        file_name = workflow.absolute_path.stem
+        file_path = str(target.absolute_path)
+        file_name = target.absolute_path.stem
 
         # Serialize the subflow.
-        serialized_flow_result = await self.engine.ahandle_request(
+        serialized_flow_result = await workflow.ahandle_request(
             SerializeFlowToCommandsRequest(flow_name=request.flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
@@ -639,8 +643,8 @@ class WorkflowSaver(EngineScoped):
 
         # Extract workflow shape from the specific subflow (not the top-level flow).
         try:
-            workflow_shape_dict = self.engine.workflow_manager.extract_workflow_shape(
-                workflow_name=registry_key, flow_name=request.flow_name
+            workflow_shape_dict = self.engine.workflow_manager.extract_workflow_shape_in(
+                workflow, workflow_name=registry_key, flow_name=request.flow_name
             )
             workflow_shape = WorkflowShape(
                 inputs=workflow_shape_dict[WorkflowShapeType.INPUT],
@@ -652,7 +656,7 @@ class WorkflowSaver(EngineScoped):
             logger.warning(msg)
 
         # Preserve the workflow's existing metadata.
-        existing = workflow.metadata
+        existing = target.metadata
 
         # Delegate file generation and writing to the existing lower-level handler.
         save_file_request = SaveWorkflowFileFromSerializedFlowRequest(
@@ -676,7 +680,7 @@ class WorkflowSaver(EngineScoped):
         workflow_metadata = save_file_result.workflow_metadata
 
         # Update the registry entry with the new metadata.
-        workflow.metadata = workflow_metadata
+        target.metadata = workflow_metadata
 
         details = f"Successfully saved subflow '{request.flow_name}' to: {save_file_result.file_path}"
         return SaveSubflowToWorkflowResultSuccess(

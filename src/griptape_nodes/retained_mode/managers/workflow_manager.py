@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
     from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 T = TypeVar("T")
@@ -898,8 +899,29 @@ class WorkflowManager(EngineScoped):
         return await self.runner.run_workflow(relative_file_path)
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
-        """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""
-        return extract_workflow_shape(self.engine.flow_manager, workflow_name, flow_name)
+        """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.
+
+        Edge method for code not handed a workflow (node library publishers); engine code calls
+        `extract_workflow_shape_in`.
+
+        Raises:
+            KeyError: No workflow is open and `flow_name` names a flow, or no flow has that name.
+            ValueError: No workflow is open and no flow is named, or the flow has no Start or End node.
+        """
+        workflow = self.engine.open_workflows.sole_workflow_or_none()
+        if workflow is None and flow_name is not None:
+            details = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(details)
+        if workflow is None:
+            details = f"Workflow '{workflow_name}' does not have a top-level flow."
+            raise ValueError(details)
+        return self.extract_workflow_shape_in(workflow, workflow_name, flow_name)
+
+    def extract_workflow_shape_in(
+        self, workflow: WorkflowRuntime, workflow_name: str, flow_name: str | None = None
+    ) -> dict[str, Any]:
+        """Extracts the input and output shape of `workflow`. See `shape.extract_workflow_shape`."""
+        return extract_workflow_shape(self.engine.flow_manager, workflow, workflow_name, flow_name)
 
     def _walk_object_tree(
         self, obj: Any, process_class_fn: Callable[[type, Any], None], visited: set[int] | None = None
