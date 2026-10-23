@@ -1334,7 +1334,7 @@ class NodeManager(EngineScoped):
                 return _FlowCancelOutcome(failure=DeleteNodeResultFailure(result_details=details))
 
         # Clear the execution queue, because we don't want to hit this node eventually.
-        parent_flow.clear_execution_queue()
+        self.engine.flow_manager.clear_execution_queue_in(workflow, parent_flow)
         return _FlowCancelOutcome(cancelled_for_node_name=entangled_node_name)
 
     def _find_entangled_live_node(self, workflow: WorkflowRuntime, node: BaseNode) -> str | None:
@@ -3003,7 +3003,7 @@ class NodeManager(EngineScoped):
             # Pass the value through to connected downstream parameters!
             # Set incoming_connection_source fields to identify this as legitimate upstream value propagation
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
-            conn_output_nodes = parent_flow.get_connected_output_parameters(node, parameter)
+            conn_output_nodes = self.engine.flow_manager.get_connected_output_parameters_in(workflow, node, parameter)
             for target_node, target_parameter in conn_output_nodes:
                 # Skip propagation for:
                 # 1. Control Parameters as they should not receive values
@@ -3042,7 +3042,7 @@ class NodeManager(EngineScoped):
                 )
                 if is_control:
                     continue
-                conn_targets = parent_flow.get_connected_output_parameters(node, output_param)
+                conn_targets = self.engine.flow_manager.get_connected_output_parameters_in(workflow, node, output_param)
                 for target_node, target_parameter in conn_targets:
                     if target_node.lock:
                         continue
@@ -4297,7 +4297,7 @@ class NodeManager(EngineScoped):
             details = f'Failed to validate node dependencies. Flow with "{flow_name}" does not exist.'
             return ValidateNodeDependenciesResultFailure(result_details=details)
         # Gets all dependent nodes
-        nodes = flow.get_node_dependencies(node)
+        nodes = self.engine.flow_manager.get_node_dependencies_in(workflow, node)
         all_exceptions = []
         for dependent_node in nodes:
             exceptions = dependent_node.validate_before_workflow_run()

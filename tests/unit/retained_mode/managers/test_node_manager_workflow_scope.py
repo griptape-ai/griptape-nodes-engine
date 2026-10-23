@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
     SetParameterValueResultSuccess,
+)
+from griptape_nodes.retained_mode.events.validation_events import (
+    ValidateNodeDependenciesRequest,
+    ValidateNodeDependenciesResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -128,6 +133,35 @@ def _create_node(engine: Engine, flow_name: str, node_name: str, open_workflow_i
     return result.node_name
 
 
+def _other_workflow_with_connected_nodes(engine: Engine) -> WorkflowRuntime:
+    """A workflow that is not the open one, holding "source" connected to "target" in flow "elsewhere"."""
+    _open_workflow(engine)
+    _create_canvas(engine)
+    other = WorkflowRuntime("other", engine)
+    engine.flow_manager.on_create_flow_request(CreateFlowRequest(parent_flow_name=None, flow_name="elsewhere"), other)
+    for node_name in ("source", "target"):
+        created = engine.node_manager.on_create_node_request(
+            CreateNodeRequest(node_type="_ValueNode", node_name=node_name, override_parent_flow_name="elsewhere"),
+            other,
+        )
+        assert isinstance(created, CreateNodeResultSuccess), created.result_details
+    source = engine.node_manager.get_node_by_name_in(other, "source")
+    target = engine.node_manager.get_node_by_name_in(other, "target")
+    source_parameter = source.get_parameter_by_name("value")
+    target_parameter = target.get_parameter_by_name("value")
+    assert source_parameter is not None
+    assert target_parameter is not None
+    other.flows.connections.add_connection(source, source_parameter, target, target_parameter)
+    return other
+
+
+@contextmanager
+def _also_open(engine: Engine, workflow: WorkflowRuntime) -> Iterator[None]:
+    """Run with `workflow` open beside the open one, so nothing can fall back to a sole open workflow."""
+    with patch.dict(engine.open_workflows._by_id, {workflow.workflow_id: workflow}):
+        yield
+
+
 class TestNodeManagerScopes:
     def test_every_handler_declares_its_scope(self) -> None:
         scopes = {
@@ -194,6 +228,56 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         assert other.objects.has("node")
         assert engine.current_workflow().nodes.name_to_parent_flow_name == {}
         assert not engine.object_manager.has_object_with_name("node")
+
+    def test_setting_a_value_passes_it_through_the_connections_of_the_workflow_it_is_handed(
+        self, engine: Engine
+    ) -> None:
+        other = _other_workflow_with_connected_nodes(engine)
+
+        with _also_open(engine, other):
+            result = engine.node_manager.on_set_parameter_value_request_in_workflow(
+                SetParameterValueRequest(parameter_name="value", value="hi", node_name="source"), other
+            )
+
+        assert isinstance(result, SetParameterValueResultSuccess), result.result_details
+        assert engine.node_manager.get_node_by_name_in(other, "target").get_parameter_value("value") == "hi"
+
+    def test_validating_dependencies_follows_the_connections_of_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        other = _other_workflow_with_connected_nodes(engine)
+        source = engine.node_manager.get_node_by_name_in(other, "source")
+        target = engine.node_manager.get_node_by_name_in(other, "target")
+        problem = ValueError("source is not ready")
+
+        with (
+            _also_open(engine, other),
+            patch.object(source, "validate_before_workflow_run", return_value=[problem]),
+            patch.object(target, "validate_before_workflow_run", return_value=[]),
+        ):
+            result = engine.node_manager.on_validate_node_dependencies_request(
+                ValidateNodeDependenciesRequest(node_name="target"), other
+            )
+
+        assert isinstance(result, ValidateNodeDependenciesResultSuccess), result.result_details
+        assert result.exceptions == [problem]
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_node_mid_run_clears_the_run_queue_of_the_workflow_it_is_handed(
+        self, engine: Engine
+    ) -> None:
+        other = _other_workflow_with_connected_nodes(engine)
+        running_machine = MagicMock()
+        running_machine.context.flow_name = "elsewhere"
+        other.flows.global_control_flow_machine = running_machine
+        other.flows.global_flow_queue.put(MagicMock())
+
+        with (
+            _also_open(engine, other),
+            patch.object(engine.node_manager, "_find_entangled_live_node", return_value=None),
+        ):
+            result = await engine.node_manager.on_delete_node_request(DeleteNodeRequest(node_name="target"), other)
+
+        assert isinstance(result, DeleteNodeResultSuccess), result.result_details
+        assert other.flows.global_flow_queue.empty()
 
     @pytest.mark.asyncio
     async def test_a_worker_runs_a_node_with_no_workflow_open(self, engine: Engine) -> None:
