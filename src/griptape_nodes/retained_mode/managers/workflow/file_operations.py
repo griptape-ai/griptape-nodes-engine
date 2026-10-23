@@ -48,14 +48,15 @@ class WorkflowFileOperations(EngineScoped):
 
     @handles(DeleteWorkflowRequest)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
-        # If the deleted workflow is the active one, tear down its flows/nodes and
-        # pop the context stack BEFORE removing the registry entry, so downstream
-        # `DeleteFlowRequest` calls can still push a flow context (they require an
-        # active workflow). Non-active deletes (e.g. published-workflow subprocess
-        # cleanup) skip this and go straight to the registry/file cleanup.
-        context_manager = self.engine.context_manager
-        if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == request.name:
-            await self.engine.aclose_workflow(self.engine.current_workflow())
+        # If the deleted workflow is open, tear down its flows/nodes and close it BEFORE
+        # removing the registry entry, which refuses to drop an open workflow's entry.
+        # Deleting a workflow that isn't open (e.g. published-workflow subprocess cleanup)
+        # goes straight to the registry/file cleanup and leaves any open workflow alone.
+        target = self.engine.workflow_registry.find_by_name(request.name)
+        if target is not None:
+            open_target = self.engine.open_workflows.find(target.workflow_id)
+            if open_target is not None:
+                await self.engine.aclose_workflow(open_target)
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.name)
             self.engine.workflow_registry.remove(workflow.workflow_id)
