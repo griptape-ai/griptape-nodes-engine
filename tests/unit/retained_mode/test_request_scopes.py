@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -170,6 +171,22 @@ class TestScopesThatTakeAWorkflow:
         assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
         assert result_event.open_workflow_id == NOT_OPEN_ID
         assert calls.workflows == []
+
+    @pytest.mark.asyncio
+    async def test_an_addressing_failure_logs_at_the_request_s_failure_log_level(
+        self, engine: Engine, calls: _Calls, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A caller that expects the miss can quiet it, as for any failure its handler returns."""
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            result_event = await engine.event_manager.ahandle_request(
+                _ScopeProbeRequest(failure_log_level=logging.DEBUG)
+            )
+
+        assert isinstance(result_event.result, GenericResultFailure)
+        records = [record for record in caplog.records if "none is open" in record.getMessage()]
+        assert [record.levelno for record in records] == [logging.DEBUG]
 
     @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
     def test_no_envelope_id_takes_the_callers_binding(self, engine: Engine, calls: _Calls, scope: RequestScope) -> None:
