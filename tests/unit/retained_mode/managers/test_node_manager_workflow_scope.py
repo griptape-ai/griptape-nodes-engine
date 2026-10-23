@@ -31,9 +31,12 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
+    ConversionConfig,
     GetParameterValueRequest,
     GetParameterValueResultFailure,
     GetParameterValueResultSuccess,
+    MigrateParameterRequest,
+    MigrateParameterResultSuccess,
     RemoveParameterFromNodeRequest,
     RemoveParameterFromNodeResultFailure,
     RemoveParameterFromNodeResultSuccess,
@@ -278,6 +281,98 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
 
         assert isinstance(result, DeleteNodeResultSuccess), result.result_details
         assert other.flows.global_flow_queue.empty()
+
+    def test_migrating_through_a_conversion_node_builds_it_in_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        other = _other_workflow_with_connected_nodes(engine)
+        created = engine.node_manager.on_create_node_request(
+            CreateNodeRequest(
+                node_type="_ValueNode",
+                node_name="replacement",
+                override_parent_flow_name="elsewhere",
+                metadata={"position": {"x": 500, "y": 300}, "size": {"width": 200, "height": 100}},
+            ),
+            other,
+        )
+        assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        other.context.push_flow(engine.flow_manager.get_flow_by_name_in(other, "elsewhere"))
+        conversion = ConversionConfig(
+            library=_LIBRARY_NAME,
+            node_type="_ValueNode",
+            input_parameter="value",
+            output_parameter="value",
+            offset_x=-300,
+        )
+
+        with _also_open(engine, other):
+            result = engine.node_manager.on_migrate_parameter_request(
+                MigrateParameterRequest(
+                    source_node_name="target",
+                    target_node_name="replacement",
+                    source_parameter_name="value",
+                    target_parameter_name="value",
+                    input_conversion=conversion,
+                ),
+                other,
+            )
+
+        assert isinstance(result, MigrateParameterResultSuccess), result.result_details
+        converter = engine.node_manager.get_node_by_name_in(other, "replacement_value_input_converter")
+        assert converter.metadata["position"] == {"x": 200, "y": 350}
+        assert engine.node_manager.get_node_by_name_in(other, "replacement").lock
+        pairs = {
+            (connection.source_node.name, connection.target_node.name)
+            for connection in other.flows.connections.connections.values()
+        }
+        assert pairs == {("source", converter.name), (converter.name, "replacement")}
+
+    def test_migrating_through_an_output_conversion_node_in_the_open_workflow(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        flow_name = _create_canvas(engine)
+        feeder = _create_node(engine, flow_name, "feeder")
+        old_node = _create_node(engine, flow_name, "old")
+        downstream = _create_node(engine, flow_name, "downstream")
+        replacement = _create_node(engine, flow_name, "replacement")
+        workflow = engine.current_workflow()
+        engine.node_manager.get_node_by_name_in(workflow, replacement).metadata.update(
+            {"position": {"x": 500, "y": 300}, "size": {"width": 200, "height": 100}}
+        )
+        for source_node_name, target_node_name in ((feeder, old_node), (old_node, downstream)):
+            connected = engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=source_node_name,
+                    source_parameter_name="value",
+                    target_node_name=target_node_name,
+                    target_parameter_name="value",
+                )
+            )
+            assert isinstance(connected, CreateConnectionResultSuccess), connected.result_details
+        conversion = ConversionConfig(
+            library=_LIBRARY_NAME,
+            node_type="_ValueNode",
+            input_parameter="value",
+            output_parameter="value",
+            offset_y=20,
+        )
+
+        result = engine.handle_request(
+            MigrateParameterRequest(
+                source_node_name=old_node,
+                target_node_name=replacement,
+                source_parameter_name="value",
+                target_parameter_name="value",
+                output_conversion=conversion,
+            )
+        )
+
+        assert isinstance(result, MigrateParameterResultSuccess), result.result_details
+        converter = engine.node_manager.get_node_by_name_in(workflow, "replacement_value_output_converter")
+        assert converter.metadata["position"] == {"x": 700, "y": 370}
+        assert engine.node_manager.get_node_by_name_in(workflow, replacement).lock
+        pairs = {
+            (connection.source_node.name, connection.target_node.name)
+            for connection in workflow.flows.connections.connections.values()
+        }
+        assert pairs == {(feeder, replacement), (replacement, converter.name), (converter.name, downstream)}
 
     @pytest.mark.asyncio
     async def test_a_worker_runs_a_node_with_no_workflow_open(self, engine: Engine) -> None:
