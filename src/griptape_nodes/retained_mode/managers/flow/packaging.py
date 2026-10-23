@@ -151,14 +151,14 @@ class FlowPackaging(EngineScoped):
             return library_version
 
         # Step 3: Validate all nodes exist
-        validation_result = self._validate_multi_node_request(request)
+        validation_result = self._validate_multi_node_request(workflow, request)
         if validation_result is not None:
             return validation_result
 
         # Get the actual node objects for processing
         nodes_to_package = []
         for node_name in request.node_names:
-            node = self.engine.node_manager.get_node_by_name(node_name)
+            node = self.engine.node_manager.get_node_by_name_in(workflow, node_name)
             nodes_to_package.append(node)
 
         # Step 4: Initialize tracking variables and mappings (moved up so package node serialization can use them)
@@ -200,7 +200,7 @@ class FlowPackaging(EngineScoped):
         node_group_node: SubflowNodeGroup | None = None
         if request.node_group_name:
             try:
-                node = self.engine.node_manager.get_node_by_name(request.node_group_name)
+                node = self.engine.node_manager.get_node_by_name_in(workflow, request.node_group_name)
                 if isinstance(node, SubflowNodeGroup):
                     node_group_node = node
             except Exception as e:
@@ -208,6 +208,7 @@ class FlowPackaging(EngineScoped):
 
         # Step 9: Create start node with parameters for external incoming connections
         start_node_result = self._create_multi_node_start_node_with_connections(
+            workflow,
             request=request,
             library_version=library_version,
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
@@ -363,14 +364,14 @@ class FlowPackaging(EngineScoped):
         return start_end_library_metadata.library_version
 
     def _validate_multi_node_request(
-        self, request: PackageNodesAsSerializedFlowRequest
+        self, workflow: WorkflowRuntime, request: PackageNodesAsSerializedFlowRequest
     ) -> PackageNodesAsSerializedFlowResultFailure | None:
         """Validate that all requested nodes exist and control flow configuration is valid."""
         # Validate all nodes exist
         missing_nodes = []
         for node_name in request.node_names:
             try:
-                self.engine.node_manager.get_node_by_name(node_name)
+                self.engine.node_manager.get_node_by_name_in(workflow, node_name)
             except Exception:
                 missing_nodes.append(node_name)
 
@@ -1012,6 +1013,7 @@ class FlowPackaging(EngineScoped):
 
     def _create_multi_node_start_node_with_connections(  # noqa: PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         request: PackageNodesAsSerializedFlowRequest,
         library_version: str,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
@@ -1059,6 +1061,7 @@ class FlowPackaging(EngineScoped):
         #  4. Create a connection from the Start Node to the package node
         for target_node_name, connection_analysis in external_connections_dict.items():
             result = self._create_start_node_parameters_and_connections_for_incoming_data(
+                workflow,
                 target_node_name=target_node_name,
                 incoming_data_connections=connection_analysis.incoming_data_connections,
                 output_parameter_prefix=request.output_parameter_prefix,
@@ -1085,6 +1088,7 @@ class FlowPackaging(EngineScoped):
 
         # Create all control connections
         control_connections = self._create_start_node_control_connections(
+            workflow,
             request=request,
             start_node_uuid=start_node_uuid,
             node_name_to_uuid=node_name_to_uuid,
@@ -1237,6 +1241,7 @@ class FlowPackaging(EngineScoped):
 
     def _create_start_node_parameters_and_connections_for_incoming_data(  # noqa: PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         target_node_name: str,
         incoming_data_connections: list[IncomingConnection],
         output_parameter_prefix: str,
@@ -1270,7 +1275,7 @@ class FlowPackaging(EngineScoped):
 
             # Get the source node to determine parameter type (from the external connection)
             try:
-                source_node = self.engine.node_manager.get_node_by_name(connection.source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, connection.source_node_name)
             except ValueError as err:
                 details = f"Attempted to package nodes as serialized flow. Failed because source node '{connection.source_node_name}' from incoming connection could not be found. Error: {err}."
                 return PackageNodesAsSerializedFlowResultFailure(result_details=details)
@@ -1340,6 +1345,7 @@ class FlowPackaging(EngineScoped):
 
     def _create_start_node_control_connections(
         self,
+        workflow: WorkflowRuntime,
         request: PackageNodesAsSerializedFlowRequest,
         start_node_uuid: SerializedNodeCommands.NodeUUID,
         node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
@@ -1347,6 +1353,7 @@ class FlowPackaging(EngineScoped):
         """Create control connection from start node to entry control node.
 
         Args:
+            workflow: The workflow the packaged nodes are in
             request: The packaging request with control flow configuration
             start_node_uuid: UUID of the start node
             node_name_to_uuid: Mapping of node names to UUIDs for lookup
@@ -1359,7 +1366,7 @@ class FlowPackaging(EngineScoped):
         # Connect start node to specified entry control node (if specified)
         if request.entry_control_node_name:
             # Get the entry node (already validated to exist)
-            entry_node = self.engine.node_manager.get_node_by_name(request.entry_control_node_name)
+            entry_node = self.engine.node_manager.get_node_by_name_in(workflow, request.entry_control_node_name)
             entry_node_uuid = node_name_to_uuid[request.entry_control_node_name]
 
             # Connect start node to specified entry control node
