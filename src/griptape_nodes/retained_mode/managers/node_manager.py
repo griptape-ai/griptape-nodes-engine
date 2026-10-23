@@ -210,6 +210,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AlterParameterGroupDetailsRequest,
     AlterParameterGroupDetailsResultFailure,
     AlterParameterGroupDetailsResultSuccess,
+    ConversionConfig,
     GetCompatibleParametersRequest,
     GetCompatibleParametersResultFailure,
     GetCompatibleParametersResultSuccess,
@@ -258,7 +259,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
-from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.retained_mode.retained_mode import OffsetSide, calculate_relative_position
 from griptape_nodes.serialization.commands import (
     ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES,
     CommandsFormatError,
@@ -6058,14 +6059,12 @@ class NodeManager(EngineScoped):
 
         # Create the intermediate node
         offset_side = input_conversion.offset_side or "left"
-        create_node_result = RetainedMode.create_node_relative_to(
+        create_node_result = self._create_conversion_node_beside(
+            workflow,
             reference_node_name=request.target_node_name,
-            new_node_type=input_conversion.node_type,
             new_node_name=intermediate_node_name,
-            specific_library_name=input_conversion.library,
+            conversion=input_conversion,
             offset_side=offset_side,  # type: ignore[arg-type]
-            offset_x=input_conversion.offset_x,
-            offset_y=input_conversion.offset_y,
         )
 
         if not isinstance(create_node_result, str):
@@ -6157,14 +6156,12 @@ class NodeManager(EngineScoped):
 
         # Create the intermediate node
         offset_side = output_conversion.offset_side or "right"
-        create_node_result = RetainedMode.create_node_relative_to(
+        create_node_result = self._create_conversion_node_beside(
+            workflow,
             reference_node_name=request.target_node_name,
-            new_node_type=output_conversion.node_type,
             new_node_name=intermediate_node_name,
-            specific_library_name=output_conversion.library,
+            conversion=output_conversion,
             offset_side=offset_side,  # type: ignore[arg-type]
-            offset_x=output_conversion.offset_x,
-            offset_y=output_conversion.offset_y,
         )
 
         if not isinstance(create_node_result, str):
@@ -6217,6 +6214,57 @@ class NodeManager(EngineScoped):
                 )
 
         return None
+
+    def _create_conversion_node_beside(
+        self,
+        workflow: WorkflowRuntime,
+        *,
+        reference_node_name: str,
+        new_node_name: str,
+        conversion: ConversionConfig,
+        offset_side: OffsetSide,
+    ) -> str | ResultPayload:
+        """Create a conversion node beside the reference node, in its group, and lock the reference node.
+
+        Returns the new node's name, or the failed result of the step that stopped it.
+        """
+        get_metadata_result = workflow.handle_request(GetNodeMetadataRequest(node_name=reference_node_name))
+        if not isinstance(get_metadata_result, GetNodeMetadataResultSuccess):
+            return get_metadata_result
+        reference_position = get_metadata_result.metadata.get("position", {"x": 0, "y": 0})
+        reference_size = get_metadata_result.metadata.get("size", {"width": 200, "height": 100})
+
+        parent_group_name = None
+        reference_node = workflow.objects.get_as_type(reference_node_name, BaseNode)
+        if reference_node is not None and reference_node.parent_group is not None:
+            parent_group_name = reference_node.parent_group.name
+
+        create_result = workflow.handle_request(
+            CreateNodeRequest(
+                node_name=new_node_name,
+                node_type=conversion.node_type,
+                specific_library_name=conversion.library,
+                parent_group_name=parent_group_name,
+            )
+        )
+        if not isinstance(create_result, CreateNodeResultSuccess):
+            return create_result
+        created_node_name = create_result.node_name
+
+        new_position = calculate_relative_position(
+            reference_position, reference_size, offset_side, conversion.offset_x, conversion.offset_y, swap=False
+        )
+        set_metadata_result = workflow.handle_request(
+            SetNodeMetadataRequest(node_name=created_node_name, metadata={"position": new_position})
+        )
+        if not isinstance(set_metadata_result, SetNodeMetadataResultSuccess):
+            return set_metadata_result
+
+        lock_result = workflow.handle_request(SetLockNodeStateRequest(node_name=reference_node_name, lock=True))
+        if not isinstance(lock_result, SetLockNodeStateResultSuccess):
+            return lock_result
+
+        return created_node_name
 
     def _create_direct_outgoing_connections(
         self,

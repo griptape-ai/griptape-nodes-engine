@@ -95,6 +95,52 @@ MIN_NODES = 2
 logger = logging.getLogger("griptpae_nodes_engine")
 
 
+def calculate_relative_position(  # noqa: PLR0913
+    base_position: dict,
+    base_size: dict,
+    offset_side: OffsetSide,
+    offset_x: int,
+    offset_y: int,
+    *,
+    swap: bool,
+) -> dict:
+    """Calculate position based on offset_side and offsets."""
+    if swap:
+        # For swap mode, offset_x/offset_y are additional pixel spacing between nodes
+        # Formula: reference_position - reference_size + offset  # noqa: ERA001
+        x_offset = base_position["x"] - base_size["width"] + offset_x
+        y_offset = base_position["y"] - base_size["height"] + offset_y
+        x_center = base_position["x"] - base_size["width"] // 2 + offset_x
+        y_center = base_position["y"] - base_size["height"] // 2 + offset_y
+        x_right = base_position["x"] + offset_x
+        y_bottom = base_position["y"] + offset_y
+    else:
+        # Absolute pixel offsets (normal mode)
+        effective_offset_x = offset_x
+        effective_offset_y = offset_y
+        # Calculate base offsets for each side (relative to reference node position)
+        x_offset = base_position["x"] + effective_offset_x
+        y_offset = base_position["y"] + effective_offset_y
+        x_center = base_position["x"] + base_size["width"] // 2 + effective_offset_x
+        y_center = base_position["y"] + base_size["height"] // 2 + effective_offset_y
+        x_right = base_position["x"] + base_size["width"] + effective_offset_x
+        y_bottom = base_position["y"] + base_size["height"] + effective_offset_y
+
+    # Position mapping
+    positions = {
+        "top_left": {"x": x_offset, "y": y_offset},
+        "top": {"x": x_center, "y": y_offset},
+        "top_right": {"x": x_right, "y": y_offset},
+        "right": {"x": x_right, "y": y_center},
+        "bottom_right": {"x": x_right, "y": y_bottom},
+        "bottom": {"x": x_center, "y": y_bottom},
+        "bottom_left": {"x": x_offset, "y": y_bottom},
+        "left": {"x": x_offset, "y": y_center},
+    }
+
+    return positions.get(offset_side, positions["right"])  # Default to right
+
+
 def node_param_split(node_and_param: str) -> tuple[str, str]:
     """Split a string in format 'node.param' into node and param.
 
@@ -694,14 +740,14 @@ class RetainedMode:
             return create_result
 
         # Calculate position based on offset_side and offsets
-        new_position = cls._calculate_relative_position(
+        new_position = calculate_relative_position(
             reference_position, reference_size, offset_side, offset_x, offset_y, swap=swap
         )
 
         if swap:
             # Swap mode: Create new node at reference position, move reference node relative to new node
             new_position = reference_position
-            reference_new_position = cls._calculate_relative_position(
+            reference_new_position = calculate_relative_position(
                 new_position, reference_size, offset_side, offset_x, offset_y, swap=swap
             )
 
@@ -725,7 +771,7 @@ class RetainedMode:
 
         else:
             # Normal mode: Create new node relative to reference node
-            new_position = cls._calculate_relative_position(
+            new_position = calculate_relative_position(
                 reference_position, reference_size, offset_side, offset_x, offset_y, swap=swap
             )
 
@@ -745,53 +791,6 @@ class RetainedMode:
                 logger.warning(msg)
                 return set_lock_node_state_result
         return new_node_name
-
-    @classmethod
-    def _calculate_relative_position(  # noqa: PLR0913
-        cls,
-        base_position: dict,
-        base_size: dict,
-        offset_side: OffsetSide,
-        offset_x: int,
-        offset_y: int,
-        *,
-        swap: bool,
-    ) -> dict:
-        """Calculate position based on offset_side and offsets."""
-        if swap:
-            # For swap mode, offset_x/offset_y are additional pixel spacing between nodes
-            # Formula: reference_position - reference_size + offset  # noqa: ERA001
-            x_offset = base_position["x"] - base_size["width"] + offset_x
-            y_offset = base_position["y"] - base_size["height"] + offset_y
-            x_center = base_position["x"] - base_size["width"] // 2 + offset_x
-            y_center = base_position["y"] - base_size["height"] // 2 + offset_y
-            x_right = base_position["x"] + offset_x
-            y_bottom = base_position["y"] + offset_y
-        else:
-            # Absolute pixel offsets (normal mode)
-            effective_offset_x = offset_x
-            effective_offset_y = offset_y
-            # Calculate base offsets for each side (relative to reference node position)
-            x_offset = base_position["x"] + effective_offset_x
-            y_offset = base_position["y"] + effective_offset_y
-            x_center = base_position["x"] + base_size["width"] // 2 + effective_offset_x
-            y_center = base_position["y"] + base_size["height"] // 2 + effective_offset_y
-            x_right = base_position["x"] + base_size["width"] + effective_offset_x
-            y_bottom = base_position["y"] + base_size["height"] + effective_offset_y
-
-        # Position mapping
-        positions = {
-            "top_left": {"x": x_offset, "y": y_offset},
-            "top": {"x": x_center, "y": y_offset},
-            "top_right": {"x": x_right, "y": y_offset},
-            "right": {"x": x_right, "y": y_center},
-            "bottom_right": {"x": x_right, "y": y_bottom},
-            "bottom": {"x": x_center, "y": y_bottom},
-            "bottom_left": {"x": x_offset, "y": y_bottom},
-            "left": {"x": x_offset, "y": y_center},
-        }
-
-        return positions.get(offset_side, positions["right"])  # Default to right
 
     @classmethod
     def migrate_parameter(  # noqa: PLR0913, PLR0917
