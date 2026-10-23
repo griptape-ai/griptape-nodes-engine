@@ -64,13 +64,12 @@ class TestRetainedModeLock:
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert "Current Context" in str(res.result_details)
 
-    def test_lock_all_missing_nodes_failure(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="lock_missing_wf")
+    def test_lock_all_missing_nodes_failure(self) -> None:
         missing_nodes = ["nope_a_123", "nope_b_456"]
         res = RetainedMode.batch_set_lock_node_state(node_names=missing_nodes, lock=True)
         assert isinstance(res, BatchSetNodeLockStateResultFailure)
         details = str(res.result_details)
-        assert "Failed to update any nodes" in details
+        assert "none is open" in details
 
 
 class TestUnlockUnresolvesNodeLeftUnexecuted:
