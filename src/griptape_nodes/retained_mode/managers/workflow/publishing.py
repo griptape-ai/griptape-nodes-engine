@@ -25,7 +25,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     SaveWorkflowRequest,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -41,7 +41,7 @@ class WorkflowPublishing(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(GetPublishOptionsRequest)
+    @handles(GetPublishOptionsRequest, scope=RequestScope.HOST)
     def on_get_publish_options_request(self, request: GetPublishOptionsRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.resolve_address(
@@ -79,7 +79,7 @@ class WorkflowPublishing(EngineScoped):
             result_details="No custom publish options for this publisher.",
         )
 
-    @handles(PublishWorkflowRequest)
+    @handles(PublishWorkflowRequest, scope=RequestScope.HOST)
     async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.resolve_address(

@@ -32,7 +32,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ResetWorkflowBranchResultFailure,
     ResetWorkflowBranchResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -60,7 +60,7 @@ class WorkflowBranching(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(BranchWorkflowRequest)
+    @handles(BranchWorkflowRequest, scope=RequestScope.HOST)
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a branch (copy) of an existing workflow with branch tracking."""
         try:
@@ -181,7 +181,7 @@ class WorkflowBranching(EngineScoped):
             traceback.print_exc()
             return BranchWorkflowResultFailure(result_details=details)
 
-    @handles(CreateWorkflowFromTemplateRequest)
+    @handles(CreateWorkflowFromTemplateRequest, scope=RequestScope.HOST)
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template or from a workflow a library provides.
 
@@ -281,7 +281,7 @@ class WorkflowBranching(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
-    @handles(MergeWorkflowBranchRequest)
+    @handles(MergeWorkflowBranchRequest, scope=RequestScope.HOST)
     def on_merge_workflow_branch_request(self, request: MergeWorkflowBranchRequest) -> ResultPayload:  # noqa: C901, PLR0911
         """Merge a branch back into its source workflow, removing the branch when complete."""
         try:
@@ -403,7 +403,7 @@ class WorkflowBranching(EngineScoped):
             details = f"Failed to merge branch workflow '{branch_workflow_name}' into source workflow '{source_workflow_name}': {e!s}"
             return MergeWorkflowBranchResultFailure(result_details=details)
 
-    @handles(ResetWorkflowBranchRequest)
+    @handles(ResetWorkflowBranchRequest, scope=RequestScope.HOST)
     def on_reset_workflow_branch_request(self, request: ResetWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Reset a branch to match its source workflow, discarding branch changes."""
         try:
@@ -505,7 +505,7 @@ class WorkflowBranching(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
-    @handles(CompareWorkflowsRequest)
+    @handles(CompareWorkflowsRequest, scope=RequestScope.HOST)
     def on_compare_workflows_request(self, request: CompareWorkflowsRequest) -> ResultPayload:
         """Compare two workflows to determine if one is ahead, behind, or up-to-date relative to the other."""
         registry = self.engine.workflow_registry

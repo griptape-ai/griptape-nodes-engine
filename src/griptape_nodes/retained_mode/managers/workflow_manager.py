@@ -94,7 +94,7 @@ from griptape_nodes.retained_mode.managers.workflow.saving import (
 )
 from griptape_nodes.retained_mode.managers.workflow.shape import extract_workflow_shape
 from griptape_nodes.retained_mode.managers.workflow.variable_substitution import VariableSubstitution
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
@@ -447,7 +447,7 @@ class WorkflowManager(EngineScoped):
                 existing_workflows.append(full_path)
             config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
 
-    @handles(RegisterWorkflowRequest)
+    @handles(RegisterWorkflowRequest, scope=RequestScope.HOST)
     def on_register_workflow_request(self, request: RegisterWorkflowRequest) -> ResultPayload:
         # The registry name is derived from the file path (minus extension), independent of the display name.
         registry_key = derive_registry_key(request.file_name)
@@ -505,7 +505,7 @@ class WorkflowManager(EngineScoped):
         )
         return repaired_name
 
-    @handles(ImportWorkflowRequest)
+    @handles(ImportWorkflowRequest, scope=RequestScope.HOST)
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
         load_metadata_request = LoadWorkflowMetadata(file_name=request.file_path)
@@ -545,7 +545,7 @@ class WorkflowManager(EngineScoped):
             ),
         )
 
-    @handles(LoadWorkflowMetadata)
+    @handles(LoadWorkflowMetadata, scope=RequestScope.HOST)
     async def on_load_workflow_metadata_request(self, request: LoadWorkflowMetadata) -> ResultPayload:
         """Load a workflow's metadata, reporting every way it can be flawed or unusable."""
         complete_file_path = self.engine.config_manager.workspace_path.joinpath(request.file_name)
@@ -907,7 +907,7 @@ class WorkflowManager(EngineScoped):
         """Kept for node libraries that call it. See `WorkflowCodeGenerator.walk_object_tree`."""
         self.codegen.walk_object_tree(obj, process_class_fn, visited)
 
-    @handles(RefreshWorkflowRegistryRequest)
+    @handles(RefreshWorkflowRegistryRequest, scope=RequestScope.HOST)
     async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
         try:
             await self.refresh_workflow_registry()
@@ -915,7 +915,7 @@ class WorkflowManager(EngineScoped):
             return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
         return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
-    @handles(RegisterWorkflowsFromConfigRequest)
+    @handles(RegisterWorkflowsFromConfigRequest, scope=RequestScope.HOST)
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
     ) -> ResultPayload:

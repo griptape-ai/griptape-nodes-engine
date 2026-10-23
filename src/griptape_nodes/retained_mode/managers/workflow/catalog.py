@@ -80,7 +80,7 @@ class WorkflowCatalog(EngineScoped):
             workflows=workflows, result_details=f"Successfully retrieved {len(workflows)} workflows."
         )
 
-    @handles(ListCallableWorkflowsRequest)
+    @handles(ListCallableWorkflowsRequest, scope=RequestScope.HOST)
     async def on_list_callable_workflows_request(self, _request: ListCallableWorkflowsRequest) -> ResultPayload:
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -100,7 +100,7 @@ class WorkflowCatalog(EngineScoped):
             result_details=f"Successfully retrieved {len(callable_workflows)} callable workflows.",
         )
 
-    @handles(GetWorkflowInfoRequest)
+    @handles(GetWorkflowInfoRequest, scope=RequestScope.HOST)
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.resolve_address(
@@ -142,7 +142,7 @@ class WorkflowCatalog(EngineScoped):
             result_details=f"Successfully retrieved workflow info for '{workflow_file_path}'.",
         )
 
-    @handles(ListAllWorkflowInfoRequest)
+    @handles(ListAllWorkflowInfoRequest, scope=RequestScope.HOST)
     def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
@@ -169,7 +169,7 @@ class WorkflowCatalog(EngineScoped):
             result_details=f"Successfully retrieved workflow info for {len(workflow_infos)} workflows.",
         )
 
-    @handles(GetWorkflowMetadataRequest)
+    @handles(GetWorkflowMetadataRequest, scope=RequestScope.HOST)
     def on_get_workflow_metadata_request(self, request: GetWorkflowMetadataRequest) -> ResultPayload:
         # Every open workflow has an entry (a file opened from outside the workspace registers
         # unlisted), so the registry answers for it too.
@@ -187,7 +187,7 @@ class WorkflowCatalog(EngineScoped):
             result_details="Successfully retrieved workflow metadata.",
         )
 
-    @handles(SetWorkflowMetadataRequest)
+    @handles(SetWorkflowMetadataRequest, scope=RequestScope.HOST)
     async def on_set_workflow_metadata_request(self, request: SetWorkflowMetadataRequest) -> ResultPayload:  # noqa: PLR0911
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 

@@ -35,7 +35,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
     SaveWorkflowResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
@@ -53,13 +53,12 @@ class WorkflowFileOperations(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(DeleteWorkflowRequest)
+    @handles(DeleteWorkflowRequest, scope=RequestScope.HOST)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
-        # If the deleted workflow is the active one, tear down its flows/nodes and
-        # close it BEFORE removing the registry entry, so downstream
-        # `DeleteFlowRequest` calls can still push a flow context (they require an
-        # active workflow). Non-active deletes (e.g. published-workflow subprocess
-        # cleanup) skip this and go straight to the registry/file cleanup.
+        # If the deleted workflow is open, tear down its flows/nodes and close it BEFORE
+        # removing the registry entry, which refuses to drop an open workflow's entry.
+        # Deleting a workflow that isn't open (e.g. published-workflow subprocess cleanup)
+        # goes straight to the registry/file cleanup and leaves any open workflow alone.
         registry = self.engine.workflow_registry
         try:
             workflow = registry.resolve_address(
@@ -68,9 +67,9 @@ class WorkflowFileOperations(EngineScoped):
         except WorkflowAddressError as err:
             return DeleteWorkflowResultFailure(result_details=str(err))
 
-        context_manager = self.engine.context_manager
-        if context_manager.has_current_workflow() and context_manager.get_current_workflow_id() == workflow.workflow_id:
-            await self.engine.close_workflow_state(self.engine.open_workflows.sole_workflow())
+        open_target = self.engine.open_workflows.find_by_id(workflow.workflow_id)
+        if open_target is not None:
+            await self.engine.close_workflow_state(open_target)
         try:
             registry.remove(workflow.workflow_id)
         except Exception as e:
@@ -93,7 +92,7 @@ class WorkflowFileOperations(EngineScoped):
             result_details=ResultDetails(message=f"Successfully deleted workflow: {workflow.name}", level=logging.INFO)
         )
 
-    @handles(RenameWorkflowRequest)
+    @handles(RenameWorkflowRequest, scope=RequestScope.HOST)
     async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
         # The one lookup of the workflow being renamed. Everything below acts on this entry, so a
         # request addressed to one workflow can never save or delete another.
@@ -341,7 +340,7 @@ class WorkflowFileOperations(EngineScoped):
             return str(delete_result.result_details)
         return None
 
-    @handles(MoveWorkflowRequest)
+    @handles(MoveWorkflowRequest, scope=RequestScope.HOST)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
         try:
             workflow = self.engine.workflow_registry.resolve_address(

@@ -61,7 +61,7 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.workflow.loading import EPOCH_START
 from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeType
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -549,7 +549,7 @@ class WorkflowSaver(EngineScoped):
             return False
         return Path(resolved).exists()
 
-    @handles(SaveWorkflowFileFromSerializedFlowRequest)
+    @handles(SaveWorkflowFileFromSerializedFlowRequest, scope=RequestScope.HOST)
     async def on_save_workflow_file_from_serialized_flow_request(
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
