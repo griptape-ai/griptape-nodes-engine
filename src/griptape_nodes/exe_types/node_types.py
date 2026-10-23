@@ -231,6 +231,16 @@ def aprocess_scope(
         VariableResolver.reset_cache(cache_token)
 
 
+def get_running_node() -> BaseNode | None:
+    """The node whose `aprocess()` body is running in this context, or None outside one.
+
+    Carried by a ContextVar, so it holds in the node's own task and in threads started with
+    `asyncio.to_thread`, which copies the context. A bare `threading.Thread` starts with an empty
+    context and sees None.
+    """
+    return _running_node.get()
+
+
 class ImportDependency(NamedTuple):
     """Import dependency specification for a node.
 
