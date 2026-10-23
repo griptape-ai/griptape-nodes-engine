@@ -1412,7 +1412,13 @@ class TestRunSpecs:
 
     @pytest.mark.asyncio
     async def test_a_node_run_whose_node_is_gone_fails(self, engine: Engine) -> None:
-        spec = ResolveNodeSpec(request=ResolveNodeRequest(node_name="gone"), flow_name="flow", node_name="gone")
+        engine.context_manager.push_workflow("wf")
+        spec = ResolveNodeSpec(
+            request=ResolveNodeRequest(node_name="gone"),
+            workflow=engine.current_workflow(),
+            flow_name="flow",
+            node_name="gone",
+        )
 
         result = await spec.execute(engine)
 

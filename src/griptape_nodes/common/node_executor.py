@@ -4140,7 +4140,7 @@ class NodeExecutor(EngineScoped):
                 if target_node.should_preserve_stored_template(target_param_name, param_value):
                     self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
                 else:
-                    self.engine.node_manager.on_set_parameter_value_request(
+                    self.engine.node_manager.set_parameter_value(
                         SetParameterValueRequest(
                             node_name=target_node_name,
                             parameter_name=target_param_name,

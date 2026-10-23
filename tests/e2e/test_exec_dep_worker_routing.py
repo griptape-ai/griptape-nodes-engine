@@ -379,7 +379,7 @@ class TestUnshippableOutputIsKept:
 
         with simulated_worker(engine, "Guardrail Library") as worker:
             request = ExecuteNodeRequest(node_name="Producer", node_metadata=cast("NodeMetadata", dict(node.metadata)))
-            result = await engine.ahandle_request(sent_from_open_workflow(request, engine))
+            result = await engine.current_workflow().ahandle_request(sent_from_open_workflow(request, engine))
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         sent = result.parameter_output_values["session"]
