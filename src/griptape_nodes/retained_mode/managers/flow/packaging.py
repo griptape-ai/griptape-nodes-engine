@@ -126,7 +126,7 @@ class FlowPackaging(EngineScoped):
     def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         request: PackageNodesAsSerializedFlowRequest,
-        workflow: WorkflowRuntime,  # noqa: ARG002 (packaging reads the nodes through NodeManager)
+        workflow: WorkflowRuntime,
     ) -> ResultPayload:
         """Handle request to package multiple nodes as a serialized flow.
 
@@ -172,6 +172,7 @@ class FlowPackaging(EngineScoped):
 
         # Step 5: Serialize nodes with local execution environment to prevent recursive loops
         serialized_package_nodes = self._serialize_package_nodes_for_local_execution(
+            workflow,
             nodes_to_package=nodes_to_package,
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -191,7 +192,7 @@ class FlowPackaging(EngineScoped):
         self._inject_output_mode_for_property_parameters(nodes_to_package, serialized_package_nodes)
 
         # Step 7: Analyze external connections (connections from/to nodes outside our selection)
-        node_connections_dict = self._analyze_multi_node_external_connections(package_nodes=nodes_to_package)
+        node_connections_dict = self._analyze_multi_node_external_connections(workflow, package_nodes=nodes_to_package)
         if isinstance(node_connections_dict, PackageNodesAsSerializedFlowResultFailure):
             return node_connections_dict
 
@@ -394,6 +395,7 @@ class FlowPackaging(EngineScoped):
 
     def _serialize_package_nodes_for_local_execution(  # noqa: C901, PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         nodes_to_package: list[BaseNode],
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
@@ -406,6 +408,7 @@ class FlowPackaging(EngineScoped):
         """Serialize package nodes while temporarily setting execution environment to local to prevent recursive loops.
 
         Args:
+            workflow: The workflow the nodes are in
             nodes_to_package: List of nodes to serialize
             unique_parameter_uuid_to_values: Shared dictionary for deduplicating parameter values across all nodes
             serialized_parameter_value_tracker: Tracker for serialized parameter values
@@ -427,9 +430,9 @@ class FlowPackaging(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 include_existing_subflow_in_group=True,
-                values_supplied_by_connections=self._package_parameters_fed_by_connections(node),
+                values_supplied_by_connections=self._package_parameters_fed_by_connections(workflow, node),
             )
-            serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request)
+            serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request, workflow)
 
             if not isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
                 return PackageNodesAsSerializedFlowResultFailure(
@@ -476,6 +479,7 @@ class FlowPackaging(EngineScoped):
 
         # Get connections from the connection manager
         connections_result = self._get_internal_connections_for_package(
+            workflow,
             nodes_to_package=nodes_to_package,
             package_node_names_set=package_node_names_set,
             node_name_to_uuid=node_name_to_uuid,
@@ -488,7 +492,7 @@ class FlowPackaging(EngineScoped):
         serialized_node_commands.extend(serialized_node_group_commands)
         return serialized_node_commands
 
-    def _package_parameters_fed_by_connections(self, node: BaseNode) -> set[str]:
+    def _package_parameters_fed_by_connections(self, workflow: WorkflowRuntime, node: BaseNode) -> set[str]:
         """Names of the node's parameters whose values the packaged flow's connections will supply.
 
         A connected input gets its value inside the rebuilt flow before its node runs: from the Start
@@ -503,10 +507,11 @@ class FlowPackaging(EngineScoped):
         """
         if node.lock:
             return set()
-        return set(self.engine.flow_manager.get_connections().incoming_index.get(node.name, {}))
+        return set(workflow.flows.connections.incoming_index.get(node.name, {}))
 
     def _get_internal_connections_for_package(
         self,
+        workflow: WorkflowRuntime,
         nodes_to_package: list[BaseNode],
         package_node_names_set: set[str],
         node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
@@ -516,6 +521,7 @@ class FlowPackaging(EngineScoped):
         Queries connections from the connection manager for all nodes being packaged.
 
         Args:
+            workflow: The workflow the nodes are in
             nodes_to_package: List of nodes being packaged
             package_node_names_set: Set of node names in the package for O(1) lookup
             node_name_to_uuid: Mapping of node names to their UUIDs in the serialization
@@ -528,7 +534,7 @@ class FlowPackaging(EngineScoped):
         for node in nodes_to_package:
             list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
             list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-                list_connections_request
+                list_connections_request, workflow
             )
 
             if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -602,7 +608,7 @@ class FlowPackaging(EngineScoped):
                 serialized_node.element_modification_commands.extend(package_alter_parameter_commands)
 
     def _analyze_multi_node_external_connections(
-        self, package_nodes: list[BaseNode]
+        self, workflow: WorkflowRuntime, package_nodes: list[BaseNode]
     ) -> dict[str, ConnectionAnalysis] | PackageNodesAsSerializedFlowResultFailure:
         """Analyze external connections for each package node using filtered single-node analysis.
 
@@ -617,6 +623,7 @@ class FlowPackaging(EngineScoped):
         the set of package node names to the single-node analysis method.
 
         Args:
+            workflow: The workflow the nodes are in
             package_nodes: List of nodes being packaged together
 
         Returns:
@@ -629,6 +636,7 @@ class FlowPackaging(EngineScoped):
         for package_node in package_nodes:
             # Perform a single node analysis, filtering out internal connections
             connection_analysis = self._analyze_package_node_connections(
+                workflow,
                 package_node=package_node,
                 node_name=package_node.name,
                 package_node_names=package_node_names_set,
@@ -642,6 +650,7 @@ class FlowPackaging(EngineScoped):
 
     def _analyze_package_node_connections(
         self,
+        workflow: WorkflowRuntime,
         package_node: BaseNode,
         node_name: str,
         package_node_names: set[str] | None = None,
@@ -649,6 +658,7 @@ class FlowPackaging(EngineScoped):
         """Analyze package node connections and separate control from data connections.
 
         Args:
+            workflow: The workflow the node is in
             package_node: The node being analyzed
             node_name: Name of the node
             package_node_names: Set of node names in the package for filtering internal connections
@@ -657,7 +667,7 @@ class FlowPackaging(EngineScoped):
         # Get connection details using the standard approach
         list_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
         list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-            list_connections_request
+            list_connections_request, workflow
         )
 
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):

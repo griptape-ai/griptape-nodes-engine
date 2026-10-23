@@ -122,7 +122,7 @@ async def _execute(node_type: str, name: str, **parameter_values: object) -> Exe
         parameter_values=dict(parameter_values),
         node_metadata={"node_type": node_type, "library": WORKER_BEHAVIOR_LIBRARY_NAME},
     )
-    result = await engine.ahandle_request(sent_from_open_workflow(request, engine))
+    result = await engine.current_workflow().ahandle_request(sent_from_open_workflow(request, engine))
     assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
     return result
 

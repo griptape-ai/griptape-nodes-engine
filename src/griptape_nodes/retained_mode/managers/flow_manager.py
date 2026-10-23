@@ -958,7 +958,7 @@ class FlowManager(EngineScoped):
                 name_to_parent_name[flow_name] = new_name
 
         # Let the Node Manager know about the change, too.
-        self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
+        self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)
 
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
@@ -2651,12 +2651,12 @@ class FlowManager(EngineScoped):
             return False
         return self._flow_is_running(flows)
 
-    def running_flow_is_stopping_after_failure(self) -> bool:
-        """True while the running flow has failed and is waiting for its other nodes to finish."""
-        flows = self._current_flows_or_none()
-        if flows is None or flows.global_control_flow_machine is None:
+    def running_flow_is_stopping_after_failure(self, workflow: WorkflowRuntime) -> bool:
+        """True while the workflow's running flow has failed and is waiting for its other nodes to finish."""
+        machine = workflow.flows.global_control_flow_machine
+        if machine is None:
             return False
-        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -2844,15 +2844,10 @@ class FlowManager(EngineScoped):
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
-        """Run one node of the open workflow, joining the run in progress if there is one.
-
-        Edge method for code not handed a workflow.
-
-        Raises:
-            OpenWorkflowError: No workflow is open, or more than one is.
-        """
-        workflow = self.engine.current_workflow()
+    async def resolve_singular_node(
+        self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False
+    ) -> None:
+        """Run one node of the workflow, joining the run in progress if there is one."""
         flows = workflow.flows
         # We are now going to have different behavior depending on how the node is behaving.
         if self._flow_is_running(flows):

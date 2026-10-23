@@ -55,6 +55,7 @@ class _ValueNode(DataNode):
 
 class TestRetainedModeLock:
     def test_lock_without_current_context_returns_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="lock_no_node_wf")
         # Ensure empty current context for nodes
         ctx = engine.context_manager
         while ctx.has_current_node():
@@ -63,7 +64,8 @@ class TestRetainedModeLock:
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert "Current Context" in str(res.result_details)
 
-    def test_lock_all_missing_nodes_failure(self) -> None:
+    def test_lock_all_missing_nodes_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="lock_missing_wf")
         missing_nodes = ["nope_a_123", "nope_b_456"]
         res = RetainedMode.batch_set_lock_node_state(node_names=missing_nodes, lock=True)
         assert isinstance(res, BatchSetNodeLockStateResultFailure)
