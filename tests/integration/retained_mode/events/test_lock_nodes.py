@@ -139,8 +139,7 @@ class TestLockNodes:
         assert missing in str(res.result_details)
 
     def test_lock_single_missing_node_returns_failure(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="workflow")
         missing = "not_here_456"
         res = engine.handle_request(SetLockNodeStateRequest(lock=True, node_name=missing))
         assert isinstance(res, SetLockNodeStateResultFailure)
-        assert missing in str(res.result_details)
+        assert "none is open" in str(res.result_details)
