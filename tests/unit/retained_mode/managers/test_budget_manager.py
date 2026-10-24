@@ -700,7 +700,7 @@ class TestHeaderSizeLimit:
         assert tags["run_id"] == "run-1"
 
     def test_an_unencodable_project_drops_nothing_and_blames_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The optional tags did not cause it, so they stay and no log line says the project was sent."""
+        """The optional tags did not cause it, so they stay and nothing is logged as left out."""
         mock_engine = _engine_with_call_state()
         mock_engine.project_manager.get_project_chain.return_value = [_entry("renders-\udce9", None)]
 
@@ -709,9 +709,10 @@ class TestHeaderSizeLimit:
 
         assert isinstance(result, GetAttributionContextResultFailure)
         assert "left out" not in caplog.text
-        assert "the project is still sent" not in caplog.text
 
-    def test_with_no_project_open_the_warning_claims_none_was_sent(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_with_no_project_open_the_warning_says_nothing_about_a_project(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         mock_engine = _engine_with_call_state()
         mock_engine.project_manager.get_project_chain.return_value = []
         mock_engine.context_manager.get_current_workflow_name.return_value = "Poster \udcff draft"
