@@ -43,6 +43,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     ImageArtifactProvider,
 )
 from griptape_nodes.utils import ffmpeg_cache
+from tests.workflow_context import unsaved_workflow_open
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
@@ -90,6 +91,13 @@ def mock_config_writes(monkeypatch: pytest.MonkeyPatch) -> None:
         return original_handle_request(self, request)
 
     monkeypatch.setattr(Engine, "handle_request", selective_mock)
+
+
+@pytest.fixture(autouse=True)
+def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
+    """The default project's directories use `{workflow_dir?:/}`, which needs a workflow to resolve."""
+    with unsaved_workflow_open(engine):
+        yield
 
 
 class TestArtifactManager:

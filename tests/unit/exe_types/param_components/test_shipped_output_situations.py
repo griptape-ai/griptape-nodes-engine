@@ -5,6 +5,7 @@ they pin the on-disk layout the shipped macros produce. The mocked unit tests fo
 components cannot catch a macro that fails to resolve in a real project.
 """
 
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.param_components import project_directory_parameter, project_file_sequence_parameter
 from griptape_nodes.retained_mode.engine import Engine
+from tests.workflow_context import unsaved_workflow_open
 
 
 @pytest.fixture
@@ -19,6 +21,13 @@ def workspace(engine: Engine, tmp_path: Path) -> Path:
     """Point the engine's workspace at a temp directory and return it."""
     engine.config_manager.set_config_value("workspace_directory", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
+    """The default project's directories use `{workflow_dir?:/}`, which needs a workflow to resolve."""
+    with unsaved_workflow_open(engine):
+        yield
 
 
 class TestSaveFileSequenceSituation:

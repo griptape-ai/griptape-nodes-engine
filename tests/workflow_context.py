@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -46,3 +48,17 @@ def as_worker_process(engine: Engine) -> Iterator[None]:
     """
     with patch.dict(engine.open_workflows._by_id, {}, clear=True):
         yield
+
+
+@contextmanager
+def unsaved_workflow_open(engine: Engine) -> Iterator[Workflow]:
+    """Run with an unsaved workflow open that names no folder, so `{workflow_dir}` answers the workspace root.
+
+    For tests of path handlers that resolve the default project's `{workflow_dir?:/}` directories.
+    Closes whatever was open before and after.
+    """
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    try:
+        yield push_unsaved_workflow(engine)
+    finally:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

@@ -88,7 +88,7 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
     def list_names(_self: object, *, project_id: str | None = None) -> list[str]:  # noqa: ARG001
         return sorted(macros.keys())
 
-    def get_var(_self: object, name: str, *, project_id: str | None = None) -> FlowVariable | None:  # noqa: ARG001
+    def get_var(_self: object, _workflow: object, name: str, *, project_id: str | None = None) -> FlowVariable | None:  # noqa: ARG001
         if name not in macros:
             return None
         return _macro(name, macros[name])

@@ -146,7 +146,8 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -161,6 +162,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -233,6 +235,18 @@ BUILTIN_VARIABLES = frozenset(var.name for var in _BUILTIN_VARIABLE_DEFINITIONS)
 # derived token there can only ever be unresolved. Used to raise an explanatory
 # error instead of a bare MISSING_REQUIRED_VARIABLES.
 DERIVED_VARIABLE_NAMES = frozenset(rule.name for rule in DERIVATION_RULES)
+
+
+class MacroNeedsWorkflowError(RuntimeError):
+    """A macro uses `{workflow_dir}` or `{workflow_name}`, and there is no workflow to answer it.
+
+    Fails the resolution even when the reference is optional (`{workflow_dir?:/}`): dropping it would
+    move the path from the workflow's folder to the workspace root, a plausible path that is wrong.
+    """
+
+    def __init__(self, builtin_name: str) -> None:
+        self.builtin_name = builtin_name
+        super().__init__(f"it uses {{{builtin_name}}} and no workflow is open")
 
 
 def _project_selection_failure(project_id: str | None) -> str:
@@ -320,9 +334,18 @@ class _ProjectVariableResolver:
         self.env_resolved[name] = resolved
         return resolved
 
-    def _get_builtin(self, name: str) -> str:
+    def _get_builtin(self, name: str, owner_kind: str, owner_name: str) -> str:
+        """The builtin's value, cached. A workflow builtin with no workflow fails the owner's resolution."""
         if name not in self.builtins_cache:
-            self.builtins_cache[name] = self.get_builtin(name)
+            try:
+                self.builtins_cache[name] = self.get_builtin(name)
+            except MacroNeedsWorkflowError as e:
+                msg = f"{owner_kind} '{owner_name}' uses {{{name}}} and no workflow is open"
+                raise MacroResolutionError(
+                    msg,
+                    failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                    variable_name=name,
+                ) from e
         return self.builtins_cache[name]
 
     def _resolve_macro_string(self, owner_kind: str, owner_name: str, raw_value: str) -> str:
@@ -343,19 +366,15 @@ class _ProjectVariableResolver:
                 ref = var_info.name
                 if ref in BUILTIN_VARIABLES:
                     try:
-                        bag[ref] = self._get_builtin(ref)
+                        bag[ref] = self._get_builtin(ref, owner_kind, owner_name)
                     except (RuntimeError, NotImplementedError) as e:
-                        # An optional reference (e.g. `{workflow_dir?:/}`) degrades cleanly:
+                        # Any other optional builtin that can't resolve degrades cleanly:
                         # leave it out of the bag so parsed.resolve() drops it, mirroring the
                         # situation-macro path in on_get_path_for_macro_request. A required
                         # builtin that can't resolve is a genuine error.
                         if not var_info.is_required:
-                            # Logged because the degraded result is a PLAUSIBLE path, not an
-                            # obviously broken one: dropping `{workflow_dir}` from
-                            # `{workflow_dir?:/}outputs` silently relocates writes and reads
-                            # from the workflow's folder to the workspace root. Without this
-                            # line the only symptom is media that resolves to a file which was
-                            # never written there.
+                            # Logged because the degraded result is a plausible path rather than
+                            # an obviously broken one.
                             logger.warning(
                                 "Optional builtin '%s' could not be resolved while resolving %s '%s'; "
                                 "dropping it from the path (%s)",
@@ -482,7 +501,7 @@ class _BuiltinResolutionResult(NamedTuple):
     `conflicts` are names where the caller already had a value AND it disagreed with
     the resolved builtin (per the project's "no silent override of builtins" policy).
     `unavailable` maps each unavailable builtin name to the exception that explains
-    why (e.g. "No current workflow"). Callers decide separately whether
+    why (e.g. MacroNeedsWorkflowError). Callers decide separately whether
     unavailability of a *required* builtin is fatal; when they raise, they should
     surface the exception text so users can tell which precondition is missing.
     """
@@ -763,7 +782,7 @@ class ProjectManager(EngineScoped):
         self._load_system_defaults()
         self._current_project_id = SYSTEM_DEFAULTS_KEY
 
-    @handles(LoadProjectTemplateRequest)
+    @handles(LoadProjectTemplateRequest, scope=RequestScope.HOST)
     async def on_load_project_template_request(
         self, request: LoadProjectTemplateRequest
     ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
@@ -1411,7 +1430,7 @@ class ProjectManager(EngineScoped):
             return existing.project_file_path
         return self._boot_id_to_file_path.get(parent_project_id)
 
-    @handles(GetProjectTemplateRequest)
+    @handles(GetProjectTemplateRequest, scope=RequestScope.HOST)
     def on_get_project_template_request(
         self, request: GetProjectTemplateRequest
     ) -> GetProjectTemplateResultSuccess | GetProjectTemplateResultFailure:
@@ -1429,7 +1448,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved project template for '{request.project_id}'. Status: {project_info.validation.status}",
         )
 
-    @handles(ResolveProjectWorkspaceRequest)
+    @handles(ResolveProjectWorkspaceRequest, scope=RequestScope.HOST)
     async def on_resolve_project_workspace_request(
         self, request: ResolveProjectWorkspaceRequest
     ) -> ResolveProjectWorkspaceResultSuccess:
@@ -1445,7 +1464,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
         )
 
-    @handles(ListProjectTemplatesRequest)
+    @handles(ListProjectTemplatesRequest, scope=RequestScope.HOST)
     async def on_list_project_templates_request(
         self, request: ListProjectTemplatesRequest
     ) -> ListProjectTemplatesResultSuccess:
@@ -1575,7 +1594,7 @@ class ProjectManager(EngineScoped):
             libraries_root=libraries_root,
         )
 
-    @handles(GetSituationRequest)
+    @handles(GetSituationRequest, scope=RequestScope.HOST)
     def on_get_situation_request(
         self, request: GetSituationRequest
     ) -> GetSituationResultSuccess | GetSituationResultFailure:
@@ -1608,11 +1627,20 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved situation '{request.situation_name}'. Macro: {situation.macro}, Policy: create_dirs={situation.policy.create_dirs}, on_collision={situation.policy.on_collision}",
         )
 
-    @handles(GetPathForMacroRequest)
-    def on_get_path_for_macro_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, request: GetPathForMacroRequest
+    @handles(GetPathForMacroRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    def on_get_path_for_macro_request(
+        self, request: GetPathForMacroRequest, workflow: WorkflowRuntime | None = None
+    ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
+        """Resolve the request's macro for `workflow`, which `{workflow_dir}` and `{workflow_name}` need."""
+        return self._resolve_path_for_macro(request, self._workflow_id_for_paths(workflow))
+
+    def _resolve_path_for_macro(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: GetPathForMacroRequest, workflow_id: str | None
     ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
         """Resolve ANY macro schema with variables to final Path.
+
+        `{workflow_dir}` and `{workflow_name}` answer for the workflow with id `workflow_id`, and fail
+        the resolution when it is None, optional or not.
 
         Flow:
         1. Select the project (request.project_id; None = current)
@@ -1641,7 +1669,9 @@ class ProjectManager(EngineScoped):
         # the pre-pass at each call site. Rules that can't fire (missing inputs,
         # unreferenced output) abstain silently, so plain macros pass through unchanged.
         resolved_macro_path = apply_derivation_rules(
-            MacroPath(request.parsed_macro, request.variables), DERIVATION_RULES
+            MacroPath(request.parsed_macro, request.variables),
+            DERIVATION_RULES,
+            lambda nested_request: self._resolve_path_for_macro(nested_request, workflow_id),
         )
         effective_variables: MacroVariables = resolved_macro_path.variables
 
@@ -1663,7 +1693,7 @@ class ProjectManager(EngineScoped):
         # env vars via inner macros (e.g. `watch_output: "{watch_folder}/outputs"`).
         # A shared resolver caches results across both sources so nested references
         # don't re-parse or re-evaluate the same path_macro twice per request.
-        resolver = self._build_variable_resolver(template, project_info)
+        resolver = self._build_variable_resolver(template, project_info, workflow_id)
 
         for var_info in variable_infos:
             var_name = var_info.name
@@ -1672,10 +1702,14 @@ class ProjectManager(EngineScoped):
                 try:
                     resolution_bag[var_name] = resolver.resolve_directory(var_name)
                 except MacroResolutionError as e:
+                    if isinstance(e.__cause__, MacroNeedsWorkflowError):
+                        details = f"Attempted to resolve '{request.parsed_macro.template}'. Failed because {e}."
+                    else:
+                        details = f"Attempted to resolve macro path. Failed to resolve directory '{var_name}': {e}"
                     return GetPathForMacroResultFailure(
                         failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
                         missing_variables=e.missing_variables,
-                        result_details=f"Attempted to resolve macro path. Failed to resolve directory '{var_name}': {e}",
+                        result_details=details,
                     )
             elif var_name in user_provided_names:
                 resolution_bag[var_name] = effective_variables[var_name]
@@ -1684,25 +1718,28 @@ class ProjectManager(EngineScoped):
         # the "no silent override of builtins" policy: caller-supplied values that
         # conflict with project-derived builtins are reported as conflicts.
         referenced_names = {vi.name for vi in variable_infos}
-        builtin_resolution = self._resolve_builtins_into_bag(resolution_bag, referenced_names, project_info)
-        # A required builtin we couldn't resolve is a hard failure; an optional
-        # one is silently skipped (the macro won't render it). Surface the
-        # underlying exception text so users can tell which precondition is missing.
+        builtin_resolution = self._resolve_builtins_into_bag(
+            resolution_bag, referenced_names, project_info, workflow_id
+        )
+        # A required builtin we couldn't resolve is a hard failure, and so is a workflow builtin
+        # with no workflow; any other optional one is skipped (the macro won't render it). Surface
+        # the underlying exception text so users can tell which precondition is missing.
         for var_info in variable_infos:
             unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
             if unavailable_reason is None:
                 continue
+            if isinstance(unavailable_reason, MacroNeedsWorkflowError):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                    result_details=f"Attempted to resolve '{request.parsed_macro.template}'. Failed because {unavailable_reason}.",
+                )
             if var_info.is_required:
                 return GetPathForMacroResultFailure(
                     failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
                     result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
                 )
             # Logged for the same reason as the equivalent degradation in
-            # _ProjectVariableResolver._resolve_macro_string: the degraded result is a
-            # PLAUSIBLE path, not an obviously broken one. Dropping `{workflow_dir}` from
-            # `{workflow_dir?:/}outputs` relocates writes and reads from the workflow's folder
-            # to the workspace root, and without this line the only symptom is media that
-            # resolves to a file which was never written there.
+            # _ProjectVariableResolver._resolve_macro_string.
             logger.warning(
                 "Optional builtin '%s' could not be resolved while resolving macro '%s'; "
                 "dropping it from the path (%s)",
@@ -1921,18 +1958,22 @@ class ProjectManager(EngineScoped):
         Returns the full env-resolution map. See `_ProjectVariableResolver` for the
         recursion and reference-lookup rules.
         """
-        resolver = self._build_variable_resolver(template, project_info)
+        # Applied to the whole process, so no workflow's folder or name may leak into it.
+        resolver = self._build_variable_resolver(template, project_info, None)
         for key in template.environment:
             resolver.resolve_env(key)
         return dict(resolver.env_resolved)
 
     def _build_variable_resolver(
-        self, template: ProjectTemplate, project_info: ProjectInfo
+        self, template: ProjectTemplate, project_info: ProjectInfo, workflow_id: str | None
     ) -> _ProjectVariableResolver:
-        """Build a resolver that recursively resolves directories and env vars for this project."""
+        """Build a resolver that recursively resolves directories and env vars for this project.
+
+        Workflow builtins answer for the workflow with id `workflow_id`, or raise when it is None.
+        """
         return _ProjectVariableResolver(
             template=template,
-            get_builtin=lambda name: self._get_builtin_variable_value(name, project_info),
+            get_builtin=lambda name: self._get_builtin_variable_value(name, project_info, workflow_id),
             secrets_manager=self._secrets_manager,
         )
 
@@ -3109,7 +3150,7 @@ class ProjectManager(EngineScoped):
             current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
         return chain
 
-    @handles(SetCurrentProjectRequest)
+    @handles(SetCurrentProjectRequest, scope=RequestScope.HOST)
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -3536,7 +3577,7 @@ class ProjectManager(EngineScoped):
         """Mark `generation` as adopted, once its activation has fully succeeded."""
         self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
-    @handles(GetCurrentProjectRequest)
+    @handles(GetCurrentProjectRequest, scope=RequestScope.HOST)
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
     ) -> GetCurrentProjectResultSuccess | GetCurrentProjectResultFailure:
@@ -3552,7 +3593,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
 
-    @handles(SaveProjectTemplateRequest)
+    @handles(SaveProjectTemplateRequest, scope=RequestScope.HOST)
     def on_save_project_template_request(
         self, request: SaveProjectTemplateRequest
     ) -> SaveProjectTemplateResultSuccess | SaveProjectTemplateResultFailure:
@@ -3720,7 +3761,7 @@ class ProjectManager(EngineScoped):
 
         return None
 
-    @handles(UpgradeProjectSchemaRequest)
+    @handles(UpgradeProjectSchemaRequest, scope=RequestScope.HOST)
     async def on_upgrade_project_schema_request(  # noqa: PLR0911
         self, request: UpgradeProjectSchemaRequest
     ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
@@ -3861,7 +3902,7 @@ class ProjectManager(EngineScoped):
             ),
         )
 
-    @handles(ValidateProjectTemplateRequest)
+    @handles(ValidateProjectTemplateRequest, scope=RequestScope.HOST)
     def on_validate_project_template_request(
         self, request: ValidateProjectTemplateRequest
     ) -> ValidateProjectTemplateResultSuccess:
@@ -4033,7 +4074,7 @@ class ProjectManager(EngineScoped):
             return ParentLinkLookup(path=None, reason=reason)
         return ParentLinkLookup(path=str(resolution.path), reason=None)
 
-    @handles(UnregisterProjectTemplateRequest)
+    @handles(UnregisterProjectTemplateRequest, scope=RequestScope.HOST)
     def on_unregister_project_template_request(  # noqa: C901, PLR0912
         self, request: UnregisterProjectTemplateRequest
     ) -> UnregisterProjectTemplateResultSuccess | UnregisterProjectTemplateResultFailure:
@@ -4110,9 +4151,9 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully unregistered project template '{project_id}'",
         )
 
-    @handles(AttemptMatchPathAgainstMacroRequest)
-    def on_match_path_against_macro_request(
-        self, request: AttemptMatchPathAgainstMacroRequest
+    @handles(AttemptMatchPathAgainstMacroRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    def on_match_path_against_macro_request(  # noqa: C901
+        self, request: AttemptMatchPathAgainstMacroRequest, workflow: WorkflowRuntime | None = None
     ) -> AttemptMatchPathAgainstMacroResultSuccess | AttemptMatchPathAgainstMacroResultFailure:
         """Attempt to match a path against a macro schema and extract variables.
 
@@ -4122,7 +4163,8 @@ class ProjectManager(EngineScoped):
            selected project (request.project_id; None = current) via
            ``_resolve_builtins_into_bag``. The shared helper enforces the
            "no silent override of builtins" policy: a caller who supplied a
-           conflicting value for a builtin gets a hard failure.
+           conflicting value for a builtin gets a hard failure, and so does a macro using
+           a workflow builtin when there is no `workflow`.
         3. Call ParsedMacro.extract_variables() with the merged bag.
         4. If match succeeds, return success with extracted_variables.
         5. If match fails, return success with match_failure (not an error).
@@ -4145,7 +4187,17 @@ class ProjectManager(EngineScoped):
                     merged_known_variables,
                     BUILTIN_VARIABLES,
                     project_info,
+                    self._workflow_id_for_paths(workflow),
                 )
+                for var_info in request.parsed_macro.get_variables():
+                    unavailable_reason = resolution.unavailable.get(var_info.name)
+                    if isinstance(unavailable_reason, MacroNeedsWorkflowError):
+                        return AttemptMatchPathAgainstMacroResultFailure(
+                            result_details=(
+                                f"Attempted to match path '{request.file_path}' against macro "
+                                f"'{request.parsed_macro.template}'. Failed because {unavailable_reason}."
+                            ),
+                        )
                 if resolution.conflicts:
                     return AttemptMatchPathAgainstMacroResultFailure(
                         result_details=(
@@ -4199,9 +4251,9 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully matched path '{request.file_path}' against macro '{request.parsed_macro.template}'. Extracted {len(extracted)} variables",
         )
 
-    @handles(GetStateForMacroRequest)
+    @handles(GetStateForMacroRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_get_state_for_macro_request(
-        self, request: GetStateForMacroRequest
+        self, request: GetStateForMacroRequest, workflow: WorkflowRuntime | None = None
     ) -> GetStateForMacroResultSuccess | GetStateForMacroResultFailure:
         """Analyze a macro and return comprehensive state information.
 
@@ -4241,11 +4293,17 @@ class ProjectManager(EngineScoped):
         # without mutating the request.
         referenced_names = {vi.name for vi in all_variables}
         analysis_bag: MacroVariables = dict(request.variables)
-        builtin_resolution = self._resolve_builtins_into_bag(analysis_bag, referenced_names, project_info)
-        # An unavailable required builtin is fatal here too — mirrors the path
-        # handler so callers don't see "looks resolvable" when it actually isn't.
+        builtin_resolution = self._resolve_builtins_into_bag(
+            analysis_bag, referenced_names, project_info, self._workflow_id_for_paths(workflow)
+        )
+        # An unavailable required builtin is fatal here too, and so is a workflow builtin with no
+        # workflow — mirrors the path handler so callers don't see "looks resolvable" when it isn't.
         for var_info in all_variables:
             unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
+            if isinstance(unavailable_reason, MacroNeedsWorkflowError):
+                return GetStateForMacroResultFailure(
+                    result_details=f"Attempted to analyze macro '{request.parsed_macro.template}'. Failed because {unavailable_reason}.",
+                )
             if unavailable_reason is not None and var_info.is_required:
                 return GetStateForMacroResultFailure(
                     result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
@@ -4293,7 +4351,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Analyzed macro with {len(all_variables)} variables: {len(satisfied_variables)} satisfied, {len(missing_required_variables)} missing, {len(conflicting_variables)} conflicting",
         )
 
-    @handles(ActivateWorkspaceProjectRequest)
+    @handles(ActivateWorkspaceProjectRequest, scope=RequestScope.HOST)
     async def on_activate_workspace_project_request(
         self, _request: ActivateWorkspaceProjectRequest
     ) -> ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure:
@@ -4332,7 +4390,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
 
-    @handles(ExportProjectRequest)
+    @handles(ExportProjectRequest, scope=RequestScope.HOST)
     def on_export_project_request(
         self, request: ExportProjectRequest
     ) -> ExportProjectResultSuccess | ExportProjectResultFailure:
@@ -4404,7 +4462,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Exported project '{request.project_id}' to '{result.archive_path}'.",
         )
 
-    @handles(PreviewImportProjectRequest)
+    @handles(PreviewImportProjectRequest, scope=RequestScope.HOST)
     def on_preview_import_project_request(
         self, request: PreviewImportProjectRequest
     ) -> PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure:
@@ -4432,7 +4490,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Read manifest from project package '{request.archive_path}'.",
         )
 
-    @handles(ImportProjectRequest)
+    @handles(ImportProjectRequest, scope=RequestScope.HOST)
     async def on_import_project_request(
         self, request: ImportProjectRequest
     ) -> ImportProjectResultSuccess | ImportProjectResultFailure:
@@ -4631,7 +4689,7 @@ class ProjectManager(EngineScoped):
         # reload when the workspace actually changes.
         self._initialization_complete = True
 
-    @handles(GetAllSituationsForProjectRequest)
+    @handles(GetAllSituationsForProjectRequest, scope=RequestScope.HOST)
     def on_get_all_situations_for_project_request(
         self, request: GetAllSituationsForProjectRequest
     ) -> GetAllSituationsForProjectResultSuccess | GetAllSituationsForProjectResultFailure:
@@ -4654,9 +4712,9 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully retrieved all situations. Found {len(situations)} situations",
         )
 
-    @handles(AttemptMapAbsolutePathToProjectRequest)
+    @handles(AttemptMapAbsolutePathToProjectRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_attempt_map_absolute_path_to_project_request(
-        self, request: AttemptMapAbsolutePathToProjectRequest
+        self, request: AttemptMapAbsolutePathToProjectRequest, workflow: WorkflowRuntime | None = None
     ) -> AttemptMapAbsolutePathToProjectResultSuccess | AttemptMapAbsolutePathToProjectResultFailure:
         """Find out if an absolute path exists anywhere within a Project directory.
 
@@ -4666,6 +4724,7 @@ class ProjectManager(EngineScoped):
 
         Args:
             request: Request containing the absolute path to check
+            workflow: The workflow whose folder directories using `{workflow_dir}` resolve to
 
         Returns:
             Success with mapped_path if path is inside project
@@ -4681,7 +4740,9 @@ class ProjectManager(EngineScoped):
 
         # Try to map the path
         try:
-            mapped_path = self._absolute_path_to_macro_path(request.absolute_path, project_info)
+            mapped_path = self._absolute_path_to_macro_path(
+                request.absolute_path, project_info, self._workflow_id_for_paths(workflow)
+            )
         except (RuntimeError, NotImplementedError) as e:
             # Variable resolution failed - this is a Failure (can't complete the operation)
             return AttemptMapAbsolutePathToProjectResultFailure(
@@ -4763,11 +4824,13 @@ class ProjectManager(EngineScoped):
             )
         self.engine.variables_manager.set_project_variables(project_id, layer)
 
-    def resolve_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable:
+    def resolve_project_variable(
+        self, name: str, *, project_id: str | None, workflow: WorkflowRuntime | None
+    ) -> FlowVariable:
         """Resolve a computed project variable (builtin or template directory) to a snapshot FlowVariable.
 
         Computed values are derived on every call — context-sensitive (workflow_dir tracks
-        the current workflow, workspace_dir the config layer) — and are always READ_ONLY.
+        `workflow`, workspace_dir the config layer) — and are always READ_ONLY.
         The returned FlowVariable is a plain snapshot safe to serialize.
 
         Stored (user-defined) project variables are NOT resolved here; those live in
@@ -4775,21 +4838,22 @@ class ProjectManager(EngineScoped):
 
         Raises ValueError when the project isn't loaded or the name isn't a computed name;
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
-        {workflow_dir} with no workflow in context).
+        MacroNeedsWorkflowError for {workflow_dir} with no workflow).
         """
         effective = self.resolve_project_id(project_id)
         if effective is None:
             msg = f"Project '{project_id}' is not loaded"
             raise ValueError(msg)
         project_info = self._successfully_loaded_project_templates[effective]
+        workflow_id = self._workflow_id_for_paths(workflow)
 
         if name in BUILTIN_VARIABLES:
-            value = self._get_builtin_variable_value(name, project_info)
+            value = self._get_builtin_variable_value(name, project_info, workflow_id)
             return FlowVariable(
                 name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
             )
         if name in project_info.template.directories:
-            resolver = self._build_variable_resolver(project_info.template, project_info)
+            resolver = self._build_variable_resolver(project_info.template, project_info, workflow_id)
             return FlowVariable(
                 name=name,
                 owning_flow_name=None,
@@ -4872,6 +4936,7 @@ class ProjectManager(EngineScoped):
         bag: MacroVariables,
         considered_names: Iterable[str],
         project_info: ProjectInfo,
+        workflow_id: str | None,
     ) -> _BuiltinResolutionResult:
         """Inject project-derived builtin values into ``bag``; flag any caller overrides.
 
@@ -4886,8 +4951,8 @@ class ProjectManager(EngineScoped):
           record a conflict (directory builtins compare as resolved paths; others
           compare as strings).
         - If ``bag`` has no value, inject the resolved builtin.
-        - If the builtin can't be resolved in the current context (no current
-          workflow, etc.), record the name → underlying exception in
+        - If the builtin can't be resolved (a workflow builtin with `workflow_id`
+          None raises MacroNeedsWorkflowError, etc.), record the name → underlying exception in
           ``unavailable`` and skip. Callers that treat unavailability of a
           *required* builtin as fatal must check the unavailable map themselves
           and surface the exception text so users can tell which precondition
@@ -4901,7 +4966,7 @@ class ProjectManager(EngineScoped):
             if var_name not in BUILTIN_VARIABLES:
                 continue
             try:
-                builtin_value = self._get_builtin_variable_value(var_name, project_info)
+                builtin_value = self._get_builtin_variable_value(var_name, project_info, workflow_id)
             except (RuntimeError, NotImplementedError) as e:
                 unavailable[var_name] = e
                 continue
@@ -4919,12 +4984,13 @@ class ProjectManager(EngineScoped):
                 conflicts.add(var_name)
         return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
-    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:
+    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo, workflow_id: str | None) -> str:
         """Get the value of a single builtin variable.
 
         Args:
             var_name: Name of the builtin variable
             project_info: Information about the current project
+            workflow_id: Id of the workflow `workflow_name` and `workflow_dir` answer for, or None
 
         Returns:
             String value of the builtin variable
@@ -4932,6 +4998,7 @@ class ProjectManager(EngineScoped):
         Raises:
             ValueError: If var_name is not a recognized builtin variable
             NotImplementedError: If builtin variable is not yet implemented
+            MacroNeedsWorkflowError: If var_name is a workflow builtin and `workflow_id` is None
         """
         match var_name:
             case "project_dir":
@@ -4945,14 +5012,14 @@ class ProjectManager(EngineScoped):
                 return self._resolve_builtin_workspace_dir()
 
             case "workflow_name":
-                context_manager = self.engine.context_manager
-                if not context_manager.has_current_workflow():
-                    msg = "No current workflow"
-                    raise RuntimeError(msg)
-                return context_manager.get_current_workflow_name()
+                if workflow_id is None:
+                    raise MacroNeedsWorkflowError(var_name)
+                return self.engine.workflow_registry.get(workflow_id).name
 
             case "workflow_dir":
-                return self._resolve_workflow_dir(project_info)
+                if workflow_id is None:
+                    raise MacroNeedsWorkflowError(var_name)
+                return self._resolve_workflow_dir(project_info, workflow_id)
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -4996,8 +5063,30 @@ class ProjectManager(EngineScoped):
         """
         return str(self._config_manager.workspace_path)
 
-    def _resolve_workflow_dir(self, project_info: ProjectInfo) -> str:
-        """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
+    def _workflow_id_for_paths(self, workflow: WorkflowRuntime | None) -> str | None:
+        """The id of the workflow a request's paths and macros resolve for: `workflow`'s, or a worker's mirror's.
+
+        A worker opens no workflow. It runs its orchestrator's nodes against a mirror of the
+        orchestrator's workflow (`ContextManager.mirror_workflow_context`), so dispatch hands its
+        handlers None, and the mirror answers for them here. The only place a mirror stands in for a
+        workflow. Exists until workers get workflow namespaces of their own (Stage 6); deleted then.
+
+        Raises:
+            WorkflowContextError: This engine has a workflow open and mirrors one too.
+        """
+        mirrored_workflow_id = self.engine.context_manager.mirrored_workflow_id()
+        if workflow is not None and mirrored_workflow_id is not None:
+            msg = (
+                f"Attempted to resolve paths for workflow '{workflow.workflow_id}'. Failed because this engine "
+                f"also mirrors workflow '{mirrored_workflow_id}', and an engine never has both."
+            )
+            raise WorkflowContextError(msg)
+        if workflow is not None:
+            return workflow.workflow_id
+        return mirrored_workflow_id
+
+    def _resolve_workflow_dir(self, project_info: ProjectInfo, workflow_id: str) -> str:
+        """Resolve the `workflow_dir` builtin: the folder the workflow with id `workflow_id` belongs to.
 
         Three sources, in descending order of authority:
 
@@ -5012,28 +5101,19 @@ class ProjectManager(EngineScoped):
            template that anchors saves outside the workspace root is answered with its folder
            rather than the root. Where the user later chooses to save is a choice at save time,
            not a misprediction by this rung. See `_resolve_default_workflow_save_dir`.
-
-        Raises:
-            RuntimeError: If no workflow is in context.
         """
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
-            msg = "No current workflow"
-            raise RuntimeError(msg)
+        entry = self.engine.workflow_registry.get(workflow_id)
+        if entry.absolute_path is not None:
+            return str(entry.absolute_path.parent)
+        if entry.working_directory is not None:
+            return entry.working_directory
+        return self._resolve_default_workflow_save_dir(project_info, workflow_id)
 
-        file_path = context_manager.get_current_workflow_file_path()
-        if file_path is not None:
-            return str(Path(file_path).parent)
-        working_directory = context_manager.get_current_workflow_working_directory()
-        if working_directory is not None:
-            return working_directory
-        return self._resolve_default_workflow_save_dir(project_info)
-
-    def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo) -> str:
+    def _resolve_default_workflow_save_dir(self, project_info: ProjectInfo, workflow_id: str) -> str:
         """The folder `save_workflow` would put a workflow in when the save names no sub-directory.
 
         Rung 3 of `_resolve_workflow_dir`. Resolves the situation through
-        `on_get_path_for_macro_request`, the same handler the real save goes through, so the
+        `_resolve_path_for_macro`, the same code the real save goes through, so the
         answer accounts for derivation rules and stored project variables rather than tracking
         only what this manager's resolver knows. `sub_dirs` is left out so the folder is the one
         a save with no hierarchy lands in; `file_name_base` and `file_extension` are required by
@@ -5061,7 +5141,7 @@ class ProjectManager(EngineScoped):
 
         self._resolving_default_workflow_save_dir = True
         try:
-            result = self.on_get_path_for_macro_request(
+            result = self._resolve_path_for_macro(
                 GetPathForMacroRequest(
                     parsed_macro=parsed_macro,
                     variables={
@@ -5069,7 +5149,8 @@ class ProjectManager(EngineScoped):
                         "file_extension": _SAVE_DIR_PROBE_EXTENSION,
                     },
                     project_id=project_info.project_id,
-                )
+                ),
+                workflow_id,
             )
         finally:
             self._resolving_default_workflow_save_dir = False
@@ -5085,7 +5166,9 @@ class ProjectManager(EngineScoped):
 
         return str(result.absolute_path.parent)
 
-    def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
+    def _absolute_path_to_macro_path(
+        self, absolute_path: Path, project_info: ProjectInfo, workflow_id: str | None
+    ) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.
 
         Resolves all project directories at runtime (to support env vars and macros),
@@ -5095,6 +5178,7 @@ class ProjectManager(EngineScoped):
         Args:
             absolute_path: Absolute path to convert (e.g., /Users/james/project/outputs/file.png)
             project_info: Information about the current project
+            workflow_id: Id of the workflow directories using `{workflow_dir}` resolve for, or None
 
         Returns:
             Macro-ified path (e.g., {outputs}/file.png) if inside a project directory,
@@ -5120,7 +5204,7 @@ class ProjectManager(EngineScoped):
         # (e.g. watch_output -> watch_folder) flatten through the same machinery
         # as forward macro resolution. Caches results across the whole inversion
         # pass below.
-        resolver = self._build_variable_resolver(template, project_info)
+        resolver = self._build_variable_resolver(template, project_info, workflow_id)
 
         # Find all matching directories (where absolute_path is inside the directory)
         class DirectoryMatch(NamedTuple):

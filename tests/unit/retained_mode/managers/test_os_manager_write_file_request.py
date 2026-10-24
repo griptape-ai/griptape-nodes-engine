@@ -55,10 +55,18 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifa
 )
 from griptape_nodes.retained_mode.managers.event_manager import RegisteredRequestHandler
 from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
+from tests.workflow_context import unsaved_workflow_open
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
 WINDOWS_MAX_PATH = 260
+
+
+@pytest.fixture(autouse=True)
+def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
+    """The default project's directories use `{workflow_dir?:/}`, which needs a workflow to resolve."""
+    with unsaved_workflow_open(engine):
+        yield
 
 
 class TestCreateNewWarningLevelResultDetails:

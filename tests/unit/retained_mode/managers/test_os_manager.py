@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
+from tests.workflow_context import unsaved_workflow_open
 
 # Windows MAX_PATH constant for tests
 WINDOWS_MAX_PATH = 260
@@ -2258,7 +2259,8 @@ class TestGetNextVersionIndexRequest:
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/renders_v{###}"), variables={})
         )
-        result = os_manager.on_get_next_version_index_request(request)
+        with unsaved_workflow_open(engine):
+            result = os_manager.on_get_next_version_index_request(request)
 
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 3  # noqa: PLR2004
