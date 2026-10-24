@@ -108,10 +108,12 @@ def _fit_attribution_tags(tags: dict[str, Any]) -> list[str]:
     UTF-8 -- a workflow named after a file whose name is not -- costs the whole header. So detail
     is given up in `_HEADER_DROP_ORDER` until the header fits and encodes: `workflow` first, being
     the largest and user-authored, and `run_id` last, being what totals a run's proxy spend with
-    its direct spend. `project` is never dropped; when it alone cannot be sent, the header is
-    refused as it always was.
+    its direct spend. `project` is never dropped. A project that cannot be encoded drops nothing,
+    since the header is refused either way, by `_encode_attribution_payload`, which says why.
     """
     dropped: list[str] = []
+    if not _encodable({key: value for key, value in tags.items() if key == "project"}):
+        return dropped
     for key in _HEADER_DROP_ORDER:
         if _sendable(tags):
             break
@@ -123,11 +125,23 @@ def _fit_attribution_tags(tags: dict[str, Any]) -> list[str]:
 
 def _sendable(tags: dict[str, Any]) -> bool:
     """Whether the header for these tags encodes as UTF-8 within Cloud's decoded size limit."""
-    try:
-        raw = json.dumps(_build_attribution_payload(tags), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    except UnicodeEncodeError:
+    raw = _encoded(tags)
+    if raw is None:
         return False
     return len(raw) <= MAX_DECODED_ATTRIBUTION_BYTES
+
+
+def _encodable(tags: dict[str, Any]) -> bool:
+    """Whether the header for these tags encodes as UTF-8, whatever its size."""
+    return _encoded(tags) is not None
+
+
+def _encoded(tags: dict[str, Any]) -> bytes | None:
+    """The header's decoded bytes for these tags, as Cloud measures them, or None if not UTF-8."""
+    try:
+        return json.dumps(_build_attribution_payload(tags), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
 
 
 def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
@@ -212,11 +226,16 @@ class BudgetManager(EngineScoped):
         dropped = _fit_attribution_tags(tags)
         if dropped:
             # Names the keys, never their values: `workflow` is user-authored.
+            if _sendable(tags):
+                outcome = "the project is still sent"
+            else:
+                outcome = "the project chain is over that limit on its own, so Griptape Cloud will not read it"
             logger.warning(
                 "Attribution header left out %s, which would have kept it from being sent (over Griptape "
-                "Cloud's %s-byte limit or not valid UTF-8); the project is still sent.",
+                "Cloud's %s-byte limit or not valid UTF-8); %s.",
                 ", ".join(dropped),
                 MAX_DECODED_ATTRIBUTION_BYTES,
+                outcome,
             )
         header_value = _encode_attribution_payload(_build_attribution_payload(tags))
         if header_value is None:

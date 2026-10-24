@@ -533,9 +533,9 @@ class TestConfidentiality:
     def test_no_user_authored_label_appears(self, engine: Engine) -> None:
         """`BaseNode.name` and `ProjectTemplate.name` are user-authored and never travel.
 
-        Ids are the only strings the payload carries now, so no key named `name` at any depth
-        -- and the guard stays even though the builder makes it near-tautological, because it
-        is what a future dimension would trip over.
+        Ids, the workflow name and a node's class are the only strings the payload carries, so no
+        key named `name` at any depth -- and the guard stays even though the builder makes it
+        near-tautological, because it is what a future dimension would trip over.
         """
         result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
@@ -699,9 +699,26 @@ class TestHeaderSizeLimit:
         assert tags["project"] == ["shot-6"]
         assert tags["run_id"] == "run-1"
 
-    def test_a_project_chain_too_large_alone_is_sent_as_it_is_today(self) -> None:
+    def test_an_unencodable_project_drops_nothing_and_blames_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The optional tags did not cause it, so they stay and no log line says the project was sent."""
+        mock_engine = _engine_with_call_state()
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("renders-\udce9", None)]
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _dispatch(BudgetManager(MagicMock(), engine=mock_engine))
+
+        assert isinstance(result, GetAttributionContextResultFailure)
+        assert "left out" not in caplog.text
+        assert "the project is still sent" not in caplog.text
+
+    def test_a_project_chain_too_large_alone_is_sent_as_it_is_today(self, caplog: pytest.LogCaptureFixture) -> None:
         """Every optional tag goes, and the project is still sent whole: no worse than before."""
-        result = _succeed(self._manager_with(chain_entries=self.OVER_ON_ITS_OWN, workflow="Poster pipeline"))
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(self._manager_with(chain_entries=self.OVER_ON_ITS_OWN, workflow="Poster pipeline"))
+
+        # Cloud will not read a header this size, so the log must not say the project got through.
+        assert "the project is still sent" not in caplog.text
+        assert "over that limit on its own" in caplog.text
 
         assert set(_tags(result)) == {"project"}
         assert len(_tags(result)["project"]) == self.OVER_ON_ITS_OWN
