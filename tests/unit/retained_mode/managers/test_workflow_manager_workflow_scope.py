@@ -469,7 +469,7 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
             assert target.context.get_current_flow().name == result.flow_name
             assert engine.open_workflows.get(tab.workflow_id).flows.name_to_parent_name == {}
 
-    def test_ensure_naming_another_workflow_than_the_one_it_is_handed_fails(self, engine: Engine) -> None:
+    def test_ensure_naming_a_workflow_that_is_not_open_fails_while_another_is_open(self, engine: Engine) -> None:
         tab = push_unsaved_workflow(engine, "tab")
         other = engine.workflow_registry.register_unsaved("other")
 
@@ -478,8 +478,28 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         )
 
         assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
-        assert "'unsaved:" in str(result.result_details)
+        assert str(result.result_details) == (
+            f"Attempted to ensure workflow '{other.workflow_id}'. Failed because workflow "
+            f"'{tab.name}' is in the Current Context."
+        )
+        assert not engine.open_workflows.is_open(other.workflow_id)
         assert engine.open_workflows.get(tab.workflow_id).flows.name_to_parent_name == {}
+
+    def test_ensure_naming_an_open_workflow_uses_it_whichever_workflow_it_is_handed(self, engine: Engine) -> None:
+        tab = push_unsaved_workflow(engine, "tab")
+
+        with _also_open(engine, "target") as target:
+            result = engine.handle_request(
+                EnsureWorkflowAndFlowRequest(workflow_id=target.workflow_id, flow_name="canvas"),
+                workflow_id=tab.workflow_id,
+            )
+
+            assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
+            assert result.workflow_id == target.workflow_id
+            assert result.created_workflow is False
+            assert result.created_flow is True
+            assert target.context.get_current_flow().name == result.flow_name
+            assert engine.open_workflows.get(tab.workflow_id).flows.name_to_parent_name == {}
 
     def test_run_command_naming_nothing_answers_for_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path

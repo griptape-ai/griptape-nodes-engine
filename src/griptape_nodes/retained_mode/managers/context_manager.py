@@ -234,7 +234,8 @@ class ContextManager(EngineScoped):
     ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Uses the open `workflow` when there is one, and otherwise opens one. Delegates opening
+        Uses the open workflow the body's id names, else the open `workflow`, and otherwise opens
+        one. Delegates opening
         to SetWorkflowContextRequest so the unsaved-registry-key scheme ("unsaved:<workflow id>")
         stays the single source of truth for scratch workflows; composes that with
         CreateFlowRequest so callers can go from a blank engine to CreateNode in a single round
@@ -246,21 +247,24 @@ class ContextManager(EngineScoped):
             CreateFlowResultSuccess,
         )
 
-        # An id names one workflow, so a different open workflow is not an answer. A name keeps
-        # the older, lenient rule: the open workflow is reused. The id is parsed first because a
-        # request may spell it as a dashed UUID.
-        if (
-            request.workflow_id is not None
-            and workflow is not None
-            and workflow.workflow_id != parse_workflow_id(request.workflow_id)
-        ):
-            open_name = self.engine.workflow_registry.get(workflow.workflow_id).name
-            return EnsureWorkflowAndFlowResultFailure(
-                result_details=(
-                    f"Attempted to ensure workflow '{request.workflow_id}'. Failed because workflow "
-                    f"'{open_name}' is in the Current Context."
+        # An id names one workflow: that workflow is used if it is open, whichever tab sent the
+        # request, and a different open workflow is not an answer. Names are the deprecated
+        # compatibility path and keep the lenient rule: the dispatched workflow is reused. The id
+        # is parsed first because a request may spell it as a dashed UUID.
+        if request.workflow_id is not None:
+            named_workflow = None
+            named_workflow_id = parse_workflow_id(request.workflow_id)
+            if named_workflow_id is not None:
+                named_workflow = self.engine.open_workflows.find_by_id(named_workflow_id)
+            if named_workflow is None and workflow is not None:
+                open_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+                return EnsureWorkflowAndFlowResultFailure(
+                    result_details=(
+                        f"Attempted to ensure workflow '{request.workflow_id}'. Failed because workflow "
+                        f"'{open_name}' is in the Current Context."
+                    )
                 )
-            )
+            workflow = named_workflow
 
         created_workflow = False
         if workflow is not None:
