@@ -225,17 +225,13 @@ class BudgetManager(EngineScoped):
         tags = self._tags_for(project_chain, node_type=node_type, node_id=None, run_id=run_id)
         dropped = _fit_attribution_tags(tags)
         if dropped:
-            # Names the keys, never their values: `workflow` is user-authored.
-            if _sendable(tags):
-                outcome = "the project is still sent"
-            else:
-                outcome = "the project chain is over that limit on its own, so Griptape Cloud will not read it"
+            # Names the keys, never their values: `workflow` is user-authored. Says nothing about the
+            # project, which may be absent, sent, or still over the limit on its own.
             logger.warning(
                 "Attribution header left out %s, which would have kept it from being sent (over Griptape "
-                "Cloud's %s-byte limit or not valid UTF-8); %s.",
+                "Cloud's %s-byte limit or not valid UTF-8).",
                 ", ".join(dropped),
                 MAX_DECODED_ATTRIBUTION_BYTES,
-                outcome,
             )
         header_value = _encode_attribution_payload(_build_attribution_payload(tags))
         if header_value is None:
