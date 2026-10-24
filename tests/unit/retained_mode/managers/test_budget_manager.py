@@ -711,14 +711,26 @@ class TestHeaderSizeLimit:
         assert "left out" not in caplog.text
         assert "the project is still sent" not in caplog.text
 
+    def test_with_no_project_open_the_warning_claims_none_was_sent(self, caplog: pytest.LogCaptureFixture) -> None:
+        mock_engine = _engine_with_call_state()
+        mock_engine.project_manager.get_project_chain.return_value = []
+        mock_engine.context_manager.get_current_workflow_name.return_value = "Poster \udcff draft"
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(BudgetManager(MagicMock(), engine=mock_engine))
+
+        assert "project" not in _tags(result)
+        assert "left out workflow" in caplog.text
+        assert "project" not in caplog.text
+
     def test_a_project_chain_too_large_alone_is_sent_as_it_is_today(self, caplog: pytest.LogCaptureFixture) -> None:
         """Every optional tag goes, and the project is still sent whole: no worse than before."""
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = _succeed(self._manager_with(chain_entries=self.OVER_ON_ITS_OWN, workflow="Poster pipeline"))
 
-        # Cloud will not read a header this size, so the log must not say the project got through.
-        assert "the project is still sent" not in caplog.text
-        assert "over that limit on its own" in caplog.text
+        # Cloud will not read a header this size, so the log must not claim the project got through.
+        assert "left out workflow," in caplog.text
+        assert "project" not in caplog.text
 
         assert set(_tags(result)) == {"project"}
         assert len(_tags(result)["project"]) == self.OVER_ON_ITS_OWN
