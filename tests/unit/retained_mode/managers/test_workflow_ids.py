@@ -1770,6 +1770,29 @@ class TestLibraryWorkflowsOpenAsUnsavedCopies:
         assert not project_engine.context_manager.has_current_workflow()
         assert set(_listed(project_engine)) == listed_before
 
+    def test_a_failed_open_whose_file_closed_its_workflow_leaves_no_copy_behind(
+        self, project_engine: Engine, tmp_path: Path
+    ) -> None:
+        library_file = _write_workflow_file(tmp_path / "library" / "closes_itself.py", workflow_id=LIBRARY_ID)
+        # The file closes the workflow it runs in, so the run fails with nothing open.
+        with library_file.open("a", encoding="utf-8") as file:
+            file.write(
+                "from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest\n"
+                "from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes\n"
+                "async def build_workflow():\n"
+                "    await GriptapeNodes.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))\n"
+            )
+        library = project_engine.workflow_registry.register_file(library_file, read_workflow_metadata(library_file))
+        library.metadata.is_griptape_provided = True
+        registered_before = set(project_engine.workflow_registry._by_id)
+
+        failed = _run(project_engine, RunWorkflowFromRegistryRequest(workflow_id=LIBRARY_ID))
+
+        assert isinstance(failed, RunWorkflowFromRegistryResultFailure)
+        assert "no current workflow" in str(failed.result_details)
+        assert not project_engine.context_manager.has_current_workflow()
+        assert set(project_engine.workflow_registry._by_id) == registered_before
+
     def test_listing_and_reading_a_library_workflow_creates_no_copy(
         self, project_engine: Engine, tmp_path: Path
     ) -> None:

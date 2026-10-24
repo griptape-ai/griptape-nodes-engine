@@ -275,20 +275,24 @@ class WorkflowRunner(EngineScoped):
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
             self.engine.context_manager.push_workflow(workflow_id=opened_workflow.workflow_id)
-            opened_runtime = self.engine.open_workflows.get(opened_workflow.workflow_id)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
             if not execution_result.execution_successful:
                 result_messages = execution_result_details(execution_result, level=logging.ERROR)
 
-                # Attempt to clear everything out, as we modified the engine state getting here.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await opened_runtime.ahandle_request(clear_all_request)
+                # Attempt to clear everything out, as we modified the engine state getting here. The
+                # file may have closed its workflow itself before failing, leaving nothing to clear.
+                closed = True
+                still_open = self.engine.open_workflows.find_by_id(opened_workflow.workflow_id)
+                if still_open is not None:
+                    clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
+                    clear_all_result = await still_open.ahandle_request(clear_all_request)
+                    closed = clear_all_result.succeeded()
 
                 # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
-                # It also closed the copy, which nothing else refers to.
-                if opened_workflow is not workflow and clear_all_result.succeeded():
+                # A closed copy is forgotten, since nothing else refers to it.
+                if opened_workflow is not workflow and closed:
                     self.engine.workflow_registry.remove(opened_workflow.workflow_id)
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
