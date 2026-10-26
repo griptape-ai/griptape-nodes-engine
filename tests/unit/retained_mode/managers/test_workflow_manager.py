@@ -4550,7 +4550,9 @@ class TestCreateVersionedWorkflow:
     ) -> SaveWorkflowTargetInfo:
         current_workflow = engine.workflow_registry.find_by_name(current_workflow_name)
         assert current_workflow is not None
+        workflow = engine.open_workflows.open(current_workflow.workflow_id)
         return engine.workflow_manager.saver._determine_save_target(
+            workflow,
             requested_file_name=requested_file_name,
             current_workflow=current_workflow,
             create_versioned=create_versioned,
@@ -5114,14 +5116,16 @@ class TestCreateVersionedWorkflow:
 
             real_handle = engine.handle_request
             synthetic_exc = RuntimeError("synthetic match-handler crash for test")
+            match_workflow_ids = []
 
-            def fake_handle(req: RequestPayload) -> object:
+            def fake_handle(req: RequestPayload, workflow_id: str | None = None) -> object:
                 if isinstance(req, AttemptMatchPathAgainstMacroRequest):
+                    match_workflow_ids.append(workflow_id)
                     return ResultPayloadFailure(
                         exception=synthetic_exc,
                         result_details="dispatch caught an exception",
                     )
-                return real_handle(req)
+                return real_handle(req, workflow_id=workflow_id)
 
             with (
                 patch.object(engine, "handle_request", side_effect=fake_handle),
@@ -5138,6 +5142,10 @@ class TestCreateVersionedWorkflow:
             # its text — future debuggers shouldn't have to chase the original cause.
             assert "RuntimeError" in str(exc_info.value)
             assert "dispatch caught an exception" in str(exc_info.value)
+            # The match runs in the workflow being saved, named on the request rather than left to dispatch.
+            saved = engine.workflow_registry.find_by_name("my_flow_v001")
+            assert saved is not None
+            assert match_workflow_ids == [saved.workflow_id]
 
     def test_create_versioned_timestamp_fallback_when_no_base_name(
         self,

@@ -269,6 +269,7 @@ class WorkflowSaver(EngineScoped):
 
         try:
             save_target = self._determine_save_target(
+                workflow,
                 requested_file_name=request.file_name,
                 current_workflow=current_workflow,
                 create_versioned=request.create_versioned,
@@ -761,6 +762,7 @@ class WorkflowSaver(EngineScoped):
 
     def _determine_save_target(
         self,
+        workflow: WorkflowRuntime,
         requested_file_name: str | None,
         current_workflow: Workflow,
         *,
@@ -769,8 +771,9 @@ class WorkflowSaver(EngineScoped):
         """Determine the target file path, name, and metadata for saving a workflow.
 
         Args:
+            workflow: The open workflow being saved, which the macro match for a versioned save runs in
             requested_file_name: The name the user wants to save as (can be None)
-            current_workflow: The open workflow being saved
+            current_workflow: The registry entry of the open workflow being saved
             create_versioned: When True, route every save through the
                 ``create_versioned_workflow`` situation so each save produces a
                 new versioned file (e.g. ``foo_v001.py``, ``foo_v002.py``, ...).
@@ -811,6 +814,7 @@ class WorkflowSaver(EngineScoped):
         # macro layer is the single source of truth for "where does it go?".
         if create_versioned:
             file_name, destination, relative_file_path = self._resolve_versioned_save_target(
+                workflow,
                 situation_name=situation_name,
                 requested_file_name=requested_file_name,
                 current_workflow=current_workflow,
@@ -919,6 +923,7 @@ class WorkflowSaver(EngineScoped):
 
     def _resolve_versioned_save_target(
         self,
+        workflow: WorkflowRuntime,
         *,
         situation_name: str,
         requested_file_name: str | None,
@@ -964,7 +969,9 @@ class WorkflowSaver(EngineScoped):
         # test_create_versioned_with_requested_name_matching_existing_workflow_runs_match.
         candidate_workflow = target_workflow if target_workflow is not None else current_workflow
         if candidate_workflow.file_path is not None:
-            matched = self._try_match_versioned_destination(candidate_workflow.file_path, situation_name=situation_name)
+            matched = self._try_match_versioned_destination(
+                workflow, candidate_workflow.file_path, situation_name=situation_name
+            )
             if matched is not None:
                 return matched
             # The existing file isn't part of a sequence this situation
@@ -984,8 +991,10 @@ class WorkflowSaver(EngineScoped):
         timestamp_name = datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
         return self._resolve_named_save_path(timestamp_name, situation_name=situation_name)
 
-    def _try_match_versioned_destination(self, file_path: str, *, situation_name: str) -> NamedSavePath | None:
-        """Reverse-match ``file_path`` against the situation's macro; build a destination on success.
+    def _try_match_versioned_destination(
+        self, workflow: WorkflowRuntime, file_path: str, *, situation_name: str
+    ) -> NamedSavePath | None:
+        """Reverse-match ``file_path`` against the situation's macro in ``workflow``; build a destination on success.
 
         Returns ``None`` only when the macro doesn't recognize the file —
         e.g. the file was created under a different situation, or lives
@@ -1034,7 +1043,7 @@ class WorkflowSaver(EngineScoped):
         # of OS.
         absolute_path = Path(self.engine.workflow_registry.get_complete_file_path(file_path)).as_posix()
 
-        match_result = self.engine.handle_request(
+        match_result = workflow.handle_request(
             AttemptMatchPathAgainstMacroRequest(
                 parsed_macro=parsed_macro,
                 file_path=absolute_path,
