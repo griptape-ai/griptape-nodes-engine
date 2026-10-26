@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.access_events import QueryModelAccessFo
 from griptape_nodes.retained_mode.events.app_events import EngineHeartbeatRequest
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
+    EventResultFailure,
     EventResultSuccess,
     RequestPayload,
     ResultPayload,
@@ -38,6 +39,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.events.diagnostics_events import CollectDiagnosticsRequest
 from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.model_events import DeclareModelInvocationRequest
 from griptape_nodes.retained_mode.events.object_events import (
@@ -77,6 +79,8 @@ from griptape_nodes.utils.async_utils import call_function
 from tests.workflow_context import push_unsaved_workflow, without_sole_workflow_fallback
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -640,6 +644,74 @@ class TestWorkflowBinding:
             "Failed because that workflow isn't open."
         )
         assert calls.workflows == []
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    @pytest.mark.asyncio
+    async def test_a_saved_files_binding_to_a_closed_workflow_counts_as_no_binding(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        """It outlives its workflow, so once that closes the request reaches the workflow open now."""
+        closed = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        await engine.close_workflow_state(closed)
+        open_now = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, scope)
+
+        async def run_as_saved_file() -> EventResultSuccess | EventResultFailure:
+            engine.bind_workflow_for_saved_file(closed)
+            assert engine.bound_workflow is None
+            return await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        # The saved file's own task, so its binding ends with it.
+        result_event = await asyncio.create_task(run_as_saved_file())
+
+        assert result_event.succeeded()
+        assert calls.workflows == [open_now]
+
+    @pytest.mark.asyncio
+    async def test_a_saved_files_binding_to_an_open_workflow_addresses_it(self, engine: Engine, calls: _Calls) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, RequestScope.WORKFLOW)
+
+        async def run_as_saved_file() -> EventResultSuccess | EventResultFailure:
+            engine.bind_workflow_for_saved_file(workflow)
+            return await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        with without_sole_workflow_fallback():
+            result_event = await asyncio.create_task(run_as_saved_file())
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]
+        assert engine.bound_workflow is None
+
+    @pytest.mark.asyncio
+    async def test_a_workflow_opened_after_a_saved_files_workflow_closed_takes_its_requests(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A script that clears the workflow its file opened and opens another keeps working."""
+        saved = tmp_path / "script.py"
+        saved.write_text("# A saved workflow file.\n", encoding="utf-8")
+
+        async def run_as_script() -> list[ResultPayload]:
+            engine.context_manager.push_workflow(file_path=str(saved))
+            results = [
+                await engine.ahandle_request(
+                    CreateFlowRequest(parent_flow_name=None, flow_name="a", set_as_new_context=False)
+                ),
+                await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True)),
+                await engine.ahandle_request(SetWorkflowContextRequest()),
+            ]
+            results.append(
+                await engine.ahandle_request(
+                    CreateFlowRequest(parent_flow_name=None, flow_name="b", set_as_new_context=False)
+                )
+            )
+            return results
+
+        results = await asyncio.create_task(run_as_script())
+
+        assert [result.succeeded() for result in results] == [True, True, True, True]
+        assert isinstance(results[3], CreateFlowResultSuccess)
+        assert results[3].flow_name == "b"
 
     @pytest.mark.parametrize("scope", [RequestScope.HOST, None])
     @pytest.mark.asyncio

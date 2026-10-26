@@ -17,6 +17,7 @@ import os
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -116,9 +117,23 @@ _root_engine: Engine | None = None
 _root_engine_lock = threading.RLock()
 _root_engine_building = False
 
-# The workflow a request sent without an envelope id acts on (see `Engine.bind_workflow`). A ContextVar
-# so a binding reaches the tasks and `asyncio.to_thread` calls made under it, and no further.
-_bound_workflow: ContextVar[WorkflowRuntime | None] = ContextVar("griptape_nodes_bound_workflow", default=None)
+
+@dataclass(frozen=True)
+class _WorkflowBinding:
+    """The workflow a request sent without an envelope id acts on, and what happens once it closes.
+
+    `lapses_when_closed` is set for a saved workflow file's binding (`Engine.bind_workflow_for_saved_file`),
+    which outlives the workflow it names: once that workflow closes, the work counts as unbound. A
+    `bind_workflow` block's binding never lapses, so a request sent in it after its workflow closed fails.
+    """
+
+    workflow: WorkflowRuntime
+    lapses_when_closed: bool
+
+
+# The binding of the current work (see `Engine.bind_workflow`). A ContextVar so a binding reaches the
+# tasks and `asyncio.to_thread` calls made under it, and no further.
+_workflow_binding: ContextVar[_WorkflowBinding | None] = ContextVar("griptape_nodes_workflow_binding", default=None)
 
 
 class EngineScoped:
@@ -398,8 +413,19 @@ class Engine:
 
     @property
     def bound_workflow(self) -> WorkflowRuntime | None:
-        """The workflow the current work is bound to (see `bind_workflow`), or None."""
-        return _bound_workflow.get()
+        """The workflow the current work is bound to (see `bind_workflow`), or None.
+
+        None also when a saved file's binding names a workflow that has since closed. A `bind_workflow`
+        block's workflow is returned even once closed, so the request sent for it fails as stale.
+        """
+        binding = _workflow_binding.get()
+        if binding is None:
+            return None
+        if binding.lapses_when_closed and self._open_workflows.find_by_id(binding.workflow.workflow_id) is not (
+            binding.workflow
+        ):
+            return None
+        return binding.workflow
 
     @contextmanager
     def bind_workflow(self, workflow: WorkflowRuntime | None) -> Iterator[None]:
@@ -414,11 +440,14 @@ class Engine:
         it, but `loop.run_in_executor` and `ThreadPoolExecutor.submit` do not unless the caller runs
         the function in `contextvars.copy_context()`.
         """
-        token = _bound_workflow.set(workflow)
+        binding = None
+        if workflow is not None:
+            binding = _WorkflowBinding(workflow=workflow, lapses_when_closed=False)
+        token = _workflow_binding.set(binding)
         try:
             yield
         finally:
-            _bound_workflow.reset(token)
+            _workflow_binding.reset(token)
 
     def bind_workflow_for_saved_file(self, workflow: WorkflowRuntime) -> None:
         """Bind `workflow` for the rest of the current context, for a saved workflow file that opened it.
@@ -426,9 +455,11 @@ class Engine:
         A saved file opens its workflow (`push_workflow(file_path=__file__)`) and then sends its
         requests without an envelope id, as does the executor that runs it. Nothing unbinds it: the
         binding lasts as long as the context, which is the file run's `bind_workflow` block when the
-        engine runs the file, or the script's own task when it runs on its own.
+        engine runs the file, or the script's own task when it runs on its own. Because it outlives
+        the workflow, it lapses once the workflow closes: the context's later requests count as unbound
+        rather than failing for a workflow that is gone.
         """
-        _bound_workflow.set(workflow)
+        _workflow_binding.set(_WorkflowBinding(workflow=workflow, lapses_when_closed=True))
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -864,4 +895,4 @@ def reset_root_engine() -> None:
         _root_engine = None
     # A saved file opened outside a task binds its workflow for the rest of this context, which would
     # address the next engine's requests to a workflow it never opened.
-    _bound_workflow.set(None)
+    _workflow_binding.set(None)
