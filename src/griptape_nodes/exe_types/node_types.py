@@ -67,6 +67,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -331,6 +332,8 @@ class BaseNode(ABC):
     # Set by the ObjectManager while this node is registered, so a node with queued changes is
     # flushed without the manager scanning every object after each request.
     _on_change_queued: Callable[[BaseNode], None] | None = None
+    # Set by the ObjectManager while this node is one of a workflow's objects; see `workflow`.
+    _workflow: WorkflowRuntime | None = None
     _entry_control_parameter: Parameter | None = (
         None  # The control input parameter used to enter this node during execution
     )
@@ -457,6 +460,16 @@ class BaseNode(ABC):
         return self._engine
 
     @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The open workflow this node belongs to, or None for a node in no workflow.
+
+        Set when the node joins a workflow's objects and cleared when it leaves them, so it is None
+        while the node's ``__init__`` runs, after the node is deleted, and for nodes that never join
+        one: a worker's transient copy of a node, and nodes built only to be inspected.
+        """
+        return self._workflow
+
+    @property
     def state(self) -> NodeResolutionState:
         """Get the current resolution state of the node.
 
@@ -544,6 +557,10 @@ class BaseNode(ABC):
     def clear_cancellation(self) -> None:
         """Clear the cancellation request flag."""
         self._cancellation_requested.clear()
+
+    def _set_workflow(self, workflow: WorkflowRuntime | None) -> None:
+        """Record the workflow whose objects this node is in. Only the ObjectManager calls this."""
+        self._workflow = workflow
 
     def set_change_listener(self, listener: Callable[[BaseNode], None] | None) -> None:
         """Call ``listener`` whenever this node queues a change, and now if one is already queued."""

@@ -190,6 +190,8 @@ class ObjectManager(EngineScoped):
     def add_object_by_name_in(self, workflow: WorkflowRuntime, name: str, obj: object) -> None:
         workflow.objects.add(name, obj)
         if isinstance(obj, BaseNode):
+            # The one place a node joins a workflow, so every node in `workflow.objects` knows it.
+            obj._set_workflow(workflow)
             obj.set_change_listener(self._note_queued_changes)
 
     def get_object_by_name(self, name: str) -> object:
@@ -228,6 +230,7 @@ class ObjectManager(EngineScoped):
                     workflow.handle_request(RemoveParameterFromNodeRequest(child.name, obj.name))
                     return
         if isinstance(obj, BaseNode):
+            obj._set_workflow(None)
             obj.set_change_listener(None)
             self._nodes_with_queued_changes.pop(id(obj), None)
         objects.remove(name)
