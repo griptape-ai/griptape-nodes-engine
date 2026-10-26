@@ -45,6 +45,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows.missing_to
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.node_type_not_found_problem import (
     NodeTypeNotFoundProblem,
 )
+from griptape_nodes.retained_mode.managers.fitness_problems.workflows.referenced_workflow_unresolvable_problem import (
+    ReferencedWorkflowUnresolvableProblem,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_not_found_problem import (
     WorkflowNotFoundProblem,
 )
@@ -69,6 +72,7 @@ __all__ = [
     "MissingLastModifiedDateProblem",
     "MissingTomlSectionProblem",
     "NodeTypeNotFoundProblem",
+    "ReferencedWorkflowUnresolvableProblem",
     "WorkflowNotFoundProblem",
     "WorkflowProblem",
     "WorkflowSchemaVersionProblem",

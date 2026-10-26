@@ -200,6 +200,11 @@ class WorkflowCodeGenerator(EngineScoped):
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        # Libraries this workflow's own nodes need, expanded to the libraries those libraries
+        # declare. A referenced sub-workflow's libraries are deliberately not folded in: it owns its
+        # own header, and it can be edited after this save, so a copy taken here would describe it
+        # as it was rather than as it is at load. Callers that need the full picture walk
+        # `workflows_referenced` for it (see `collect_referenced_workflow_dependencies`).
         direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
         all_libs = self.engine.library_manager.dependencies.resolve_transitive_library_deps(direct_libs)
 
