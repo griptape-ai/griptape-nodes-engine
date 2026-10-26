@@ -1,5 +1,5 @@
 import logging
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
@@ -56,6 +56,10 @@ from griptape_nodes.retained_mode.events.variable_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import handles
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectVariableResolver
+
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
     VariableLayer,
@@ -268,7 +272,9 @@ class VariablesManager(EngineScoped):
         """Resolve None → current project id; returns None when no project is available."""
         return self.engine.project_manager.resolve_project_id(project_id)
 
-    def _get_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable | None:
+    def _get_project_variable(
+        self, name: str, *, project_id: str | None, resolver: "ProjectVariableResolver | None" = None
+    ) -> FlowVariable | None:
         """Resolve a single project-layer variable (computed namespace first, then stored layer).
 
         ``project_id=None`` means the current project. Computed values (builtins/directories)
@@ -276,7 +282,7 @@ class VariablesManager(EngineScoped):
         (e.g. {workflow_dir} with no workflow in context) yields None, matching the
         silent-skip contract — the name exists, so the stored layer is NOT consulted as a
         fallback. Stored hits return a snapshot copy so callers can't mutate stored state through a
-        response payload.
+        response payload. Pass ``resolver`` to share resolved values across several reads.
         """
         effective = self._effective_project_id(project_id)
         if effective is None:
@@ -289,7 +295,9 @@ class VariablesManager(EngineScoped):
         project_manager = self.engine.project_manager
         if name in project_manager.project_computed_names(project_id=effective):
             try:
-                return project_manager.resolve_project_variable(name, project_id=effective)
+                if resolver is None:
+                    resolver = project_manager.computed_variable_resolver(project_id=effective)
+                return resolver.resolve_computed_variable(name)
             except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
                 # Computed name exists but its context isn't ready (e.g. {workflow_dir} with no
                 # workflow in context, or a directory macro that can't resolve). Silent-skip,
@@ -388,11 +396,17 @@ class VariablesManager(EngineScoped):
         workflow_dir with no workflow in context) are omitted rather than raising. Each entry
         carries VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
         """
+        effective = self._effective_project_id(project_id)
+        if effective is None:
+            return []
+        # One resolver for the whole enumeration, so the builtins every directory references
+        # resolve once rather than once per directory.
+        resolver = self.engine.project_manager.computed_variable_resolver(project_id=effective)
         collected: list[ResolvedVariable] = []
-        for name in self._list_project_variable_names(project_id=project_id):
+        for name in self._list_project_variable_names(project_id=effective):
             if name in seen:
                 continue
-            variable = self._get_project_variable(name, project_id=project_id)
+            variable = self._get_project_variable(name, project_id=effective, resolver=resolver)
             if variable is None:
                 continue
             collected.append(ResolvedVariable(variable=variable, layer=VariableLayerKind.PROJECT))

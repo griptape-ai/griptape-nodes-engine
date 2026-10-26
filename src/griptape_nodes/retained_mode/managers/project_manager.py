@@ -260,7 +260,7 @@ def _substitutable_stored_values(stored_values: dict[str, Any]) -> dict[str, str
 
 
 @dataclass
-class _ProjectVariableResolver:
+class ProjectVariableResolver:
     """Recursive resolver for project directory path_macros and environment values.
 
     Both directories and env vars may contain macros that reference builtins, other
@@ -280,6 +280,22 @@ class _ProjectVariableResolver:
     env_resolved: dict[str, str] = field(default_factory=dict)
     directories_resolved: dict[str, str] = field(default_factory=dict)
     in_progress: set[str] = field(default_factory=set)
+
+    def resolve_computed_variable(self, name: str) -> FlowVariable:
+        """Resolve a builtin or template directory to a READ_ONLY snapshot FlowVariable.
+
+        Raises ValueError when the name isn't a computed name.
+        """
+        if name in BUILTIN_VARIABLES:
+            value = self._get_builtin(name)
+        elif name in self.template.directories:
+            value = self.resolve_directory(name)
+        else:
+            msg = f"Unknown computed project variable '{name}'"
+            raise ValueError(msg)
+        return FlowVariable(
+            name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
+        )
 
     def resolve_directory(self, name: str) -> str:
         if name in self.directories_resolved:
@@ -1698,7 +1714,7 @@ class ProjectManager(EngineScoped):
                     result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
                 )
             # Logged for the same reason as the equivalent degradation in
-            # _ProjectVariableResolver._resolve_macro_string: the degraded result is a
+            # ProjectVariableResolver._resolve_macro_string: the degraded result is a
             # PLAUSIBLE path, not an obviously broken one. Dropping `{workflow_dir}` from
             # `{workflow_dir?:/}outputs` relocates writes and reads from the workflow's folder
             # to the workspace root, and without this line the only symptom is media that
@@ -1918,7 +1934,7 @@ class ProjectManager(EngineScoped):
     def _resolve_project_env_values(self, template: ProjectTemplate, project_info: ProjectInfo) -> dict[str, str]:
         """Recursively resolve every entry in template.environment to a final string.
 
-        Returns the full env-resolution map. See `_ProjectVariableResolver` for the
+        Returns the full env-resolution map. See `ProjectVariableResolver` for the
         recursion and reference-lookup rules.
         """
         resolver = self._build_variable_resolver(template, project_info)
@@ -1926,11 +1942,9 @@ class ProjectManager(EngineScoped):
             resolver.resolve_env(key)
         return dict(resolver.env_resolved)
 
-    def _build_variable_resolver(
-        self, template: ProjectTemplate, project_info: ProjectInfo
-    ) -> _ProjectVariableResolver:
+    def _build_variable_resolver(self, template: ProjectTemplate, project_info: ProjectInfo) -> ProjectVariableResolver:
         """Build a resolver that recursively resolves directories and env vars for this project."""
-        return _ProjectVariableResolver(
+        return ProjectVariableResolver(
             template=template,
             get_builtin=lambda name: self._get_builtin_variable_value(name, project_info),
             secrets_manager=self._secrets_manager,
@@ -4777,28 +4791,23 @@ class ProjectManager(EngineScoped):
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
         {workflow_dir} with no workflow in context).
         """
+        return self.computed_variable_resolver(project_id=project_id).resolve_computed_variable(name)
+
+    def computed_variable_resolver(self, *, project_id: str | None) -> ProjectVariableResolver:
+        """Return a resolver for a project's computed variables that resolves each value once.
+
+        Use one resolver to read several computed variables at the same moment: directories
+        reference the same builtins, and `workflow_dir` alone resolves a whole situation macro.
+        Values are not refreshed, so do not keep the resolver past the read.
+
+        Raises ValueError when the project isn't loaded.
+        """
         effective = self.resolve_project_id(project_id)
         if effective is None:
             msg = f"Project '{project_id}' is not loaded"
             raise ValueError(msg)
         project_info = self._successfully_loaded_project_templates[effective]
-
-        if name in BUILTIN_VARIABLES:
-            value = self._get_builtin_variable_value(name, project_info)
-            return FlowVariable(
-                name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
-            )
-        if name in project_info.template.directories:
-            resolver = self._build_variable_resolver(project_info.template, project_info)
-            return FlowVariable(
-                name=name,
-                owning_flow_name=None,
-                type="str",
-                value=resolver.resolve_directory(name),
-                permission=VariablePermission.READ_ONLY,
-            )
-        msg = f"Unknown computed project variable '{name}'"
-        raise ValueError(msg)
+        return self._build_variable_resolver(project_info.template, project_info)
 
     # Helper methods (private)
 
