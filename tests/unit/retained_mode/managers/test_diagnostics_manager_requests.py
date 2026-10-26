@@ -514,11 +514,10 @@ class TestTheOpenWorkflow:
     """
 
     @pytest.fixture
-    def open_workflow(self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    def open_workflow(self, engine: Engine, tmp_path: Path) -> Path:
         """Open a saved workflow in the engine, and return the file it was saved to."""
         workflow = tmp_path / "the-flow-that-broke.py"
-        workflow.write_text("# a saved workflow\n", encoding="utf-8")
-        self._open(monkeypatch, engine, name="the-flow-that-broke", file_path=str(workflow))
+        self._open(engine, saved_to=workflow)
         return workflow
 
     @pytest.mark.asyncio
@@ -530,6 +529,45 @@ class TestTheOpenWorkflow:
         assert f"workflow/{open_workflow.name}" in _members(result)
 
     @pytest.mark.asyncio
+    async def test_the_workflow_the_envelope_names_is_copied_into_the_bundle(
+        self, engine: Engine, tmp_path: Path, open_workflow: Path
+    ) -> None:
+        workflow_id = engine.open_workflows.sole_workflow().workflow_id
+        result = await engine.ahandle_request(
+            CollectDiagnosticsRequest(
+                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+            ),
+            workflow_id=workflow_id,
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert f"workflow/{open_workflow.name}" in _members(result)
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_the_open_workflow(self, engine: Engine, open_workflow: Path) -> None:
+        report = await _report(engine)
+
+        assert report.session.current_workflow_name is not None
+        assert open_workflow.stem in report.session.current_workflow_name
+        assert report.session.current_workflow_path is not None
+        assert report.session.current_workflow_path.endswith(open_workflow.name)
+
+    @pytest.mark.asyncio
+    async def test_a_request_handed_no_workflow_copies_none_even_with_one_open(
+        self, engine: Engine, tmp_path: Path, open_workflow: Path
+    ) -> None:
+        result = await engine.diagnostics_manager.on_collect_diagnostics_request(
+            CollectDiagnosticsRequest(
+                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+            ),
+            None,
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert f"workflow/{open_workflow.name}" not in _members(result)
+        assert [warning for warning in result.manifest.warnings if "No workflow was open" in warning] != []
+
+    @pytest.mark.asyncio
     async def test_nothing_open_is_reported_rather_than_left_blank(self, engine: Engine, tmp_path: Path) -> None:
         """Asked for and absent is a different thing from never asked for."""
         result = await _collect(engine, tmp_path, include_current_workflow=True)
@@ -538,38 +576,38 @@ class TestTheOpenWorkflow:
 
     @pytest.mark.asyncio
     async def test_an_unsaved_workflow_is_reported_with_what_to_do_about_it(
-        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """The likeliest case of all: the workflow being reported on has never been saved."""
-        self._open(monkeypatch, engine, name="untitled", file_path=None)
+        self._open(engine, saved_to=None)
 
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
         assert [warning for warning in result.manifest.warnings if "never been saved" in warning] != []
 
     @pytest.mark.asyncio
-    async def test_a_workflow_whose_file_is_gone_is_reported_by_name(
-        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_a_workflow_whose_file_is_gone_is_reported_by_name(self, engine: Engine, tmp_path: Path) -> None:
         """Deleted from under the engine, which is itself worth knowing about."""
-        self._open(monkeypatch, engine, name="deleted-since", file_path=str(tmp_path / "deleted-since.py"))
+        saved_to = tmp_path / "deleted-since.py"
+        self._open(engine, saved_to=saved_to)
+        saved_to.unlink()
 
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
         assert [warning for warning in result.manifest.warnings if "deleted-since.py" in warning] != []
 
     @staticmethod
-    def _open(monkeypatch: pytest.MonkeyPatch, engine: Engine, *, name: str, file_path: str | None) -> None:
-        """Answer the context manager as though this workflow were open.
+    def _open(engine: Engine, *, saved_to: Path | None) -> None:
+        """Open an empty workflow, saved to a placeholder file at `saved_to` unless it is None.
 
-        Patched rather than really opened: opening one runs its generated module, which
-        registers nodes and libraries this has nothing to do with. The three methods
-        replaced here are everything the diagnostics code asks about the open workflow.
+        The placeholder is never run: running a workflow file registers nodes and libraries this has
+        nothing to do with.
         """
-        context_manager = engine.context_manager
-        monkeypatch.setattr(context_manager, "has_current_workflow", lambda: True)
-        monkeypatch.setattr(context_manager, "get_current_workflow_name", lambda: name)
-        monkeypatch.setattr(context_manager, "get_current_workflow_file_path", lambda: file_path)
+        entry = push_unsaved_workflow(engine)
+        if saved_to is None:
+            return
+        saved_to.write_text("# a saved workflow\n", encoding="utf-8")
+        engine.workflow_registry.set_file_path(entry, saved_to)
 
 
 class TestBundleWrittenToStaticFiles:

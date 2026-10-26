@@ -60,6 +60,7 @@ from griptape_nodes.utils.http_utils import is_retryable_httpx_error, request_wi
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -177,14 +178,17 @@ class BudgetManager(EngineScoped):
             ),
         )
 
-    @handles(BudgetAccessRequest)
+    @handles(BudgetAccessRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_budget_access_request(
-        self, request: BudgetAccessRequest
+        self, request: BudgetAccessRequest, workflow: WorkflowRuntime | None = None
     ) -> BudgetAccessResultSuccess | BudgetAccessResultFailure:
-        """Ask Cloud whether a direct provider call fits its budgets; fail open unless Cloud says no."""
+        """Ask Cloud whether a direct provider call fits its budgets; fail open unless Cloud says no.
+
+        The call is tagged with `workflow`, the workflow it is made for, when there is one.
+        """
         correlation_id = uuid.uuid4().hex
         body: dict[str, Any] = {
-            "tags": self._build_tags(request.node_type, request.node_id),
+            "tags": self._build_tags(request.node_type, request.node_id, workflow),
             "model": request.model,
             "correlation_id": correlation_id,
         }
@@ -234,11 +238,14 @@ class BudgetManager(EngineScoped):
             result_details=f"Griptape Cloud cleared a direct call to model '{request.model}' against its budgets.",
         )
 
-    @handles(ReportUsageRequest)
+    @handles(ReportUsageRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_report_usage_request(
-        self, request: ReportUsageRequest
+        self, request: ReportUsageRequest, workflow: WorkflowRuntime | None = None
     ) -> ReportUsageResultSuccess | ReportUsageResultFailure:
-        """Queue a usage report for a direct provider call and return without waiting on Cloud."""
+        """Queue a usage report for a direct provider call and return without waiting on Cloud.
+
+        The report is tagged with `workflow`, the workflow the call was made for, when there is one.
+        """
         problem = _shape_problem(request)
         if problem is not None:
             return self._report_not_sent(request.model, f"Failed because {problem}")
@@ -249,7 +256,7 @@ class BudgetManager(EngineScoped):
         idempotency_key = uuid.uuid4().hex
         body: dict[str, Any] = {
             "idempotency_key": idempotency_key,
-            "tags": self._build_tags(request.node_type, request.node_id),
+            "tags": self._build_tags(request.node_type, request.node_id, workflow),
             "occurred_at": datetime.now(UTC).isoformat(),
         }
         if request.declared_cost_micro_usd is None:
@@ -292,15 +299,16 @@ class BudgetManager(EngineScoped):
 
         return [entry.id for entry in chain if entry.id.strip() != SYSTEM_DEFAULTS_KEY]
 
-    def _build_tags(self, node_type: str | None, node_id: str | None) -> dict[str, Any]:
+    def _build_tags(
+        self, node_type: str | None, node_id: str | None, workflow: WorkflowRuntime | None
+    ) -> dict[str, Any]:
         """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown."""
         tags: dict[str, Any] = {}
         project_chain = self._resolve_project_chain()
         if project_chain:
             tags["project"] = project_chain
-        context_manager = self.engine.context_manager
-        if context_manager.has_current_workflow():
-            tags["workflow"] = context_manager.get_current_workflow_name()
+        if workflow is not None:
+            tags["workflow"] = self.engine.workflow_registry.get(workflow.workflow_id).name
         candidates = {
             "node_type": node_type,
             "node_id": node_id,

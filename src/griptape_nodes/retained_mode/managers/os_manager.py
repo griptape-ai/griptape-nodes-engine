@@ -2544,6 +2544,16 @@ class OSManager(EngineScoped):
             else "Base path is available (no index needed)",
         )
 
+    async def write_file_in(self, workflow: "WorkflowRuntime | None", request: WriteFileRequest) -> ResultPayload:
+        """Write `request` for `workflow`, for a handler that holds the workflow it writes for, or None.
+
+        A held workflow gets the request addressed to it. None is written here with no workflow:
+        dispatch would hand an unaddressed request whichever workflow it finds open.
+        """
+        if workflow is None:
+            return await self.on_write_file_request(request)
+        return await workflow.ahandle_request(request)
+
     @handles(WriteFileRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_write_file_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
         self, request: WriteFileRequest, workflow: "WorkflowRuntime | None" = None

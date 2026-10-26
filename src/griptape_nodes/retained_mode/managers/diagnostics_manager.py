@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -233,11 +234,15 @@ class DiagnosticsManager(EngineScoped):
             ),
         )
 
-    @handles(CollectDiagnosticsRequest)
+    @handles(CollectDiagnosticsRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_collect_diagnostics_request(
-        self, request: CollectDiagnosticsRequest
+        self, request: CollectDiagnosticsRequest, workflow: WorkflowRuntime | None = None
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        """Build a diagnostics bundle and return a link to download it."""
+        """Build a diagnostics bundle and return a link to download it.
+
+        `workflow` is the workflow whose file the bundle includes and whose static files it is saved
+        in, or None.
+        """
         # This name is joined onto the output directory, so anything with a directory in it --
         # `../../.ssh/config`, an absolute path, a bare `..` -- lands somewhere the caller never saw.
         if request.file_name is not None and not _is_a_plain_file_name(request.file_name):
@@ -263,7 +268,7 @@ class DiagnosticsManager(EngineScoped):
                 if request.include_logs:
                     self._stage_logs(bundle, warnings)
                 if request.include_current_workflow:
-                    self._stage_current_workflow(bundle, warnings)
+                    self._stage_workflow(bundle, warnings, workflow)
 
                 report = await self._build_report(redactor, warnings, normalize_identity=request.normalize_identity)
                 if report is None:
@@ -294,11 +299,16 @@ class DiagnosticsManager(EngineScoped):
 
         file_name = request.file_name or self._default_bundle_file_name(report)
         if request.output_path is not None:
-            return await self._write_bundle_to_path(request.output_path, file_name, data, manifest)
+            return await self._write_bundle_to_path(workflow, request.output_path, file_name, data, manifest)
         return self._write_bundle_to_static_files(file_name, data, manifest)
 
     async def _write_bundle_to_path(
-        self, output_path: str, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
+        self,
+        workflow: WorkflowRuntime | None,
+        output_path: str,
+        file_name: str,
+        data: bytes,
+        manifest: DiagnosticsBundleManifest,
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
         r"""Write a bundle to a path on the engine\'s machine.
 
@@ -313,14 +323,15 @@ class DiagnosticsManager(EngineScoped):
 
         # Extension coercion off: a zip is written as a zip, and a diagnostics bundle
         # renamed by format sniffing would break whatever the user is about to attach it to.
-        result = await self.engine.ahandle_request(
+        result = await self.engine.os_manager.write_file_in(
+            workflow,
             WriteFileRequest(
                 file_path=str(destination),
                 content=data,
                 existing_file_policy=ExistingFilePolicy.CREATE_NEW,
                 skip_metadata_injection=True,
                 coerce_extension_to_match_bytes=False,
-            )
+            ),
         )
         if not isinstance(result, WriteFileResultSuccess):
             details = (
@@ -563,22 +574,20 @@ class DiagnosticsManager(EngineScoped):
             "most likely cannot be written to."
         )
 
-    def _stage_current_workflow(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
-        """Add the open workflow's saved file to a bundle, when there is one."""
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
+    def _stage_workflow(self, bundle: DiagnosticsBundle, warnings: list[str], workflow: WorkflowRuntime | None) -> None:
+        """Add the saved file of `workflow` to a bundle, when there is one."""
+        if workflow is None:
             warnings.append("No workflow was open, so none is in this bundle.")
             return
 
-        file_path = context_manager.get_current_workflow_file_path()
-        if file_path is None:
+        workflow_path = self.engine.workflow_registry.get(workflow.workflow_id).absolute_path
+        if workflow_path is None:
             warnings.append(
                 "The open workflow has never been saved, so it is not in this bundle. "
                 "Save it and collect again to include it."
             )
             return
 
-        workflow_path = Path(file_path)
         if not workflow_path.exists():
             warnings.append(
                 f"The open workflow's file '{workflow_path.name}' is no longer on disk, so it is not in this bundle."
@@ -911,18 +920,21 @@ class DiagnosticsManager(EngineScoped):
 
     async def _build_session_section(self, redactor: Redactor, warnings: list[str]) -> SessionDiagnostics:
         """Report what the engine currently has open."""
-        context_manager = self.engine.context_manager
-        object_manager = self.engine.object_manager
+        workflow = self.engine.open_workflows.sole_workflow_or_none()
 
         workflow_name = None
         workflow_path = None
-        if context_manager.has_current_workflow():
+        flow_count = 0
+        node_count = 0
+        if workflow is not None:
+            entry = self.engine.workflow_registry.get(workflow.workflow_id)
             # Redacted even though it is a "name": a workflow saved outside the workspace is keyed
             # by its absolute path, so one saved to the desktop is named `/Users/sam/Desktop/flow`.
-            workflow_name = redactor.redact_text(context_manager.get_current_workflow_name())
-            current_path = context_manager.get_current_workflow_file_path()
-            if current_path is not None:
-                workflow_path = redactor.redact_path(current_path)
+            workflow_name = redactor.redact_text(entry.name)
+            if entry.absolute_path is not None:
+                workflow_path = redactor.redact_path(entry.absolute_path)
+            flow_count = len(workflow.objects.get_filtered_subset(type=ControlFlow))
+            node_count = len(workflow.objects.get_filtered_subset(type=BaseNode))
 
         registered_count = 0
         workflows_result = await self.engine.ahandle_request(ListAllWorkflowsRequest(broadcast_result=False))
@@ -934,8 +946,8 @@ class DiagnosticsManager(EngineScoped):
         return SessionDiagnostics(
             current_workflow_name=workflow_name,
             current_workflow_path=workflow_path,
-            flow_count=len(object_manager.get_filtered_subset(type=ControlFlow)),
-            node_count=len(object_manager.get_filtered_subset(type=BaseNode)),
+            flow_count=flow_count,
+            node_count=node_count,
             registered_workflow_count=registered_count,
         )
 
