@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.files.path_utils import resolve_path_safely
@@ -19,9 +20,13 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GeneratePreviewFromDefaultsRequest,
     GeneratePreviewRequest,
     GetPreviewForArtifactRequest,
+    GetPreviewForArtifactResultFailure,
+    PreviewGenerationPolicy,
+    RegisterArtifactProviderRequest,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
+    ExistingFilePolicy,
     GetNextVersionIndexRequest,
     ListDirectoryRequest,
     ListDirectoryResultSuccess,
@@ -49,10 +54,13 @@ from griptape_nodes.retained_mode.events.project_events import (
 from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileDownloadUrlFromPathRequest,
     CreateStaticFileDownloadUrlRequest,
+    CreateStaticFileDownloadUrlResultSuccess,
     CreateStaticFileRequest,
     CreateStaticFileUploadUrlRequest,
+    CreateStaticFileUploadUrlResultFailure,
 )
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
@@ -126,6 +134,15 @@ def nothing_open(engine: Engine) -> Iterator[Engine]:
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield engine
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+@pytest.fixture
+def workspace(nothing_open: Engine, tmp_path: Path) -> Iterator[Path]:
+    """Make `tmp_path` the workspace, so static files under a workflow's folder stay in that folder."""
+    original = nothing_open.config_manager.workspace_path
+    nothing_open.config_manager.workspace_path = tmp_path
+    yield tmp_path
+    nothing_open.config_manager.workspace_path = original
 
 
 def _folder(path: Path) -> Path:
@@ -303,3 +320,73 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         )
 
         assert isinstance(result, ResolveMacroPathResultFailure)
+
+
+class TestStaticFilesResolveForTheDispatchedWorkflow:
+    """Static files and previews go to the folder of the workflow they are for, and say so when there is none."""
+
+    def test_a_static_file_url_points_into_the_addressed_workflows_folder(
+        self, nothing_open: Engine, workspace: Path
+    ) -> None:
+        push_unsaved_workflow(nothing_open, working_directory=str(workspace / "open"))
+
+        with _also_open(nothing_open, workspace / "addressed") as addressed:
+            result = nothing_open.handle_request(
+                CreateStaticFileDownloadUrlRequest(file_name="notes.txt", situation_name="save_static_file"),
+                workflow_id=addressed.workflow_id,
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlResultSuccess), result.result_details
+        assert Path(result.file_url) == workspace / "addressed" / "staticfiles" / "notes.txt"
+        assert "/workspace/addressed/staticfiles/notes.txt" in result.url
+
+    def test_a_preview_is_looked_up_in_the_addressed_workflows_preview_folder(
+        self, nothing_open: Engine, workspace: Path
+    ) -> None:
+        """Generating one writes through unaddressed requests, so this checks where it is looked for."""
+        nothing_open.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
+        push_unsaved_workflow(nothing_open, working_directory=str(workspace / "open"))
+        image_path = workspace / "img.png"
+        Image.new("RGB", (64, 64), color="red").save(image_path)
+
+        with _also_open(nothing_open, workspace / "addressed") as addressed:
+            result = nothing_open.handle_request(
+                GetPreviewForArtifactRequest(
+                    macro_path=MacroPath(ParsedMacro(str(image_path)), {}),
+                    artifact_provider_name=ImageArtifactProvider.get_friendly_name(),
+                    preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
+                ),
+                workflow_id=addressed.workflow_id,
+            )
+
+        assert isinstance(result, GetPreviewForArtifactResultFailure)
+        assert f"metadata file not found at '{_folder(workspace / 'addressed' / '.griptape-nodes-previews')}" in str(
+            result.result_details
+        )
+
+    def test_save_static_file_with_nothing_open_names_the_missing_workflow(self, nothing_open: Engine) -> None:
+        """A host caller, such as an agent tool, gets the real cause rather than a missing situation."""
+        with pytest.raises(RuntimeError) as raised:
+            nothing_open.static_files_manager.save_static_file(b"hello", "notes.txt")
+
+        message = str(raised.value)
+        assert message.startswith("Attempted to save static file 'notes.txt'. Failed because ")
+        assert "uses {workflow_dir}" in message
+        assert "missing the" not in message
+
+    def test_save_workspace_static_file_with_nothing_open_lands_in_the_workspace(
+        self, nothing_open: Engine, workspace: Path
+    ) -> None:
+        url = nothing_open.static_files_manager.save_workspace_static_file(
+            b"hello", "notes.txt", ExistingFilePolicy.CREATE_NEW
+        )
+
+        assert (workspace / "staticfiles" / "notes.txt").read_bytes() == b"hello"
+        assert "/workspace/staticfiles/notes.txt" in url
+
+    def test_upload_url_with_nothing_open_names_the_missing_workflow(self, nothing_open: Engine) -> None:
+        result = nothing_open.handle_request(CreateStaticFileUploadUrlRequest(file_name="notes.txt"))
+
+        assert isinstance(result, CreateStaticFileUploadUrlResultFailure)
+        assert "uses {workflow_dir}" in str(result.result_details)
+        assert "missing the" not in str(result.result_details)

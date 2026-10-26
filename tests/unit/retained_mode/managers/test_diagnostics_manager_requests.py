@@ -22,6 +22,7 @@ import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlparse
 
 import httpx2
 import pytest
@@ -48,10 +49,14 @@ from griptape_nodes.retained_mode.events.diagnostics_events import (
     RunHealthChecksResultFailure,
     RunHealthChecksResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
+from tests.workflow_context import push_unsaved_workflow
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.common.diagnostics.report import DiagnosticsReport
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -579,7 +584,7 @@ class TestBundleWrittenToStaticFiles:
     async def test_returns_a_link_rather_than_a_path(self, engine: Engine) -> None:
         saved_as = "https://static.example.com/files/griptape-nodes-diagnostics-1.2.3-20260101-000000_1.zip"
 
-        with patch.object(engine.static_files_manager, "save_static_file", return_value=saved_as) as save:
+        with patch.object(engine.static_files_manager, "save_workspace_static_file", return_value=saved_as) as save:
             result = await engine.ahandle_request(
                 CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
             )
@@ -600,7 +605,9 @@ class TestBundleWrittenToStaticFiles:
         """No disk space, or a static files directory that is not there any more."""
         with (
             patch.object(
-                engine.static_files_manager, "save_static_file", side_effect=OSError("No space left on device")
+                engine.static_files_manager,
+                "save_workspace_static_file",
+                side_effect=OSError("No space left on device"),
             ),
             caplog.at_level(logging.ERROR, logger=LOGGER_NAME),
         ):
@@ -625,7 +632,7 @@ class TestBundleWrittenToStaticFiles:
         with (
             patch.object(
                 engine.static_files_manager,
-                "save_static_file",
+                "save_workspace_static_file",
                 side_effect=httpx2.ConnectError("All connection attempts failed"),
             ),
             caplog.at_level(logging.ERROR, logger=LOGGER_NAME),
@@ -637,6 +644,51 @@ class TestBundleWrittenToStaticFiles:
         assert isinstance(result, CollectDiagnosticsResultFailure)
         assert "All connection attempts failed" in str(result.result_details)
         assert "Attempted to save the diagnostics bundle" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_open_the_bundle_lands_in_the_workspace_static_files(
+        self, engine: Engine, workspace: Path
+    ) -> None:
+        """The editor offers "Collect troubleshooting info" before any workflow is open."""
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        result = await engine.ahandle_request(
+            CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert result.url is not None
+        # The static server serves the workspace, so the editor can download it from this link.
+        assert urlparse(result.url).path == f"/workspace/staticfiles/{result.file_name}"
+        assert zipfile.is_zipfile(workspace / "staticfiles" / result.file_name)
+
+    @pytest.mark.asyncio
+    async def test_with_a_workflow_open_the_bundle_still_lands_in_the_workspace_static_files(
+        self, engine: Engine, workspace: Path, tmp_path: Path
+    ) -> None:
+        """The bundle describes the engine, so it does not follow the open workflow to its folder."""
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        push_unsaved_workflow(engine, working_directory=str(tmp_path / "elsewhere"))
+        try:
+            result = await engine.ahandle_request(
+                CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
+            )
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert zipfile.is_zipfile(workspace / "staticfiles" / result.file_name)
+        assert not (tmp_path / "elsewhere").exists()
+
+    @pytest.fixture
+    def workspace(self, engine: Engine, tmp_path: Path) -> Iterator[Path]:
+        """Point the engine's workspace at a fresh folder, so the bundle written there can be found."""
+        original = engine.config_manager.workspace_path
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        engine.config_manager.workspace_path = workspace_path
+        yield workspace_path
+        engine.config_manager.workspace_path = original
 
 
 class TestHealthChecks:

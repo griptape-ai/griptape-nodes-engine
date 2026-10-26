@@ -94,6 +94,16 @@ class ResolvedStaticFilePath(NamedTuple):
     file_metadata: SidecarContent | None = None
 
 
+class StaticFilePathFailure(NamedTuple):
+    """Why a static file's situation path could not be resolved.
+
+    Attributes:
+        reason: Completes "Failed because ..." in the caller's message.
+    """
+
+    reason: str
+
+
 class PreviewResolution(NamedTuple):
     """Outcome of resolving which file to serve for a preview-eligible request.
 
@@ -370,8 +380,8 @@ class StaticFilesManager(EngineScoped):
         situation_name = request.situation_name
 
         resolved = self._resolve_static_file_path(workflow, file_name, situation_name)
-        if resolved is None:
-            msg = f"Attempted to create upload URL for '{file_name}'. Failed because the project template is missing the '{situation_name}' situation."
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to create upload URL for '{file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileUploadUrlResultFailure(error=msg, result_details=msg)
 
         try:
@@ -405,8 +415,8 @@ class StaticFilesManager(EngineScoped):
         """
         situation_name = request.situation_name
         resolved = self._resolve_static_file_path(workflow, request.file_name, situation_name)
-        if resolved is None:
-            msg = f"Attempted to create download URL for '{request.file_name}'. Failed because the project template is missing the '{situation_name}' situation."
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to create download URL for '{request.file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         try:
@@ -772,32 +782,79 @@ class StaticFilesManager(EngineScoped):
 
         Raises:
             FileExistsError: When existing_file_policy is FAIL and file already exists.
-            RuntimeError: If the project template is missing the save_static_file situation, or if the file write fails.
+            RuntimeError: If the save_static_file situation's path cannot be resolved, or if the file write fails.
         """
         resolved = self._resolve_static_file_path(workflow, file_name)
-        if resolved is None:
-            msg = f"Attempted to save static file '{file_name}'. Failed because the project template is missing the '{BuiltInSituation.SAVE_STATIC_FILE}' situation."
-            raise RuntimeError(msg)
-
-        file_path = resolved.path
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to save static file '{file_name}'. Failed because {resolved.reason}."
+            raise RuntimeError(msg)  # noqa: TRY004
 
         if existing_file_policy is None:
             effective_policy = resolved.policy
         else:
             effective_policy = existing_file_policy
 
+        return self._save_to_storage(
+            resolved.path,
+            data,
+            effective_policy,
+            skip_metadata_injection=skip_metadata_injection,
+            file_metadata=resolved.file_metadata,
+        )
+
+    def save_workspace_static_file(
+        self,
+        data: bytes,
+        file_name: str,
+        existing_file_policy: ExistingFilePolicy,
+        *,
+        skip_metadata_injection: bool = False,
+    ) -> str:
+        """Save a file in the workspace's static files folder, whatever workflow is open, and return its URL.
+
+        For output that belongs to the engine rather than to a workflow, such as a diagnostics bundle.
+        Skips the `save_static_file` situation, whose path is the workflow's folder.
+
+        Raises:
+            FileExistsError: When existing_file_policy is FAIL and file already exists.
+            RuntimeError: If the file write fails.
+        """
+        static_files_dir = self.config_manager.get_config_value("static_files_directory", default="staticfiles")
+        return self._save_to_storage(
+            Path(static_files_dir) / file_name,
+            data,
+            existing_file_policy,
+            skip_metadata_injection=skip_metadata_injection,
+            file_metadata=None,
+        )
+
+    def _save_to_storage(
+        self,
+        file_path: Path,
+        data: bytes,
+        existing_file_policy: ExistingFilePolicy,
+        *,
+        skip_metadata_injection: bool,
+        file_metadata: SidecarContent | None,
+    ) -> str:
+        """Write `data` through the storage driver at `file_path` and return a download URL for what it wrote.
+
+        Raises:
+            FileExistsError: When existing_file_policy is FAIL and file already exists.
+            RuntimeError: If the file write fails.
+        """
         try:
             saved_path = self.storage_driver.save_file(
                 file_path,
                 data,
-                effective_policy,
+                existing_file_policy,
                 skip_metadata_injection=skip_metadata_injection,
-                file_metadata=resolved.file_metadata,
+                file_metadata=file_metadata,
             )
         except FileExistsError:
             raise
         except Exception as e:
-            msg = f"Failed to save static file {file_name}: {e}"
+            msg = f"Failed to save static file {file_path.name}: {e}"
             raise RuntimeError(msg) from e
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 
@@ -806,7 +863,7 @@ class StaticFilesManager(EngineScoped):
         workflow: "WorkflowRuntime | None",
         file_name: str,
         situation_name: str = BuiltInSituation.SAVE_STATIC_FILE,
-    ) -> ResolvedStaticFilePath | None:
+    ) -> ResolvedStaticFilePath | StaticFilePathFailure:
         """Resolve the file path for a static file using the given situation, for `workflow`.
 
         Args:
@@ -816,16 +873,13 @@ class StaticFilesManager(EngineScoped):
                 ``save_static_file``.
 
         Returns:
-            ResolvedStaticFilePath if situation resolution succeeds, or None on failure.
+            ResolvedStaticFilePath if situation resolution succeeds, or StaticFilePathFailure saying why not.
         """
         situation_result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(situation_result, GetSituationResultSuccess):
-            logger.warning(
-                "Project template does not include '%s' situation; static files will save to the default directory. "
-                "Projects using StaticFilesManager.save_static_file require this situation in their project template.",
-                situation_name,
+            return StaticFilePathFailure(
+                reason=f"the project template is missing the '{situation_name}' situation",
             )
-            return None
 
         situation = situation_result.situation
 
@@ -834,8 +888,9 @@ class StaticFilesManager(EngineScoped):
         try:
             parsed_macro = ParsedMacro(situation.macro)
         except MacroSyntaxError as e:
-            logger.warning("Failed to parse %s situation macro: %s", situation_name, e)
-            return None
+            return StaticFilePathFailure(
+                reason=f"the '{situation_name}' situation's path '{situation.macro}' is not valid: {e}",
+            )
 
         macro_result = self.engine.project_manager.get_path_for_macro_in(
             workflow,
@@ -845,8 +900,10 @@ class StaticFilesManager(EngineScoped):
             ),
         )
         if not isinstance(macro_result, GetPathForMacroResultSuccess):
-            logger.warning("Failed to resolve %s situation path: %s", situation_name, macro_result.result_details)
-            return None
+            # The resolver's own message names the cause, such as a `{workflow_dir}` with no workflow.
+            return StaticFilePathFailure(
+                reason=f"the '{situation_name}' situation's path could not be resolved. {macro_result.result_details}",
+            )
 
         workspace_dir = self.config_manager.workspace_path
         try:
