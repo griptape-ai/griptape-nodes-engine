@@ -231,7 +231,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                         type=type(event).__name__,
                         value=event.value,
                     )
-                    execution_event = ExecutionEvent(payload=payload)
+                    execution_event = ExecutionEvent(payload=payload, workflow_id=event.workflow_id)
                     self._send_event("execution_event", execution_event)
 
                 event_queue.task_done()

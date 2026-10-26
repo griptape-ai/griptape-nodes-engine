@@ -8,6 +8,7 @@ happens to a live DAG when something changes underneath the parked driver.
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,6 +37,9 @@ def node_stub(name: str) -> BaseNode:
     # ErrorState instead of executing.
     node.parameter_output_values = MagicMock()
     node.validate_before_node_run = MagicMock(return_value=None)
+    # The real factory, for a node in no workflow, so tests can read the events a node sent.
+    node._event_workflow_id.return_value = None
+    node.execution_event.side_effect = functools.partial(BaseNode.execution_event, node)
     return node
 
 

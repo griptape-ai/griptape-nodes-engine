@@ -3,6 +3,7 @@
 # ruff: noqa: PLR2004
 
 import asyncio
+import functools
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -640,6 +641,8 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         node.name = "n"
         node.lock = False
         node.state = NodeResolutionState.RESOLVING
+        node._event_workflow_id.return_value = None
+        node.execution_event.side_effect = functools.partial(BaseNode.execution_event, node)
         graph = DirectedGraph()
         graph.add_node("n")
         dag_builder = DagBuilder(Connections())

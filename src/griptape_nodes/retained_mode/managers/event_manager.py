@@ -1948,10 +1948,12 @@ class EventTranslationContext:
         if wrapped_event is None:
             return None
 
-        # Create new wrapped_event with translated payload
+        # Create new wrapped_event with translated payload, keeping the workflow it was built for
         wrapped_class = type(wrapped_event)
         try:
-            new_wrapped = wrapped_class(payload=translated_payload)
+            new_wrapped = wrapped_class(
+                payload=translated_payload, workflow_id=getattr(wrapped_event, "workflow_id", None)
+            )
         except Exception:
             return None
 
