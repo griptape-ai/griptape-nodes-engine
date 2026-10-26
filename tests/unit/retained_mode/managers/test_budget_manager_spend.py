@@ -26,14 +26,18 @@ from griptape_nodes.retained_mode.events.budget_events import (
     ReportUsageResultFailure,
     ReportUsageResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers import budget_manager as budget_manager_module
 from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError
 from griptape_nodes.utils.http_utils import request_with_retry
+from tests.workflow_context import push_unsaved_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 BASE_URL = "https://cloud.example.test"
 
@@ -48,23 +52,12 @@ class _InlineQueue:
         self._manager._send_report(body)
 
 
-# The workflow a node making a direct call runs in; the registry names it.
-_POSTER_FLOW = MagicMock(workflow_id="poster-flow-id")
-
-
-def _registry_entries(workflow_id: str) -> MagicMock:
-    entry = MagicMock()
-    entry.name = {"poster-flow-id": "poster_flow"}[workflow_id]
-    return entry
-
-
 def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
     engine = MagicMock()
     engine.project_manager.get_project_chain.return_value = [
         ProjectChainEntry(id="shot-6", name="Shot 6"),
         ProjectChainEntry(id="star-wars-x", name="Star Wars X"),
     ]
-    engine.workflow_registry.get.side_effect = _registry_entries
     engine.get_engine_id.return_value = "engine-1"
     engine.get_session_id.return_value = "session-1"
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
@@ -79,9 +72,9 @@ def _manager(engine: MagicMock | None = None) -> BudgetManager:
 
 
 def _check(
-    manager: BudgetManager, request: BudgetAccessRequest, workflow: MagicMock | None = None
+    manager: BudgetManager, request: BudgetAccessRequest
 ) -> BudgetAccessResultSuccess | BudgetAccessResultFailure:
-    return asyncio.run(manager.on_budget_access_request(request, workflow))
+    return asyncio.run(manager.on_budget_access_request(request))
 
 
 def _response(status: int, body: object = None) -> httpx2.Response:
@@ -193,7 +186,6 @@ class TestBudgetCheckAllowed:
                 node_type="AnthropicPrompt",
                 node_id="node-7",
             ),
-            _POSTER_FLOW,
         )
 
         assert isinstance(result, BudgetAccessResultSuccess)
@@ -203,7 +195,6 @@ class TestBudgetCheckAllowed:
         assert _sent(http) == {
             "tags": {
                 "project": ["shot-6", "star-wars-x"],
-                "workflow": "poster_flow",
                 "node_type": "AnthropicPrompt",
                 "node_id": "node-7",
                 "engine_id": "engine-1",
@@ -436,8 +427,7 @@ class TestReportUsage:
                 node_type="AnthropicPrompt",
                 node_id="node-7",
                 correlation_id="corr-1",
-            ),
-            _POSTER_FLOW,
+            )
         )
 
         assert isinstance(result, ReportUsageResultSuccess)
@@ -451,7 +441,6 @@ class TestReportUsage:
             "declared_cost_micro_usd": 12345,
             "tags": {
                 "project": ["shot-6", "star-wars-x"],
-                "workflow": "poster_flow",
                 "node_type": "AnthropicPrompt",
                 "node_id": "node-7",
                 "engine_id": "engine-1",
@@ -727,6 +716,58 @@ class TestReportQueue:
 
         assert posted.wait(timeout=5)
         assert [body["n"] for body in calls] == [1, 2]
+
+
+class TestWorkflowTag:
+    """A check or report is tagged with the workflow its envelope names, through the engine's dispatch."""
+
+    @pytest.fixture
+    def budget_engine(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Engine:
+        """The engine, with a Cloud credential and usage reports posted on the spot."""
+        secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": "gt-key"}
+        monkeypatch.setattr(engine.secrets_manager, "get_secret", lambda name, **_: secrets.get(name))
+        monkeypatch.setattr(engine.budget_manager, "_reports", _InlineQueue(engine.budget_manager))
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_a_check_is_tagged_with_the_workflow_its_envelope_names(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = await budget_engine.ahandle_request(
+            BudgetAccessRequest(model="gpt-5-nano"), workflow_id=workflow.workflow_id
+        )
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_a_report_is_tagged_with_the_workflow_its_envelope_names(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(201, {"spend_id": "s-1"})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = await budget_engine.ahandle_request(
+            ReportUsageRequest(declared_cost_micro_usd=1), workflow_id=workflow.workflow_id
+        )
+
+        assert isinstance(result, ReportUsageResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_open_a_check_carries_no_workflow_tag(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        budget_engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert "workflow" not in _sent(http)["tags"]
 
 
 class TestWiring:
