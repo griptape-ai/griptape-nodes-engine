@@ -130,6 +130,15 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     prev: Parameter | None = None
     parent_container_name: str | None = None
     parent_element_name: str | None = None
+    # Type-adaptive wildcard pins. Every parameter on a node that names the same group takes the type
+    # of the first wire connected to any of them, and goes back to its declared types when the last
+    # wire in the group is removed. None means the parameter keeps the types it was declared with.
+    adaptive_type_group: str | None = None
+    # The type the group currently has, or None while no wire has given it one.
+    adaptive_resolved_type: str | None = None
+    _adaptive_declared_type: str | None = None
+    _adaptive_declared_input_types: list[str] | None = None
+    _adaptive_declared_output_type: str | None = None
 
     def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
         self,
@@ -168,6 +177,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         parent_element_name: str | None = None,
         badge: BadgeData
         | None = None,  # Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+        adaptive_type_group: str | None = None,
     ):
         if not element_id:
             element_id = str(uuid.uuid4().hex)
@@ -265,6 +275,12 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         self.type = type
         self.input_types = input_types
         self.output_type = output_type
+        self.adaptive_type_group = adaptive_type_group
+        self.adaptive_resolved_type = None
+        # What the group goes back to once its last wire is removed.
+        self._adaptive_declared_type = self._type
+        self._adaptive_declared_input_types = self._input_types
+        self._adaptive_declared_output_type = self._output_type
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a nested dictionary representation of this node and its children."""
@@ -299,6 +315,8 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         our_dict["parent_container_name"] = self.parent_container_name
         our_dict["parent_element_name"] = self.parent_element_name
         our_dict["parent_group_name"] = self.parent_group_name
+        our_dict["adaptive_type_group"] = self.adaptive_type_group
+        our_dict["adaptive_resolved_type"] = self.adaptive_resolved_type
 
         return our_dict
 

@@ -16,6 +16,12 @@ import httpx2
 from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.exe_types.adaptive_types import (
+    apply_adaptive_type,
+    find_wires_blocked_by_typing,
+    plan_adaptive_connection,
+    revert_adaptive_type_if_unwired,
+)
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
@@ -1010,10 +1016,52 @@ class FlowManager(EngineScoped):
             details = f'Connection failed: "{target_node_name}.{request.target_parameter_name}" is not an allowed INPUT'
             return CreateConnectionResultFailure(result_details=details)
 
+        # Work out what type-adaptive parameters on either end do to this connection. For parameters
+        # that are not adaptive the plan carries the source's own output type, so the check below is
+        # the same type check as always.
+        replaceable_connection = self._connections.get_existing_connection_for_restricted_scenario(
+            node=target_node, parameter=target_param, is_source=False
+        )
+        adaptive_plan = plan_adaptive_connection(
+            source_node=source_node,
+            source_parameter=source_param,
+            target_node=target_node,
+            target_parameter=target_param,
+            connections=self._connections,
+            replaced=replaceable_connection,
+        )
+
         # Validate that the data type from the source is allowed by the target.
-        if not target_param.is_incoming_type_allowed(source_param.output_type):
-            details = f'Connection failed on type mismatch "{source_node_name}.{request.source_parameter_name}" type({source_param.output_type}) to "{target_node_name}.{request.target_parameter_name}" types({target_param.input_types}) '
+        if adaptive_plan.target_accepts_any:
+            type_allowed = True
+        else:
+            type_allowed = target_param.is_incoming_type_allowed(adaptive_plan.source_type)
+        if not type_allowed:
+            details = self._type_mismatch_details(
+                source_node_name=source_node_name,
+                source_param=source_param,
+                source_type=adaptive_plan.source_type,
+                target_node_name=target_node_name,
+                target_param=target_param,
+            )
             return CreateConnectionResultFailure(result_details=details)
+
+        # Giving a group a type must not leave one of its existing wires carrying a type it can't.
+        for typing in adaptive_plan.typings:
+            blocked = find_wires_blocked_by_typing(typing, self._connections, excluding=replaceable_connection)
+            if blocked:
+                wire_names = ", ".join(
+                    f"'{conn.source_node.name}.{conn.source_parameter.name}' to "
+                    f"'{conn.target_node.name}.{conn.target_parameter.name}'"
+                    for conn in blocked
+                )
+                details = (
+                    f"Attempted to connect '{source_node_name}.{request.source_parameter_name}' to "
+                    f"'{target_node_name}.{request.target_parameter_name}'. Failed because it would make the "
+                    f"'{typing.group}' parameters on '{typing.node.name}' take the type '{typing.new_type}', "
+                    f"which these existing connections can't carry: {wire_names}. Disconnect them first."
+                )
+                return CreateConnectionResultFailure(result_details=details)
 
         # Ask each node involved to bless this union.
         if not source_node.allow_outgoing_connection(
@@ -1146,6 +1194,11 @@ class FlowManager(EngineScoped):
             source_parameter=source_param,
             target_parameter=target_param,
         )
+
+        # Now that the wire exists, give the groups it typed their type. The type setters queue the
+        # AlterElementEvents the editor uses to redraw the pins.
+        for typing in adaptive_plan.typings:
+            apply_adaptive_type(typing.node, typing.group, typing.new_type)
 
         # Check if either node is in a NodeGroup and track connections
 
@@ -1425,6 +1478,11 @@ class FlowManager(EngineScoped):
             target_parameter=target_param,
         )
 
+        # A type-adaptive group whose last wire this was goes back to its declared types.
+        for end_node, end_param in ((source_node, source_param), (target_node, target_param)):
+            if end_param.adaptive_type_group is not None:
+                revert_adaptive_type_if_unwired(end_node, end_param.adaptive_type_group, self._connections)
+
         details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" deleted.'
 
         # Check if either node is ErrorProxyNode and mark connection modification (deletes are always user-initiated)
@@ -1435,6 +1493,32 @@ class FlowManager(EngineScoped):
 
         result = DeleteConnectionResultSuccess(result_details=details)
         return result
+
+    def _type_mismatch_details(
+        self,
+        *,
+        source_node_name: str,
+        source_param: Parameter,
+        source_type: str,
+        target_node_name: str,
+        target_param: Parameter,
+    ) -> str:
+        """Explain why a connection's types don't fit, naming the group that fixed a type if one did."""
+        if target_param.adaptive_resolved_type is not None:
+            return (
+                f"Attempted to connect '{source_node_name}.{source_param.name}' ({source_type}) to "
+                f"'{target_node_name}.{target_param.name}'. Failed because '{target_param.name}' took the type "
+                f"'{target_param.adaptive_resolved_type}' from its other connections. "
+                f"Disconnect them to let it take a new type."
+            )
+        if source_param.adaptive_resolved_type is not None:
+            return (
+                f"Attempted to connect '{source_node_name}.{source_param.name}' to "
+                f"'{target_node_name}.{target_param.name}' ({', '.join(target_param.input_types)}). Failed because "
+                f"'{source_param.name}' took the type '{source_param.adaptive_resolved_type}' from its other "
+                f"connections. Disconnect them to let it take a new type."
+            )
+        return f'Connection failed on type mismatch "{source_node_name}.{source_param.name}" type({source_type}) to "{target_node_name}.{target_param.name}" types({target_param.input_types}) '
 
     def _is_node_executing(self, node: BaseNode) -> bool:
         """Whether a run is currently inside this node's process method.

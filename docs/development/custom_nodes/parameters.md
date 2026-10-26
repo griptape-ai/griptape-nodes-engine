@@ -680,6 +680,30 @@ Media parameters work differently. `ParameterImage`, `ParameterAudio`, `Paramete
 
 ## Advanced Parameter Patterns
 
+### Type-Adaptive Parameters
+
+Some nodes work on any type but should still connect like typed nodes: a Switch or Select passes on whatever it receives, and its output should only connect where that type fits. Give each such parameter `type="any"` and the same `adaptive_type_group` name:
+
+```python
+for name in ("a", "b"):
+    self.add_parameter(Parameter(name=name, type="any", adaptive_type_group="T", allow_output=False))
+self.add_parameter(
+    Parameter(name="result", type="any", adaptive_type_group="T", allow_input=False, allow_property=False)
+)
+```
+
+The parameters in a group share one type:
+
+- Until something is connected, every parameter in the group accepts a connection of any type.
+- The first connection whose other end has a type (not `any`) gives the whole group that type, inputs and outputs alike. Connecting an `int` output to `a` makes `a`, `b`, and `result` all `int`.
+- While the group has a type, a connection that can't carry it is rejected, and the message says which type the group took.
+- When the last connection to any parameter in the group is removed, the group goes back to `any`.
+- A connection that would give the group a type one of its existing connections can't carry is rejected rather than breaking that connection. Disconnect it first.
+
+Each parameter's `adaptive_resolved_type` holds the group's current type, or `None` while it has none. The editor learns about a change from the `AlterElementEvent` sent for each parameter, which carries the new `type`, `input_types`, `output_type`, and `adaptive_resolved_type`. Saved workflows don't store these types: they come back as the workflow's connections are recreated on load.
+
+A type only spreads across one node. When an untyped adaptive output is connected to another node's untyped adaptive input, giving the first node a type later doesn't retype the second.
+
 ### Dynamic Parameter Visibility
 
 Use `after_value_set()` callback to create context-aware UIs:

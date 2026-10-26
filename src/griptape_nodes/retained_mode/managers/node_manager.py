@@ -278,6 +278,9 @@ logger = logging.getLogger("griptape_nodes")
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
 
+# The fields a type-adaptive parameter's connections decide, which a saved workflow leaves out.
+_ADAPTIVE_TYPE_KEYS = ("type", "input_types", "output_type", "adaptive_resolved_type")
+
 # A node in one of these states owes the running flow nothing further, so deleting it takes
 # nothing away from the run.
 _SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
@@ -5016,10 +5019,14 @@ class NodeManager(EngineScoped):
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
         base_param = base_node_obj.get_parameter_by_name(parameter.name)
-        if base_param:
-            diff = base_param.equals(parameter)
-        else:
+        if not base_param:
             return vars(parameter)
+        diff = base_param.equals(parameter)
+        if parameter.adaptive_type_group is not None:
+            # A type-adaptive parameter's types come from its connections, which the saved workflow
+            # replays after the parameters. Saving them as well would pin the type on load.
+            for key in _ADAPTIVE_TYPE_KEYS:
+                diff.pop(key, None)
         return diff
 
     @staticmethod
