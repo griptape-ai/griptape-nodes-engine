@@ -10,6 +10,9 @@ import pytest
 from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionRequest,
     AppEndSessionResultSuccess,
+    AppJoinSessionRequest,
+    AppJoinSessionResultFailure,
+    AppJoinSessionResultSuccess,
     AppLeaveSessionRequest,
     AppLeaveSessionResultFailure,
     AppLeaveSessionResultSuccess,
@@ -107,6 +110,45 @@ class TestSessionClients:
         await manager.handle_session_start_request(AppStartSessionRequest())
 
         assert manager.active_session_id is not None
+        assert manager.clients == []
+
+    @pytest.mark.asyncio
+    async def test_join_lists_the_client_on_the_named_active_session(self, manager: SessionManager) -> None:
+        manager.save_session("session-a")
+
+        result = await manager.handle_join_session_request(
+            AppJoinSessionRequest(session_id="session-a", client_id="tab-1", client_type="editor", client_label="Kate")
+        )
+
+        assert isinstance(result, AppJoinSessionResultSuccess)
+        assert result.session_id == "session-a"
+        assert [(c.client_id, c.client_label) for c in manager.clients] == [("tab-1", "Kate")]
+
+    @pytest.mark.asyncio
+    async def test_join_refuses_a_session_that_is_not_the_active_one(self, manager: SessionManager) -> None:
+        manager.save_session("session-a")
+
+        result = await manager.handle_join_session_request(
+            AppJoinSessionRequest(session_id="session-stale", client_id="tab-1")
+        )
+
+        assert isinstance(result, AppJoinSessionResultFailure)
+        assert "session-a" in str(result.result_details)
+        assert manager.clients == []
+
+    @pytest.mark.asyncio
+    async def test_join_fails_without_a_session(self, manager: SessionManager) -> None:
+        result = await manager.handle_join_session_request(AppJoinSessionRequest(session_id="session-a"))
+
+        assert isinstance(result, AppJoinSessionResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_join_without_a_client_id_lists_nobody(self, manager: SessionManager) -> None:
+        manager.save_session("session-a")
+
+        result = await manager.handle_join_session_request(AppJoinSessionRequest(session_id="session-a"))
+
+        assert isinstance(result, AppJoinSessionResultSuccess)
         assert manager.clients == []
 
     @pytest.mark.asyncio

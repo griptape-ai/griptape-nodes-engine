@@ -22,6 +22,9 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionResultSuccess,
     AppGetSessionRequest,
     AppGetSessionResultSuccess,
+    AppJoinSessionRequest,
+    AppJoinSessionResultFailure,
+    AppJoinSessionResultSuccess,
     AppLeaveSessionRequest,
     AppLeaveSessionResultFailure,
     AppLeaveSessionResultSuccess,
@@ -313,6 +316,24 @@ class SessionManager:
             self.attach_client(request.client_id, request.client_type, request.client_label)
 
         return AppStartSessionResultSuccess(current_session_id, result_details="Session started successfully.")
+
+    @handles(AppJoinSessionRequest)
+    async def handle_join_session_request(self, request: AppJoinSessionRequest) -> ResultPayload:
+        active = self.active_session_id
+        if active is None:
+            return AppJoinSessionResultFailure(
+                result_details=f"Attempted to join session '{request.session_id}'. Failed because no session is active."
+            )
+        if request.session_id != active:
+            return AppJoinSessionResultFailure(
+                result_details=(
+                    f"Attempted to join session '{request.session_id}'. "
+                    f"Failed because the active session is '{active}'."
+                )
+            )
+        if request.client_id:
+            self.attach_client(request.client_id, request.client_type, request.client_label)
+        return AppJoinSessionResultSuccess(session_id=active, result_details=f"Joined session '{active}'.")
 
     @handles(AppLeaveSessionRequest)
     async def handle_leave_session_request(self, request: AppLeaveSessionRequest) -> ResultPayload:

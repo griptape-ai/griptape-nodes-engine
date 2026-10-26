@@ -429,6 +429,33 @@ class AppEndSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class AppJoinSessionRequest(RequestPayload):
+    """Join the named session, which must be the active one, and list the client on it.
+
+    Start creates-or-joins without naming a session; Join is for a client that already holds a
+    session id, e.g. one restored from storage, and wants the engine to refuse a stale id.
+    """
+
+    session_id: str
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+    session_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultFailure(ResultPayloadFailure):
+    """Join failed: no session is active, or the named one is not the active session."""
+
+
+@dataclass
+@PayloadRegistry.register
 class AppLeaveSessionRequest(RequestPayload):
     """Delist a client from the active session without ending it."""
 
