@@ -69,10 +69,12 @@ class WorkflowPublishing(EngineScoped):
 
         event_data = publishing_handler.event_data
         if isinstance(event_data, PublishWorkflowRegisteredEventData) and event_data.get_publish_options is not None:
-            # Publishers read the workflow's name, so they get a copy with it filled in.
-            return event_data.get_publish_options(
-                dataclasses.replace(request, workflow_name=workflow.name, workflow_id=workflow.workflow_id)
-            )
+            # Publishers read the workflow's name, so they get a copy with it filled in. The requests
+            # they send, which name no workflow, act on the workflow being published.
+            with self.engine.bind_workflow(self.engine.open_workflows.get(workflow.workflow_id)):
+                return event_data.get_publish_options(
+                    dataclasses.replace(request, workflow_name=workflow.name, workflow_id=workflow.workflow_id)
+                )
 
         return GetPublishOptionsResultSuccess(
             fields=[],
@@ -122,11 +124,13 @@ class WorkflowPublishing(EngineScoped):
                 )
                 return PublishWorkflowResultFailure(result_details=details)
 
-            # Publishers read the workflow's name, so they get a copy with it filled in.
+            # Publishers read the workflow's name, so they get a copy with it filled in. The requests
+            # they send, which name no workflow, act on the workflow being published.
             publisher_request = dataclasses.replace(
                 request, workflow_name=workflow.name, workflow_id=workflow.workflow_id
             )
-            result = await asyncio.to_thread(publishing_handler.handler, publisher_request)
+            with self.engine.bind_workflow(open_workflow):
+                result = await asyncio.to_thread(publishing_handler.handler, publisher_request)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
                 workflow_file = Path(result.published_workflow_file_path)
                 result = await self._register_published_workflow_file(workflow_file, result)

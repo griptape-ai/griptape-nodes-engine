@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -24,14 +24,19 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultSuccess,
+    PublishWorkflowRegisteredEventData,
+    PublishWorkflowRequest,
+    PublishWorkflowResultSuccess,
     RunWorkflowFromRegistryRequest,
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
     RunWorkflowWithCurrentStateResultSuccess,
+    SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, collect_workflow_metadata
+from griptape_nodes.retained_mode.managers.library.common import RegisteredEventHandler
 from tests.workflow_context import push_unsaved_workflow, without_sole_workflow_fallback
 
 if TYPE_CHECKING:
@@ -40,7 +45,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # A saved workflow file as codegen writes one: it opens its workflow unless one is open, then sends
@@ -218,6 +223,49 @@ class TestLocalWorkflowExecutor:
 
         assert reused is not None
         assert "saved_canvas" in reused.flows.name_to_parent_name
+
+
+class TestPublishing:
+    def test_the_requests_a_publisher_sends_act_on_the_workflow_it_publishes(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        saved = _register_saved_workflow(engine, tmp_path / "published.py")
+        engine.context_manager.push_workflow(workflow_id=saved.workflow_id)
+        published = engine.open_workflows.get(saved.workflow_id)
+
+        def publish(_request: RequestPayload) -> ResultPayload:
+            created = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name="packaged", set_as_new_context=False)
+            )
+            assert isinstance(created, CreateFlowResultSuccess), created.result_details
+            return PublishWorkflowResultSuccess(
+                published_workflow_file_path="", skip_published_workflow_registration=True, result_details="ok"
+            )
+
+        publisher = RegisteredEventHandler(
+            handler=publish,
+            library_data=MagicMock(),
+            event_data=PublishWorkflowRegisteredEventData(
+                start_flow_node_type="Start",
+                start_flow_node_library_name="lib",
+                end_flow_node_type="End",
+                end_flow_node_library_name="lib",
+            ),
+        )
+        with (
+            patch.object(engine.library_manager, "get_registered_event_handlers", return_value={"lib": publisher}),
+            patch.object(
+                engine.workflow_manager.saver,
+                "save_open_workflow",
+                AsyncMock(return_value=SaveWorkflowResultSuccess(file_path="", workflow_name="", result_details="ok")),
+            ),
+        ):
+            result = asyncio.run(
+                engine.ahandle_request(PublishWorkflowRequest(workflow_id=saved.workflow_id, publisher_name="lib"))
+            )
+
+        assert isinstance(result, PublishWorkflowResultSuccess), result.result_details
+        assert "packaged" in published.flows.name_to_parent_name
 
 
 class TestImageMetadata:
