@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import UndecodedValue
 from tests.workflow_context import push_unsaved_workflow
 
@@ -571,7 +572,7 @@ class TestNodeManagerCancelExecuteNode:
 
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
-        await node_manager.cancel_worker_execution("ghost_node")
+        await node_manager.cancel_worker_execution(WorkflowRuntime("workflow", engine), "ghost_node")
 
 
 class TestDeserializeNodeFromCommandsRetargetsElementCommands:

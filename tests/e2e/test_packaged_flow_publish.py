@@ -94,7 +94,7 @@ async def test_the_publisher_gets_the_packaged_flow_by_its_registry_name(
     node_executor = engine.flow_manager.node_executor
     with engine.context_manager.flow(flow_result.flow_name):
         packaged = await node_executor._publish_local_workflow(
-            node, library=LibraryRegistry.get_library(name=LIBRARY_NAME)
+            engine.open_workflows.sole_workflow(), node, library=LibraryRegistry.get_library(name=LIBRARY_NAME)
         )
     assert packaged is not None
     packaged_file = Path(packaged.workflow_result.file_path)

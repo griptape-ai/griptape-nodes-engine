@@ -36,7 +36,7 @@ class TestNodeRunSeconds:
     async def test_a_node_that_runs_records_how_long_it_took(self) -> None:
         dag_node = _dag_node()
 
-        await ExecuteDagState.execute_node(_engine_whose_executor(AsyncMock()), dag_node)
+        await ExecuteDagState.execute_node(_engine_whose_executor(AsyncMock()), MagicMock(), dag_node)
 
         assert dag_node.run_seconds is not None
         assert dag_node.run_seconds >= 0
@@ -47,7 +47,7 @@ class TestNodeRunSeconds:
         engine = _engine_whose_executor(AsyncMock(side_effect=RuntimeError("boom")))
 
         with pytest.raises(RuntimeError, match="boom"):
-            await ExecuteDagState.execute_node(engine, dag_node)
+            await ExecuteDagState.execute_node(engine, MagicMock(), dag_node)
 
         assert dag_node.run_seconds is not None
 

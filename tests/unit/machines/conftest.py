@@ -28,7 +28,7 @@ def held_node_execution(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
 
     hold = asyncio.Event()
 
-    async def _hold_until_released(_engine: object, _dag_node: DagNode) -> None:
+    async def _hold_until_released(_engine: object, _workflow: object, _dag_node: DagNode) -> None:
         await hold.wait()
 
     monkeypatch.setattr(ExecuteDagState, "execute_node", _hold_until_released)

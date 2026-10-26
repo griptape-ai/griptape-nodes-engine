@@ -991,7 +991,9 @@ class TestDeleteIterationFlows:
         assert object_manager.attempt_get_object_by_name(already_gone) is None
 
         executor = NodeExecutor(engine=engine)
-        await executor._delete_iteration_flows(deserialized_flows, engine.event_manager)
+        await executor._delete_iteration_flows(
+            engine.open_workflows.sole_workflow(), deserialized_flows, engine.event_manager
+        )
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None

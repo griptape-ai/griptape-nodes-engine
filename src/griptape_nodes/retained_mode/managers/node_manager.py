@@ -3668,7 +3668,7 @@ class NodeManager(EngineScoped):
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
-    async def cancel_worker_execution(self, node_name: str) -> None:
+    async def cancel_worker_execution(self, workflow: WorkflowRuntime, node_name: str) -> None:
         """Dispatch CancelExecuteNodeRequest to the worker running node_name.
 
         No-op when the node is not currently routed to a worker (either because
@@ -3678,10 +3678,8 @@ class NodeManager(EngineScoped):
         cooperative cancellation is signalled via task.cancel() on the
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
-
-        Edge method for code not handed a workflow.
         """
-        entry = self._nodes_or_empty().orch_worker_requests.get(node_name)
+        entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry

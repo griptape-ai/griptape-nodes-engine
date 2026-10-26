@@ -807,11 +807,17 @@ class TestNodesOnTheRuntime:
             engine.node_manager.get_node_parent_flow_by_name("node")
 
     @pytest.mark.asyncio
-    async def test_cancelling_a_worker_run_with_no_workflow_open_does_nothing(self, engine: Engine) -> None:
-        with patch.object(engine.worker_manager, "forward_event_to_worker", AsyncMock()) as forward:
-            await engine.node_manager.cancel_worker_execution("node")
+    async def test_cancelling_a_worker_run_reads_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        push_unsaved_workflow(engine)
+        other = WorkflowRuntime("other", engine)
+        other.nodes.orch_worker_requests["node"] = ("request", "worker", "topic")
 
-        forward.assert_not_awaited()
+        with patch.object(engine.worker_manager, "forward_event_to_worker", AsyncMock()) as forward:
+            await engine.node_manager.cancel_worker_execution(other, "node")
+
+        forward.assert_awaited_once()
+        assert forward.await_args is not None
+        assert forward.await_args.kwargs["worker_engine_id"] == "worker"
 
     def test_renaming_a_flow_repoints_its_nodes(self, engine: Engine) -> None:
         push_unsaved_workflow(engine)

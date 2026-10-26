@@ -1,12 +1,12 @@
 """Tests for current_executing_node_name ContextVar in NodeExecutor.execute().
 
-NodeExecutor.execute now dispatches ExecuteNodeRequest through the injected
-Engine's ahandle_request for both local and worker execution. The ContextVar
+NodeExecutor.execute dispatches ExecuteNodeRequest through the ahandle_request of the
+workflow it runs in, for both local and worker execution. The ContextVar
 is set before dispatch and reset on return (or exception).
 """
 
 import asyncio
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,9 +49,9 @@ class TestNodeExecutorContextVar:
             return _success_result()
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
-        await executor.execute(node)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(side_effect=fake_handle)
+        await executor.execute(workflow, node)
 
         assert captured == ["TestNode"]
 
@@ -61,9 +61,9 @@ class TestNodeExecutorContextVar:
         node = _make_node("TestNode")
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
-        await executor.execute(node)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(return_value=_success_result())
+        await executor.execute(workflow, node)
 
         assert current_executing_node_name.get() is None
 
@@ -73,11 +73,11 @@ class TestNodeExecutorContextVar:
         node = _make_node("TestNode")
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
 
         with pytest.raises(RuntimeError, match="node failed"):
-            await executor.execute(node)
+            await executor.execute(workflow, node)
 
         assert current_executing_node_name.get() is None
 
@@ -95,12 +95,12 @@ class TestNodeExecutorContextVar:
             return _success_result()
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(side_effect=fake_handle)
 
         await asyncio.gather(
-            executor.execute(node_a),
-            executor.execute(node_b),
+            executor.execute(workflow, node_a),
+            executor.execute(workflow, node_b),
         )
 
         assert results["NodeA"] == "NodeA"

@@ -31,14 +31,13 @@ from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 
-def _engine_with_execution_mode(mode: WorkflowExecutionMode, dag_builder: DagBuilder) -> MagicMock:
-    """Build a stub engine reporting `mode` and handing back `dag_builder` as the global one.
+def _engine_with_execution_mode(mode: WorkflowExecutionMode) -> MagicMock:
+    """Build a stub engine reporting `mode`.
 
-    ControlFlowMachine reads its execution mode and its global DagBuilder off the engine it is
-    handed, so a stub engine replaces what used to be a patch of the process-wide facade.
+    ControlFlowMachine reads its execution mode off the engine it is handed, so a stub engine
+    replaces what used to be a patch of the process-wide facade.
     """
     engine = MagicMock()
-    engine.flow_manager.global_dag_builder = dag_builder
     engine.config_manager.get_config_value.side_effect = lambda key, default=None: {
         "workflow_execution_mode": mode,
         "max_nodes_in_parallel": 5,
@@ -46,11 +45,11 @@ def _engine_with_execution_mode(mode: WorkflowExecutionMode, dag_builder: DagBui
     return engine
 
 
-def _engine_with_connections(connections: MagicMock) -> MagicMock:
-    """Build a stub engine whose flow_manager hands back `connections`."""
-    engine = MagicMock()
-    engine.flow_manager.get_connections.return_value = connections
-    return engine
+def _workflow_with_global_dag_builder(dag_builder: DagBuilder) -> MagicMock:
+    """Build a stub workflow whose flows hand back `dag_builder` as the global one."""
+    workflow = MagicMock()
+    workflow.flows.global_dag_builder = dag_builder
+    return workflow
 
 
 class TestParallelFlowExecution:
@@ -62,10 +61,11 @@ class TestParallelFlowExecution:
 
         # The engine reports PARALLEL execution mode and hands back the global DAG builder
         mock_dag_builder = MagicMock(spec=DagBuilder)
-        engine = _engine_with_execution_mode(WorkflowExecutionMode.PARALLEL, mock_dag_builder)
+        engine = _engine_with_execution_mode(WorkflowExecutionMode.PARALLEL)
+        workflow = _workflow_with_global_dag_builder(mock_dag_builder)
 
         # Create ControlFlowMachine - it will read PARALLEL from config
-        control_flow = ControlFlowMachine(flow_name, engine=engine)
+        control_flow = ControlFlowMachine(workflow, flow_name, engine=engine)
 
         # Verify that a ParallelResolutionMachine was created
         assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
@@ -81,10 +81,11 @@ class TestParallelFlowExecution:
         flow_name = "test_flow"
 
         mock_dag_builder = MagicMock(spec=DagBuilder)
-        engine = _engine_with_execution_mode(WorkflowExecutionMode.SEQUENTIAL, mock_dag_builder)
+        engine = _engine_with_execution_mode(WorkflowExecutionMode.SEQUENTIAL)
+        workflow = _workflow_with_global_dag_builder(mock_dag_builder)
 
         # Create ControlFlowMachine - it will read SEQUENTIAL from config
-        control_flow = ControlFlowMachine(flow_name, engine=engine)
+        control_flow = ControlFlowMachine(workflow, flow_name, engine=engine)
 
         # Verify ParallelResolutionMachine was created (SEQUENTIAL now maps to PARALLEL)
         assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
@@ -101,7 +102,7 @@ class TestParallelFlowExecution:
 
         # Create ParallelResolutionMachine with DAG builder
         parallel_machine = ParallelResolutionMachine(
-            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=mock_dag_builder
+            MagicMock(), flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=mock_dag_builder
         )
 
         # Verify context initialization
@@ -116,7 +117,7 @@ class TestParallelFlowExecution:
         mock_dag_builder = MagicMock(spec=DagBuilder)
 
         # Create ParallelResolutionMachine without specifying max_nodes_in_parallel
-        parallel_machine = ParallelResolutionMachine(flow_name, dag_builder=mock_dag_builder)
+        parallel_machine = ParallelResolutionMachine(MagicMock(), flow_name, dag_builder=mock_dag_builder)
 
         # Should default to 5
         assert parallel_machine._context.max_nodes_in_parallel == 5
@@ -130,7 +131,7 @@ class TestParallelFlowExecution:
         mock_graphs = {"default": MagicMock()}
         mock_dag_builder.graphs = mock_graphs
 
-        context = ParallelResolutionContext(flow_name, dag_builder=mock_dag_builder)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=mock_dag_builder)
 
         # Access networks property - this should delegate to DAG builder's graphs
         networks = context.networks
@@ -147,7 +148,7 @@ class TestParallelFlowExecution:
         mock_node_to_reference = {"node1": MagicMock(), "node2": MagicMock()}
         mock_dag_builder.node_to_reference = mock_node_to_reference
 
-        context = ParallelResolutionContext(flow_name, dag_builder=mock_dag_builder)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=mock_dag_builder)
 
         # Access node_to_reference property
         node_ref = context.node_to_reference
@@ -160,7 +161,7 @@ class TestParallelFlowExecution:
         from griptape_nodes.machines.parallel_resolution import ParallelResolutionContext
 
         flow_name = "test_flow"
-        context = ParallelResolutionContext(flow_name, dag_builder=None)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=None)
 
         # Accessing networks property should raise ValueError
         try:
@@ -187,7 +188,7 @@ class TestParallelFlowExecution:
         mock_dag_builder.graphs = {"default": MagicMock()}
         mock_dag_builder.node_to_reference = {}
 
-        context = ParallelResolutionContext(flow_name, dag_builder=mock_dag_builder)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=mock_dag_builder)
 
         # Call reset without cancel
         context.reset(cancel=False)
@@ -204,7 +205,7 @@ class TestParallelFlowExecution:
         mock_dag_builder.graphs = {"default": MagicMock()}
         mock_dag_builder.node_to_reference = {"node1": MagicMock()}
 
-        context = ParallelResolutionContext(flow_name, dag_builder=mock_dag_builder)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=mock_dag_builder)
 
         # Call reset with cancel
         context.reset(cancel=True)
@@ -217,7 +218,7 @@ class TestParallelFlowExecution:
         from griptape_nodes.machines.parallel_resolution import ParallelResolutionContext
 
         flow_name = "test_flow"
-        context = ParallelResolutionContext(flow_name, dag_builder=None)
+        context = ParallelResolutionContext(MagicMock(), flow_name, dag_builder=None)
 
         # Reset should not raise error even with None DAG builder
         context.reset(cancel=False)
@@ -381,14 +382,14 @@ class TestCollectValuesFromUpstreamNodes:
         node_reference = MagicMock()
         node_reference.node_reference = locked_node
 
-        engine = MagicMock()
-        engine.ahandle_request = AsyncMock()
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock()
 
-        await ExecuteDagState.collect_values_from_upstream_nodes(engine, node_reference)
+        await ExecuteDagState.collect_values_from_upstream_nodes(workflow, node_reference)
 
         # No connections were inspected and no set-parameter request was issued.
-        engine.flow_manager.get_connections.assert_not_called()
-        engine.ahandle_request.assert_not_awaited()
+        workflow.flows.connections.get_connected_node.assert_not_called()
+        workflow.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unlocked_node_collects_upstream_value(self) -> None:
@@ -414,12 +415,13 @@ class TestCollectValuesFromUpstreamNodes:
 
         mock_connections = MagicMock()
         mock_connections.get_connected_node.return_value = (upstream_node, upstream_parameter)
-        engine = _engine_with_connections(mock_connections)
+        workflow = MagicMock()
+        workflow.flows.connections = mock_connections
 
         ahandle_request = AsyncMock(return_value=MagicMock())
-        engine.ahandle_request = ahandle_request
+        workflow.ahandle_request = ahandle_request
 
-        await ExecuteDagState.collect_values_from_upstream_nodes(engine, node_reference)
+        await ExecuteDagState.collect_values_from_upstream_nodes(workflow, node_reference)
 
         mock_connections.get_connected_node.assert_called_once_with(
             target_node, target_parameter, direction=Direction.UPSTREAM
@@ -457,7 +459,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         dag_builder.graphs["n"] = graph
         dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
 
-        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
+        return ParallelResolutionContext(MagicMock(), "flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
 
     @staticmethod
     def _context_with_real_node_mid_flight() -> tuple[ParallelResolutionContext, BaseNode]:
@@ -477,7 +479,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         dag_builder.graphs["n"] = graph
         dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.ERRORED)
 
-        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder), node
+        return ParallelResolutionContext(MagicMock(), "flow", max_nodes_in_parallel=5, dag_builder=dag_builder), node
 
     @pytest.mark.asyncio
     async def test_a_cancel_that_never_reaches_error_state_still_gives_nodes_back(self) -> None:
@@ -645,7 +647,9 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
         engine = MagicMock()
         engine.event_manager.aput_event = AsyncMock()
-        context = ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=engine)
+        context = ParallelResolutionContext(
+            MagicMock(), "flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=engine
+        )
 
         raised = KeyError("n: Key 'b' not found")
         flattened = "Node 'n' execution failed: Attempted to execute node 'n'. Failed with error: \"n: Key 'b'\""
@@ -698,7 +702,7 @@ class TestLockedNodeIsNeverQueuedOrExecuted:
         dag_builder.graphs["locked"] = graph
         dag_builder.node_to_reference["locked"] = DagNode(node_reference=node, node_state=NodeState.WAITING)
 
-        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
+        return ParallelResolutionContext(MagicMock(), "flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
 
     def test_locked_node_is_marked_done_and_not_queued(self) -> None:
         """The queueing gate must divert a locked node to DONE instead of into the priority queue."""
@@ -753,7 +757,7 @@ class TestLockedNodeRecordsResolvingWithoutExecuting:
         dag_builder.node_to_reference[node.name] = DagNode(node_reference=node, node_state=NodeState.DONE)
 
         context = ParallelResolutionContext(
-            "flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=MagicMock()
+            MagicMock(), "flow", max_nodes_in_parallel=5, dag_builder=dag_builder, engine=MagicMock()
         )
         context.engine.event_manager.aput_event = AsyncMock()
         return context

@@ -48,7 +48,9 @@ def _machine_parked_on_a_node_task() -> _ParkedMachine:
     dag_builder.graphs["n"] = graph
     dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
 
-    machine = ParallelResolutionMachine("flow", max_nodes_in_parallel=1, dag_builder=dag_builder, engine=engine)
+    machine = ParallelResolutionMachine(
+        MagicMock(), "flow", max_nodes_in_parallel=1, dag_builder=dag_builder, engine=engine
+    )
 
     release = asyncio.Event()
     node_task = asyncio.ensure_future(release.wait())

@@ -110,24 +110,24 @@ class TestGetIterationControlAction:
 
         # _find_sources_for_control_param returns the direct source for each connection
         # _check_control_source_fired is keyed on the source_node_name returned
-        def fake_find_sources(incoming: list, param_name: str) -> list[tuple[str, str]]:
+        def fake_find_sources(_workflow: object, incoming: list, param_name: str) -> list[tuple[str, str]]:
             return [
                 (c.source_node_name, c.source_parameter_name) for c in incoming if c.target_parameter_name == param_name
             ]
 
-        def fake_check_fired(source: tuple[str, str] | None, _mappings: dict) -> bool:
+        def fake_check_fired(_workflow: object, source: tuple[str, str] | None, _mappings: dict) -> bool:
             if source is None:
                 return False
             return check_fired_returns.get(source[0], False)
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.handle_request.return_value = connections_result
+        workflow = MagicMock()
+        workflow.handle_request.return_value = connections_result
         with (
             patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
             patch.object(NodeExecutor, "_check_control_source_fired", side_effect=fake_check_fired),
         ):
-            return executor._get_iteration_control_action(end_node, {})
+            return executor._get_iteration_control_action(workflow, end_node, {})
 
     def test_returns_add_when_no_connections(self) -> None:
         end_node = MagicMock(spec=BaseIterativeEndNode)
@@ -185,10 +185,10 @@ class TestGetIterationControlAction:
         end_node = MagicMock(spec=BaseIterativeEndNode)
         end_node.name = "EndLoop"
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
+        workflow = MagicMock()
         # Return a non-success result from handle_request
-        mock_engine.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
-        result = executor._get_iteration_control_action(end_node, {})
+        workflow.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
+        result = executor._get_iteration_control_action(workflow, end_node, {})
         assert result == IterationControlAction.ADD
 
 
@@ -204,17 +204,18 @@ class TestCheckControlSourceFired:
         return node
 
     def test_returns_false_when_source_is_none(self) -> None:
-        assert _make_executor()._check_control_source_fired(None, {}) is False
+        assert _make_executor()._check_control_source_fired(MagicMock(), None, {}) is False
 
     def test_returns_false_when_source_node_not_in_mappings(self) -> None:
-        result = _make_executor()._check_control_source_fired(("SrcOrig", "out"), {})
+        result = _make_executor()._check_control_source_fired(MagicMock(), ("SrcOrig", "out"), {})
         assert result is False
 
     def test_returns_false_when_node_manager_raises_value_error(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.side_effect = ValueError("not found")
+        mock_engine.node_manager.get_node_by_name_in.side_effect = ValueError("not found")
         result = executor._check_control_source_fired(
+            MagicMock(),
             ("SrcOrig", "out"),
             {"SrcOrig": "Src_inst1"},
         )
@@ -223,8 +224,9 @@ class TestCheckControlSourceFired:
     def test_returns_false_when_node_manager_returns_none(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = None
+        mock_engine.node_manager.get_node_by_name_in.return_value = None
         result = executor._check_control_source_fired(
+            MagicMock(),
             ("SrcOrig", "out"),
             {"SrcOrig": "Src_inst1"},
         )
@@ -234,8 +236,9 @@ class TestCheckControlSourceFired:
         node = self._make_source_node(next_control_output=None)
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         result = executor._check_control_source_fired(
+            MagicMock(),
             ("SrcOrig", "out"),
             {"SrcOrig": "Src_inst1"},
         )
@@ -250,8 +253,9 @@ class TestCheckControlSourceFired:
         )
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         result = executor._check_control_source_fired(
+            MagicMock(),
             ("SrcOrig", "out"),
             {"SrcOrig": "Src_inst1"},
         )
@@ -266,8 +270,9 @@ class TestCheckControlSourceFired:
         )
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         result = executor._check_control_source_fired(
+            MagicMock(),
             ("SrcOrig", "out"),
             {"SrcOrig": "Src_inst1"},
         )
@@ -279,20 +284,21 @@ class TestFindSourceForControlParam:
 
     def test_returns_first_source_when_multiple_present(self) -> None:
         executor = _make_executor()
+        workflow = MagicMock()
         with patch.object(
             NodeExecutor,
             "_find_sources_for_control_param",
             return_value=[("A", "out"), ("B", "out")],
         ) as mock_multi:
-            result = executor._find_source_for_control_param([], "break_loop")
+            result = executor._find_source_for_control_param(workflow, [], "break_loop")
 
         assert result == ("A", "out")
-        mock_multi.assert_called_once_with([], "break_loop")
+        mock_multi.assert_called_once_with(workflow, [], "break_loop")
 
     def test_returns_none_when_no_sources(self) -> None:
         executor = _make_executor()
         with patch.object(NodeExecutor, "_find_sources_for_control_param", return_value=[]):
-            result = executor._find_source_for_control_param([], "break_loop")
+            result = executor._find_source_for_control_param(MagicMock(), [], "break_loop")
 
         assert result is None
 
@@ -334,12 +340,14 @@ class TestGetIterationControlActionEndToEnd:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
 
-        def fake_get_node(name: str) -> Any:
+        workflow = MagicMock()
+
+        def fake_get_node(_workflow: object, name: str) -> Any:
             return deserialized_nodes.get(name)
 
-        mock_engine.handle_request.return_value = connections_result
-        mock_engine.node_manager.get_node_by_name.side_effect = fake_get_node
-        return executor._get_iteration_control_action(end_node, node_name_mappings)
+        workflow.handle_request.return_value = connections_result
+        mock_engine.node_manager.get_node_by_name_in.side_effect = fake_get_node
+        return executor._get_iteration_control_action(workflow, end_node, node_name_mappings)
 
     def _make_deserialized_node_firing(self, param_name: str) -> MagicMock:
         """Return a mock deserialized node whose get_next_control_output fires the named param."""

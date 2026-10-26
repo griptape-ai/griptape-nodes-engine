@@ -65,9 +65,9 @@ class TestLocalExecuteCopyBack:
         result = ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"out": 42})
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(return_value=result)
-        await executor.execute(node)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(return_value=result)
+        await executor.execute(workflow, node)
 
         assert node.parameter_output_values == {"out": 42}
         node.set_parameter_value.assert_not_called()
@@ -88,10 +88,10 @@ class TestLocalExecuteCopyBack:
             )
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(side_effect=fake_handle)
         with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
-            await executor.execute(node)
+            await executor.execute(workflow, node)
 
         assert mock_emit.call_count == 1
         assert node.parameter_output_values == {"out": 42}
@@ -112,10 +112,10 @@ class TestLocalExecuteCopyBack:
             )
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(side_effect=fake_handle)
         with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
-            await executor.execute(node)
+            await executor.execute(workflow, node)
 
         # Two fresh keys; each __setitem__ sees old_value None != new_value.
         assert mock_emit.call_count == _EXPECTED_FRESH_OUTPUT_EMITS
@@ -204,11 +204,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node()
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_values["prompt"] == "{SHOT}"
 
@@ -217,11 +219,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node()
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_output_values["prompt"] == "hyperreal"
 
@@ -230,11 +234,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node(template="plain text")
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_values["prompt"] == "hyperreal"
 
@@ -247,11 +253,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node(template="body {color: red}")
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_values["prompt"] == "hyperreal"
 
@@ -267,11 +275,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node(template="{SHOT:03}")
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_values["prompt"] == "hyperreal"
 
@@ -285,11 +295,13 @@ class TestGroupCopyBackPreservesTemplate:
         node = _make_template_node(template="{SHOT?}")
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
+        mock_engine.node_manager.get_node_by_name_in.return_value = node
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable(name="SOMETHING_ELSE"):
-            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_last_iteration_to_packaged_nodes(
+                MagicMock(), {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
         assert node.parameter_values["prompt"] == "{SHOT?}"
         assert node.parameter_output_values["prompt"] == "hyperreal"
@@ -309,9 +321,11 @@ class TestGroupCopyBackPreservesTemplate:
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_parameter_values_to_node(
+                MagicMock(), node, {"PromptNode_prompt": "hyperreal"}, package_result
+            )
 
-        mock_engine.node_manager.on_set_parameter_value_request.assert_not_called()
+        mock_engine.node_manager.on_set_parameter_value_request_in_workflow.assert_not_called()
         assert node.parameter_values["prompt"] == "{SHOT}"
         assert node.parameter_output_values["prompt"] == "hyperreal"
 
@@ -323,13 +337,13 @@ class TestGroupCopyBackPreservesTemplate:
         """
         node = _make_template_node()
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
+        workflow = MagicMock()
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
-            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_parameter_values_to_node(workflow, node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve = workflow.flows.connections.unresolve_future_nodes
         unresolve.assert_called_once_with(node)
 
     def test_apply_parameter_values_invalidates_even_when_output_unchanged(self) -> None:
@@ -342,7 +356,7 @@ class TestGroupCopyBackPreservesTemplate:
         """
         node = _make_template_node()
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
+        workflow = MagicMock()
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
@@ -351,9 +365,9 @@ class TestGroupCopyBackPreservesTemplate:
             # guard and emits an event, so it needs the same mocked singletons the
             # call under test does.
             node.parameter_output_values["prompt"] = "hyperreal"
-            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_parameter_values_to_node(workflow, node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve = workflow.flows.connections.unresolve_future_nodes
         unresolve.assert_called_once_with(node)
 
     def test_apply_parameter_values_writes_non_template_values_normally(self) -> None:
@@ -363,10 +377,13 @@ class TestGroupCopyBackPreservesTemplate:
         mock_engine = cast("MagicMock", executor.engine)
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
+        workflow = MagicMock()
         with _gn_mock_with_variable():
-            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+            executor._apply_parameter_values_to_node(workflow, node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        request = mock_engine.node_manager.on_set_parameter_value_request.call_args.args[0]
+        set_value = mock_engine.node_manager.on_set_parameter_value_request_in_workflow
+        request = set_value.call_args.args[0]
+        assert set_value.call_args.args[1] is workflow
         assert request.is_output is False
         assert request.parameter_name == "prompt"
         assert request.value == "hyperreal"

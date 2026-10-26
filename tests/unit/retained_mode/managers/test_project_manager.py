@@ -961,38 +961,40 @@ class TestProjectManagerBuiltinVariables:
 
         assert context_manager.has_current_workflow() is False
 
-    def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
-        self,
-        project_manager_with_template: ProjectManager,
-    ) -> None:
-        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        assert project_manager_with_template.workflow_context_for_dispatch().name is None
-
-    def test_dispatch_snapshot_carries_the_whole_context(
+    def test_dispatch_snapshot_carries_the_whole_context_of_the_workflow_it_is_handed(
         self,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Raw context, not a resolved path: derived values are then computed by the peer."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_id.return_value = "show_id"
-        mock_context_manager.get_current_workflow_name.return_value = "my_show"
-        mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
-        mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
+        entry = Mock()
+        entry.name = "my_show"
+        entry.absolute_path = Path("/shows/my_show/my_show.py")
+        entry.working_directory = "/shows/my_show"
         project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        project_manager_with_template._engine.workflow_registry.get.side_effect = {"show_id": entry}.__getitem__
 
-        snapshot = project_manager_with_template.workflow_context_for_dispatch()
+        snapshot = project_manager_with_template.workflow_context_for_dispatch(WorkflowRuntime("show_id", MagicMock()))
 
         assert snapshot.workflow_id == "show_id"
         assert snapshot.name == "my_show"
-        assert snapshot.file_path == "/shows/my_show/my_show.py"
+        assert snapshot.file_path == str(Path("/shows/my_show/my_show.py"))
         assert snapshot.working_directory == "/shows/my_show"
+
+    def test_dispatch_snapshot_of_an_unsaved_workflow_names_no_file(
+        self,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        entry = Mock()
+        entry.name = "unsaved:show_id"
+        entry.absolute_path = None
+        entry.working_directory = None
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.workflow_registry.get.return_value = entry
+
+        snapshot = project_manager_with_template.workflow_context_for_dispatch(WorkflowRuntime("show_id", MagicMock()))
+
+        assert snapshot.workflow_id == "show_id"
+        assert snapshot.file_path is None
 
     def test_builtin_workflow_dir_resolves_correctly(
         self,

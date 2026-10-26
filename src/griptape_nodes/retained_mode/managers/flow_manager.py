@@ -3287,6 +3287,7 @@ class FlowManager(EngineScoped):
             return StartLocalSubflowResultFailure(result_details=details)
 
         subflow_machine = ControlFlowMachine(
+            workflow,
             flow.name,
             is_isolated=True,
             engine=self.engine,
@@ -4765,7 +4766,7 @@ class FlowManager(EngineScoped):
 
         # Initialize global control flow machine and DAG builder
 
-        flows.global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
+        flows.global_control_flow_machine = ControlFlowMachine(workflow, flow.name, engine=self.engine)
         # Set off the request here.
         try:
             await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
@@ -5141,7 +5142,7 @@ class FlowManager(EngineScoped):
             flows.global_flow_queue.task_done()
             # Get or create machine
             if flows.global_control_flow_machine is None:
-                flows.global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
+                flows.global_control_flow_machine = ControlFlowMachine(workflow, flow.name, engine=self.engine)
             await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def _handle_post_execution_queue_processing(self, workflow: WorkflowRuntime, *, debug_mode: bool) -> None:
@@ -5186,7 +5187,7 @@ class FlowManager(EngineScoped):
             # Set that we are only working on one node right now!
             flows.global_single_node_resolution = True
             # Get or create machine
-            flows.global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
+            flows.global_control_flow_machine = ControlFlowMachine(workflow, flow.name, engine=self.engine)
             flows.global_control_flow_machine.context.current_nodes = [node]
             resolution_machine = flows.global_control_flow_machine.resolution_machine
             resolution_machine.change_debug_mode(debug_mode=debug_mode)
@@ -5725,16 +5726,14 @@ class FlowManager(EngineScoped):
         # Return all connected nodes. No duplicates
         return connected_nodes
 
-    def is_node_connected(self, start_node: BaseNode, node: BaseNode) -> list[str]:
+    def is_node_connected(self, workflow: WorkflowRuntime, start_node: BaseNode, node: BaseNode) -> list[str]:
         """Check if node is in the forward control path from start_node, returning boundary nodes if connected.
-
-        Edge method for code not handed a workflow.
 
         Returns:
             list[str]: Names of nodes that have direct connections to 'node' and are in the forward control path,
                       or empty list if not in forward path.
         """
-        connections = self.get_connections()
+        connections = workflow.flows.connections
 
         # Check if node is in the forward control path from start_node
         if not connections.is_node_in_forward_control_path(start_node, node):

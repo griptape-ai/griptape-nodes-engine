@@ -90,18 +90,18 @@ class TestExecuteSubflowNodeGroupBranches:
         node = _make_subflow_node(ISOLATED_EXECUTION)
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
+        workflow = MagicMock()
         with (
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
-            mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            workflow.ahandle_request = AsyncMock()
+            await executor.execute(workflow, node)
 
-        mock_private.assert_awaited_once_with(node)
+        mock_private.assert_awaited_once_with(workflow, node)
         mock_library.assert_not_awaited()
         node.aprocess.assert_not_awaited()
-        mock_engine.ahandle_request.assert_not_awaited()
+        workflow.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_library_execution_routes_through_library_workflow(self) -> None:
@@ -109,18 +109,18 @@ class TestExecuteSubflowNodeGroupBranches:
         node = _make_subflow_node("some_library_name")
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
+        workflow = MagicMock()
         with (
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
-            mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            workflow.ahandle_request = AsyncMock()
+            await executor.execute(workflow, node)
 
-        mock_library.assert_awaited_once_with(node, "some_library_name")
+        mock_library.assert_awaited_once_with(workflow, node, "some_library_name")
         mock_private.assert_not_awaited()
         node.aprocess.assert_not_awaited()
-        mock_engine.ahandle_request.assert_not_awaited()
+        workflow.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_subprocess_paths_clear_execution_state_first(self) -> None:
@@ -129,7 +129,7 @@ class TestExecuteSubflowNodeGroupBranches:
 
         executor = _make_executor()
         with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock):
-            await executor.execute(node)
+            await executor.execute(MagicMock(), node)
 
         node.subflow_execution_component.clear_execution_state.assert_called_once()
 
@@ -138,7 +138,7 @@ class TestExecuteSubflowNodeGroupBranches:
         """LOCAL_EXECUTION runs aprocess directly; clearing subprocess state is unnecessary."""
         node = _make_subflow_node(LOCAL_EXECUTION)
 
-        await _make_executor().execute(node)
+        await _make_executor().execute(MagicMock(), node)
 
         node.subflow_execution_component.clear_execution_state.assert_not_called()
 
@@ -159,7 +159,7 @@ class TestPrivateExecutionInWorker:
             patch(_IS_BETA_ENABLED_PATH, return_value=True),
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
         ):
-            await _make_executor().execute(node)
+            await _make_executor().execute(MagicMock(), node)
 
         assert seen == [IsolatedExecutionScope(owner_name="Subflow")]
         mock_private.assert_not_awaited()
@@ -171,7 +171,7 @@ class TestPrivateExecutionInWorker:
         node = _make_subflow_node(ISOLATED_EXECUTION)
 
         with patch(_IS_BETA_ENABLED_PATH, return_value=True):
-            await _make_executor().execute(node)
+            await _make_executor().execute(MagicMock(), node)
 
         assert current_isolated_execution_scope.get() is None
 
@@ -179,13 +179,14 @@ class TestPrivateExecutionInWorker:
     async def test_the_subprocess_path_is_kept_when_the_feature_is_off(self) -> None:
         node = _make_subflow_node(ISOLATED_EXECUTION)
 
+        workflow = MagicMock()
         with (
             patch(_IS_BETA_ENABLED_PATH, return_value=False),
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
         ):
-            await _make_executor().execute(node)
+            await _make_executor().execute(workflow, node)
 
-        mock_private.assert_awaited_once_with(node)
+        mock_private.assert_awaited_once_with(workflow, node)
         node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -199,7 +200,7 @@ class TestPrivateExecutionInWorker:
             patch(_IS_BETA_ENABLED_PATH, return_value=True),
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock),
         ):
-            await _make_executor().execute(node)
+            await _make_executor().execute(MagicMock(), node)
 
         assert all(scope is None for scope in seen)
 
@@ -268,7 +269,7 @@ class TestPrivateExecutionStartEndLoop:
             patch.object(NodeExecutor, "_execute_loop_iterations_sequentially_private", runner("sequentially_private")),
             pytest.raises(_LoopBodyRan),
         ):
-            await executor.handle_loop_execution(self._end_node(run_in_order=run_in_order))
+            await executor.handle_loop_execution(MagicMock(), self._end_node(run_in_order=run_in_order))
         return calls
 
     @pytest.mark.asyncio
@@ -302,11 +303,11 @@ class TestExecuteUnexpectedResultType:
         not_a_payload: Any = "not a payload at all"
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(return_value=not_a_payload)
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(return_value=not_a_payload)
 
         with pytest.raises(RuntimeError, match="Weird"):
-            await executor.execute(node)
+            await executor.execute(workflow, node)
 
 
 class TestExecuteSuccessReturnsNone:
@@ -321,11 +322,11 @@ class TestExecuteSuccessReturnsNone:
         node.metadata = {}
 
         executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(
+        workflow = MagicMock()
+        workflow.ahandle_request = AsyncMock(
             return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"x": 1}),
         )
-        result = await executor.execute(node)
+        result = await executor.execute(workflow, node)
 
         assert result is None
 

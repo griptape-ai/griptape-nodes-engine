@@ -42,7 +42,8 @@ if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.machines.dag_builder import DagBuilder, DagNode
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -71,6 +72,7 @@ class NodeStatesResult(NamedTuple):
 
 
 class ParallelResolutionContext(EngineScoped):
+    workflow: WorkflowRuntime
     paused: bool
     flow_name: str
     error_message: str | None
@@ -87,12 +89,15 @@ class ParallelResolutionContext(EngineScoped):
 
     def __init__(
         self,
+        workflow: WorkflowRuntime,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
         engine: Engine | None = None,
     ) -> None:
         super().__init__(engine)
+        # The workflow this run belongs to. Its tasks outlive the request that started it.
+        self.workflow = workflow
         self.flow_name = flow_name
         self.paused = False
         self.error_message = None
@@ -200,7 +205,7 @@ class ExecuteDagState(State):
         if context.dag_builder is not None:
             newly_available = context.dag_builder.remove_node_from_dependencies(current_node_name, network_name)
             for data_node_name in newly_available:
-                data_node = context.engine.node_manager.get_node_by_name(data_node_name)
+                data_node = context.engine.node_manager.get_node_by_name_in(context.workflow, data_node_name)
                 added_nodes = context.dag_builder.add_node_with_dependencies(data_node, data_node_name)
                 if added_nodes:
                     for added_node in added_nodes:
@@ -343,18 +348,18 @@ class ExecuteDagState(State):
     @staticmethod
     def get_next_control_graph(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> None:
         """Get next control flow nodes and add them to the DAG graph."""
-        flow_manager = context.engine.flow_manager
+        flows = context.workflow.flows
 
         # Early returns for various conditions
-        if ExecuteDagState._should_skip_control_flow(context, node, network_name, flow_manager):
+        if ExecuteDagState._should_skip_control_flow(context, node, network_name, flows):
             return
         next_output = node.get_next_control_output()
         if next_output is not None:
-            ExecuteDagState._process_next_control_node(context, node, next_output, network_name, flow_manager)
+            ExecuteDagState._process_next_control_node(context, node, next_output, network_name, flows)
 
     @staticmethod
     def _should_skip_control_flow(
-        context: ParallelResolutionContext, node: BaseNode, network_name: str, flow_manager: FlowManager
+        context: ParallelResolutionContext, node: BaseNode, network_name: str, flows: WorkflowFlows
     ) -> bool:
         """Check if control flow processing should be skipped.
 
@@ -372,8 +377,8 @@ class ExecuteDagState(State):
         if network is None:
             msg = f"Network {network_name} not found in DAG builder"
             raise ValueError(msg)
-        is_isolated = context.dag_builder is not flow_manager.global_dag_builder
-        if flow_manager.global_single_node_resolution and not is_isolated:
+        is_isolated = context.dag_builder is not flows.global_dag_builder
+        if flows.global_single_node_resolution and not is_isolated:
             # Clean up nodes from emptied graphs in single node resolution mode
             if len(network) == 0 and context.dag_builder is not None:
                 context.dag_builder.cleanup_empty_graph_nodes(network_name)
@@ -390,10 +395,10 @@ class ExecuteDagState(State):
         node: BaseNode,
         next_output: Parameter,
         network_name: str,
-        flow_manager: FlowManager,
+        flows: WorkflowFlows,
     ) -> None:
         """Process the next control node in the flow."""
-        node_connection = flow_manager.get_connections().get_connected_node(node, next_output, include_internal=False)
+        node_connection = flows.connections.get_connected_node(node, next_output, include_internal=False)
         if node_connection is not None:
             next_node, next_parameter = node_connection
 
@@ -483,7 +488,7 @@ class ExecuteDagState(State):
                 context.node_priority_queue.add_node(dag_node)
 
     @staticmethod
-    async def collect_values_from_upstream_nodes(engine: Engine, node_reference: DagNode) -> None:
+    async def collect_values_from_upstream_nodes(workflow: WorkflowRuntime, node_reference: DagNode) -> None:
         """Collect output values from resolved upstream nodes and pass them to the current node.
 
         This method iterates through all input parameters of the current node, finds their
@@ -491,7 +496,7 @@ class ExecuteDagState(State):
         values and passes them through using SetParameterValueRequest.
 
         Args:
-            engine (Engine): The engine whose connections and request bus this run belongs to.
+            workflow (WorkflowRuntime): The workflow whose connections feed the node and whose requests set its values.
             node_reference (DagOrchestrator.DagNode): The node to collect values for.
         """
         current_node = node_reference.node_reference
@@ -504,7 +509,7 @@ class ExecuteDagState(State):
         if current_node.lock:
             return
 
-        connections = engine.flow_manager.get_connections()
+        connections = workflow.flows.connections
 
         for parameter in current_node.parameters:
             # Get the connected upstream node for this parameter
@@ -519,7 +524,7 @@ class ExecuteDagState(State):
                     output_value = upstream_node._get_raw_parameter_value(upstream_parameter.name)
 
                 # Pass the value through using the same mechanism as normal resolution
-                result = await engine.ahandle_request(
+                result = await workflow.ahandle_request(
                     SetParameterValueRequest(
                         parameter_name=parameter.name,
                         node_name=current_node.name,
@@ -614,11 +619,11 @@ class ExecuteDagState(State):
                 ExecuteDagState._try_queue_waiting_node(context, leaf_node)
 
     @staticmethod
-    async def execute_node(engine: Engine, current_node: DagNode) -> None:
+    async def execute_node(engine: Engine, workflow: WorkflowRuntime, current_node: DagNode) -> None:
         executor = engine.flow_manager.node_executor
         started_at = time.perf_counter()
         try:
-            await executor.execute(current_node.node_reference)
+            await executor.execute(workflow, current_node.node_reference)
         finally:
             current_node.run_seconds = time.perf_counter() - started_at
 
@@ -690,7 +695,7 @@ class ExecuteDagState(State):
 
             # Collect parameter values from upstream nodes before executing
             try:
-                await ExecuteDagState.collect_values_from_upstream_nodes(context.engine, node_reference)
+                await ExecuteDagState.collect_values_from_upstream_nodes(context.workflow, node_reference)
             except Exception as e:
                 context.running_tasks_count -= 1  # Decrement on error
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
@@ -793,7 +798,9 @@ class ExecuteDagState(State):
 
             node_reference.node_reference.clear_cancellation()
 
-            node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
+            node_task = asyncio.create_task(
+                ExecuteDagState.execute_node(context.engine, context.workflow, node_reference)
+            )
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
 
@@ -1040,20 +1047,21 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
 
     def __init__(
         self,
+        workflow: WorkflowRuntime,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
         engine: Engine | None = None,
     ) -> None:
         resolution_context = ParallelResolutionContext(
-            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
+            workflow, flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
         )
         super().__init__(resolution_context)
 
     async def resolve_node(self, node: BaseNode | None = None) -> None:  # noqa: ARG002
         """Execute the DAG structure using the existing DagBuilder."""
         if self.context.dag_builder is None:
-            self.context.dag_builder = self.context.engine.flow_manager.global_dag_builder
+            self.context.dag_builder = self.context.workflow.flows.global_dag_builder
         await self.start(ExecuteDagState)
 
     def inject_node(self, node: BaseNode, graph_name: str | None = None) -> list[BaseNode]:
@@ -1104,7 +1112,7 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # add to node_to_reference, breaking this iteration mid-cancel.
         node_manager = self.context.engine.node_manager
         for dag_node in list(self.context.node_to_reference.values()):
-            await node_manager.cancel_worker_execution(dag_node.node_reference.name)
+            await node_manager.cancel_worker_execution(self.context.workflow, dag_node.node_reference.name)
 
         # Cancel all running tasks
         tasks = list(self.context.task_to_node.keys())

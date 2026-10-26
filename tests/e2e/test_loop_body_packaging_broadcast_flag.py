@@ -118,7 +118,9 @@ async def _package_a_real_loop_body(
         _connect(engine, start_name, "exec_out", body_name, "exec_in")
         _connect(engine, body_name, "exec_out", end_node.name, "add_item")
 
-        packaged = await NodeExecutor(engine=engine)._package_loop_body(start_node, end_node)
+        packaged = await NodeExecutor(engine=engine)._package_loop_body(
+            engine.open_workflows.sole_workflow(), start_node, end_node
+        )
 
     assert packaged is not None, "The loop body came back empty, so this test asserted nothing."
     package_result, _execution_type = packaged

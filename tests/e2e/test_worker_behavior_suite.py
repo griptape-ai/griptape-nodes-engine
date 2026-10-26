@@ -99,7 +99,8 @@ def _make_in_flow(node_type: str, name: str) -> BaseNode:
 
 async def _execute(node_type: str, name: str, **parameter_values: object) -> ExecuteNodeResultSuccess:
     # Names the open workflow as an orchestrator's dispatch does, so a worker mirrors it and resolves its paths.
-    workflow_context = current_engine().project_manager.workflow_context_for_dispatch()
+    engine = current_engine()
+    workflow_context = engine.project_manager.workflow_context_for_dispatch(engine.open_workflows.sole_workflow())
     request = ExecuteNodeRequest(
         node_name=name,
         parameter_values=dict(parameter_values),
