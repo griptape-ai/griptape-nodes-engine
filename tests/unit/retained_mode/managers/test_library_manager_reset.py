@@ -454,7 +454,7 @@ class TestApplyPendingResets:
             patch.object(library_manager, "load_all_libraries_from_config", side_effect=record_load),
             pytest.raises(_StopInitialization),
         ):
-            await library_manager._run_app_initialization(AppInitializationComplete())
+            await library_manager.load_libraries_for_startup(AppInitializationComplete())
 
         assert calls == ["apply", "load"]
 
@@ -470,7 +470,7 @@ class TestApplyPendingResets:
             patch.object(library_manager, "load_all_libraries_from_config", side_effect=_StopInitialization),
             pytest.raises(_StopInitialization),
         ):
-            await library_manager._run_app_initialization(
+            await library_manager.load_libraries_for_startup(
                 AppInitializationComplete(is_worker=True, libraries_to_register=[LIBRARY_NAME])
             )
 
@@ -489,7 +489,9 @@ class TestApplyPendingResets:
             patch.object(library_manager, "load_all_libraries_from_config", side_effect=_StopInitialization),
             pytest.raises(_StopInitialization),
         ):
-            await library_manager._run_app_initialization(AppInitializationComplete(defer_pending_library_resets=True))
+            await library_manager.load_libraries_for_startup(
+                AppInitializationComplete(defer_pending_library_resets=True)
+            )
 
         apply.assert_not_awaited()
 
