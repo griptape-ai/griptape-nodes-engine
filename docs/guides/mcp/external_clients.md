@@ -18,6 +18,30 @@ When the engine starts, it logs the actual bound address, for example:
 INFO MCP server listening at http://127.0.0.1:8125/mcp/
 ```
 
+## Library tools
+
+Some node libraries add tools for their own product, such as a library for a compositing app
+that can list and run that app's workflows. These tools are not on the address above, so an
+agent only loads the tools of the products you use. Each library has its own address, named
+after the library in lowercase with underscores for spaces:
+
+```
+http://localhost:8125/mcp/libraries/nuke_nodes_library/
+```
+
+Add it to your client as a second server next to `griptape-nodes`. Your client then shows the
+tools under that server's name.
+
+To get the engine's tools and some libraries' tools from one server, list the libraries after
+`?libraries=`, separated by commas:
+
+```
+http://localhost:8125/mcp/?libraries=nuke_nodes_library
+```
+
+If a library's address returns an error, check that the library is loaded in the editor's
+**Libraries** panel and that the address spells its name correctly.
+
 ## Overrides
 
 The host and port are controlled by environment variables:

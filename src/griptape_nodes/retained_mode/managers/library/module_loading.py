@@ -21,6 +21,7 @@ from griptape_nodes.files.path_utils import (
     relative_to_keeping_or_following_links,
     resolve_workspace_path,
 )
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.node_library.library_registry import (
     Library,
     LibraryRegistry,
@@ -36,6 +37,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AppEventListenerRegistrationProblem,
     BeforeLibraryCallbackProblem,
     ExecutionEventListenerRegistrationProblem,
+    MCPToolRegistrationProblem,
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
@@ -593,6 +595,15 @@ class LibraryModuleLoading(EngineScoped):
                     err,
                 )
 
+        # Request types the library exposes on the engine's MCP server. Checked against the
+        # handlers just registered, so this has to run after them.
+        if advanced_library:
+            try:
+                self._register_mcp_tools(advanced_library, library)
+            except Exception as err:
+                library_info.problems.append(MCPToolRegistrationProblem(error_message=str(err)))
+                logger.error("Failed to register MCP tools for library '%s': %s", library_data.name, err)
+
         # Register post-dispatch hooks declared by the library
         if advanced_library:
             try:
@@ -758,6 +769,32 @@ class LibraryModuleLoading(EngineScoped):
                 library_name,
                 err,
             )
+
+    def _register_mcp_tools(self, advanced_library: AdvancedNodeLibrary, library: Library) -> None:
+        """Store the library's MCP tools on it, or raise without storing any if one is invalid."""
+        library_name = library.get_library_data().name
+        tools = advanced_library.get_mcp_tools()
+        handled_types = library.get_registered_request_handler_types()
+        for tool in tools:
+            if not isinstance(tool, MCPTool):
+                msg = (
+                    f"Attempted to expose an MCP tool from library '{library_name}'. "
+                    f"Failed because '{tool}' is not an MCPTool. Each entry from get_mcp_tools() must be "
+                    f"an MCPTool naming a request type."
+                )
+                raise TypeError(msg)
+            if tool.request_type not in handled_types:
+                request_name = getattr(tool.request_type, "__name__", tool.request_type)
+                msg = (
+                    f"Attempted to expose '{request_name}' as an MCP tool from library '{library_name}'. "
+                    f"Failed because the library does not handle that request. Return it from "
+                    f"get_request_handlers() too."
+                )
+                raise ValueError(msg)
+
+        library._mcp_tools = list(tools)
+        if tools:
+            logger.debug("Exposed %d MCP tool(s) for library '%s'", len(tools), library_name)
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.

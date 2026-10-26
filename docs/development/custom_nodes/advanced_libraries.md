@@ -25,6 +25,8 @@ list in the manifest. That is the common case and it needs no Python beyond the 
     [Registering node types without listing them](#registering-node-types-without-listing-them-in-the-manifest).
 - **Serve a request type** your library owns, so other libraries and nodes can call into
     it. See [`get_request_handlers`](#get_request_handlers).
+- **Give AI agents tools for your product**, such as listing or starting renders, through
+    the engine's MCP server. See [`get_mcp_tools`](#get_mcp_tools).
 - **React after the engine handles a request** it already owns, such as running your own
     step every time a workflow is saved. See
     [`get_post_dispatch_hooks`](#get_post_dispatch_hooks).
@@ -95,10 +97,11 @@ that silently does nothing. Registering a library runs, in order:
 | 8    | Registers the manifest's widgets                                    |
 | 9    | **Calls `after_library_nodes_loaded`**                              |
 | 10   | **Calls `get_request_handlers`** and registers what it returns      |
-| 11   | **Calls `get_post_dispatch_hooks`** and registers what it returns   |
-| 12   | **Calls `get_execution_event_listeners`** and registers them        |
-| 13   | **Calls `get_app_event_listeners`** and registers them              |
-| 14   | Computes library fitness and marks the library `LOADED`             |
+| 11   | **Calls `get_mcp_tools`** and exposes what it returns               |
+| 12   | **Calls `get_post_dispatch_hooks`** and registers what it returns   |
+| 13   | **Calls `get_execution_event_listeners`** and registers them        |
+| 14   | **Calls `get_app_event_listeners`** and registers them              |
+| 15   | Computes library fitness and marks the library `LOADED`             |
 
 Two consequences worth internalizing:
 
@@ -113,7 +116,7 @@ Unregistering runs in the reverse spirit:
 | ---- | ------------------------------------------------------------------------------- |
 | 1    | **Calls `before_library_unregistered`**                                         |
 | 2    | Removes the library's app and execution event listeners, and its dispatch hooks |
-| 3    | Removes the request handlers it registered                                      |
+| 3    | Removes the request handlers it registered and the MCP tools it exposed         |
 | 4    | Unregisters the library's widgets                                               |
 | 5    | Removes the library from the `LibraryRegistry`                                  |
 
@@ -270,6 +273,61 @@ Constraints on the mechanism:
 Other code can discover what a loaded library exposes with
 `library.get_registered_request_handler_types()`, then inspect each type with
 `dataclasses.fields()` and `typing.get_type_hints()`.
+
+### `get_mcp_tools`
+
+```python
+def get_mcp_tools(self) -> list[MCPTool]: ...
+```
+
+Returns the request types to offer AI agents as tools on the engine's MCP server, which
+external clients such as Claude Code and Cursor connect to. Each tool is a request your
+library already serves through [`get_request_handlers`](#get_request_handlers), so a call
+from an agent runs your handler like any other request.
+
+```python
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary, MCPTool
+
+
+class RenderLibrary(AdvancedNodeLibrary):
+    def get_request_handlers(self):
+        return [
+            (ListRendersRequest, self._handle_list_renders),
+            (StartRenderRequest, self._handle_start_render),
+        ]
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        return [
+            MCPTool(ListRendersRequest, read_only=True),
+            MCPTool(StartRenderRequest),
+        ]
+```
+
+The agent sees the tool under the request's name. It reads the request's docstring to
+learn what the tool does and its fields to learn what to send, so write the docstring for
+an agent that has never seen your product. Set `read_only=True` on tools that only read
+state. Clients use it to skip asking the user before a call.
+
+Your tools stay off the engine's own address, so agents that don't use your product don't
+have to load them. With the server at its default `http://localhost:8125/mcp/`:
+
+| Address                               | Serves                                       |
+| ------------------------------------- | -------------------------------------------- |
+| `/mcp/libraries/<slug>/`              | Your library's tools only                    |
+| `/mcp/?libraries=<slug>,<other slug>` | The engine's tools plus the named libraries' |
+
+The slug is your library's name in lowercase, with each run of spaces and punctuation
+replaced by one underscore, so "Render Library" becomes `render_library`. See
+[Connect External MCP Clients](../../guides/mcp/external_clients.md#library-tools).
+
+Constraints on the mechanism:
+
+- **Expose only requests you handle.** Every request type must also come from
+    `get_request_handlers`. A tool that breaks this rule, or an entry that is not an
+    `MCPTool`, is reported as an `MCPToolRegistrationProblem` and none of your tools are
+    exposed.
+- **The engine's tools win a name clash.** If a request shares its name with one of the
+    engine's tools, the combined address serves the engine's.
 
 ### `get_post_dispatch_hooks`
 
