@@ -239,7 +239,7 @@ DERIVED_VARIABLE_NAMES = frozenset(rule.name for rule in DERIVATION_RULES)
 
 
 class MacroNeedsWorkflowError(RuntimeError):
-    """A macro uses `{workflow_dir}` or `{workflow_name}`, and there is no workflow to answer it.
+    """A macro uses `{workflow_dir}` or `{workflow_name}`, and the request has no workflow to answer it.
 
     Fails the resolution even when the reference is optional (`{workflow_dir?:/}`): dropping it would
     move the path from the workflow's folder to the workspace root, a plausible path that is wrong.
@@ -247,7 +247,7 @@ class MacroNeedsWorkflowError(RuntimeError):
 
     def __init__(self, builtin_name: str) -> None:
         self.builtin_name = builtin_name
-        super().__init__(f"it uses {{{builtin_name}}} and no workflow is open")
+        super().__init__(f"it uses {{{builtin_name}}} and the request has no workflow")
 
 
 def _project_selection_failure(project_id: str | None) -> str:
@@ -341,7 +341,7 @@ class _ProjectVariableResolver:
             try:
                 self.builtins_cache[name] = self.get_builtin(name)
             except MacroNeedsWorkflowError as e:
-                msg = f"{owner_kind} '{owner_name}' uses {{{name}}} and no workflow is open"
+                msg = f"{owner_kind} '{owner_name}' uses {{{name}}} and the request has no workflow"
                 raise MacroResolutionError(
                     msg,
                     failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
@@ -1947,16 +1947,11 @@ class ProjectManager(EngineScoped):
     def _apply_project_env(self, project_info: ProjectInfo) -> None:
         """Apply template.environment to os.environ, snapshotting originals for later restore.
 
-        Env values are recursively resolved before being written to os.environ. Values that
-        fail to resolve (e.g. reference a workflow-context builtin when no workflow is active,
-        or form a cycle) are skipped with a warning so one bad entry doesn't poison the rest.
+        Env values are recursively resolved before being written to os.environ. Each value that
+        fails to resolve (it uses `{workflow_dir}` or `{workflow_name}`, which no process-wide
+        value can, or it forms a cycle) is skipped with a warning, and the rest are applied.
         """
-        template = project_info.template
-        try:
-            resolved_env = self._resolve_project_env_values(template, project_info)
-        except MacroResolutionError as e:
-            logger.warning("Failed to resolve project environment variables; skipping os.environ application: %s", e)
-            return
+        resolved_env = self._resolve_project_env_values(project_info.template, project_info)
         for key, value in resolved_env.items():
             if key in self._DANGEROUS_ENV_KEYS:
                 logger.warning("Project template is overriding sensitive environment variable '%s'", key)
@@ -1964,15 +1959,26 @@ class ProjectManager(EngineScoped):
             os.environ[key] = value
 
     def _resolve_project_env_values(self, template: ProjectTemplate, project_info: ProjectInfo) -> dict[str, str]:
-        """Recursively resolve every entry in template.environment to a final string.
+        """Recursively resolve each entry in template.environment to a final string, skipping any that fail.
 
-        Returns the full env-resolution map. See `_ProjectVariableResolver` for the
-        recursion and reference-lookup rules.
+        Returns the values that resolved, with a warning logged for each one that did not. See
+        `_ProjectVariableResolver` for the recursion and reference-lookup rules.
         """
         # Applied to the whole process, so no workflow's folder or name may leak into it.
         resolver = self._build_variable_resolver(template, project_info, None)
         for key in template.environment:
-            resolver.resolve_env(key)
+            try:
+                resolver.resolve_env(key)
+            except MacroResolutionError as e:
+                if isinstance(e.__cause__, MacroNeedsWorkflowError):
+                    logger.warning(
+                        "Project environment variable '%s' was not applied because it depends on {%s}, and "
+                        "environment variables apply to the whole engine rather than to one workflow.",
+                        key,
+                        e.__cause__.builtin_name,
+                    )
+                else:
+                    logger.warning("Project environment variable '%s' was not applied because %s", key, e)
         return dict(resolver.env_resolved)
 
     def _build_variable_resolver(
@@ -4263,7 +4269,7 @@ class ProjectManager(EngineScoped):
         )
 
     @handles(GetStateForMacroRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
-    def on_get_state_for_macro_request(
+    def on_get_state_for_macro_request(  # noqa: C901
         self, request: GetStateForMacroRequest, workflow: WorkflowRuntime | None = None
     ) -> GetStateForMacroResultSuccess | GetStateForMacroResultFailure:
         """Analyze a macro and return comprehensive state information.
@@ -4304,9 +4310,8 @@ class ProjectManager(EngineScoped):
         # without mutating the request.
         referenced_names = {vi.name for vi in all_variables}
         analysis_bag: MacroVariables = dict(request.variables)
-        builtin_resolution = self._resolve_builtins_into_bag(
-            analysis_bag, referenced_names, project_info, self._workflow_id_for_paths(workflow)
-        )
+        workflow_id = self._workflow_id_for_paths(workflow)
+        builtin_resolution = self._resolve_builtins_into_bag(analysis_bag, referenced_names, project_info, workflow_id)
         # An unavailable required builtin is fatal here too, and so is a workflow builtin with no
         # workflow — mirrors the path handler so callers don't see "looks resolvable" when it isn't.
         for var_info in all_variables:
@@ -4320,6 +4325,17 @@ class ProjectManager(EngineScoped):
                     result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
                 )
         conflicting_variables.update(builtin_resolution.conflicts)
+
+        # A directory that uses a workflow builtin fails with no workflow, as it does in the path handler.
+        # One the caller also supplies is a conflict instead, which the path handler reports first.
+        if workflow_id is None:
+            needs_workflow = self._directory_needing_a_workflow(
+                project_info, (referenced_names & directory_names) - user_provided_names
+            )
+            if needs_workflow is not None:
+                return GetStateForMacroResultFailure(
+                    result_details=f"Attempted to analyze macro '{request.parsed_macro.template}'. Failed because {needs_workflow}.",
+                )
 
         # A referenced name is satisfied if ANY source can fill it: directory, caller,
         # available builtin, or stored project variable.
@@ -4361,6 +4377,19 @@ class ProjectManager(EngineScoped):
             can_resolve=can_resolve,
             result_details=f"Analyzed macro with {len(all_variables)} variables: {len(satisfied_variables)} satisfied, {len(missing_required_variables)} missing, {len(conflicting_variables)} conflicting",
         )
+
+    def _directory_needing_a_workflow(
+        self, project_info: ProjectInfo, directory_names: set[str]
+    ) -> MacroResolutionError | None:
+        """The error of the first of `directory_names` that uses `{workflow_dir}` or `{workflow_name}`, or None."""
+        resolver = self._build_variable_resolver(project_info.template, project_info, None)
+        for directory_name in sorted(directory_names):
+            try:
+                resolver.resolve_directory(directory_name)
+            except MacroResolutionError as e:
+                if isinstance(e.__cause__, MacroNeedsWorkflowError):
+                    return e
+        return None
 
     @handles(ActivateWorkspaceProjectRequest, scope=RequestScope.HOST)
     async def on_activate_workspace_project_request(
@@ -4962,7 +4991,9 @@ class ProjectManager(EngineScoped):
           record a conflict (directory builtins compare as resolved paths; others
           compare as strings).
         - If ``bag`` has no value, inject the resolved builtin.
-        - If the builtin can't be resolved (a workflow builtin with `workflow_id`
+        - A workflow builtin with `workflow_id` None that ``bag`` already has keeps the caller's
+          value: with no workflow to compare against, the caller's is the only answer.
+        - If the builtin can't be resolved otherwise (a workflow builtin with `workflow_id`
           None raises MacroNeedsWorkflowError, etc.), record the name → underlying exception in
           ``unavailable`` and skip. Callers that treat unavailability of a
           *required* builtin as fatal must check the unavailable map themselves
@@ -4978,6 +5009,10 @@ class ProjectManager(EngineScoped):
                 continue
             try:
                 builtin_value = self._get_builtin_variable_value(var_name, project_info, workflow_id)
+            except MacroNeedsWorkflowError as e:
+                if bag.get(var_name) is None:
+                    unavailable[var_name] = e
+                continue
             except (RuntimeError, NotImplementedError) as e:
                 unavailable[var_name] = e
                 continue
@@ -5051,8 +5086,8 @@ class ProjectManager(EngineScoped):
         value through its own normal code paths, so the two cannot drift and a new derived value
         needs no new handoff.
 
-        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
-        answering from its own equally-empty context, so both degrade identically.
+        Empty when this process has no workflow -- there is nothing to lend, so the peer mirrors
+        none, and a path that needs `{workflow_dir}` fails there as it does here.
         """
         context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():

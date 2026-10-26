@@ -517,7 +517,7 @@ class TestProjectManagerMacroHandlers:
         assert "workflow_name" in result.unavailable
         assert "workflow_dir" in result.unavailable
         assert isinstance(result.unavailable["workflow_name"], MacroNeedsWorkflowError)
-        assert "no workflow is open" in str(result.unavailable["workflow_name"])
+        assert "the request has no workflow" in str(result.unavailable["workflow_name"])
         # workspace_dir resolves fine → not in unavailable, and injected into the bag.
         assert "workspace_dir" not in result.unavailable
         assert bag["workspace_dir"] == str(tmp_path.resolve())
@@ -709,7 +709,7 @@ class TestProjectManagerBuiltinVariables:
         assert result.failure_reason == PathResolutionFailureReason.MACRO_RESOLUTION_ERROR
         assert str(result.result_details) == (
             "Attempted to resolve '{workflow_name}_output.txt'. "
-            "Failed because it uses {workflow_name} and no workflow is open."
+            "Failed because it uses {workflow_name} and the request has no workflow."
         )
 
     def test_builtin_project_name_not_implemented(self, project_manager_with_template: ProjectManager) -> None:
@@ -1027,7 +1027,7 @@ class TestProjectManagerBuiltinVariables:
         assert result.failure_reason == PathResolutionFailureReason.MACRO_RESOLUTION_ERROR
         assert str(result.result_details) == (
             "Attempted to resolve '{workflow_dir}/output.txt'. "
-            "Failed because it uses {workflow_dir} and no workflow is open."
+            "Failed because it uses {workflow_dir} and the request has no workflow."
         )
 
     def test_builtin_workflow_dir_optional_fails_when_no_workflow(
@@ -1047,7 +1047,7 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultFailure)
         assert str(result.result_details) == (
             "Attempted to resolve '{workflow_dir?:/}staticfiles/output.txt'. "
-            "Failed because it uses {workflow_dir} and no workflow is open."
+            "Failed because it uses {workflow_dir} and the request has no workflow."
         )
 
     def test_optional_workflow_dir_through_a_directory_fails_when_no_workflow(
@@ -1066,7 +1066,7 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultFailure)
         assert str(result.result_details) == (
             "Attempted to resolve '{outputs}/image.png'. "
-            "Failed because directory 'outputs' uses {workflow_dir} and no workflow is open."
+            "Failed because directory 'outputs' uses {workflow_dir} and the request has no workflow."
         )
 
     @pytest.mark.parametrize(
@@ -1569,7 +1569,7 @@ class TestProjectManagerGetStateForMacro:
 
             assert isinstance(result, GetStateForMacroResultFailure)
             assert str(result.result_details) == (
-                f"Attempted to analyze macro '{template}'. Failed because it uses {{workflow_name}} and no workflow is open."
+                f"Attempted to analyze macro '{template}'. Failed because it uses {{workflow_name}} and the request has no workflow."
             )
 
     def test_get_state_for_macro_conflicting_builtin_override(
@@ -7094,7 +7094,7 @@ class TestProjectEnvironmentVariableRecursion:
         assert isinstance(result, GetPathForMacroResultFailure)
         assert str(result.result_details) == (
             "Attempted to resolve '{inputs}/img.png'. "
-            "Failed because directory 'inputs' uses {workflow_dir} and no workflow is open."
+            "Failed because directory 'inputs' uses {workflow_dir} and the request has no workflow."
         )
 
     def test_directory_required_workflow_dir_still_fails_when_no_workflow(self) -> None:
@@ -7148,7 +7148,9 @@ class TestProjectEnvironmentVariableRecursion:
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{WF}/x.png"), variables={})
             )
         assert isinstance(result, GetPathForMacroResultFailure)
-        assert "environment variable 'WF' uses {workflow_dir} and no workflow is open" in str(result.result_details)
+        assert "environment variable 'WF' uses {workflow_dir} and the request has no workflow" in str(
+            result.result_details
+        )
 
     def test_apply_project_env_resolves_with_no_workflow_even_when_one_is_open(self) -> None:
         """Project env is applied process-wide, so it never takes the open workflow's folder."""
@@ -7162,6 +7164,29 @@ class TestProjectEnvironmentVariableRecursion:
         finally:
             pm._restore_project_env()
             os.environ.pop("GTN_TEST_WF_ENV", None)
+
+    def test_apply_project_env_skips_only_the_value_that_needs_a_workflow(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One value naming {workflow_dir} is left out; the others are still applied."""
+        pm = self._make_pm_with_template(
+            environment={"GTN_TEST_ENV_A": "{workflow_dir?:/}sub", "GTN_TEST_ENV_B": "{workspace_dir}/b"}
+        )
+        assert pm._current_project_id is not None
+        project_info = pm._successfully_loaded_project_templates[pm._current_project_id]
+        try:
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                pm._apply_project_env(project_info)
+            assert "GTN_TEST_ENV_A" not in os.environ
+            assert os.environ["GTN_TEST_ENV_B"] == f"{Path('/workspace')}/b"
+            assert (
+                "Project environment variable 'GTN_TEST_ENV_A' was not applied because it depends on {workflow_dir}"
+                in (caplog.text)
+            )
+        finally:
+            pm._restore_project_env()
+            os.environ.pop("GTN_TEST_ENV_A", None)
+            os.environ.pop("GTN_TEST_ENV_B", None)
 
     def test_apply_project_env_writes_resolved_values_to_os_environ(self) -> None:
         pm = self._make_pm_with_template(environment={"FOO": "{workspace_dir}/sub"})

@@ -73,7 +73,11 @@ Builtins are resolved at the moment a macro is evaluated — not when the projec
 - `project_dir` reflects the actual path of the loaded project file
 - `workspace_dir` reflects the project directory when no explicit workspace is configured, otherwise the value from the project-adjacent config or environment variable
 
-If a builtin variable is required but cannot be resolved (for example, `workflow_name` when no workflow is running), macro resolution fails with an error. If the variable is optional (marked with `?`), the block is silently omitted instead.
+If a builtin variable is required but cannot be resolved, macro resolution fails with an error. If the variable is optional (marked with `?`), the block is silently omitted instead.
+
+`workflow_name` and `workflow_dir` are the exception: when the request has no workflow, for example when nothing is open, a macro that uses either one fails, even in its optional form (`{workflow_dir?:/}`). Leaving the block out would move the path from the workflow's folder to the workspace root, a path that looks right but is not where the workflow keeps its files. To resolve a path with no workflow, use a macro without `workflow_dir`, such as one starting with `{workspace_dir}`.
+
+Project environment values apply to the whole engine rather than to one workflow, so an environment value that uses `workflow_name` or `workflow_dir` is not applied, and a warning names it. The other environment values are still applied.
 
 ### Builtin variables in situation macros
 
@@ -83,7 +87,7 @@ The `save_static_file` situation uses `workflow_dir` and `static_files_dir`:
 {workflow_dir?:/}{static_files_dir}/{file_name_base}.{file_extension}
 ```
 
-If `workflow_dir` is available, the static files go into a subdirectory of the workflow folder. If not, the `{workflow_dir?:/}` block is omitted and the path becomes workspace-relative.
+The static files go into a subdirectory of the workflow's folder. With no workflow, saving a static file fails. The bundle that the Help menu's "Troubleshooting Info" item collects does not use this situation: it always goes to the workspace's `staticfiles` folder.
 
 ### Unsaved workflows
 

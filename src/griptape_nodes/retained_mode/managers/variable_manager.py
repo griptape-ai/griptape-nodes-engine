@@ -280,8 +280,8 @@ class VariablesManager(EngineScoped):
             try:
                 return project_manager.resolve_project_variable(name, project_id=effective, workflow=workflow)
             except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
-                # Computed name exists but its context isn't ready (e.g. {workflow_dir} with no
-                # workflow in context, or a directory macro that can't resolve). Silent-skip,
+                # Computed name exists but can't resolve right now (e.g. a directory macro that
+                # can't resolve, or {project_name}, which is not implemented). Silent-skip,
                 # no stored-layer fallback — the name is defined, just unavailable right now.
                 logger.debug("Computed project variable %r unavailable: %s", name, e)
                 return None

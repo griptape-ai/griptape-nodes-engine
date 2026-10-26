@@ -44,11 +44,13 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectResultFailure,
     AttemptMapAbsolutePathToProjectResultSuccess,
     AttemptMatchPathAgainstMacroRequest,
+    AttemptMatchPathAgainstMacroResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
+    GetStateForMacroResultSuccess,
     MacroPath,
 )
 from griptape_nodes.retained_mode.events.static_file_events import (
@@ -210,7 +212,7 @@ class TestNoWorkflowFailsRatherThanMovingThePath:
 
         assert isinstance(result, GetPathForMacroResultFailure)
         assert str(result.result_details).startswith(f"Attempted to resolve '{template}'. Failed because ")
-        assert str(result.result_details).endswith("uses {workflow_dir} and no workflow is open.")
+        assert str(result.result_details).endswith("uses {workflow_dir} and the request has no workflow.")
 
     def test_get_path_for_macro_without_a_workflow_builtin_still_resolves(self, nothing_open: Engine) -> None:
         result = nothing_open.handle_request(
@@ -225,14 +227,65 @@ class TestNoWorkflowFailsRatherThanMovingThePath:
         )
 
         assert isinstance(result, AttemptMapAbsolutePathToProjectResultFailure)
-        assert "uses {workflow_dir} and no workflow is open" in str(result.result_details)
+        assert "uses {workflow_dir} and the request has no workflow" in str(result.result_details)
 
-    def test_get_state_for_macro_fails_with_nothing_open(self, nothing_open: Engine) -> None:
-        result = nothing_open.handle_request(
-            GetStateForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}img.png"), variables={})
-        )
+    @pytest.mark.parametrize("template", ["{workflow_dir?:/}img.png", "{outputs}/img.png"])
+    def test_get_state_for_macro_fails_with_nothing_open(self, nothing_open: Engine, template: str) -> None:
+        """A directory under the workflow's folder can no more resolve than `{workflow_dir}` itself."""
+        result = nothing_open.handle_request(GetStateForMacroRequest(parsed_macro=ParsedMacro(template), variables={}))
 
         assert isinstance(result, GetStateForMacroResultFailure)
+        assert "uses {workflow_dir} and the request has no workflow" in str(result.result_details)
+
+    def test_get_state_for_macro_reports_a_directory_resolvable_for_a_workflow(
+        self, nothing_open: Engine, tmp_path: Path
+    ) -> None:
+        workflow = push_unsaved_workflow(nothing_open, working_directory=str(tmp_path))
+
+        result = nothing_open.handle_request(
+            GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}),
+            workflow_id=workflow.workflow_id,
+        )
+
+        assert isinstance(result, GetStateForMacroResultSuccess), result.result_details
+        assert result.can_resolve
+
+
+class TestCallerSuppliedWorkflowValuesWin:
+    """A caller that supplies `{workflow_dir}` itself needs no workflow to answer it."""
+
+    @pytest.mark.parametrize("template", ["{workflow_dir}/img.png", "{workflow_dir?:/}img.png"])
+    def test_get_path_for_macro_uses_the_callers_workflow_dir(
+        self, nothing_open: Engine, tmp_path: Path, template: str
+    ) -> None:
+        result = nothing_open.handle_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro(template), variables={"workflow_dir": str(tmp_path)})
+        )
+
+        assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
+        assert result.absolute_path == _folder(tmp_path / "img.png")
+
+    def test_attempt_match_uses_the_callers_workflow_dir(self, nothing_open: Engine) -> None:
+        result = nothing_open.handle_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{workflow_dir}/outputs/{file_name}.png"),
+                file_path="/shows/my_show/outputs/hero.png",
+                known_variables={"workflow_dir": "/shows/my_show"},
+            )
+        )
+
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess), result.result_details
+        assert result.extracted_variables == {"workflow_dir": "/shows/my_show", "file_name": "hero"}
+
+    def test_get_state_for_macro_counts_the_callers_workflow_dir(self, nothing_open: Engine) -> None:
+        result = nothing_open.handle_request(
+            GetStateForMacroRequest(
+                parsed_macro=ParsedMacro("{workflow_dir}/img.png"), variables={"workflow_dir": "/shows/my_show"}
+            )
+        )
+
+        assert isinstance(result, GetStateForMacroResultSuccess), result.result_details
+        assert result.can_resolve
 
 
 class TestAWorkerResolvesThroughItsMirror:
@@ -256,7 +309,7 @@ class TestAWorkerResolvesThroughItsMirror:
             )
 
         assert isinstance(result, GetPathForMacroResultFailure)
-        assert "no workflow is open" in str(result.result_details)
+        assert "the request has no workflow" in str(result.result_details)
 
     def test_a_workflow_and_a_mirror_together_are_refused(self, nothing_open: Engine, tmp_path: Path) -> None:
         workflow_file = tmp_path / "w.py"
@@ -312,7 +365,7 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         )
 
         assert isinstance(result, WriteFileResultFailure)
-        assert "uses {workflow_dir} and no workflow is open" in str(result.result_details)
+        assert "uses {workflow_dir} and the request has no workflow" in str(result.result_details)
 
     def test_resolve_macro_path_fails_with_nothing_open(self, nothing_open: Engine) -> None:
         result = nothing_open.handle_request(
