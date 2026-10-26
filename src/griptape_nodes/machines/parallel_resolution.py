@@ -730,7 +730,7 @@ class ExecuteDagState(State):
             node_reference.node_reference.parameter_output_values.silent_clear()
             # Stops the node's input checks probing videos, which blocks this loop, after a few seconds,
             # and reads each input once for its declared validators and its own checks together.
-            unchecked: dict[str, str] = {}
+            unchecked: list[tuple[str, str]] = []
             with input_check_budget(), input_check_readings():
                 exceptions: list[Exception] = [
                     *run_pre_run_validators(node_reference.node_reference, unchecked=unchecked)
@@ -738,8 +738,8 @@ class ExecuteDagState(State):
                 exceptions.extend(node_reference.node_reference.validate_before_node_run() or [])
                 # The node's own checks can probe files directly; name any of those that timed out too.
                 unchecked_inputs = [
-                    *unchecked.values(),
-                    *unchecked_locations_by_name(timed_out_locations(), unchecked),
+                    *(subject for _, subject in unchecked),
+                    *unchecked_locations_by_name(timed_out_locations(), {location for location, _ in unchecked}),
                 ]
             if unchecked_inputs:
                 await ExecuteDagState._report_unchecked_inputs(

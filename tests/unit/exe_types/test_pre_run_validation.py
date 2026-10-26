@@ -597,8 +597,8 @@ class TestUncheckedInputs:
         return str(clip)
 
     @staticmethod
-    def _unchecked(node: BaseNode) -> tuple[list[NodeError], dict[str, str]]:
-        unchecked: dict[str, str] = {}
+    def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[tuple[str, str]]]:
+        unchecked: list[tuple[str, str]] = []
         with input_check_readings():
             errors = run_pre_run_validators(node, unchecked=unchecked)
         return errors, unchecked
@@ -607,7 +607,7 @@ class TestUncheckedInputs:
         clip = self._clip(tmp_path)
         node = _node_with(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("video", clip)
-        assert self._unchecked(node) == ([], {clip: "The video in 'Video'"})
+        assert self._unchecked(node) == ([], [(clip, "The video in 'Video'")])
 
     def test_still_reports_what_it_could_read(self, tmp_path: Path) -> None:
         clip = self._clip(tmp_path)
@@ -616,7 +616,7 @@ class TestUncheckedInputs:
         errors, unchecked = self._unchecked(node)
         (message,) = _messages(errors)
         assert message.startswith("The video in 'video' is")
-        assert unchecked == {clip: "The video in 'video'"}
+        assert unchecked == [(clip, "The video in 'video'")]
 
     def test_names_each_list_item_by_its_position(self, tmp_path: Path) -> None:
         first, second = self._clip(tmp_path, "a.mp4"), self._clip(tmp_path, "b.mp4")
@@ -632,15 +632,25 @@ class TestUncheckedInputs:
             )
         )
         node.set_parameter_value("clips", [first, second])
-        assert self._unchecked(node)[1] == {
-            first: "Video 1 in 'Reference Videos'",
-            second: "Video 2 in 'Reference Videos'",
-        }
+        assert self._unchecked(node)[1] == [
+            (first, "Video 1 in 'Reference Videos'"),
+            (second, "Video 2 in 'Reference Videos'"),
+        ]
+
+    def test_names_both_inputs_that_hold_the_same_file(self, tmp_path: Path) -> None:
+        clip = self._clip(tmp_path)
+        node = _node_with(
+            ParameterVideo(name="start", display_name="Start", pre_run_validators=[Duration(max=5)]),
+            ParameterVideo(name="end", display_name="End", pre_run_validators=[Duration(max=5)]),
+        )
+        node.set_parameter_value("start", clip)
+        node.set_parameter_value("end", clip)
+        assert self._unchecked(node)[1] == [(clip, "The video in 'Start'"), (clip, "The video in 'End'")]
 
     def test_names_nothing_when_only_the_size_is_read(self, tmp_path: Path) -> None:
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(10_000)]))
         node.set_parameter_value("video", self._clip(tmp_path))
-        assert self._unchecked(node) == ([], {})
+        assert self._unchecked(node) == ([], [])
 
     def test_names_nothing_for_an_input_read_in_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -650,7 +660,7 @@ class TestUncheckedInputs:
         )
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("video", self._clip(tmp_path))
-        assert self._unchecked(node) == ([], {})
+        assert self._unchecked(node) == ([], [])
 
 
 class TestUncheckedLocationsByName:
@@ -659,6 +669,13 @@ class TestUncheckedLocationsByName:
 
     def test_names_nothing_when_every_file_is_covered(self) -> None:
         assert unchecked_locations_by_name({"/clips/a.mp4"}, {"/clips/a.mp4"}) == []
+
+    def test_shows_only_a_windows_paths_file_name(self) -> None:
+        assert unchecked_locations_by_name({r"C:\Users\artist\Videos\clip.mp4"}, set()) == ["'clip.mp4'"]
+
+    def test_drops_a_urls_cachebuster(self) -> None:
+        location = "http://localhost:8124/workspace/staticfiles/clip.mp4?v=1730000000"
+        assert unchecked_locations_by_name({location}, set()) == ["'clip.mp4'"]
 
 
 class TestUncheckedInputsMessage:
