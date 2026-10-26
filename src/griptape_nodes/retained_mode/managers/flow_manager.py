@@ -1362,22 +1362,6 @@ class FlowManager(EngineScoped):
 
             return DeleteConnectionResultFailure(result_details=details)
 
-        # Check if either node is in a NodeGroup and untrack connections BEFORE removing connection
-
-        # Find the connection before it's deleted
-        if (
-            source_node.name in self._connections.outgoing_index
-            and source_param.name in self._connections.outgoing_index[source_node.name]
-        ):
-            connection_ids = self._connections.outgoing_index[source_node.name][source_param.name]
-            for candidate_id in connection_ids:
-                candidate = self._connections.connections[candidate_id]
-                if (
-                    candidate.target_node.name == target_node.name
-                    and candidate.target_parameter.name == target_param.name
-                ):
-                    break
-
         # Remove the connection.
         if not self._connections.remove_connection(
             source_node=source_node.name,
