@@ -109,5 +109,9 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
         await machine.cancel_all_nodes()
 
         assert flag.is_set(), "a cancel arriving after dispatch must still reach the node it is meant to stop"
+        # A worker running the node is told to stop through the workflow the run belongs to.
+        machine.context.engine.node_manager.cancel_worker_execution.assert_any_await(
+            machine.context.workflow, "running_then_cancelled"
+        )
 
         await let_the_run_finish(driver, release, held_node_execution)
