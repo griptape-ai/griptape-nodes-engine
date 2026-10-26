@@ -4,7 +4,7 @@ import json
 import logging
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import semver
 from pydantic import BaseModel, ValidationError
@@ -107,11 +107,15 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
 from griptape_nodes.utils.file_utils import mtimes_match
 from griptape_nodes.utils.keyed_mutex import KeyedMutex
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -392,21 +396,22 @@ class ArtifactManager(EngineScoped):
             )
             raise RuntimeError(error_message)
 
-    @handles(GeneratePreviewRequest)
+    @handles(GeneratePreviewRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_handle_generate_preview_request(  # noqa: PLR0911, C901, PLR0912, PLR0915
-        self, request: GeneratePreviewRequest
+        self, request: GeneratePreviewRequest, workflow: "WorkflowRuntime | None" = None
     ) -> GeneratePreviewResultSuccess | GeneratePreviewResultFailure:
         """Handle generate preview request.
 
         Args:
             request: Contains macro_path, artifact_provider_name, format (optional), preview_generator_name (optional)
+            workflow: The workflow the source macro and the preview folder resolve for, or None
 
         Returns:
             Success or failure result
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = self.engine.handle_request(resolve_request)
+        resolve_result = self.engine.os_manager.resolve_macro_path_in(workflow, resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GeneratePreviewResultFailure(
@@ -487,7 +492,7 @@ class ArtifactManager(EngineScoped):
         # FAILURE CASE: Resolve preview path using project situation template
         source_path_obj = Path(source_path)
         try:
-            resolved_path = self._resolve_preview_path(source_path, preview_format)
+            resolved_path = self._resolve_preview_path(source_path, preview_format, workflow)
         except Exception as e:
             return GeneratePreviewResultFailure(
                 result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {e}"
@@ -642,9 +647,9 @@ class ArtifactManager(EngineScoped):
 
         return GeneratePreviewResultSuccess(result_details=result_message, paths_to_preview=paths_to_preview)
 
-    @handles(GeneratePreviewFromDefaultsRequest)
+    @handles(GeneratePreviewFromDefaultsRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_handle_generate_preview_from_defaults_request(
-        self, request: GeneratePreviewFromDefaultsRequest
+        self, request: GeneratePreviewFromDefaultsRequest, workflow: "WorkflowRuntime | None" = None
     ) -> GeneratePreviewFromDefaultsResultSuccess | GeneratePreviewFromDefaultsResultFailure:
         """Handle generate preview request using config defaults.
 
@@ -653,6 +658,7 @@ class ArtifactManager(EngineScoped):
 
         Args:
             request: Contains macro_path and artifact_provider_name
+            workflow: The workflow the source macro and the preview folder resolve for, or None
 
         Returns:
             Success or failure result
@@ -690,7 +696,7 @@ class ArtifactManager(EngineScoped):
             generate_preview_metadata_json=True,
         )
 
-        result = await self.on_handle_generate_preview_request(generate_request)
+        result = await self.on_handle_generate_preview_request(generate_request, workflow)
 
         # FAILURE CASE: Delegation/validation failed
         if isinstance(result, GeneratePreviewResultFailure):
@@ -701,21 +707,34 @@ class ArtifactManager(EngineScoped):
             result_details=result.result_details, paths_to_preview=result.paths_to_preview
         )
 
-    @handles(GetPreviewForArtifactRequest)
+    async def get_preview_for_artifact_in(
+        self, workflow: "WorkflowRuntime | None", request: GetPreviewForArtifactRequest
+    ) -> "ResultPayload":
+        """Answer `request` for `workflow`, for a handler that holds the workflow it resolves for, or None.
+
+        A held workflow gets the request addressed to it. None is answered here with no workflow:
+        dispatch would hand an unaddressed request whichever workflow it finds open.
+        """
+        if workflow is None:
+            return await self.on_handle_get_preview_for_artifact_request(request)
+        return await workflow.ahandle_request(request)
+
+    @handles(GetPreviewForArtifactRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_handle_get_preview_for_artifact_request(
-        self, request: GetPreviewForArtifactRequest
+        self, request: GetPreviewForArtifactRequest, workflow: "WorkflowRuntime | None" = None
     ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
         """Handle get preview for artifact request with policy-based generation.
 
         Args:
             request: Contains macro_path, artifact_provider_name, and preview_generation_policy
+            workflow: The workflow the source macro and the preview folder resolve for, or None
 
         Returns:
             Success with path_to_preview string, or failure with details
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = self.engine.handle_request(resolve_request)
+        resolve_result = self.engine.os_manager.resolve_macro_path_in(workflow, resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -732,10 +751,10 @@ class ArtifactManager(EngineScoped):
         # metadata and return the cached preview instead of regenerating again.
         lock_key = str(canonicalize_for_identity(source_path))
         async with self._preview_mutex.locked(lock_key):
-            return await self._get_preview_for_artifact_locked(request, source_path)
+            return await self._get_preview_for_artifact_locked(request, source_path, workflow)
 
     async def _get_preview_for_artifact_locked(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, request: GetPreviewForArtifactRequest, source_path: str
+        self, request: GetPreviewForArtifactRequest, source_path: str, workflow: "WorkflowRuntime | None"
     ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
         """Look up, validate, and (per policy) regenerate a preview for one source.
 
@@ -745,6 +764,7 @@ class ArtifactManager(EngineScoped):
         Args:
             request: Contains macro_path, artifact_provider_name, and preview_generation_policy
             source_path: The macro-resolved absolute path of the source artifact
+            workflow: The workflow the preview folder resolves for, or None
 
         Returns:
             Success with path_to_preview string, or failure with details
@@ -780,7 +800,7 @@ class ArtifactManager(EngineScoped):
 
         # FAILURE CASE: Calculate metadata path using same logic as preview path (metadata uses .json extension)
         try:
-            resolved_path = self._resolve_preview_path(source_path, "json")
+            resolved_path = self._resolve_preview_path(source_path, "json", workflow)
         except Exception as e:
             return GetPreviewForArtifactResultFailure(
                 result_details=f"Attempted to get preview for '{source_path}'. Failed due to: {e}"
@@ -815,7 +835,9 @@ class ArtifactManager(EngineScoped):
                         macro_path=request.macro_path,
                         artifact_provider_name=request.artifact_provider_name,
                     )
-                    generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
+                    generate_result = await self.on_handle_generate_preview_from_defaults_request(
+                        generate_request, workflow
+                    )
 
                     if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
                         _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
@@ -969,7 +991,7 @@ class ArtifactManager(EngineScoped):
                 macro_path=request.macro_path,
                 artifact_provider_name=request.artifact_provider_name,
             )
-            generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
+            generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request, workflow)
 
             if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
                 _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
@@ -998,7 +1020,7 @@ class ArtifactManager(EngineScoped):
             artifact_metadata=metadata.artifact_metadata,
         )
 
-    @handles(CheckArtifactReadPermissionRequest)
+    @handles(CheckArtifactReadPermissionRequest, scope=RequestScope.HOST)
     def on_check_artifact_read_permission_request(
         self, request: CheckArtifactReadPermissionRequest
     ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
@@ -1023,7 +1045,7 @@ class ArtifactManager(EngineScoped):
             result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
         )
 
-    @handles(ListArtifactProvidersRequest)
+    @handles(ListArtifactProvidersRequest, scope=RequestScope.HOST)
     def on_handle_list_artifact_providers_request(
         self, _request: ListArtifactProvidersRequest
     ) -> ListArtifactProvidersResultSuccess | ListArtifactProvidersResultFailure:
@@ -1036,7 +1058,7 @@ class ArtifactManager(EngineScoped):
             result_details="Successfully listed artifact providers", friendly_names=friendly_names
         )
 
-    @handles(GetArtifactProviderDetailsRequest)
+    @handles(GetArtifactProviderDetailsRequest, scope=RequestScope.HOST)
     def on_handle_get_artifact_provider_details_request(
         self, request: GetArtifactProviderDetailsRequest
     ) -> GetArtifactProviderDetailsResultSuccess | GetArtifactProviderDetailsResultFailure:
@@ -1060,7 +1082,7 @@ class ArtifactManager(EngineScoped):
             registered_preview_generators=preview_generator_names,
         )
 
-    @handles(RegisterArtifactProviderRequest)
+    @handles(RegisterArtifactProviderRequest, scope=RequestScope.HOST)
     def on_handle_register_artifact_provider_request(
         self, request: RegisterArtifactProviderRequest
     ) -> RegisterArtifactProviderResultSuccess | RegisterArtifactProviderResultFailure:
@@ -1087,7 +1109,7 @@ class ArtifactManager(EngineScoped):
         # NOTE: Provider is NOT instantiated here - lazy instantiation happens on first use
         return RegisterArtifactProviderResultSuccess(result_details="Artifact provider registered successfully")
 
-    @handles(RegisterPreviewGeneratorRequest)
+    @handles(RegisterPreviewGeneratorRequest, scope=RequestScope.HOST)
     def on_handle_register_preview_generator_request(
         self, request: RegisterPreviewGeneratorRequest
     ) -> RegisterPreviewGeneratorResultSuccess | RegisterPreviewGeneratorResultFailure:
@@ -1126,7 +1148,7 @@ class ArtifactManager(EngineScoped):
             result_details=f"Preview generator '{generator_name}' registered successfully"
         )
 
-    @handles(ListPreviewGeneratorsRequest)
+    @handles(ListPreviewGeneratorsRequest, scope=RequestScope.HOST)
     def on_handle_list_preview_generators_request(
         self, request: ListPreviewGeneratorsRequest
     ) -> ListPreviewGeneratorsResultSuccess | ListPreviewGeneratorsResultFailure:
@@ -1154,7 +1176,7 @@ class ArtifactManager(EngineScoped):
             preview_generator_names=preview_generator_names,
         )
 
-    @handles(GetPreviewGeneratorDetailsRequest)
+    @handles(GetPreviewGeneratorDetailsRequest, scope=RequestScope.HOST)
     def on_handle_get_preview_generator_details_request(
         self, request: GetPreviewGeneratorDetailsRequest
     ) -> GetPreviewGeneratorDetailsResultSuccess | GetPreviewGeneratorDetailsResultFailure:
@@ -1212,7 +1234,7 @@ class ArtifactManager(EngineScoped):
             parameters=parameters_dict,
         )
 
-    @handles(GetArtifactSchemasRequest)
+    @handles(GetArtifactSchemasRequest, scope=RequestScope.HOST)
     def on_handle_get_artifact_schemas_request(
         self,
         request: GetArtifactSchemasRequest,  # noqa: ARG002
@@ -1674,6 +1696,7 @@ class ArtifactManager(EngineScoped):
         self,
         source_path: str,
         preview_format: str,
+        workflow: "WorkflowRuntime | None",
     ) -> ResolvedPreviewPath:
         """Resolve preview path using project situation template.
 
@@ -1684,6 +1707,7 @@ class ArtifactManager(EngineScoped):
         Args:
             source_path: Absolute path to source file
             preview_format: Preview file extension (e.g., "webp", "json")
+            workflow: The workflow the preview folder's `{workflow_dir}` resolves for, or None
 
         Returns:
             ResolvedPreviewPath with destination_dir and file_name
@@ -1730,7 +1754,7 @@ class ArtifactManager(EngineScoped):
             parsed_macro=parsed_macro,
             variables=variables,
         )
-        path_result = self.engine.handle_request(path_request)
+        path_result = self.engine.project_manager.get_path_for_macro_in(workflow, path_request)
 
         if not isinstance(path_result, GetPathForMacroResultSuccess):
             msg = f"Failed to resolve preview path macro: {path_result.result_details}"

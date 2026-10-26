@@ -61,7 +61,7 @@ class TestWriteSidecarFailurePaths:
         mock_engine.handle_request.return_value = GetCurrentProjectResultFailure(result_details="no project")
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            write_sidecar(file_path, metadata, mock_engine)
+            write_sidecar(file_path, metadata, mock_engine, None)
 
         assert "Failed to write sidecar metadata" in caplog.text
         assert "output.txt" in caplog.text
@@ -92,9 +92,12 @@ class TestWriteSidecarFailurePaths:
 
         mock_engine = Mock()
         mock_engine.handle_request.side_effect = handle_request
+        mock_engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: handle_request(
+            request
+        )
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            write_sidecar(file_path, metadata, mock_engine)
+            write_sidecar(file_path, metadata, mock_engine, None)
 
         assert "Failed to write sidecar metadata" in caplog.text
 
@@ -144,9 +147,12 @@ class TestWriteSidecarFailurePaths:
 
         mock_engine = Mock()
         mock_engine.handle_request.side_effect = handle_request
+        mock_engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: handle_request(
+            request
+        )
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            write_sidecar(file_path, metadata, mock_engine)
+            write_sidecar(file_path, metadata, mock_engine, None)
 
         assert "Failed to write sidecar metadata" in caplog.text
 
@@ -197,9 +203,12 @@ class TestWriteSidecarFailurePaths:
 
         mock_engine = Mock()
         mock_engine.handle_request.side_effect = handle_request
+        mock_engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: handle_request(
+            request
+        )
         mock_engine.context_manager.has_current_workflow.return_value = False
 
-        write_sidecar(file_path, None, mock_engine)
+        write_sidecar(file_path, None, mock_engine, None)
 
         assert sidecar_path.exists()
         data = json.loads(sidecar_path.read_text())

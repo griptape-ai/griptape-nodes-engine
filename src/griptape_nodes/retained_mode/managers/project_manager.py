@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -1633,6 +1634,16 @@ class ProjectManager(EngineScoped):
     ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
         """Resolve the request's macro for `workflow`, which `{workflow_dir}` and `{workflow_name}` need."""
         return self._resolve_path_for_macro(request, self._workflow_id_for_paths(workflow))
+
+    def get_path_for_macro_in(self, workflow: WorkflowRuntime | None, request: GetPathForMacroRequest) -> ResultPayload:
+        """Resolve `request` for `workflow`, for a handler that holds the workflow it resolves for, or None.
+
+        A held workflow gets the request addressed to it. None is resolved here with no workflow:
+        dispatch would hand an unaddressed request whichever workflow it finds open.
+        """
+        if workflow is None:
+            return self.on_get_path_for_macro_request(request)
+        return workflow.handle_request(request)
 
     def _resolve_path_for_macro(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: GetPathForMacroRequest, workflow_id: str | None

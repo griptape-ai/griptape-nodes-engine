@@ -3,7 +3,7 @@ import os
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, patch
 
 import anyio
@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     GeneratePreviewFromDefaultsRequest,
@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils import ffmpeg_cache
 from tests.workflow_context import unsaved_workflow_open
 
@@ -82,15 +83,20 @@ def mock_config_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     # Store the original handle_request method
     original_handle_request = Engine.handle_request
 
-    def selective_mock(self: Engine, request: RequestPayload) -> ResultPayload:
+    def selective_mock(self: Engine, request: RequestPayload, **kwargs: Any) -> ResultPayload:
         """Only mock SetConfigValueRequest, let all other requests through."""
         if isinstance(request, SetConfigValueRequest):
             # Mock config writes to prevent test pollution
             return SetConfigValueResultSuccess(result_details="Mocked config write")
         # Let all other requests go to the real handler
-        return original_handle_request(self, request)
+        return original_handle_request(self, request, **kwargs)
 
     monkeypatch.setattr(Engine, "handle_request", selective_mock)
+
+
+def _open_workflow() -> "WorkflowRuntime":
+    """The workflow `unsaved_workflow` opened, which these tests hand the preview handlers."""
+    return current_engine().open_workflows.sole_workflow()
 
 
 @pytest.fixture(autouse=True)
@@ -801,7 +807,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -832,7 +838,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -883,7 +889,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultFailure)
         assert "file not found" in str(result.result_details).lower()
@@ -906,7 +912,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultFailure)
         assert "provider" in str(result.result_details).lower() or "format" in str(result.result_details).lower()
@@ -924,7 +930,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 30, "max_height": 40},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -951,7 +957,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -980,7 +986,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -1002,7 +1008,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
 
@@ -1043,7 +1049,7 @@ class TestGeneratePreview:
             "attempt_generate_preview",
             new=AsyncMock(side_effect=RuntimeError("codec exploded")),
         ):
-            result = await artifact_manager.on_handle_generate_preview_request(request)
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultFailure)
         assert "codec exploded" in str(result.result_details)
@@ -1074,7 +1080,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
         with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_delete_source):
-            result = await artifact_manager.on_handle_generate_preview_request(request)
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
         assert generation_calls == 1
@@ -1107,7 +1113,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
         with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_mutate_source):
-            result = await artifact_manager.on_handle_generate_preview_request(request)
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
         assert generation_calls == 2  # noqa: PLR2004
@@ -1153,7 +1159,7 @@ class TestGeneratePreview:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
         with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_rewrite_same_size):
-            result = await artifact_manager.on_handle_generate_preview_request(request)
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
         assert generation_calls == 2  # noqa: PLR2004
@@ -1194,7 +1200,7 @@ class TestGeneratePreview:
             patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_always_mutating_source),
             caplog.at_level(logging.INFO, logger="griptape_nodes"),
         ):
-            result = await artifact_manager.on_handle_generate_preview_request(request)
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
 
         assert isinstance(result, GeneratePreviewResultSuccess)
         assert generation_calls == 2  # noqa: PLR2004
@@ -1284,7 +1290,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
         metadata_dir = anyio.Path(temp_dir / ".griptape-nodes-metadata")
@@ -1307,7 +1313,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
         nested_previews = anyio.Path(temp_dir / ".griptape-nodes-metadata" / ".griptape-nodes-previews")
@@ -1328,7 +1334,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = await artifact_manager.on_handle_generate_preview_request(request)
+        result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
         double_json_files = [f async for f in anyio.Path(temp_dir).rglob("*.json.json")]
@@ -1415,7 +1421,7 @@ class TestGetPreviewForArtifact:
             preview_generator_parameters={"max_width": 50, "max_height": 50},
         )
 
-        result = asyncio.run(artifact_manager.on_handle_generate_preview_request(request))
+        result = asyncio.run(artifact_manager.on_handle_generate_preview_request(request, _open_workflow()))
         assert isinstance(result, GeneratePreviewResultSuccess)
 
         # Return the actual preview path from the result
@@ -1432,7 +1438,7 @@ class TestGetPreviewForArtifact:
             artifact_provider_name="Image",
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
         assert result.paths_to_preview is not None
@@ -1453,7 +1459,7 @@ class TestGetPreviewForArtifact:
             artifact_provider_name="Image",
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "source file not found" in str(result.result_details).lower()
@@ -1471,7 +1477,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "metadata file not found" in str(result.result_details).lower()
@@ -1497,7 +1503,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "malformed" in str(result.result_details).lower() or "json" in str(result.result_details).lower()
@@ -1528,7 +1534,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "invalid metadata" in str(result.result_details).lower()
@@ -1553,7 +1559,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "stale" in str(result.result_details).lower() or "modified" in str(result.result_details).lower()
@@ -1578,7 +1584,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "stale" in str(result.result_details).lower() or "modified" in str(result.result_details).lower()
@@ -1601,7 +1607,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultFailure)
         assert "not found" in str(result.result_details).lower()
@@ -1619,7 +1625,7 @@ class TestGetPreviewForArtifact:
         )
 
         # Should not raise error (but will fail since no preview exists)
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
         assert isinstance(result, GetPreviewForArtifactResultFailure)
 
     @pytest.mark.usefixtures("generated_preview_with_metadata")
@@ -1642,7 +1648,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         # Should regenerate successfully
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
@@ -1660,7 +1666,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         # Should generate successfully
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
@@ -1681,7 +1687,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.ALWAYS,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         # Should regenerate successfully even though preview was fresh
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
@@ -1733,7 +1739,7 @@ class TestGetPreviewForArtifact:
             preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
         )
 
-        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request, _open_workflow()))
 
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
 
@@ -1759,10 +1765,10 @@ class TestGetPreviewForArtifact:
         generation_count = 0
         original_generate = artifact_manager.on_handle_generate_preview_from_defaults_request
 
-        async def counting_generate(request: GeneratePreviewFromDefaultsRequest) -> object:
+        async def counting_generate(request: GeneratePreviewFromDefaultsRequest, workflow: WorkflowRuntime) -> object:
             nonlocal generation_count
             generation_count += 1
-            return await original_generate(request)
+            return await original_generate(request, workflow)
 
         artifact_manager.on_handle_generate_preview_from_defaults_request = counting_generate  # type: ignore[method-assign]
 
@@ -1776,7 +1782,7 @@ class TestGetPreviewForArtifact:
                 for _ in range(5)
             ]
             return await asyncio.gather(
-                *(artifact_manager.on_handle_get_preview_for_artifact_request(r) for r in requests)
+                *(artifact_manager.on_handle_get_preview_for_artifact_request(r, _open_workflow()) for r in requests)
             )
 
         results = asyncio.run(fire_concurrent_requests())

@@ -7,6 +7,7 @@ Several tests open a second workflow beside the first and address it, so a handl
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -14,7 +15,25 @@ import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.files.path_utils import resolve_path_safely
+from griptape_nodes.retained_mode.events.artifact_events import (
+    GeneratePreviewFromDefaultsRequest,
+    GeneratePreviewRequest,
+    GetPreviewForArtifactRequest,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.os_events import (
+    GetNextVersionIndexRequest,
+    ListDirectoryRequest,
+    ListDirectoryResultSuccess,
+    ListDirectorySequencesRequest,
+    ResolveMacroPathRequest,
+    ResolveMacroPathResultFailure,
+    ScanSequencesRequest,
+    WriteFileRequest,
+    WriteFileResultFailure,
+    WriteFileResultSuccess,
+    WriteTempFileRequest,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultFailure,
@@ -25,8 +44,18 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroResultSuccess,
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
+    MacroPath,
 )
+from griptape_nodes.retained_mode.events.static_file_events import (
+    CreateStaticFileDownloadUrlFromPathRequest,
+    CreateStaticFileDownloadUrlRequest,
+    CreateStaticFileRequest,
+    CreateStaticFileUploadUrlRequest,
+)
+from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_scope, handled_request_types
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -34,7 +63,6 @@ from tests.workflow_context import as_worker_process, push_unsaved_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload
@@ -45,8 +73,22 @@ _OPTIONAL_WORKFLOW_REQUESTS: set[type[RequestPayload]] = {
     AttemptMatchPathAgainstMacroRequest,
     GetStateForMacroRequest,
     AttemptMapAbsolutePathToProjectRequest,
+    ListDirectoryRequest,
+    ListDirectorySequencesRequest,
+    ScanSequencesRequest,
+    GetNextVersionIndexRequest,
+    WriteFileRequest,
+    WriteTempFileRequest,
+    ResolveMacroPathRequest,
+    CreateStaticFileRequest,
+    CreateStaticFileUploadUrlRequest,
+    CreateStaticFileDownloadUrlRequest,
+    CreateStaticFileDownloadUrlFromPathRequest,
+    GeneratePreviewRequest,
+    GeneratePreviewFromDefaultsRequest,
+    GetPreviewForArtifactRequest,
 }
-_HANDLER_CLASSES: tuple[type, ...] = (ProjectManager,)
+_HANDLER_CLASSES: tuple[type, ...] = (ProjectManager, OSManager, StaticFilesManager, ArtifactManager)
 
 
 def _declared_scopes(handler_classes: tuple[type, ...]) -> dict[type[RequestPayload], RequestScope | None]:
@@ -211,3 +253,53 @@ class TestAWorkerResolvesThroughItsMirror:
                 project_manager.on_get_path_for_macro_request(
                     GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/x"), variables={}), workflow
                 )
+
+
+class TestFileHandlersResolveForTheDispatchedWorkflow:
+    """OS handlers resolve macro paths, and address the requests they send, to the workflow they are handed."""
+
+    def test_write_file_lands_in_the_addressed_workflows_outputs(self, nothing_open: Engine, tmp_path: Path) -> None:
+        push_unsaved_workflow(nothing_open, working_directory=str(tmp_path / "open"))
+
+        with _also_open(nothing_open, tmp_path / "addressed") as addressed:
+            result = nothing_open.handle_request(
+                WriteFileRequest(
+                    file_path=MacroPath(ParsedMacro("{outputs}/notes.txt"), {}), content="hello", create_parents=True
+                ),
+                workflow_id=addressed.workflow_id,
+            )
+
+        assert isinstance(result, WriteFileResultSuccess), result.result_details
+        assert Path(result.final_file_path) == _folder(tmp_path / "addressed" / "outputs" / "notes.txt")
+        assert not (tmp_path / "open" / "outputs").exists()
+
+    def test_list_directory_resolves_a_macro_for_the_addressed_workflow(
+        self, nothing_open: Engine, tmp_path: Path
+    ) -> None:
+        push_unsaved_workflow(nothing_open, working_directory=str(tmp_path / "open"))
+        (tmp_path / "addressed" / "outputs").mkdir(parents=True)
+        (tmp_path / "addressed" / "outputs" / "a.txt").write_text("a")
+
+        with _also_open(nothing_open, tmp_path / "addressed") as addressed:
+            result = nothing_open.handle_request(
+                ListDirectoryRequest(directory_path="{outputs}", workspace_only=False),
+                workflow_id=addressed.workflow_id,
+            )
+
+        assert isinstance(result, ListDirectoryResultSuccess), result.result_details
+        assert [entry.name for entry in result.entries] == ["a.txt"]
+
+    def test_write_file_to_a_macro_path_fails_with_nothing_open(self, nothing_open: Engine) -> None:
+        result = nothing_open.handle_request(
+            WriteFileRequest(file_path=MacroPath(ParsedMacro("{outputs}/notes.txt"), {}), content="hello")
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert "uses {workflow_dir} and no workflow is open" in str(result.result_details)
+
+    def test_resolve_macro_path_fails_with_nothing_open(self, nothing_open: Engine) -> None:
+        result = nothing_open.handle_request(
+            ResolveMacroPathRequest(macro_path=MacroPath(ParsedMacro("{workflow_dir?:/}img.png"), {}))
+        )
+
+        assert isinstance(result, ResolveMacroPathResultFailure)

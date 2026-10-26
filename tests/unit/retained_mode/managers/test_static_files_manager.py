@@ -22,6 +22,17 @@ TEST_FILE_NAME = "test_image.jpg"
 TEST_ALTERNATIVE_NAME = "test_image_1.jpg"
 
 
+def _route_resolution_through_dispatch(engine: Mock) -> Mock:
+    """Send the stand-in engine's resolve-for-a-workflow helpers through its dispatch, which the tests patch."""
+    engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: engine.handle_request(request)
+
+    async def get_preview(_workflow: object, request: object) -> object:
+        return await engine.ahandle_request(request)
+
+    engine.artifact_manager.get_preview_for_artifact_in.side_effect = get_preview
+    return engine
+
+
 class TestStaticFilesManagerSaveStaticFile:
     """Test StaticFilesManager.save_static_file() method with ExistingFilePolicy support."""
 
@@ -374,7 +385,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
                 config_manager=mock_config_manager,
                 secrets_manager=mock_secrets_manager,
                 event_manager=None,
-                engine=Mock(),
+                engine=_route_resolution_through_dispatch(Mock()),
             )
             manager.storage_driver = Mock()
             return manager
@@ -825,7 +836,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         registry = mock_static_files_manager.engine.artifact_manager._registry
         registry.get_provider_classes_by_format.return_value = []
 
-        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file, None)
 
         assert resolution.path_to_serve == source_file
         assert resolution.preview_failure_reason is None
@@ -1049,7 +1060,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+                config_manager=mock_config,
+                secrets_manager=Mock(),
+                event_manager=None,
+                engine=_route_resolution_through_dispatch(Mock()),
             )
         return manager
 
@@ -1097,7 +1111,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
         assert result is not None
         assert result.path == expected_relative_path
@@ -1119,7 +1133,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             ),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
         assert result is None
         assert "save_static_file" in caplog.text
@@ -1157,7 +1171,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             ),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
         assert result is None
         assert "save_static_file" in caplog.text
@@ -1206,7 +1220,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
         assert result is None
         assert "save_static_file" in caplog.text
@@ -1264,7 +1278,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
         assert result is not None
         assert result.path == Path("staticfiles/output.png")
@@ -1660,7 +1674,7 @@ class TestStaticFilesManagerWatchesMintedFiles:
         mock_config = Mock()
         mock_config.get_config_value.side_effect = lambda key, default=None, **_kwargs: config_values.get(key, default)
         mock_config.workspace_path = Path("/mock/workspace")
-        engine = Mock()
+        engine = _route_resolution_through_dispatch(Mock())
         engine.library_manager.is_worker = is_worker
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(

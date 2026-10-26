@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -98,7 +99,7 @@ class _SidecarDocument(BaseModel):
     parameters_omitted: list[str] | None = None
 
 
-def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
+def _resolve_sidecar_path(file_path: Path, engine: Engine, workflow: WorkflowRuntime | None) -> Path:
     """Resolve the sidecar path for a given file via the project template system.
 
     Uses the 'save_griptape_nodes_metadata' situation from the current project template to determine
@@ -108,6 +109,7 @@ def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
     Args:
         file_path: Absolute path to the saved file.
         engine: The engine whose request bus resolves the project and situation.
+        workflow: The workflow the sidecar path's `{workflow_dir}` resolves for, or None.
 
     Returns:
         Absolute path to the sidecar JSON file.
@@ -136,11 +138,12 @@ def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
 
     situation = get_situation_result.situation
     parsed_macro = ParsedMacro(situation.macro)
-    path_result = engine.handle_request(
+    path_result = engine.project_manager.get_path_for_macro_in(
+        workflow,
         GetPathForMacroRequest(
             parsed_macro=parsed_macro,
             variables=variables,
-        )
+        ),
     )
     if not isinstance(path_result, GetPathForMacroResultSuccess):
         msg = f"Failed to resolve sidecar path macro: {path_result.result_details}"
@@ -149,7 +152,9 @@ def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
     return path_result.absolute_path
 
 
-def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engine) -> None:
+def write_sidecar(
+    file_path: Path, metadata: SidecarContent | None, engine: Engine, workflow: WorkflowRuntime | None
+) -> None:
     """Write a sidecar JSON metadata file for the saved file.
 
     Resolves the sidecar path via the project template's 'save_griptape_nodes_metadata' situation,
@@ -161,9 +166,10 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engi
         file_path: Absolute path to the file that was just saved.
         metadata: Caller-provided situation and variable context (may be None).
         engine: The engine whose request bus resolves the sidecar path.
+        workflow: The workflow the sidecar path resolves for, or None.
     """
     try:
-        sidecar_path = _resolve_sidecar_path(file_path, engine)
+        sidecar_path = _resolve_sidecar_path(file_path, engine, workflow)
         provenance = collect_sidecar_provenance(engine)
         content = _SidecarDocument(
             situation=metadata.situation if metadata else None,

@@ -2260,7 +2260,7 @@ class TestGetNextVersionIndexRequest:
             macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/renders_v{###}"), variables={})
         )
         with unsaved_workflow_open(engine):
-            result = os_manager.on_get_next_version_index_request(request)
+            result = os_manager.on_get_next_version_index_request(request, engine.open_workflows.sole_workflow())
 
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 3  # noqa: PLR2004
