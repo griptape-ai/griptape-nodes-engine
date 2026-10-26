@@ -26,7 +26,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
 from griptape_nodes.utils.engine_dirs import engine_config_dir
 
@@ -148,7 +148,7 @@ class SecretsManager:
             if self.get_secret(secret_name, should_error_on_not_found=False) is None:
                 self.set_secret(secret_name, default_value)
 
-    @handles(GetSecretValueRequest)
+    @handles(GetSecretValueRequest, scope=RequestScope.HOST)
     def on_handle_get_secret_request(self, request: GetSecretValueRequest) -> ResultPayload:
         secret_key = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = self.get_secret(secret_key, should_error_on_not_found=request.should_error_on_not_found)
@@ -161,7 +161,7 @@ class SecretsManager:
             value=secret_value, result_details=f"Successfully retrieved secret value for key: {secret_key}"
         )
 
-    @handles(SetSecretValueRequest)
+    @handles(SetSecretValueRequest, scope=RequestScope.HOST)
     def on_handle_set_secret_request(self, request: SetSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = request.value
@@ -185,7 +185,7 @@ class SecretsManager:
 
         return SetSecretValueResultSuccess(result_details=f"Successfully set secret value for key: {secret_name}")
 
-    @handles(GetAllSecretValuesRequest)
+    @handles(GetAllSecretValuesRequest, scope=RequestScope.HOST)
     def on_handle_get_all_secret_values_request(self, request: GetAllSecretValuesRequest) -> ResultPayload:  # noqa: ARG002
         # An unreadable file fails; a missing one is a real "no secrets yet" and succeeds
         # empty, so callers replacing content with this result cannot delete credentials
@@ -203,7 +203,7 @@ class SecretsManager:
             values=secret_values, result_details=f"Successfully retrieved {len(secret_values)} secret values"
         )
 
-    @handles(DeleteSecretValueRequest)
+    @handles(DeleteSecretValueRequest, scope=RequestScope.HOST)
     def on_handle_delete_secret_value_request(self, request: DeleteSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
 

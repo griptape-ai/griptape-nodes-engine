@@ -97,6 +97,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
     WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
@@ -749,9 +750,11 @@ def register_broadcast_handlers(
             project_manager.record_adopted_generation(request.generation)
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
-    event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
-    event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
-    event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
+    event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config, scope=RequestScope.HOST)
+    event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets, scope=RequestScope.HOST)
+    event_manager.assign_manager_to_request_type(
+        ActivateProjectRequest, handle_activate_project, scope=RequestScope.HOST
+    )
 
     _register_local_object_handlers(event_manager)
 
@@ -764,9 +767,13 @@ def _register_local_object_handlers(event_manager: EventManager) -> None:
     async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)
 
-    event_manager.assign_manager_to_request_type(DropAllLocalObjectsRequest, handle_drop_all_local_objects)
+    event_manager.assign_manager_to_request_type(
+        DropAllLocalObjectsRequest, handle_drop_all_local_objects, scope=RequestScope.HOST
+    )
 
     async def handle_drop_local_objects(request: DropLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_local_objects(request, event_manager=event_manager)
 
-    event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)
+    event_manager.assign_manager_to_request_type(
+        DropLocalObjectsRequest, handle_drop_local_objects, scope=RequestScope.HOST
+    )

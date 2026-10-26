@@ -24,7 +24,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.git_utils import (
     is_git_url,
 )
@@ -46,7 +46,7 @@ class LibrarySync(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(SyncLibrariesRequest)
+    @handles(SyncLibrariesRequest, scope=RequestScope.HOST)
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
         managed = self.engine.library_manager.managed_environment

@@ -65,7 +65,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
     LibraryRegistration,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.git_utils import (
     extract_repo_name_from_url,
@@ -389,7 +389,7 @@ class LibraryDiscovery(EngineScoped):
             problems=problems,
         )
 
-    @handles(LoadLibrariesRequest)
+    @handles(LoadLibrariesRequest, scope=RequestScope.HOST)
     async def load_libraries_request(self, request: LoadLibrariesRequest) -> ResultPayload:  # noqa: ARG002, C901, PLR0912
         """Load all libraries from configuration (backward compatibility wrapper).
 

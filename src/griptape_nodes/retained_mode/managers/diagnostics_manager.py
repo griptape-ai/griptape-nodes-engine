@@ -92,7 +92,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     SECRETS_TO_REGISTER_KEY,
     SESSION_LOG_BUFFER_LINES_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
 from griptape_nodes.utils.version_utils import get_install_source
 
@@ -175,7 +175,7 @@ class DiagnosticsManager(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(GetDiagnosticsReportRequest)
+    @handles(GetDiagnosticsReportRequest, scope=RequestScope.HOST)
     async def on_get_diagnostics_report_request(
         self, request: GetDiagnosticsReportRequest
     ) -> GetDiagnosticsReportResultSuccess | GetDiagnosticsReportResultFailure:
@@ -201,7 +201,7 @@ class DiagnosticsManager(EngineScoped):
             ),
         )
 
-    @handles(RunHealthChecksRequest)
+    @handles(RunHealthChecksRequest, scope=RequestScope.HOST)
     async def on_run_health_checks_request(
         self,
         request: RunHealthChecksRequest,  # noqa: ARG002 - the checks take no options yet

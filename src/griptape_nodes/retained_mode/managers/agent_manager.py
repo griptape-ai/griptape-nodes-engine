@@ -161,7 +161,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
@@ -589,14 +589,14 @@ class AgentManager(EngineScoped):
             self._load_providers_from_config()
             self._runner_cache.clear()
 
-    @handles(RunAgentRequest)
+    @handles(RunAgentRequest, scope=RequestScope.HOST)
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
         try:
             return await self._run_agent(request)
         except Exception as e:
             return self._agent_run_failure(e, request.provider_name)
 
-    @handles(ResolveToolApprovalsRequest)
+    @handles(ResolveToolApprovalsRequest, scope=RequestScope.HOST)
     async def on_handle_resolve_tool_approvals_request(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
         try:
             return await self._resolve_tool_approvals(request)
@@ -901,7 +901,7 @@ class AgentManager(EngineScoped):
             result_details=result_details,
         )
 
-    @handles(ClearToolGrantsRequest)
+    @handles(ClearToolGrantsRequest, scope=RequestScope.HOST)
     def on_handle_clear_tool_grants_request(self, request: ClearToolGrantsRequest) -> ResultPayload:
         if not self._thread_storage.thread_exists(request.thread_id):
             details = f"Attempted to forget the approvals given in conversation {request.thread_id}. Failed because the conversation does not exist."
@@ -917,7 +917,7 @@ class AgentManager(EngineScoped):
             result_details=f"Cleared the approvals given in conversation {request.thread_id}.",
         )
 
-    @handles(CancelAgentRequest)
+    @handles(CancelAgentRequest, scope=RequestScope.HOST)
     def on_handle_cancel_agent_request(self, request: CancelAgentRequest) -> ResultPayload:
         """Signal cooperative cancellation to the in-flight run for a thread.
 
@@ -946,7 +946,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return CancelAgentResultFailure(result_details=details)
 
-    @handles(CreateThreadRequest)
+    @handles(CreateThreadRequest, scope=RequestScope.HOST)
     def on_handle_create_thread_request(self, request: CreateThreadRequest) -> ResultPayload:
         try:
             thread_id, meta = self._thread_storage.create_thread(title=request.title, local_id=request.local_id)
@@ -962,7 +962,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return CreateThreadResultFailure(result_details=details)
 
-    @handles(GetThreadMetadataRequest)
+    @handles(GetThreadMetadataRequest, scope=RequestScope.HOST)
     def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
@@ -978,7 +978,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return GetThreadMetadataResultFailure(result_details=details)
 
-    @handles(ListThreadsRequest)
+    @handles(ListThreadsRequest, scope=RequestScope.HOST)
     def on_handle_list_threads_request(self, _: ListThreadsRequest) -> ResultPayload:
         try:
             threads = self._thread_storage.list_threads()
@@ -988,7 +988,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return ListThreadsResultFailure(result_details=details)
 
-    @handles(DeleteThreadRequest)
+    @handles(DeleteThreadRequest, scope=RequestScope.HOST)
     def on_handle_delete_thread_request(self, request: DeleteThreadRequest) -> ResultPayload:
         try:
             self._thread_storage.delete_thread(request.thread_id)
@@ -1001,7 +1001,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return DeleteThreadResultFailure(result_details=details)
 
-    @handles(RenameThreadRequest)
+    @handles(RenameThreadRequest, scope=RequestScope.HOST)
     def on_handle_rename_thread_request(self, request: RenameThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
@@ -1020,7 +1020,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return RenameThreadResultFailure(result_details=details)
 
-    @handles(ArchiveThreadRequest)
+    @handles(ArchiveThreadRequest, scope=RequestScope.HOST)
     def on_handle_archive_thread_request(self, request: ArchiveThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
@@ -1042,7 +1042,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return ArchiveThreadResultFailure(result_details=details)
 
-    @handles(UnarchiveThreadRequest)
+    @handles(UnarchiveThreadRequest, scope=RequestScope.HOST)
     def on_handle_unarchive_thread_request(self, request: UnarchiveThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
@@ -1064,7 +1064,7 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return UnarchiveThreadResultFailure(result_details=details)
 
-    @handles(ConfigureAgentRequest)
+    @handles(ConfigureAgentRequest, scope=RequestScope.HOST)
     def on_handle_configure_agent_request(self, request: ConfigureAgentRequest) -> ResultPayload:
         """Update agent configuration from the chat sidebar.
 
@@ -1118,7 +1118,7 @@ class AgentManager(EngineScoped):
             changed = True
         return changed
 
-    @handles(ListAgentModelsRequest)
+    @handles(ListAgentModelsRequest, scope=RequestScope.HOST)
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
         return ListAgentModelsResultSuccess(
             prompt_models=list(MODEL_CHOICES),
@@ -1128,7 +1128,7 @@ class AgentManager(EngineScoped):
             result_details="Agent model lists retrieved successfully.",
         )
 
-    @handles(GetAgentConfigRequest)
+    @handles(GetAgentConfigRequest, scope=RequestScope.HOST)
     def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
         gc = self._get_provider(None)
         return GetAgentConfigResultSuccess(
@@ -1140,7 +1140,7 @@ class AgentManager(EngineScoped):
             result_details="Agent config retrieved successfully.",
         )
 
-    @handles(ListProviderModelsRequest)
+    @handles(ListProviderModelsRequest, scope=RequestScope.HOST)
     async def on_handle_list_provider_models_request(self, request: ListProviderModelsRequest) -> ResultPayload:
         try:
             if request.provider == ProviderID.GRIPTAPE_CLOUD:
@@ -1177,7 +1177,7 @@ class AgentManager(EngineScoped):
             details = friendly or f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             return ListProviderModelsResultFailure(result_details=details)
 
-    @handles(GetConversationMemoryRequest)
+    @handles(GetConversationMemoryRequest, scope=RequestScope.HOST)
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
         try:
             history = self._thread_storage.load_history(request.thread_id)
@@ -1301,7 +1301,7 @@ class AgentManager(EngineScoped):
         except OSError as e:
             logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
 
-    @handles(ListAgentProvidersRequest)
+    @handles(ListAgentProvidersRequest, scope=RequestScope.HOST)
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
             providers=list(self._providers),
@@ -1309,7 +1309,7 @@ class AgentManager(EngineScoped):
             result_details="Chat providers retrieved successfully.",
         )
 
-    @handles(CreateAgentProviderRequest)
+    @handles(CreateAgentProviderRequest, scope=RequestScope.HOST)
     def on_handle_create_agent_provider_request(self, request: CreateAgentProviderRequest) -> ResultPayload:
         pd = request.provider
         name = pd.name.strip()
@@ -1343,7 +1343,7 @@ class AgentManager(EngineScoped):
         self._runner_cache.clear()
         return CreateAgentProviderResultSuccess(name=name, result_details=f"Provider '{name}' created successfully.")
 
-    @handles(UpdateAgentProviderRequest)
+    @handles(UpdateAgentProviderRequest, scope=RequestScope.HOST)
     def on_handle_update_agent_provider_request(self, request: UpdateAgentProviderRequest) -> ResultPayload:
         existing = next((p for p in self._providers if p.name == request.name), None)
         if existing is None:
@@ -1376,7 +1376,7 @@ class AgentManager(EngineScoped):
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
 
-    @handles(DeleteAgentProviderRequest)
+    @handles(DeleteAgentProviderRequest, scope=RequestScope.HOST)
     def on_handle_delete_agent_provider_request(self, request: DeleteAgentProviderRequest) -> ResultPayload:
         if request.name == _PROTECTED_PROVIDER_NAME:
             return DeleteAgentProviderResultFailure(

@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
     LibraryRegistration,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.library_utils import extract_library_path
 
 if TYPE_CHECKING:
@@ -106,7 +106,7 @@ class LibraryWorkers(EngineScoped):
             return
         await self._library_load_reporter(ReportGeneralPurposeWorkerReadyRequest())
 
-    @handles(ReportLibraryLoadedRequest)
+    @handles(ReportLibraryLoadedRequest, scope=RequestScope.HOST)
     async def on_report_library_loaded_request(self, request: ReportLibraryLoadedRequest) -> ResultPayload:
         """Note that a library loaded in the worker that executes its nodes.
 

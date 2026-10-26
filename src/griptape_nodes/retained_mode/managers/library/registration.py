@@ -78,7 +78,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
     LibraryDependencyInstallBehavior,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.dict_utils import merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.uv_utils import find_uv_bin
 
@@ -102,7 +102,7 @@ class LibraryRegistrar(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(RegisterLibraryFromFileRequest)
+    @handles(RegisterLibraryFromFileRequest, scope=RequestScope.HOST)
     async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
         """Register a library by name or path, progressing through all lifecycle phases.
 
@@ -184,7 +184,7 @@ class LibraryRegistrar(EngineScoped):
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
                 return RegisterLibraryFromFileResultFailure(result_details=details)
 
-    @handles(RegisterLibraryFromRequirementSpecifierRequest)
+    @handles(RegisterLibraryFromRequirementSpecifierRequest, scope=RequestScope.HOST)
     async def register_library_from_requirement_specifier_request(  # noqa: PLR0911 (each failure returns its own result)
         self, request: RegisterLibraryFromRequirementSpecifierRequest
     ) -> ResultPayload:
@@ -267,7 +267,7 @@ class LibraryRegistrar(EngineScoped):
             result_details=f"Successfully registered library from requirement specifier: {request.requirement_specifier}",
         )
 
-    @handles(UnloadLibraryFromRegistryRequest)
+    @handles(UnloadLibraryFromRegistryRequest, scope=RequestScope.HOST)
     def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
         try:
             LibraryRegistry.unregister_library(

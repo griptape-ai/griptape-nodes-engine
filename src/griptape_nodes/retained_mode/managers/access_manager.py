@@ -115,7 +115,7 @@ class AccessManager(EngineScoped):
         if event_manager is not None:
             event_manager.register_request_handlers(self)
 
-    @handles(QueryModelAccessRequest)
+    @handles(QueryModelAccessRequest, scope=RequestScope.HOST)
     def on_query_model_access_request(self, request: QueryModelAccessRequest) -> ResultPayload:
         """Bare form. Hook sees `ID` (the model id) per candidate; no `NODE_TYPE`, no catalog enrichment."""
         verdicts = self._evaluate(
@@ -156,7 +156,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} model(s) for '{request.node_type}'.",
         )
 
-    @handles(QueryCodecAccessRequest)
+    @handles(QueryCodecAccessRequest, scope=RequestScope.HOST)
     def on_query_codec_access_request(self, request: QueryCodecAccessRequest) -> ResultPayload:
         """Per-codec offer query. Hook sees `ID` (the codec) plus optional `CONTAINER_FORMAT`.
 
@@ -199,7 +199,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} candidate codec(s) for '{request.direction}'.",
         )
 
-    @handles(QueryModelAccessForCatalogRequest)
+    @handles(QueryModelAccessForCatalogRequest, scope=RequestScope.HOST)
     def on_query_model_access_for_catalog_request(self, request: QueryModelAccessForCatalogRequest) -> ResultPayload:
         """Catalog-scoped. Hook sees `ID` (the model id) plus enrichment when the id resolves.
 

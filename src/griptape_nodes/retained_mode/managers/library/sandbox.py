@@ -75,7 +75,7 @@ from griptape_nodes.retained_mode.managers.library.common import (
 )
 from griptape_nodes.retained_mode.managers.library.metadata_loading import is_library_name_registered
 from griptape_nodes.retained_mode.managers.library.module_loading import get_root_cause_from_exception
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -150,7 +150,7 @@ class LibrarySandbox(EngineScoped):
 
         return sandbox_library_dir
 
-    @handles(ScanSandboxDirectoryRequest)
+    @handles(ScanSandboxDirectoryRequest, scope=RequestScope.HOST)
     def scan_sandbox_directory_request(
         self,
         request: ScanSandboxDirectoryRequest,
@@ -182,7 +182,7 @@ class LibrarySandbox(EngineScoped):
             ),
         )
 
-    @handles(RegisterSandboxNodeFromSourceRequest)
+    @handles(RegisterSandboxNodeFromSourceRequest, scope=RequestScope.HOST)
     def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911, PLR0912
         self, request: RegisterSandboxNodeFromSourceRequest
     ) -> ResultPayload:
@@ -347,7 +347,7 @@ class LibrarySandbox(EngineScoped):
             result_details=summary,
         )
 
-    @handles(ReloadSandboxLibraryRequest)
+    @handles(ReloadSandboxLibraryRequest, scope=RequestScope.HOST)
     async def reload_sandbox_library_request(self, request: ReloadSandboxLibraryRequest) -> ResultPayload:  # noqa: ARG002
         """Reload only the sandbox library: unregister it, rescan its directory, and register it again.
 

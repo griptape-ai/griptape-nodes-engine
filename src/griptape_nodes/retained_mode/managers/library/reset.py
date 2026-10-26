@@ -30,7 +30,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.engine_dirs import engine_state_dir
 
 if TYPE_CHECKING:
@@ -51,7 +51,7 @@ class LibraryReset(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(ResetLibraryRequest)
+    @handles(ResetLibraryRequest, scope=RequestScope.HOST)
     async def reset_library_request(self, request: ResetLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911 (each refusal returns its own result)
         library_name = request.library_name
         library_manager = self.engine.library_manager

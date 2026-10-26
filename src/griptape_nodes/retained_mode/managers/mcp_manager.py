@@ -36,7 +36,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import MCPServerConfig
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -143,7 +143,7 @@ class MCPManager:
             if value is not None:
                 setattr(server_config, config_field, value)
 
-    @handles(ListMCPServersRequest)
+    @handles(ListMCPServersRequest, scope=RequestScope.HOST)
     def on_list_mcp_servers_request(
         self, request: ListMCPServersRequest
     ) -> ListMCPServersResultSuccess | ListMCPServersResultFailure:
@@ -166,7 +166,7 @@ class MCPManager:
             result_details=f"Successfully listed {len(servers_dict)} MCP servers",
         )
 
-    @handles(GetMCPServerRequest)
+    @handles(GetMCPServerRequest, scope=RequestScope.HOST)
     def on_get_mcp_server_request(
         self, request: GetMCPServerRequest
     ) -> GetMCPServerResultSuccess | GetMCPServerResultFailure:
@@ -184,7 +184,7 @@ class MCPManager:
             result_details=f"Successfully retrieved MCP server '{request.name}'",
         )
 
-    @handles(CreateMCPServerRequest)
+    @handles(CreateMCPServerRequest, scope=RequestScope.HOST)
     def on_create_mcp_server_request(
         self, request: CreateMCPServerRequest
     ) -> CreateMCPServerResultSuccess | CreateMCPServerResultFailure:
@@ -237,7 +237,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully created MCP server '{request.name}'"
         )
 
-    @handles(UpdateMCPServerRequest)
+    @handles(UpdateMCPServerRequest, scope=RequestScope.HOST)
     def on_update_mcp_server_request(
         self, request: UpdateMCPServerRequest
     ) -> UpdateMCPServerResultSuccess | UpdateMCPServerResultFailure:
@@ -271,7 +271,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully updated MCP server '{request.name}'"
         )
 
-    @handles(DeleteMCPServerRequest)
+    @handles(DeleteMCPServerRequest, scope=RequestScope.HOST)
     def on_delete_mcp_server_request(
         self, request: DeleteMCPServerRequest
     ) -> DeleteMCPServerResultSuccess | DeleteMCPServerResultFailure:
@@ -302,7 +302,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully deleted MCP server '{request.name}'"
         )
 
-    @handles(EnableMCPServerRequest)
+    @handles(EnableMCPServerRequest, scope=RequestScope.HOST)
     def on_enable_mcp_server_request(
         self, request: EnableMCPServerRequest
     ) -> EnableMCPServerResultSuccess | EnableMCPServerResultFailure:
@@ -331,7 +331,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully enabled MCP server '{request.name}'"
         )
 
-    @handles(DisableMCPServerRequest)
+    @handles(DisableMCPServerRequest, scope=RequestScope.HOST)
     def on_disable_mcp_server_request(
         self, request: DisableMCPServerRequest
     ) -> DisableMCPServerResultSuccess | DisableMCPServerResultFailure:
@@ -360,7 +360,7 @@ class MCPManager:
             name=request.name, result_details=f"Successfully disabled MCP server '{request.name}'"
         )
 
-    @handles(GetEnabledMCPServersRequest)
+    @handles(GetEnabledMCPServersRequest, scope=RequestScope.HOST)
     def on_get_enabled_mcp_servers_request(
         self,
         request: GetEnabledMCPServersRequest,  # noqa: ARG002

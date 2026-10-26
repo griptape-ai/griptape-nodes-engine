@@ -74,7 +74,7 @@ from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -373,7 +373,7 @@ class LibraryManager(EngineScoped):
         finally:
             self._is_initializing = False
 
-    @handles(ReloadAllLibrariesRequest)
+    @handles(ReloadAllLibrariesRequest, scope=RequestScope.HOST)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # Bracket the reload like on_app_initialization_complete so the heartbeat reports
         # is_initializing during a mid-session reload too. finally clears it even on failure.

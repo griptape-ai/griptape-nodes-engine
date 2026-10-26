@@ -29,7 +29,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultDetails,
     ResultPayload,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.retained_mode.utils.name_generator import generate_engine_name
 from griptape_nodes.utils.engine_dirs import engine_data_dir
 
@@ -136,7 +136,7 @@ class EngineIdentityManager:
         """
         return self._engines_data.engines
 
-    @handles(GetEngineNameRequest)
+    @handles(GetEngineNameRequest, scope=RequestScope.HOST)
     def handle_get_engine_name_request(self, request: GetEngineNameRequest) -> ResultPayload:  # noqa: ARG002
         """Handle requests to get the current engine name."""
         try:
@@ -148,7 +148,7 @@ class EngineIdentityManager:
             error_message = f"Failed to get engine name: {err}"
             return GetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
-    @handles(SetEngineNameRequest)
+    @handles(SetEngineNameRequest, scope=RequestScope.HOST)
     def handle_set_engine_name_request(self, request: SetEngineNameRequest) -> ResultPayload:
         """Handle requests to set a new engine name."""
         try:

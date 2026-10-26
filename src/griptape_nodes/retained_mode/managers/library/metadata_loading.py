@@ -34,7 +34,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     LibrarySchemaValidationProblem,
 )
 from griptape_nodes.retained_mode.managers.library.common import LIBRARY_CONFIG_FILENAME, LibraryFitness
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.git_utils import (
     get_git_info,
 )
@@ -61,7 +61,7 @@ class LibraryMetadataLoading(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(LoadLibraryMetadataFromFileRequest)
+    @handles(LoadLibraryMetadataFromFileRequest, scope=RequestScope.HOST)
     def load_library_metadata_from_file_request(
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
@@ -75,7 +75,7 @@ class LibraryMetadataLoading(EngineScoped):
             result.git_remote, result.git_ref = get_git_info(_library_dir(result))
         return result
 
-    @handles(LoadMetadataForAllLibrariesRequest)
+    @handles(LoadMetadataForAllLibrariesRequest, scope=RequestScope.HOST)
     async def load_metadata_for_all_libraries_request(
         self,
         request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002

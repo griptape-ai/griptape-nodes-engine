@@ -651,7 +651,7 @@ class Engine:
         if dropped:
             logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
-    @handles(GetEngineVersionRequest)
+    @handles(GetEngineVersionRequest, scope=RequestScope.HOST)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)

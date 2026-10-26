@@ -27,7 +27,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     REQUIRES_ENGINE_KEY,
     LibraryDownload,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
@@ -92,7 +92,7 @@ class LibraryProvisioning(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(PreviewProjectProvisioningRequest)
+    @handles(PreviewProjectProvisioningRequest, scope=RequestScope.HOST)
     async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
     ) -> PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure:

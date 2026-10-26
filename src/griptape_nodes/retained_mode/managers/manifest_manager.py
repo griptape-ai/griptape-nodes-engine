@@ -36,7 +36,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -63,7 +63,7 @@ class ManifestManager(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(GenerateManifestRequest)
+    @handles(GenerateManifestRequest, scope=RequestScope.HOST)
     async def on_generate_manifest_request(
         self, request: GenerateManifestRequest
     ) -> GenerateManifestResultSuccess | GenerateManifestResultFailure:

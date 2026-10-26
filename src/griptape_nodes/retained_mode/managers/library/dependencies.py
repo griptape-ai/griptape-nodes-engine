@@ -31,7 +31,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.git_utils import (
     extract_repo_name_from_url,
@@ -235,7 +235,7 @@ class LibraryDependencies(EngineScoped):
         dependencies = [dep.library_name for dep in self._walk_declared_library_dependencies(root_libraries)]
         return list(dict.fromkeys([*roots, *dependencies]))
 
-    @handles(InstallLibraryDependenciesRequest)
+    @handles(InstallLibraryDependenciesRequest, scope=RequestScope.HOST)
     async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901 (edit and execution environments each branch)
         """Install a library's dependencies into its edit-time and execution environments.
 

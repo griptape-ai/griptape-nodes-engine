@@ -49,7 +49,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
     LIBRARY_MINIMUM_RELEASE_AGE_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.file_utils import find_file_in_directory
 from griptape_nodes.utils.git_utils import (
     GitError,
@@ -138,7 +138,7 @@ class LibraryGitOperations(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(CheckLibraryUpdateRequest)
+    @handles(CheckLibraryUpdateRequest, scope=RequestScope.HOST)
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
         library_name = request.library_name
@@ -366,7 +366,7 @@ class LibraryGitOperations(EngineScoped):
             result_details=details,
         )
 
-    @handles(UpdateLibraryRequest)
+    @handles(UpdateLibraryRequest, scope=RequestScope.HOST)
     async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         """Update a library to the latest version using the appropriate git strategy.
 
@@ -484,7 +484,7 @@ class LibraryGitOperations(EngineScoped):
             library_name=library_name, old_version=old_version, new_version=new_version
         )
 
-    @handles(SwitchLibraryRefRequest)
+    @handles(SwitchLibraryRefRequest, scope=RequestScope.HOST)
     async def switch_library_ref_request(self, request: SwitchLibraryRefRequest) -> ResultPayload:  # noqa: PLR0911 (each failure returns its own result)
         """Switch a library to a different git branch or tag."""
         library_name = request.library_name
@@ -555,7 +555,7 @@ class LibraryGitOperations(EngineScoped):
             new_version=new_version,
         )
 
-    @handles(DownloadLibraryRequest)
+    @handles(DownloadLibraryRequest, scope=RequestScope.HOST)
     async def download_library_request(self, request: DownloadLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Download a library from a git repository."""
         managed = self.engine.library_manager.managed_environment
@@ -706,7 +706,7 @@ class LibraryGitOperations(EngineScoped):
             result_details=details,
         )
 
-    @handles(InspectLibraryRepoRequest)
+    @handles(InspectLibraryRepoRequest, scope=RequestScope.HOST)
     async def inspect_library_repo_request(self, request: InspectLibraryRepoRequest) -> ResultPayload:
         """Inspect a library's metadata from a git repository without downloading the full repository."""
         git_url = request.git_url

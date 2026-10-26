@@ -58,7 +58,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.async_utils import cancel_subprocess
 from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.model_download_errors import (
@@ -460,7 +460,7 @@ class ModelManager(EngineScoped):
         status_dir.mkdir(parents=True, exist_ok=True)
         return status_dir
 
-    @handles(DownloadModelRequest)
+    @handles(DownloadModelRequest, scope=RequestScope.HOST)
     async def on_handle_download_model_request(self, request: DownloadModelRequest) -> ResultPayload:
         """Handle model download requests asynchronously.
 
@@ -700,7 +700,7 @@ class ModelManager(EngineScoped):
             if model_id in self._download_processes:
                 del self._download_processes[model_id]
 
-    @handles(ListModelsRequest)
+    @handles(ListModelsRequest, scope=RequestScope.HOST)
     async def on_handle_list_models_request(self, request: ListModelsRequest) -> ResultPayload:  # noqa: ARG002
         """Handle model listing requests asynchronously.
 
@@ -731,7 +731,7 @@ class ModelManager(EngineScoped):
                 exception=e,
             )
 
-    @handles(DeleteModelRequest)
+    @handles(DeleteModelRequest, scope=RequestScope.HOST)
     async def on_handle_delete_model_request(self, request: DeleteModelRequest) -> ResultPayload:
         """Handle model deletion requests asynchronously.
 
@@ -779,7 +779,7 @@ class ModelManager(EngineScoped):
             result_details=result_details,
         )
 
-    @handles(SearchModelsRequest)
+    @handles(SearchModelsRequest, scope=RequestScope.HOST)
     async def on_handle_search_models_request(self, request: SearchModelsRequest) -> ResultPayload:
         """Handle model search requests asynchronously.
 
@@ -810,7 +810,7 @@ class ModelManager(EngineScoped):
                 result_details=result_details,
             )
 
-    @handles(GetModelInfoRequest)
+    @handles(GetModelInfoRequest, scope=RequestScope.HOST)
     async def on_handle_get_model_info_request(self, request: GetModelInfoRequest) -> ResultPayload:
         """Fetch detailed info for a specific model from Hugging Face Hub.
 
@@ -1188,7 +1188,7 @@ class ModelManager(EngineScoped):
             return True
         return recorded_kind in RETRYABLE_KINDS
 
-    @handles(ListModelDownloadsRequest)
+    @handles(ListModelDownloadsRequest, scope=RequestScope.HOST)
     async def on_handle_list_model_downloads_request(self, request: ListModelDownloadsRequest) -> ResultPayload:
         """Handle model download status requests asynchronously.
 
@@ -1380,7 +1380,7 @@ class ModelManager(EngineScoped):
         # Get all download statuses
         return self._list_all_download_statuses()
 
-    @handles(DeleteModelDownloadRequest)
+    @handles(DeleteModelDownloadRequest, scope=RequestScope.HOST)
     async def on_handle_delete_model_download_request(self, request: DeleteModelDownloadRequest) -> ResultPayload:
         """Handle model download status deletion requests asynchronously.
 

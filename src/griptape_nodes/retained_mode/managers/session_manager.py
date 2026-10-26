@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.engine_dirs import engine_state_dir
 
 if TYPE_CHECKING:
@@ -264,7 +264,7 @@ class SessionManager:
         # Update in-memory copy
         self._sessions_data = sessions_data
 
-    @handles(AppStartSessionRequest)
+    @handles(AppStartSessionRequest, scope=RequestScope.HOST)
     async def handle_session_start_request(self, request: AppStartSessionRequest) -> ResultPayload:  # noqa: ARG002
         current_session_id = self.active_session_id
         if current_session_id is None:
@@ -278,7 +278,7 @@ class SessionManager:
 
         return AppStartSessionResultSuccess(current_session_id, result_details="Session started successfully.")
 
-    @handles(AppEndSessionRequest)
+    @handles(AppEndSessionRequest, scope=RequestScope.HOST)
     async def handle_session_end_request(self, _: AppEndSessionRequest) -> ResultPayload:
         try:
             previous_session_id = self.active_session_id
@@ -297,14 +297,14 @@ class SessionManager:
             details = f"Failed to end session due to '{err}'."
             return AppEndSessionResultFailure(result_details=details)
 
-    @handles(AppGetSessionRequest)
+    @handles(AppGetSessionRequest, scope=RequestScope.HOST)
     def handle_get_session_request(self, _: AppGetSessionRequest) -> ResultPayload:
         return AppGetSessionResultSuccess(
             session_id=self.active_session_id,
             result_details="Session ID retrieved successfully.",
         )
 
-    @handles(SessionHeartbeatRequest)
+    @handles(SessionHeartbeatRequest, scope=RequestScope.HOST)
     def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
         """Handle session heartbeat requests.
 

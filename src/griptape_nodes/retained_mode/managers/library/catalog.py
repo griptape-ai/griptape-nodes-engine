@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeModuleImportProblem,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -155,7 +155,7 @@ class LibraryCatalog(EngineScoped):
             return None
         return self.explain_stale_module_failure(library_name)
 
-    @handles(ListCapableLibraryEventHandlersRequest)
+    @handles(ListCapableLibraryEventHandlersRequest, scope=RequestScope.HOST)
     def on_list_capable_event_handlers(self, request: ListCapableLibraryEventHandlersRequest) -> ResultPayload:
         """Get all registered event handlers for a specific request type."""
         request_type = PayloadRegistry.get_type(request.request_type)
@@ -183,7 +183,7 @@ class LibraryCatalog(EngineScoped):
             result_details=f"Successfully listed {len(handler_mappings)} capable library event handlers",
         )
 
-    @handles(ListRegisteredLibrariesRequest)
+    @handles(ListRegisteredLibrariesRequest, scope=RequestScope.HOST)
     async def on_list_registered_libraries_request(self, _request: ListRegisteredLibrariesRequest) -> ResultPayload:
         await self.engine.library_manager._libraries_loading_complete.wait()
         # Make a COPY of the list
@@ -198,7 +198,7 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
-    @handles(GetLibrarySourceInfoRequest)
+    @handles(GetLibrarySourceInfoRequest, scope=RequestScope.HOST)
     async def on_get_library_source_info_request(self, request: GetLibrarySourceInfoRequest) -> ResultPayload:
         """Return the filesystem paths for a registered library's source files.
 
@@ -238,7 +238,7 @@ class LibraryCatalog(EngineScoped):
             result_details=f"Source info for library '{request.library}'.",
         )
 
-    @handles(GetEngineSourceInfoRequest)
+    @handles(GetEngineSourceInfoRequest, scope=RequestScope.HOST)
     def on_get_engine_source_info_request(self, _request: GetEngineSourceInfoRequest) -> ResultPayload:
         """Return the filesystem path of the installed ``griptape_nodes`` package.
 
@@ -268,7 +268,7 @@ class LibraryCatalog(EngineScoped):
             result_details="Engine source info.",
         )
 
-    @handles(ListNodeTypesInLibraryRequest)
+    @handles(ListNodeTypesInLibraryRequest, scope=RequestScope.HOST)
     def on_list_node_types_in_library_request(self, request: ListNodeTypesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -291,7 +291,7 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
-    @handles(GetLibraryMetadataRequest)
+    @handles(GetLibraryMetadataRequest, scope=RequestScope.HOST)
     def get_library_metadata_request(self, request: GetLibraryMetadataRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -309,7 +309,7 @@ class LibraryCatalog(EngineScoped):
         result = GetLibraryMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
-    @handles(GetNodeMetadataFromLibraryRequest)
+    @handles(GetNodeMetadataFromLibraryRequest, scope=RequestScope.HOST)
     def get_node_metadata_from_library_request(self, request: GetNodeMetadataFromLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -335,7 +335,7 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
-    @handles(DescribeNodeTypeRequest)
+    @handles(DescribeNodeTypeRequest, scope=RequestScope.HOST)
     def describe_node_type_request(self, request: DescribeNodeTypeRequest) -> ResultPayload:
         # Resolve the library for this node type. When no library is supplied, we rely on
         # LibraryRegistry to pick the unique library that provides it.
@@ -438,7 +438,7 @@ class LibraryCatalog(EngineScoped):
             result_details=details,
         )
 
-    @handles(ListCategoriesInLibraryRequest)
+    @handles(ListCategoriesInLibraryRequest, scope=RequestScope.HOST)
     def list_categories_in_library_request(self, request: ListCategoriesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -486,7 +486,7 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
-    @handles(GetAllInfoForAllLibrariesRequest)
+    @handles(GetAllInfoForAllLibrariesRequest, scope=RequestScope.HOST)
     async def on_get_all_info_for_all_libraries_request(
         self, request: GetAllInfoForAllLibrariesRequest
     ) -> ResultPayload:
@@ -494,7 +494,7 @@ class LibraryCatalog(EngineScoped):
         await self.engine.library_manager._libraries_loading_complete.wait()
         return await self.get_all_info_for_all_libraries_request(request)
 
-    @handles(GetAllInfoForLibraryRequest)
+    @handles(GetAllInfoForLibraryRequest, scope=RequestScope.HOST)
     async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
         """Registered entry point: hold the caller until any in-flight reload finishes.
 

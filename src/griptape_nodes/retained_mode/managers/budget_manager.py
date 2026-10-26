@@ -48,7 +48,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     ReportUsageResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.budget_refusal import (
     BudgetExceededError,
     describe,
@@ -125,7 +125,7 @@ class BudgetManager(EngineScoped):
         threading.Thread(target=self._post_reports, name="budget-report", daemon=True).start()
         event_manager.register_request_handlers(self)
 
-    @handles(GetAttributionContextRequest)
+    @handles(GetAttributionContextRequest, scope=RequestScope.HOST)
     def on_get_attribution_context_request(
         self,
         request: GetAttributionContextRequest,  # noqa: ARG002
