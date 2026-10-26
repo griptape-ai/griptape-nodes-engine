@@ -2,6 +2,7 @@ import ast
 import asyncio
 import logging
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -15,8 +16,6 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
-
-from collections.abc import Iterator
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -4545,12 +4544,11 @@ class TestCreateVersionedWorkflow:
         engine: Engine,
         *,
         requested_file_name: str | None,
-        current_workflow_name: str | None,
+        current_workflow_name: str,
         create_versioned: bool,
     ) -> SaveWorkflowTargetInfo:
-        current_workflow = None
-        if current_workflow_name is not None:
-            current_workflow = engine.workflow_registry.find_by_name(current_workflow_name)
+        current_workflow = engine.workflow_registry.find_by_name(current_workflow_name)
+        assert current_workflow is not None
         return engine.workflow_manager.saver._determine_save_target(
             requested_file_name=requested_file_name,
             current_workflow=current_workflow,
@@ -4777,10 +4775,11 @@ class TestCreateVersionedWorkflow:
         engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         with empty_workflow_registry(engine), caplog.at_level("WARNING"):
+            unsaved = engine.workflow_registry.register_unsaved("Untitled")
             self._determine(
                 engine,
                 requested_file_name="my_flow",
-                current_workflow_name=None,
+                current_workflow_name=unsaved.name,
                 create_versioned=False,
             )
 
@@ -4833,10 +4832,11 @@ class TestCreateVersionedWorkflow:
         engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         with empty_workflow_registry(engine), caplog.at_level("WARNING"):
+            unsaved = engine.workflow_registry.register_unsaved("Untitled")
             self._determine(
                 engine,
                 requested_file_name="my_flow",
-                current_workflow_name=None,
+                current_workflow_name=unsaved.name,
                 create_versioned=True,
             )
 
@@ -4865,10 +4865,11 @@ class TestCreateVersionedWorkflow:
     def test_first_versioned_save_with_no_registry_entry(self, engine: Engine) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
         with empty_workflow_registry(engine):
+            unsaved = engine.workflow_registry.register_unsaved("Untitled")
             target = self._determine(
                 engine,
                 requested_file_name="brand_new_flow",
-                current_workflow_name=None,
+                current_workflow_name=unsaved.name,
                 create_versioned=True,
             )
 
@@ -5137,11 +5138,11 @@ class TestCreateVersionedWorkflow:
             assert "RuntimeError" in str(exc_info.value)
             assert "dispatch caught an exception" in str(exc_info.value)
 
-    def test_create_versioned_timestamp_fallback_when_no_candidate_workflow(
+    def test_create_versioned_timestamp_fallback_when_no_base_name(
         self,
         engine: Engine,
     ) -> None:
-        """Step 5: no current AND no target workflow → timestamp-derived filename.
+        """Step 5: an unsaved workflow with no display name and no target → timestamp-derived filename.
 
         Pins the last-resort branch of ``_resolve_versioned_save_target``:
         when there's nothing in scope to derive a base name from, the
@@ -5149,11 +5150,12 @@ class TestCreateVersionedWorkflow:
         the standard ``_resolve_named_save_path`` plumbing.
         """
         with empty_workflow_registry(engine):
-            # Empty registry + no current workflow + no target → Step 5.
+            # No file, no display name and no target → Step 5.
+            unsaved = engine.workflow_registry.register_unsaved("")
             target = self._determine(
                 engine,
                 requested_file_name=None,
-                current_workflow_name=None,
+                current_workflow_name=unsaved.name,
                 create_versioned=True,
             )
 

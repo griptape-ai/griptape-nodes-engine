@@ -436,7 +436,7 @@ class WorkflowSaver(EngineScoped):
         *,
         scenario: SaveWorkflowScenario,
         destination: ProjectFileDestination,
-        current_workflow: Workflow | None,
+        current_workflow: Workflow,
         keep_open_workflow_identity: bool,
     ) -> str:
         """The id a save writes into the file: the open workflow's when the file continues it, else a new one.
@@ -446,8 +446,6 @@ class WorkflowSaver(EngineScoped):
         a rename moves it to. Every other save is a copy (Save As, a versioned save, saving onto a
         library workflow), which is a new workflow with an id of its own.
         """
-        if current_workflow is None:
-            return new_workflow_id()
         if keep_open_workflow_identity or not current_workflow.is_saved:
             return current_workflow.workflow_id
         if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
@@ -475,7 +473,7 @@ class WorkflowSaver(EngineScoped):
         *,
         written_path: str,
         workflow_metadata: WorkflowMetadata,
-        current_workflow: Workflow | None,
+        current_workflow: Workflow,
     ) -> Workflow:
         """Update the registry for a file a save just wrote, and return the workflow it holds.
 
@@ -487,7 +485,7 @@ class WorkflowSaver(EngineScoped):
         registry = self.engine.workflow_registry
         displaced = registry.find_by_path(written_path)
 
-        if current_workflow is not None and workflow_metadata.workflow_id == current_workflow.workflow_id:
+        if workflow_metadata.workflow_id == current_workflow.workflow_id:
             if displaced is not None and displaced is not current_workflow:
                 registry.remove(displaced.workflow_id)
             if displaced is not current_workflow:
@@ -764,7 +762,7 @@ class WorkflowSaver(EngineScoped):
     def _determine_save_target(
         self,
         requested_file_name: str | None,
-        current_workflow: Workflow | None,
+        current_workflow: Workflow,
         *,
         create_versioned: bool = False,
     ) -> SaveWorkflowTargetInfo:
@@ -772,7 +770,7 @@ class WorkflowSaver(EngineScoped):
 
         Args:
             requested_file_name: The name the user wants to save as (can be None)
-            current_workflow: The workflow currently loaded in context (can be None)
+            current_workflow: The open workflow being saved
             create_versioned: When True, route every save through the
                 ``create_versioned_workflow`` situation so each save produces a
                 new versioned file (e.g. ``foo_v001.py``, ``foo_v002.py``, ...).
@@ -818,10 +816,8 @@ class WorkflowSaver(EngineScoped):
                 current_workflow=current_workflow,
                 target_workflow=target_workflow,
             )
-            creation_date = (
-                current_workflow.metadata.creation_date if current_workflow is not None else datetime.now(tz=UTC)
-            )
-            branched_from = current_workflow.metadata.branched_from if current_workflow is not None else None
+            creation_date = current_workflow.metadata.creation_date
+            branched_from = current_workflow.metadata.branched_from
             if (creation_date is None) or (creation_date == EPOCH_START):
                 creation_date = datetime.now(tz=UTC)
             return SaveWorkflowTargetInfo(
@@ -857,7 +853,7 @@ class WorkflowSaver(EngineScoped):
         elif target_workflow and target_workflow.file_path is not None:
             # Requested name exists in registry as a saved workflow → overwrite it.
             # (If it were unsaved, we would instead treat this as first-save of the current
-            # workflow; handled by the `elif requested_file_name and current_workflow` branch.)
+            # workflow; handled by the `elif requested_file_name` branch.)
             scenario = SaveWorkflowScenario.OVERWRITE_EXISTING
             # Use the registry key as the file name, independent of the display name in metadata.
             file_name = derive_registry_key(target_workflow.file_path)
@@ -866,8 +862,8 @@ class WorkflowSaver(EngineScoped):
             relative_file_path = target_workflow.file_path
             file_path = Path(self.engine.workflow_registry.get_complete_file_path(relative_file_path))
 
-        elif requested_file_name and current_workflow:
-            # Requested name doesn't exist but we have a current workflow → Save As.
+        elif requested_file_name:
+            # Requested name doesn't exist → Save As.
             # A user-typed name like "episode/my_wf" splits into sub-directory + stem
             # and is authoritative: the requested name fully determines the save path.
             scenario = SaveWorkflowScenario.SAVE_AS
@@ -876,7 +872,7 @@ class WorkflowSaver(EngineScoped):
             file_name, destination, relative_file_path = self._resolve_named_save_path(requested_file_name)
 
         else:
-            # No requested name or no current workflow → first save.
+            # No requested name → first save.
             scenario = SaveWorkflowScenario.FIRST_SAVE
             creation_date = datetime.now(tz=UTC)
             branched_from = None
@@ -898,9 +894,7 @@ class WorkflowSaver(EngineScoped):
             branched_from=branched_from,
         )
 
-    def _resolve_first_save_path(
-        self, requested_file_name: str | None, current_workflow: Workflow | None
-    ) -> NamedSavePath:
+    def _resolve_first_save_path(self, requested_file_name: str | None, current_workflow: Workflow) -> NamedSavePath:
         """Where a first save goes when no saved workflow holds the requested name.
 
         A user-typed name like "episode/my_wf" splits into sub-directory + stem. With no name in
@@ -912,8 +906,6 @@ class WorkflowSaver(EngineScoped):
         timestamp_name = datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
         if requested_file_name:
             return self._resolve_named_save_path(requested_file_name)
-        if current_workflow is None:
-            return self._resolve_named_save_path(timestamp_name)
 
         library_file_stem = self.engine.workflow_registry.library_file_stem(current_workflow)
         if library_file_stem is not None:
@@ -930,7 +922,7 @@ class WorkflowSaver(EngineScoped):
         *,
         situation_name: str,
         requested_file_name: str | None,
-        current_workflow: Workflow | None,
+        current_workflow: Workflow,
         target_workflow: Workflow | None,
     ) -> NamedSavePath:
         """Build the ``(file_name, destination, relative_file_path)`` triple for a versioned save.
@@ -955,7 +947,7 @@ class WorkflowSaver(EngineScoped):
         4. Candidate workflow with no ``file_path`` (unsaved). Use the library
            file's stem for a library workflow's copy, else sanitize
            ``metadata.name``, and route through ``_resolve_named_save_path``.
-        5. Timestamp fallback when no candidate workflow exists.
+        5. Timestamp fallback when the candidate's display name sanitizes to nothing.
         """
         # Step 1 only fires for a truly novel requested name. If the name
         # resolves to a workflow already in the registry (target_workflow is set),
@@ -971,7 +963,7 @@ class WorkflowSaver(EngineScoped):
         # file_name" bug — see
         # test_create_versioned_with_requested_name_matching_existing_workflow_runs_match.
         candidate_workflow = target_workflow if target_workflow is not None else current_workflow
-        if candidate_workflow is not None and candidate_workflow.file_path is not None:
+        if candidate_workflow.file_path is not None:
             matched = self._try_match_versioned_destination(candidate_workflow.file_path, situation_name=situation_name)
             if matched is not None:
                 return matched
@@ -981,14 +973,13 @@ class WorkflowSaver(EngineScoped):
             stem = derive_registry_key(candidate_workflow.file_path)
             return self._resolve_named_save_path(stem, situation_name=situation_name)
 
-        if candidate_workflow is not None:
-            library_file_stem = self.engine.workflow_registry.library_file_stem(candidate_workflow)
-            if library_file_stem is not None:
-                return self._resolve_named_save_path(library_file_stem, situation_name=situation_name)
-            display_name = (candidate_workflow.metadata.name or "").strip()
-            sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
-            if sanitized:
-                return self._resolve_named_save_path(sanitized, situation_name=situation_name)
+        library_file_stem = self.engine.workflow_registry.library_file_stem(candidate_workflow)
+        if library_file_stem is not None:
+            return self._resolve_named_save_path(library_file_stem, situation_name=situation_name)
+        display_name = (candidate_workflow.metadata.name or "").strip()
+        sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+        if sanitized:
+            return self._resolve_named_save_path(sanitized, situation_name=situation_name)
 
         timestamp_name = datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
         return self._resolve_named_save_path(timestamp_name, situation_name=situation_name)
