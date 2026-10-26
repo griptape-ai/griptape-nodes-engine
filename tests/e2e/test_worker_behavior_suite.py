@@ -98,14 +98,22 @@ def _make_in_flow(node_type: str, name: str) -> BaseNode:
 
 
 async def _execute(node_type: str, name: str, **parameter_values: object) -> ExecuteNodeResultSuccess:
+    # Names the open workflow as an orchestrator's dispatch does, so a worker mirrors it and resolves its paths.
+    workflow_context = current_engine().project_manager.workflow_context_for_dispatch()
     request = ExecuteNodeRequest(
         node_name=name,
         parameter_values=dict(parameter_values),
         node_metadata={"node_type": node_type, "library": WORKER_BEHAVIOR_LIBRARY_NAME},
+        orchestrator_workflow_id=workflow_context.workflow_id,
+        workflow_name=workflow_context.name,
+        workflow_file_path=workflow_context.file_path,
+        workflow_working_directory=workflow_context.working_directory,
     )
     if current_engine().library_manager.is_worker:
         with as_worker_process(current_engine()):
             result = await current_engine().ahandle_request(request)
+            # Back in the orchestrator role, where an engine with a workflow open mirrors none.
+            current_engine().context_manager.mirror_workflow_context(None, None, None, None)
     else:
         result = await current_engine().ahandle_request(request)
     assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
