@@ -308,6 +308,35 @@ class Connections:
 
         return internal_connections
 
+    def collect_downstream_data_nodes(self, node: BaseNode, visited: set[str] | None = None) -> set[str]:
+        """Return the names of every node reachable from ``node`` through data connections.
+
+        The same walk as ``unresolve_future_nodes`` without touching any node's state. A caller that
+        passes its own ``visited`` set gets the union across several roots in one pass; the root
+        itself is recorded in ``visited`` but is not part of the returned set.
+        """
+        if visited is None:
+            visited = set()
+        downstream: set[str] = set()
+        if node.name in visited:
+            return downstream
+        visited.add(node.name)
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            for connection_ids in self.outgoing_index.get(current.name, {}).values():
+                for connection_id in connection_ids:
+                    connection = self.connections.get(connection_id)
+                    if connection is None or not self._carries_data(connection):
+                        continue
+                    target_node = connection.target_node
+                    downstream.add(target_node.name)
+                    if target_node.name in visited:
+                        continue
+                    visited.add(target_node.name)
+                    pending.append(target_node)
+        return downstream
+
     def unresolve_future_nodes(self, node: BaseNode, visited: set[str] | None = None) -> None:
         """Mark every RESOLVED node downstream of ``node`` through data connections as UNRESOLVED.
 
