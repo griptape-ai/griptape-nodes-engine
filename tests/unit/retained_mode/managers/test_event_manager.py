@@ -1762,14 +1762,16 @@ class TestTheRequestSender:
     """A handler reads which engine, and which of its sessions, sent the request from its envelope."""
 
     @staticmethod
-    def _manager_recording_senders(seen: list[RequestSender | None]) -> EventManager:
+    def _manager_recording_senders(
+        seen: list[RequestSender | None], sender: RequiredSender | None = RequiredSender.ENGINE
+    ) -> EventManager:
         event_manager = EventManager()
 
         async def handler(_request: _ProbeRequest) -> _ProbeResult:
             seen.append(current_request_sender())
             return _ProbeResult(result_details="ok")
 
-        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=RequiredSender.ENGINE)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=sender)
         return event_manager
 
     @pytest.mark.asyncio
@@ -1855,7 +1857,7 @@ class TestTheRequestSender:
     @pytest.mark.asyncio
     async def test_a_request_no_engine_sent_has_no_sender(self) -> None:
         seen: list[RequestSender | None] = []
-        event_manager = self._manager_recording_senders(seen)
+        event_manager = self._manager_recording_senders(seen, sender=None)
 
         await event_manager.ahandle_request(_ProbeRequest(), result_context=ResultContext(request_id="r1"))
 
