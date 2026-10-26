@@ -157,10 +157,11 @@ class CompleteState(State):
             logger.debug("Isolated subflow '%s' is complete.", context.flow_name)
             return None
 
-        # Broadcast completion events for any remaining current nodes
+        # Broadcast completion events for any remaining current nodes. The run's event names the
+        # run's workflow, which an end node deleted mid-run no longer has.
         for current_node in context.current_nodes:
             context.engine.event_manager.put_event(
-                current_node.execution_event(
+                context.workflow.execution_event(
                     ControlFlowResolvedEvent(
                         end_node_name=current_node.name,
                         parameter_output_values=NodeManager.result_parameter_values(current_node),
@@ -233,7 +234,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             # including the group that is running the iteration (issue #5486).
             involved_nodes = flow_manager.get_involved_node_names(flow)
             self._context.engine.event_manager.put_event(
-                start_node.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
+                self._context.workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
         await self.start(ResolveNodeState)  # Begins the flow
 

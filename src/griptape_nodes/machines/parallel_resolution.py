@@ -374,7 +374,7 @@ class ExecuteDagState(State):
             # Clean up nodes from emptied graphs in single node resolution mode
             if len(network) == 0 and context.dag_builder is not None:
                 context.dag_builder.cleanup_empty_graph_nodes(network_name)
-                ExecuteDagState._emit_involved_nodes_update(context, node)
+                ExecuteDagState._emit_involved_nodes_update(context)
             return True
 
         node_reference = context.dag_builder.node_to_reference.get(node.name)
@@ -414,12 +414,12 @@ class ExecuteDagState(State):
             ExecuteDagState.add_and_queue_nodes(context, next_node, network_name)
 
     @staticmethod
-    def _emit_involved_nodes_update(context: ParallelResolutionContext, node: BaseNode) -> None:
-        """Emit update of involved nodes based on current DAG state, in the workflow of ``node``, which just ran."""
+    def _emit_involved_nodes_update(context: ParallelResolutionContext) -> None:
+        """Emit update of involved nodes based on current DAG state, in the run's workflow."""
         if context.dag_builder is not None:
             involved_nodes = list(context.node_to_reference.keys())
             context.engine.event_manager.put_event(
-                node.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
+                context.workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
 
     @staticmethod

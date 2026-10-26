@@ -11,10 +11,12 @@ from pydantic import ValidationError
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import ControlNode
+from griptape_nodes.machines.control_flow import CompleteState, ControlFlowContext
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.base_events import ExecutionGriptapeNodeEvent, ProgressEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
+    ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
     InvolvedNodesEvent,
     NodeResolvedEvent,
@@ -241,6 +243,27 @@ class TestARunsEventsNameItsWorkflow:
         assert progress_events
         assert {event.workflow_id for event in execution_events} == {entry.workflow_id}
         assert {event.workflow_id for event in progress_events} == {entry.workflow_id}
+
+
+class TestARunsOwnEventsNameItsWorkflowNotANodes:
+    @pytest.mark.asyncio
+    async def test_the_run_finished_event_names_the_workflow_when_the_end_node_was_deleted(
+        self, engine: Engine, put_events: list[Any]
+    ) -> None:
+        workflow = WorkflowRuntime("wf", engine)
+        object_manager = ObjectManager(MagicMock(), engine=MagicMock())
+        end_node = MockNode(name="end")
+        object_manager.add_object_by_name_in(workflow, end_node.name, end_node)
+        object_manager.del_obj_by_name_in(workflow, end_node.name)
+        context = ControlFlowContext(workflow, "canvas", 1, engine=engine)
+        context.current_nodes = [end_node]
+
+        await CompleteState.on_enter(context)
+
+        [finished] = _execution_events(put_events, ControlFlowResolvedEvent)
+        assert end_node.workflow is None
+        assert finished.payload.end_node_name == "end"
+        assert finished.workflow_id == "wf"
 
 
 class TestFlowManagerEventsNameTheWorkflowItActsOn:
