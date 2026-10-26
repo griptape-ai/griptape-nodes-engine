@@ -2,10 +2,10 @@
 
 Most libraries are fully described by their `griptape_nodes_library.json` manifest: the
 engine reads it, imports the node modules it names, and registers those classes. An
-**advanced library** is an optional Python class that lets your library run code at five
-points in its own lifecycle: before its nodes load, after they load, before it is
-unregistered, when the engine collects request handlers, and when it collects
-post-dispatch hooks.
+**advanced library** is an optional Python class that lets your library run code at
+points in its own lifecycle: before its nodes load, after they load, and before it is
+unregistered. It also hands the engine things to register on your library's behalf:
+request handlers, post-dispatch hooks, and event listeners.
 
 This page is the author's reference for that class. For the manifest itself (metadata,
 categories, declarations, dependency management) see
@@ -28,6 +28,12 @@ list in the manifest. That is the common case and it needs no Python beyond the 
 - **React after the engine handles a request** it already owns, such as running your own
     step every time a workflow is saved. See
     [`get_post_dispatch_hooks`](#get_post_dispatch_hooks).
+- **Watch every node a workflow runs**, including the nodes inside groups and loops: log
+    when each one starts and how it ends, time it, or send it to your own monitoring. See
+    [`get_execution_event_listeners`](#get_execution_event_listeners) and the
+    [timing example](#example-a-library-that-times-every-node-run).
+- **React to what happens in the engine process**, such as a setting changing. See
+    [`get_app_event_listeners`](#get_app_event_listeners).
 - **Register a competing provider** for an engine request type, such as a workflow
     publisher. See [Publishing](../../guides/publishing.md).
 
@@ -90,7 +96,9 @@ that silently does nothing. Registering a library runs, in order:
 | 9    | **Calls `after_library_nodes_loaded`**                              |
 | 10   | **Calls `get_request_handlers`** and registers what it returns      |
 | 11   | **Calls `get_post_dispatch_hooks`** and registers what it returns   |
-| 12   | Computes library fitness and marks the library `LOADED`             |
+| 12   | **Calls `get_execution_event_listeners`** and registers them        |
+| 13   | **Calls `get_app_event_listeners`** and registers them              |
+| 14   | Computes library fitness and marks the library `LOADED`             |
 
 Two consequences worth internalizing:
 
@@ -104,7 +112,7 @@ Unregistering runs in the reverse spirit:
 | Step | What the engine does                                                            |
 | ---- | ------------------------------------------------------------------------------- |
 | 1    | **Calls `before_library_unregistered`**                                         |
-| 2    | Removes the library's app event listeners, pre-dispatch and post-dispatch hooks |
+| 2    | Removes the library's app and execution event listeners, and its dispatch hooks |
 | 3    | Removes the request handlers it registered                                      |
 | 4    | Unregisters the library's widgets                                               |
 | 5    | Removes the library from the `LibraryRegistry`                                  |
@@ -272,18 +280,18 @@ def get_post_dispatch_hooks(self) -> list[tuple[type[RequestPayload], Callable]]
 Returns `(request_type, callback)` pairs the engine registers on your behalf, and
 deregisters when your library unloads. After the engine's own handler for that request
 type produces a result, your callback is invoked with `(request, result)`. This is how a
-library runs its own step when something happens in the engine — appending to an audit
-log, posting to a chat channel, kicking off an export — for a request type it does not
+library runs its own step, such as appending to an audit log, posting to a chat channel,
+or kicking off an export, when the engine handles a request type the library does not
 own.
 
 It is the mirror image of [`get_request_handlers`](#get_request_handlers), and the
 difference is ownership:
 
-|                         | `get_request_handlers`         | `get_post_dispatch_hooks`                           |
-| ----------------------- | ------------------------------ | --------------------------------------------------- |
-| Claims the request type | Yes — one handler engine-wide  | No — any number of libraries may hook the same type |
-| When it runs            | *Instead of* an engine handler | *After* the engine's handler produced a result      |
-| Can change the outcome  | It **is** the outcome          | No, notification only                               |
+|                         | `get_request_handlers`         | `get_post_dispatch_hooks`                          |
+| ----------------------- | ------------------------------ | -------------------------------------------------- |
+| Claims the request type | Yes, one handler engine-wide   | No, any number of libraries may hook the same type |
+| When it runs            | *Instead of* an engine handler | *After* the engine's handler produced a result     |
+| Can change the outcome  | It **is** the outcome          | No, notification only                              |
 
 That is why you can hook `SaveWorkflowRequest`, which `WorkflowManager` already owns and
 which `get_request_handlers` would fail to claim.
@@ -311,8 +319,9 @@ Constraints on the mechanism:
     type to filter, as the example above does.
 - **Usually detached, sometimes not.** Whenever the engine has a live event loop the hook
     is scheduled as a detached task, so the result reaches the editor without waiting for
-    it. Some paths have no such loop — CLI commands, bootstrap workflow runs, worker
-    threads — and there the hook runs inline and **blocks the caller until it returns**.
+    it. Some paths, such as CLI commands, bootstrap workflow runs, and worker threads,
+    have no such loop, and there the hook runs inline and **blocks the caller until it
+    returns**.
     Keep hooks quick, or move slow work off-process, if they may fire on those paths.
 - **Exact type matching.** A hook registered for a request type fires for that exact type
     only, never for its subclasses.
@@ -322,7 +331,8 @@ Constraints on the mechanism:
     not a way to read them.
 - **Do not issue engine requests from a hook.** The engine's operation-depth and
     node-execution state is process-wide, so a request sent from a hook can perturb an
-    operation that is still in flight. Do external work — HTTP, file writes — instead.
+    operation that is still in flight. Do external work, such as HTTP calls or file
+    writes, instead.
 - **Registered per process.** Hooks are registered on the event manager of whichever
     process loads the library. A library whose nodes execute in a worker loads in both
     processes, so each copy observes only the requests its own process handles. See
@@ -330,10 +340,75 @@ Constraints on the mechanism:
 - **Not durable.** Hooks still in flight when the process exits are abandoned. Do not use
     them where delivery has to be guaranteed.
 
-A malformed pair — a callback that is not callable, or a key that is not a request type —
-is reported as a `PostDispatchHookRegistrationProblem` and stops the rest of the list from
-registering, leaving the library `FLAWED`. Pairs registered before the bad one stay
-active, and are still removed when the library unloads.
+A pair is malformed when its callback is not callable or its key is not a request type. A
+malformed pair is reported as a `PostDispatchHookRegistrationProblem` and stops the rest
+of the list from registering, leaving the library `FLAWED`. Pairs registered before the
+bad one stay active, and are still removed when the library unloads.
+
+### `get_execution_event_listeners`
+
+```python
+def get_execution_event_listeners(self) -> list[tuple[type[ExecutionPayload], Callable]]: ...
+```
+
+Returns `(event_type, callback)` pairs. While Griptape Nodes runs a workflow, it calls
+your callback with the event each time one of that type happens. The engine registers
+the pairs when your library loads and removes them when it unloads.
+
+|               | `get_post_dispatch_hooks`    | `get_execution_event_listeners`  | `get_app_event_listeners`          |
+| ------------- | ---------------------------- | -------------------------------- | ---------------------------------- |
+| Reacts to     | A request the engine handled | Something that happened in a run | Something that happened to the app |
+| Called with   | `(request, result)`          | The event                        | The event                          |
+| Sync or async | Both                         | Sync only                        | Both                               |
+| When it runs  | After the request is handled | As the event happens             | As the event happens               |
+
+Rules for writing a listener:
+
+- **Keep it quick.** The workflow waits for your callback to return, so a slow one holds
+    it up. Hand slow work, such as network calls or writing files, to a background thread.
+    The [timing example](#example-a-library-that-times-every-node-run) shows how.
+- **Synchronous only.** An `async` callback is reported as an
+    `ExecutionEventListenerRegistrationProblem`.
+- **Notification only.** The return value is ignored. If your callback raises, the error
+    is logged and the workflow carries on.
+- **Don't modify the event.** Other listeners receive the same one.
+- **Exact type matching.** A listener for an event type hears that type only, never its
+    subclasses.
+
+A pair is malformed when its callback is not callable or its key is not an execution event
+type. A malformed pair is reported as an `ExecutionEventListenerRegistrationProblem` and
+stops the rest of the list from registering, leaving the library `FLAWED`. Pairs
+registered before the bad one stay active, and are still removed when the library unloads.
+
+### `get_app_event_listeners`
+
+```python
+def get_app_event_listeners(self) -> list[tuple[type[AppPayload], Callable]]: ...
+```
+
+Returns `(event_type, callback)` pairs for app events: things that happen to Griptape
+Nodes itself, such as `ConfigChanged` when a setting changes or `CurrentProjectChanged`
+when the user switches projects. For example, a library that caches an API client built
+from one of its settings can drop the client when that setting changes, so the next node
+run builds a new one:
+
+```python
+def get_app_event_listeners(self):
+    return [(ConfigChanged, self._on_config_changed)]
+
+
+def _on_config_changed(self, event: ConfigChanged) -> None:
+    # An empty key means the whole configuration was replaced.
+    if event.key in ("my_library.base_url", ""):
+        self._client = None
+```
+
+Callbacks can be sync or `async`. Otherwise the rules are the same as for
+[execution event listeners](#get_execution_event_listeners), and a malformed pair is
+reported as an `AppEventListenerRegistrationProblem`. One thing to watch for: libraries
+load while Griptape Nodes starts up, so a listener for `AppInitializationComplete` doesn't
+hear the startup that loaded its library. Do that work in
+[`after_library_nodes_loaded`](#after_library_nodes_loaded) instead.
 
 ## Registering node types without listing them in the manifest
 
@@ -447,8 +522,9 @@ Prefer synthesizing definitions anyway, for two reasons:
 
 ## Examples
 
-Two complete, working libraries. Copy either folder into your workspace's `libraries`
-directory, register it through the editor's library settings, and restart the engine.
+Three complete, working libraries. Copy any of the folders into your workspace's
+`libraries` directory, register it through the editor's library settings, and restart the
+engine.
 
 ### Example: a library that serves a request type
 
@@ -485,3 +561,22 @@ manifest:
 You should see a **Dynamic** category with four nodes. Add an entry to `node_specs.json`
 reusing an existing `operator` value, restart, and a fifth node appears with no change to
 the manifest or the Python.
+
+### Example: a library that times every node run
+
+A library that logs how long every node in a workflow takes, including the nodes inside
+groups and loops, and how each run ended:
+
+- [`griptape_nodes_library.json`](example_node_timing_library/griptape_nodes_library.json):
+    manifest declaring one node and the advanced library
+- [`advanced_library.py`](example_node_timing_library/advanced_library.py): listens for
+    `NodeStartProcessEvent` and `NodeFinishProcessEvent`, and writes one log line per node
+    run from a background thread
+- [`nodes.py`](example_node_timing_library/nodes.py): a **Wait** node that waits a set
+    number of seconds, so there is something to time
+
+Add two **Wait** nodes, give them different `seconds`, connect them, and run the
+workflow. The engine log gets a line for each, such as
+`Wait_1 (WaitNode) succeeded in 2.00s`. Put a **Wait** node inside a **ForEach Group** and
+you get a line for every iteration, plus one for the group. To send the timings somewhere
+else, replace the logging call in `_on_finish`; the rest of the library stays the same.

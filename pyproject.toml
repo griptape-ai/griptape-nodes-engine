@@ -181,7 +181,10 @@ ignore = [
 # and the `__init__` built inside the class factory has to be named `__init__`.
 # TID251: node libraries are the intended audience for the GriptapeNodes facade, as the
 # ban message itself says.
+# ARG002: a hook override keeps the base class's signature even where the example doesn't
+# use every argument.
 "docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
+"docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",

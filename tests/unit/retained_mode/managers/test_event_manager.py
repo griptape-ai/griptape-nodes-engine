@@ -5,7 +5,7 @@ import inspect
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,7 +29,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
     StrictModeViolationDetail,
 )
+from griptape_nodes.retained_mode.events.execution_events import NodeFinishProcessEvent, NodeProcessOutcome
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -41,6 +43,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import (
     EventManager,
+    EventTranslationContext,
     ResultContext,
     current_request_type,
 )
@@ -2065,3 +2068,71 @@ class TestExecutionEventSubscription:
         manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output"))
 
         assert received == []
+
+
+class TestAppEventListenerRemoval:
+    """Removing app event listeners is safe to repeat, so a library always unloads cleanly."""
+
+    def test_removing_a_listener_that_is_not_subscribed_does_nothing(self) -> None:
+        event_manager = EventManager()
+        listener = AsyncMock()
+
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+
+        event_manager.add_listener_to_app_event(ConfigChanged, listener)
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+
+        event_manager.broadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+        listener.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_listener_added_during_a_broadcast_does_not_disturb_it(self) -> None:
+        event_manager = EventManager()
+        late_listener = AsyncMock()
+        heard: list[str] = []
+
+        async def listener_that_subscribes_another(event: ConfigChanged) -> None:
+            heard.append(event.key)
+            event_manager.add_listener_to_app_event(ConfigChanged, late_listener)
+
+        event_manager.add_listener_to_app_event(ConfigChanged, listener_that_subscribes_another)
+
+        await event_manager.abroadcast_app_event(ConfigChanged(key="first", old_value="a", new_value="b"))
+
+        assert heard == ["first"]
+        late_listener.assert_not_called()
+        await event_manager.abroadcast_app_event(ConfigChanged(key="second", old_value="b", new_value="c"))
+        late_listener.assert_awaited_once()
+
+
+class TestNodeProcessEventTranslation:
+    """Loop-body event translation leaves the node events' canvas names and other fields alone."""
+
+    @pytest.mark.asyncio
+    async def test_translation_keeps_every_field_of_a_finish_event(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[NodeFinishProcessEvent] = []
+        manager.add_listener_to_execution_event(NodeFinishProcessEvent, received.append)
+        error = NodeErrorDetails(message="boom", exception_type="builtins.RuntimeError")
+        finish = NodeFinishProcessEvent(
+            node_name="Body",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id="group-run",
+            outcome=NodeProcessOutcome.FAILED,
+            error_message="boom",
+            error=error,
+        )
+
+        with EventTranslationContext(manager, {"Body_1": "Body", "Start_Package_MultiNode_1": "Start"}):
+            manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+            # A copy's name is translated; everything else on the event survives the copy it makes.
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1")))
+            )
+
+        assert received == [finish, finish]

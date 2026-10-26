@@ -183,7 +183,7 @@ plugins:
           - development/custom_nodes/direct_provider_budgets.md: Checking Griptape Cloud budgets before a direct provider call and reporting its cost after
           - development/custom_nodes/error_handling.md: Best practices for secrets, imports, parameter payload size, validation, error handling, and logging
           - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
-          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
+          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, post-dispatch hooks, execution and app event listeners, and registering node types without listing them in the manifest
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library's node execution in a worker subprocess for dependency isolation

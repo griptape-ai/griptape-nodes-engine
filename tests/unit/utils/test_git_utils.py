@@ -73,7 +73,7 @@ def remove_repo(path: Path) -> None:
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run git with fixture-only identity and local-file transport settings."""
+    """Run git with fixture-only identity, local-file transport, and signing disabled."""
     return subprocess.run(  # noqa: S603
         [  # noqa: S607
             "git",
@@ -83,6 +83,10 @@ def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
             "user.name=Test",
             "-c",
             "protocol.file.allow=always",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
             *args,
         ],
         cwd=cwd,

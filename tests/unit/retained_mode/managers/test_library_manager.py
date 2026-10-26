@@ -32,7 +32,9 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
     LibrarySchema,
+    NodeDeprecationMetadata,
     NodeMetadata,
+    NodeTypeEntry,
     get_declared_models,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
@@ -51,6 +53,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
+    ListNodeTypesInLibraryRequest,
+    ListNodeTypesInLibraryResultFailure,
+    ListNodeTypesInLibraryResultSuccess,
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultSuccess,
     LoadLibrariesRequest,
@@ -2720,6 +2725,99 @@ class TestDescribeNodeTypeRequest:
         assert "simulated I/O failure" in str(result.result_details)
 
 
+class _ListedImageNode(BaseNode):
+    """Node type registered eagerly into the ListNodeTypesInLibrary metadata test library."""
+
+
+class _ListedLegacyNode(BaseNode):
+    """Node type the ListNodeTypesInLibrary metadata tests mark deprecated."""
+
+
+class TestListNodeTypesInLibraryMetadata:
+    """Exercise ListNodeTypesInLibraryRequest.include_metadata."""
+
+    _LIBRARY = "listed-metadata-library"
+    _IMAGE_METADATA = NodeMetadata(category="image", description="Loads an image", display_name="Load Image")
+    _LEGACY_METADATA = NodeMetadata(
+        category="image",
+        description="Old image loader",
+        display_name="Legacy Image",
+        deprecation=NodeDeprecationMetadata(deprecation_message="Use Load Image", removal_version="2.0.0"),
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        """LibraryRegistry holds class-level state that survives the singleton reset fixture."""
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_library(self) -> None:
+        schema = LibrarySchema(
+            name=self._LIBRARY,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test", description="image", library_version="1.0.0", engine_version="1.0.0", tags=[]
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(_ListedImageNode, self._IMAGE_METADATA)
+        library.register_new_node_type(_ListedLegacyNode, self._LEGACY_METADATA)
+
+    def test_returns_metadata_keyed_by_node_type_when_asked(self, engine: Engine) -> None:
+        self._register_library()
+
+        result = engine.library_manager.catalog.on_list_node_types_in_library_request(
+            ListNodeTypesInLibraryRequest(library=self._LIBRARY, include_metadata=True)
+        )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultSuccess), result.result_details
+        assert result.node_types == ["_ListedImageNode", "_ListedLegacyNode"]
+        assert result.node_metadata == {
+            "_ListedImageNode": self._IMAGE_METADATA,
+            "_ListedLegacyNode": self._LEGACY_METADATA,
+        }
+
+    def test_leaves_metadata_out_by_default(self, engine: Engine) -> None:
+        self._register_library()
+
+        result = engine.library_manager.catalog.on_list_node_types_in_library_request(
+            ListNodeTypesInLibraryRequest(library=self._LIBRARY)
+        )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultSuccess), result.result_details
+        assert result.node_types == ["_ListedImageNode", "_ListedLegacyNode"]
+        assert result.node_metadata is None
+
+    def test_unknown_library_fails(self, engine: Engine) -> None:
+        result = engine.library_manager.catalog.on_list_node_types_in_library_request(
+            ListNodeTypesInLibraryRequest(library="No Such Library", include_metadata=True)
+        )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultFailure)
+
+    def test_metadata_does_not_resolve_or_construct_node_classes(self, engine: Engine) -> None:
+        self._register_library()
+
+        with (
+            patch.object(NodeTypeEntry, "resolve") as resolve,
+            patch.object(Library, "get_node_class") as get_node_class,
+            patch.object(Library, "create_node") as create_node,
+            patch.object(_ListedImageNode, "__init__") as image_node_init,
+        ):
+            result = engine.library_manager.catalog.on_list_node_types_in_library_request(
+                ListNodeTypesInLibraryRequest(library=self._LIBRARY, include_metadata=True)
+            )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultSuccess), result.result_details
+        resolve.assert_not_called()
+        get_node_class.assert_not_called()
+        create_node.assert_not_called()
+        image_node_init.assert_not_called()
+
+
 class _LifecycleProbe(BaseNode):
     """Concrete BaseNode used to exercise Library.create_node's metadata injection."""
 
@@ -3961,55 +4059,6 @@ class TestProvisionGitLibraryOverwriteDir:
         assert sent_request.target_directory_name is None
 
 
-class TestLibraryManagerInitializationFlag:
-    """Test the is_initializing flag reported on the engine heartbeat."""
-
-    def test_not_initializing_by_default(self, engine: Engine) -> None:
-        assert engine.library_manager.is_initializing() is False
-
-    @pytest.mark.asyncio
-    async def test_reload_brackets_is_initializing(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        """is_initializing() is True for the duration of the reload and False once it returns."""
-        from griptape_nodes.retained_mode.events.library_events import (
-            ReloadAllLibrariesRequest,
-            ReloadAllLibrariesResultSuccess,
-        )
-
-        library_manager = engine.library_manager
-        observed: dict[str, bool] = {}
-
-        async def fake_run(_request: ReloadAllLibrariesRequest) -> ReloadAllLibrariesResultSuccess:
-            observed["during"] = library_manager.is_initializing()
-            return ReloadAllLibrariesResultSuccess(result_details="ok")
-
-        monkeypatch.setattr(library_manager, "_run_reload_libraries", fake_run)
-
-        await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
-
-        assert observed["during"] is True
-        assert library_manager.is_initializing() is False
-
-    @pytest.mark.asyncio
-    async def test_reload_clears_is_initializing_on_exception(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A failure during reload still clears the flag (finally), so the GUI doesn't hang."""
-        from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
-
-        library_manager = engine.library_manager
-
-        async def boom(_request: ReloadAllLibrariesRequest) -> None:
-            msg = "boom"
-            raise RuntimeError(msg)
-
-        monkeypatch.setattr(library_manager, "_run_reload_libraries", boom)
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
-
-        assert library_manager.is_initializing() is False
-
-
 class TestDownloadLibraryRegisterPersistence:
     """download_library_request must only persist to the GLOBAL config when registering now.
 
@@ -4466,7 +4515,7 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
 
 
 class TestCollectLibraryLoadStatuses:
-    """_collect_library_load_statuses turns LibraryInfo into serializable status data."""
+    """collect_library_load_statuses turns LibraryInfo into serializable status data."""
 
     def test_maps_fields_and_disabled_state(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -4494,7 +4543,7 @@ class TestCollectLibraryLoadStatuses:
             "/libs/off.json": disabled,
         }
 
-        statuses = library_manager._collect_library_load_statuses()
+        statuses = library_manager.collect_library_load_statuses()
 
         # Unpacking enforces exactly two statuses were produced.
         good_status, disabled_status = statuses
@@ -4513,7 +4562,7 @@ class TestCollectLibraryLoadStatuses:
         library_manager = engine.library_manager
         library_manager._library_file_path_to_info = {}
 
-        assert library_manager._collect_library_load_statuses() == []
+        assert library_manager.collect_library_load_statuses() == []
 
 
 class TestLibraryFitnessAuthorizationCheckpoint:

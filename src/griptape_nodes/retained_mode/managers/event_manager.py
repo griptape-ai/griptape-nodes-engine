@@ -43,6 +43,7 @@ from griptape_nodes.utils.async_utils import call_function, to_thread
 if TYPE_CHECKING:
     import types
     from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Set as AbstractSet
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
@@ -185,6 +186,10 @@ class EventManager(EngineScoped):
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
+        # Libraries subscribe while they load, which runs in asyncio.to_thread, while a broadcast
+        # may be iterating a set on the loop's thread, so guard the dict and snapshot a set before
+        # iterating.
+        self._app_event_listeners_lock = threading.Lock()
         # Dictionary to store ALL SUBSCRIBERS to execution events (the live feed of
         # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
         # tap the feed while it runs and react (e.g. stream tokens to a parameter).
@@ -271,13 +276,19 @@ class EventManager(EngineScoped):
         attribute depending on the wrapper: request results expose it as ``result``, execution
         events as ``payload``, and both may arrive already wrapped in a ``GriptapeNodeEvent``.
 
+        Matching is by ``isinstance``, so a set may name a base class such as ``ResultPayload``.
+
         Suppression is scoped to the current context; see ``_suppressed_event_types``.
         """
         suppressed_types = _suppressed_event_types.get()
         if not suppressed_types:
             return False
 
-        return any(type(candidate) in suppressed_types for candidate in _suppression_candidates(event))
+        return any(
+            isinstance(candidate, suppressed_type)
+            for candidate in _suppression_candidates(event)
+            for suppressed_type in suppressed_types
+        )
 
     def clear_event_suppression(self) -> None:
         """Drop any suppression the current context has in effect.
@@ -338,6 +349,11 @@ class EventManager(EngineScoped):
         if self._event_queue is None:
             return
 
+        # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
+        if self.should_suppress_event(event):
+            self._dispatch_to_execution_listeners(event)
+            return
+
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
             # _is_cross_thread_call() guarantees _event_loop is not None
@@ -360,6 +376,11 @@ class EventManager(EngineScoped):
             event: The event to publish to the queue
         """
         if self._event_queue is None:
+            return
+
+        # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
+        if self.should_suppress_event(event):
+            self._dispatch_to_execution_listeners(event)
             return
 
         if self._is_cross_thread_call() and self._event_loop is not None:
@@ -1299,12 +1320,13 @@ class EventManager(EngineScoped):
         lives in, and a peer's payload describes the peer, so acting on it would corrupt the
         receiver. A worker that has something to tell the orchestrator sends it a request.
         """
-        listener_set = self._app_event_listeners.get(app_event_type)
-        if listener_set is None:
-            listener_set = set()
-            self._app_event_listeners[app_event_type] = listener_set
+        with self._app_event_listeners_lock:
+            listener_set = self._app_event_listeners.get(app_event_type)
+            if listener_set is None:
+                listener_set = set()
+                self._app_event_listeners[app_event_type] = listener_set
 
-        listener_set.add(callback)
+            listener_set.add(callback)
 
     def add_listener_to_execution_event(self, execution_event_type: type[EP], callback: Callable[[EP], None]) -> None:
         """Subscribe to a type of execution event on the live event feed.
@@ -1333,6 +1355,12 @@ class EventManager(EngineScoped):
         ``remove_listener_for_execution_event``). The agent payloads are the exception:
         they carry the ``thread_id`` of their conversation, so a subscriber can filter
         on that instead.
+
+        A library should return its listeners from
+        ``AdvancedNodeLibrary.get_execution_event_listeners()`` instead of calling this, so the
+        engine removes them when the library unloads.
+
+        Nothing is delivered while the event queue has not been initialized.
         """
         callback_call = type(callback).__call__
         if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(callback_call):
@@ -1398,8 +1426,23 @@ class EventManager(EngineScoped):
     def remove_listener_for_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
-        listener_set = self._app_event_listeners[app_event_type]
-        listener_set.remove(callback)
+        """Unsubscribe a callback previously registered with ``add_listener_to_app_event``.
+
+        Removing a callback that is not subscribed does nothing, so a library that listed the same
+        listener twice still unloads cleanly.
+        """
+        with self._app_event_listeners_lock:
+            listener_set = self._app_event_listeners.get(app_event_type)
+            if listener_set is None:
+                return
+            listener_set.discard(callback)
+            if not listener_set:
+                del self._app_event_listeners[app_event_type]
+
+    def _app_event_listeners_for(self, app_event_type: type[AppPayload]) -> list[Callable]:
+        """A snapshot of the listeners for an app event type, safe to iterate while others subscribe."""
+        with self._app_event_listeners_lock:
+            return list(self._app_event_listeners.get(app_event_type, ()))
 
     def broadcast_app_event(self, app_event: AP) -> None:
         """Broadcast an app event to all registered listeners (sync version).
@@ -1407,17 +1450,15 @@ class EventManager(EngineScoped):
         Args:
             app_event: The app event to broadcast
         """
-        app_event_type = type(app_event)
-        if app_event_type in self._app_event_listeners:
-            listener_set = self._app_event_listeners[app_event_type]
-
+        listeners = self._app_event_listeners_for(type(app_event))
+        if listeners:
             # Support async callbacks for sync method. See the matching comment
             # in handle_request for the ThreadRunner rationale: listeners here
             # are user-supplied callbacks that do not share primitives with the
             # caller's loop, so the side-loop path is safe.
             async def _broadcast_async() -> None:
                 async with asyncio.TaskGroup() as tg:
-                    for listener_callback in listener_set:
+                    for listener_callback in listeners:
                         tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
             if _running_loop() is not None:
@@ -1432,12 +1473,10 @@ class EventManager(EngineScoped):
         Args:
             app_event: The app event to broadcast
         """
-        app_event_type = type(app_event)
-        if app_event_type in self._app_event_listeners:
-            listener_set = self._app_event_listeners[app_event_type]
-
+        listeners = self._app_event_listeners_for(type(app_event))
+        if listeners:
             async with asyncio.TaskGroup() as tg:
-                for listener_callback in listener_set:
+                for listener_callback in listeners:
                     tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
     async def _call_app_event_listener(
@@ -1490,9 +1529,9 @@ class EventSuppressionContext:
     permanently dark event stream desyncs the editor.
     """
 
-    events_to_suppress: set[type]
+    events_to_suppress: AbstractSet[type]
 
-    def __init__(self, manager: EventManager, events_to_suppress: set[type]):
+    def __init__(self, manager: EventManager, events_to_suppress: AbstractSet[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
         self._tokens: list[contextvars.Token[frozenset[type]]] = []

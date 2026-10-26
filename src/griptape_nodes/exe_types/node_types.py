@@ -2305,10 +2305,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # receive resolved values without the node needing to know about variables.
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
-        if _in_aprocess.get():
-            parameter = self._node.get_parameter_by_name(key)
-            if parameter is None or parameter.allow_variable_substitution:
-                value = self._node._resolve_variables_in_value(value)
+        if _in_aprocess.get() and self._substitutes_on_write(key, value):
+            value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -2318,6 +2316,28 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # would keep showing the stale prior value.
         if not had_key or _values_differ(old_value, value):
             self._emit_parameter_change_event(key, value)
+
+    def _substitutes_on_write(self, key: str, value: Any) -> bool:
+        """Whether a value written to ``key`` during a run gets its variables resolved.
+
+        Mirrors the gate in ``get_parameter_value``: a parameter fed by a connection is not
+        substituted. Its value was resolved once already, by the node that produced it, or that
+        node opted out, which is a statement that the text is data rather than a template. A
+        node that copies a connected input onto its own output (the End node does this for
+        every parameter) would otherwise resolve it a second time, and a status such as
+        ``Saved to: {outputs}/a.mp4`` that the producer deliberately kept as a macro would be
+        written into the saved workflow as the absolute path.
+
+        Ordered cheap to expensive. The connection lookup is a request round trip, and this
+        runs on every output write, including each token a streaming node appends, so a value
+        with no macro in it must leave before reaching it.
+        """
+        if not VariableResolver.contains_variable_macro(value):
+            return False
+        parameter = self._node.get_parameter_by_name(key)
+        if parameter is not None and not parameter.allow_variable_substitution:
+            return False
+        return not self._node._param_has_incoming_connection(key)
 
     def __delitem__(self, key: str) -> None:
         if key in self:
@@ -2533,6 +2553,9 @@ class SuccessFailureNode(BaseNode):
             parameter_group_initially_collapsed=parameter_group_initially_collapsed,
             result_details_tooltip=result_details_tooltip,
             result_details_placeholder=result_details_placeholder,
+            # The node writes its own status, often naming a project path as a macro such as
+            # {outputs}/file.png. Substitution would expand it to the absolute path.
+            result_details_allow_variable_substitution=False,
         )
 
     def _clear_execution_status(self) -> None:

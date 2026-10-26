@@ -189,6 +189,18 @@ class ListRows:
                 values.pop(row.name, None)
         return values
 
+    def has_connected_rows(self, parameter: Parameter) -> bool:
+        """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
+
+        Checked only when there are rows: on a worker the question goes to the orchestrator.
+        """
+        if not isinstance(parameter, ParameterList):
+            return False
+        rows = parameter.get_child_parameters()
+        if not rows:
+            return False
+        return bool(self._connected_parameter_names({row.name for row in rows}))
+
     def _replace(self, parameter_list: ParameterList, items: Any) -> None:
         """Replace the list's rows with one row per entry of `items`, the way the editor fills a list.
 
@@ -212,8 +224,7 @@ class ListRows:
             msg = f"Attempted to set list {list_label} to {item_count} items, counting the items of any list in it. Failed because the list holds at most {max_items} items."
             raise ValueError(msg)
         old_rows = parameter_list.get_child_parameters()
-        # Checked only when there are rows: on a worker the question goes to the orchestrator.
-        if old_rows and self._connected_parameter_names({row.name for row in old_rows}):
+        if self.has_connected_rows(parameter_list):
             msg = f"Attempted to set list {list_label}. Failed because some of its items are connected to other nodes, and replacing the items would remove those connections. Disconnect them first."
             raise ValueError(msg)
 

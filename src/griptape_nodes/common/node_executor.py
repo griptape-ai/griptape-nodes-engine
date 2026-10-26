@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -14,6 +15,12 @@ import anyio
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketUnavailableError
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
 from griptape_nodes.common.isolated_execution_scope import isolated_execution_scope
+from griptape_nodes.common.loop_body_scope import (
+    LoopBodyScope,
+    current_loop_body_scope,
+    entered_loop_body_scope,
+    loop_body_scope_for,
+)
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -44,7 +51,14 @@ from griptape_nodes.node_library.library_registry import Library, LibraryRegistr
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
-from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
+from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
+    ForwardedException,
+    ProgressEvent,
+    ResultPayload,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
@@ -63,6 +77,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     InvolvedNodesEvent,
     NodeFinishProcessEvent,
     NodeMetadata,
+    NodeProcessOutcome,
     NodeResolvedEvent,
     NodeStartProcessEvent,
     NodeUnresolvedEvent,
@@ -86,7 +101,11 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails, build_engine_error_details
+from griptape_nodes.retained_mode.events.node_error_details import (
+    NodeErrorDetails,
+    build_engine_error_details,
+    build_node_error_details,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultFailure,
     CreateNodeResultSuccess,
@@ -136,6 +155,10 @@ logger = logging.getLogger("griptape_nodes")
 # Tracks the name of the node currently being executed in this async context.
 # Each asyncio task gets its own copy, so parallel node execution is safe.
 current_executing_node_name: ContextVar[str | None] = ContextVar("current_executing_node_name", default=None)
+
+# The execution_id of the node run in progress in this async context, sent as parent_execution_id
+# on the node events of every run nested inside it.
+current_node_execution_id: ContextVar[str | None] = ContextVar("current_node_execution_id", default=None)
 
 
 class IterationControlAction(StrEnum):
@@ -206,18 +229,20 @@ LOOP_EVENTS_TO_SUPPRESS = {
     SetLockNodeStateResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
     DeserializeFlowFromCommandsResultFailure,
+    # Everything else the bookkeeping dispatches (connection listings, parameter additions, deletes), by
+    # base class: should_suppress_event matches by isinstance.
+    ResultPayload,
+    # Element events of the packaged copies. These cannot be translated to the real node: the editor
+    # matches elements by id, and a copy's ids are its own.
+    AlterElementEvent,
+    RemoveElementEvent,
 }
 
-# NOTE: every member of this set is inert, and test_execution_events_to_suppress_is_entirely_inert
-# checks that it stays that way. Execution events are emitted through put_event/aput_event, which
-# never consult should_suppress_event -- only request results are checked (engine.py). The set is
-# kept as the record of intent: the aim is to stop parallel iterations from flooding the websocket
-# with per-node execution traffic. Wiring put_event up to suppression would also silence the node
-# highlighting that EventTranslationContext exists to provide, so it needs its own design rather
-# than a one-line change.
-#
-# Only ExecutionPayload members belong here. A ResultPayload in this set is a live transport change
-# wearing the costume of a no-op: put it in LOOP_EVENTS_TO_SUPPRESS deliberately, or leave it out.
+# Execution events from a parallel loop's iteration flows. The editor has no node by those names.
+# Don't use in the sequential path: it relies on EventTranslationContext to highlight the real node.
+# Execution-event listeners hear every parallel iteration either way. NodeStartProcessEvent and
+# NodeFinishProcessEvent are not here: the loop body scope reports them under canvas names (#5950).
+# Only ExecutionPayload members belong here; request results go in LOOP_EVENTS_TO_SUPPRESS.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -228,8 +253,6 @@ EXECUTION_EVENTS_TO_SUPPRESS = {
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
     NodeUnresolvedEvent,
-    NodeStartProcessEvent,
-    NodeFinishProcessEvent,
     InvolvedNodesEvent,
     GriptapeEvent,
     PublishWorkflowProgressEvent,
@@ -285,6 +308,13 @@ class ExecuteNodeFailedError(RuntimeError):
         self.details = details
 
 
+def node_error_details_for(node_name: str, exc: BaseException) -> NodeErrorDetails:
+    """Use the details built where the node failed, or build them from an engine exception that never became a result."""
+    if isinstance(exc, ExecuteNodeFailedError):
+        return exc.details
+    return build_node_error_details(node_name, exc)
+
+
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
@@ -298,11 +328,43 @@ class NodeExecutor(EngineScoped):
         raise ValueError(msg)
 
     async def execute(self, node: BaseNode) -> None:
-        """Execute the given node.
+        """Execute the given node, sending NodeStartProcessEvent before it runs and NodeFinishProcessEvent after.
+
+        The events use the synchronous put_event so the finish event still goes out from a cancelled
+        task. Nodes the engine added to a loop body run without either event.
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
+        """
+        loop_body_scope = current_loop_body_scope.get()
+        if loop_body_scope is not None and loop_body_scope.is_engine_node(node.name):
+            await self._run_node(node)
+            return
+
+        start_event = self._node_start_process_event(node, loop_body_scope)
+        self._put_execution_event(start_event)
+        outcome = NodeProcessOutcome.FAILED
+        failure: Exception | None = None
+        token = current_node_execution_id.set(start_event.execution_id)
+        try:
+            await self._run_node(node)
+            outcome = self._outcome_after_return(node)
+        except asyncio.CancelledError:
+            outcome = NodeProcessOutcome.CANCELLED
+            raise
+        except Exception as err:
+            # Broad by design: only recorded for the finish event, then re-raised unchanged.
+            failure = err
+            raise
+        finally:
+            current_node_execution_id.reset(token)
+            self._put_execution_event(self._node_finish_process_event(start_event, outcome=outcome, failure=failure))
+
+    async def _run_node(self, node: BaseNode) -> None:
+        """Run the given node by the path its type and execution environment call for.
+
+        Args:
+            node: The BaseNode to execute
         """
         token = current_executing_node_name.set(node.name)
         try:
@@ -383,6 +445,68 @@ class NodeExecutor(EngineScoped):
             # A connection torn down while this node was running left its input value in place so the
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
+
+    def _node_start_process_event(self, node: BaseNode, loop_body_scope: LoopBodyScope | None) -> NodeStartProcessEvent:
+        """Describe the node about to run as the artist placed it, with a fresh execution_id.
+
+        Everything is captured here, before the run, so the finish event can describe a node that
+        was deleted while it ran.
+        """
+        canvas_node_name = node.name
+        if loop_body_scope is not None:
+            scoped_node_name = loop_body_scope.canvas_name_for(node.name)
+            if scoped_node_name is not None:
+                canvas_node_name = scoped_node_name
+        return NodeStartProcessEvent(
+            node_name=canvas_node_name,
+            node_type=node.__class__.__name__,
+            specific_library_name=node.metadata.get("library"),
+            flow_name=self._parent_flow_name(canvas_node_name),
+            execution_id=uuid.uuid4().hex,
+            parent_execution_id=current_node_execution_id.get(),
+        )
+
+    def _node_finish_process_event(
+        self,
+        start_event: NodeStartProcessEvent,
+        *,
+        outcome: NodeProcessOutcome,
+        failure: Exception | None,
+    ) -> NodeFinishProcessEvent:
+        """Describe how the run that start_event announced ended."""
+        error_message = None
+        error = None
+        if failure is not None:
+            error_message = str(failure)
+            error = node_error_details_for(start_event.node_name, failure)
+        return NodeFinishProcessEvent(
+            node_name=start_event.node_name,
+            node_type=start_event.node_type,
+            specific_library_name=start_event.specific_library_name,
+            flow_name=start_event.flow_name,
+            execution_id=start_event.execution_id,
+            parent_execution_id=start_event.parent_execution_id,
+            outcome=outcome,
+            error_message=error_message,
+            error=error,
+        )
+
+    def _parent_flow_name(self, node_name: str) -> str | None:
+        """The flow the node is in, or None when no node by that name exists."""
+        try:
+            return self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+        except KeyError:
+            return None
+
+    def _put_execution_event(self, payload: ExecutionPayload) -> None:
+        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+
+    @staticmethod
+    def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
+        """A node that returned after a cancel was requested stopped early on purpose: it was cancelled."""
+        if node.is_cancellation_requested:
+            return NodeProcessOutcome.CANCELLED
+        return NodeProcessOutcome.SUCCEEDED
 
     def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
         message = self._format_node_failure_message(node_name, result, exc)
@@ -1338,6 +1462,7 @@ class NodeExecutor(EngineScoped):
             reverse_node_mapping = {
                 packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
             }
+            loop_body_scope = self._loop_body_scope(package_result, node_name_mappings)
 
             if packaged_start_node_name is None:
                 msg = f"Could not find deserialized Start node (original: '{start_node_name}') for sequential loop"
@@ -1378,7 +1503,11 @@ class NodeExecutor(EngineScoped):
                     flow_name,
                     packaged_start_node_name,
                 )
-                with EventTranslationContext(event_manager, reverse_node_mapping):
+                with (
+                    EventTranslationContext(event_manager, reverse_node_mapping),
+                    entered_loop_body_scope(loop_body_scope),
+                    EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+                ):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=packaged_start_node_name,
@@ -1838,6 +1967,7 @@ class NodeExecutor(EngineScoped):
                 resolved_upstream_values=resolved_upstream_values,
                 iteration_startflow_params=iteration_startflow_params,
                 reverse_node_mapping=reverse_node_mapping,
+                loop_body_scope=self._loop_body_scope(package_result, node_name_mappings),
                 event_manager=event_manager,
                 max_iterations=max_iterations,
                 total_iterations=total_iterations,
@@ -1928,6 +2058,7 @@ class NodeExecutor(EngineScoped):
         resolved_upstream_values: dict[str, Any],
         iteration_startflow_params: list[str],
         reverse_node_mapping: dict[str, str],
+        loop_body_scope: LoopBodyScope,
         event_manager: Any,
         max_iterations: int,
         total_iterations: int,
@@ -1957,7 +2088,11 @@ class NodeExecutor(EngineScoped):
             )
 
             # Execute the subflow
-            with EventTranslationContext(event_manager, reverse_node_mapping):
+            with (
+                EventTranslationContext(event_manager, reverse_node_mapping),
+                entered_loop_body_scope(loop_body_scope),
+                EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            ):
                 start_subflow_request = StartLocalSubflowRequest(
                     flow_name=flow_name,
                     start_node=packaged_start_node_name,
@@ -3004,6 +3139,24 @@ class NodeExecutor(EngineScoped):
         msg = f"start_or_end must be 'start' or 'end', got {start_or_end}"
         raise ValueError(msg)
 
+    def _loop_body_scope(
+        self, package_result: PackageNodesAsSerializedFlowResultSuccess, node_name_mappings: dict[str, str]
+    ) -> LoopBodyScope:
+        """The scope naming one deserialized copy of a loop body by the canvas nodes it stands for.
+
+        Entered around each iteration, so the node events it sends name canvas nodes rather than
+        the copies, and leave out the Start and End nodes the engine adds to the body.
+        """
+        engine_made_node_names = {
+            self.get_node_parameter_mappings(package_result, "start").node_name,
+            self.get_node_parameter_mappings(package_result, "end").node_name,
+        }
+        return loop_body_scope_for(
+            node_name_mappings,
+            engine_made_node_names=engine_made_node_names,
+            enclosing_scope=current_loop_body_scope.get(),
+        )
+
     def get_parameter_values_from_iterations(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
@@ -3155,6 +3308,13 @@ class NodeExecutor(EngineScoped):
 
         return last_iteration_values
 
+    def _parallel_iteration_gate(self, total_iterations: int) -> asyncio.Semaphore:
+        """Semaphore sized by `max_loop_iterations_in_parallel`; 0 or unset means no limit."""
+        configured_limit = self.engine.config_manager.get_config_value("max_loop_iterations_in_parallel", default=0)
+        if configured_limit is None or configured_limit <= 0:
+            return asyncio.Semaphore(max(total_iterations, 1))
+        return asyncio.Semaphore(configured_limit)
+
     async def _delete_iteration_flows(
         self,
         deserialized_flows: list[tuple[int, str, dict[str, str]]],
@@ -3169,7 +3329,7 @@ class NodeExecutor(EngineScoped):
         an in-flight exception (including CancelledError).
         """
         # Suppress events during deletion to prevent sending them to websockets.
-        with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
+        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             for iteration_index, flow_name, _ in deserialized_flows:
                 # Skip flows already torn down (e.g. a partially-run iteration cleaned itself up).
                 if self.engine.object_manager.attempt_get_object_by_name(flow_name) is None:
@@ -3225,10 +3385,15 @@ class NodeExecutor(EngineScoped):
         saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
         self._silence_packaged_node_creation_broadcasts(package_result)
 
-        # Suppress events during deserialization to prevent sending them to websockets
+        # Everything about the iteration flows stays off the wire, from the first deserialize to the last
+        # delete: the bookkeeping and, since nothing here can be translated to a canvas node, the
+        # execution events of the copies too.
         event_manager = self.engine.event_manager
-        try:
-            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS),
+        ):
+            try:
                 for iteration_index in range(total_iterations):
                     # Restore context before each deserialization to ensure all iteration flows
                     # are created at the same level (not as children of each other)
@@ -3260,160 +3425,163 @@ class NodeExecutor(EngineScoped):
                         and context_manager.get_current_flow().name == deserialize_result.flow_name
                     ):
                         context_manager.pop_flow()
-            logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
-            # Step 2: Define the per-iteration coroutine
-            packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
+                # Step 2: Define the per-iteration coroutine
+                packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                # All tasks are created up front so a cancel reaches them; the gate limits how many run.
+                concurrency_gate = self._parallel_iteration_gate(total_iterations)
 
-            async def run_single_iteration(
-                flow_name: str, iteration_index: int, start_node_name: str
-            ) -> IterationOutcome:
-                """Run a single iteration flow and report whether it finished, and why not."""
-                # Suppress execution events during parallel iteration to prevent flooding websockets
-                with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
-                    start_subflow_request = StartLocalSubflowRequest(
-                        flow_name=flow_name,
-                        start_node=start_node_name,
-                    )
-                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
-                    if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                        return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
-                    # The reason travels out with the verdict: this closure is the only place that
-                    # holds it, so anything narrower than IterationOutcome loses it for good.
-                    return IterationOutcome(
-                        iteration_index=iteration_index,
-                        succeeded=False,
-                        detail=str(start_subflow_result.result_details),
-                    )
+                async def run_single_iteration(
+                    flow_name: str, iteration_index: int, start_node_name: str, loop_body_scope: LoopBodyScope
+                ) -> IterationOutcome:
+                    """Run a single iteration flow and report whether it finished, and why not."""
+                    async with concurrency_gate:
+                        with entered_loop_body_scope(loop_body_scope):
+                            start_subflow_request = StartLocalSubflowRequest(
+                                flow_name=flow_name,
+                                start_node=start_node_name,
+                            )
+                            start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
+                            if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
+                                return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
+                            # The reason travels out with the verdict: this closure is the only place that
+                            # holds it, so anything narrower than IterationOutcome loses it for good.
+                            return IterationOutcome(
+                                iteration_index=iteration_index,
+                                succeeded=False,
+                                detail=str(start_subflow_result.result_details),
+                            )
 
-            # Step 3: Set input values on start nodes for each iteration
-            for iteration_index, _, node_name_mappings in deserialized_flows:
-                parameter_values = parameter_values_per_iteration[iteration_index]
+                # Step 3: Set input values on start nodes for each iteration
+                for iteration_index, _, node_name_mappings in deserialized_flows:
+                    parameter_values = parameter_values_per_iteration[iteration_index]
 
-                # Get Start node mapping (index 0 in the list)
-                start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-                start_node_name = start_node_mapping.node_name
-                start_params = start_node_mapping.parameter_mappings
+                    # Get Start node mapping (index 0 in the list)
+                    start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+                    start_node_name = start_node_mapping.node_name
+                    start_params = start_node_mapping.parameter_mappings
 
-                # Find the deserialized name for the Start node
-                deserialized_start_node_name = node_name_mappings.get(start_node_name)
-                if deserialized_start_node_name is None:
-                    logger.warning(
-                        "Could not find deserialized Start node (original: '%s') for iteration %d",
-                        start_node_name,
-                        iteration_index,
-                    )
-                    continue
-
-                # Set all parameter values on the deserialized Start node
-                for startflow_param_name in start_params:
-                    if startflow_param_name not in parameter_values:
+                    # Find the deserialized name for the Start node
+                    deserialized_start_node_name = node_name_mappings.get(start_node_name)
+                    if deserialized_start_node_name is None:
+                        logger.warning(
+                            "Could not find deserialized Start node (original: '%s') for iteration %d",
+                            start_node_name,
+                            iteration_index,
+                        )
                         continue
 
-                    value_to_set = parameter_values[startflow_param_name]
+                    # Set all parameter values on the deserialized Start node
+                    for startflow_param_name in start_params:
+                        if startflow_param_name not in parameter_values:
+                            continue
 
-                    set_value_request = SetParameterValueRequest(
-                        node_name=deserialized_start_node_name,
-                        parameter_name=startflow_param_name,
-                        value=value_to_set,
-                    )
-                    set_value_result = await self.engine.ahandle_request(set_value_request)
-                    if not isinstance(set_value_result, SetParameterValueResultSuccess):
-                        logger.warning(
-                            "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
-                            startflow_param_name,
-                            deserialized_start_node_name,
-                            iteration_index,
-                            set_value_result.result_details,
+                        value_to_set = parameter_values[startflow_param_name]
+
+                        set_value_request = SetParameterValueRequest(
+                            node_name=deserialized_start_node_name,
+                            parameter_name=startflow_param_name,
+                            value=value_to_set,
                         )
-
-            logger.debug("Successfully set input values for %d iterations", total_iterations)
-            # Step 4: Run all iterations concurrently.
-            # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
-            # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
-            # falling through to the finally that deletes the iteration flows. Each iteration unwinds
-            # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
-            # awaiting them here guarantees no body-node task is still running when its flow is
-            # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
-            iteration_tasks = [
-                asyncio.ensure_future(
-                    run_single_iteration(
-                        flow_name,
-                        iteration_index,
-                        node_name_mappings.get(packaged_start_node_name),
-                    )
-                )
-                for iteration_index, flow_name, node_name_mappings in deserialized_flows
-            ]
-            try:
-                iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                for task in iteration_tasks:
-                    task.cancel()
-                # Let every iteration finish unwinding (tearing down its isolated machine) before the
-                # finally deletes the flows out from under them.
-                await asyncio.gather(*iteration_tasks, return_exceptions=True)
-                raise
-
-            # Step 5: Collect successful and failed iterations
-            successful_iterations = []
-            failed_iteration_indices = []
-            iteration_failures: list[IterationFailure] = []
-
-            for idx, result in enumerate(iteration_task_results):
-                if isinstance(result, Exception):
-                    # Exception doesn't include iteration_index, use enumerate index
-                    failed_iteration_indices.append(idx)
-                    iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
-                    continue
-                if isinstance(result, IterationOutcome):
-                    if result.succeeded:
-                        successful_iterations.append(result.iteration_index)
-                    else:
-                        failed_iteration_indices.append(result.iteration_index)
-                        iteration_failures.append(
-                            IterationFailure(
-                                iteration_index=result.iteration_index,
-                                detail=result.detail or "The iteration reported failure without a reason.",
+                        set_value_result = await self.engine.ahandle_request(set_value_request)
+                        if not isinstance(set_value_result, SetParameterValueResultSuccess):
+                            logger.warning(
+                                "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
+                                startflow_param_name,
+                                deserialized_start_node_name,
+                                iteration_index,
+                                set_value_result.result_details,
                             )
-                        )
 
-            if failed_iteration_indices:
-                logger.warning(
-                    "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
-                    "iterations.\n%s",
-                    len(failed_iteration_indices),
-                    total_iterations,
-                    "\n".join(
-                        self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
-                    ),
+                logger.debug("Successfully set input values for %d iterations", total_iterations)
+                # Step 4: Run all iterations concurrently.
+                # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
+                # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
+                # falling through to the finally that deletes the iteration flows. Each iteration unwinds
+                # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
+                # awaiting them here guarantees no body-node task is still running when its flow is
+                # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
+                iteration_tasks = [
+                    asyncio.ensure_future(
+                        run_single_iteration(
+                            flow_name,
+                            iteration_index,
+                            node_name_mappings.get(packaged_start_node_name),
+                            self._loop_body_scope(package_result, node_name_mappings),
+                        )
+                    )
+                    for iteration_index, flow_name, node_name_mappings in deserialized_flows
+                ]
+                try:
+                    iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    for task in iteration_tasks:
+                        task.cancel()
+                    # Let every iteration finish unwinding (tearing down its isolated machine) before the
+                    # finally deletes the flows out from under them.
+                    await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                    raise
+
+                # Step 5: Collect successful and failed iterations
+                successful_iterations = []
+                failed_iteration_indices = []
+                iteration_failures: list[IterationFailure] = []
+
+                for idx, result in enumerate(iteration_task_results):
+                    if isinstance(result, Exception):
+                        # Exception doesn't include iteration_index, use enumerate index
+                        failed_iteration_indices.append(idx)
+                        iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
+                        continue
+                    if isinstance(result, IterationOutcome):
+                        if result.succeeded:
+                            successful_iterations.append(result.iteration_index)
+                        else:
+                            failed_iteration_indices.append(result.iteration_index)
+                            iteration_failures.append(
+                                IterationFailure(
+                                    iteration_index=result.iteration_index,
+                                    detail=result.detail or "The iteration reported failure without a reason.",
+                                )
+                            )
+
+                if failed_iteration_indices:
+                    logger.warning(
+                        "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
+                        "iterations.\n%s",
+                        len(failed_iteration_indices),
+                        total_iterations,
+                        "\n".join(
+                            self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
+                        ),
+                    )
+
+                # Step 6: Extract parameter values from iterations BEFORE cleanup
+                iteration_results = self.get_parameter_values_from_iterations(
+                    end_loop_node=end_loop_node,
+                    deserialized_flows=deserialized_flows,
+                    package_flow_result_success=package_result,
                 )
 
-            # Step 6: Extract parameter values from iterations BEFORE cleanup
-            iteration_results = self.get_parameter_values_from_iterations(
-                end_loop_node=end_loop_node,
-                deserialized_flows=deserialized_flows,
-                package_flow_result_success=package_result,
-            )
+                # Add None values for failed iterations that didn't produce any results
+                # (e.g., nested loops may fail but still produce partial output)
+                for failed_idx in failed_iteration_indices:
+                    if failed_idx not in iteration_results:
+                        iteration_results[failed_idx] = None
 
-            # Add None values for failed iterations that didn't produce any results
-            # (e.g., nested loops may fail but still produce partial output)
-            for failed_idx in failed_iteration_indices:
-                if failed_idx not in iteration_results:
-                    iteration_results[failed_idx] = None
+                # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
+                last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
+                    deserialized_flows=deserialized_flows,
+                    package_result=package_result,
+                    total_iterations=total_iterations,
+                )
 
-            # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
-            last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
-                deserialized_flows=deserialized_flows,
-                package_result=package_result,
-                total_iterations=total_iterations,
-            )
-
-            return iteration_results, successful_iterations, last_iteration_values
-        finally:
-            # Cleanup - delete every iteration flow created above, on ALL exit paths
-            # (success, raise, cancellation). deserialized_flows is complete because each flow is
-            # appended immediately after creation, inside this try.
-            await self._delete_iteration_flows(deserialized_flows, event_manager)
+                return iteration_results, successful_iterations, last_iteration_values
+            finally:
+                # Cleanup - delete every iteration flow created above, on ALL exit paths
+                # (success, raise, cancellation). deserialized_flows is complete because each flow is
+                # appended immediately after creation, inside this try.
+                await self._delete_iteration_flows(deserialized_flows, event_manager)
 
     async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,
@@ -4087,7 +4255,14 @@ class NodeExecutor(EngineScoped):
             # parameter_values would destroy the template the user typed rather than
             # merely hiding it. The output value below still reflects the last
             # iteration for downstream consumers and artifacts.
-            if not target_node.should_preserve_stored_template(target_param_name, param_value):
+            #
+            # Skip it as well for a list whose rows are connected to other nodes. A whole
+            # list written to a node becomes its rows, and replacing a connected row would
+            # remove its connection, which the list refuses. Those rows belong to their
+            # connections; the output value below still carries the iteration's list.
+            preserves_template = target_node.should_preserve_stored_template(target_param_name, param_value)
+            rows_are_connected = target_node._list_rows.has_connected_rows(target_param)
+            if not preserves_template and not rows_are_connected:
                 target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 

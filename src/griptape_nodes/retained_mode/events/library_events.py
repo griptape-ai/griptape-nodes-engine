@@ -145,15 +145,22 @@ class ListNodeTypesInLibraryRequest(RequestPayload):
     """List all node types available in a specific library.
 
     Use when: Discovering available nodes, building node creation UIs,
-    validating node types, exploring library contents.
+    validating node types, exploring library contents. Set include_metadata when choosing
+    which node types to create: it adds each type's category, display name, description,
+    and deprecation, read from the library's registered metadata, so no node code loads.
+    To survey every library in one round trip, send one request per library from
+    ListRegisteredLibrariesRequest in an EventRequestBatch. For a node type's parameters,
+    follow up with DescribeNodeTypeRequest.
 
     Args:
         library: Name of the library to list node types for
+        include_metadata: Also return each node type's metadata in node_metadata
 
     Results: ListNodeTypesInLibraryResultSuccess (with node types) | ListNodeTypesInLibraryResultFailure (library not found)
     """
 
     library: str
+    include_metadata: bool = False
 
 
 @dataclass
@@ -162,10 +169,13 @@ class ListNodeTypesInLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayload
     """Node types in library listed successfully.
 
     Args:
-        node_types: List of node type names available in the library
+        node_types: List of node type names available in the library, in registration order
+        node_metadata: Each node type's metadata, keyed by node type name, when the request
+            set include_metadata; otherwise None
     """
 
     node_types: list[str]
+    node_metadata: dict[str, NodeMetadata] | None = None
 
 
 @dataclass

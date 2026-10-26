@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     GriptapeEvent,
     NodeFinishProcessEvent,
+    NodeProcessOutcome,
     NodeResolvedEvent,
     NodeStartProcessEvent,
 )
@@ -284,7 +285,11 @@ class SubflowExecutionComponent:
         return f"Starting: {payload.node_name}"
 
     def _format_node_finish_process(self, payload: NodeFinishProcessEvent) -> str:
-        """Format a NodeFinishProcessEvent."""
+        """Format a NodeFinishProcessEvent, saying how the node's run ended when the event knows."""
+        if payload.outcome == NodeProcessOutcome.FAILED:
+            return f"Failed: {payload.node_name}"
+        if payload.outcome == NodeProcessOutcome.CANCELLED:
+            return f"Cancelled: {payload.node_name}"
         return f"Finished: {payload.node_name}"
 
     def _format_node_resolved(self, payload: NodeResolvedEvent) -> str:

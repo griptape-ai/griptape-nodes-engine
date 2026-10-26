@@ -84,11 +84,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
 
-    async def _process_execution_event_async(self, event: ExecutionGriptapeNodeEvent) -> None:
-        """Process execution events asynchronously for real-time websocket emission."""
-        logger.debug("REAL-TIME: Processing execution event for session %s", self._session_id)
-        self._send_event("execution_event", event.wrapped_event)
-
     async def arun(
         self,
         flow_input: Any,
@@ -216,9 +211,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 elif isinstance(event, ExecutionGriptapeNodeEvent):
                     # Emit execution event via WebSocket
                     result_send_failure = self._send_execution_event(event)
-                    task = asyncio.create_task(self._process_execution_event_async(event))
-                    background_tasks.add(task)
-                    task.add_done_callback(_handle_task_done)
                     is_flow_finished, error = await self._handle_execution_event(event, flow_name)
                     # The flow's own error, if any, is the cause worth reporting.
                     if result_send_failure is not None and error is None:

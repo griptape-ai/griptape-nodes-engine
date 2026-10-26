@@ -57,6 +57,19 @@ def _make_node(
     return node
 
 
+def _make_spec_node(spec: type, name: str) -> MagicMock:
+    """A node of a specific type, for the routes that branch on it.
+
+    A spec'd mock has no attributes the class only sets in __init__, so the ones execute() reads
+    to describe the node in its events are set here.
+    """
+    node = MagicMock(spec=spec)
+    node.name = name
+    node.metadata = {}
+    node.is_cancellation_requested = False
+    return node
+
+
 def _success_result(outputs: dict[str, Any] | None = None) -> ExecuteNodeResultSuccess:
     return ExecuteNodeResultSuccess(
         result_details="ok",
@@ -246,8 +259,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_basewhilenodegroup_routes_to_handle_while_group_execution(self) -> None:
-        node = MagicMock(spec=BaseWhileNodeGroup)
-        node.name = "WhileGroup"
+        node = _make_spec_node(BaseWhileNodeGroup, "WhileGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -266,8 +278,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativenodegroup_routes_to_handle_iterative_group_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeNodeGroup)
-        node.name = "IterGroup"
+        node = _make_spec_node(BaseIterativeNodeGroup, "IterGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -286,8 +297,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativeendnode_routes_to_handle_loop_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeEndNode)
-        node.name = "EndLoop"
+        node = _make_spec_node(BaseIterativeEndNode, "EndLoop")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -301,8 +311,7 @@ class TestExecuteSpecialNodeRouting:
     @pytest.mark.asyncio
     async def test_subflownodegroup_local_execution_calls_aprocess(self) -> None:
         """When execution_environment is LOCAL_EXECUTION, run aprocess in-process and skip dispatch."""
-        node = MagicMock(spec=SubflowNodeGroup)
-        node.name = "Subflow"
+        node = _make_spec_node(SubflowNodeGroup, "Subflow")
         node.execution_environment = MagicMock()
         node.execution_environment.name = "execution_environment"
         node.get_parameter_value = MagicMock(return_value=LOCAL_EXECUTION)
