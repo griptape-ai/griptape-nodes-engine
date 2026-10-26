@@ -32,6 +32,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.implicit_conversion import find_implicit_conversion
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup, SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
@@ -52,6 +53,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultDetails,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
+    ConnectionConversion,
     CreateConnectionRequest,
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
@@ -1031,11 +1033,16 @@ class FlowManager(EngineScoped):
             replaced=replaceable_connection,
         )
 
-        # Validate that the data type from the source is allowed by the target.
+        # Validate that the data type from the source is allowed by the target. A target that opted
+        # in to implicit conversion also takes a type one of the conversion rules turns into its own.
+        implicit_conversion = None
         if adaptive_plan.target_accepts_any:
             type_allowed = True
         else:
             type_allowed = target_param.is_incoming_type_allowed(adaptive_plan.source_type)
+        if not type_allowed and target_param.implicit_conversion:
+            implicit_conversion = find_implicit_conversion(adaptive_plan.source_type, target_param.input_types)
+            type_allowed = implicit_conversion is not None
         if not type_allowed:
             details = self._type_mismatch_details(
                 source_node_name=source_node_name,
@@ -1159,6 +1166,7 @@ class FlowManager(EngineScoped):
                 target_node=target_node,
                 target_parameter=target_param,
                 is_node_group_internal=is_node_group_internal,
+                implicit_conversion=implicit_conversion,
             )
             id(conn)
         except ValueError as e:
@@ -1309,7 +1317,11 @@ class FlowManager(EngineScoped):
             if isinstance(target_node, ErrorProxyNode):
                 target_node.set_post_init_connections_modified()
 
-        result = CreateConnectionResultSuccess(result_details=details, replaced_connection=replaced_connection)
+        result = CreateConnectionResultSuccess(
+            result_details=details,
+            replaced_connection=replaced_connection,
+            conversion=ConnectionConversion.describe(implicit_conversion),
+        )
 
         return result
 

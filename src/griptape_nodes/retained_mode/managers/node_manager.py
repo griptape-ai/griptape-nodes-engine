@@ -44,12 +44,14 @@ from griptape_nodes.exe_types.core_types import (
     Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.implicit_conversion import ImplicitConversionError, preview_value
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
     BaseNode,
+    Connection,
     ErrorProxyNode,
     NodeDependencies,
     NodeResolutionState,
@@ -79,6 +81,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
+    ConnectionConversion,
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
     DeleteConnectionRequest,
@@ -1730,6 +1733,7 @@ class NodeManager(EngineScoped):
                                 source_parameter_name=connection.source_parameter.name,
                                 target_node_name=connection.target_node.name,
                                 target_parameter_name=connection.target_parameter.name,
+                                conversion=ConnectionConversion.describe(connection.implicit_conversion),
                             )
                         )
 
@@ -1745,6 +1749,7 @@ class NodeManager(EngineScoped):
                                 source_node_name=connection.source_node.name,
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=connection.target_parameter.name,
+                                conversion=ConnectionConversion.describe(connection.implicit_conversion),
                             )
                         )
 
@@ -1807,6 +1812,7 @@ class NodeManager(EngineScoped):
                     source_parameter_name=connection.source_parameter.name,
                     target_node_name=connection.target_node.name,
                     target_parameter_name=connection.target_parameter.name,
+                    conversion=ConnectionConversion.describe(connection.implicit_conversion),
                 )
                 for connection_id in connection_mgr.outgoing_index[node_name][parameter_name]
                 for connection in [connection_mgr.connections[connection_id]]
@@ -1820,6 +1826,7 @@ class NodeManager(EngineScoped):
                     source_node_name=connection.source_node.name,
                     source_parameter_name=connection.source_parameter.name,
                     target_parameter_name=connection.target_parameter.name,
+                    conversion=ConnectionConversion.describe(connection.implicit_conversion),
                 )
                 for connection_id in connection_mgr.incoming_index[node_name][parameter_name]
                 for connection in [connection_mgr.connections[connection_id]]
@@ -2740,6 +2747,13 @@ class NodeManager(EngineScoped):
             result = SetParameterValueResultFailure(result_details=details)
             return result
 
+        # A value arriving over a converting connection becomes the target's type before anything
+        # else sees it, so the node's hooks and the type check below get the converted value.
+        if incoming_node_set:
+            conversion_failure = self._convert_incoming_connection_value(request, node_name, param_name)
+            if conversion_failure is not None:
+                return conversion_failure
+
         # Prevent manual property setting on parameters that have both INPUT and PROPERTY modes when they have incoming connections
         # When a parameter can accept both input connections AND manual property values, having an active connection should
         # make the parameter non-settable as a property to avoid conflicts between connected values and manual values
@@ -2901,6 +2915,60 @@ class NodeManager(EngineScoped):
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
         )
         return result
+
+    def _convert_incoming_connection_value(
+        self, request: SetParameterValueRequest, node_name: str, param_name: str
+    ) -> SetParameterValueResultFailure | None:
+        """Convert a value passed over a converting connection in place. Returns a failure if it can't.
+
+        Only a connection made into a parameter that opted in to implicit conversion converts; for
+        every other connection this leaves the request alone.
+        """
+        source_node_name = request.incoming_connection_source_node_name
+        source_param_name = request.incoming_connection_source_parameter_name
+        connection = self._find_incoming_connection(
+            source_node_name=source_node_name,
+            source_param_name=source_param_name,
+            target_node_name=node_name,
+            target_param_name=param_name,
+        )
+        if connection is None or connection.implicit_conversion is None:
+            return None
+        conversion = connection.implicit_conversion
+        try:
+            converted = conversion.apply(request.value)
+        except ImplicitConversionError as err:
+            details = (
+                f"Attempted to pass the value {preview_value(request.value)} from "
+                f"'{source_node_name}.{source_param_name}' to '{node_name}.{param_name}', converting it from "
+                f"{conversion.source_type} to {conversion.target_type}. Failed because {err}."
+            )
+            return SetParameterValueResultFailure(result_details=details)
+        request.value = converted
+        request.data_type = conversion.target_type
+        return None
+
+    def _find_incoming_connection(
+        self,
+        *,
+        source_node_name: str | None,
+        source_param_name: str | None,
+        target_node_name: str,
+        target_param_name: str,
+    ) -> Connection | None:
+        """The connection from the named source into the named target parameter, if there is one."""
+        connections = self.engine.flow_manager.get_connections()
+        connection_ids = connections.incoming_index.get(target_node_name, {}).get(target_param_name, [])
+        for connection_id in connection_ids:
+            connection = connections.connections.get(connection_id)
+            if connection is None:
+                continue
+            if (
+                connection.source_node.name == source_node_name
+                and connection.source_parameter.name == source_param_name
+            ):
+                return connection
+        return None
 
     def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
         """Discard the output value that the set we just applied has invalidated.

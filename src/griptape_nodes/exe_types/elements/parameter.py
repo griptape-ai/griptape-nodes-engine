@@ -139,6 +139,9 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     _adaptive_declared_type: str | None = None
     _adaptive_declared_input_types: list[str] | None = None
     _adaptive_declared_output_type: str | None = None
+    # Opt-in: a wire whose type this parameter doesn't accept may still connect when a rule in
+    # exe_types/implicit_conversion.py converts it, and its value is converted as it arrives.
+    implicit_conversion: bool = False
 
     def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
         self,
@@ -178,6 +181,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         badge: BadgeData
         | None = None,  # Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
         adaptive_type_group: str | None = None,
+        implicit_conversion: bool = False,
     ):
         if not element_id:
             element_id = str(uuid.uuid4().hex)
@@ -277,6 +281,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         self.output_type = output_type
         self.adaptive_type_group = adaptive_type_group
         self.adaptive_resolved_type = None
+        self.implicit_conversion = implicit_conversion
         # What the group goes back to once its last wire is removed.
         self._adaptive_declared_type = self._type
         self._adaptive_declared_input_types = self._input_types
@@ -317,6 +322,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         our_dict["parent_group_name"] = self.parent_group_name
         our_dict["adaptive_type_group"] = self.adaptive_type_group
         our_dict["adaptive_resolved_type"] = self.adaptive_resolved_type
+        our_dict["implicit_conversion"] = self.implicit_conversion
 
         return our_dict
 

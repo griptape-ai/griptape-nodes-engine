@@ -66,6 +66,7 @@ from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
+    from griptape_nodes.exe_types.implicit_conversion import ImplicitConversion
     from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
@@ -2926,8 +2927,11 @@ class Connection:
     source_parameter: Parameter
     target_parameter: Parameter
     is_node_group_internal: bool
+    # Set when the wire converts its value to the target's type as it passes (see
+    # exe_types/implicit_conversion.py); None for a wire whose types already match.
+    implicit_conversion: ImplicitConversion | None
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         source_node: BaseNode,
         source_parameter: Parameter,
@@ -2935,12 +2939,14 @@ class Connection:
         target_parameter: Parameter,
         *,
         is_node_group_internal: bool = False,
+        implicit_conversion: ImplicitConversion | None = None,
     ) -> None:
         self.source_node = source_node
         self.target_node = target_node
         self.source_parameter = source_parameter
         self.target_parameter = target_parameter
         self.is_node_group_internal = is_node_group_internal
+        self.implicit_conversion = implicit_conversion
 
     def get_target_node(self) -> BaseNode:
         return self.target_node

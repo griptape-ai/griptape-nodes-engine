@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
+from griptape_nodes.exe_types.implicit_conversion import ImplicitConversion
 from griptape_nodes.exe_types.node_types import BaseNode, Connection, NodeResolutionState
 
 logger = logging.getLogger("griptape_nodes")
@@ -34,7 +35,7 @@ class Connections:
         self.outgoing_index = {}
         self.incoming_index = {}
 
-    def add_connection(
+    def add_connection(  # noqa: PLR0913
         self,
         source_node: BaseNode,
         source_parameter: Parameter,
@@ -42,6 +43,7 @@ class Connections:
         target_parameter: Parameter,
         *,
         is_node_group_internal: bool = False,
+        implicit_conversion: ImplicitConversion | None = None,
     ) -> Connection:
         if ParameterMode.OUTPUT not in source_parameter.get_mode():
             errormsg = f"Output Connection not allowed on Parameter '{source_parameter.name}'."
@@ -59,6 +61,7 @@ class Connections:
                 target_node,
                 target_parameter,
                 is_node_group_internal=is_node_group_internal,
+                implicit_conversion=implicit_conversion,
             )
             # New index management.
             connection_id = id(connection)

@@ -704,6 +704,32 @@ Each parameter's `adaptive_resolved_type` holds the group's current type, or `No
 
 A type only spreads across one node. When an untyped adaptive output is connected to another node's untyped adaptive input, giving the first node a type later doesn't retype the second.
 
+### Implicit Conversion
+
+By default an input only accepts a connection whose type it lists: an `int` output can't connect to a `str` input. Set `implicit_conversion=True` on an input to also accept the types below, converting the value to the input's type as it arrives:
+
+```python
+self.add_parameter(Parameter(name="text", type="str", implicit_conversion=True))
+```
+
+| From                   | To             | Notes                                                                                                                                                                               |
+| ---------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `int`                  | `float`        | Exact.                                                                                                                                                                              |
+| `float`                | `int`          | Drops the fractional part: `3.9` becomes `3`. Marked lossy.                                                                                                                         |
+| `int`, `float`, `bool` | `str`          | The value as text: `42` becomes `"42"`.                                                                                                                                             |
+| `dict`, `list`         | `json`         | Passed as-is once checked to be valid JSON.                                                                                                                                         |
+| `dict`, `list`, `json` | `str`          | JSON text.                                                                                                                                                                          |
+| `str`, `json`          | `dict`, `list` | Read from JSON text. Can fail when the flow runs.                                                                                                                                   |
+| `str`                  | `json`         | Read from JSON text. Can fail when the flow runs.                                                                                                                                   |
+| `str`                  | `int`, `float` | The number the text spells. Can fail when the flow runs.                                                                                                                            |
+| `any`                  | any type       | An output whose type is only known when it runs. The arriving value's own type picks a rule above; a value already of the input's type passes through. Can fail when the flow runs. |
+
+Inputs without `implicit_conversion=True` reject these connections exactly as before. The setting also works on a type-adaptive input: once its group has a type, it converts from the types above.
+
+A value that can't be converted, such as the text `"abc"` arriving at an `int` input, stops the run with an error on the receiving node that names the node and parameter it came from and the value. It never arrives as an empty value.
+
+The editor can tell a converting connection from the rest: `CreateConnectionResultSuccess`, and each entry in `ListConnectionsForNodeResultSuccess` and `GetConnectionsForParameterResultSuccess`, has a `conversion` field. It is `None` for an ordinary connection and otherwise gives `source_type`, `target_type`, `lossy`, and `may_fail`.
+
 ### Dynamic Parameter Visibility
 
 Use `after_value_set()` callback to create context-aware UIs:

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -8,6 +11,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+
+if TYPE_CHECKING:
+    from griptape_nodes.exe_types.implicit_conversion import ImplicitConversion
 
 
 @dataclass
@@ -41,6 +47,39 @@ class CreateConnectionRequest(RequestPayload):
 
 
 @dataclass
+class ConnectionConversion:
+    """How a connection converts its value to the type its target takes.
+
+    Present only on connections into a parameter that opted in to implicit conversion and whose
+    source type it doesn't accept as-is. The editor draws these connections differently.
+
+    Args:
+        source_type: The type the source sends
+        target_type: The type the value is converted to
+        lossy: The conversion can discard information (a float becoming a whole number)
+        may_fail: The conversion depends on the value and can fail when the flow runs (text that
+            isn't a number or isn't JSON)
+    """
+
+    source_type: str
+    target_type: str
+    lossy: bool = False
+    may_fail: bool = False
+
+    @classmethod
+    def describe(cls, conversion: ImplicitConversion | None) -> ConnectionConversion | None:
+        """Describe a connection's conversion for the editor, or None for a connection without one."""
+        if conversion is None:
+            return None
+        return cls(
+            source_type=conversion.source_type,
+            target_type=conversion.target_type,
+            lossy=conversion.lossy,
+            may_fail=conversion.may_fail,
+        )
+
+
+@dataclass
 class ReplacedConnection:
     """A connection that was deleted to make room for a new one."""
 
@@ -59,9 +98,12 @@ class CreateConnectionResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         replaced_connection: The existing connection that was deleted to make room for this one,
             because the target input or source output allows only one connection (None if nothing
             was replaced)
+        conversion: How the connection converts its value to the target's type (None if the
+            target takes the source's type as-is)
     """
 
     replaced_connection: ReplacedConnection | None = None
+    conversion: ConnectionConversion | None = None
 
 
 @dataclass
@@ -136,6 +178,8 @@ class IncomingConnection:
     source_node_name: str
     source_parameter_name: str
     target_parameter_name: str
+    # How the connection converts its value to the target's type; None if it doesn't.
+    conversion: ConnectionConversion | None = None
 
 
 @dataclass
@@ -143,6 +187,8 @@ class OutgoingConnection:
     source_parameter_name: str
     target_node_name: str
     target_parameter_name: str
+    # How the connection converts its value to the target's type; None if it doesn't.
+    conversion: ConnectionConversion | None = None
 
 
 @dataclass
