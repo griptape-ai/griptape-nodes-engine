@@ -202,6 +202,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 
+@dataclass
+class FlowCreationRecord:
+    """The flows created while a `record_created_flows` block was open.
+
+    `own` holds those created directly in the block; `nested` holds those that nested blocks
+    created and left behind.
+    """
+
+    own: list[str] = field(default_factory=list)
+    nested: list[str] = field(default_factory=list)
+
+    @property
+    def all(self) -> list[str]:
+        """Every flow created in the block, nested ones included."""
+        return [*self.own, *self.nested]
+
+
 class DagExecutionType(StrEnum):
     START_NODE = "start_node"
     CONTROL_NODE = "control_node"
@@ -319,7 +336,7 @@ class FlowManager(EngineScoped):
     _name_to_parent_name: dict[str, str | None]
     _flow_to_referenced_workflow_name: dict[ControlFlow, str]
     _iteration_flow_to_owner_flow_name: dict[str, str]
-    _flow_creation_record: contextvars.ContextVar[list[str] | None]
+    _flow_creation_record: contextvars.ContextVar[FlowCreationRecord | None]
     _connections: Connections
 
     # Global execution state (moved from individual ControlFlows)
@@ -364,17 +381,26 @@ class FlowManager(EngineScoped):
         return self._node_executor
 
     @contextmanager
-    def record_created_flows(self) -> Iterator[list[str]]:
+    def record_created_flows(self) -> Iterator[FlowCreationRecord]:
         """Collect the names of flows created by the current task during the `with` block.
 
-        Flows created by other tasks running at the same time are not collected.
+        Flows created by other tasks running at the same time are not collected. When the block ends,
+        the flows it recorded that still exist are added to the enclosing block's `nested` list.
         """
-        created: list[str] = []
+        created = FlowCreationRecord()
+        enclosing = self._flow_creation_record.get()
         token = self._flow_creation_record.set(created)
         try:
             yield created
         finally:
             self._flow_creation_record.reset(token)
+            if enclosing is not None:
+                object_manager = self.engine.object_manager
+                enclosing.nested.extend(
+                    name
+                    for name in created.all
+                    if object_manager.attempt_get_object_by_name_as_type(name, ControlFlow) is not None
+                )
 
     def get_connections(self) -> Connections:
         """Get the connections instance."""
@@ -384,7 +410,7 @@ class FlowManager(EngineScoped):
         """Add a newly created flow to the current task's creation record, if one is active."""
         creation_record = self._flow_creation_record.get()
         if creation_record is not None:
-            creation_record.append(flow_name)
+            creation_record.own.append(flow_name)
 
     def _cleanup_flow_on_failed_deserialization(self, flow_name: str, *, pushed_flow_context: bool) -> None:
         """Clean up a flow that failed during deserialization.

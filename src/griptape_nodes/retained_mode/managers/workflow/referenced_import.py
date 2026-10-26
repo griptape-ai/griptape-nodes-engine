@@ -11,6 +11,8 @@ from griptape_nodes.exe_types.workflow_node_errors import WorkflowRecursionLimit
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
+    DeleteFlowRequest,
+    DeleteFlowResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
     SetFlowMetadataRequest,
     SetFlowMetadataResultSuccess,
@@ -189,59 +191,56 @@ class ReferencedWorkflowImport(EngineScoped):
 
         # Execute the workflow within the target flow context, on this task's own copy of the flow
         # stack so concurrent imports cannot push onto each other's. Only the flows this import
-        # creates are recorded, so flows created by other tasks are never mistaken for ours.
-        # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
-        # serializes as an import command. When False, the flow serializes as inline content.
-        workflow_manager = self.engine.workflow_manager
-        context_manager = self.engine.context_manager
-        with (
-            self.engine.flow_manager.record_created_flows() as new_flows,
-            context_manager.isolated_flow_stack(),
-            context_manager.flow(flow_name),
-        ):
-            if request.track_as_referenced:
-                with workflow_manager.referenced_workflow(request.workflow_name):
-                    workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
-            else:
-                workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
+        # creates are recorded, so flows created by other tasks are never mistaken for ours. The
+        # record stays open until the end so a failed import can remove exactly what it created.
+        flow_manager = self.engine.flow_manager
+        with flow_manager.record_created_flows() as created_flows:
+            try:
+                workflow_result = await self._run_workflow_file(request, workflow_file_path, flow_name)
+            except BaseException:
+                # BaseException on purpose: a cancelled import (CancelledError) must also remove
+                # its half-built flows before the cancellation carries on.
+                self._delete_created_flows(created_flows.all)
+                raise
 
-        if not workflow_result.execution_successful:
-            details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
-            return ImportWorkflowAsReferencedSubFlowResultFailure(
-                result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
+            if not workflow_result.execution_successful:
+                details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
+                return self._failed_import(created_flows.all, details, workflow_result=workflow_result)
+
+            # Only the flows this import created itself are candidates for the result; flows made by
+            # imports nested inside it are cleaned up on failure but never picked as the result.
+            # The record only grows, so drop flows deleted or renamed before the import returned.
+            # It holds names, not the flows themselves, so a flow renamed during the import is missed,
+            # and a name freed and reused by another task would be taken for ours.
+            object_manager = self.engine.object_manager
+            surviving_flows = {
+                name
+                for name in created_flows.own
+                if object_manager.attempt_get_object_by_name_as_type(name, ControlFlow) is not None
+            }
+
+            if not surviving_flows:
+                details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
+                return self._failed_import(created_flows.all, details)
+
+            created_flow_name = self._select_top_level_imported_flow(
+                surviving_flows, flow_name, request.workflow_name, self.engine
             )
 
-        # The record only grows, so drop flows deleted or renamed before the import returned.
-        # It holds names, so a flow renamed during the import is dropped and can't be recovered here.
-        object_manager = self.engine.object_manager
-        surviving_flows = {
-            name
-            for name in new_flows
-            if object_manager.attempt_get_object_by_name_as_type(name, ControlFlow) is not None
-        }
+            # Apply imported flow metadata if provided
+            if request.imported_flow_metadata:
+                set_metadata_request = SetFlowMetadataRequest(
+                    flow_name=created_flow_name, metadata=request.imported_flow_metadata
+                )
+                set_metadata_result = self.engine.handle_request(set_metadata_request)
 
-        if not surviving_flows:
-            details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+                if not isinstance(set_metadata_result, SetFlowMetadataResultSuccess):
+                    details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because metadata could not be applied to created flow '{created_flow_name}'"
+                    return self._failed_import(created_flows.all, details)
 
-        created_flow_name = self._select_top_level_imported_flow(
-            surviving_flows, flow_name, request.workflow_name, self.engine
-        )
-
-        # Apply imported flow metadata if provided
-        if request.imported_flow_metadata:
-            set_metadata_request = SetFlowMetadataRequest(
-                flow_name=created_flow_name, metadata=request.imported_flow_metadata
-            )
-            set_metadata_result = self.engine.handle_request(set_metadata_request)
-
-            if not isinstance(set_metadata_result, SetFlowMetadataResultSuccess):
-                details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because metadata could not be applied to created flow '{created_flow_name}'"
-                return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
-
-            logger.debug(
-                "Applied imported flow metadata to '%s': %s", created_flow_name, request.imported_flow_metadata
-            )
+                logger.debug(
+                    "Applied imported flow metadata to '%s': %s", created_flow_name, request.imported_flow_metadata
+                )
 
         details = (
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
@@ -251,6 +250,67 @@ class ReferencedWorkflowImport(EngineScoped):
             status=workflow_result.status,
             result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
+
+    async def _run_workflow_file(
+        self, request: ImportWorkflowAsReferencedSubFlowRequest, workflow_file_path: str, flow_name: str
+    ) -> WorkflowExecutionResult:
+        """Run the workflow file inside `flow_name`.
+
+        When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow serializes as
+        an import command. When False, the flow serializes as inline content.
+        """
+        workflow_manager = self.engine.workflow_manager
+        context_manager = self.engine.context_manager
+        with context_manager.isolated_flow_stack(), context_manager.flow(flow_name):
+            if request.track_as_referenced:
+                with workflow_manager.referenced_workflow(request.workflow_name):
+                    return await workflow_manager.runner.run_workflow(workflow_file_path)
+            return await workflow_manager.runner.run_workflow(workflow_file_path)
+
+    def _failed_import(
+        self, new_flows: list[str], message: str, *, workflow_result: WorkflowExecutionResult | None = None
+    ) -> ImportWorkflowAsReferencedSubFlowResultFailure:
+        """Remove the flows the import created, then build its failure result."""
+        leftover_flows = self._delete_created_flows(new_flows)
+        if leftover_flows:
+            names = ", ".join(f"'{name}'" for name in leftover_flows)
+            if len(leftover_flows) == 1:
+                message += f" A flow the import had already built could not be removed: {names}. Delete it by hand."
+            else:
+                message += f" Flows the import had already built could not be removed: {names}. Delete them by hand."
+        if workflow_result is None:
+            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=message)
+        return ImportWorkflowAsReferencedSubFlowResultFailure(
+            result_details=self._import_result_details(workflow_result, message, level=logging.ERROR)
+        )
+
+    def _delete_created_flows(self, new_flows: list[str]) -> list[str]:
+        """Delete the top-most flows among `new_flows` that still exist; return the ones that would not go.
+
+        Deleting a flow deletes the flows and nodes inside it, so flows whose parent is also in the
+        record are left to their parent.
+        """
+        flow_manager = self.engine.flow_manager
+        object_manager = self.engine.object_manager
+        created = set(new_flows)
+        roots = [
+            name
+            for name in dict.fromkeys(new_flows)
+            if object_manager.attempt_get_object_by_name_as_type(name, ControlFlow) is not None
+            and flow_manager.get_parent_flow(name) not in created
+        ]
+
+        leftover_flows: list[str] = []
+        for root in roots:
+            delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=root))
+            if not isinstance(delete_result, DeleteFlowResultSuccess):
+                logger.warning(
+                    "Could not remove flow '%s' left behind by a failed workflow import: %s",
+                    root,
+                    delete_result.result_details,
+                )
+                leftover_flows.append(root)
+        return leftover_flows
 
     def _import_result_details(
         self, workflow_result: WorkflowExecutionResult, message: str, *, level: int

@@ -1254,7 +1254,53 @@ class TestRecordCreatedFlows:
         )
         assert isinstance(outside, CreateFlowResultSuccess)
 
-        assert recorded == [inside.flow_name]
+        assert recorded.own == [inside.flow_name]
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_nested_recording_also_reaches_the_enclosing_record(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_nested_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+
+        with engine.flow_manager.record_created_flows() as outer:
+            first = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="first", set_as_new_context=False)
+            )
+            with engine.flow_manager.record_created_flows() as inner:
+                nested = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="nested", set_as_new_context=False)
+                )
+            last = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="last", set_as_new_context=False)
+            )
+        assert isinstance(first, CreateFlowResultSuccess)
+        assert isinstance(nested, CreateFlowResultSuccess)
+        assert isinstance(last, CreateFlowResultSuccess)
+
+        assert inner.own == [nested.flow_name]
+        assert outer.own == [first.flow_name, last.flow_name]
+        assert outer.nested == [nested.flow_name]
+        assert outer.all == [first.flow_name, last.flow_name, nested.flow_name]
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_nested_flows_deleted_before_the_block_ends_do_not_reach_the_enclosing_record(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_nested_deleted_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+
+        with engine.flow_manager.record_created_flows() as outer, engine.flow_manager.record_created_flows():
+            kept = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="kept", set_as_new_context=False)
+            )
+            gone = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="gone", set_as_new_context=False)
+            )
+            assert isinstance(gone, CreateFlowResultSuccess)
+            delete_result = engine.handle_request(DeleteFlowRequest(flow_name=gone.flow_name))
+            assert isinstance(delete_result, DeleteFlowResultSuccess)
+        assert isinstance(kept, CreateFlowResultSuccess)
+
+        assert outer.nested == [kept.flow_name]
 
     @pytest.mark.usefixtures("clean_object_state")
     @pytest.mark.asyncio
@@ -1273,7 +1319,7 @@ class TestRecordCreatedFlows:
                     CreateFlowRequest(parent_flow_name=top.flow_name, flow_name=f"flow_{own}", set_as_new_context=False)
                 )
                 assert isinstance(result, CreateFlowResultSuccess)
-            recorded_by_task[own] = list(recorded)
+            recorded_by_task[own] = list(recorded.own)
 
         await asyncio.gather(record("a", "b"), record("b", "a"))
 

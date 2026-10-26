@@ -97,7 +97,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     LibraryNotRegisteredProblem,
     MissingTomlSectionProblem,
 )
-from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.managers.flow_manager import FlowCreationRecord, FlowManager
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow.codegen import WorkflowCodeGenerator
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
@@ -5681,16 +5681,16 @@ class TestExecuteWorkflowImport:
     @pytest.fixture
     def recorded_flows(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         """Replace the FlowManager with a mock whose per-import record is the returned list."""
-        recorded: list[str] = []
+        recorded = FlowCreationRecord()
 
         @contextlib.contextmanager
-        def record_created_flows() -> Iterator[list[str]]:
+        def record_created_flows() -> Iterator[FlowCreationRecord]:
             yield recorded
 
         flow_manager = Mock(spec=FlowManager)
         flow_manager.record_created_flows.side_effect = record_created_flows
         monkeypatch.setattr(engine, "_flow_manager", flow_manager)
-        return recorded
+        return recorded.own
 
     @pytest.fixture
     def existing_flows(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> set[str]:

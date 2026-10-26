@@ -41,6 +41,10 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
+    ImportWorkflowAsReferencedSubFlowRequest,
+    ImportWorkflowAsReferencedSubFlowResultFailure,
+    ImportWorkflowRequest,
+    ImportWorkflowResultSuccess,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
 )
@@ -74,6 +78,40 @@ LOOP_NODE_FILE = LOOP_LIBRARY_DIR / "iterative_group_nodes.py"
 # The loop executor packages a loop body with the Start and End Flow nodes of a library with this name.
 LOOP_LIBRARY_NAME = "Griptape Nodes Library"
 LIBRARY_NAME = "Workflow Node Library"
+
+# A saved workflow whose only content is a flow holding an import of itself. `{path}` is its registry key.
+SELF_IMPORTING_WORKFLOW = """# /// script
+# dependencies = []
+#
+# [tool.griptape-nodes]
+# name = "self_import_workflow"
+# schema_version = "0.21.0"
+# engine_version_created_with = "0.0.0"
+# node_libraries_referenced = []
+# node_types_used = []
+# is_griptape_provided = false
+# is_template = false
+# is_internal = false
+# ///
+
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
+from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowRequest
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+async def build_workflow() -> None:
+    flow_name = (
+        await GriptapeNodes.ahandle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="SelfImportFlow", set_as_new_context=False)
+        )
+    ).flow_name
+    with GriptapeNodes.ContextManager().flow(flow_name):
+        result = await GriptapeNodes.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name="{path}")
+        )
+        if result.failed():
+            raise RuntimeError(str(result.result_details))
+"""
 
 
 class FixtureWorkflow(NamedTuple):
@@ -646,6 +684,26 @@ class TestSubflowImportCycle:
         assert outer.error.message.count(RUN_SENTENCE) == 1, outer.error.message
         # The refusal path ran, not the partial-failure summary.
         assert "Iterative group execution failed" not in outer.error.message, outer.error.message
+
+    @pytest.mark.asyncio
+    async def test_load_time_recursion_refusal_leaves_no_flows(
+        self, tmp_path: Path, engine: Engine, set_recursion_depth: Callable[[int], None]
+    ) -> None:
+        """A workflow file that imports itself is refused two levels in, and every level it built is removed."""
+        set_recursion_depth(1)
+        workflow_path = tmp_path / "self_import_workflow.py"
+        workflow_path.write_text(SELF_IMPORTING_WORKFLOW.format(path=workflow_path.with_suffix("").as_posix()))
+        registered = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(workflow_path)))
+        assert isinstance(registered, ImportWorkflowResultSuccess), registered
+        parent_flow = self._new_parent_flow(engine)
+
+        result = await engine.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name=registered.workflow_name, flow_name=parent_flow)
+        )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure), result
+        assert "contains itself" in str(result.result_details), result
+        assert set(engine.object_manager.get_filtered_subset(type=ControlFlow)) == {parent_flow}
 
     def _new_parent_flow(self, engine: Engine) -> str:
         engine.context_manager.push_workflow(workflow_name="import_cycle_parent")
