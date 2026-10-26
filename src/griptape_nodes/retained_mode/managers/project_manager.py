@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3021,8 +3022,18 @@ class ProjectManager(EngineScoped):
         # before the checks that can fail it, so the workflow is gone either way. A failure
         # that claimed otherwise would leave the client showing a workflow the engine has
         # dropped, which is the state this teardown exists to prevent.
+        logger.info(
+            "_____TEST____ [project-switch] reload step: library_config_changed=%s workspace_changed=%s",
+            library_config_changed,
+            workspace_changed,
+        )
         if workspace_changed:
+            clear_start = time.perf_counter()
             clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            logger.info(
+                "_____TEST____ [project-switch] ClearAllObjectStateRequest took %.0fms",
+                (time.perf_counter() - clear_start) * 1000,
+            )
             if not clear_result.succeeded():
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
@@ -3030,7 +3041,12 @@ class ProjectManager(EngineScoped):
                     altered_workflow_state=True,
                 )
         if library_config_changed:
+            libraries_start = time.perf_counter()
             reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
+            logger.info(
+                "_____TEST____ [project-switch] ReloadAllLibrariesRequest took %.0fms",
+                (time.perf_counter() - libraries_start) * 1000,
+            )
             if isinstance(reload_result, ReloadAllLibrariesResultFailure):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
@@ -3038,7 +3054,12 @@ class ProjectManager(EngineScoped):
                     altered_workflow_state=True,
                 )
         if workspace_changed:
+            registry_start = time.perf_counter()
             await self.engine.workflow_manager.refresh_workflow_registry()
+            logger.info(
+                "_____TEST____ [project-switch] refresh_workflow_registry took %.0fms",
+                (time.perf_counter() - registry_start) * 1000,
+            )
         return None
 
     def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:
@@ -3164,7 +3185,12 @@ class ProjectManager(EngineScoped):
                 result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
             )
 
+        activation_start = time.perf_counter()
         outcome = await self._activate_project(resolved_project_id)
+        logger.info(
+            "_____TEST____ [project-switch] _activate_project total %.0fms",
+            (time.perf_counter() - activation_start) * 1000,
+        )
         if outcome.failure is not None:
             # Restore the previously active project so the engine stays in a working
             # state, then surface the original failure to the caller. This runs during
