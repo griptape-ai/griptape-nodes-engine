@@ -246,6 +246,42 @@ class WidgetDefinition(BaseModel):
     description: str | None = None  # Optional description for documentation
 
 
+# What a preset (or node) does, as a fixed vocabulary clients can group by. Checked when the library registers rather than
+# by the schema, so one preset with a wrong role is dropped instead of failing the whole manifest.
+PRESET_ROLES: tuple[str, ...] = (
+    "Inspect",
+    "Edit",
+    "Convert",
+    "Generate",
+    "Load & save",
+    "View",
+    "Combine",
+    "Flow",
+)
+
+
+class PresetDefinition(BaseModel):
+    """A named starting point for a node: a node type plus the parameter values to set on it.
+
+    Editors list presets beside node types, so one node with an ``operation`` parameter can
+    appear as "Crop", "Resize", and so on. Registration drops a preset whose node isn't in the
+    library or whose role isn't in ``PRESET_ROLES``; a preset whose params name a parameter the
+    node doesn't have is dropped the first time presets are listed.
+    """
+
+    # Node type (class name) the preset creates.
+    node: str
+    # Name shown for the preset, e.g. "Crop".
+    name: str
+    # One of PRESET_ROLES.
+    role: str
+    # Parameter values to set on the new node, keyed by parameter name.
+    params: dict[str, Any] = Field(default_factory=dict)
+    description: str | None = None
+    # Library that provides `node`. None means the library that declares the preset.
+    library: str | None = None
+
+
 class LibrarySchema(BaseModel):
     """Schema for a library definition file.
 
@@ -256,8 +292,9 @@ class LibrarySchema(BaseModel):
 
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
-    # optional beta_features list, which older engines ignore.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.14.0"
+    # optional beta_features list, which older engines ignore. 0.15.0 adds the optional presets
+    # list, which older engines ignore too.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
 
     name: str
     library_schema_version: str
@@ -276,6 +313,8 @@ class LibrarySchema(BaseModel):
     # whole manifest. parse_library_beta_features checks each one, and the load reports the
     # dropped ones as library problems.
     beta_features: list[Any] | None = None
+    # Named node + parameter value combinations that editors list beside the node types.
+    presets: list[PresetDefinition] | None = None
 
 
 class LibraryRegistry:
@@ -612,6 +651,11 @@ class Library:
     # Valid beta features from the manifest, parsed on first use and kept because the manifest
     # can't change while loaded.
     _beta_features: dict[str, BetaFeature] | None
+    # Presets that passed the registration checks (None until set: all the manifest declares), and
+    # whether their params have been checked against the nodes' parameters yet (deferred, because
+    # that needs the node classes).
+    _presets: list[PresetDefinition] | None
+    _preset_params_checked: bool
     _advanced_library: AdvancedNodeLibrary | None
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
@@ -639,6 +683,8 @@ class Library:
         self._node_types = {}
         self._node_metadata = {}
         self._beta_features = None
+        self._presets = None
+        self._preset_params_checked = False
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
         self._registered_execution_event_listeners = []
@@ -653,6 +699,20 @@ class Library:
                 self._library_data.name, self._library_data.beta_features or []
             ).features
         return dict(self._beta_features)
+
+    def get_presets(self) -> list[PresetDefinition]:
+        """The presets this library declares that have not been rejected."""
+        if self._presets is None:
+            return list(self._library_data.presets or [])
+        return list(self._presets)
+
+    def set_presets(self, presets: list[PresetDefinition], *, params_checked: bool = False) -> None:
+        """Replace the accepted presets, recording whether their params have been checked."""
+        self._presets = list(presets)
+        self._preset_params_checked = params_checked
+
+    def are_preset_params_checked(self) -> bool:
+        return self._preset_params_checked
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)

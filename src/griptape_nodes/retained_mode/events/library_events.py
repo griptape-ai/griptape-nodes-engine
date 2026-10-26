@@ -9,6 +9,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
     NodeMetadata,
+    PresetDefinition,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -148,13 +149,16 @@ class ListNodeTypesInLibraryRequest(RequestPayload):
     validating node types, exploring library contents. Set include_metadata when choosing
     which node types to create: it adds each type's category, display name, description,
     and deprecation, read from the library's registered metadata, so no node code loads.
+    It also adds the library's presets: named node + parameter value combinations from
+    the library JSON, which an editor lists beside the node types.
     To survey every library in one round trip, send one request per library from
     ListRegisteredLibrariesRequest in an EventRequestBatch. For a node type's parameters,
     follow up with DescribeNodeTypeRequest.
 
     Args:
         library: Name of the library to list node types for
-        include_metadata: Also return each node type's metadata in node_metadata
+        include_metadata: Also return each node type's metadata in node_metadata, and the
+            library's presets in presets
 
     Results: ListNodeTypesInLibraryResultSuccess (with node types) | ListNodeTypesInLibraryResultFailure (library not found)
     """
@@ -172,10 +176,15 @@ class ListNodeTypesInLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayload
         node_types: List of node type names available in the library, in registration order
         node_metadata: Each node type's metadata, keyed by node type name, when the request
             set include_metadata; otherwise None
+        presets: The library's presets, in library JSON order, when the request set
+            include_metadata; otherwise None. Presets whose node or params don't match the
+            library are left out and reported as library problems. The first such request
+            for a library constructs each preset's node once to read its parameters.
     """
 
     node_types: list[str]
     node_metadata: dict[str, NodeMetadata] | None = None
+    presets: list[PresetDefinition] | None = None
 
 
 @dataclass

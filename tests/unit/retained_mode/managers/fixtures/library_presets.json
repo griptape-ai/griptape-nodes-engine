@@ -1,0 +1,40 @@
+{
+  "presets": [
+    {
+      "node": "Reformat",
+      "name": "Crop",
+      "role": "Edit",
+      "params": {
+        "operation": "crop"
+      },
+      "description": "Crop an image to a region."
+    },
+    {
+      "node": "Reformat",
+      "name": "Resize",
+      "role": "Edit",
+      "params": {
+        "operation": "resize"
+      },
+      "description": "Resize an image."
+    },
+    {
+      "node": "Reformat",
+      "name": "Extend",
+      "role": "Edit",
+      "params": {
+        "operation": "extend"
+      },
+      "description": "Extend an image's canvas."
+    },
+    {
+      "node": "Reformat",
+      "name": "Split grid",
+      "role": "Edit",
+      "params": {
+        "operation": "split_grid"
+      },
+      "description": "Split an image into a grid of tiles."
+    }
+  ]
+}

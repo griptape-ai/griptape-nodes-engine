@@ -63,6 +63,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     CreateConfigCategoryProblem,
     DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
+    InvalidPresetProblem,
     LibraryDependencyProblem,
     LibraryProblem,
     ShadowedEnginePackagesProblem,
@@ -72,6 +73,7 @@ from griptape_nodes.retained_mode.managers.library.common import LibraryFitness,
 from griptape_nodes.retained_mode.managers.library.dependencies import parse_dependency_url
 from griptape_nodes.retained_mode.managers.library.environment import describe_unmet_requirements
 from griptape_nodes.retained_mode.managers.library.managed_environment import LibrariesProvidedByEnvironmentError
+from griptape_nodes.retained_mode.managers.library.presets import check_presets_at_registration
 from griptape_nodes.retained_mode.managers.library.workers import resolve_executes_in_worker
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import (
@@ -801,6 +803,18 @@ class LibraryRegistrar(EngineScoped):
                         library_info.problems.extend(
                             self._check_beta_feature_settings_collision(library_data.name, library)
                         )
+
+                        # Before the nodes load, so the load's fitness verdict counts dropped presets.
+                        # Replaced rather than appended, since the LibraryInfo survives a reload; that
+                        # also clears problems the previous load's deferred param check recorded.
+                        preset_check = check_presets_at_registration(library_data)
+                        library.set_presets(preset_check.accepted)
+                        library_info.problems = [
+                            problem
+                            for problem in library_info.problems
+                            if not isinstance(problem, InvalidPresetProblem)
+                        ]
+                        library_info.problems.extend(preset_check.problems)
 
                         # Attempt to load nodes from the library (modifies library_info in place).
                         await asyncio.to_thread(

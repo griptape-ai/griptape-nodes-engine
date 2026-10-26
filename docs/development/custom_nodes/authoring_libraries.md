@@ -429,6 +429,36 @@ A few rules worth knowing:
 - **Engines released before library schema `0.14.0` ignore `beta_features`.** Set
     `library_schema_version` to `0.14.0` or later when you add them.
 
+### Presets
+
+A preset is a named starting point for one of your nodes: the node plus values for some of its
+parameters. Editors list presets beside your nodes, so one node with an `operation` parameter can
+show up as "Crop", "Resize", and "Extend". Declare them in a `presets` list at the top level of the
+library JSON:
+
+```json
+"presets": [
+    {"node": "Reformat", "name": "Crop", "role": "Edit", "params": {"operation": "crop"}},
+    {"node": "Reformat", "name": "Resize", "role": "Edit", "params": {"operation": "resize"}}
+]
+```
+
+Each entry has these fields:
+
+- `node`: the class name of the node the preset creates.
+- `name`: the name shown for the preset.
+- `role`: what the preset does, so a client can group presets by it. One of `Inspect`, `Edit`, `Convert`, `Generate`,
+    `Load & save`, `View`, `Combine`, or `Flow`.
+- `params`: optional. Parameter values to set on the new node, keyed by parameter name.
+- `description`: optional. A sentence describing what the preset does.
+- `library`: optional. The library that provides `node`, when it isn't this one.
+
+A preset that doesn't match your library is left out and reported as a library problem, and the rest
+of the library still loads. A preset is left out when its `node` isn't in the library, when its
+`role` isn't one of the names above, or when `params` names a parameter the node doesn't have. The
+parameter check runs the first time an editor asks for the library's presets, not when the library
+loads. Engines released before library schema `0.15.0` ignore `presets`.
+
 ## Library Structure with uv Dependency Management
 
 **Modern Approach**: Use `uv` for fast, reproducible dependency management following the Minimax library pattern.

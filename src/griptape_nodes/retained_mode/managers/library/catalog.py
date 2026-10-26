@@ -58,13 +58,18 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    InvalidPresetProblem,
     NodeModuleImportProblem,
 )
+from griptape_nodes.retained_mode.managers.library.common import LibraryFitness
+from griptape_nodes.retained_mode.managers.library.presets import PresetCheckResult, preset_param_rejection_reason
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.node_library.library_registry import Library, PresetDefinition
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -284,15 +289,19 @@ class LibraryCatalog(EngineScoped):
         event_copy = snapshot_list.copy()
 
         # Registered metadata only, so node modules that deferred registration has not imported stay unimported.
+        # Presets are the exception: the first listing constructs their nodes once to check their params.
         node_metadata = None
+        presets = None
         if request.include_metadata:
             node_metadata = {node_type: library.get_node_metadata(node_type) for node_type in event_copy}
+            presets = self._list_presets(library)
 
         details = f"Successfully retrieved the list of node types in the Library named '{request.library}'."
 
         result = ListNodeTypesInLibraryResultSuccess(
             node_types=event_copy,
             node_metadata=node_metadata,
+            presets=presets,
             result_details=details,
         )
         return result
@@ -395,22 +404,8 @@ class LibraryCatalog(EngineScoped):
                     ),
                 ),
             )
-        probe_name = f"__describe_node_type_probe__{request.node_type}"
         try:
-            # Wrap in ``LibraryRegistry.constructing_node()`` so the
-            # parameter-mutation detector skips this ephemeral probe's
-            # declarative ``add_parameter`` calls (this construction
-            # bypasses ``LibraryRegistry.create_node``).
-            #
-            # Pass the node's library and type so declarative ``__init__`` logic
-            # that resolves against the library -- e.g. ``get_declared_models``
-            # populating a model dropdown from the ``model_catalog`` -- works
-            # during the probe just as it does under ``create_node``.
-            with LibraryRegistry.constructing_node(throwaway=True):
-                probe_node = node_class(
-                    name=probe_name,
-                    metadata={"library": library_name, "node_type": request.node_type},
-                )
+            probe_node = self._construct_probe_node(node_class, library_name, request.node_type)
         except Exception as err:
             probe_error = f"{type(err).__name__}: {err}"
             return DescribeNodeTypeResultSuccess(
@@ -590,6 +585,76 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
+    def _list_presets(self, library: Library) -> list[PresetDefinition]:
+        """Return the library's presets, checking their params against their nodes on first use.
+
+        The check is cached on the Library. A preset for another library that isn't registered yet
+        is left out of this listing without a verdict, and checked again on the next one.
+        """
+        if library.are_preset_params_checked():
+            return library.get_presets()
+
+        library_name = library.get_library_data().name
+        check = PresetCheckResult()
+        # Accepted and pending presets, in declared order, kept for the next listing.
+        remaining: list[PresetDefinition] = []
+        any_pending = False
+        for preset in library.get_presets():
+            target_library_name = preset.library or library_name
+            try:
+                target_library = LibraryRegistry.get_library(name=target_library_name)
+            except KeyError:
+                remaining.append(preset)
+                any_pending = True
+                continue
+            reason = self._preset_param_rejection_reason(target_library, target_library_name, preset)
+            if reason is not None:
+                check.reject(library_name, preset, reason)
+                continue
+            check.accepted.append(preset)
+            remaining.append(preset)
+
+        library.set_presets(remaining, params_checked=not any_pending)
+        self._record_preset_problems(library_name, check.problems)
+        return check.accepted
+
+    def _preset_param_rejection_reason(
+        self, target_library: Library, target_library_name: str, preset: PresetDefinition
+    ) -> str | None:
+        """Return why a preset doesn't fit its node, or None if it does or its node can't be inspected."""
+        if not target_library.has_node_type(preset.node):
+            return f"library '{target_library_name}' has no node type '{preset.node}'"
+        if not preset.params:
+            return None
+        # A node that won't import or construct already reports that elsewhere; the preset isn't at fault.
+        try:
+            node_class = target_library.get_node_class(preset.node)
+        except (ImportError, AttributeError, TypeError) as err:
+            logger.debug(
+                "Could not check the params of preset '%s' because its node failed to import: %s", preset.name, err
+            )
+            return None
+        try:
+            probe_node = self._construct_probe_node(node_class, target_library_name, preset.node)
+        except Exception as err:
+            logger.debug(
+                "Could not check the params of preset '%s' because its node failed to construct: %s", preset.name, err
+            )
+            return None
+        parameter_names = {parameter.name for parameter in probe_node.parameters}
+        return preset_param_rejection_reason(preset, parameter_names)
+
+    def _record_preset_problems(self, library_name: str, problems: list[InvalidPresetProblem]) -> None:
+        """Add problems found by the deferred preset check to the library's loaded state."""
+        if not problems:
+            return
+        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return
+        library_info.problems.extend(problems)
+        if library_info.fitness == LibraryFitness.GOOD:
+            library_info.fitness = LibraryFitness.FLAWED
+
     def _library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
         """The library that recorded an import failure for a node type, or None when none did.
 
@@ -661,3 +726,20 @@ class LibraryCatalog(EngineScoped):
                 )
             )
         return widgets_info
+
+    @staticmethod
+    def _construct_probe_node(node_class: type[BaseNode], library_name: str, node_type: str) -> BaseNode:
+        """Construct a throwaway node to read the parameters its __init__ declares.
+
+        The node is never added to a flow or the ObjectManager. Wrapped in
+        ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector skips the probe's
+        declarative ``add_parameter`` calls (this construction bypasses ``LibraryRegistry.create_node``).
+        The node's library and type are passed so declarative ``__init__`` logic that resolves
+        against the library -- e.g. ``get_declared_models`` populating a model dropdown from the
+        ``model_catalog`` -- works during the probe just as it does under ``create_node``.
+        """
+        with LibraryRegistry.constructing_node(throwaway=True):
+            return node_class(
+                name=f"__describe_node_type_probe__{node_type}",
+                metadata={"library": library_name, "node_type": node_type},
+            )
