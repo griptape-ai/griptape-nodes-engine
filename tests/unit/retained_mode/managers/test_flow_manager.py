@@ -23,6 +23,11 @@ from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode,
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelRunRequest,
+    CancelRunResultFailure,
+    CancelRunResultSuccess,
+    ListRunsRequest,
+    ListRunsResultSuccess,
     ResolveNodeRequest,
     ResolveNodeResultFailure,
     StartFlowFromNodeRequest,
@@ -1319,3 +1324,69 @@ class TestRunSpecs:
 
         assert isinstance(result, ResolveNodeResultFailure)
         assert "does not exist" in str(result.result_details)
+
+
+class TestRunRequests:
+    """A script can see the runs and withdraw one that waits, through requests."""
+
+    @pytest.mark.asyncio
+    async def test_runs_are_listed_in_progress_first_then_waiting_in_order(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def waits() -> Any:
+            return _ran("waiting")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = [asyncio.ensure_future(flow_manager.start_run(_Spec(name, waits))) for name in ("second", "third")]
+        await asyncio.sleep(0)
+
+        result = flow_manager.on_list_runs_request(ListRunsRequest())
+
+        assert isinstance(result, ListRunsResultSuccess)
+        assert [(run.flow_name, run.state, run.position) for run in result.runs] == [
+            ("first", "running", 0),
+            ("second", "queued", 1),
+            ("third", "queued", 2),
+        ]
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, *waiting), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_waiting_run_by_request_withdraws_it(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        executed: list[str] = []
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting_run = flow_manager.submit_run(_Spec("second", second))
+
+        result = await flow_manager.on_cancel_run_request(CancelRunRequest(run_id=waiting_run.run_id))
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert isinstance(result, CancelRunResultSuccess)
+        outcome = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
+        assert "cancelled before it started" in str(outcome.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_run_that_does_not_exist_fails(self, engine: Engine) -> None:
+        result = await engine.flow_manager.on_cancel_run_request(CancelRunRequest(run_id="no-such-run"))
+
+        assert isinstance(result, CancelRunResultFailure)
+        assert "no run with that id" in str(result.result_details)

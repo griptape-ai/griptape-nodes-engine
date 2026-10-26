@@ -374,7 +374,8 @@ EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today
 ### Agents cannot be interrupted mid-run
 
 `StartFlowRequest` holds the call until the run finishes or errors. A subsequent
-`StartFlowRequest` waits for that run to finish, then starts.
+`StartFlowRequest` waits for that run to finish, then starts. `ListRunsRequest` shows the
+run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a waiting run.
 
 ## Tool Cheat Sheet
 

@@ -209,6 +209,81 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class CancelRunRequest(RequestPayload):
+    """Cancel one run: a waiting run leaves the line without starting, and the run in progress stops.
+
+    Use when: withdrawing a run queued behind another, or stopping a particular run. Run ids come
+    from ListRunsRequest or RunQueuedEvent.
+
+    Args:
+        run_id: The run to cancel.
+
+    Results: CancelRunResultSuccess | CancelRunResultFailure (no such run, or its flow has not started yet)
+    """
+
+    run_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The run was cancelled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The run was not cancelled. Common causes: no run with that id, or its flow has not started yet."""
+
+
+@dataclass
+class RunInfo:
+    """A run in progress or waiting for one to end.
+
+    Args:
+        run_id: The run.
+        flow_name: The flow it executes.
+        state: Its state: queued, running, or paused.
+        position: Its place in line, 1 being next, or 0 for the run in progress.
+    """
+
+    run_id: str
+    flow_name: str
+    state: str
+    position: int
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsRequest(RequestPayload):
+    """List the run in progress and the runs waiting behind it.
+
+    Use when: finding a queued run to cancel, or showing what is waiting.
+
+    Results: ListRunsResultSuccess (the run in progress first, then the waiting runs in order)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The runs, the one in progress first, then the waiting runs next first.
+
+    Args:
+        runs: The runs.
+    """
+
+    runs: list[RunInfo]
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The runs could not be listed."""
+
+
+@dataclass
+@PayloadRegistry.register
 class UnresolveFlowRequest(RequestPayload):
     """Reset every node in a flow back to unresolved.
 

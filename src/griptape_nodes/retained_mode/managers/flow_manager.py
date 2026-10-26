@@ -65,6 +65,9 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
     CancelFlowResultFailure,
     CancelFlowResultSuccess,
+    CancelRunRequest,
+    CancelRunResultFailure,
+    CancelRunResultSuccess,
     ContinueExecutionStepRequest,
     ContinueExecutionStepResultFailure,
     ContinueExecutionStepResultSuccess,
@@ -76,6 +79,9 @@ from griptape_nodes.retained_mode.events.execution_events import (
     GetIsFlowRunningResultFailure,
     GetIsFlowRunningResultSuccess,
     InvolvedNodesEvent,
+    ListRunsRequest,
+    ListRunsResultSuccess,
+    RunInfo,
     RunQueuedEvent,
     SingleExecutionStepRequest,
     SingleExecutionStepResultFailure,
@@ -395,7 +401,9 @@ class FlowManager(EngineScoped):
         self._node_executor = NodeExecutor(self.engine)
         self._run_queue = RunQueue()
         self._run_in_progress: Run | None = None
-        # True while the run in progress is executing its request, before that request has returned.
+        # True from when the run in progress starts until its request returns. While it is, only `_drive`
+        # may end the run: its flow can be not running yet (still validating) or stopped mid-request
+        # (cancelled), and the paths that end a paused run must not take either as the run being over.
         self._driving = False
 
     @property
@@ -3250,6 +3258,32 @@ class FlowManager(EngineScoped):
         details = f"Successfully cancelled flow execution with name {flow_name}"
 
         return CancelFlowResultSuccess(result_details=details)
+
+    @handles(CancelRunRequest)
+    async def on_cancel_run_request(self, request: CancelRunRequest) -> ResultPayload:
+        try:
+            cancelled = await self.cancel_run(request.run_id)
+        except RuntimeError as e:
+            details = f"Attempted to cancel run '{request.run_id}'. Failed because its flow has not started yet: {e}"
+            return CancelRunResultFailure(result_details=details)
+        if not cancelled:
+            details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
+            return CancelRunResultFailure(result_details=details)
+        return CancelRunResultSuccess(result_details=f"Cancelled run '{request.run_id}'.")
+
+    @handles(ListRunsRequest)
+    def on_list_runs_request(self, _request: ListRunsRequest) -> ResultPayload:
+        runs: list[RunInfo] = []
+        in_progress = self._run_in_progress
+        if in_progress is not None:
+            runs.append(
+                RunInfo(run_id=in_progress.run_id, flow_name=in_progress.flow_name, state=in_progress.state, position=0)
+            )
+        for index, waiting in enumerate(self._run_queue.snapshot()):
+            runs.append(
+                RunInfo(run_id=waiting.run_id, flow_name=waiting.flow_name, state=waiting.state, position=index + 1)
+            )
+        return ListRunsResultSuccess(runs=runs, result_details=f"Listed {len(runs)} run(s).")
 
     @handles(SingleNodeStepRequest)
     async def on_single_node_step_request(self, request: SingleNodeStepRequest) -> ResultPayload:
