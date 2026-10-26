@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalWorkflowExecutor
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, new_workflow_id
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -178,6 +179,44 @@ class TestSavedWorkflowFilesRunOnTheirOwn:
             assert bound.workflow_id == engine.context_manager.get_current_workflow_id()
 
         assert engine.bound_workflow is None
+
+
+class TestLocalWorkflowExecutor:
+    def test_a_workflow_it_loads_from_a_file_stays_bound_for_the_rest_of_the_run(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        saved = _write_saved_workflow(tmp_path / "saved.py")
+        failed_path = tmp_path / "failed.py"
+        executor = LocalWorkflowExecutor(save_on_failure_path=str(failed_path))
+
+        async def run() -> tuple[str, ResultPayload]:
+            flow_name = await executor.aprepare_workflow_for_run(flow_input={}, workflow_path=str(saved))
+            top_level = await engine.ahandle_request(GetTopLevelFlowRequest())
+            # Its failure save, run as the executor exits, reads the same workflow.
+            await executor._save_failed_workflow(RuntimeError("The run failed."))
+            return flow_name, top_level
+
+        flow_name, top_level = asyncio.run(run())
+
+        assert flow_name == "saved_canvas"
+        assert isinstance(top_level, GetTopLevelFlowResultSuccess), top_level.result_details
+        assert top_level.flow_name == "saved_canvas"
+        assert failed_path.exists()
+
+    def test_with_no_file_it_reuses_the_workflow_a_script_opened(self, tmp_path: Path) -> None:
+        saved = _write_saved_workflow(tmp_path / "script.py")
+        namespace: dict[str, Any] = {"__file__": str(saved)}
+        exec(compile(saved.read_text(encoding="utf-8"), str(saved), "exec"), namespace)  # noqa: S102
+        executor = LocalWorkflowExecutor()
+
+        async def run_as_script() -> WorkflowRuntime | None:
+            await namespace["build_workflow"]()
+            return await executor.ensure_default_workflow()
+
+        reused = asyncio.run(run_as_script())
+
+        assert reused is not None
+        assert "saved_canvas" in reused.flows.name_to_parent_name
 
 
 class TestCleanSlateClosesEveryOpenWorkflow:

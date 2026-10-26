@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
     from types import TracebackType
 
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +78,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         self._save_on_failure_path = save_on_failure_path
         # The id of the workflow `_load_workflow_from_path` opened, so callers can address it.
         self._loaded_workflow_id: str | None = None
+        # The workflow this executor runs, which `ensure_default_workflow` binds.
+        self._workflow: WorkflowRuntime | None = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -234,8 +238,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             self._loaded_workflow_id = result.workflow_id
 
     async def _handle_event_request(self, event: EventRequest) -> None:
-        """Handle EventRequest objects by processing them through GriptapeNodes."""
-        await GriptapeNodes.ahandle_request(event.request)
+        """Handle EventRequest objects by processing them through GriptapeNodes, in the workflow they name."""
+        await GriptapeNodes.get_instance().ahandle_request(event.request, workflow_id=event.workflow_id)
 
     async def _handle_execution_event(
         self, event: ExecutionGriptapeNodeEvent, flow_name: str
@@ -271,10 +275,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """
         GriptapeNodes.EventManager().initialize_queue()
 
-        # Load workflow from file if workflow_path is provided
-        workflow_path = kwargs.get("workflow_path")
-        if workflow_path:
-            await self._load_workflow_from_path(workflow_path)
+        await self.ensure_default_workflow(kwargs.get("workflow_path"))
 
         # Load the flow
         flow_name = self._load_flow_for_workflow()
@@ -282,6 +283,37 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         await self._set_input_for_flow(flow_name=flow_name, flow_input=flow_input)
 
         return flow_name
+
+    async def ensure_default_workflow(self, workflow_path: str | None = None) -> WorkflowRuntime | None:
+        """Open the workflow this executor runs, or reuse the one bound for it, and bind it for the rest of the run.
+
+        With `workflow_path`, the file runs from scratch and opens its workflow. Without one, the executor
+        runs the workflow already bound to the current work: a saved file run as a script binds the
+        workflow it opens. The binding lasts for the rest of the executor's context, as a saved file's does,
+        so the run's requests, which name no workflow, reach it. None when nothing is bound and no file is
+        given; the run's requests then name no workflow.
+
+        Raises:
+            LocalExecutorError: The file could not be loaded, or its load opened no workflow.
+        """
+        engine = GriptapeNodes.get_instance()
+        if not workflow_path:
+            self._workflow = engine.bound_workflow
+            return self._workflow
+
+        await self._load_workflow_from_path(workflow_path)
+        workflow = None
+        if self._loaded_workflow_id is not None:
+            workflow = engine.open_workflows.find_by_id(self._loaded_workflow_id)
+        if workflow is None:
+            msg = (
+                f"Attempted to run the workflow in '{workflow_path}'. Failed because loading it left no workflow open."
+            )
+            raise LocalExecutorError(msg)
+
+        engine.bind_workflow_for_saved_file(workflow)
+        self._workflow = workflow
+        return workflow
 
     async def _resolve_failure_save_path(self, workflow_name: str) -> str | None:
         """Resolve the user-supplied save-on-failure path to an absolute path string.

@@ -424,9 +424,9 @@ class Engine:
         """Bind `workflow` for the rest of the current context, for a saved workflow file that opened it.
 
         A saved file opens its workflow (`push_workflow(file_path=__file__)`) and then sends its
-        requests without an envelope id. Nothing unbinds it: the binding lasts as long as the context,
-        which is the file run's `bind_workflow` block when the engine runs the file, or the script's
-        own task when it runs on its own.
+        requests without an envelope id, as does the executor that runs it. Nothing unbinds it: the
+        binding lasts as long as the context, which is the file run's `bind_workflow` block when the
+        engine runs the file, or the script's own task when it runs on its own.
         """
         _bound_workflow.set(workflow)
 
