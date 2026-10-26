@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -225,8 +226,16 @@ class WorkflowRunner(EngineScoped):
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
             return RunWorkflowWithCurrentStateResultFailure(result_details=details)
-        # The file runs into the open workflow (at most one is open), and opens its own when none is.
-        open_workflow = next(iter(self.engine.open_workflows), None)
+        # The file runs into the open workflow, and opens its own when none is. Stage 6 gives this request
+        # the workflow it runs into; until then it never picks one of several.
+        try:
+            open_workflow = self.engine.open_workflows.sole_workflow_or_none()
+        except OpenWorkflowError:
+            details = (
+                f"Attempted to run '{relative_file_path}' into the open workflow. "
+                "Failed because more than one workflow is open."
+            )
+            return RunWorkflowWithCurrentStateResultFailure(result_details=details)
         execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=open_workflow)
 
         if execution_result.execution_successful:

@@ -32,11 +32,13 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultFailure,
     RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, collect_workflow_metadata
 from griptape_nodes.retained_mode.managers.library.common import RegisteredEventHandler
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.workflow_context import push_unsaved_workflow, without_sole_workflow_fallback
 
 if TYPE_CHECKING:
@@ -46,7 +48,6 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # A saved workflow file as codegen writes one: it opens its workflow unless one is open, then sends
 # requests that name no workflow.
@@ -134,6 +135,25 @@ class TestSavedWorkflowFilesTheEngineRuns:
         assert isinstance(result, RunWorkflowWithCurrentStateResultSuccess), result.result_details
         assert result.workflow_id == open_workflow.workflow_id
         assert "saved_canvas" in open_workflow.flows.name_to_parent_name
+
+    def test_a_file_run_with_the_current_state_never_picks_one_of_several_open_workflows(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        first = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        # Only one workflow can open until Stage 6, so the second is placed in the set directly.
+        second_id = engine.workflow_registry.register_unsaved("second").workflow_id
+        second = WorkflowRuntime(second_id, engine.open_workflows._dispatcher)
+        saved = _write_saved_workflow(tmp_path / "saved.py")
+
+        with patch.dict(engine.open_workflows._by_id, {second_id: second}):
+            result = asyncio.run(engine.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(saved))))
+
+        assert isinstance(result, RunWorkflowWithCurrentStateResultFailure)
+        assert str(result.result_details) == (
+            f"Attempted to run '{saved}' into the open workflow. Failed because more than one workflow is open."
+        )
+        assert first.flows.name_to_parent_name == {}
+        assert second.flows.name_to_parent_name == {}
 
     def test_a_referenced_import_builds_into_the_workflow_it_is_handed(self, engine: Engine, tmp_path: Path) -> None:
         importing = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
