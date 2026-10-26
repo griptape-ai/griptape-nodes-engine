@@ -72,13 +72,13 @@ class TestSerializeFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_round_trips_through_json(self, engine: Engine) -> None:
         """The payload decodes back into the exact commands a direct request would produce."""
-        push_unsaved_workflow(engine, "wf_roundtrip")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_roundtrip").workflow_id)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_roundtrip", set_as_new_context=True)
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        payload = _serialize_flow(engine, flow_name=created.flow_name)
+        payload = _serialize_flow(engine, workflow, flow_name=created.flow_name)
         assert payload is not None
 
         decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
@@ -92,29 +92,29 @@ class TestSerializeFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_no_flow_name_and_no_current_flow_returns_none(self, engine: Engine) -> None:
         """With nothing to serialize and no flow context to fall back to, this must not raise."""
-        push_unsaved_workflow(engine, "wf_no_flow")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_no_flow").workflow_id)
 
         assert not engine.context_manager.has_current_flow()
-        assert _serialize_flow(engine, flow_name=None) is None
+        assert _serialize_flow(engine, workflow, flow_name=None) is None
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_unknown_flow_name_returns_none(self, engine: Engine) -> None:
         """A flow name that does not exist fails the underlying request; this must degrade to None, not raise."""
-        push_unsaved_workflow(engine, "wf_missing_flow")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_missing_flow").workflow_id)
 
-        assert _serialize_flow(engine, flow_name="does_not_exist") is None
+        assert _serialize_flow(engine, workflow, flow_name="does_not_exist") is None
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_none_flow_name_uses_current_flow_context(self, engine: Engine) -> None:
         """Omitting `flow_name` serializes whichever flow is active in the Current Context."""
-        push_unsaved_workflow(engine, "wf_current_context")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_current_context").workflow_id)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_current_context", set_as_new_context=True)
         )
         assert isinstance(created, CreateFlowResultSuccess)
         assert engine.context_manager.has_current_flow()
 
-        payload = _serialize_flow(engine, flow_name=None)
+        payload = _serialize_flow(engine, workflow, flow_name=None)
         assert payload is not None
 
         decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
@@ -150,23 +150,23 @@ class TestCollectWorkflowMetadata:
     @pytest.mark.usefixtures("clean_object_state")
     def test_every_key_is_namespaced(self, engine: Engine) -> None:
         """Every injected key carries the `gtn_` prefix so it never collides with a user's own PNG text chunks."""
-        push_unsaved_workflow(engine, "wf_namespace")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_namespace").workflow_id)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_namespace", set_as_new_context=True)
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        metadata = collect_workflow_metadata(engine)
+        metadata = collect_workflow_metadata(engine, workflow)
 
         assert metadata  # sanity: something was collected
         assert all(key.startswith(METADATA_NAMESPACE) for key in metadata)
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_no_workflow_context_still_returns_saved_at(self, engine: Engine) -> None:
-        """Even with no workflow in context, a timestamp is always available."""
+        """Even with no workflow, a timestamp is always available."""
         assert not engine.context_manager.has_current_workflow()
 
-        metadata = collect_workflow_metadata(engine)
+        metadata = collect_workflow_metadata(engine, None)
 
         assert f"{METADATA_NAMESPACE}saved_at" in metadata
         assert f"{METADATA_NAMESPACE}workflow_name" not in metadata
@@ -176,13 +176,13 @@ class TestCollectWorkflowMetadata:
         """A flow in context contributes its serialized commands under FLOW_COMMANDS_KEY."""
         from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 
-        push_unsaved_workflow(engine, "wf_flow_commands")
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine, "wf_flow_commands").workflow_id)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_flow_commands", set_as_new_context=True)
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        metadata = collect_workflow_metadata(engine)
+        metadata = collect_workflow_metadata(engine, workflow)
 
         assert FLOW_COMMANDS_KEY in metadata
         decoded = decode_commands(json.loads(metadata[FLOW_COMMANDS_KEY]), SerializedFlowCommands)

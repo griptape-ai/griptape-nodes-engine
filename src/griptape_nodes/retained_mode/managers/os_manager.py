@@ -2715,7 +2715,7 @@ class OSManager(EngineScoped):
             # loop; only the re-encode with the collected metadata goes to a worker thread.
             provider = self.engine.artifact_manager.provider_for_write(file_path.name)
             if provider is not None:
-                metadata = provider.collect_metadata_for_write(file_path.name)
+                metadata = provider.collect_metadata_for_write(file_path.name, workflow)
                 if metadata:
                     content = await to_thread(provider.prepare_content_for_write, content, file_path.name, metadata)
 

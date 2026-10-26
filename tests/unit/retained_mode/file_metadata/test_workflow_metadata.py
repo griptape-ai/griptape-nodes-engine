@@ -373,12 +373,38 @@ class TestCollectSidecarProvenance:
 
 
 class TestCollectWorkflowMetadata:
-    def test_returns_saved_at_with_no_context(self) -> None:
-        engine = _make_engine(has_workflow=False)
+    def test_returns_only_saved_at_with_no_workflow_and_no_mirror(self) -> None:
+        engine = _make_engine()
+        engine.context_manager.mirrored_workflow_id.return_value = None
 
-        result = collect_workflow_metadata(engine)
+        result = collect_workflow_metadata(engine, None)
 
-        assert "gtn_saved_at" in result
+        assert list(result) == ["gtn_saved_at"]
+
+    def test_with_no_workflow_a_worker_answers_from_its_mirror(self) -> None:
+        engine = _make_engine(workflow_name="mirrored_workflow")
+        engine.context_manager.mirrored_workflow_id.return_value = "wf-mirrored"
+
+        with patch(
+            "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
+            return_value=None,
+        ):
+            result = collect_workflow_metadata(engine, None)
+
+        assert result["gtn_workflow_name"] == "mirrored_workflow"
+
+    def test_reads_the_workflow_it_is_handed(self) -> None:
+        engine = Mock()
+        workflow = _make_workflow(engine, workflow_name="handed_workflow")
+
+        with patch(
+            "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
+            return_value=None,
+        ) as serialize_flow:
+            result = collect_workflow_metadata(engine, workflow)
+
+        assert result["gtn_workflow_name"] == "handed_workflow"
+        serialize_flow.assert_called_once_with(engine, workflow)
 
     def test_excluded_params_excluded_from_png_metadata(self) -> None:
         priv, _ = _make_param("password", exclude_from_metadata=True, value=None)
@@ -391,14 +417,15 @@ class TestCollectWorkflowMetadata:
         node.parameters = [priv, pub]
         node._get_raw_parameter_value.side_effect = param_values.get
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
         with patch(
             "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
             return_value=None,
         ):
-            result = collect_workflow_metadata(engine)
+            result = collect_workflow_metadata(engine, workflow)
 
         assert "gtn_param_prompt" in result
         assert "gtn_param_password" not in result

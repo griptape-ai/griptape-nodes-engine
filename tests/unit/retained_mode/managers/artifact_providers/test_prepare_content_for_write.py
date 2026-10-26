@@ -37,7 +37,7 @@ class TestBaseArtifactProviderDefaults:
     """A provider that overrides neither hook embeds nothing and leaves the bytes alone."""
 
     def test_collects_no_metadata(self, registry: ProviderRegistry) -> None:
-        assert AudioArtifactProvider(registry=registry).collect_metadata_for_write("clip.mp3") == {}
+        assert AudioArtifactProvider(registry=registry).collect_metadata_for_write("clip.mp3", None) == {}
 
     def test_returns_data_unchanged(self, registry: ProviderRegistry) -> None:
         data = b"audio bytes"
@@ -53,14 +53,17 @@ class TestImageArtifactProviderCollectMetadataForWrite:
     def test_collects_workflow_metadata_for_png(self, image_provider: ImageArtifactProvider) -> None:
         metadata = {"gtn_saved_at": "2024-01-01T00:00:00+00:00"}
 
-        with patch(COLLECT_PATH, return_value=metadata):
-            result = image_provider.collect_metadata_for_write("image.png")
+        workflow = MagicMock()
+
+        with patch(COLLECT_PATH, return_value=metadata) as mock_collect:
+            result = image_provider.collect_metadata_for_write("image.png", workflow)
 
         assert result == metadata
+        mock_collect.assert_called_once_with(image_provider.engine, workflow)
 
     def test_skips_collecting_for_formats_without_metadata(self, image_provider: ImageArtifactProvider) -> None:
         with patch(COLLECT_PATH) as mock_collect:
-            result = image_provider.collect_metadata_for_write("image.jpg")
+            result = image_provider.collect_metadata_for_write("image.jpg", None)
 
         mock_collect.assert_not_called()
         assert result == {}
@@ -69,7 +72,7 @@ class TestImageArtifactProviderCollectMetadataForWrite:
         self, image_provider: ImageArtifactProvider, caplog: pytest.LogCaptureFixture
     ) -> None:
         with patch(COLLECT_PATH, side_effect=RuntimeError("collect failed")), caplog.at_level(logging.WARNING):
-            result = image_provider.collect_metadata_for_write("image.png")
+            result = image_provider.collect_metadata_for_write("image.png", None)
 
         assert result == {}
         assert any("Attempted to collect workflow metadata" in record.message for record in caplog.records)

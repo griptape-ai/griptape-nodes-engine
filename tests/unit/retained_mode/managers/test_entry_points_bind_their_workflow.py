@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateRequest,
     RunWorkflowWithCurrentStateResultSuccess,
 )
+from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, collect_workflow_metadata
 from tests.workflow_context import push_unsaved_workflow, without_sole_workflow_fallback
 
 if TYPE_CHECKING:
@@ -217,6 +218,19 @@ class TestLocalWorkflowExecutor:
 
         assert reused is not None
         assert "saved_canvas" in reused.flows.name_to_parent_name
+
+
+class TestImageMetadata:
+    def test_metadata_for_a_file_written_for_a_workflow_embeds_that_workflow_and_its_flow(self, engine: Engine) -> None:
+        entry = push_unsaved_workflow(engine, "pictured")
+        workflow = engine.open_workflows.get(entry.workflow_id)
+        canvas = _create_flow(engine, workflow, "canvas")
+        workflow.context.push_flow(engine.flow_manager.get_flow_by_name_in(workflow, canvas))
+
+        metadata = collect_workflow_metadata(engine, workflow)
+
+        assert metadata["gtn_workflow_name"] == entry.name
+        assert FLOW_COMMANDS_KEY in metadata
 
 
 class TestCleanSlateClosesEveryOpenWorkflow:

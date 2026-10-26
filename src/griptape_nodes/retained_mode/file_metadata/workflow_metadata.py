@@ -60,17 +60,22 @@ def _serialize_node(node_name: str, engine: Engine) -> str | None:
     return None
 
 
-def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
+def _serialize_flow(engine: Engine, workflow: WorkflowRuntime | None, flow_name: str | None = None) -> str | None:
     """Serialize a flow's commands to JSON for image metadata.
 
     Args:
         engine: The engine whose request bus and context manager perform the serialization
+        workflow: The workflow whose flow to serialize, or None for the context's (a worker's mirror)
         flow_name: Name of the flow to serialize (None for current context flow)
 
     Returns:
         The flow's commands as JSON text, or None if serialization fails
     """
-    if flow_name is None and not engine.context_manager.has_current_flow():
+    if workflow is None:
+        has_current_flow = engine.context_manager.has_current_flow()
+    else:
+        has_current_flow = workflow.context.has_current_flow()
+    if flow_name is None and not has_current_flow:
         logger.warning("Cannot serialize flow: no current flow context available")
         return None
 
@@ -78,7 +83,10 @@ def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
         flow_name=flow_name,
         include_create_flow_command=False,
     )
-    serialize_result = engine.handle_request(serialize_request)
+    if workflow is None:
+        serialize_result = engine.handle_request(serialize_request)
+    else:
+        serialize_result = workflow.handle_request(serialize_request)
     if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
         logger.warning("Failed to serialize flow '%s' to commands", flow_name or "current")
         return None
@@ -174,9 +182,9 @@ def _collect_workflow_info(engine: Engine, workflow_name: str) -> dict[str, Any]
 def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
     """Collect structured provenance from current execution context without any output formatting.
 
-    collect_workflow_metadata() delegates here, and so does collect_sidecar_provenance() on a
-    worker; each formats the result for its target (flat PNG text-chunk strings vs. JSON
-    sidecar). _collect_raw_provenance_in() collects the same blocks for a given workflow.
+    collect_workflow_metadata() and collect_sidecar_provenance() delegate here on a worker; each
+    formats the result for its target (flat PNG text-chunk strings vs. JSON sidecar).
+    _collect_raw_provenance_in() collects the same blocks for a given workflow.
 
     Args:
         engine: The engine whose context manager and flow manager supply the metadata.
@@ -308,15 +316,17 @@ def _flatten_workflow_info(wf: dict[str, Any], metadata: dict[str, str]) -> None
         metadata[f"{METADATA_NAMESPACE}workflow_description"] = wf["description"]
 
 
-def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
-    """Collect available workflow metadata from current execution context.
+def collect_workflow_metadata(engine: Engine, workflow: WorkflowRuntime | None) -> dict[str, str]:
+    """Collect available workflow metadata for a file written for `workflow`.
 
-    Delegates to _collect_raw_provenance() then flattens the result to a gtn_-prefixed
+    Collects the raw provenance then flattens the result to a gtn_-prefixed
     string dict suitable for PNG text-chunk injection. Also appends the serialized flow
     commands blob, which is only needed for the embedded-metadata path.
 
     Args:
-        engine: The engine whose context manager and flow manager supply the metadata.
+        engine: The engine whose flow manager and workflow registry supply the metadata.
+        workflow: The workflow the file is written for, or None. With None, a worker answers
+            from the workflow it mirrors, and any other engine records only the save time.
 
     Returns:
         Dictionary of metadata key-value pairs, may be empty if no context available.
@@ -324,7 +334,13 @@ def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
     metadata: dict[str, str] = {}
     metadata[f"{METADATA_NAMESPACE}saved_at"] = datetime.now(UTC).isoformat()
 
-    raw = _collect_raw_provenance(engine)
+    if workflow is not None:
+        raw = _collect_raw_provenance_in(engine, workflow)
+    elif engine.context_manager.mirrored_workflow_id() is not None:
+        # A worker opens no workflow; its context is the mirror of its orchestrator's.
+        raw = _collect_raw_provenance(engine)
+    else:
+        return metadata
 
     if "workflow" in raw:
         _flatten_workflow_info(raw["workflow"], metadata)
@@ -341,7 +357,7 @@ def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
 
     # Serialize the entire flow to commands. Only needed for embedded image metadata,
     # not the sidecar (the command tree is too large to be useful there).
-    flow_commands = _serialize_flow(engine)
+    flow_commands = _serialize_flow(engine, workflow)
     if flow_commands:
         metadata[FLOW_COMMANDS_KEY] = flow_commands
 

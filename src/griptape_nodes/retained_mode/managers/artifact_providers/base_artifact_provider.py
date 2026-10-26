@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class WriteVettingPolicy(StrEnum):
@@ -253,13 +254,14 @@ class BaseArtifactProvider(EngineScoped, ABC):
 
         return result
 
-    def collect_metadata_for_write(self, file_name: str) -> dict[str, str]:  # noqa: ARG002
+    def collect_metadata_for_write(self, file_name: str, workflow: WorkflowRuntime | None) -> dict[str, str]:  # noqa: ARG002
         """Collect the metadata to embed in a file of this format, or {} to embed none.
 
         Runs on the event loop, so it may read engine state. Default embeds nothing.
 
         Args:
             file_name: Resolved filename including extension (post-macro resolution and post-policy)
+            workflow: The workflow the file is written for, or None
         """
         return {}
 

@@ -458,7 +458,7 @@ class TestImageMetadata:
         self, engine: Engine, library_name: str, flow_name: str, tmp_path: Path
     ) -> None:
         _create_node(engine, library_name, flow_name, "A")
-        flow_commands_text = _serialize_flow(engine, flow_name)
+        flow_commands_text = _serialize_flow(engine, engine.open_workflows.sole_workflow(), flow_name)
         assert flow_commands_text is not None
         info = PngInfo()
         info.add_text(FLOW_COMMANDS_KEY, flow_commands_text)
@@ -480,4 +480,4 @@ class TestImageMetadata:
     ) -> None:
         _create_node(engine, library_name, flow_name, "A").metadata["handle"] = _Handle()
 
-        assert _serialize_flow(engine, flow_name) is None
+        assert _serialize_flow(engine, engine.open_workflows.sole_workflow(), flow_name) is None

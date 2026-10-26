@@ -554,7 +554,9 @@ class TestMetadataInjection:
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_lookup.assert_called_once_with("image.png")
-        provider.collect_metadata_for_write.assert_called_once_with("image.png")
+        provider.collect_metadata_for_write.assert_called_once_with(
+            "image.png", engine.open_workflows.sole_workflow_or_none()
+        )
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
 
     def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
