@@ -113,7 +113,7 @@ Results are delivered on the `response_topic` you named, to every connection tha
 
 Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`.
 
-While a flow runs, the engine also sends messages whose `type` is `execution_event`, such as a node starting, finishing, or updating a value. The `workflow_id` inside `payload` names the open workflow the event belongs to. It is `null` for events that belong to no workflow, such as a chat agent's replies.
+While a flow runs, the engine also sends messages whose `type` is `execution_event`, such as a node starting, finishing, or updating a value. The `workflow_id` inside `payload` names the open workflow the event belongs to. It is `null` for events that belong to no workflow, such as a chat agent's replies, and for the events a node sends while it is being created, before it joins its workflow.
 
 If your organization uses license keys, the engine checks each request against your license. A request your license doesn't permit is refused rather than run.
 

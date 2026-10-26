@@ -559,7 +559,11 @@ class BaseNode(ABC):
         self._cancellation_requested.clear()
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
-        """An execution event about this node, naming the workflow it belongs to (None when it has none)."""
+        """An execution event about this node, naming the workflow it belongs to (None when it has none).
+
+        A node joins its workflow after it is constructed, so the events its `__init__` sends (such as
+        adding its parameters) name no workflow.
+        """
         return ExecutionGriptapeNodeEvent(
             wrapped_event=ExecutionEvent(payload=payload, workflow_id=self._event_workflow_id())
         )
