@@ -23,7 +23,9 @@ from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LOCAL_EXECUTION
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.events.variable_events import ListVariablesRequest, ListVariablesResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind
 
 
 def _make_executor() -> NodeExecutor:
@@ -287,6 +289,35 @@ class TestPrivateExecutionStartEndLoop:
         calls = await self._run(run_in_order=run_in_order, beta_enabled=False)
 
         assert calls == {private_runner: [None]}
+
+
+class TestResolveVariablesForNode:
+    """The variables a dispatch carries come from the workflow the node runs in."""
+
+    def test_none_when_the_workflow_turned_substitution_off(self) -> None:
+        workflow = MagicMock()
+        workflow.variables.substitution_enabled = False
+
+        assert _make_executor()._resolve_variables_for_node(workflow, "Node") == {}
+        workflow.handle_request.assert_not_called()
+
+    def test_lists_them_in_the_workflow_it_is_handed(self) -> None:
+        workflow = MagicMock()
+        workflow.variables.substitution_enabled = True
+        workflow.nodes.parent_flow_name.return_value = "Flow"
+        workflow.handle_request.return_value = ListVariablesResultSuccess(
+            variables=[FlowVariable(name="SHOT", owning_flow_name="Flow", type="str", value="010")],
+            layers=[VariableLayerKind.FLOW],
+            result_details="ok",
+        )
+
+        variables = _make_executor()._resolve_variables_for_node(workflow, "Node")
+
+        assert variables == {"SHOT": "010"}
+        workflow.nodes.parent_flow_name.assert_called_once_with("Node")
+        request = workflow.handle_request.call_args.args[0]
+        assert isinstance(request, ListVariablesRequest)
+        assert request.starting_flow == "Flow"
 
 
 class TestExecuteUnexpectedResultType:
