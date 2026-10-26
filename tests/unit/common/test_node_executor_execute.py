@@ -280,9 +280,11 @@ class TestExecuteDeletedNode:
         workflow = MagicMock()
         workflow.ahandle_request = AsyncMock()
 
-        with pytest.raises(RuntimeError, match="was deleted while the run was in progress"):
+        with pytest.raises(RuntimeError, match="was deleted while the run was in progress") as caught:
             await executor.execute(workflow, node)
 
+        # The run wraps the message with the node's name, so naming it here would say it twice.
+        assert "Gone" not in str(caught.value)
         workflow.ahandle_request.assert_not_awaited()
 
 

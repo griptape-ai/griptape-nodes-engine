@@ -308,8 +308,9 @@ class NodeExecutor(EngineScoped):
             RuntimeError: The node was deleted from the workflow before it started.
         """
         # A node leaves its workflow when it is deleted, and a run can still reach one deleted mid-run.
+        # The message leaves the node unnamed: the error event and the run's failure message name it.
         if node.workflow is None:
-            msg = f"Attempted to run node '{node.name}'. Failed because it was deleted while the run was in progress."
+            msg = "Attempted to run this node. Failed because it was deleted while the run was in progress."
             raise RuntimeError(msg)
         token = current_executing_node_name.set(node.name)
         try:
