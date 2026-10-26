@@ -321,13 +321,14 @@ class DagBuilder(EngineScoped):
 
     @staticmethod
     def collect_nodes_in_forward_control_path(
-        start_node: BaseNode, end_node: BaseNode, connections: Connections
+        start_node: BaseNode, end_node: BaseNode | None, connections: Connections
     ) -> set[str]:
         """Collect all nodes in the forward control path from start_node to end_node.
 
         Args:
             start_node: The node to start traversal from
-            end_node: The node to stop traversal at (inclusive)
+            end_node: The node to stop traversal at (inclusive), or None to follow every control
+                wire to its end
             connections: The connections manager
 
         Returns:

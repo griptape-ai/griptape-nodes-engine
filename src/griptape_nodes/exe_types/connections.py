@@ -299,6 +299,36 @@ class Connections:
         return internal_connections
 
     # Used to check data connections for all future nodes to be BAD!
+    def collect_downstream_data_nodes(self, node: BaseNode, visited: set[str] | None = None) -> set[str]:
+        """Return the names of every node reachable from `node` over data (non-control) output edges.
+
+        Same traversal as `unresolve_future_nodes`, without touching any node's state. A caller that
+        passes its own `visited` set gets the union across several roots in one pass; the root
+        itself is recorded in `visited` but is not part of the returned set.
+        """
+        if visited is None:
+            visited = set()
+        downstream: set[str] = set()
+        if node.name in visited:
+            return downstream
+        visited.add(node.name)
+
+        if node.name not in self.outgoing_index:
+            return downstream
+        for parameter in node.parameters:
+            if (
+                ParameterMode.OUTPUT in parameter.allowed_modes
+                and ParameterTypeBuiltin.CONTROL_TYPE.value != parameter.output_type
+                and parameter.name in self.outgoing_index[node.name]
+            ):
+                for connection_id in self.outgoing_index[node.name][parameter.name]:
+                    if connection_id not in self.connections:
+                        continue
+                    target_node = self.connections[connection_id].target_node
+                    downstream.add(target_node.name)
+                    downstream.update(self.collect_downstream_data_nodes(target_node, visited))
+        return downstream
+
     def unresolve_future_nodes(self, node: BaseNode, visited: set[str] | None = None) -> None:
         """Mark every data node downstream of `node` unresolved.
 

@@ -96,3 +96,26 @@ def test_node_taken_out_of_the_set_is_walked_again_but_not_past_nodes_still_in_i
     assert c.state == NodeResolutionState.UNRESOLVED
     assert d.state == NodeResolutionState.RESOLVED
     assert visited == {"A", "B", "C", "D"}
+
+
+def test_collect_downstream_data_nodes_matches_the_unresolve_walk_without_touching_state() -> None:
+    """The collect-only walk names the same nodes the unresolve walk would flip, and flips nothing."""
+    connections, (a, b, c) = _chain("A", "B", "C")
+
+    downstream = connections.collect_downstream_data_nodes(a)
+
+    assert downstream == {"B", "C"}
+    assert (a.state, b.state, c.state) == (NodeResolutionState.RESOLVED,) * 3
+
+
+def test_collect_downstream_data_nodes_shares_a_visited_set_across_roots() -> None:
+    """Two roots feeding one chain are walked once; the shared set stops the second descent."""
+    connections, (a, b, _c) = _chain("A", "B", "C")
+    visited: set[str] = set()
+
+    first = connections.collect_downstream_data_nodes(a, visited)
+    second = connections.collect_downstream_data_nodes(b, visited)
+
+    assert first == {"B", "C"}
+    assert second == set()  # B was already visited through A
+    assert visited == {"A", "B", "C"}

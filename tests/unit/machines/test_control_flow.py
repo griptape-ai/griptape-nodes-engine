@@ -85,14 +85,23 @@ class TestDrainGlobalFlowQueue:
 class TestSeedDagFromCategories:
     """Tests for ControlFlowMachine._seed_dag_from_categories."""
 
-    def test_pass1_adds_start_and_control_entries(self) -> None:
+    @staticmethod
+    def _connections(*, downstream: set[str] | None = None) -> MagicMock:
+        """A Connections stand-in: `collect_downstream_data_nodes` returns `downstream` for any root."""
+        connections = MagicMock()
+        connections.get_connected_node.return_value = None
+        connections.collect_downstream_data_nodes.return_value = set(downstream or ())
+        return connections
+
+    def test_pass1_adds_start_and_control_entries(self, monkeypatch: pytest.MonkeyPatch) -> None:
         start = _mock_node("Start")
         control = _mock_node("Ctrl")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[control], data_sink_nodes=[])
-
-        connections = MagicMock()
-        connections.get_connected_node.return_value = None
+        connections = self._connections()
         dag_builder = DagBuilder(_engine_with_connections(connections))
+        monkeypatch.setattr(
+            DagBuilder, "collect_nodes_in_forward_control_path", staticmethod(lambda n, _e, _c: {n.name})
+        )
 
         entry_nodes = ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
 
@@ -104,14 +113,16 @@ class TestSeedDagFromCategories:
         assert start.state == NodeResolutionState.UNRESOLVED
         assert control.state == NodeResolutionState.UNRESOLVED
 
-    def test_pass2_defers_sinks_until_the_control_graphs_finish(self) -> None:
+    def test_pass2_defers_a_sink_fed_by_the_control_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         start = _mock_node("Start")
         sink = _mock_node("Sink")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
-
-        connections = MagicMock()
-        connections.get_connected_node.return_value = None
+        # Start's control path reaches Ctrl; Ctrl feeds Middle which feeds Sink (data edges).
+        connections = self._connections(downstream={"Middle", "Sink"})
         dag_builder = DagBuilder(_engine_with_connections(connections))
+        monkeypatch.setattr(
+            DagBuilder, "collect_nodes_in_forward_control_path", staticmethod(lambda n, _e, _c: {n.name, "Ctrl"})
+        )
 
         ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
 
@@ -121,31 +132,31 @@ class TestSeedDagFromCategories:
         assert dag_builder.deferred_data_sinks == [sink]
         assert dag_builder.start_node_candidates == {}
 
-    def test_pass2_seeds_sinks_now_when_the_run_has_no_control_work(self) -> None:
-        first = _mock_node("First")
-        second = _mock_node("Second")
-        categories = DagNodeCategories(start_nodes=[], control_nodes=[], data_sink_nodes=[second])
-
-        connections = MagicMock()
-        connections.get_connected_node.return_value = None
-        connections.incoming_index = {}
-        connections.outgoing_index = {}
-        dag_builder = DagBuilder(_engine_with_connections(connections))
-
-        ControlFlowMachine._seed_dag_from_categories(first, categories, dag_builder, connections)
-
-        # Nothing control-wired can re-run under the sink, so it runs alongside the start node.
-        assert "Second" in dag_builder.node_to_reference
-        assert dag_builder.deferred_data_sinks == []
-
-    def test_sink_already_in_dag_is_not_deferred(self) -> None:
+    def test_pass2_seeds_a_sink_the_control_path_never_feeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         start = _mock_node("Start")
         sink = _mock_node("Sink")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
-
-        connections = MagicMock()
-        connections.get_connected_node.return_value = None
+        connections = self._connections(downstream={"Other"})
         dag_builder = DagBuilder(_engine_with_connections(connections))
+        monkeypatch.setattr(
+            DagBuilder, "collect_nodes_in_forward_control_path", staticmethod(lambda n, _e, _c: {n.name, "Ctrl"})
+        )
+
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
+
+        # Nothing above the sink will re-run, so it starts alongside the control graph.
+        assert "Sink" in dag_builder.node_to_reference
+        assert dag_builder.deferred_data_sinks == []
+
+    def test_sink_already_in_dag_is_not_deferred(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        start = _mock_node("Start")
+        sink = _mock_node("Sink")
+        categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
+        connections = self._connections(downstream={"Sink"})
+        dag_builder = DagBuilder(_engine_with_connections(connections))
+        monkeypatch.setattr(
+            DagBuilder, "collect_nodes_in_forward_control_path", staticmethod(lambda n, _e, _c: {n.name})
+        )
 
         # Pre-seed the sink so PASS 2 sees it already present.
         dag_builder.add_node(sink)

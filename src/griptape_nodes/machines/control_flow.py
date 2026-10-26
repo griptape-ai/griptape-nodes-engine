@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
@@ -41,18 +40,6 @@ class NextNodeInfo:
 
 
 logger = logging.getLogger("griptape_nodes")
-
-
-def _has_control_connection(node: BaseNode, connections: Connections) -> bool:
-    """Whether any control-typed parameter on `node` has a connection in either direction."""
-    for parameter in node.parameters:
-        if parameter.output_type != ParameterTypeBuiltin.CONTROL_TYPE.value:
-            continue
-        incoming = node.name in connections.incoming_index and parameter.name in connections.incoming_index[node.name]
-        outgoing = node.name in connections.outgoing_index and parameter.name in connections.outgoing_index[node.name]
-        if incoming or outgoing:
-            return True
-    return False
 
 
 # This is the control flow context. Owns the Resolution Machine
@@ -366,21 +353,17 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
     ) -> list[BaseNode]:
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
-        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 marks the data
-        sinks (terminal/leaf nodes with no control wires) stale and, when the run has control work,
-        does NOT seed them yet: a sink seeded alongside the control graphs adopts its upstream chain
-        while the control nodes on it are still RESOLVED from the previous run, so it gets no edge
-        to them and runs on their old outputs while they re-run beside it. The driver seeds the
+        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 handles the data
+        sinks (terminal/leaf nodes with no control wires). A sink that sits downstream of this run's
+        control path is marked stale and put off: seeded now, its upstream walk would stop at a node
+        still RESOLVED from the previous run and never add an edge to the control node about to
+        re-run above it, so it would run beside that node on its old output. The driver seeds the
         deferred sinks once every control graph has finished
-        (``ExecuteDagState._seed_deferred_data_sinks``), when the only nodes left UNRESOLVED
-        upstream of a sink are the ones this run actually made stale. A run with no control-wired
-        node in scope has nothing that could re-run under a sink, so its sinks are seeded now and
-        run in parallel as before.
+        (``ExecuteDagState._seed_deferred_data_sinks``), when the control nodes have run and marked
+        their downstream stale, so the walk adopts exactly what must recompute. A sink with nothing
+        from the control path above it is seeded now and runs alongside everything else.
         """
         start_nodes = [start_node]
-        has_control_work = bool(categories.start_nodes or categories.control_nodes) or _has_control_connection(
-            start_node, connections
-        )
 
         # PASS 1: control/start entries build the control-flow graphs.
         for node in (*categories.start_nodes, *categories.control_nodes):
@@ -390,12 +373,21 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                 if node not in start_nodes:
                     start_nodes.append(node)
 
-        # PASS 2: data sinks. Put off until the control graphs have run, unless there are none.
+        # Everything this run's control walk will re-run, and every data node fed by any of it.
+        may_be_stale: set[str] = set()
+        for entry_node in start_nodes:
+            may_be_stale.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
+        node_manager = dag_builder.engine.node_manager
+        visited: set[str] = set()
+        for name in list(may_be_stale):
+            may_be_stale.update(connections.collect_downstream_data_nodes(node_manager.get_node_by_name(name), visited))
+
+        # PASS 2: data sinks.
         for node in categories.data_sink_nodes:
             node.state = NodeResolutionState.UNRESOLVED
             if node.name in dag_builder.node_to_reference:
                 continue
-            if has_control_work:
+            if node.name in may_be_stale:
                 dag_builder.deferred_data_sinks.append(node)
             else:
                 dag_builder.add_node_with_dependencies(node, node.name)
