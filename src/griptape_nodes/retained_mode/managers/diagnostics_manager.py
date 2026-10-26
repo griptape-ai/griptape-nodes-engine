@@ -102,7 +102,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -234,15 +233,11 @@ class DiagnosticsManager(EngineScoped):
             ),
         )
 
-    @handles(CollectDiagnosticsRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    @handles(CollectDiagnosticsRequest, scope=RequestScope.HOST)
     async def on_collect_diagnostics_request(
-        self, request: CollectDiagnosticsRequest, workflow: WorkflowRuntime | None = None
+        self, request: CollectDiagnosticsRequest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        """Build a diagnostics bundle and return a link to download it.
-
-        `workflow` is the workflow whose file the bundle includes and whose static files it is saved
-        in, or None.
-        """
+        """Build a diagnostics bundle and return a link to download it."""
         # This name is joined onto the output directory, so anything with a directory in it --
         # `../../.ssh/config`, an absolute path, a bare `..` -- lands somewhere the caller never saw.
         if request.file_name is not None and not _is_a_plain_file_name(request.file_name):
@@ -268,7 +263,7 @@ class DiagnosticsManager(EngineScoped):
                 if request.include_logs:
                     self._stage_logs(bundle, warnings)
                 if request.include_current_workflow:
-                    self._stage_workflow(bundle, warnings, workflow)
+                    self._stage_open_workflow(bundle, warnings)
 
                 report = await self._build_report(redactor, warnings, normalize_identity=request.normalize_identity)
                 if report is None:
@@ -299,16 +294,11 @@ class DiagnosticsManager(EngineScoped):
 
         file_name = request.file_name or self._default_bundle_file_name(report)
         if request.output_path is not None:
-            return await self._write_bundle_to_path(workflow, request.output_path, file_name, data, manifest)
+            return await self._write_bundle_to_path(request.output_path, file_name, data, manifest)
         return self._write_bundle_to_static_files(file_name, data, manifest)
 
     async def _write_bundle_to_path(
-        self,
-        workflow: WorkflowRuntime | None,
-        output_path: str,
-        file_name: str,
-        data: bytes,
-        manifest: DiagnosticsBundleManifest,
+        self, output_path: str, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
         r"""Write a bundle to a path on the engine\'s machine.
 
@@ -323,8 +313,9 @@ class DiagnosticsManager(EngineScoped):
 
         # Extension coercion off: a zip is written as a zip, and a diagnostics bundle
         # renamed by format sniffing would break whatever the user is about to attach it to.
-        result = await self.engine.os_manager.write_file_in(
-            workflow,
+        # Written with no workflow: the bundle describes the engine, and dispatch would hand an
+        # unaddressed request whichever workflow it finds open.
+        result = await self.engine.os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=str(destination),
                 content=data,
@@ -574,10 +565,15 @@ class DiagnosticsManager(EngineScoped):
             "most likely cannot be written to."
         )
 
-    def _stage_workflow(self, bundle: DiagnosticsBundle, warnings: list[str], workflow: WorkflowRuntime | None) -> None:
-        """Add the saved file of `workflow` to a bundle, when there is one."""
+    def _stage_open_workflow(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
+        """Add the open workflow's saved file to a bundle, when there is one.
+
+        Read from the open workflows rather than the request, which names none: the bundle reports
+        what the engine has open, as the session section does.
+        """
+        workflow = self.engine.open_workflows.sole_workflow_or_none()
         if workflow is None:
-            warnings.append("No workflow was open, so none is in this bundle.")
+            warnings.append("No workflow is open, so none is in this bundle.")
             return
 
         workflow_path = self.engine.workflow_registry.get(workflow.workflow_id).absolute_path

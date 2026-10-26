@@ -529,15 +529,18 @@ class TestTheOpenWorkflow:
         assert f"workflow/{open_workflow.name}" in _members(result)
 
     @pytest.mark.asyncio
-    async def test_the_workflow_the_envelope_names_is_copied_into_the_bundle(
+    async def test_a_stale_envelope_id_still_collects_the_open_workflow(
         self, engine: Engine, tmp_path: Path, open_workflow: Path
     ) -> None:
-        workflow_id = engine.open_workflows.sole_workflow().workflow_id
+        """The editor stamps every request with the id it last knew, which may be a closed workflow.
+
+        The troubleshooting button has to work exactly then, so the bundle ignores that id.
+        """
         result = await engine.ahandle_request(
             CollectDiagnosticsRequest(
                 output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
             ),
-            workflow_id=workflow_id,
+            workflow_id="a-workflow-closed-since",
         )
 
         assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
@@ -553,26 +556,24 @@ class TestTheOpenWorkflow:
         assert report.session.current_workflow_path.endswith(open_workflow.name)
 
     @pytest.mark.asyncio
-    async def test_a_request_handed_no_workflow_copies_none_even_with_one_open(
-        self, engine: Engine, tmp_path: Path, open_workflow: Path
-    ) -> None:
-        result = await engine.diagnostics_manager.on_collect_diagnostics_request(
-            CollectDiagnosticsRequest(
-                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
-            ),
-            None,
-        )
-
-        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
-        assert f"workflow/{open_workflow.name}" not in _members(result)
-        assert [warning for warning in result.manifest.warnings if "No workflow was open" in warning] != []
-
-    @pytest.mark.asyncio
     async def test_nothing_open_is_reported_rather_than_left_blank(self, engine: Engine, tmp_path: Path) -> None:
         """Asked for and absent is a different thing from never asked for."""
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
-        assert [warning for warning in result.manifest.warnings if "No workflow was open" in warning] != []
+        assert [warning for warning in result.manifest.warnings if "No workflow is open" in warning] != []
+
+    @pytest.mark.asyncio
+    async def test_nothing_open_and_a_stale_envelope_id_still_collects(self, engine: Engine, tmp_path: Path) -> None:
+        """The editor's id outlives the last workflow it named; the bundle is still collected."""
+        result = await engine.ahandle_request(
+            CollectDiagnosticsRequest(
+                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+            ),
+            workflow_id="a-workflow-closed-since",
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert [warning for warning in result.manifest.warnings if "No workflow is open" in warning] != []
 
     @pytest.mark.asyncio
     async def test_an_unsaved_workflow_is_reported_with_what_to_do_about_it(

@@ -667,6 +667,7 @@ class TestWorkerForwarding:
 
 # The editor sends these with no envelope id, or an id it has not confirmed open, because they
 # report or replace what is open. QueryModelAccessForNodeRequest asks about the host's license.
+# CollectDiagnosticsRequest reports on the engine, and has to work when the editor's id is stale.
 HOST_REQUESTS = [
     GetWorkflowContextRequest,
     ListAllWorkflowsRequest,
@@ -676,6 +677,7 @@ HOST_REQUESTS = [
     RunWorkflowFromScratchRequest,
     RunWorkflowWithCurrentStateRequest,
     QueryModelAccessForNodeRequest,
+    CollectDiagnosticsRequest,
 ]
 
 
@@ -799,7 +801,6 @@ OPTIONAL_WORKFLOW_HOST_STATE_REQUESTS = [
     DeclareModelInvocationRequest,
     BudgetAccessRequest,
     ReportUsageRequest,
-    CollectDiagnosticsRequest,
 ]
 
 
