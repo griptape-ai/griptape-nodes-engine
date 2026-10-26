@@ -1,10 +1,13 @@
 """A run executes against the workflow it was started in, even when that is not the only one open.
 
 Each test builds a flow in one workflow, then opens a second, empty one beside it. While the run
-goes, a read of "the open workflow" made by the machines or the node executor answers with that
-second workflow, and a request they send naming no workflow is handed none. So run machinery that
-reads ambient state instead of the workflow it holds fails or acts on the empty workflow, and every
-such read fails the test.
+goes, every ambient way to find a workflow answers run machinery (the machines and the node
+executor) with that second workflow: the only open workflow, the workflow bound to the current
+work, and iterating the open workflows. A request they send naming no workflow is handed none. So
+run machinery that reads ambient state instead of the workflow it holds fails or acts on the empty
+workflow, and every such read fails the test. A read made through a helper outside the engine's
+managers (an `exe_types` static, a `utils` function, a standard library frame) counts as run
+machinery's when run machinery called the helper.
 
 Node code (`exe_types/` and node libraries) still reads the open workflow in places; moving it onto
 `node.workflow` comes next. Its reads answer with the run's workflow here, as `node.workflow` will.
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sysconfig
 import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -22,6 +26,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
@@ -51,7 +56,6 @@ from tests.workflow_context import push_unsaved_workflow
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 
 pytestmark = pytest.mark.timeout(120, method="thread")
@@ -74,6 +78,12 @@ _DISPATCH_FILES = (
     "retained_mode/runtime/workflow_runtime.py",
 )
 
+_STDLIB_DIR = Path(sysconfig.get_path("stdlib")).as_posix() + "/"
+
+# The engine's own reads of what is open, kept so the patches below can answer everyone else as usual.
+_ENGINE_BOUND_WORKFLOW = Engine.bound_workflow
+_ITERATE_OPEN_WORKFLOWS = OpenWorkflowSet.__iter__
+
 _POLL_ATTEMPTS = 500
 _POLL_SECONDS = 0.01
 
@@ -82,29 +92,56 @@ def _is_run_machinery(reader: str) -> bool:
     return any(part in reader for part in _RUN_MACHINERY)
 
 
+def _frame_path(frame: traceback.FrameSummary) -> str:
+    return frame.filename.replace("\\", "/")
+
+
 def _reader_of(stack: list[traceback.FrameSummary]) -> str:
     """The code that asked for the open workflow: the first frame outside the engine's managers.
 
+    Standard library frames are passed over, as are the engine's managers. A helper (an `exe_types`
+    static, a `utils` function) reads on behalf of whoever called it, so when the next frame out
+    from the reader, passing over the same frames, is run machinery, the read is run machinery's.
     A read made by a handler while a request is dispatched is the handler's own, so a frame of
     dispatch ends the search there.
     """
+    reader: traceback.FrameSummary | None = None
     for frame in reversed(stack):
-        path = frame.filename.replace("\\", "/")
-        if path.endswith("open_workflow_set.py"):
-            continue
+        path = _frame_path(frame)
         if path.endswith("retained_mode/managers/event_manager.py"):
-            return "a request handler"
-        if "griptape_nodes/retained_mode/" in path:
+            if reader is None:
+                return "a request handler"
+            break
+        if "griptape_nodes/retained_mode/" in path or path.startswith((_STDLIB_DIR, "<")):
             continue
-        return f"{path}:{frame.lineno} in {frame.name}"
-    return "unknown"
+        if reader is None:
+            reader = frame
+            continue
+        if _is_run_machinery(path):
+            return f"{path}:{frame.lineno} in {frame.name}, through {_describe(reader)}"
+        break
+    if reader is None:
+        return "unknown"
+    return _describe(reader)
+
+
+def _describe(frame: traceback.FrameSummary) -> str:
+    return f"{_frame_path(frame)}:{frame.lineno} in {frame.name}"
+
+
+def _sender_of(stack: list[traceback.FrameSummary]) -> str:
+    """The code that sent the request being dispatched: the reader once the dispatch's frames are dropped."""
+    while stack and _frame_path(stack[-1]).endswith(_DISPATCH_FILES):
+        stack.pop()
+    return _reader_of(stack)
 
 
 class _AnotherWorkflowOpen:
     """Opens an empty second workflow beside the run's, and makes it what run machinery reads as open.
 
     A request the run machinery sends naming no workflow is handed none, as every one will be once
-    the temporary fallback that hands it the only open workflow is deleted.
+    the temporary fallback that hands it the only open workflow is deleted. Run machinery that reads
+    the workflow bound to the current work, or iterates the open workflows, gets the second workflow.
     """
 
     def __init__(self, engine: Engine, run_workflow: WorkflowRuntime) -> None:
@@ -115,9 +152,12 @@ class _AnotherWorkflowOpen:
         self.run_machinery_readers: list[str] = []
 
     def __enter__(self) -> Self:
+        # `OpenWorkflowSet.open` refuses a second workflow while one is open, so it is added directly.
         self._engine.open_workflows._by_id[self.workflow.workflow_id] = self.workflow
         self._patches = contextlib.ExitStack()
         self._patches.enter_context(patch.object(OpenWorkflowSet, "sole_workflow_or_none", self._ambient_workflow))
+        self._patches.enter_context(patch.object(OpenWorkflowSet, "__iter__", self._iterate_open_workflows))
+        self._patches.enter_context(patch.object(Engine, "bound_workflow", property(self._bound_workflow)))
         self._patches.enter_context(
             patch.object(event_manager_module, "_workflow_for_unaddressed_request", self._unaddressed_workflow)
         )
@@ -125,7 +165,8 @@ class _AnotherWorkflowOpen:
 
     def __exit__(self, *_exc: object) -> None:
         self._patches.close()
-        del self._engine.open_workflows._by_id[self.workflow.workflow_id]
+        self._engine.open_workflows.close(self.workflow)
+        self._engine.workflow_registry.remove(self.workflow.workflow_id)
 
     def assert_untouched(self) -> None:
         assert self.run_machinery_readers == []
@@ -141,12 +182,24 @@ class _AnotherWorkflowOpen:
         self.run_machinery_readers.append(reader)
         return self.workflow
 
+    def _iterate_open_workflows(self) -> Iterator[WorkflowRuntime]:
+        # Patched onto the class as a bound method, so it is not handed the set it replaces.
+        reader = _reader_of(traceback.extract_stack()[:-1])
+        if not _is_run_machinery(reader):
+            return _ITERATE_OPEN_WORKFLOWS(self._engine.open_workflows)
+        self.run_machinery_readers.append(reader)
+        return iter([self.workflow])
+
+    def _bound_workflow(self, engine: Engine) -> WorkflowRuntime | None:
+        # Dispatch reads the binding for a request naming no workflow, so the reader is whoever sent it.
+        reader = _sender_of(traceback.extract_stack()[:-1])
+        if not _is_run_machinery(reader):
+            return _ENGINE_BOUND_WORKFLOW.__get__(engine, Engine)
+        self.run_machinery_readers.append(reader)
+        return self.workflow
+
     def _unaddressed_workflow(self, _open_workflows: OpenWorkflowSet) -> WorkflowRuntime | None:
-        # Drop the frames of the dispatch that asked, so the reader is whoever sent the request.
-        stack = traceback.extract_stack()[:-1]
-        while stack and stack[-1].filename.replace("\\", "/").endswith(_DISPATCH_FILES):
-            stack.pop()
-        reader = _reader_of(stack)
+        reader = _sender_of(traceback.extract_stack()[:-1])
         if not _is_run_machinery(reader):
             return self._run_workflow
         self.run_machinery_readers.append(reader)
