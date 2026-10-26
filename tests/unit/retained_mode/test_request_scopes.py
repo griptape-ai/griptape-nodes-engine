@@ -461,6 +461,8 @@ _HOST_READS: list[Callable[[], RequestPayload]] = [
     ListBetaFeaturesRequest,
     GetCurrentProjectRequest,
     ListProjectTemplatesRequest,
+    # Reports on the engine, and has to work when the editor's id is stale.
+    CollectDiagnosticsRequest,
 ]
 
 
@@ -822,7 +824,6 @@ OPTIONAL_WORKFLOW_HOST_STATE_REQUESTS = [
     DeclareModelInvocationRequest,
     BudgetAccessRequest,
     ReportUsageRequest,
-    CollectDiagnosticsRequest,
 ]
 
 
