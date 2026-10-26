@@ -39,6 +39,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    BranchWorkflowRequest,
+    BranchWorkflowResultSuccess,
+    CompareWorkflowsRequest,
+    CompareWorkflowsResultSuccess,
     DeleteWorkflowRequest,
     DeleteWorkflowResultSuccess,
     GetVariableSubstitutionEnabledRequest,
@@ -47,6 +51,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowRunCommandResultSuccess,
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
+    MergeWorkflowBranchRequest,
+    MergeWorkflowBranchResultFailure,
     PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
     PublishWorkflowResultSuccess,
@@ -268,6 +274,45 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
         assert project_engine.open_workflows.is_open(tab.workflow_id or "")
         assert project_engine.workflow_registry.find_by_id(other.workflow_id or "") is None
+
+    def test_merging_a_branch_open_beside_the_tab_is_refused(self, project_engine: Engine) -> None:
+        source = _open_and_save(project_engine, "source")
+        project_engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
+        assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
+        tab = _open_and_save(project_engine, "tab")
+        branch_runtime = WorkflowRuntime(branch.branched_workflow_id or "", project_engine)
+        source_content = Path(source.file_path).read_text(encoding="utf-8")
+
+        with patch.dict(project_engine.open_workflows._by_id, {branch_runtime.workflow_id: branch_runtime}):
+            merged = project_engine.handle_request(
+                MergeWorkflowBranchRequest(workflow_id=branch.branched_workflow_id), workflow_id=tab.workflow_id
+            )
+
+        assert isinstance(merged, MergeWorkflowBranchResultFailure)
+        assert str(merged.result_details) == (
+            f"Attempted to merge workflow branch '{branch.branched_workflow_name}'. "
+            "Failed because it is open. Open another workflow first."
+        )
+        assert project_engine.workflow_registry.find_by_id(branch.branched_workflow_id or "") is not None
+        assert Path(source.file_path).read_text(encoding="utf-8") == source_content
+
+    def test_comparing_compares_the_workflows_it_names_not_the_tab(self, project_engine: Engine) -> None:
+        source = _open_and_save(project_engine, "source")
+        project_engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
+        assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
+        tab = _open_and_save(project_engine, "tab")
+
+        compared = project_engine.handle_request(
+            CompareWorkflowsRequest(workflow_id=branch.branched_workflow_id, compare_workflow_id=source.workflow_id),
+            workflow_id=tab.workflow_id,
+        )
+
+        assert isinstance(compared, CompareWorkflowsResultSuccess), compared.result_details
+        assert compared.workflow_name == branch.branched_workflow_name
+        assert compared.compare_workflow_name == source.workflow_name
+        assert project_engine.open_workflows.is_open(tab.workflow_id or "")
 
     def test_renaming_an_open_workflow_saves_that_workflow(self, engine: Engine) -> None:
         tab = push_unsaved_workflow(engine, "tab")
