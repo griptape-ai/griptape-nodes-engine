@@ -39,7 +39,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesResultSuccess,
     UnloadLibraryFromRegistryRequest,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.library.catalog import LibraryCatalog
 from griptape_nodes.retained_mode.managers.library.common import (
     LIBRARY_CONFIG_FILENAME,
@@ -619,8 +618,7 @@ class LibraryManager(EngineScoped):
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.
-        clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-        clear_all_result = await self.engine.ahandle_request(clear_all_request)
+        clear_all_result = await self.engine.object_manager.close_open_workflows()
         if not clear_all_result.succeeded():
             details = "Failed to clear the existing object state when preparing to reload all libraries."
             return ReloadAllLibrariesResultFailure(result_details=details)

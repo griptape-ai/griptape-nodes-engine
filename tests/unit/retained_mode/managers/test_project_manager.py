@@ -6013,11 +6013,22 @@ class TestProjectManagerProjectWorkspaces:
             ReloadAllLibrariesRequest,
             ReloadAllLibrariesResultSuccess,
         )
-        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateResultSuccess
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
+        order: list[str] = []
+
+        async def record_close() -> object:
+            order.append("close")
+            return ClearAllObjectStateResultSuccess(result_details="ok")
+
+        async def record_request(request: object) -> object:
+            order.append(type(request).__name__)
+            return ReloadAllLibrariesResultSuccess(result_details="ok")
+
         harness = self._make_workspace_switch_harness(tmp_path, library_config_changes=True)
-        harness.engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
+        harness.engine.object_manager.close_open_workflows = AsyncMock(side_effect=record_close)
+        harness.engine.ahandle_request = AsyncMock(side_effect=record_request)
 
         with patch.object(harness.project_manager, "_engine", harness.engine):
             result = await harness.project_manager.on_set_current_project_request(
@@ -6026,8 +6037,7 @@ class TestProjectManagerProjectWorkspaces:
 
         # The workflow is closed before the reload; the reload's own clear then finds an
         # empty stack, so the teardown happens exactly once.
-        dispatched = [type(call.args[0]) for call in harness.engine.ahandle_request.call_args_list]
-        assert dispatched == [ClearAllObjectStateRequest, ReloadAllLibrariesRequest]
+        assert order == ["close", ReloadAllLibrariesRequest.__name__]
         harness.workflow_manager.refresh_workflow_registry.assert_called_once()
         assert result.altered_workflow_state
 
@@ -6041,22 +6051,21 @@ class TestProjectManagerProjectWorkspaces:
         """
         from unittest.mock import AsyncMock, patch
 
-        from griptape_nodes.retained_mode.events.object_events import (
-            ClearAllObjectStateRequest,
-            ClearAllObjectStateResultSuccess,
-        )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateResultSuccess
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         harness = self._make_workspace_switch_harness(tmp_path)
-        harness.engine.ahandle_request = AsyncMock(return_value=ClearAllObjectStateResultSuccess(result_details="ok"))
+        close_open_workflows = AsyncMock(return_value=ClearAllObjectStateResultSuccess(result_details="ok"))
+        harness.engine.object_manager.close_open_workflows = close_open_workflows
+        harness.engine.ahandle_request = AsyncMock()
 
         with patch.object(harness.project_manager, "_engine", harness.engine):
             result = await harness.project_manager.on_set_current_project_request(
                 SetCurrentProjectRequest(project_id=harness.project_id)
             )
 
-        dispatched = [type(call.args[0]) for call in harness.engine.ahandle_request.call_args_list]
-        assert dispatched == [ClearAllObjectStateRequest]
+        close_open_workflows.assert_awaited_once_with()
+        harness.engine.ahandle_request.assert_not_called()
         harness.workflow_manager.refresh_workflow_registry.assert_called_once()
         assert result.altered_workflow_state
 
@@ -6070,7 +6079,7 @@ class TestProjectManagerProjectWorkspaces:
 
         order: list[str] = []
 
-        async def record_clear(_request: object) -> object:
+        async def record_clear() -> object:
             order.append("clear")
             return ClearAllObjectStateResultSuccess(result_details="ok")
 
@@ -6078,7 +6087,7 @@ class TestProjectManagerProjectWorkspaces:
             order.append("refresh")
 
         harness = self._make_workspace_switch_harness(tmp_path)
-        harness.engine.ahandle_request = AsyncMock(side_effect=record_clear)
+        harness.engine.object_manager.close_open_workflows = AsyncMock(side_effect=record_clear)
         harness.workflow_manager.refresh_workflow_registry = AsyncMock(side_effect=record_refresh)
 
         with patch.object(harness.project_manager, "_engine", harness.engine):
@@ -6105,7 +6114,7 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         harness = self._make_workspace_switch_harness(tmp_path)
-        harness.engine.ahandle_request = AsyncMock(
+        harness.engine.object_manager.close_open_workflows = AsyncMock(
             return_value=ClearAllObjectStateResultFailure(result_details="a node refused to release")
         )
 

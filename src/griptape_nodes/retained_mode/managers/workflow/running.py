@@ -173,8 +173,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # Start with a clean slate: the run replaces whatever is open.
-            clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-            clear_all_result = await self.engine.ahandle_request(clear_all_request)
+            clear_all_result = await self.engine.object_manager.close_open_workflows()
             if not clear_all_result.succeeded():
                 details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
@@ -281,8 +280,7 @@ class WorkflowRunner(EngineScoped):
         with self.engine.workflow_manager.squelch_workflow_altered():
             if request.run_with_clean_slate:
                 # Start with a clean slate: the run replaces whatever is open.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
+                clear_all_result = await self.engine.object_manager.close_open_workflows()
                 if not clear_all_result.succeeded():
                     details = (
                         f"Failed to clear the existing object state when preparing to run workflow '{workflow_name}'."

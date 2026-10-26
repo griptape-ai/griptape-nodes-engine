@@ -61,7 +61,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
@@ -3080,7 +3079,7 @@ class ProjectManager(EngineScoped):
         # that claimed otherwise would leave the client showing a workflow the engine has
         # dropped, which is the state this teardown exists to prevent.
         if workspace_changed:
-            clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            clear_result = await self.engine.object_manager.close_open_workflows()
             if not clear_result.succeeded():
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "

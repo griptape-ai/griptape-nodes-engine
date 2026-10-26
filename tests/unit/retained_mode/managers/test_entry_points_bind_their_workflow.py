@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
 )
+from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     RunWorkflowFromRegistryRequest,
@@ -176,3 +178,62 @@ class TestSavedWorkflowFilesRunOnTheirOwn:
             assert bound.workflow_id == engine.context_manager.get_current_workflow_id()
 
         assert engine.bound_workflow is None
+
+
+class TestCleanSlateClosesEveryOpenWorkflow:
+    """Work that starts from a clean slate closes each open workflow by id, never "the only one"."""
+
+    def test_the_open_workflow_is_closed_by_id(self, engine: Engine) -> None:
+        push_unsaved_workflow(engine)
+
+        result = asyncio.run(engine.object_manager.close_open_workflows())
+
+        assert result.succeeded(), result.result_details
+        assert list(engine.open_workflows) == []
+
+    def test_with_none_open_it_clears_with_no_workflow_even_under_a_stale_binding(self, engine: Engine) -> None:
+        closed = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        asyncio.run(engine.close_workflow_state(closed))
+
+        with engine.bind_workflow(closed):
+            result = asyncio.run(engine.object_manager.close_open_workflows())
+
+        assert result.succeeded(), result.result_details
+
+    def test_a_run_from_scratch_replaces_the_open_workflow(self, engine: Engine, tmp_path: Path) -> None:
+        replaced = push_unsaved_workflow(engine)
+        saved = _write_saved_workflow(tmp_path / "saved.py")
+
+        result = asyncio.run(engine.ahandle_request(RunWorkflowFromScratchRequest(file_path=str(saved))))
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
+        assert not engine.open_workflows.is_open(replaced.workflow_id)
+        assert [workflow.workflow_id for workflow in engine.open_workflows] == [result.workflow_id]
+
+    def test_a_run_from_the_registry_with_a_clean_slate_replaces_the_open_workflow(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        replaced = push_unsaved_workflow(engine)
+        saved = _register_saved_workflow(engine, tmp_path / "registered.py")
+
+        result = asyncio.run(
+            engine.ahandle_request(
+                RunWorkflowFromRegistryRequest(workflow_id=saved.workflow_id, run_with_clean_slate=True)
+            )
+        )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result.result_details
+        assert not engine.open_workflows.is_open(replaced.workflow_id)
+
+    def test_a_library_reload_closes_the_open_workflow(self, engine: Engine) -> None:
+        push_unsaved_workflow(engine)
+        library_manager = engine.library_manager
+
+        with (
+            patch.object(library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock()),
+        ):
+            result = asyncio.run(library_manager._run_reload_libraries(ReloadAllLibrariesRequest()))
+
+        assert result.succeeded(), result.result_details
+        assert list(engine.open_workflows) == []

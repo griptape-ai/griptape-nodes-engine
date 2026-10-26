@@ -164,6 +164,24 @@ class ObjectManager(EngineScoped):
         details = "Successfully cleared all object state (deleted everything)."
         return ClearAllObjectStateResultSuccess(result_details=details)
 
+    async def close_open_workflows(self) -> ResultPayload:
+        """Clear all object state in every open workflow, for work that starts from a clean slate.
+
+        Sends ClearAllObjectState to each open workflow by id, stopping at the first failure, which it
+        returns. With none open, sends it with no workflow, which clears a worker's mirror and what
+        this process holds.
+        """
+        open_workflows = list(self.engine.open_workflows)
+        if not open_workflows:
+            with self.engine.bind_workflow(None):
+                return await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        for workflow in open_workflows[:-1]:
+            result = await workflow.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if not result.succeeded():
+                return result
+        return await open_workflows[-1].ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
     def get_filtered_subset[T](
         self,
         name: str | Pattern | None = None,
