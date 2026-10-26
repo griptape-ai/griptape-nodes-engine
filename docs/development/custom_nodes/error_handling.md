@@ -483,7 +483,9 @@ The checks follow these rules:
     image over Pillow's decompression-bomb limit (about 179 megapixels), a video or audio input when
     ffprobe isn't installed, or a probe that runs out of time (see "No network calls, and a cap on blocking"
     below) is left for the provider to judge. A validator refuses only an input it has read and
-    found outside the limit.
+    found outside the limit. When a probe runs out of time, the engine logs a warning and sends a
+    `NodeInputsNotCheckedEvent` naming the node and each input it couldn't check, which the editor
+    shows as a warning. The node still runs.
 - **Declare the provider's limits and a docs link.** The validators know nothing about any provider.
     Your node declares the limits the provider documents, only on the inputs its request sends, and
     `input_limits_url()` returns the page that documents them, so the user can see the rule.

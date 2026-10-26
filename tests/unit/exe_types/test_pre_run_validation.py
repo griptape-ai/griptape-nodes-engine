@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import importlib
+import json
+import subprocess
 import sys
 from dataclasses import dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
@@ -38,7 +40,7 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
-from griptape_nodes.exe_types.pre_run_validation import run_pre_run_validators
+from griptape_nodes.exe_types.pre_run_validation import run_pre_run_validators, unchecked_inputs_message
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
 from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
@@ -571,6 +573,90 @@ class TestParameterTypes:
         assert _Records.seen == []
         run_pre_run_validators(node)
         assert _Records.seen == ["a cat"]
+
+
+class TestUncheckedInputs:
+    """An input that took too long to read is named, so the user can be told; the node still runs."""
+
+    @pytest.fixture(autouse=True)
+    def slow_ffprobe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def run(cmd: list[str], **kwargs: Any) -> None:
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(input_checks.subprocess, "run", run)
+
+    @staticmethod
+    def _clip(tmp_path: Path, name: str = "clip.mp4") -> str:
+        clip = tmp_path / name
+        clip.write_bytes(b"video")
+        return str(clip)
+
+    @staticmethod
+    def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[str]]:
+        unchecked: list[str] = []
+        with input_check_readings():
+            errors = run_pre_run_validators(node, unchecked=unchecked)
+        return errors, unchecked
+
+    def test_names_a_video_that_took_too_long(self, tmp_path: Path) -> None:
+        node = _node_with(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
+        node.set_parameter_value("video", self._clip(tmp_path))
+        assert self._unchecked(node) == ([], ["The video in 'Video'"])
+
+    def test_still_reports_what_it_could_read(self, tmp_path: Path) -> None:
+        node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(1), Duration(max=5)]))
+        node.set_parameter_value("video", self._clip(tmp_path))
+        errors, unchecked = self._unchecked(node)
+        (message,) = _messages(errors)
+        assert message.startswith("The video in 'video' is")
+        assert unchecked == ["The video in 'video'"]
+
+    def test_names_each_list_item_by_its_position(self, tmp_path: Path) -> None:
+        node = _node_with(
+            ParameterList(
+                name="clips",
+                tooltip="",
+                input_types=["VideoUrlArtifact"],
+                type="VideoUrlArtifact",
+                display_name="Reference Videos",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                pre_run_validators=[Duration(max=5)],
+            )
+        )
+        node.set_parameter_value("clips", [self._clip(tmp_path, "a.mp4"), self._clip(tmp_path, "b.mp4")])
+        assert self._unchecked(node)[1] == ["Video 1 in 'Reference Videos'", "Video 2 in 'Reference Videos'"]
+
+    def test_names_nothing_when_only_the_size_is_read(self, tmp_path: Path) -> None:
+        node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(10_000)]))
+        node.set_parameter_value("video", self._clip(tmp_path))
+        assert self._unchecked(node) == ([], [])
+
+    def test_names_nothing_for_an_input_read_in_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            input_checks.subprocess,
+            "run",
+            lambda *_a, **_k: SimpleNamespace(stdout=json.dumps({"format": {"duration": "4.0"}})),
+        )
+        node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
+        node.set_parameter_value("video", self._clip(tmp_path))
+        assert self._unchecked(node) == ([], [])
+
+
+class TestUncheckedInputsMessage:
+    def test_one_input(self) -> None:
+        assert unchecked_inputs_message(["The video in 'Video'"]) == (
+            "The video in 'Video' wasn't checked before the run because reading it took too long. "
+            "The provider may still reject it."
+        )
+
+    def test_several_inputs(self) -> None:
+        assert unchecked_inputs_message(
+            ["The video in 'Video'", "Audio clip 1 in 'Reference Audio'", "Audio clip 2 in 'Reference Audio'"]
+        ) == (
+            "The video in 'Video', audio clip 1 in 'Reference Audio' and audio clip 2 in 'Reference Audio' "
+            "weren't checked before the run because reading them took too long. The provider may still reject them."
+        )
 
 
 @dataclass(frozen=True)

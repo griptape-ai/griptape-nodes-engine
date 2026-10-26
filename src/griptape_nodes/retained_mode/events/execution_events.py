@@ -495,6 +495,26 @@ class NodeErrorEvent(ExecutionPayload):
 
 @dataclass
 @PayloadRegistry.register
+class NodeInputsNotCheckedEvent(ExecutionPayload):
+    """Some of a node's inputs weren't checked before it ran, because reading them took too long.
+
+    The node still runs; the provider may still reject an input that wasn't checked. Sent once per
+    node, after its pre-run checks, when any video or audio input's probe ran out of time.
+
+    Args:
+        node_name: The node about to run.
+        inputs: Each input that wasn't checked, as a message would name it, such as
+            "The video in 'Video'" or "Audio clip 2 in 'Reference Audio'".
+        message: One sentence for the user saying which inputs weren't checked and why.
+    """
+
+    node_name: str
+    inputs: list[str]
+    message: str
+
+
+@dataclass
+@PayloadRegistry.register
 class InvolvedNodesEvent(ExecutionPayload):
     """Event indicating which nodes are involved in the current execution.
 

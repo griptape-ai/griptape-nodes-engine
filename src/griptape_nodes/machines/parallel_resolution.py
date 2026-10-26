@@ -16,7 +16,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
-from griptape_nodes.exe_types.pre_run_validation import run_pre_run_validators
+from griptape_nodes.exe_types.pre_run_validation import run_pre_run_validators, unchecked_inputs_message
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentDataNodeEvent,
     InvolvedNodesEvent,
     NodeErrorEvent,
+    NodeInputsNotCheckedEvent,
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
 )
@@ -725,9 +726,14 @@ class ExecuteDagState(State):
             node_reference.node_reference.parameter_output_values.silent_clear()
             # Stops the node's input checks probing videos, which blocks this loop, after a few seconds,
             # and reads each input once for its declared validators and its own checks together.
+            unchecked: list[str] = []
             with input_check_budget(), input_check_readings():
-                exceptions: list[Exception] = [*run_pre_run_validators(node_reference.node_reference)]
+                exceptions: list[Exception] = [
+                    *run_pre_run_validators(node_reference.node_reference, unchecked=unchecked)
+                ]
                 exceptions.extend(node_reference.node_reference.validate_before_node_run() or [])
+            if unchecked:
+                await ExecuteDagState._report_unchecked_inputs(context, node_reference.node_reference.name, unchecked)
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
@@ -911,6 +917,19 @@ class ExecuteDagState(State):
         if context.paused:
             return None
         return ExecuteDagState
+
+    @staticmethod
+    async def _report_unchecked_inputs(context: ParallelResolutionContext, node_name: str, inputs: list[str]) -> None:
+        """Tell the user which of a node's inputs weren't checked before it ran, and log it."""
+        message = unchecked_inputs_message(inputs)
+        logger.warning("Node '%s': %s", node_name, message)
+        await context.engine.event_manager.aput_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(
+                    payload=NodeInputsNotCheckedEvent(node_name=node_name, inputs=inputs, message=message)
+                )
+            )
+        )
 
     @staticmethod
     def _log_abandoned(context: ParallelResolutionContext) -> None:

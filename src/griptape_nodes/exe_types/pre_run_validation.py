@@ -2,7 +2,8 @@
 
 The resolution machine calls `run_pre_run_validators` just before the node's
 `validate_before_node_run`, inside one `input_check_budget` and one `input_check_readings`, and
-reports both methods' errors together.
+reports both methods' errors together. It also names each input whose video or audio took too long to
+read, so the machine can tell the user it wasn't checked.
 """
 
 from __future__ import annotations
@@ -22,14 +23,14 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.validators.base import PreRunValidator
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["run_pre_run_validators"]
+__all__ = ["run_pre_run_validators", "unchecked_inputs_message"]
 
 # What an input is called in a message, by the kind of media its parameter holds.
 _NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
 _DEFAULT_NOUN = "input"
 
 
-def run_pre_run_validators(node: BaseNode) -> list[NodeError]:
+def run_pre_run_validators(node: BaseNode, *, unchecked: list[str] | None = None) -> list[NodeError]:
     """Every error the node's inputs break its declared limits with, or an empty list.
 
     For each parameter with `pre_run_validators`, reads its value once, for every reading those
@@ -37,6 +38,11 @@ def run_pre_run_validators(node: BaseNode) -> list[NodeError]:
     named by its position, except those that check the whole list. Then the node's
     `node_validators` run with what was read. A value that can't be read locally is skipped, as the
     checks underneath skip it.
+
+    Args:
+        node: The node about to run.
+        unchecked: If given, gets the subject of each input skipped because its video or audio
+            probe ran out of time, such as "The video in 'Video'", in the order checked.
     """
     declared = [parameter for parameter in node.parameters if parameter.pre_run_validators]
     if not declared and not node.node_validators:
@@ -49,11 +55,34 @@ def run_pre_run_validators(node: BaseNode) -> list[NodeError]:
         if not validators:
             continue
         readings = _check_parameter(node, parameter, validators, docs_url=docs_url, errors=errors)
-        if readings is not None:
-            media[parameter.name] = readings
+        if readings is None:
+            continue
+        media[parameter.name] = readings
+        if unchecked is not None:
+            unchecked.extend(_timed_out_subjects(parameter, readings))
     for node_validator in node.node_validators:
         errors.extend(node_validator.check(node, media=media, docs_url=docs_url))
     return errors
+
+
+def unchecked_inputs_message(inputs: Sequence[str]) -> str:
+    """One sentence telling the user these inputs weren't checked before the run, and why.
+
+    Args:
+        inputs: Each input's subject, as `run_pre_run_validators` gives them, such as
+            "The video in 'Video'".
+    """
+    if len(inputs) == 1:
+        return (
+            f"{inputs[0]} wasn't checked before the run because reading it took too long. "
+            "The provider may still reject it."
+        )
+    rest = [subject[0].lower() + subject[1:] for subject in inputs[1:]]
+    listed = ", ".join([inputs[0], *rest[:-1]]) + f" and {rest[-1]}"
+    return (
+        f"{listed} weren't checked before the run because reading them took too long. "
+        "The provider may still reject them."
+    )
 
 
 def _check_parameter(
@@ -138,6 +167,19 @@ def _noun(parameter: Parameter, kind: MediaKind | None) -> str:
     if kind is None:
         return _DEFAULT_NOUN
     return _NOUN_FOR_KIND[kind]
+
+
+def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> list[str]:
+    """The subject of each of the parameter's inputs whose probe ran out of time."""
+    shown_name = parameter.display_name or parameter.name
+    noun = _noun(parameter, media_kind_of(parameter))
+    if not holds_list(parameter):
+        return [input_subject(shown_name, noun=noun) for reading in readings if reading.timed_out]
+    return [
+        input_subject(shown_name, noun=noun, position=position)
+        for position, reading in enumerate(readings, start=1)
+        if reading.timed_out
+    ]
 
 
 def _readings_if_media(readings: list[MediaInfo], kind: MediaKind | None) -> list[MediaInfo] | None:
