@@ -141,6 +141,16 @@ class TestOpenWorkflowSet:
         with pytest.raises(OpenWorkflowError, match="2 workflows are open"):
             workflows.sole_workflow()
 
+    def test_iterating_lists_every_open_workflow_in_the_order_opened(self) -> None:
+        workflows = OpenWorkflowSet(MagicMock())
+        assert list(workflows) == []
+        first = workflows.open("abc")
+        # Several open cannot happen through `open`; force it to check every one is listed.
+        second = WorkflowRuntime("def", MagicMock())
+        workflows._by_id["def"] = second
+
+        assert list(workflows) == [first, second]
+
     def test_reads_never_open_a_workflow(self) -> None:
         workflows = OpenWorkflowSet(MagicMock())
 

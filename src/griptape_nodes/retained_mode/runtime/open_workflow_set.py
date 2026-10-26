@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.runtime.workflow_runtime import RequestDispatcher
 
 
@@ -32,6 +34,10 @@ class OpenWorkflowSet:
         """
         self._dispatcher = dispatcher
         self._by_id: dict[str, WorkflowRuntime] = {}
+
+    def __iter__(self) -> Iterator[WorkflowRuntime]:
+        """The open workflows' runtimes, in the order they were opened."""
+        return iter(list(self._by_id.values()))
 
     def open(self, workflow_id: str) -> WorkflowRuntime:
         """Open the workflow with this id and return its empty runtime.

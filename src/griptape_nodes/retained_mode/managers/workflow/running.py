@@ -193,13 +193,17 @@ class WorkflowRunner(EngineScoped):
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
-        open_workflow = self._open_workflow_for_file_run()
-        if open_workflow is not None and open_workflow.context.has_current_flow():
+        workflow_with_flow = None
+        for open_workflow in self.engine.open_workflows:
+            if open_workflow.context.has_current_flow():
+                workflow_with_flow = open_workflow
+                break
+        if workflow_with_flow is not None:
             # Disallow opening a workflow inside another workflow this way. It would
             # become an invisible child flow (no way to reach it in the UI), persisted
             # with the parent workflow on save, and executed invisibly whenever the
             # parent workflow was executed.
-            open_flow_name = open_workflow.context.get_current_flow().name
+            open_flow_name = workflow_with_flow.context.get_current_flow().name
             details = (
                 f"Attempted to open workflow '{relative_file_path}' while the flow '{open_flow_name}' is still open. "
                 "Close the current workflow first, before opening this one."
@@ -250,7 +254,7 @@ class WorkflowRunner(EngineScoped):
 
         # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
         # Refused before anything is registered or run.
-        already_open = self._open_workflow_for_file_run()
+        already_open = next(iter(self.engine.open_workflows), None)
         if not request.run_with_clean_slate and already_open is not None:
             details = (
                 f"Attempted to run workflow '{workflow_name}'. Failed because workflow "
