@@ -31,8 +31,6 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.input_checks import (
     FRAME_RATE_TOLERANCE,
-    _audio_readings_of,
-    _mime_type_error,
     check_aspect_ratio_exact,
     check_aspect_ratio_range,
     check_audio_codec,
@@ -134,12 +132,8 @@ class AllowedFormats(PreRunValidator):
 
     def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
         if media.audio is not None:
-            return _mime_type_error(
-                media.audio.mime_type,
-                subject=subject,
-                allowed=self.mime_types,
-                docs_url=docs_url,
-                also_matching=_audio_readings_of(self.mime_types),
+            return check_mime_type(
+                media.audio.mime_type, subject=subject, allowed=self.mime_types, docs_url=docs_url, audio=True
             )
         return check_mime_type(media.mime_type, subject=subject, allowed=self.mime_types, docs_url=docs_url)
 
@@ -186,7 +180,8 @@ class AspectRatioRange(PreRunValidator):
     A video whose pixels aren't square passes when either its stored or its displayed shape fits.
 
     Raises:
-        ValueError: If `tallest` or `widest` isn't a ratio such as "16:9".
+        ValueError: If `tallest` or `widest` isn't a ratio such as "16:9", or `tallest` is the wider
+            of the two.
     """
 
     needs = _FRAME_NEEDS

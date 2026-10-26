@@ -40,7 +40,11 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
-from griptape_nodes.exe_types.pre_run_validation import run_pre_run_validators, unchecked_inputs_message
+from griptape_nodes.exe_types.pre_run_validation import (
+    run_pre_run_validators,
+    unchecked_inputs_message,
+    unchecked_locations_by_name,
+)
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
 from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
@@ -593,26 +597,29 @@ class TestUncheckedInputs:
         return str(clip)
 
     @staticmethod
-    def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[str]]:
-        unchecked: list[str] = []
+    def _unchecked(node: BaseNode) -> tuple[list[NodeError], dict[str, str]]:
+        unchecked: dict[str, str] = {}
         with input_check_readings():
             errors = run_pre_run_validators(node, unchecked=unchecked)
         return errors, unchecked
 
     def test_names_a_video_that_took_too_long(self, tmp_path: Path) -> None:
+        clip = self._clip(tmp_path)
         node = _node_with(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
-        node.set_parameter_value("video", self._clip(tmp_path))
-        assert self._unchecked(node) == ([], ["The video in 'Video'"])
+        node.set_parameter_value("video", clip)
+        assert self._unchecked(node) == ([], {clip: "The video in 'Video'"})
 
     def test_still_reports_what_it_could_read(self, tmp_path: Path) -> None:
+        clip = self._clip(tmp_path)
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(1), Duration(max=5)]))
-        node.set_parameter_value("video", self._clip(tmp_path))
+        node.set_parameter_value("video", clip)
         errors, unchecked = self._unchecked(node)
         (message,) = _messages(errors)
         assert message.startswith("The video in 'video' is")
-        assert unchecked == ["The video in 'video'"]
+        assert unchecked == {clip: "The video in 'video'"}
 
     def test_names_each_list_item_by_its_position(self, tmp_path: Path) -> None:
+        first, second = self._clip(tmp_path, "a.mp4"), self._clip(tmp_path, "b.mp4")
         node = _node_with(
             ParameterList(
                 name="clips",
@@ -624,13 +631,16 @@ class TestUncheckedInputs:
                 pre_run_validators=[Duration(max=5)],
             )
         )
-        node.set_parameter_value("clips", [self._clip(tmp_path, "a.mp4"), self._clip(tmp_path, "b.mp4")])
-        assert self._unchecked(node)[1] == ["Video 1 in 'Reference Videos'", "Video 2 in 'Reference Videos'"]
+        node.set_parameter_value("clips", [first, second])
+        assert self._unchecked(node)[1] == {
+            first: "Video 1 in 'Reference Videos'",
+            second: "Video 2 in 'Reference Videos'",
+        }
 
     def test_names_nothing_when_only_the_size_is_read(self, tmp_path: Path) -> None:
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(10_000)]))
         node.set_parameter_value("video", self._clip(tmp_path))
-        assert self._unchecked(node) == ([], [])
+        assert self._unchecked(node) == ([], {})
 
     def test_names_nothing_for_an_input_read_in_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -640,7 +650,15 @@ class TestUncheckedInputs:
         )
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("video", self._clip(tmp_path))
-        assert self._unchecked(node) == ([], [])
+        assert self._unchecked(node) == ([], {})
+
+
+class TestUncheckedLocationsByName:
+    def test_names_a_file_no_declared_input_covers_by_its_file_name(self) -> None:
+        assert unchecked_locations_by_name({"/clips/a.mp4", "/clips/b.mp4"}, {"/clips/a.mp4"}) == ["'b.mp4'"]
+
+    def test_names_nothing_when_every_file_is_covered(self) -> None:
+        assert unchecked_locations_by_name({"/clips/a.mp4"}, {"/clips/a.mp4"}) == []
 
 
 class TestUncheckedInputsMessage:

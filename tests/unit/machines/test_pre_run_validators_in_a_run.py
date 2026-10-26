@@ -182,3 +182,51 @@ async def test_says_nothing_when_every_input_was_checked(tmp_path: Path) -> None
     await asyncio.wait_for(machine.resolve_node(), timeout=5)
 
     assert _unchecked_events(put_event) == []
+
+
+class _ProbesItself(MockNode):
+    """A node whose own check reads a video directly, with no declared validator on it."""
+
+    def __init__(self, clip: str) -> None:
+        super().__init__(name="own-check")
+        self._clip = clip
+
+    def validate_before_node_run(self) -> list[Exception] | None:
+        input_checks.local_video_probe(self._clip)
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("slow_ffprobe")
+async def test_names_a_file_the_nodes_own_check_could_not_read(tmp_path: Path) -> None:
+    """A probe the node ran itself that times out is reported too, named by its file."""
+    clip = tmp_path / "own.mp4"
+    clip.write_bytes(b"video")
+    machine, put_event = _machine_for(_ProbesItself(str(clip)))
+
+    await asyncio.wait_for(machine.resolve_node(), timeout=5)
+
+    (event,) = _unchecked_events(put_event)
+    assert event.inputs == ["'own.mp4'"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("slow_ffprobe")
+async def test_names_a_declared_input_once_when_the_node_also_reads_it(tmp_path: Path) -> None:
+    """An input the validators already named isn't named again by file when the node reads it too."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"video")
+
+    class _Both(_VideoNode):
+        def validate_before_node_run(self) -> list[Exception] | None:
+            input_checks.local_video_probe(str(clip))
+            return None
+
+    node = _Both()
+    node.set_parameter_value("video", str(clip))
+    machine, put_event = _machine_for(node)
+
+    await asyncio.wait_for(machine.resolve_node(), timeout=5)
+
+    (event,) = _unchecked_events(put_event)
+    assert event.inputs == ["The video in 'Video'"]

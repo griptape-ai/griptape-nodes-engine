@@ -99,6 +99,10 @@ class TestInputSubject:
     def test_names_a_single_input(self) -> None:
         assert input_subject("start frame", noun="image") == "The image in 'start frame'"
 
+    def test_keeps_a_nouns_own_capitals_at_a_position(self) -> None:
+        assert input_subject("icons", noun="SVG icon", position=2) == "SVG icon 2 in 'icons'"
+        assert input_subject("loras", noun="LoRA file", position=1) == "LoRA file 1 in 'loras'"
+
 
 class TestLocalSizeBytes:
     @pytest.mark.parametrize("length", [1, 2, 3, 100, 1001])
@@ -864,6 +868,10 @@ class TestCheckDimensions:
 
 
 class TestCheckAspectRatioRange:
+    def test_refuses_bounds_given_widest_first(self) -> None:
+        with pytest.raises(ValueError, match="pass the tall bound first"):
+            check_aspect_ratio_range(None, subject=SUBJECT, widest="9:16", tallest="16:9")
+
     @pytest.mark.parametrize(("width", "height"), [(300, 900), (900, 300), (1000, 1000), (1920, 1080)])
     def test_allows_a_shape_in_range_including_the_ends(self, width: int, height: int) -> None:
         info = ImageInfo(width, height, None)
@@ -1356,6 +1364,12 @@ class TestCodecNames:
 
 
 class TestCheckMimeType:
+    def test_accepts_an_mp4_videos_audio_for_an_audio_input(self) -> None:
+        assert check_mime_type("audio/mp4", subject=SUBJECT, allowed=("video/mp4",), audio=True) is None
+
+    def test_does_not_widen_for_a_non_audio_input(self) -> None:
+        assert check_mime_type("audio/mp4", subject=SUBJECT, allowed=("video/mp4",)) is not None
+
     def test_allows_a_listed_type(self) -> None:
         assert check_mime_type("image/png", subject=SUBJECT, allowed=("image/jpeg", "image/png")) is None
 

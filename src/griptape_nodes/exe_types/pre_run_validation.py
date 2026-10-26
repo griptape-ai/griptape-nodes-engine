@@ -15,7 +15,7 @@ from griptape_nodes.exe_types.input_checks import input_subject, read_media
 from griptape_nodes.exe_types.validators.base import MediaInfo, holds_list, media_kind_of, needs_for_kind
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_error import NodeError
@@ -23,14 +23,14 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.validators.base import PreRunValidator
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["run_pre_run_validators", "unchecked_inputs_message"]
+__all__ = ["run_pre_run_validators", "unchecked_inputs_message", "unchecked_locations_by_name"]
 
 # What an input is called in a message, by the kind of media its parameter holds.
 _NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
 _DEFAULT_NOUN = "input"
 
 
-def run_pre_run_validators(node: BaseNode, *, unchecked: list[str] | None = None) -> list[NodeError]:
+def run_pre_run_validators(node: BaseNode, *, unchecked: dict[str, str] | None = None) -> list[NodeError]:
     """Every error the node's inputs break its declared limits with, or an empty list.
 
     For each parameter with `pre_run_validators`, reads its value once, for every reading those
@@ -41,8 +41,10 @@ def run_pre_run_validators(node: BaseNode, *, unchecked: list[str] | None = None
 
     Args:
         node: The node about to run.
-        unchecked: If given, gets the subject of each input skipped because its video or audio
-            probe ran out of time, such as "The video in 'Video'", in the order checked.
+        unchecked: If given, gets each input with declared validators that was skipped because
+            its video or audio probe ran out of time: its location, mapped to its subject such as
+            "The video in 'Video'", in the order checked. `unchecked_locations_by_name` names the
+            rest.
     """
     declared = [parameter for parameter in node.parameters if parameter.pre_run_validators]
     if not declared and not node.node_validators:
@@ -59,10 +61,23 @@ def run_pre_run_validators(node: BaseNode, *, unchecked: list[str] | None = None
             continue
         media[parameter.name] = readings
         if unchecked is not None:
-            unchecked.extend(_timed_out_subjects(parameter, readings))
+            unchecked.update(_timed_out_subjects(parameter, readings))
     for node_validator in node.node_validators:
         errors.extend(node_validator.check(node, media=media, docs_url=docs_url))
     return errors
+
+
+def unchecked_locations_by_name(timed_out: Collection[str], named: Collection[str]) -> list[str]:
+    """Subjects for timed-out locations no declared input accounts for, named by their file names.
+
+    A node's `validate_before_node_run` or a `NodeValidator` can probe a file directly; when that
+    times out there is no parameter to name, so the file is named instead, such as "'clip.mp4'".
+
+    Args:
+        timed_out: Every location that timed out during the node's checks, from `timed_out_locations`.
+        named: The locations `run_pre_run_validators` already named through `unchecked`.
+    """
+    return [f"'{_file_name(location)}'" for location in sorted(set(timed_out) - set(named))]
 
 
 def unchecked_inputs_message(inputs: Sequence[str]) -> str:
@@ -169,17 +184,24 @@ def _noun(parameter: Parameter, kind: MediaKind | None) -> str:
     return _NOUN_FOR_KIND[kind]
 
 
-def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> list[str]:
-    """The subject of each of the parameter's inputs whose probe ran out of time."""
+def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> dict[str, str]:
+    """Each of the parameter's inputs whose probe ran out of time: its location, mapped to its subject."""
     shown_name = parameter.display_name or parameter.name
     noun = _noun(parameter, media_kind_of(parameter))
-    if not holds_list(parameter):
-        return [input_subject(shown_name, noun=noun) for reading in readings if reading.timed_out]
-    return [
-        input_subject(shown_name, noun=noun, position=position)
-        for position, reading in enumerate(readings, start=1)
-        if reading.timed_out
-    ]
+    subjects: dict[str, str] = {}
+    for position, reading in enumerate(readings, start=1):
+        if not reading.timed_out or reading.location is None:
+            continue
+        if holds_list(parameter):
+            subjects[reading.location] = input_subject(shown_name, noun=noun, position=position)
+        else:
+            subjects[reading.location] = input_subject(shown_name, noun=noun)
+    return subjects
+
+
+def _file_name(location: str) -> str:
+    """The last part of a path or URL, which is how a user knows the file."""
+    return location.rstrip("/").rsplit("/", 1)[-1] or location
 
 
 def _readings_if_media(readings: list[MediaInfo], kind: MediaKind | None) -> list[MediaInfo] | None:

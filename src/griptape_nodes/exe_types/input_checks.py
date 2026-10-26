@@ -14,7 +14,8 @@ runs. The validators are built from the parts here, which a custom validator can
   tool to read it is missing or too slow. Inside `input_check_readings`, which the engine opens
   around each node's checks, each reader reads a location once and returns the same result after.
   A probe that runs out of time is logged as a warning and noted, so the engine can tell the user
-  that input wasn't checked.
+  that input wasn't checked, whether a declared validator or the node's own check asked for it;
+  `timed_out_locations` lists them.
 - **`read_media`** takes the readings a set of validators needs from one value, in one call.
 - **Checks** (`check_count`, `check_size`, `check_dimensions`, `check_aspect_ratio_range`,
   `check_aspect_ratio_exact`, `check_mime_type`, `check_video_codec`, `check_audio_codec`,
@@ -80,6 +81,7 @@ __all__ = [
     "local_size_bytes",
     "local_video_probe",
     "read_media",
+    "timed_out_locations",
 ]
 
 BYTES_PER_MB = 1024 * 1024
@@ -137,7 +139,7 @@ def input_subject(parameter: str, *, noun: str, position: int | None = None) -> 
     """
     if position is None:
         return f"The {noun} in '{parameter}'"
-    return f"{noun.capitalize()} {position} in '{parameter}'"
+    return f"{noun[:1].upper()}{noun[1:]} {position} in '{parameter}'"
 
 
 @contextmanager
@@ -160,6 +162,15 @@ def input_check_readings() -> Iterator[None]:
     finally:
         _timed_out.reset(timed_out_token)
         _readings.reset(token)
+
+
+def timed_out_locations() -> frozenset[str]:
+    """Every location whose video or audio probe ran out of time in the current `input_check_readings` block.
+
+    Includes probes a node's own checks ran by calling the readers directly, not only those its
+    declared validators asked for. Empty outside a block.
+    """
+    return frozenset(_timed_out.get() or ())
 
 
 def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> MediaInfo:
@@ -196,14 +207,14 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
         video = local_video_probe(location)
     if MediaNeed.AUDIO in needs:
         audio = local_audio_probe(location)
-    timed_out_locations = _timed_out.get()
     return MediaInfo(
         size_bytes=size_bytes,
         image=image,
         image_format=image_format,
         video=video,
         audio=audio,
-        timed_out=timed_out_locations is not None and location in timed_out_locations,
+        location=location,
+        timed_out=location in timed_out_locations(),
     )
 
 
@@ -674,10 +685,17 @@ def check_aspect_ratio_range(
         docs_url: The provider's page documenting the limit.
 
     Raises:
-        ValueError: If `widest` or `tallest` isn't a ratio such as "16:9".
+        ValueError: If `widest` or `tallest` isn't a ratio such as "16:9", or `tallest` is wider than
+            `widest`, which no frame could pass.
     """
     widest_ratio = _parse_ratio(widest)
     tallest_ratio = _parse_ratio(tallest)
+    if tallest_ratio > widest_ratio:
+        msg = (
+            f"Attempted to check an aspect ratio range. Failed because the tallest ratio, {tallest}, is "
+            f"wider than the widest, {widest}; pass the tall bound first, such as ('9:16', '16:9')."
+        )
+        raise ValueError(msg)
     if info is None or info.height == 0:
         return None
     ratio = info.width / info.height
@@ -729,7 +747,12 @@ def check_aspect_ratio_exact(
 
 
 def check_mime_type(
-    mime_type: str | None, *, subject: str, allowed: Sequence[str], docs_url: str | None = None
+    mime_type: str | None,
+    *,
+    subject: str,
+    allowed: Sequence[str],
+    docs_url: str | None = None,
+    audio: bool = False,
 ) -> NodeError | None:
     """An error when an input's format isn't one the provider accepts.
 
@@ -738,12 +761,16 @@ def check_mime_type(
         subject: The input, from `input_subject`.
         allowed: The MIME types the provider accepts, such as ("image/jpeg", "image/png").
         docs_url: The provider's page documenting the limit.
+        audio: True when `mime_type` was read from an audio input, such as `local_audio_probe`'s.
+            A video container in `allowed` then also accepts the audio read from it, such as an
+            MP4's, which reads as audio/mp4.
 
     Raises:
         TypeError: If `allowed` is a single string rather than a sequence of MIME types.
     """
     _require_mime_type_sequence(allowed)
-    return _mime_type_error(mime_type, subject=subject, allowed=allowed, docs_url=docs_url)
+    also_matching = _audio_readings_of(allowed) if audio else ()
+    return _mime_type_error(mime_type, subject=subject, allowed=allowed, docs_url=docs_url, also_matching=also_matching)
 
 
 def _mime_type_error(

@@ -150,7 +150,7 @@ class TestOnRealImages:
 
     def test_skips_a_remote_image(self) -> None:
         media = _image("https://example.com/image.gif")
-        assert media == MediaInfo()
+        assert media == MediaInfo(location="https://example.com/image.gif")
         assert _messages(list(self.KLING), media) == []
 
     def test_reduces_an_in_memory_image_to_a_string_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,7 +396,13 @@ class TestVideoReadings:
         monkeypatch.setattr(
             input_checks.subprocess, "run", lambda *_a, **_k: pytest.fail("a remote video must not be probed")
         )
-        assert _video("https://example.com/clip.mp4") == MediaInfo()
+        assert _video("https://example.com/clip.mp4") == MediaInfo(location="https://example.com/clip.mp4")
+
+
+class TestAspectRatioRangeBounds:
+    def test_refuses_bounds_given_widest_first_when_built(self) -> None:
+        with pytest.raises(ValueError, match="pass the tall bound first"):
+            AspectRatioRange("16:9", "9:16")
 
 
 class TestAudioReadings:
