@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 from griptape_nodes.retained_mode.managers.event_manager import EventTranslationContext
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.unit.exe_types.mocks import MockNode
 from tests.workflow_context import push_unsaved_workflow
@@ -179,6 +180,13 @@ class TestBaseNodeExecutionEvent:
 
         assert node.workflow is None
         assert event.wrapped_event.workflow_id == "orchestrator-wf"
+
+    def test_a_node_in_a_workflow_that_is_also_a_workers_copy_is_refused(self) -> None:
+        node = _node_in(WorkflowRuntime("wf", MagicMock()))
+        node._set_mirrored_workflow_id("orchestrator-wf")
+
+        with pytest.raises(WorkflowContextError, match="is never both"):
+            node.execution_event(CurrentControlNodeEvent(node_name=node.name))
 
 
 class TestNodeEventsNameTheNodesWorkflow:

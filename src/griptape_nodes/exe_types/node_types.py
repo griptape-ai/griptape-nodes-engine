@@ -59,6 +59,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.variable_types import VariableScope  # noqa: TC001 - read at runtime by the converter
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
@@ -574,9 +575,19 @@ class BaseNode(ABC):
     def _event_workflow_id(self) -> str | None:
         """The workflow this node's events name: its workflow's id, or the id a worker's copy runs for.
 
-        A node in a workflow is never a worker's copy, so at most one is set. The only place a mirrored
-        id stands in for a node's workflow, until workers get workflow namespaces of their own.
+        The only place a mirrored id stands in for a node's workflow, until workers get workflow
+        namespaces of their own.
+
+        Raises:
+            WorkflowContextError: The node is in a workflow and is also a worker's copy.
         """
+        if self._workflow is not None and self._mirrored_workflow_id is not None:
+            msg = (
+                f"Attempted to send an event for this node. Failed because it is in workflow "
+                f"'{self._workflow.workflow_id}' and is also a worker's copy running for workflow "
+                f"'{self._mirrored_workflow_id}', and a node is never both."
+            )
+            raise WorkflowContextError(msg)
         if self._workflow is not None:
             return self._workflow.workflow_id
         return self._mirrored_workflow_id
