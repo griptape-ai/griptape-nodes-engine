@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,7 +8,7 @@ from urllib.parse import urlparse
 
 import httpx2
 
-from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import join_cloud_url, resolve_cloud_base_url, resolve_cloud_credential
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import get_workspace_relative_path
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
@@ -20,21 +19,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
-
-
-def join_cloud_url(base_url: str, path: str) -> str:
-    """Append a path to a Griptape Cloud base URL, keeping any path the base URL already has.
-
-    `urljoin` is not used here because an absolute path replaces the base URL's path.
-
-    Args:
-        base_url: Griptape Cloud base URL, optionally with a path (e.g. https://example.com/prefix).
-        path: Path to append (e.g. /api/buckets).
-
-    Returns:
-        The joined URL.
-    """
-    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 class GriptapeCloudStorageDriver(BaseStorageDriver):
@@ -59,7 +43,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         """
         super().__init__(config_manager)
 
-        self.base_url = kwargs.get("base_url") or os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        self.base_url = kwargs.get("base_url") or resolve_cloud_base_url()
         self.api_key = api_key if api_key is not None else resolve_cloud_credential()
         self.headers = kwargs.get("headers") or {"Authorization": f"Bearer {self.api_key}"}
         self.request_timeout = kwargs.get("request_timeout")
@@ -571,7 +555,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         # Get expected cloud domain from parameter or environment
         if base_url is None:
-            base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+            base_url = resolve_cloud_base_url()
 
         expected_parsed = urlparse(base_url)
         expected_domain = expected_parsed.netloc.lower()

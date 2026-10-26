@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import httpx2
 import pytest
 
-from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver, join_cloud_url
+from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 
 # pyright: reportAttributeAccessIssue=false
@@ -524,22 +524,6 @@ class TestGriptapeCloudStorageDriverDeleteFile:
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             cloud_storage_driver.delete_file(TEST_FILE_PATH)
-
-
-class TestJoinCloudUrl:
-    """Test join_cloud_url() keeps any path on the base URL."""
-
-    @pytest.mark.parametrize(
-        ("base_url", "expected"),
-        [
-            ("https://cloud.griptape.ai", "https://cloud.griptape.ai/api/buckets"),
-            ("https://cloud.griptape.ai/", "https://cloud.griptape.ai/api/buckets"),
-            ("https://example.com/prefix", "https://example.com/prefix/api/buckets"),
-            ("https://example.com/prefix/", "https://example.com/prefix/api/buckets"),
-        ],
-    )
-    def test_join(self, base_url: str, expected: str) -> None:
-        assert join_cloud_url(base_url, "/api/buckets") == expected
 
 
 class TestGriptapeCloudStorageDriverBaseUrlPath:
