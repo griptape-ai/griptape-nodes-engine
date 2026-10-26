@@ -487,7 +487,7 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
         return self.wrapped_event.get_request()
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProgressEvent:
     value: Any = field()
     node_name: str = field()

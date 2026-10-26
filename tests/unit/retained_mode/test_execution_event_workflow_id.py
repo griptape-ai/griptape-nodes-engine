@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -126,6 +127,14 @@ class TestWorkflowRuntimeExecutionEvent:
 
         with pytest.raises(ValidationError):
             event.wrapped_event.workflow_id = "other"
+
+
+class TestProgressEvent:
+    def test_the_workflow_cannot_be_changed_after(self) -> None:
+        event = ProgressEvent(value="chunk", node_name="node", parameter_name="out", workflow_id="wf")
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            event.workflow_id = "other"  # type: ignore[misc]
 
 
 class TestBaseNodeExecutionEvent:
