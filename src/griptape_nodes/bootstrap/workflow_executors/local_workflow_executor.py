@@ -78,8 +78,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         self._save_on_failure_path = save_on_failure_path
         # The id of the workflow `_load_workflow_from_path` opened, so callers can address it.
         self._loaded_workflow_id: str | None = None
-        # The workflow this executor runs, which `ensure_default_workflow` binds.
-        self._workflow: WorkflowRuntime | None = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -289,17 +287,17 @@ class LocalWorkflowExecutor(WorkflowExecutor):
 
         With `workflow_path`, the file runs from scratch and opens its workflow. Without one, the executor
         runs the workflow already bound to the current work: a saved file run as a script binds the
-        workflow it opens. The binding lasts for the rest of the executor's context, as a saved file's does,
-        so the run's requests, which name no workflow, reach it. None when nothing is bound and no file is
-        given; the run's requests then name no workflow.
+        workflow it opens. The binding lasts for the rest of the executor's context, so the run's
+        requests, which name no workflow, reach it, and lapses once the workflow closes, as a saved
+        file's does. None when nothing is bound and no file is given; the run's requests then name no
+        workflow.
 
         Raises:
             LocalExecutorError: The file could not be loaded, or its load opened no workflow.
         """
         engine = GriptapeNodes.get_instance()
         if not workflow_path:
-            self._workflow = engine.bound_workflow
-            return self._workflow
+            return engine.bound_workflow
 
         await self._load_workflow_from_path(workflow_path)
         workflow = None
@@ -312,7 +310,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg)
 
         engine.bind_workflow_for_saved_file(workflow)
-        self._workflow = workflow
         return workflow
 
     async def _resolve_failure_save_path(self, workflow_name: str) -> str | None:

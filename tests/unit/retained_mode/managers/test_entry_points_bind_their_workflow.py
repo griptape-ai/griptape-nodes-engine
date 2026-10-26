@@ -23,6 +23,8 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
+    GetPublishOptionsRequest,
+    GetPublishOptionsResultSuccess,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
@@ -286,6 +288,39 @@ class TestPublishing:
 
         assert isinstance(result, PublishWorkflowResultSuccess), result.result_details
         assert "packaged" in published.flows.name_to_parent_name
+
+    def test_the_requests_a_publisher_sends_for_its_options_act_on_the_workflow_it_publishes(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        saved = _register_saved_workflow(engine, tmp_path / "published.py")
+        engine.context_manager.push_workflow(workflow_id=saved.workflow_id)
+        published = engine.open_workflows.get(saved.workflow_id)
+
+        def get_publish_options(_request: GetPublishOptionsRequest) -> GetPublishOptionsResultSuccess:
+            created = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name="options", set_as_new_context=False)
+            )
+            assert isinstance(created, CreateFlowResultSuccess), created.result_details
+            return GetPublishOptionsResultSuccess(fields=[], result_details="ok")
+
+        publisher = RegisteredEventHandler(
+            handler=MagicMock(),
+            library_data=MagicMock(),
+            event_data=PublishWorkflowRegisteredEventData(
+                start_flow_node_type="Start",
+                start_flow_node_library_name="lib",
+                end_flow_node_type="End",
+                end_flow_node_library_name="lib",
+                get_publish_options=get_publish_options,
+            ),
+        )
+        with patch.object(engine.library_manager, "get_registered_event_handlers", return_value={"lib": publisher}):
+            result = engine.handle_request(
+                GetPublishOptionsRequest(workflow_id=saved.workflow_id, publisher_name="lib")
+            )
+
+        assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
+        assert "options" in published.flows.name_to_parent_name
 
 
 class TestImageMetadata:
