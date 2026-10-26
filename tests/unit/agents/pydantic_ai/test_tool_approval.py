@@ -284,7 +284,7 @@ def gtn_like_toolset(ran: list[str], gate: ToolGate | None = None) -> Any:
         Tool(recorder(name), name=name, takes_ctx=False)
         for name in ("StartFlowRequest", "ListFlowsInCurrentContextRequest", "EventRequestBatch")
     ]
-    return _compose(GTN_SERVER_NAME, FunctionToolset(tools=tools), requires_approval=_gtn_tool_requires_approval)
+    return _compose(GTN_SERVER_NAME, FunctionToolset(tools=tools)).approval_required(_gtn_tool_requires_approval)
 
 
 def runner_with(
