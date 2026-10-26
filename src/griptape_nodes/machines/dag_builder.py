@@ -88,6 +88,9 @@ class DagBuilder(EngineScoped):
         self.node_to_reference: dict[str, DagNode] = {}
         self.graph_to_nodes = {}
         self.start_node_candidates = {}
+        # Data sinks (no control wires, no outgoing connections) a run has put off seeding until
+        # its control graphs have finished; see ExecuteDagState._seed_deferred_data_sinks.
+        self.deferred_data_sinks: list[BaseNode] = []
 
     def _get_nodes_to_exclude_for_iterative_end(self, node: BaseNode, connections: Connections) -> set[str]:
         """Get nodes to exclude when collecting dependencies for BaseIterativeEndNode.
@@ -226,6 +229,7 @@ class DagBuilder(EngineScoped):
         self.node_to_reference.clear()
         self.graph_to_nodes.clear()
         self.start_node_candidates.clear()
+        self.deferred_data_sinks.clear()
 
     def _has_active_control_path_to_node(self, node: DagNode, connections: Connections) -> bool:
         """Check if any active graph has a control path that can reach the target node.

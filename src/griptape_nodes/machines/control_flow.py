@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
@@ -24,6 +25,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
 if TYPE_CHECKING:
+    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.retained_mode.engine import Engine
@@ -39,6 +41,18 @@ class NextNodeInfo:
 
 
 logger = logging.getLogger("griptape_nodes")
+
+
+def _has_control_connection(node: BaseNode, connections: Connections) -> bool:
+    """Whether any control-typed parameter on `node` has a connection in either direction."""
+    for parameter in node.parameters:
+        if parameter.output_type != ParameterTypeBuiltin.CONTROL_TYPE.value:
+            continue
+        incoming = node.name in connections.incoming_index and parameter.name in connections.incoming_index[node.name]
+        outgoing = node.name in connections.outgoing_index and parameter.name in connections.outgoing_index[node.name]
+        if incoming or outgoing:
+            return True
+    return False
 
 
 # This is the control flow context. Owns the Resolution Machine
@@ -301,7 +315,6 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         dag_builder.add_node_with_dependencies(start_node, start_node.name)
 
         flow_manager = self._context.engine.flow_manager
-        node_manager = self._context.engine.node_manager
         is_isolated = dag_builder is not flow_manager.global_dag_builder
 
         if is_isolated:
@@ -318,7 +331,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         else:
             categories = self._drain_global_flow_queue(flow_manager)
 
-        return self._seed_dag_from_categories(start_node, categories, dag_builder, flow_manager, node_manager)
+        return self._seed_dag_from_categories(start_node, categories, dag_builder, flow_manager.get_connections())
 
     @staticmethod
     def _drain_global_flow_queue(flow_manager: FlowManager) -> DagNodeCategories:
@@ -349,19 +362,25 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         start_node: BaseNode,
         categories: DagNodeCategories,
         dag_builder: DagBuilder,
-        flow_manager: FlowManager,
-        node_manager: NodeManager,
+        connections: Connections,
     ) -> list[BaseNode]:
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
-        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 adds data
-        sink (terminal/leaf) nodes. A sink that is only data-connected gets its own graph so its
-        dependencies resolve unconditionally; a sink reachable from a graph's forward control
-        path is instead registered as a control-gated candidate so branches stay gated. The
-        current classifier only routes control-disconnected nodes into data_sink_nodes, so the
-        gated branch is a defensive fallback and the data-connected case is what runs in practice.
+        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 marks the data
+        sinks (terminal/leaf nodes with no control wires) stale and, when the run has control work,
+        does NOT seed them yet: a sink seeded alongside the control graphs adopts its upstream chain
+        while the control nodes on it are still RESOLVED from the previous run, so it gets no edge
+        to them and runs on their old outputs while they re-run beside it. The driver seeds the
+        deferred sinks once every control graph has finished
+        (``ExecuteDagState._seed_deferred_data_sinks``), when the only nodes left UNRESOLVED
+        upstream of a sink are the ones this run actually made stale. A run with no control-wired
+        node in scope has nothing that could re-run under a sink, so its sinks are seeded now and
+        run in parallel as before.
         """
         start_nodes = [start_node]
+        has_control_work = bool(categories.start_nodes or categories.control_nodes) or _has_control_connection(
+            start_node, connections
+        )
 
         # PASS 1: control/start entries build the control-flow graphs.
         for node in (*categories.start_nodes, *categories.control_nodes):
@@ -371,22 +390,14 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                 if node not in start_nodes:
                     start_nodes.append(node)
 
-        # PASS 2: data sinks, after the control graphs exist.
+        # PASS 2: data sinks. Put off until the control graphs have run, unless there are none.
         for node in categories.data_sink_nodes:
             node.state = NodeResolutionState.UNRESOLVED
             if node.name in dag_builder.node_to_reference:
                 continue
-            disconnected = True
-            for graph_start_node_name in list(dag_builder.graphs):
-                graph_start_node = node_manager.get_node_by_name(graph_start_node_name)
-                boundary_nodes = flow_manager.is_node_connected(graph_start_node, node)
-                if boundary_nodes:
-                    disconnected = False
-                    if node.name not in dag_builder.start_node_candidates:
-                        dag_builder.start_node_candidates[node.name] = {}
-                    dag_builder.start_node_candidates[node.name][graph_start_node_name] = set(boundary_nodes)
-            if disconnected:
-                # Not gated by any control graph - resolve it (and its dependencies) on its own.
+            if has_control_work:
+                dag_builder.deferred_data_sinks.append(node)
+            else:
                 dag_builder.add_node_with_dependencies(node, node.name)
 
         return start_nodes

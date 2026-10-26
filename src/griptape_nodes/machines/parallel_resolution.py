@@ -535,6 +535,32 @@ class ExecuteDagState(State):
                     raise RuntimeError(msg)
 
     @staticmethod
+    def _seed_deferred_data_sinks(context: ParallelResolutionContext) -> bool:
+        """Seed the data sinks the control-flow seeder put off, now that the control graphs are done.
+
+        A data sink has no control wires, so nothing gates it and nothing waits on it. Seeding it
+        only after every control graph has finished means its upstream walk sees the control nodes
+        as truly RESOLVED (they have run this time) and the data nodes below them as UNRESOLVED
+        (marked stale when those control nodes started), so it adopts exactly the nodes that need to
+        recompute and reads final values from the rest. Seeding it at run start instead let it
+        adopt a RESOLVED-from-last-run chain with no edge to the control node that was about to
+        re-run beside it.
+
+        Returns True if any sink was seeded, so the caller re-reads the leaf nodes.
+        """
+        dag_builder = context.dag_builder
+        if dag_builder is None or not dag_builder.deferred_data_sinks:
+            return False
+
+        sinks = list(dag_builder.deferred_data_sinks)
+        dag_builder.deferred_data_sinks.clear()
+        for sink in sinks:
+            if sink.name in context.node_to_reference:
+                continue
+            ExecuteDagState.add_and_queue_nodes(context, sink, sink.name)
+        return True
+
+    @staticmethod
     def build_node_states(context: ParallelResolutionContext) -> NodeStatesResult:
         networks = context.networks
         leaf_nodes = set()
@@ -663,6 +689,10 @@ class ExecuteDagState(State):
         # Reinitialize leaf nodes since maybe we changed things up.
         # We removed nodes from the network. There may be new leaf nodes.
         node_states = ExecuteDagState.build_node_states(context)
+        # The control graphs have drained. Before calling the run complete, seed the data sinks
+        # the seeder put off, so they build their graphs against this run's results.
+        if not node_states.leaf_nodes and ExecuteDagState._seed_deferred_data_sinks(context):
+            node_states = ExecuteDagState.build_node_states(context)
         # We have no more leaf nodes. Quit early.
         if not node_states.leaf_nodes:
             context.workflow_state = WorkflowState.WORKFLOW_COMPLETE

@@ -89,16 +89,12 @@ class TestSeedDagFromCategories:
         start = _mock_node("Start")
         control = _mock_node("Ctrl")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[control], data_sink_nodes=[])
-        flow_manager = MagicMock()
-        node_manager = MagicMock()
 
         connections = MagicMock()
         connections.get_connected_node.return_value = None
         dag_builder = DagBuilder(_engine_with_connections(connections))
 
-        entry_nodes = ControlFlowMachine._seed_dag_from_categories(
-            start, categories, dag_builder, flow_manager, node_manager
-        )
+        entry_nodes = ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
 
         # The start node plus every entry node come back so the control flow can begin.
         assert [node.name for node in entry_nodes] == ["Start", "Ctrl"]
@@ -108,52 +104,44 @@ class TestSeedDagFromCategories:
         assert start.state == NodeResolutionState.UNRESOLVED
         assert control.state == NodeResolutionState.UNRESOLVED
 
-    def test_pass2_disconnected_sink_gets_its_own_graph(self) -> None:
+    def test_pass2_defers_sinks_until_the_control_graphs_finish(self) -> None:
         start = _mock_node("Start")
         sink = _mock_node("Sink")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
-        # is_node_connected returns [] -> the sink is not gated by any control graph.
-        flow_manager = MagicMock()
-        flow_manager.is_node_connected.return_value = []
-        node_manager = MagicMock()
 
         connections = MagicMock()
         connections.get_connected_node.return_value = None
         dag_builder = DagBuilder(_engine_with_connections(connections))
 
-        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
 
-        # A data-only sink is seeded directly so its dependencies resolve unconditionally.
-        assert "Sink" in dag_builder.node_to_reference
+        # The sink is marked stale now but seeded later, by the driver, once control has run.
+        assert sink.state == NodeResolutionState.UNRESOLVED
+        assert "Sink" not in dag_builder.node_to_reference
+        assert dag_builder.deferred_data_sinks == [sink]
         assert dag_builder.start_node_candidates == {}
 
-    def test_pass2_gated_sink_becomes_control_candidate(self) -> None:
-        start = _mock_node("Start")
-        sink = _mock_node("Sink")
-        categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
-        # is_node_connected returns boundary nodes -> the sink is gated by Start's control graph.
-        flow_manager = MagicMock()
-        flow_manager.is_node_connected.return_value = ["Start"]
-        node_manager = MagicMock()
-        node_manager.get_node_by_name.side_effect = lambda name: start if name == "Start" else None
+    def test_pass2_seeds_sinks_now_when_the_run_has_no_control_work(self) -> None:
+        first = _mock_node("First")
+        second = _mock_node("Second")
+        categories = DagNodeCategories(start_nodes=[], control_nodes=[], data_sink_nodes=[second])
 
         connections = MagicMock()
         connections.get_connected_node.return_value = None
+        connections.incoming_index = {}
+        connections.outgoing_index = {}
         dag_builder = DagBuilder(_engine_with_connections(connections))
 
-        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(first, categories, dag_builder, connections)
 
-        # A gated sink is not seeded directly; it is registered as a candidate keyed by the graph
-        # start so the branch stays control-gated.
-        assert "Sink" not in dag_builder.node_to_reference
-        assert dag_builder.start_node_candidates["Sink"]["Start"] == {"Start"}
+        # Nothing control-wired can re-run under the sink, so it runs alongside the start node.
+        assert "Second" in dag_builder.node_to_reference
+        assert dag_builder.deferred_data_sinks == []
 
-    def test_sink_already_in_dag_is_skipped(self) -> None:
+    def test_sink_already_in_dag_is_not_deferred(self) -> None:
         start = _mock_node("Start")
         sink = _mock_node("Sink")
         categories = DagNodeCategories(start_nodes=[start], control_nodes=[], data_sink_nodes=[sink])
-        flow_manager = MagicMock()
-        node_manager = MagicMock()
 
         connections = MagicMock()
         connections.get_connected_node.return_value = None
@@ -162,10 +150,9 @@ class TestSeedDagFromCategories:
         # Pre-seed the sink so PASS 2 sees it already present.
         dag_builder.add_node(sink)
 
-        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, connections)
 
-        # Already-present sinks short-circuit before any connectivity check.
-        flow_manager.is_node_connected.assert_not_called()
+        assert dag_builder.deferred_data_sinks == []
         assert dag_builder.start_node_candidates == {}
 
 
