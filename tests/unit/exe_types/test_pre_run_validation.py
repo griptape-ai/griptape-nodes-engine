@@ -23,6 +23,7 @@ from griptape_nodes.exe_types.input_checks import (
     local_image_info,
     local_video_probe,
 )
+from griptape_nodes.exe_types.local_objects import make_reference
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.exe_types.param_types.parameter_audio import ParameterAudio
@@ -426,16 +427,20 @@ class TestByParameter:
         with pytest.raises(TypeError, match="holds another ByParameter"):
             ByParameter("model", {"pro": [ByParameter("size", {})]})
 
-    def test_checks_nothing_when_the_pick_lists_no_validators(self, tmp_path: Path) -> None:
+    def test_checks_nothing_when_the_pick_lists_no_validators(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # A model that doesn't send the input lists no limits for it, and the input isn't read.
         node = _node_with(
             ParameterString(name="model", default_value="fast"),
             ParameterImage(name="last_frame", pre_run_validators=[ByParameter("model", {"pro": [SideRange(min=300)]})]),
         )
         node.set_parameter_value("last_frame", str(image_file(tmp_path, 10, 10)))
+        reads: list[str] = []
+        monkeypatch.setattr(input_checks, "_read_image_info", reads.append)
         with input_check_readings():
             assert run_pre_run_validators(node) == []
-            assert input_checks._readings.get() == {}
+        assert reads == []
 
     def test_refuses_a_picked_validator_the_parameter_cannot_hold(self) -> None:
         with pytest.raises(TypeError, match="checks audio, and the parameter holds image"):
@@ -676,6 +681,31 @@ class TestUncheckedLocationsByName:
     def test_drops_a_urls_cachebuster(self) -> None:
         location = "http://localhost:8124/workspace/staticfiles/clip.mp4?v=1730000000"
         assert unchecked_locations_by_name({location}, set()) == ["'clip.mp4'"]
+
+
+class TestValuesHeldInAnotherProcess:
+    """A worker-held value reaches this process only as a key; it can't be read here, so it's skipped."""
+
+    _ELSEWHERE = make_reference(worker="some-other-worker", key="LoadVideo.video#deadbeef", source="LoadVideo@abc12345")
+
+    def test_skips_a_single_input_held_elsewhere(self) -> None:
+        node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
+        node.set_parameter_value("video", self._ELSEWHERE)
+        assert run_pre_run_validators(node) == []
+
+    def test_skips_a_list_held_elsewhere(self) -> None:
+        node = _node_with(
+            ParameterList(
+                name="clips",
+                tooltip="",
+                input_types=["VideoUrlArtifact"],
+                type="VideoUrlArtifact",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                pre_run_validators=[MaxCount(1), Duration(max=5)],
+            )
+        )
+        node.set_parameter_value("clips", [self._ELSEWHERE, self._ELSEWHERE])
+        assert run_pre_run_validators(node) == []
 
 
 class TestUncheckedInputsMessage:

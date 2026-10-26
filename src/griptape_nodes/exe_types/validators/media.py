@@ -92,14 +92,6 @@ class MaxFileSize(PreRunValidator):
     fix: str | None = None
 
     def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
-        if self.fix is None:
-            return check_size(
-                media.size_bytes,
-                maximum_bytes=self.maximum_bytes,
-                subject=subject,
-                strict=self.strict,
-                docs_url=docs_url,
-            )
         return check_size(
             media.size_bytes,
             maximum_bytes=self.maximum_bytes,

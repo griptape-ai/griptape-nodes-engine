@@ -118,7 +118,7 @@ def _check_parameter(
     shown_name = parameter.display_name or parameter.name
     noun = _noun(parameter, kind)
     if not holds_list(parameter):
-        value = node.get_parameter_value(parameter.name)
+        value = _value_here(node, parameter.name)
         if value is None:
             return None
         info = _read(value, validators, kind)
@@ -167,11 +167,26 @@ def _collect(
     return errors
 
 
+def _value_here(node: BaseNode, name: str) -> Any:
+    """The parameter's value, or None when it's held in another process and can't be read here.
+
+    A value a worker produced and kept (a `serializable=False` output) reaches this process only as a
+    key, and reading it raises. It can't be read locally, so it's skipped like any other such value.
+    """
+    try:
+        return node.get_parameter_value(name)
+    except RuntimeError:
+        return None
+
+
 def _list_items(node: BaseNode, parameter: Parameter) -> list[Any]:
-    """A list parameter's items, flattened, without empty rows."""
+    """A list parameter's items, flattened, without empty rows; empty when they're held in another process."""
     if isinstance(parameter, ParameterList):
-        return node.get_parameter_list_value(parameter.name)
-    value = node.get_parameter_value(parameter.name)
+        try:
+            return node.get_parameter_list_value(parameter.name)
+        except RuntimeError:
+            return []
+    value = _value_here(node, parameter.name)
     if not isinstance(value, list):
         return []
     return [item for item in value if item is not None]

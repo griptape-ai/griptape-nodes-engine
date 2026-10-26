@@ -586,7 +586,7 @@ def check_size(  # noqa: PLR0913
     *,
     maximum_bytes: int,
     subject: str,
-    fix: str = "Use a smaller file.",
+    fix: str | None = None,
     strict: bool = False,
     docs_url: str | None = None,
 ) -> NodeError | None:
@@ -597,13 +597,14 @@ def check_size(  # noqa: PLR0913
         maximum_bytes: The largest file the provider accepts, or with `strict`, the size every file
             must be under.
         subject: The input, from `input_subject`.
-        fix: What the artist can do about it.
+        fix: What the artist can do about it. Defaults to "Use a smaller file."
         strict: For a provider that writes "less than 30 MB": a file of exactly `maximum_bytes` is
             refused too.
         docs_url: The provider's page documenting the limit.
     """
     if size_bytes is None:
         return None
+    fix = fix or "Use a smaller file."
     if strict and size_bytes >= maximum_bytes:
         limit = _format_limit(maximum_bytes / BYTES_PER_MB)
         # A file at exactly the limit is the one a strict limit adds; printed past it, it would round
