@@ -363,8 +363,8 @@ class TestLibraryMetadataWorkerDeclarations:
 
 
 class TestSchemaVersion:
-    def test_latest_schema_version_is_0_15_0(self) -> None:
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.15.0"
+    def test_latest_schema_version_is_0_16_0(self) -> None:
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.16.0"
 
 
 # ---------- Model catalog ----------

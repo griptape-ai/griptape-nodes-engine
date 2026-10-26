@@ -459,6 +459,31 @@ of the library still loads. A preset is left out when its `node` isn't in the li
 parameter check runs the first time an editor asks for the library's presets, not when the library
 loads. Engines released before library schema `0.15.0` ignore `presets`.
 
+### Node role and media
+
+Two optional fields in a node's `metadata` tell editors what the node does and what it works on, so
+they can group it without guessing from its tags or name:
+
+```json
+"metadata": {
+    "category": "image",
+    "display_name": "Blur",
+    "description": "Blurs an image or video.",
+    "role": "Edit",
+    "media": ["image", "video"]
+}
+```
+
+- `role`: one of `Inspect`, `Edit`, `Convert`, `Generate`, `Load & save`, `View`, `Combine`, or
+    `Flow`, the same names presets use.
+- `media`: a list of what the node works on, each one of `image`, `video`, `audio`, `3d`, `text`,
+    `number`, `list`, `dict`, `file`, or `agent`. A node that handles images and video alike lists
+    both, and editors show it under each.
+
+A value that isn't one of the names above is left out and reported as a library problem. The node
+still loads with the rest of its metadata. Engines released before library schema `0.16.0` ignore
+`role` and `media`.
+
 ## Library Structure with uv Dependency Management
 
 **Modern Approach**: Use `uv` for fast, reproducible dependency management following the Minimax library pattern.

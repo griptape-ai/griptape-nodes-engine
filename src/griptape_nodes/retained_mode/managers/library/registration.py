@@ -63,6 +63,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     CreateConfigCategoryProblem,
     DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
+    InvalidNodeMetadataProblem,
     InvalidPresetProblem,
     LibraryDependencyProblem,
     LibraryProblem,
@@ -73,6 +74,7 @@ from griptape_nodes.retained_mode.managers.library.common import LibraryFitness,
 from griptape_nodes.retained_mode.managers.library.dependencies import parse_dependency_url
 from griptape_nodes.retained_mode.managers.library.environment import describe_unmet_requirements
 from griptape_nodes.retained_mode.managers.library.managed_environment import LibrariesProvidedByEnvironmentError
+from griptape_nodes.retained_mode.managers.library.node_role_media import check_node_role_media_at_registration
 from griptape_nodes.retained_mode.managers.library.presets import check_presets_at_registration
 from griptape_nodes.retained_mode.managers.library.workers import resolve_executes_in_worker
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
@@ -815,6 +817,15 @@ class LibraryRegistrar(EngineScoped):
                             if not isinstance(problem, InvalidPresetProblem)
                         ]
                         library_info.problems.extend(preset_check.problems)
+
+                        # Also before the nodes load: it drops unknown role/media values from the
+                        # metadata the nodes register with. Replaced on reload, like presets.
+                        library_info.problems = [
+                            problem
+                            for problem in library_info.problems
+                            if not isinstance(problem, InvalidNodeMetadataProblem)
+                        ]
+                        library_info.problems.extend(check_node_role_media_at_registration(library_data))
 
                         # Attempt to load nodes from the library (modifies library_info in place).
                         await asyncio.to_thread(

@@ -185,6 +185,12 @@ class NodeMetadata(BaseModel):
     group: str | None = None
     deprecation: NodeDeprecationMetadata | None = None
     is_node_group: bool | None = None
+    # What the node does, one of NODE_ROLES. Lets an editor group nodes without guessing from tags.
+    # Checked when the library registers; an unknown value is dropped and reported as a problem.
+    role: str | None = None
+    # What the node works on, each one of NODE_MEDIA. A node that handles images and video alike
+    # lists both, so an editor can file it under each. Checked like role; unknown values are dropped.
+    media: list[str] | None = None
     # Declarative properties / capabilities for this node.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[NodeDeclaration] = Field(default_factory=list)
@@ -260,6 +266,24 @@ PRESET_ROLES: tuple[str, ...] = (
 )
 
 
+# The roles a node's metadata can declare: the same groups presets sit under.
+NODE_ROLES: tuple[str, ...] = PRESET_ROLES
+
+# The kinds of data a node's metadata can say it works on.
+NODE_MEDIA: tuple[str, ...] = (
+    "image",
+    "video",
+    "audio",
+    "3d",
+    "text",
+    "number",
+    "list",
+    "dict",
+    "file",
+    "agent",
+)
+
+
 class PresetDefinition(BaseModel):
     """A named starting point for a node: a node type plus the parameter values to set on it.
 
@@ -293,8 +317,9 @@ class LibrarySchema(BaseModel):
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
     # optional beta_features list, which older engines ignore. 0.15.0 adds the optional presets
-    # list, which older engines ignore too.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
+    # list, which older engines ignore too. 0.16.0 adds the optional role and media fields on node
+    # metadata, which older engines ignore as well.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.16.0"
 
     name: str
     library_schema_version: str

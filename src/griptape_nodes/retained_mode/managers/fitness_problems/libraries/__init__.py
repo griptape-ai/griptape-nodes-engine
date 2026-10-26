@@ -17,6 +17,7 @@ from .execution_event_listener_registration_problem import ExecutionEventListene
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
 from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
+from .invalid_node_metadata_problem import InvalidNodeMetadataProblem
 from .invalid_preset_problem import InvalidPresetProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
 from .library_dependency_problem import LibraryDependencyProblem
@@ -67,6 +68,7 @@ __all__ = [
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
     "InvalidBetaFeatureProblem",
+    "InvalidNodeMetadataProblem",
     "InvalidPresetProblem",
     "InvalidVersionStringProblem",
     "LibraryDependencyProblem",
