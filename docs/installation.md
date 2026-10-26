@@ -138,3 +138,5 @@ Organization admins looking to issue and manage license keys should start with t
 Next, on to learning how to actually work inside Griptape Nodes! [Begin](tutorials/index.md)
 
 To remove Griptape Nodes, see [Uninstalling Griptape Nodes](uninstalling.md).
+
+Behind a proxy, with TLS inspection, or without internet access? See [Offline and Proxy Installs](offline_and_proxy_installs.md).
