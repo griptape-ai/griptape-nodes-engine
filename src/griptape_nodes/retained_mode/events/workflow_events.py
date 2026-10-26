@@ -125,28 +125,19 @@ class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
 class RunWorkflowFromRegistryRequest(RequestPayload):
     """Open a saved workflow from the registry and make it the Current Context.
 
-    Use when: Opening a workflow by name, switching which workflow is open, loading a
-    workflow template. This is the request that OPENS a workflow: it replays the saved `.py`
-    file, rebuilding the workflow's nodes, connections, and parameter values in the engine,
-    and leaves that workflow in the Current Context. SetWorkflowContextRequest only records a
-    name, so it would leave you holding an empty engine -- and it refuses outright while
-    another workflow is open.
+    Replays the saved `.py` file, rebuilding the workflow's nodes, connections, and parameter
+    values, and leaves that workflow in the Current Context. It does NOT execute the
+    workflow; issue a StartFlowRequest afterwards for that. It cannot open an unsaved
+    workflow, since there is no file to replay -- use SetWorkflowContextRequest for that.
 
     DESTRUCTIVE BY DEFAULT. With run_with_clean_slate=True this first wipes the engine,
-    which throws away unsaved changes in whatever workflow is currently open -- including
-    work an artist has in front of them right now in the editor, which cannot be
-    recovered. Save first (SaveWorkflowRequest) if that matters.
+    discarding unsaved changes in whatever workflow is currently open. Save first
+    (SaveWorkflowRequest) if that matters.
 
-    Building the graph is where this stops. It does NOT execute the workflow; issue a
-    StartFlowRequest afterwards to do that. It also cannot open an unsaved workflow,
-    because there is no file to replay.
-
-    The engine emits CurrentWorkflowChanged app events as the Current Context moves; that event
-    documents how many to expect and what each one means. Wait for the workflow you asked for
-    rather than for a fixed number of events. Opening a large workflow can take a while, since it
-    resolves node libraries and replays the whole file, and a timeout on your side does not cancel
-    it -- so wait and read the graph back (ListNodesInFlowRequest against the current flow) rather
-    than sending the request again, which would replay the file a second time.
+    The engine emits CurrentWorkflowChanged app events as the Current Context moves; see that
+    event for how many to expect. Wait for the workflow you asked for rather than a fixed
+    count. Opening a large workflow can take a while, and a timeout on your side does not
+    cancel it -- wait and read the graph back (ListNodesInFlowRequest) rather than resending.
 
     Args:
         workflow_name: Registry key of the workflow to open. These are the keys of the

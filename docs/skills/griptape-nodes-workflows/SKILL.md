@@ -376,50 +376,17 @@ A typo here surfaces as an opaque validation error from pydantic, not a friendly
 
 ### Only one workflow in context at a time
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context — and when an
-editor is attached there always is one, because a blank canvas is itself an
-`unsaved:` workflow. Don't reach for `ClearAllObjectStateRequest` to get around that:
+`SetWorkflowContextRequest` refuses if a workflow is already in context. To open a saved
+workflow (replacing what's open), send `RunWorkflowFromRegistryRequest(workflow_name=...)`
+instead — it replays the saved `.py` and leaves it in the Current Context. It's destructive
+by default (`run_with_clean_slate=True` wipes the engine first), and it does NOT run the
+workflow; follow with `StartFlowRequest` for that. To close what's open without opening
+anything, `ClearAllObjectStateRequest(i_know_what_im_doing=True)` still wipes EVERYTHING.
 
-- **To open a saved workflow**, send `RunWorkflowFromRegistryRequest(workflow_name=...)`.
-    That is the request that actually opens one: it replays the saved `.py`, rebuilding the
-    workflow's nodes, connections, and values, and leaves it in the Current Context. It
-    does not require an empty context. It does NOT run the workflow — follow with
-    `StartFlowRequest` for that.
-
-    **This is destructive by default.** `run_with_clean_slate` defaults to `True`, which
-    wipes the engine before opening — throwing away unsaved changes in the workflow the
-    artist may have open in front of them, with no undo. Save first
-    (`SaveWorkflowRequest`), or ask, before opening something on a live engine.
-
-    A big workflow takes a while to open, since it resolves node libraries and replays the
-    whole file, so this tool gets a 5-minute budget instead of the usual 30 seconds. If it
-    does time out, the open keeps going — wait and read the graph back
-    (`ListNodesInFlowRequest`) rather than sending the request again, which would replay the
-    file on top of the first attempt.
-
-- **To close what's open without opening anything**, send
-    `ClearAllObjectStateRequest(i_know_what_im_doing=True)`. This wipes EVERYTHING
-    (nodes, flows, connections, workflow) and leaves the engine with no current workflow.
-
-`SetWorkflowContextRequest` itself is bookkeeping only: it records a name and never reads
-a file, so on its own it would leave you holding a workflow name and none of its nodes.
-
-Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying the
-`workflow_name` now in context (`None` when the engine has none) and `is_saved` for that
-workflow, so every attached editor follows along when an agent switches workflows out from
-under it. Three things to know about it:
-
-- **The last one is the truth.** A clean-slate open of a workflow while another one is open
-    emits `None` from the wipe and then the opened workflow, so a `None` in the middle of an
-    open means "mid-switch", not "everything closed". Opening on an engine with nothing open
-    emits just the one event, so wait for the workflow you asked for rather than for a
-    particular number of events.
-- **It says which workflow, not that the workflow is loaded.** An open switches the
-    context first and replays the file afterwards, so the nodes arrive behind the event.
-- **`is_saved` comes with it, so there is nothing to follow up with.** It is the same answer
-    `GetWorkflowContextRequest` gives -- `False` for a workflow that has never been saved,
-    `None` when nothing is open -- and the first save of a scratch workflow rekeys it, so the
-    flip to `True` arrives as its own event rather than silently going stale.
+The engine broadcasts a `CurrentWorkflowChanged` app event whenever the Current Context
+moves, carrying `workflow_name` (`None` when nothing is open) and `is_saved` — so every
+attached client, not just the one that asked, can follow along. See that event's docstring
+for ordering details.
 
 ### Agents cannot be interrupted mid-run
 
