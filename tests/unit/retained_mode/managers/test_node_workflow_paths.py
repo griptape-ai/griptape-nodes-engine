@@ -13,7 +13,7 @@ from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, Err
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, new_workflow_id
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
-from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+from griptape_nodes.retained_mode.events.execution_events import CurrentControlNodeEvent, ExecuteNodeRequest
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -388,3 +388,16 @@ class TestNodesBuiltToInspect:
 
         assert isinstance(transient, _ValueNode)
         assert transient.workflow is None
+
+    def test_a_worker_transient_nodes_events_name_the_orchestrator_workflow_it_runs_for(self, engine: Engine) -> None:
+        transient = engine.node_manager._materialize_transient_node_from_metadata(
+            ExecuteNodeRequest(
+                node_name="node",
+                node_metadata={"node_type": "_ValueNode", "library": _LIBRARY_NAME},
+                orchestrator_workflow_id="orchestrator-wf",
+            )
+        )
+
+        assert isinstance(transient, _ValueNode)
+        event = transient.execution_event(CurrentControlNodeEvent(node_name="node"))
+        assert event.wrapped_event.workflow_id == "orchestrator-wf"

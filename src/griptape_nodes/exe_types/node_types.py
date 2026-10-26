@@ -67,6 +67,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -334,6 +335,8 @@ class BaseNode(ABC):
     _on_change_queued: Callable[[BaseNode], None] | None = None
     # Set by the ObjectManager while this node is one of a workflow's objects; see `workflow`.
     _workflow: WorkflowRuntime | None = None
+    # Set on a worker's transient copy of a node: the orchestrator's workflow it runs for. See `_event_workflow_id`.
+    _mirrored_workflow_id: str | None = None
     _entry_control_parameter: Parameter | None = (
         None  # The control input parameter used to enter this node during execution
     )
@@ -558,9 +561,29 @@ class BaseNode(ABC):
         """Clear the cancellation request flag."""
         self._cancellation_requested.clear()
 
+    def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
+        """An execution event about this node, naming the workflow it belongs to (None when it has none)."""
+        return ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=payload, workflow_id=self._event_workflow_id())
+        )
+
     def _set_workflow(self, workflow: WorkflowRuntime | None) -> None:
         """Record the workflow whose objects this node is in. Only the ObjectManager calls this."""
         self._workflow = workflow
+
+    def _set_mirrored_workflow_id(self, workflow_id: str | None) -> None:
+        """Record the orchestrator workflow a worker's transient copy runs for. Only the NodeManager calls this."""
+        self._mirrored_workflow_id = workflow_id
+
+    def _event_workflow_id(self) -> str | None:
+        """The workflow this node's events name: its workflow's id, or the id a worker's copy runs for.
+
+        A node in a workflow is never a worker's copy, so at most one is set. The only place a mirrored
+        id stands in for a node's workflow, until workers get workflow namespaces of their own.
+        """
+        if self._workflow is not None:
+            return self._workflow.workflow_id
+        return self._mirrored_workflow_id
 
     def set_change_listener(self, listener: Callable[[BaseNode], None] | None) -> None:
         """Call ``listener`` whenever this node queues a change, and now if one is already queued."""

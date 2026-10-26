@@ -106,6 +106,7 @@
     }
   },
   "ExecutionEvent": {
+    "workflow_id": "wf",
     "event_type": "ExecutionEvent",
     "payload_type": "CurrentControlNodeEvent",
     "payload": {

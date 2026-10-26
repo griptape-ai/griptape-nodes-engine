@@ -58,7 +58,7 @@ def _events() -> dict[str, BaseEvent]:
             result=GetParameterValueResultFailure(result_details="nope"),
             request_id="r2",
         ),
-        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n")),
+        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), workflow_id="wf"),
         "AppEvent": AppEvent(payload=AppInitializationComplete()),
     }
 
@@ -135,6 +135,18 @@ def test_batch_round_trips_through_json() -> None:
     assert converters.engine.unstructure(restored) == converters.engine.unstructure(original)
 
 
+def test_execution_event_workflow_id_round_trips_through_json() -> None:
+    """The workflow an execution event belongs to survives a JSON hop, beside the payload."""
+    original = _events()["ExecutionEvent"]
+
+    wire = json.loads(json.dumps(converters.engine.unstructure(original), default=str))
+    restored = converters.engine.structure(wire, ExecutionEvent)
+
+    assert wire["workflow_id"] == "wf"
+    assert "workflow_id" not in wire["payload"]
+    assert restored.workflow_id == "wf"
+
+
 def test_payload_fields_hold_unstructured_output() -> None:
     """Payload fields use converter hooks, not pydantic serialization."""
     serialized = converters.engine.unstructure(_events()["EventResultSuccess"])
@@ -180,6 +192,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "result",
     ]
     assert list(converters.engine.unstructure(_events()["ExecutionEvent"])) == [
+        "workflow_id",
         "event_type",
         "payload_type",
         "payload",

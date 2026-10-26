@@ -3542,6 +3542,8 @@ class NodeManager(EngineScoped):
             # Adopt the orchestrator's identity. A fresh node is built for every execution, so without this
             # each run would cache under a new identity and nothing would ever displace anything.
             transient.local_object_source = request.local_object_source
+        # The copy joins no workflow here, so its events name the orchestrator's workflow it runs for.
+        transient._set_mirrored_workflow_id(request.orchestrator_workflow_id)
         return transient
 
     def _local_library_load_failure(self, library_name: str | None) -> str | None:

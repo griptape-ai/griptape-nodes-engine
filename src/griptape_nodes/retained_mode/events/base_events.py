@@ -427,7 +427,17 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
+    """An event from running a flow, or from work like publishing that reports as one.
+
+    Args:
+        payload: What happened.
+        workflow_id: The open workflow the event belongs to, or None for a host event. Set when the
+            event is built, through `WorkflowRuntime.execution_event` or `BaseNode.execution_event`,
+            and never changed after.
+    """
+
     payload: E
+    workflow_id: str | None = Field(default=None, frozen=True)
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
@@ -482,3 +492,5 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
+    # The workflow of the node that streamed this. See ExecutionEvent.workflow_id.
+    workflow_id: str | None = field(default=None)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
@@ -11,7 +12,7 @@ from griptape_nodes.retained_mode.runtime.objects import WorkflowObjects
 from griptape_nodes.retained_mode.runtime.variables import WorkflowVariables
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload, RequestPayload, ResultPayload
 
 
 class RequestDispatcher(Protocol):
@@ -53,3 +54,7 @@ class WorkflowRuntime:
     async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
         """Handle a request in this workflow, as one whose envelope names it."""
         return await self._dispatcher.ahandle_request(request, workflow_id=self.workflow_id)
+
+    def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
+        """An execution event that belongs to this workflow."""
+        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=self.workflow_id))
