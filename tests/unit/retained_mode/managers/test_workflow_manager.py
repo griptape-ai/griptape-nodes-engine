@@ -3615,7 +3615,7 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_allows_a_workflow_context_with_no_open_flow(
         self,
         engine: Engine,
-        open_workflow: WorkflowRuntime,  # noqa: ARG002
+        open_workflow: WorkflowRuntime,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
@@ -3625,7 +3625,8 @@ class TestRunWorkflowWithCurrentStateRequest:
         )
 
         # Getting past the guard is the behaviour under test; what the run then does is mocked away.
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE)
+        # The file runs into the open workflow.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, workflow=open_workflow)
 
 
 class TestWorkflowsLoadingGate:
@@ -6307,7 +6308,8 @@ class TestNodeLibraryDelegates:
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py")
+        # No workflow is open, so the file opens its own.
+        run_mock.assert_awaited_once_with("flow.py", None)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager

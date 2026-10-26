@@ -895,8 +895,11 @@ class WorkflowManager(EngineScoped):
         return True
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
-        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`."""
-        return await self.runner.run_workflow(relative_file_path)
+        """Kept for node libraries that call it: runs the file into the open workflow, else into the one it opens.
+
+        Edge method for code not handed a workflow; engine code calls `WorkflowRunner.run_workflow`.
+        """
+        return await self.runner.run_workflow(relative_file_path, self.engine.open_workflows.sole_workflow_or_none())
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.

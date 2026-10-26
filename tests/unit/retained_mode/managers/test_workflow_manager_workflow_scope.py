@@ -467,8 +467,11 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         with _also_open(engine, "importing") as importing:
             canvas = _create_flow(engine, importing, "importing_canvas")
 
-            async def run_workflow(_relative_file_path: str) -> WorkflowExecutionResult:
-                # A workflow file creates its flow under the flow it is run in.
+            async def run_workflow(
+                _relative_file_path: str, workflow: WorkflowRuntime | None
+            ) -> WorkflowExecutionResult:
+                # The file runs into the workflow the import was handed, under the flow it is run in.
+                assert workflow is importing
                 created = engine.flow_manager.on_create_flow_request(
                     CreateFlowRequest(parent_flow_name=canvas, flow_name="imported_flow"), importing
                 )

@@ -907,11 +907,13 @@ class TestConcurrentLoadsDoNotCrossContaminate:
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
         _register_workflow(reopened, tmp_path, inner_path)
+        # Both loads run into one open workflow, so neither depends on which opens it first.
+        open_workflow = reopened.open_workflows.get(push_unsaved_workflow(reopened).workflow_id)
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path),
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path, workflow=open_workflow),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path, workflow=open_workflow),
             )
 
         host_result, sibling_result = asyncio.run(load_both())

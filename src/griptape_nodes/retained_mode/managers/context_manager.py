@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -95,17 +96,25 @@ class ContextManager(EngineScoped):
         """A push asked to open a workflow while another one is open."""
 
     class WorkflowContext:
-        """Opens a Workflow for the length of a `with` block, closing it on exit."""
+        """Opens a Workflow for the length of a `with` block, closing it on exit.
+
+        The push binds the workflow it opens; that binding ends with the block too.
+        """
 
         _manager: ContextManager
         _workflow_name: str
+        _binding: ExitStack
 
         def __init__(self, manager: ContextManager, workflow_name: str):
             self._manager = manager
             self._workflow_name = workflow_name
+            self._binding = ExitStack()
 
         def __enter__(self) -> None:
-            self._manager.push_workflow(workflow_name=self._workflow_name)
+            with ExitStack() as binding:
+                binding.enter_context(self._manager.engine.bind_workflow(None))
+                self._manager.push_workflow(workflow_name=self._workflow_name)
+                self._binding = binding.pop_all()
 
         def __exit__(
             self,
@@ -113,7 +122,10 @@ class ContextManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self._manager.pop_workflow()
+            try:
+                self._manager.pop_workflow()
+            finally:
+                self._binding.close()
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         """Initialize the context manager with no mirrored workflow."""
@@ -732,6 +744,10 @@ class ContextManager(EngineScoped):
         context. A library-provided workflow is never opened itself: its file opens as a new
         unsaved copy (`register_unsaved_copy`), and naming it by id or name is refused.
 
+        A push by file or by name is how a saved workflow file opens its workflow (older files push by
+        name). It binds the workflow it opened for the rest of the caller's context
+        (`Engine.bind_workflow_for_saved_file`), so the file's requests, which name no workflow, reach it.
+
         Args:
             workflow_name: The legacy registry name of a registered Workflow.
             file_path: Path to a workflow file. Saved workflow files push themselves this way
@@ -766,19 +782,7 @@ class ContextManager(EngineScoped):
             raise self.WorkflowAlreadyOpenError(msg)
 
         registry = self.engine.workflow_registry
-        if workflow_name is not None:
-            workflow = registry.find_by_name(workflow_name)
-            if workflow is None:
-                msg = f"Attempted to enter Workflow '{workflow_name}'. Failed because no workflow has that name."
-                raise self.UnknownWorkflowError(msg)
-        elif workflow_id is not None:
-            workflow = registry.find_by_id(workflow_id)
-            if workflow is None:
-                msg = f"Attempted to enter Workflow '{workflow_id}'. Failed because no workflow has that id."
-                raise self.UnknownWorkflowError(msg)
-        else:
-            workflow = self._find_or_register_open_file(str(file_path))
-
+        workflow = self._registered_workflow_to_push(workflow_name, file_path=file_path, workflow_id=workflow_id)
         if workflow.metadata.is_griptape_provided:
             if file_path is None:
                 msg = (
@@ -792,8 +796,33 @@ class ContextManager(EngineScoped):
 
         if working_directory is not None:
             workflow.working_directory = working_directory
-        self.engine.open_workflows.open(workflow.workflow_id)
+        runtime = self.engine.open_workflows.open(workflow.workflow_id)
+        if workflow_id is None:
+            self.engine.bind_workflow_for_saved_file(runtime)
         return workflow.name
+
+    def _registered_workflow_to_push(
+        self, workflow_name: str | None, *, file_path: str | None, workflow_id: str | None
+    ) -> Workflow:
+        """The registry entry the one argument `push_workflow` was given names.
+
+        Raises:
+            UnknownWorkflowError: No registered workflow has that name or id.
+        """
+        registry = self.engine.workflow_registry
+        if workflow_name is not None:
+            workflow = registry.find_by_name(workflow_name)
+            if workflow is None:
+                msg = f"Attempted to enter Workflow '{workflow_name}'. Failed because no workflow has that name."
+                raise self.UnknownWorkflowError(msg)
+            return workflow
+        if workflow_id is not None:
+            workflow = registry.find_by_id(workflow_id)
+            if workflow is None:
+                msg = f"Attempted to enter Workflow '{workflow_id}'. Failed because no workflow has that id."
+                raise self.UnknownWorkflowError(msg)
+            return workflow
+        return self._find_or_register_open_file(str(file_path))
 
     def _find_or_register_open_file(self, file_path: str) -> Workflow:
         """The registry entry for a workflow file being opened, registered unlisted when there is none.

@@ -408,7 +408,7 @@ class Engine:
         For entry points that send requests without naming a workflow (executors, workflow file runs).
         A request's envelope id still wins, and host requests ignore the binding. A request sent while
         the bound workflow is no longer open fails, as a stale envelope id does. None runs the block
-        unbound.
+        unbound, for a workflow file that opens and binds its own workflow.
 
         The binding is a ContextVar: tasks created in the block and `asyncio.to_thread` calls carry
         it, but `loop.run_in_executor` and `ThreadPoolExecutor.submit` do not unless the caller runs
@@ -419,6 +419,16 @@ class Engine:
             yield
         finally:
             _bound_workflow.reset(token)
+
+    def bind_workflow_for_saved_file(self, workflow: WorkflowRuntime) -> None:
+        """Bind `workflow` for the rest of the current context, for a saved workflow file that opened it.
+
+        A saved file opens its workflow (`push_workflow(file_path=__file__)`) and then sends its
+        requests without an envelope id. Nothing unbinds it: the binding lasts as long as the context,
+        which is the file run's `bind_workflow` block when the engine runs the file, or the script's
+        own task when it runs on its own.
+        """
+        _bound_workflow.set(workflow)
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -852,3 +862,6 @@ def reset_root_engine() -> None:
 
     with _root_engine_lock:
         _root_engine = None
+    # A saved file opened outside a task binds its workflow for the rest of this context, which would
+    # address the next engine's requests to a workflow it never opened.
+    _bound_workflow.set(None)
