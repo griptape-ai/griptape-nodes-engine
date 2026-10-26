@@ -48,14 +48,23 @@ class _InlineQueue:
         self._manager._send_report(body)
 
 
+# The workflow a node making a direct call runs in; the registry names it.
+_POSTER_FLOW = MagicMock(workflow_id="poster-flow-id")
+
+
+def _registry_entries(workflow_id: str) -> MagicMock:
+    entry = MagicMock()
+    entry.name = {"poster-flow-id": "poster_flow"}[workflow_id]
+    return entry
+
+
 def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
     engine = MagicMock()
     engine.project_manager.get_project_chain.return_value = [
         ProjectChainEntry(id="shot-6", name="Shot 6"),
         ProjectChainEntry(id="star-wars-x", name="Star Wars X"),
     ]
-    engine.context_manager.has_current_workflow.return_value = True
-    engine.context_manager.get_current_workflow_name.return_value = "poster_flow"
+    engine.workflow_registry.get.side_effect = _registry_entries
     engine.get_engine_id.return_value = "engine-1"
     engine.get_session_id.return_value = "session-1"
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
@@ -70,9 +79,9 @@ def _manager(engine: MagicMock | None = None) -> BudgetManager:
 
 
 def _check(
-    manager: BudgetManager, request: BudgetAccessRequest
+    manager: BudgetManager, request: BudgetAccessRequest, workflow: MagicMock | None = None
 ) -> BudgetAccessResultSuccess | BudgetAccessResultFailure:
-    return asyncio.run(manager.on_budget_access_request(request))
+    return asyncio.run(manager.on_budget_access_request(request, workflow))
 
 
 def _response(status: int, body: object = None) -> httpx2.Response:
@@ -184,6 +193,7 @@ class TestBudgetCheckAllowed:
                 node_type="AnthropicPrompt",
                 node_id="node-7",
             ),
+            _POSTER_FLOW,
         )
 
         assert isinstance(result, BudgetAccessResultSuccess)
@@ -216,7 +226,6 @@ class TestBudgetCheckAllowed:
         http.return_value = _response(200, {"allowed": True})
         engine = _mock_engine()
         engine.project_manager.get_project_chain.return_value = []
-        engine.context_manager.has_current_workflow.return_value = False
         engine.get_engine_id.return_value = None
         engine.get_session_id.return_value = None
 
@@ -427,7 +436,8 @@ class TestReportUsage:
                 node_type="AnthropicPrompt",
                 node_id="node-7",
                 correlation_id="corr-1",
-            )
+            ),
+            _POSTER_FLOW,
         )
 
         assert isinstance(result, ReportUsageResultSuccess)

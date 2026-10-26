@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.managers.model_manager import (
     _create_progress_tracker,
     _load_status_file,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 @pytest.fixture
@@ -368,8 +369,8 @@ class TestDeclareModelInvocationCatalogEnrichment:
             }
         )
 
-    def _register_node(self, node_name: str, engine: Engine) -> None:
-        """Register a library + probe node type, then a node instance the handler can resolve."""
+    def _register_node(self, node_name: str, engine: Engine) -> WorkflowRuntime:
+        """Register a library + probe node type, then a node instance in a newly opened workflow, which it returns."""
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.node_library.library_registry import (
             LibraryMetadata,
@@ -407,7 +408,9 @@ class TestDeclareModelInvocationCatalogEnrichment:
             metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
         )
         engine.context_manager.push_workflow(workflow_name="model_workflow")
-        engine.object_manager.add_object_by_name(node_name, node)
+        workflow = engine.current_workflow()
+        engine.object_manager.add_object_by_name_in(workflow, node_name, node)
+        return workflow
 
     def test_checkpoint_carries_family_and_provider_for_declared_model(
         self,
@@ -418,7 +421,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointDenial,
         )
 
-        self._register_node("Probe_1", engine)
+        workflow = self._register_node("Probe_1", engine)
         seen: dict[str, object] = {}
 
         def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
@@ -426,10 +429,10 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         engine.event_manager.add_authorization_hook(capture)
-        manager = ModelManager()
 
-        result = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+        result = engine.handle_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
+            workflow_id=workflow.workflow_id,
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
@@ -452,7 +455,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointFailure,
         )
 
-        self._register_node("Probe_1", engine)
+        workflow = self._register_node("Probe_1", engine)
 
         def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             if "GPT Image" in (checkpoint.attributes.get("model_families") or []):
@@ -463,7 +466,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"), workflow
         )
 
         assert isinstance(result, DeclareModelInvocationResultFailure)
@@ -473,6 +476,29 @@ class TestDeclareModelInvocationCatalogEnrichment:
         # A key the node does not declare cannot be enriched; the checkpoint
         # carries only the bare id, so a family/provider rule cannot match but a
         # bare-id rule still can.
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        workflow = self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
+        manager = ModelManager()
+
+        manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1"), workflow
+        )
+
+        assert seen["attributes"] == {"id": "gtc_not_declared"}
+
+    def test_a_node_name_with_no_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
+        # The node is looked up only in the workflow the declaration is handed, never the open one.
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -489,10 +515,10 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1")
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"), None
         )
 
-        assert seen["attributes"] == {"id": "gtc_not_declared"}
+        assert seen["attributes"] == {"id": "gtc_gpt_image_1_mini"}
 
     def test_missing_node_name_falls_back_to_bare_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
