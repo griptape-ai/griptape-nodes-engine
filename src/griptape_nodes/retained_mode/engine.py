@@ -116,6 +116,10 @@ _root_engine: Engine | None = None
 _root_engine_lock = threading.RLock()
 _root_engine_building = False
 
+# The workflow a request sent without an envelope id acts on (see `Engine.bind_workflow`). A ContextVar
+# so a binding reaches the tasks and `asyncio.to_thread` calls made under it, and no further.
+_bound_workflow: ContextVar[WorkflowRuntime | None] = ContextVar("griptape_nodes_bound_workflow", default=None)
+
 
 class EngineScoped:
     """Base for objects that belong to a single `Engine`.
@@ -391,6 +395,30 @@ class Engine:
     @property
     def open_workflows(self) -> OpenWorkflowSet:
         return self._open_workflows
+
+    @property
+    def bound_workflow(self) -> WorkflowRuntime | None:
+        """The workflow the current work is bound to (see `bind_workflow`), or None."""
+        return _bound_workflow.get()
+
+    @contextmanager
+    def bind_workflow(self, workflow: WorkflowRuntime | None) -> Iterator[None]:
+        """Address the requests sent in this block without an envelope id to `workflow`.
+
+        For entry points that send requests without naming a workflow (executors, workflow file runs).
+        A request's envelope id still wins, and host requests ignore the binding. A request sent while
+        the bound workflow is no longer open fails, as a stale envelope id does. None runs the block
+        unbound.
+
+        The binding is a ContextVar: tasks created in the block and `asyncio.to_thread` calls carry
+        it, but `loop.run_in_executor` and `ThreadPoolExecutor.submit` do not unless the caller runs
+        the function in `contextvars.copy_context()`.
+        """
+        token = _bound_workflow.set(workflow)
+        try:
+            yield
+        finally:
+            _bound_workflow.reset(token)
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so

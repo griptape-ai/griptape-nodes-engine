@@ -195,7 +195,7 @@ class _RequestWorkflowError(Exception):
 
 
 def _workflow_for_unaddressed_request(open_workflows: OpenWorkflowSet) -> WorkflowRuntime | None:
-    """The workflow a request whose envelope names none acts on: the one open workflow, or None.
+    """The one open workflow, or None, for a request that neither its envelope nor a binding addresses.
 
     Exists until every caller addresses its requests; deleted when addressing is required.
     """
@@ -1405,7 +1405,8 @@ class EventManager(EngineScoped):
 
         Raises:
             _RequestWorkflowError: The call is handled here, its scope takes a workflow, and the request
-                names one that isn't open, or a WORKFLOW request names none while none is open.
+                names one that isn't open, its binding has closed, or a WORKFLOW request names none while
+                none is open.
         """
         callback = registered.callback
         if not isinstance(callback, ForwardingRequestHandler):
@@ -1423,7 +1424,7 @@ class EventManager(EngineScoped):
 
         Raises:
             _RequestWorkflowError: The scope takes a workflow, and the request names one that isn't
-                open, or a WORKFLOW request names none while none is open.
+                open, its binding has closed, or a WORKFLOW request names none while none is open.
         """
         scope = registered.scope
         if scope is None:
@@ -1436,11 +1437,11 @@ class EventManager(EngineScoped):
     def _workflow_for_request(
         self, request: RequestPayload, scope: RequestScope, workflow_id: str | None
     ) -> WorkflowRuntime | None:
-        """The open workflow a request whose handler takes one acts on.
+        """The open workflow a request whose handler takes one acts on: its envelope's, else the bound one.
 
         Raises:
-            _RequestWorkflowError: The request names a workflow that isn't open, or a WORKFLOW request
-                names none while none is open.
+            _RequestWorkflowError: The request names a workflow that isn't open, the workflow bound to
+                the current work has closed, or a WORKFLOW request names none while none is open.
         """
         request_name = type(request).__name__
         open_workflows = self.engine.open_workflows
@@ -1450,6 +1451,13 @@ class EventManager(EngineScoped):
             except OpenWorkflowError as err:
                 msg = f"Attempted to run {request_name} in workflow '{workflow_id}'. Failed because that workflow isn't open."
                 raise _RequestWorkflowError(msg) from err
+
+        bound = self.engine.bound_workflow
+        if bound is not None:
+            if open_workflows.find_by_id(bound.workflow_id) is not bound:
+                msg = f"Attempted to run {request_name} in workflow '{bound.workflow_id}'. Failed because that workflow isn't open."
+                raise _RequestWorkflowError(msg)
+            return bound
 
         workflow = _workflow_for_unaddressed_request(open_workflows)
         if workflow is None and scope is RequestScope.WORKFLOW:

@@ -7,7 +7,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -74,7 +74,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.utils.async_utils import call_function
-from tests.workflow_context import push_unsaved_workflow
+from tests.workflow_context import push_unsaved_workflow, without_sole_workflow_fallback
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -575,6 +575,120 @@ class TestNestedRequests:
         assert isinstance(result, GenericResultFailure)
         assert f"in workflow '{closed.workflow_id}'" in str(result.result_details)
         assert calls.workflows == []
+
+
+class TestWorkflowBinding:
+    """A request with no envelope id acts on the workflow `Engine.bind_workflow` bound, before any fallback."""
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    @pytest.mark.asyncio
+    async def test_the_binding_names_the_workflow_passed_before_the_fallback(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, scope)
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.event_manager._workflow_for_unaddressed_request") as fallback,
+            engine.bind_workflow(workflow),
+        ):
+            result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]
+        fallback.assert_not_called()
+
+    def test_the_sync_path_uses_the_binding_too(self, engine: Engine, calls: _Calls) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, RequestScope.WORKFLOW)
+
+        with without_sole_workflow_fallback(), engine.bind_workflow(workflow):
+            result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_the_envelope_id_wins_over_the_binding(self, engine: Engine, calls: _Calls) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, RequestScope.WORKFLOW)
+
+        with engine.bind_workflow(workflow):
+            result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest(), workflow_id=NOT_OPEN_ID)
+
+        assert isinstance(result_event.result, GenericResultFailure)
+        assert f"in workflow '{NOT_OPEN_ID}'" in str(result_event.result.result_details)
+        assert calls.workflows == []
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    @pytest.mark.asyncio
+    async def test_a_binding_to_a_closed_workflow_fails_like_a_stale_envelope_id(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        """It never falls through to the workflow open now."""
+        closed = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        await engine.close_workflow_state(closed)
+        push_unsaved_workflow(engine)
+        _register(engine, calls, scope)
+
+        with engine.bind_workflow(closed):
+            result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert isinstance(result_event.result, GenericResultFailure)
+        assert str(result_event.result.result_details) == (
+            f"Attempted to run _ScopeProbeRequest in workflow '{closed.workflow_id}'. "
+            "Failed because that workflow isn't open."
+        )
+        assert calls.workflows == []
+
+    @pytest.mark.parametrize("scope", [RequestScope.HOST, None])
+    @pytest.mark.asyncio
+    async def test_host_and_undeclared_scopes_ignore_the_binding(
+        self, engine: Engine, calls: _Calls, scope: RequestScope | None
+    ) -> None:
+        closed = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        await engine.close_workflow_state(closed)
+        _register(engine, calls, scope)
+
+        with engine.bind_workflow(closed):
+            result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert calls.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_binding_none_runs_the_block_unbound(self, engine: Engine, calls: _Calls) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW)
+
+        with without_sole_workflow_fallback(), engine.bind_workflow(workflow), engine.bind_workflow(None):
+            await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert calls.workflows == [None]
+
+    @pytest.mark.asyncio
+    async def test_requests_from_tasks_and_to_thread_calls_made_in_the_block_carry_the_binding(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+        _register(engine, calls, RequestScope.WORKFLOW)
+
+        with without_sole_workflow_fallback(), engine.bind_workflow(workflow):
+            task = asyncio.create_task(engine.ahandle_request(_ScopeProbeRequest()))
+            from_thread = await asyncio.to_thread(engine.handle_request, _ScopeProbeRequest())
+            from_task = await task
+
+        assert from_task.succeeded()
+        assert from_thread.succeeded()
+        assert calls.workflows == [workflow, workflow]
+
+    def test_the_binding_ends_with_the_block(self, engine: Engine) -> None:
+        workflow = engine.open_workflows.get(push_unsaved_workflow(engine).workflow_id)
+
+        with engine.bind_workflow(workflow):
+            assert engine.bound_workflow is workflow
+
+        assert engine.bound_workflow is None
 
 
 class _RecordingRequestClient:

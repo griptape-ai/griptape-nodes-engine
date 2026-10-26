@@ -62,3 +62,16 @@ def unsaved_workflow_open(engine: Engine) -> Iterator[Workflow]:
         yield push_unsaved_workflow(engine)
     finally:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+@contextmanager
+def without_sole_workflow_fallback() -> Iterator[None]:
+    """Run with dispatch's temporary "the one open workflow" fallback off.
+
+    A request that neither its envelope nor a binding addresses then gets no workflow, as it will once
+    addressing is required. Proves a caller addresses its requests while only one workflow can be open.
+    """
+    with patch(
+        "griptape_nodes.retained_mode.managers.event_manager._workflow_for_unaddressed_request", return_value=None
+    ):
+        yield
