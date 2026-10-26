@@ -359,7 +359,7 @@ class EventManager(EngineScoped):
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
             self._dispatch_to_execution_listeners(event)
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -393,7 +393,7 @@ class EventManager(EngineScoped):
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
             self._dispatch_to_execution_listeners(event)
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
