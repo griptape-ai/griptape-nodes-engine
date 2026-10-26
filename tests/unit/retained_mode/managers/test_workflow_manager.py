@@ -5735,6 +5735,25 @@ class TestExecuteWorkflowImport:
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
         assert "no new flow was created" in str(result.result_details)
 
+    @pytest.mark.asyncio
+    async def test_fails_when_a_recorded_flow_no_longer_exists(
+        self, engine: Engine, import_inputs: ImportInputs, recorded_flows: list[str], run_workflow_mock: AsyncMock
+    ) -> None:
+        request, imported, workflow = import_inputs
+
+        async def run_workflow(_path: str, _workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
+            recorded_flows.append("DeletedFlow")
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        run_workflow_mock.side_effect = run_workflow
+
+        result = await engine.workflow_manager.referenced_import._execute_workflow_import(
+            workflow, request, imported, "ParentFlow"
+        )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
+        assert "was removed before the import finished" in str(result.result_details)
+
 
 class SiblingTargets(NamedTuple):
     """The names of the two flows the concurrent imports target."""
