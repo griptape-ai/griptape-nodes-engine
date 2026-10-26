@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING
 
 from watchfiles import Change, PythonFilter, watch
 
-from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -215,7 +219,7 @@ class SyncManager(EngineScoped):
 
         # Get cloud storage configuration from secrets
         bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
-        base_url = secrets_manager.get_secret("GT_CLOUD_BASE_URL", should_error_on_not_found=False)
+        base_url = resolve_cloud_base_url(secrets_manager)
         api_key = resolve_cloud_credential(secrets_manager)
 
         if not bucket_id:

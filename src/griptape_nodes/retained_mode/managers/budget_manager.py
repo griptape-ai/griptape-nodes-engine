@@ -24,12 +24,12 @@ import uuid
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, NamedTuple
-from urllib.parse import urljoin
 
 import httpx2
 
 from griptape_nodes.drivers.cloud_credentials import (
     MISSING_CREDENTIAL_MESSAGE,
+    join_cloud_url,
     resolve_cloud_base_url,
     resolve_cloud_credential,
 )
@@ -317,7 +317,7 @@ class BudgetManager(EngineScoped):
         if credential is None:
             raise _NoCredentialError
         return CloudTarget(
-            url=urljoin(resolve_cloud_base_url(secrets_manager), path),
+            url=join_cloud_url(resolve_cloud_base_url(secrets_manager), path),
             headers={"Authorization": f"Bearer {credential}"},
         )
 
