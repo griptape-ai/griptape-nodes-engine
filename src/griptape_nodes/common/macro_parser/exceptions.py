@@ -67,6 +67,55 @@ class MacroResolutionError(Exception):
         self.missing_variables = missing_variables
 
 
+class MacroFunctionError(MacroResolutionError):
+    """Raised when a function call inside a macro token cannot be evaluated.
+
+    Covers every failure of a call to a known function in the ``{fn(arg, ...)}`` syntax: wrong
+    number of arguments, an argument of the wrong kind, malformed call syntax, and a path that
+    escapes (``..`` above path_join's first argument, a later absolute argument, or a temp path
+    outside the workspace and project folders). A call to an unknown function is not an error: the
+    token is left verbatim, like an unknown variable. Carries the function's name and the character position of the
+    failing call within the text being resolved, so the message can point at it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        failure_reason: MacroResolutionFailureReason,
+        function_name: str,
+        position: int | None = None,
+        variable_name: str | None = None,
+    ) -> None:
+        """Initialize MacroFunctionError.
+
+        Args:
+            message: Human-readable error message
+            failure_reason: Specific reason for the failure
+            function_name: Name of the function being called (as written)
+            position: 0-based character position of the failing call or argument, if known
+            variable_name: Name of the variable involved, if the failure is about one
+        """
+        super().__init__(message, failure_reason=failure_reason, variable_name=variable_name)
+        self.function_name = function_name
+        self.position = position
+
+
+class MacroFunctionArityError(MacroFunctionError):
+    """Raised when a macro function is called with the wrong number of arguments."""
+
+
+class MacroFunctionArgumentError(MacroFunctionError):
+    """Raised when a macro function argument has the wrong kind of value or names an unknown variable."""
+
+
+class MacroFunctionSyntaxError(MacroFunctionError):
+    """Raised when a call to a known macro function is malformed (unbalanced parentheses, bad literal)."""
+
+
+class MacroPathEscapeError(MacroFunctionError):
+    """Raised when a path function's arguments climb out of its folder, or a temp path leaves the workspace."""
+
+
 class MacroMatchFailureReason(StrEnum):
     """Reason why path matching failed."""
 
@@ -100,6 +149,10 @@ class MacroResolutionFailureReason(StrEnum):
     ENVIRONMENT_VARIABLE_NOT_FOUND = "ENVIRONMENT_VARIABLE_NOT_FOUND"
     SECRETS_UNAVAILABLE = "SECRETS_UNAVAILABLE"
     UNEXPECTED_SEGMENT_TYPE = "UNEXPECTED_SEGMENT_TYPE"
+    FUNCTION_ARITY = "FUNCTION_ARITY"
+    FUNCTION_ARGUMENT = "FUNCTION_ARGUMENT"
+    FUNCTION_SYNTAX = "FUNCTION_SYNTAX"
+    PATH_ESCAPE = "PATH_ESCAPE"
 
 
 @dataclass

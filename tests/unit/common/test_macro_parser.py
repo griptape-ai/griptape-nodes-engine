@@ -989,7 +989,11 @@ class TestMacroFailureTypes:
         assert MacroResolutionFailureReason.ENVIRONMENT_VARIABLE_NOT_FOUND == "ENVIRONMENT_VARIABLE_NOT_FOUND"
         assert MacroResolutionFailureReason.SECRETS_UNAVAILABLE == "SECRETS_UNAVAILABLE"
         assert MacroResolutionFailureReason.UNEXPECTED_SEGMENT_TYPE == "UNEXPECTED_SEGMENT_TYPE"
-        assert len(MacroResolutionFailureReason) == 7
+        assert MacroResolutionFailureReason.FUNCTION_ARITY == "FUNCTION_ARITY"
+        assert MacroResolutionFailureReason.FUNCTION_ARGUMENT == "FUNCTION_ARGUMENT"
+        assert MacroResolutionFailureReason.FUNCTION_SYNTAX == "FUNCTION_SYNTAX"
+        assert MacroResolutionFailureReason.PATH_ESCAPE == "PATH_ESCAPE"
+        assert len(MacroResolutionFailureReason) == 11
 
 
 class TestEnhancedExceptions:

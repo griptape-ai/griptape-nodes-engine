@@ -4,10 +4,11 @@ import json
 import logging
 import re
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
-from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
+from griptape_nodes.common.macro_parser.exceptions import MacroFunctionError, MacroResolutionError, MacroSyntaxError
+from griptape_nodes.common.macro_parser.functions import MacroFunctionContext, MacroFunctions, ParsedFunctionToken
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
 
 if TYPE_CHECKING:
@@ -26,6 +27,21 @@ _NO_FLOW: object = object()
 _aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
     "_variable_resolver_aprocess_cache", default=None
 )
+
+# Results of volatile macro function tokens ({now()}, {random()}, {temp_file("png")}) for the
+# duration of one aprocess() call, keyed by the token text. A node that reads the same parameter
+# twice during one run sees the same timestamp, number, or temp path both times. None outside a
+# scope: nothing is memoised there.
+_aprocess_function_cache: ContextVar[dict[str, str] | None] = ContextVar(
+    "_variable_resolver_aprocess_function_cache", default=None
+)
+
+
+class _CacheResetToken(NamedTuple):
+    """The ContextVar tokens seed_cache() hands back, reset together by reset_cache()."""
+
+    variables: object
+    functions: object
 
 
 class VariableResolver:
@@ -73,17 +89,35 @@ class VariableResolver:
         )
 
     @staticmethod
-    def resolve_macro_token(token: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
-        """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
+    def resolve_macro_token(
+        token: str, variables: dict[str, str | int], node_name: str | None = None, *, text_offset: int = 0
+    ) -> str:
+        """Try to resolve a single {VAR}, {VAR:spec}, or {fn(arg, ...)} token against the variable dict.
 
         Returns the resolved string on success, or the original token if the variable
         is unknown, the token is not a macro reference, or parsing fails.
+
+        A function-call token is the exception to leaving things verbatim: once a token is a
+        call (see ``MacroFunctions.parse``), any failure -- unknown function, wrong number of
+        arguments, a bad or unknown argument, a path outside the workspace -- raises a
+        ``MacroFunctionError`` rather than handing back a half-resolved string. ``text_offset``
+        is where the token starts in the full text, so the error's position points into it.
 
         Variable values are substituted literally — NOT routed through env-var resolution.
         A value like "$HOME" is treated as the string "$HOME", not expanded to the home
         directory. This prevents both secret exfiltration and silent no-ops on dollar-sign
         values (e.g. "$50", "$HOME/x").
         """
+        content = token[1:-1]
+        if MacroFunctions.looks_like_call(content):
+            parsed_call = MacroFunctions.parse(content, offset=text_offset + 1)
+            if parsed_call is not None:
+                return VariableResolver._resolve_function_token(token, parsed_call, variables)
+        return VariableResolver._resolve_variable_token(token, variables, node_name)
+
+    @staticmethod
+    def _resolve_variable_token(token: str, variables: dict[str, str | int], node_name: str | None) -> str:
+        """Resolve a {VAR} or {VAR:spec} token, leaving it verbatim when it cannot be resolved."""
         try:
             parsed = ParsedMacro(token)
         except MacroSyntaxError:
@@ -119,9 +153,13 @@ class VariableResolver:
 
     @staticmethod
     def resolve_string(text: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
-        """Substitute all {VAR} tokens in text using the provided variable dict."""
+        """Substitute all {VAR} and {fn(...)} tokens in text using the provided variable dict.
+
+        Raises MacroFunctionError if a function-call token cannot be evaluated; nothing of the
+        text is substituted in that case.
+        """
         return VariableResolver._MACRO_TOKEN.sub(
-            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables, node_name),
+            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables, node_name, text_offset=m.start()),
             text,
         )
 
@@ -173,14 +211,21 @@ class VariableResolver:
             _active.discard(id(value))
 
     @staticmethod
-    def seed_cache(variables: dict[str, str | int] | None) -> object:
-        """Pre-seed the per-aprocess variable cache. Returns an opaque reset token."""
-        return _aprocess_variable_cache.set(variables)
+    def seed_cache(variables: dict[str, str | int] | None) -> _CacheResetToken:
+        """Pre-seed the per-aprocess variable cache and start an empty function-result cache.
+
+        Returns an opaque reset token.
+        """
+        return _CacheResetToken(
+            variables=_aprocess_variable_cache.set(variables),
+            functions=_aprocess_function_cache.set({}),
+        )
 
     @staticmethod
-    def reset_cache(token: object) -> None:
-        """Reset the per-aprocess variable cache to its state before seed_cache was called."""
-        _aprocess_variable_cache.reset(token)  # type: ignore[arg-type]
+    def reset_cache(token: _CacheResetToken) -> None:
+        """Reset the per-aprocess caches to their state before seed_cache was called."""
+        _aprocess_function_cache.reset(token.functions)  # type: ignore[arg-type]
+        _aprocess_variable_cache.reset(token.variables)  # type: ignore[arg-type]
 
     @staticmethod
     def is_substitution_enabled(engine: Engine) -> bool:
@@ -271,6 +316,8 @@ class VariableResolver:
         if isinstance(value, str):
             for match in VariableResolver._MACRO_TOKEN.finditer(value):
                 content = match.group(1)
+                if VariableResolver._function_token_references(content, variable_name):
+                    return True
                 name = content.split("|")[0].split(":")[0].rstrip("?").strip()
                 if name == variable_name:
                     return True
@@ -302,7 +349,7 @@ class VariableResolver:
 
         def rewrites(text: str) -> bool:
             return any(
-                VariableResolver.resolve_macro_token(match.group(0), variables) != match.group(0)
+                VariableResolver._token_rewrites(match.group(0), variables)
                 for match in VariableResolver._MACRO_TOKEN.finditer(text)
             )
 
@@ -326,6 +373,43 @@ class VariableResolver:
             return VariableResolver.get_variables_if_enabled(engine, node_name)
         finally:
             _aprocess_variable_cache.reset(token)
+
+    @staticmethod
+    def _resolve_function_token(token: str, parsed_call: ParsedFunctionToken, variables: dict[str, str | int]) -> str:
+        """Evaluate a parsed function-call token, memoising volatile results inside aprocess()."""
+        cache = _aprocess_function_cache.get()
+        volatile = parsed_call.is_volatile
+        if volatile and cache is not None and token in cache:
+            return cache[token]
+        resolved = MacroFunctions.evaluate(parsed_call, MacroFunctionContext.from_variables(variables))
+        if volatile and cache is not None:
+            cache[token] = resolved
+        return resolved
+
+    @staticmethod
+    def _token_rewrites(token: str, variables: dict[str, str | int]) -> bool:
+        """Whether resolving `token` would change it. A function call that fails counts as a rewrite.
+
+        A failing call raises during the run, so its template is still the user's text to keep;
+        answering True keeps a copy-back from overwriting it.
+        """
+        try:
+            return VariableResolver.resolve_macro_token(token, variables) != token
+        except MacroFunctionError:
+            return True
+
+    @staticmethod
+    def _function_token_references(content: str, variable_name: str) -> bool:
+        """Whether a function-call token reads `variable_name` as one of its arguments."""
+        if not MacroFunctions.looks_like_call(content):
+            return False
+        try:
+            parsed_call = MacroFunctions.parse(content)
+        except MacroFunctionError:
+            return False
+        if parsed_call is None:
+            return False
+        return variable_name in parsed_call.variable_names()
 
     @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:

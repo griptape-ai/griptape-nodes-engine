@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from griptape_nodes.common.macro_parser.functions import MacroFunctionInfo
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
@@ -347,10 +348,15 @@ class ListVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     ``layers`` is parallel to ``variables``: layers[i] names the layer variables[i]
     was resolved from (flow / project / global). Kept as a separate defaulted field
     so the shipped ``variables`` shape is unchanged (wire-additive).
+
+    ``functions`` lists every function the ``{fn(arg, ...)}`` macro syntax accepts, sorted by
+    name, with its signature and a one-line description, for the editor's ``{`` picker. It is the
+    same in every scope. Wire-additive like ``layers``.
     """
 
     variables: list[FlowVariable]
     layers: list[VariableLayerKind] = field(default_factory=list)
+    functions: list[MacroFunctionInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -457,9 +463,16 @@ class ListSubstitutablesRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class ListSubstitutablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Substitutables listed successfully."""
+    """Substitutables listed successfully.
+
+    Attributes:
+        substitutables: Values available for {VAR} substitution
+        functions: Every function the {fn(arg, ...)} macro syntax accepts, sorted by name, with its
+            signature and a one-line description. The same in every scope; not filtered by flow.
+    """
 
     substitutables: list[Substitutable]
+    functions: list[MacroFunctionInfo] = field(default_factory=list)
 
 
 @dataclass

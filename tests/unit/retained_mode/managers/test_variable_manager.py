@@ -123,7 +123,27 @@ def _add_variable(engine: Engine, name: str, value: object, type_: str = "str") 
     assert isinstance(result, CreateVariableResultSuccess)
 
 
+class TestListVariablesFunctions:
+    def test_lists_macro_functions(self, engine: Engine, flow_name: str) -> None:
+        with project_macros({}):
+            result = engine.handle_request(ListVariablesRequest(starting_flow=flow_name))
+        assert isinstance(result, ListVariablesResultSuccess)
+        names = [f.name for f in result.functions]
+        assert {"path_join", "with_ext", "temp_file", "now", "random"} <= set(names)
+        assert names == sorted(names)
+
+
 class TestListSubstitutablesRequest:
+    def test_lists_macro_functions(self, engine: Engine, flow_name: str) -> None:
+        with project_macros({}):
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+        assert isinstance(result, ListSubstitutablesResultSuccess)
+        by_name = {f.name: f for f in result.functions}
+        assert {"path_join", "with_ext", "temp_file", "now", "random", "format", "div"} <= set(by_name)
+        assert by_name["path_join"].signature == "path_join(folder, part, ...)"
+        assert by_name["path_join"].description
+        assert [f.name for f in result.functions] == sorted(by_name)
+
     def test_returns_user_vars_and_macros(self, engine: Engine, flow_name: str) -> None:
         _add_variable(engine, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/workspace"}):

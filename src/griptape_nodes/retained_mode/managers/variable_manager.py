@@ -2,6 +2,7 @@ import logging
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError
+from griptape_nodes.common.macro_parser.functions import MacroFunctions
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -1023,7 +1024,10 @@ class VariablesManager(EngineScoped):
         variables = [r.variable for r in resolved]
         layers = [r.layer for r in resolved]
         return ListVariablesResultSuccess(
-            variables=variables, layers=layers, result_details=f"Successfully listed {len(variables)} variables."
+            variables=variables,
+            layers=layers,
+            functions=MacroFunctions.list_functions(),
+            result_details=f"Successfully listed {len(variables)} variables.",
         )
 
     @handles(ListSubstitutablesRequest)
@@ -1072,6 +1076,7 @@ class VariablesManager(EngineScoped):
         substitutables.sort(key=lambda s: s.name)
         return ListSubstitutablesResultSuccess(
             substitutables=substitutables,
+            functions=MacroFunctions.list_functions(),
             result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
         )
 
