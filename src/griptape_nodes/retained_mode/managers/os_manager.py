@@ -159,9 +159,9 @@ from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # File is not in static directory (or not a local file), create small preview
-from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
@@ -546,7 +546,7 @@ class OSManager(EngineScoped):
             raise
 
     def _resolve_macro_path_to_string(
-        self, macro_path: MacroPath, workflow: WorkflowRuntime | None, *, failure_log_level: int = logging.ERROR
+        self, macro_path: MacroPath, workflow: "WorkflowRuntime | None", *, failure_log_level: int = logging.ERROR
     ) -> str | MacroResolutionFailure:
         """Resolve MacroPath to absolute string via ProjectManager, for `workflow`.
 
@@ -840,7 +840,7 @@ class OSManager(EngineScoped):
     # ============================================================================
 
     def _bind_project_variables_for_index_scan(
-        self, macro_path: MacroPath, workflow: WorkflowRuntime | None
+        self, macro_path: MacroPath, workflow: "WorkflowRuntime | None"
     ) -> MacroPath:
         """Bake project directories and builtins into a macro so only its `{_index}` slot is left open.
 
@@ -1725,7 +1725,7 @@ class OSManager(EngineScoped):
 
     @handles(ListDirectoryRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_list_directory_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, request: ListDirectoryRequest, workflow: WorkflowRuntime | None = None
+        self, request: ListDirectoryRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Handle a request to list directory contents. Macros in the path resolve for `workflow`."""
         try:
@@ -1948,7 +1948,7 @@ class OSManager(EngineScoped):
             msg = f"Unexpected error in list_directory: {type(e).__name__}: {e}"
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
-    def _resolve_directory_location(self, directory_path: str, workflow: WorkflowRuntime | None) -> str:
+    def _resolve_directory_location(self, directory_path: str, workflow: "WorkflowRuntime | None") -> str:
         """Resolve a listed directory's location; a path with macros resolves for `workflow`.
 
         Raises:
@@ -1969,7 +1969,7 @@ class OSManager(EngineScoped):
 
     @handles(ListDirectorySequencesRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_list_directory_sequences_request(
-        self, request: ListDirectorySequencesRequest, workflow: WorkflowRuntime | None = None
+        self, request: ListDirectorySequencesRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Handle a request to list only file sequences in a directory.
 
@@ -2068,7 +2068,7 @@ class OSManager(EngineScoped):
 
     @handles(ScanSequencesRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_scan_sequences_request(  # noqa: PLR0911
-        self, request: ScanSequencesRequest, workflow: WorkflowRuntime | None = None
+        self, request: ScanSequencesRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Handle a request to scan a path or pattern for file sequences.
 
@@ -2161,7 +2161,7 @@ class OSManager(EngineScoped):
         )
 
     def _build_scan_path_mapping(  # noqa: PLR0911
-        self, path: str, workflow: WorkflowRuntime | None
+        self, path: str, workflow: "WorkflowRuntime | None"
     ) -> PathMapping | ScanSequencesResultFailure:
         """Parse `path`, resolve any macro head, and build a `PathMapping`.
 
@@ -2512,7 +2512,7 @@ class OSManager(EngineScoped):
 
     @handles(GetNextVersionIndexRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_get_next_version_index_request(
-        self, request: GetNextVersionIndexRequest, workflow: WorkflowRuntime | None = None
+        self, request: GetNextVersionIndexRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Find the next available version index via a single glob pass; project macros resolve for `workflow`."""
         scan_macro_path = self._bind_project_variables_for_index_scan(request.macro_path, workflow)
@@ -2546,7 +2546,7 @@ class OSManager(EngineScoped):
 
     @handles(WriteFileRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     async def on_write_file_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
-        self, request: WriteFileRequest, workflow: WorkflowRuntime | None = None
+        self, request: WriteFileRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Write content to a file with exclusive locking, returning once it is on disk.
 
@@ -3049,7 +3049,7 @@ class OSManager(EngineScoped):
 
     @handles(WriteTempFileRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_write_temp_file_request(
-        self, request: WriteTempFileRequest, workflow: WorkflowRuntime | None = None
+        self, request: WriteTempFileRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path, resolved for `workflow`.
 
@@ -3078,7 +3078,7 @@ class OSManager(EngineScoped):
         )
 
     def _stage_bytes_at_temp(
-        self, content: bytes, variables: MacroVariables, workflow: WorkflowRuntime | None
+        self, content: bytes, variables: MacroVariables, workflow: "WorkflowRuntime | None"
     ) -> _StagedTempOutcome:
         """Land ``content`` at the SAVE_TEMP_FILE path resolved with ``variables``.
 
@@ -3202,7 +3202,7 @@ class OSManager(EngineScoped):
 
     def _run_write_vet(
         self,
-        workflow: WorkflowRuntime | None,
+        workflow: "WorkflowRuntime | None",
         *,
         content: bytes,
         sniffed_ext: str,
@@ -4403,7 +4403,7 @@ class OSManager(EngineScoped):
 
     @handles(ResolveMacroPathRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
     def on_handle_resolve_macro_path_request(
-        self, request: ResolveMacroPathRequest, workflow: WorkflowRuntime | None = None
+        self, request: ResolveMacroPathRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResolveMacroPathResultSuccess | ResolveMacroPathResultFailure:
         """Handle macro path resolution request.
 
@@ -4428,7 +4428,7 @@ class OSManager(EngineScoped):
         )
 
     def resolve_macro_path_in(
-        self, workflow: WorkflowRuntime | None, request: ResolveMacroPathRequest
+        self, workflow: "WorkflowRuntime | None", request: ResolveMacroPathRequest
     ) -> ResultPayload:
         """Resolve `request` for `workflow`, for a handler that holds the workflow it resolves for, or None.
 
