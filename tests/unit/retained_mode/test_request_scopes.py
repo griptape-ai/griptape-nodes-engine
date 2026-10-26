@@ -6,10 +6,11 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.app.worker_routing import RemoteHandler
+from griptape_nodes.app.worker_routing import RemoteHandler, register_broadcast_handlers
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 from griptape_nodes.retained_mode.events.app_events import (
@@ -18,16 +19,19 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
 )
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
+from griptape_nodes.retained_mode.events.budget_events import BudgetAccessRequest, ReportUsageRequest
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigCategoryRequest,
     GetWorkspaceRequest,
     ListBetaFeaturesRequest,
 )
+from griptape_nodes.retained_mode.events.diagnostics_events import CollectDiagnosticsRequest
 from griptape_nodes.retained_mode.events.generic_events import (
     WorkflowNotNamedResultFailure,
     WorkflowNotOpenResultFailure,
 )
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
+from griptape_nodes.retained_mode.events.model_events import DeclareModelInvocationRequest
 from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
@@ -57,7 +61,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetVariableSubstitutionEnabledRequest,
 )
 from griptape_nodes.retained_mode.managers import event_manager as event_manager_module
-from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope, scope_from_signature
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
@@ -782,3 +786,49 @@ class TestAmbientUntilMigrated:
 
         assert not isinstance(handler, ForwardingHandler)
         assert scope_from_signature(handler) is None
+
+
+class TestEveryEngineHandlerDeclaresAScope:
+    """Library handlers registered at library load (`module_loading.py`) are not covered: none load here."""
+
+    def test_every_handler_the_engine_registers_declares_a_scope(self, engine: Engine) -> None:
+        event_manager = engine.event_manager
+
+        undeclared = sorted(
+            request_type.__name__
+            for request_type in event_manager.registered_request_types()
+            if event_manager.get_scope_for_request_type(request_type) is None
+        )
+
+        assert undeclared == []
+
+    def test_every_broadcast_handler_a_worker_registers_declares_host_scope(self) -> None:
+        event_manager = EventManager()
+        register_broadcast_handlers(
+            event_manager, config_manager=MagicMock(), secrets_manager=MagicMock(), project_manager=MagicMock()
+        )
+
+        scopes = {
+            request_type.__name__: event_manager.get_scope_for_request_type(request_type)
+            for request_type in event_manager.registered_request_types()
+        }
+
+        assert scopes
+        assert set(scopes.values()) == {RequestScope.HOST}
+
+
+# Host-state handlers that read a node, or tag a call, in the workflow they are handed when there is one.
+OPTIONAL_WORKFLOW_HOST_STATE_REQUESTS = [
+    DeclareModelInvocationRequest,
+    BudgetAccessRequest,
+    ReportUsageRequest,
+    CollectDiagnosticsRequest,
+]
+
+
+class TestHostStateRequestsThatTakeAWorkflow:
+    @pytest.mark.parametrize("request_type", OPTIONAL_WORKFLOW_HOST_STATE_REQUESTS)
+    def test_is_registered_with_optional_workflow_scope(
+        self, engine: Engine, request_type: type[RequestPayload]
+    ) -> None:
+        assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.OPTIONAL_WORKFLOW
