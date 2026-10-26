@@ -166,11 +166,11 @@ def write_sidecar(
         file_path: Absolute path to the file that was just saved.
         metadata: Caller-provided situation and variable context (may be None).
         engine: The engine whose request bus resolves the sidecar path.
-        workflow: The workflow the sidecar path resolves for, or None.
+        workflow: The workflow the file was written for, whose folder and provenance the sidecar records, or None.
     """
     try:
         sidecar_path = _resolve_sidecar_path(file_path, engine, workflow)
-        provenance = collect_sidecar_provenance(engine)
+        provenance = collect_sidecar_provenance(engine, workflow)
         content = _SidecarDocument(
             situation=metadata.situation if metadata else None,
             workflow=WorkflowInfo(**provenance["workflow"]) if "workflow" in provenance else None,

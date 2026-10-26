@@ -266,19 +266,59 @@ class TestCollectRawProvenance:
         assert "parameters" not in result
 
 
-class TestCollectSidecarProvenance:
-    def test_empty_when_no_context(self) -> None:
-        engine = _make_engine(has_workflow=False)
+def _make_workflow(
+    engine: Mock,
+    *,
+    workflow_name: str = "test_workflow",
+    has_flow: bool = True,
+    flow_name: str = "ControlFlow_1",
+    resolving_nodes: list[str] | None = None,
+) -> Mock:
+    """Build a mock workflow runtime, and answer the engine's per-workflow lookups for it."""
+    workflow = Mock()
+    workflow.workflow_id = "wf-1"
+    workflow.context.has_current_flow.return_value = has_flow
+    flow = Mock()
+    flow.name = flow_name
+    workflow.context.get_current_flow.return_value = flow
+    workflow.objects.get_as_type.return_value = None
+    engine.flow_manager.flow_state_in.return_value = (None, resolving_nodes or [], None)
+    engine.workflow_registry.get.return_value.name = workflow_name
+    return workflow
 
-        result = collect_sidecar_provenance(engine)
+
+class TestCollectSidecarProvenance:
+    def test_empty_with_no_workflow_and_no_mirror(self) -> None:
+        engine = _make_engine()
+        engine.context_manager.mirrored_workflow_id.return_value = None
+
+        result = collect_sidecar_provenance(engine, None)
 
         assert result == {}
 
-    def test_flow_block_uses_first_resolving_node_as_node_name(self) -> None:
-        engine = _make_engine(resolving_nodes=["NodeA", "NodeB"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
+    def test_a_worker_with_no_workflow_answers_from_its_mirror(self) -> None:
+        engine = _make_engine(workflow_name="mirrored")
+        engine.context_manager.mirrored_workflow_id.return_value = "wf-mirrored"
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, None)
+
+        assert result["workflow"]["name"] == "mirrored"
+
+    def test_reads_the_given_workflow_not_the_context(self) -> None:
+        engine = _make_engine(workflow_name="in_context", flow_name="ContextFlow")
+        workflow = _make_workflow(engine, workflow_name="given", flow_name="GivenFlow")
+
+        result = collect_sidecar_provenance(engine, workflow)
+
+        assert result["workflow"]["name"] == "given"
+        assert result["flow"]["name"] == "GivenFlow"
+        engine.workflow_registry.get.assert_called_with("wf-1")
+
+    def test_flow_block_uses_first_resolving_node_as_node_name(self) -> None:
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["NodeA", "NodeB"])
+
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert result["flow"]["node_name"] == "NodeA"
         assert "resolving_nodes" not in result["flow"]
@@ -294,10 +334,11 @@ class TestCollectSidecarProvenance:
         node.parameters = [priv, pub]
         node._get_raw_parameter_value.side_effect = param_values.get
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert result["parameters"] == {"prompt": "hi"}
         assert result["parameters_omitted"] == ["password"]
@@ -311,18 +352,20 @@ class TestCollectSidecarProvenance:
         node.parameters = [pub]
         node._get_raw_parameter_value.return_value = "hello"
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert "parameters_omitted" not in result
         assert "prompt" in result["parameters"]
 
     def test_no_flow_block_when_no_flow_context(self) -> None:
-        engine = _make_engine(has_flow=False)
+        engine = Mock()
+        workflow = _make_workflow(engine, has_flow=False)
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert "workflow" in result
         assert "flow" not in result

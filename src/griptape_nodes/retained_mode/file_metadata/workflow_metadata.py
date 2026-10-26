@@ -22,6 +22,7 @@ from griptape_nodes.serialization.values import ValueEncodeError, dump_json, enc
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -114,6 +115,11 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
         logger.warning("Failed to get node '%s' for parameter collection: %s", node_name, e)
         return None
 
+    return _parameter_values_of(node_name, node)
+
+
+def _parameter_values_of(node_name: str, node: BaseNode | None) -> _ParameterCollection | None:
+    """Collect `node`'s INPUT and PROPERTY parameter values; see `_collect_parameter_values`."""
     if node is None:
         logger.warning("Node '%s' not found for parameter collection", node_name)
         return None
@@ -168,9 +174,9 @@ def _collect_workflow_info(engine: Engine, workflow_name: str) -> dict[str, Any]
 def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
     """Collect structured provenance from current execution context without any output formatting.
 
-    This is the single source of truth for provenance data. Both collect_sidecar_provenance()
-    and collect_workflow_metadata() delegate here and then format the result for their
-    respective targets (JSON sidecar vs. flat PNG text-chunk strings).
+    collect_workflow_metadata() delegates here, and so does collect_sidecar_provenance() on a
+    worker; each formats the result for its target (flat PNG text-chunk strings vs. JSON
+    sidecar). _collect_raw_provenance_in() collects the same blocks for a given workflow.
 
     Args:
         engine: The engine whose context manager and flow manager supply the metadata.
@@ -199,36 +205,75 @@ def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
     try:
         flow = context_manager.get_current_flow()
         _, resolving_nodes, _ = engine.flow_manager.flow_state(flow)
-        result["flow"] = {"name": flow.name, "resolving_nodes": list(resolving_nodes)}
-
+        collection = None
         if resolving_nodes:
             collection = _collect_parameter_values(resolving_nodes[0], engine)
-            if collection is not None:
-                if collection.values:
-                    result["parameters"] = collection.values
-                if collection.omitted:
-                    result["parameters_omitted"] = collection.omitted
+        _add_flow_provenance(result, flow.name, resolving_nodes, collection)
     except Exception:
         logger.exception("Failed to collect flow/node metadata for provenance")
 
     return result
 
 
-def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
-    """Collect structured provenance data for the sidecar JSON file.
+def _collect_raw_provenance_in(engine: Engine, workflow: WorkflowRuntime) -> dict[str, Any]:
+    """Collect the same structured provenance as `_collect_raw_provenance`, for `workflow` rather than the context."""
+    result: dict[str, Any] = {
+        "workflow": _collect_workflow_info(engine, engine.workflow_registry.get(workflow.workflow_id).name)
+    }
 
-    Delegates to _collect_raw_provenance() and reshapes the flow block for the
+    if not workflow.context.has_current_flow():
+        return result
+
+    try:
+        flow = workflow.context.get_current_flow()
+        _, resolving_nodes, _ = engine.flow_manager.flow_state_in(workflow, flow)
+        collection = None
+        if resolving_nodes:
+            node_name = resolving_nodes[0]
+            collection = _parameter_values_of(node_name, workflow.objects.get_as_type(node_name, BaseNode))
+        _add_flow_provenance(result, flow.name, resolving_nodes, collection)
+    except Exception:
+        logger.exception("Failed to collect flow/node metadata for provenance")
+
+    return result
+
+
+def _add_flow_provenance(
+    result: dict[str, Any], flow_name: str, resolving_nodes: list[str], collection: _ParameterCollection | None
+) -> None:
+    """Add the flow block, and the first resolving node's parameters when collected, to `result`."""
+    result["flow"] = {"name": flow_name, "resolving_nodes": list(resolving_nodes)}
+    if collection is None:
+        return
+    if collection.values:
+        result["parameters"] = collection.values
+    if collection.omitted:
+        result["parameters_omitted"] = collection.omitted
+
+
+def collect_sidecar_provenance(engine: Engine, workflow: WorkflowRuntime | None) -> dict[str, Any]:
+    """Collect structured provenance data for the sidecar JSON file of a file written for `workflow`.
+
+    Collects the raw provenance and reshapes the flow block for the
     sidecar's JSON schema. Private parameters are already excluded by
-    _collect_parameter_values(); this function passes 'parameters_omitted' through
+    _parameter_values_of(); this function passes 'parameters_omitted' through
     unchanged. Unlike collect_workflow_metadata(), values stay typed (not stringified).
 
     Args:
-        engine: The engine whose context manager and flow manager supply the metadata.
+        engine: The engine whose flow manager and workflow registry supply the metadata.
+        workflow: The workflow the file was written for, or None. With None, a worker answers
+            from the workflow it mirrors, and any other engine records no provenance.
 
     Returns:
         Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
     """
-    raw = _collect_raw_provenance(engine)
+    if workflow is not None:
+        raw = _collect_raw_provenance_in(engine, workflow)
+    elif engine.context_manager.mirrored_workflow_id() is not None:
+        # A worker opens no workflow; its context is the mirror of its orchestrator's.
+        raw = _collect_raw_provenance(engine)
+    else:
+        return {}
     result: dict[str, Any] = {}
 
     if "workflow" in raw:

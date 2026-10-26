@@ -6,6 +6,7 @@ Several tests open a second workflow beside the first and address it, so a handl
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,6 +62,7 @@ from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileUploadUrlRequest,
     CreateStaticFileUploadUrlResultFailure,
 )
+from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
 from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
@@ -342,6 +344,25 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         assert isinstance(result, WriteFileResultSuccess), result.result_details
         assert Path(result.final_file_path) == _folder(tmp_path / "addressed" / "outputs" / "notes.txt")
         assert not (tmp_path / "open" / "outputs").exists()
+
+    def test_a_sidecar_records_the_addressed_workflow(self, nothing_open: Engine, tmp_path: Path) -> None:
+        open_workflow = push_unsaved_workflow(nothing_open, working_directory=str(tmp_path / "open"))
+        written = tmp_path / "addressed" / "notes.txt"
+
+        with _also_open(nothing_open, tmp_path / "addressed") as addressed:
+            result = nothing_open.handle_request(
+                WriteFileRequest(
+                    file_path=str(written), content="hello", create_parents=True, file_metadata=SidecarContent()
+                ),
+                workflow_id=addressed.workflow_id,
+            )
+
+        assert isinstance(result, WriteFileResultSuccess), result.result_details
+        sidecars = list((tmp_path / "addressed" / ".griptape-nodes-metadata").rglob("notes.txt.json"))
+        assert len(sidecars) == 1
+        recorded_name = json.loads(sidecars[0].read_text())["workflow"]["name"]
+        assert recorded_name == nothing_open.workflow_registry.get(addressed.workflow_id).name
+        assert recorded_name != open_workflow.name
 
     def test_list_directory_resolves_a_macro_for_the_addressed_workflow(
         self, nothing_open: Engine, tmp_path: Path
