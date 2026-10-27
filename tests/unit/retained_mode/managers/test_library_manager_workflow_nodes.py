@@ -72,7 +72,7 @@ def _definition(workflow_path: str) -> WorkflowNodeDefinition:
     )
 
 
-def _write_workflow(tmp_path: Path, *, shape: dict[str, Any] | None, is_template: bool = False) -> Path:
+def _write_workflow(tmp_path: Path, *, shape: dict[str, Any] | None, is_template: bool = True) -> Path:
     lines = [
         "# /// script",
         "# [tool.griptape-nodes]",
@@ -201,6 +201,21 @@ class TestListWorkflowAtLoad:
         workflow = engine.workflow_registry.get_workflow_by_name(derive_registry_key(str(workflow_path)))
         assert workflow.metadata.is_griptape_provided is True
 
+    def test_workflow_that_is_not_a_template_is_not_listed(
+        self,
+        engine: Engine,
+        tmp_path: Path,
+        workspace: Path,  # noqa: ARG002
+    ) -> None:
+        """The editor lists every library-provided workflow as a template, so only templates are listed."""
+        library_dir = tmp_path / "library"
+        library_dir.mkdir()
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE, is_template=False)
+
+        _register(engine, library_dir)
+
+        assert derive_registry_key(str(workflow_path)) not in engine.workflow_registry.list_workflows()
+
     def test_the_file_on_disk_is_not_rewritten(self, engine: Engine, tmp_path: Path, workspace: Path) -> None:  # noqa: ARG002
         library_dir = tmp_path / "library"
         library_dir.mkdir()
@@ -210,24 +225,6 @@ class TestListWorkflowAtLoad:
         _register(engine, library_dir)
 
         assert workflow_path.read_text(encoding="utf-8") == original_text
-
-    @pytest.mark.parametrize("is_template", [True, False])
-    def test_template_status_comes_from_the_header(
-        self,
-        engine: Engine,
-        tmp_path: Path,
-        workspace: Path,  # noqa: ARG002
-        *,
-        is_template: bool,
-    ) -> None:
-        library_dir = tmp_path / "library"
-        library_dir.mkdir()
-        workflow_path = _write_workflow(library_dir, shape=_SHAPE, is_template=is_template)
-
-        _register(engine, library_dir)
-
-        workflow = engine.workflow_registry.get_workflow_by_name(derive_registry_key(str(workflow_path)))
-        assert workflow.metadata.is_template is is_template
 
     def test_workflow_in_the_workspace_is_left_to_the_workspace_scan(self, engine: Engine, workspace: Path) -> None:
         workflow_path = _write_workflow(workspace, shape=_SHAPE)

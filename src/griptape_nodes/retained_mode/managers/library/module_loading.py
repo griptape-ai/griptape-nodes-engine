@@ -1058,11 +1058,15 @@ class LibraryModuleLoading(EngineScoped):
         """List the workflow behind a library's workflow node in the registry as library-provided.
 
         Listed like the workflows in the library's `workflows` list: browsable before any node is
-        placed. A registry refresh clears every workflow and calls this again, so the key follows the
-        current workspace. A workflow elsewhere in the workspace is the user's own file, so it stays
-        editable and the workspace scan lists it. The scan skips everything under a non-sandbox
-        library's directory, which includes libraries installed into the workspace.
+        placed. Only a workflow whose header sets `is_template` is listed, because the editor shows
+        every library-provided workflow as a template. A registry refresh clears every workflow and
+        calls this again, so the key follows the current workspace. A workflow elsewhere in the
+        workspace is the user's own file, so it stays editable and the workspace scan lists it. The
+        scan skips everything under a non-sandbox library's directory, which includes libraries
+        installed into the workspace.
         """
+        if not node_class.workflow_metadata.is_template:
+            return
         workspace_path = self.engine.config_manager.workspace_path
         if self._is_users_workflow(node_class.workflow_file_path, workspace_path, library_info):
             return

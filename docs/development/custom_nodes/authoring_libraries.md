@@ -172,10 +172,10 @@ metadata header at the top of the workflow file, which the editor writes on save
 saved shape (no Start Flow and End Flow nodes, or a hand-written file with no header) is reported as
 a library problem and its node is not registered.
 
-The workflow is also registered as a workflow in its own right, so it shows up in the editor's
-workflow picker under your library as soon as the library loads, next to the workflows in your
-`workflows` list. To make it a template, set `is_template = true` in its metadata header. To keep a
-workflow that only exists to back a node out of the picker, set `is_internal = true` instead.
+To also offer the workflow as a template, set `is_template = true` in its metadata header. It then
+shows up in the editor's templates under your library as soon as the library loads, next to the
+workflows in your `workflows` list. Without it, the workflow is only listed once the node is placed.
+To keep a workflow that only exists to back a node out of the picker, set `is_internal = true`.
 
 ### Library and Node Declarations
 
