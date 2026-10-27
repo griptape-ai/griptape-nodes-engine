@@ -165,13 +165,8 @@ def input_check_readings() -> Iterator[None]:
         _readings.reset(token)
 
 
-# The readings that run ffprobe, and so can run out of time, and which one probes each kind of media.
+# The readings that run ffprobe, and so can run out of time.
 _PROBE_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
-_PROBE_NEED_FOR_KIND: dict[MediaKind, MediaNeed] = {
-    "image": MediaNeed.IMAGE,
-    "video": MediaNeed.VIDEO,
-    "audio": MediaNeed.AUDIO,
-}
 
 
 def timed_out_locations() -> frozenset[str]:
@@ -1127,7 +1122,7 @@ def _note_timed_out(location: str, kind: MediaKind, reason: str) -> None:
     logger.warning("Skipped checking %s before the run because %s: %s", _INPUT_NOUN[kind], reason, location)
     timed_out = _timed_out.get()
     if timed_out is not None:
-        timed_out.add((_PROBE_NEED_FOR_KIND[kind], location))
+        timed_out.add((MediaNeed(kind), location))
 
 
 def _record_matroska_doctype(data: dict[str, Any], path: Path) -> None:

@@ -34,13 +34,6 @@ class MediaNeed(StrEnum):
     AUDIO = "audio"
 
 
-# The reading each media kind's parameter gets for a validator that needs a frame, a format or a length.
-_NEED_FOR_KIND: dict[MediaKind, MediaNeed] = {
-    "image": MediaNeed.IMAGE,
-    "video": MediaNeed.VIDEO,
-    "audio": MediaNeed.AUDIO,
-}
-
 # The artifact type names a parameter declares for each kind of media.
 _KIND_FOR_TYPE: dict[str, MediaKind] = {
     "imageurlartifact": "image",
@@ -176,8 +169,9 @@ def needs_for_kind(validators: Iterable[PreRunValidator], kind: MediaKind | None
     for validator in validators:
         if MediaNeed.SIZE in validator.needs:
             needs.add(MediaNeed.SIZE)
-        if kind is not None and _NEED_FOR_KIND[kind] in validator.needs:
-            needs.add(_NEED_FOR_KIND[kind])
+        # A media kind's own reading shares its name, such as MediaNeed("video").
+        if kind is not None and MediaNeed(kind) in validator.needs:
+            needs.add(MediaNeed(kind))
     return frozenset(needs)
 
 
@@ -208,7 +202,7 @@ def require_validators_fit(parameter: Parameter) -> None:
                 )
                 raise TypeError(msg)
             media_needs = validator.needs - {MediaNeed.SIZE}
-            if media_needs and _NEED_FOR_KIND[kind] not in media_needs:
+            if media_needs and MediaNeed(kind) not in media_needs:
                 readable = " or ".join(sorted(need.value for need in media_needs))
                 msg = (
                     f"Attempted to add {name} to parameter '{parameter.name}'. "
