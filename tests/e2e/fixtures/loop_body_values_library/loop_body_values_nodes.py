@@ -80,7 +80,7 @@ class NarrowingSliderNode(ControlNode):
 
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Insist on ``note`` the way the BaseNode docstring shows, with the engine's own helper."""
-        note_error = self.validate_empty_parameter(param="note")
+        note_error = self.validate_empty_parameter(param="note", skip_if_connected=True)
         if note_error is None:
             return None
         return [note_error]

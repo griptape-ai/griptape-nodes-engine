@@ -1474,20 +1474,26 @@ class BaseNode(ABC):
     """
     def validate_before_workflow_run(self) -> list[Exception] | None:
         exceptions = []
-        prompt_error = self.validate_empty_parameter(param="prompt", additional_msg="Please provide a prompt to generate an image.")
+        prompt_error = self.validate_empty_parameter(
+            param="prompt", additional_msg="Please provide a prompt to generate an image.", skip_if_connected=True
+        )
         if prompt_error:
             exceptions.append(prompt_error)
         return exceptions if exceptions else None
     """
 
-    def validate_empty_parameter(self, param: str, additional_msg: str = "") -> Exception | None:
-        """Report a text parameter the user left blank, unless a connection will fill it.
+    def validate_empty_parameter(
+        self, param: str, additional_msg: str = "", *, skip_if_connected: bool = False
+    ) -> Exception | None:
+        """Report a text parameter that holds no text.
 
-        Pre-run validation happens before any connection delivers its value, so a connected
-        parameter may hold nothing yet. That is not a blank: the upstream node provides the value when
-        it runs, and a missing one is reported there.
+        Pass ``skip_if_connected=True`` from ``validate_before_workflow_run``: it runs before any
+        connection has delivered a value, so a connected parameter may hold nothing yet. That is not a
+        blank; the upstream node provides the value when it runs, and a missing one is reported there.
+        Leave it off at run time, where the connection has already delivered and an empty value is a
+        real error.
         """
-        if self._param_has_incoming_connection(param):
+        if skip_if_connected and self._param_has_incoming_connection(param):
             return None
         param_value = self.parameter_values.get(param, None)
         node_name = self.name
