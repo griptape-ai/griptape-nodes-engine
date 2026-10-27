@@ -63,3 +63,23 @@ class TestEngineHeartbeatOperatingSystem:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.engine_os == "sentinel-os"
+
+
+class TestEngineHeartbeatClients:
+    """Heartbeat lists the clients attached to the session so discovery can show who holds an engine."""
+
+    def test_reports_no_clients_when_none_attached(self, engine: Engine) -> None:
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-none"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.clients == []
+
+    def test_reports_an_attached_client(self, engine: Engine) -> None:
+        session_manager = engine._session_manager
+        session_manager.save_session("session-hb")
+        assert session_manager.attach_client("nuke:shot010", "nuke")
+
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-client"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert [(c.client_id, c.client_type) for c in result.clients] == [("nuke:shot010", "nuke")]
