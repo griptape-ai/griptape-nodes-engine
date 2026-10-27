@@ -859,7 +859,8 @@ class TestAWorkerAnotherEngineRuns:
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "not holding itself for your run" in str(result.result_details)
-        assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+        for workflow in worker_engine.worker_workflows.all_kept():
+            assert "Echo" not in workflow.nodes.name_to_parent_flow_name
 
     @pytest.mark.asyncio
     async def test_refuses_a_node_sent_without_a_lease(self, worker_engine: Engine) -> None:

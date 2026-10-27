@@ -32,7 +32,8 @@ class TestClearAllObjectStateCancelsFirst:
         # Awaited by the handler to release objects libraries parked in workers.
         engine.worker_manager.broadcast_local_object_teardown = AsyncMock()
         engine.context_manager.has_current_workflow.return_value = False
-        engine.current_workflow_or_none.return_value = None
+        # An open workflow, which teardown leaves with no objects.
+        engine.current_workflow_or_none.return_value = MagicMock(objects=[])
 
         object_manager = ObjectManager(MagicMock(), engine=engine)
         result = await object_manager.on_clear_all_object_state_request(
@@ -49,7 +50,8 @@ class TestClearAllObjectStateCancelsFirst:
         engine.flow_manager.cancel_all_runs = AsyncMock(side_effect=RuntimeError("a node would not stop"))
         engine.worker_manager.broadcast_local_object_teardown = AsyncMock()
         engine.context_manager.has_current_workflow.return_value = False
-        engine.current_workflow_or_none.return_value = None
+        # An open workflow, which teardown leaves with no objects.
+        engine.current_workflow_or_none.return_value = MagicMock(objects=[])
 
         object_manager = ObjectManager(MagicMock(), engine=engine)
         result = await object_manager.on_clear_all_object_state_request(
