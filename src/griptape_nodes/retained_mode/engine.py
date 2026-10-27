@@ -738,8 +738,9 @@ class Engine:
 
         Cancels its run, deletes its flows (and with them their nodes) through the normal delete
         path, then forgets its runtime, which takes its context stack and queued UI changes with it,
-        and releases the held objects this process kept for it. The workers hold their own: the
-        async callers tell them (`WorkerManager.broadcast_local_object_teardown`).
+        forgets an unsaved workflow's registry entry, and releases the held objects this process
+        kept for it. The workers hold their own: the async callers tell them
+        (`WorkerManager.broadcast_local_object_teardown`).
 
         The flows are deleted while the workflow is still open, because deleting one enters its
         context. A teardown that raises leaves the workflow open, rather than dropping live nodes
@@ -756,6 +757,12 @@ class Engine:
             self._delete_workflow_flows()
         self._open_workflows.close(workflow)
         self.unbind_closed_workflow(workflow)
+
+        # An unsaved workflow's nodes lived only in the runtime just closed, so there is nothing
+        # left to open: forget its registry entry too.
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.is_saved:
+            self._workflow_registry.remove(workflow.workflow_id)
 
         # Every key referring to a held object lived on a node just deleted, so each entry would hold
         # what it holds -- a multi-gigabyte pipeline -- until something else cleared it. The store is not

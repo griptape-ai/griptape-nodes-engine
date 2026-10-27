@@ -48,6 +48,11 @@ class WorkflowFileOperations(EngineScoped):
 
     @handles(DeleteWorkflowRequest)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
+        workflow = self.engine.workflow_registry.find_by_name(request.name)
+        if workflow is None:
+            details = f"Attempted to delete workflow '{request.name}'. Failed because no workflow has that name."
+            return DeleteWorkflowResultFailure(result_details=details)
+
         # If the deleted workflow is the active one, tear down its flows/nodes and
         # pop the context stack BEFORE removing the registry entry, so downstream
         # `DeleteFlowRequest` calls can still push a flow context (they require an
@@ -60,8 +65,9 @@ class WorkflowFileOperations(EngineScoped):
             # awaited, so it belongs here in the async handler rather than in that sync method.
             await self.engine.worker_manager.broadcast_local_object_teardown()
         try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.name)
-            self.engine.workflow_registry.remove(workflow.workflow_id)
+            # Closing an unsaved workflow already removed its entry.
+            if self.engine.workflow_registry.find_by_id(workflow.workflow_id) is not None:
+                self.engine.workflow_registry.remove(workflow.workflow_id)
         except Exception as e:
             details = f"Failed to remove workflow from registry with name '{request.name}'. Exception: {e}"
             return DeleteWorkflowResultFailure(result_details=details)

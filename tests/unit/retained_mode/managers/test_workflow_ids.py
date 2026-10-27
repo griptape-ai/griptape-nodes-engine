@@ -898,6 +898,29 @@ class TestIdsOnResults:
         assert heartbeat.current_workflow_id == workflow_id
 
 
+class TestClosingAnUnsavedWorkflow:
+    """An unsaved workflow's nodes live only while it is open, so closing it removes its entry."""
+
+    def test_closing_forgets_it(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None
+        assert name not in _listed(project_engine)
+
+    def test_deleting_it_while_open_succeeds(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        deleted = _run(project_engine, DeleteWorkflowRequest(name=name))
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert not project_engine.context_manager.has_current_workflow()
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None
+
+
 class TestIdentityAcrossTheWorkflowLifecycle:
     """One workflow keeps one id through create, save, rename, move, reopen and refresh, until the engine stops."""
 
@@ -1184,6 +1207,26 @@ class TestLibraryWorkflowsOpenAsUnsavedCopies:
         assert written.name == "Poster Collage"
         assert written.description == "My poster."
         assert written.image == "mine.webp"
+
+    def test_closing_an_unsaved_copy_forgets_it(self, project_engine: Engine, tmp_path: Path) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        listed_before = set(_listed(project_engine))
+        copy_id = _open_library_workflow(project_engine, library)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(copy_id) is None
+        assert set(_listed(project_engine)) == listed_before
+        assert project_engine.workflow_registry.get(library.workflow_id) is library
+
+    def test_closing_a_saved_copy_keeps_it(self, project_engine: Engine, tmp_path: Path) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        copy_id = _open_library_workflow(project_engine, library)
+        _save(project_engine)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.get(copy_id).is_saved
 
     def test_pushing_a_library_workflow_by_name_is_refused(self, project_engine: Engine, tmp_path: Path) -> None:
         library = _library_workflow(project_engine, tmp_path / "library")

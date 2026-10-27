@@ -416,8 +416,8 @@ class WorkflowRunner(EngineScoped):
     async def _close_copy_a_failed_load_opened(self, open_before: WorkflowRuntime | None) -> None:
         """Close the open workflow if the failed load opened it as a library workflow's copy.
 
-        Nothing else refers to the half-built copy, so its registry entry is removed too. A
-        workflow open before the load, or one with a file of its own, is left open.
+        Nothing else refers to the half-built copy, and closing an unsaved workflow forgets it.
+        A workflow open before the load, or one with a file of its own, is left open.
         """
         opened = self.engine.current_workflow_or_none()
         if opened is None or opened is open_before:
@@ -428,7 +428,6 @@ class WorkflowRunner(EngineScoped):
         self.engine.close_workflow(opened)
         # close_workflow releases what this process holds; the workers hold their own.
         await self.engine.worker_manager.broadcast_local_object_teardown()
-        self.engine.workflow_registry.remove(entry.workflow_id)
 
     def _current_workflow_id(self) -> str | None:
         """The id of the workflow a load left in context, or None if it left none."""
