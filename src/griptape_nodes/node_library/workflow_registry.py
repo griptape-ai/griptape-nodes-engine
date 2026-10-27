@@ -23,6 +23,8 @@ from griptape_nodes.node_library.library_registry import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -314,13 +316,17 @@ class DuplicateWorkflowIdError(WorkflowRegistryError):
         self.existing = existing
 
 
-class _IndexKeys(NamedTuple):
-    """Where an entry sits in the path and name indexes."""
+class _EntryKeys(NamedTuple):
+    """The path and names a registry entry answers to, derived from its file."""
 
     file_path: str | None
     name: str
     path_keys: list[str]
-    alias_names: list[str]
+    # The entry's name and the names derived from its alias paths.
+    names: list[str]
+
+
+_NO_KEYS = _EntryKeys(file_path=None, name="", path_keys=[], names=[])
 
 
 class _WorkflowRegistry:
@@ -335,9 +341,9 @@ class _WorkflowRegistry:
     place: `refresh_file` keeps the entry a file already has, and `remove_saved_workflows_except`
     drops only the entries the rescan did not find.
 
-    Names and paths are indexes into the id-keyed entries, kept here and nowhere else.
-    `set_file_path` is the only way an entry's path changes, so the indexes cannot drift from
-    the entries. Lookups never register anything.
+    Lookups by name or path scan the entries. Each entry caches the keys derived from its paths,
+    which the registry sets whenever an entry's paths change: `set_file_path` is the only way
+    to move one. Lookups never register anything.
     """
 
     # Prefix of the legacy name of an unsaved (in-memory) workflow: "unsaved:<workflow id>".
@@ -348,11 +354,6 @@ class _WorkflowRegistry:
     def __init__(self, config_manager: ConfigManager) -> None:
         self._config_manager = config_manager
         self._by_id: dict[str, Workflow] = {}
-        # Canonical absolute path -> id. Holds every path an entry is known by: its path as named
-        # (links kept), the same path with links followed, and the paths of its aliases.
-        self._id_by_path: dict[str, str] = {}
-        # Legacy name -> id, "unsaved:<id>" included.
-        self._id_by_name: dict[str, str] = {}
 
     def get(self, workflow_id: str) -> Workflow:
         """Return the entry with this id.
@@ -372,10 +373,10 @@ class _WorkflowRegistry:
 
     def find_by_name(self, name: str) -> Workflow | None:
         """Return the entry with this legacy name ("unsaved:<id>" included), or None."""
-        workflow_id = self._id_by_name.get(name)
-        if workflow_id is None:
-            return None
-        return self._by_id[workflow_id]
+        for workflow in self._by_id.values():
+            if name in workflow._keys.names:
+                return workflow
+        return None
 
     def unsaved_name_workflow_id(self, name: str) -> str | None:
         """The workflow id in an "unsaved:<id>" name. None for any other name, or an id not in its hex form."""
@@ -393,9 +394,9 @@ class _WorkflowRegistry:
     def find_by_path(self, path: str | Path) -> Workflow | None:
         """Return the entry for the file at `path`, or None. Accepts any path the entry is known by."""
         for path_key in self._path_keys(self.canonical_path(path)):
-            workflow_id = self._id_by_path.get(path_key)
-            if workflow_id is not None:
-                return self._by_id[workflow_id]
+            for workflow in self._by_id.values():
+                if path_key in workflow._keys.path_keys:
+                    return workflow
         return None
 
     def register_file(self, path: str | Path, metadata: WorkflowMetadata) -> Workflow:
@@ -498,17 +499,12 @@ class _WorkflowRegistry:
             msg = f"File path '{absolute_path}' does not exist."
             raise ValueError(msg)
 
-        holder = self.find_by_path(absolute_path)
-        if holder is None:
-            holder = self.find_by_name(derive_registry_key(self._registry_form(absolute_path)))
-        if holder is not None and holder is not workflow:
-            msg = f"Attempted to move workflow '{workflow.name}' to '{absolute_path}'. Failed because '{holder.name}' is registered there."
-            raise WorkflowPathTakenError(msg, existing=holder)
+        keys = self._entry_keys(workflow.workflow_id, absolute_path, [])
+        self._raise_if_taken(workflow, keys, self._by_id.values())
 
-        self._remove_from_indexes(workflow)
         workflow._absolute_path = absolute_path
         workflow._alias_paths = []
-        self._add_to_indexes(workflow)
+        workflow._keys = keys
 
     def remove(self, workflow_id: str) -> Workflow:
         """Remove the entry with this id and return it. A file registered at its path later gets an id of its own.
@@ -517,7 +513,6 @@ class _WorkflowRegistry:
             KeyError: No workflow has that id.
         """
         workflow = self.get(workflow_id)
-        self._remove_from_indexes(workflow)
         del self._by_id[workflow_id]
         return workflow
 
@@ -531,36 +526,32 @@ class _WorkflowRegistry:
         A legacy name is derived against the workspace, which may have changed (a project
         switch), and a path key follows links, which may point elsewhere now. Two entries can
         only collide when a link was retargeted outside the engine, giving one entry another
-        entry's file. Unsaved entries are indexed first, then saved ones whose path keys did not
-        change, then the rest. A saved entry that collides is removed; the rescan registers its
-        file again if it is still a workflow of its own.
+        entry's file. Unsaved entries settle first, then saved ones whose path keys did not
+        change, then the rest. A saved entry that collides with one settled before it is
+        removed; the rescan registers its file again if it is still a workflow of its own.
         """
-        previous_path_keys: dict[str, set[str]] = {}
-        for path_key, workflow_id in self._id_by_path.items():
-            previous_path_keys.setdefault(workflow_id, set()).add(path_key)
-        self._id_by_path.clear()
-        self._id_by_name.clear()
-
-        unsaved_workflows = []
-        unchanged_workflows = []
-        changed_workflows = []
+        unsaved: list[tuple[Workflow, _EntryKeys]] = []
+        unchanged: list[tuple[Workflow, _EntryKeys]] = []
+        changed: list[tuple[Workflow, _EntryKeys]] = []
         for workflow in self._by_id.values():
+            keys = self._entry_keys(workflow.workflow_id, workflow.absolute_path, workflow._alias_paths)
             if not workflow.is_saved:
-                unsaved_workflows.append(workflow)
-            elif set(self._index_keys(workflow).path_keys) == previous_path_keys.get(workflow.workflow_id):
-                unchanged_workflows.append(workflow)
+                unsaved.append((workflow, keys))
+            elif set(keys.path_keys) == set(workflow._keys.path_keys):
+                unchanged.append((workflow, keys))
             else:
-                changed_workflows.append(workflow)
+                changed.append((workflow, keys))
 
-        # Unsaved entries hold no path and are named by their id, so they never collide.
-        for workflow in unsaved_workflows:
-            self._add_to_indexes(workflow)
-        for workflow in [*unchanged_workflows, *changed_workflows]:
+        settled: list[Workflow] = []
+        for workflow, keys in [*unsaved, *unchanged, *changed]:
             try:
-                self._add_to_indexes(workflow)
+                self._raise_if_taken(workflow, keys, settled)
             except WorkflowPathTakenError as err:
                 logger.debug("Dropped workflow '%s' from the registry ahead of a rescan: %s", workflow.name, err)
                 del self._by_id[workflow.workflow_id]
+                continue
+            workflow._keys = keys
+            settled.append(workflow)
 
     def remove_saved_workflows_except(self, kept_workflow_ids: set[str]) -> None:
         """Remove every saved entry whose id is not in `kept_workflow_ids`.
@@ -573,7 +564,6 @@ class _WorkflowRegistry:
                 continue
             if workflow.workflow_id in kept_workflow_ids:
                 continue
-            self._remove_from_indexes(workflow)
             del self._by_id[workflow.workflow_id]
 
     # Create a new workflow with everything we'd need.
@@ -695,64 +685,46 @@ class _WorkflowRegistry:
         return [workflow.name for workflow in self._by_id.values() if workflow.metadata.branched_from == workflow_name]
 
     def _add(self, workflow: Workflow) -> None:
-        self._add_to_indexes(workflow)
+        keys = self._entry_keys(workflow.workflow_id, workflow.absolute_path, [])
+        self._raise_if_taken(workflow, keys, self._by_id.values())
+        workflow._keys = keys
         self._by_id[workflow.workflow_id] = workflow
 
     def _add_alias(self, workflow: Workflow, alias_path: Path) -> None:
-        self._remove_from_indexes(workflow)
-        workflow._alias_paths.append(alias_path)
-        self._add_to_indexes(workflow)
+        alias_paths = [*workflow._alias_paths, alias_path]
+        keys = self._entry_keys(workflow.workflow_id, workflow.absolute_path, alias_paths)
+        self._raise_if_taken(workflow, keys, self._by_id.values())
+        workflow._alias_paths = alias_paths
+        workflow._keys = keys
 
-    def _add_to_indexes(self, workflow: Workflow) -> None:
-        """Index `workflow` by its paths and names, refusing any another entry holds."""
-        index_keys = self._index_keys(workflow)
-        for path_key in index_keys.path_keys:
-            holder_id = self._id_by_path.get(path_key)
-            if holder_id is not None and holder_id != workflow.workflow_id:
-                holder = self._by_id[holder_id]
-                msg = f"Attempted to register workflow '{index_keys.name}'. Failed because '{holder.name}' is registered at '{path_key}'."
-                raise WorkflowPathTakenError(msg, existing=holder)
-        for name in [index_keys.name, *index_keys.alias_names]:
-            holder_id = self._id_by_name.get(name)
-            if holder_id is not None and holder_id != workflow.workflow_id:
-                holder = self._by_id[holder_id]
-                msg = f"Attempted to register workflow '{name}'. Failed because another workflow is already registered under that name."
-                raise WorkflowPathTakenError(msg, existing=holder)
+    @staticmethod
+    def _raise_if_taken(workflow: Workflow, keys: _EntryKeys, others: Iterable[Workflow]) -> None:
+        """Refuse `keys` for `workflow` if another of `others` answers to one of its paths or names."""
+        for other in others:
+            if other is workflow:
+                continue
+            for path_key in keys.path_keys:
+                if path_key in other._keys.path_keys:
+                    msg = f"Attempted to register workflow '{keys.name}'. Failed because '{other.name}' is registered at '{path_key}'."
+                    raise WorkflowPathTakenError(msg, existing=other)
+            for name in keys.names:
+                if name in other._keys.names:
+                    msg = f"Attempted to register workflow '{name}'. Failed because another workflow is already registered under that name."
+                    raise WorkflowPathTakenError(msg, existing=other)
 
-        workflow._file_path = index_keys.file_path
-        workflow._name = index_keys.name
-        for path_key in index_keys.path_keys:
-            self._id_by_path[path_key] = workflow.workflow_id
-        for name in [index_keys.name, *index_keys.alias_names]:
-            self._id_by_name[name] = workflow.workflow_id
+    def _entry_keys(self, workflow_id: str, absolute_path: Path | None, alias_paths: list[Path]) -> _EntryKeys:
+        if absolute_path is None:
+            name = f"{self.UNSAVED_KEY_PREFIX}{workflow_id}"
+            return _EntryKeys(file_path=None, name=name, path_keys=[], names=[name])
 
-    def _remove_from_indexes(self, workflow: Workflow) -> None:
-        for path_key in [key for key, holder_id in self._id_by_path.items() if holder_id == workflow.workflow_id]:
-            del self._id_by_path[path_key]
-        for name in [key for key, holder_id in self._id_by_name.items() if holder_id == workflow.workflow_id]:
-            del self._id_by_name[name]
-
-    def _index_keys(self, workflow: Workflow) -> _IndexKeys:
-        if workflow.absolute_path is None:
-            return _IndexKeys(
-                file_path=None,
-                name=f"{self.UNSAVED_KEY_PREFIX}{workflow.workflow_id}",
-                path_keys=[],
-                alias_names=[],
-            )
-
-        file_path = self._registry_form(workflow.absolute_path)
-        path_keys = self._path_keys(workflow.absolute_path)
-        alias_names = []
-        for alias_path in workflow._alias_paths:
+        file_path = self._registry_form(absolute_path)
+        name = derive_registry_key(file_path)
+        path_keys = self._path_keys(absolute_path)
+        names = [name]
+        for alias_path in alias_paths:
             path_keys.extend(self._path_keys(alias_path))
-            alias_names.append(derive_registry_key(self._registry_form(alias_path)))
-        return _IndexKeys(
-            file_path=file_path,
-            name=derive_registry_key(file_path),
-            path_keys=path_keys,
-            alias_names=alias_names,
-        )
+            names.append(derive_registry_key(self._registry_form(alias_path)))
+        return _EntryKeys(file_path=file_path, name=name, path_keys=path_keys, names=names)
 
     def _registry_form(self, absolute_path: Path) -> str:
         """The form `Workflow.file_path` reports: workspace-relative inside the workspace, else absolute."""
@@ -767,7 +739,7 @@ class _WorkflowRegistry:
 
     @staticmethod
     def _path_keys(absolute_path: Path) -> list[str]:
-        """The keys a path is indexed under: as named, and with links followed."""
+        """The keys a path is known by: as named, and with links followed."""
         kept = str(absolute_path)
         followed = str(canonicalize_for_identity(absolute_path))
         if followed == kept:
@@ -873,8 +845,8 @@ class Workflow:
     - **Unsaved**: in-memory only. `file_path` and `absolute_path` are None. Becomes saved when
       the registry's `set_file_path` gives it a file.
 
-    `workflow_id` never changes while the engine runs. Only the registry changes the path, so its
-    indexes stay right.
+    `workflow_id` never changes while the engine runs. Only the registry changes the path, so the
+    keys it caches on the entry stay right.
     """
 
     metadata: WorkflowMetadata
@@ -896,9 +868,8 @@ class Workflow:
         self._absolute_path = absolute_path
         # Other paths to the same file (os.path.samefile), so `find_by_path` answers for each.
         self._alias_paths: list[Path] = []
-        # Path in the registry's form, and the legacy name: the registry sets both when it indexes the entry.
-        self._file_path: str | None = None
-        self._name = ""
+        # Path in the registry's form, legacy names, and path keys: the registry sets them whenever the paths change.
+        self._keys = _NO_KEYS
 
     @property
     def workflow_id(self) -> str:
@@ -907,12 +878,12 @@ class Workflow:
     @property
     def name(self) -> str:
         """The legacy registry name: the file path without its extension, or "unsaved:<id>"."""
-        return self._name
+        return self._keys.name
 
     @property
     def file_path(self) -> str | None:
         """The file, workspace-relative inside the workspace and absolute outside it. None while unsaved."""
-        return self._file_path
+        return self._keys.file_path
 
     @property
     def absolute_path(self) -> Path | None:
