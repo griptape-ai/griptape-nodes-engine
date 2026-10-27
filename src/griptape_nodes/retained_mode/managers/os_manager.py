@@ -69,6 +69,11 @@ from griptape_nodes.files.path_utils import (
     strip_surrounding_quotes,
 )
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
+from griptape_nodes.retained_mode.events.artifact_events import (
+    GetPreviewForArtifactRequest,
+    GetPreviewForArtifactResultSuccess,
+    PreviewGenerationPolicy,
+)
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
     CopyFileRequest,
@@ -149,7 +154,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     RegisterResourceTypeResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
-from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
+from griptape_nodes.retained_mode.managers.artifact_providers import BaseArtifactProvider, WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
@@ -2334,7 +2339,8 @@ class OSManager(EngineScoped):
         """Handle image content by creating previews or returning static URLs.
 
         The workspace check reads engine state, so it runs on the loop; only the image encode
-        runs on a worker thread.
+        runs on a worker thread. Only decodes with Pillow when a registered artifact provider
+        claims the extension; see ``_preview_via_registered_provider``.
 
         Args:
             content: Image bytes
@@ -2374,7 +2380,59 @@ class OSManager(EngineScoped):
             # Not a valid local path (might be URL or data URI), continue to preview
             pass
 
+        path_obj = Path(file_path) if isinstance(file_path, str) else file_path
+        extension = path_obj.suffix.lstrip(".").lower()
+        provider_classes = self.engine.artifact_manager._registry.get_provider_classes_by_format(extension)
+
+        if not provider_classes:
+            # Nothing vouches for this extension. mimetypes.guess_type() reports an ``image/*``
+            # MIME type for formats it has never verified Pillow can safely decode (EXR, for
+            # one, maps to "image/aces") -- attempting a raw PIL decode here is what has hung
+            # the engine on large/multi-part files. Skip decoding and hand back the original
+            # bytes undecoded instead of guessing.
+            logger.debug("No registered artifact provider for .%s; skipping thumbnail generation.", extension)
+            return f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
+
+        registered_preview = await self._preview_via_registered_provider(path_obj, provider_classes[0])
+        if registered_preview is not None:
+            return registered_preview
+
         return await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes, mime_type)
+
+    async def _preview_via_registered_provider(
+        self, path_obj: Path, provider_class: type[BaseArtifactProvider]
+    ) -> str | None:
+        """Generate a preview through the ArtifactProvider registered for this format.
+
+        Returns:
+            A data URL built from the provider's preview output, or None if the provider
+            could not produce one (the caller falls back to the legacy Pillow-based preview,
+            which is safe here since a provider is registered for this extension).
+        """
+        provider_name = provider_class.get_friendly_name()
+        macro_path = MacroPath(ParsedMacro(str(path_obj)), {})
+
+        result = await self.engine.ahandle_request(
+            GetPreviewForArtifactRequest(
+                macro_path=macro_path,
+                artifact_provider_name=provider_name,
+                preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+            )
+        )
+
+        if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
+            logger.debug(
+                "Registered provider could not produce a preview for %s; falling back to legacy preview path. "
+                "Reason: %s",
+                path_obj,
+                str(result.result_details),
+            )
+            return None
+
+        preview_path = Path(result.paths_to_preview)
+        preview_bytes = await to_thread(preview_path.read_bytes)
+        preview_mime_type = mimetypes.guess_type(str(preview_path))[0] or "image/webp"
+        return f"data:{preview_mime_type};base64,{base64.b64encode(preview_bytes).decode('utf-8')}"
 
     @staticmethod
     def _image_bytes_to_preview_data_url(image_bytes: bytes, mime_type: str) -> str:
