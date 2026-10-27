@@ -227,6 +227,31 @@ class FilenameParts(NamedTuple):
         return cls(directory=path.parent, stem=path.stem, extension=path.suffix.lstrip("."))
 
 
+def with_default_extension(file_name: str, default_file_name: str) -> str:
+    """Give an extension-less filename the extension of a default filename.
+
+    Save macros join ``{file_name_base}.{file_extension}``, so a filename with no
+    extension resolves to a bare trailing dot (``image_v001.``), a name some
+    filesystems reject. Trailing dots are dropped for the same reason.
+
+    Args:
+        file_name: Filename or path as the user entered it (e.g. "shot" or "renders/shot").
+        default_file_name: Filename whose extension fills the gap (e.g. "image.png").
+
+    Returns:
+        ``file_name`` without trailing dots, plus the default's extension when it has
+        none of its own. A value that names no file (empty, or ending in a path
+        separator) is returned unchanged.
+    """
+    stripped = file_name.rstrip(".")
+    if not stripped or stripped.endswith(("/", "\\")):
+        return file_name
+    default_extension = Path(default_file_name).suffix
+    if Path(stripped).suffix or not default_extension:
+        return stripped
+    return f"{stripped}{default_extension}"
+
+
 def _parse_unc_host(netloc: str, path: str) -> str | None:
     """Validate a non-local netloc as a UNC host and build the UNC path, or None if invalid.
 

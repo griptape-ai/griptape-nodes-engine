@@ -31,6 +31,7 @@ from griptape_nodes.files.path_utils import (
     strip_surrounding_quotes,
     strip_windows_long_path_prefix,
     unexpanded_references,
+    with_default_extension,
 )
 
 
@@ -72,6 +73,44 @@ class TestFilenameParts:
         """Directory is Path('.') when the input has no directory component."""
         parts = FilenameParts.from_filename("output.png")
         assert parts.directory == Path()
+
+
+class TestWithDefaultExtension:
+    """Tests for with_default_extension."""
+
+    @pytest.mark.parametrize(
+        ("file_name", "expected"),
+        [
+            ("bedroom_flipped_grid_bw", "bedroom_flipped_grid_bw.png"),
+            ("bedroom_flipped_grid_bw.", "bedroom_flipped_grid_bw.png"),
+            ("renders/shot", "renders/shot.png"),
+            ("render_####", "render_####.png"),
+            ("/abs/dir/shot", "/abs/dir/shot.png"),
+            ("file:///abs/dir/shot", "file:///abs/dir/shot.png"),
+        ],
+    )
+    def test_adds_default_extension_when_missing(self, file_name: str, expected: str) -> None:
+        """A filename with no extension takes the default's extension."""
+        assert with_default_extension(file_name, "image.png") == expected
+
+    @pytest.mark.parametrize("file_name", ["shot.jpg", "renders/shot.webp", "archive.tar.gz"])
+    def test_keeps_existing_extension(self, file_name: str) -> None:
+        """A filename that has an extension is returned unchanged."""
+        assert with_default_extension(file_name, "image.png") == file_name
+
+    def test_drops_trailing_dot_after_existing_extension(self) -> None:
+        """A trailing dot after an extension is dropped rather than kept as an empty suffix."""
+        assert with_default_extension("shot.jpg.", "image.png") == "shot.jpg"
+
+    @pytest.mark.parametrize("file_name", ["", ".", "..", "/", "./", "renders/", "file:///", "file:///C:/"])
+    def test_unchanged_when_value_names_no_file(self, file_name: str) -> None:
+        """A value naming no file is left for the save path to refuse or route."""
+        assert with_default_extension(file_name, "image.png") == file_name
+
+    def test_without_default_extension_only_drops_trailing_dot(self) -> None:
+        """With no default extension to borrow, only the trailing dot is dropped."""
+        assert with_default_extension("shot", "output") == "shot"
+        assert with_default_extension("shot.", "output") == "shot"
 
 
 class TestSanitizePathStringWindowsSeparators:
