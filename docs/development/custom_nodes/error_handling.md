@@ -446,20 +446,23 @@ ParameterList(
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a total
 length across several clips, write a `NodeValidator` and list it in the node's `node_validators`.
-It runs after every parameter's validators, and gets what they read, by parameter name, so it
-doesn't read any file again.
+It runs after every parameter's validators. Its `media` holds what they read, by parameter name,
+but only the readings some validator on that parameter asked for: a parameter with no validator
+that reads its video has `info.video` set to None. To be sure of a reading, call the reader
+yourself; during the node's checks it returns what was already read, so no file is read twice.
 
 ```python
 from typing import ClassVar
 
+from griptape_nodes.exe_types.input_checks import local_video_probe
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.validators.base import NodeValidator
 
 
 class TotalLength(NodeValidator):
     def check(self, node, *, media, docs_url) -> list[NodeError]:
-        seconds = [info.video.shortest_seconds for info in media.get("reference_videos", []) if info.video]
-        total = sum(s for s in seconds if s is not None)
+        probes = [local_video_probe(video) for video in node.get_parameter_list_value("reference_videos")]
+        total = sum(probe.shortest_seconds or 0 for probe in probes if probe is not None)
         if total <= 30:
             return []
         return [NodeError(f"'Reference Videos' are {total:.1f} seconds long together and the limit is 30.")]

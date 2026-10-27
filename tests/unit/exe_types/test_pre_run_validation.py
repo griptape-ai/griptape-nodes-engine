@@ -58,6 +58,10 @@ from griptape_nodes.exe_types.validators.media import (
     SideRange,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultSuccess,
+)
 from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import image_file
 
@@ -765,12 +769,24 @@ class TestNodeInAGroup:
         self, engine: Engine, tmp_path: Path
     ) -> None:
         inner = _node_with(ParameterImage(name="image", pre_run_validators=[SideRange(min=300)]))
+        original = inner.get_parameter_by_name("image") or pytest.fail("no image parameter")
         group = _Group(name="group")
         engine.object_manager.add_object_by_name(group.name, group)
         try:
-            proxy = group._create_proxy_parameter_for_connection(
-                inner.get_parameter_by_name("image") or pytest.fail("no image parameter"), is_incoming=True
+            # The request a group adds a proxy with for an incoming connection.
+            result = engine.handle_request(
+                AddParameterToNodeRequest(
+                    node_name=group.name,
+                    parameter_name=original.name,
+                    input_types=original.input_types,
+                    tooltip="",
+                    mode_allowed_input=True,
+                    mode_allowed_output=True,
+                    serializable=original.serializable,
+                )
             )
+            assert isinstance(result, AddParameterToNodeResultSuccess), result
+            proxy = group.get_parameter_by_name(result.parameter_name) or pytest.fail("no proxy parameter")
             image = str(image_file(tmp_path, 200, 200))
             group.set_parameter_value(proxy.name, image)
             inner.set_parameter_value("image", image)
