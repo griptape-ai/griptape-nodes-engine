@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +13,9 @@ from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
+from griptape_nodes.exe_types.workflow_node import WORKFLOW_NODE_KEY, build_workflow_node_class
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
-from griptape_nodes.node_library.workflow_registry import new_workflow_id
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape, new_workflow_id
 from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -40,16 +42,16 @@ from griptape_nodes.retained_mode.events.worker_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
-from griptape_nodes.retained_mode.managers.worker_manager import EngineLease
+from griptape_nodes.retained_mode.managers.worker_manager import EngineLease, WorkerManager
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import UndecodedValue, encode_value
 from tests.simulated_worker import simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata as ExecutionNodeMetadata
@@ -85,6 +87,12 @@ class _RoutedNode(DataNode):
         pass
 
 
+class _WorkerIncompatibleNode(_RoutedNode):
+    """A node, like a Workflow node, whose class keeps it out of every worker."""
+
+    is_worker_compatible = False
+
+
 def _make_routed_node(
     node_type: type[BaseNode] = _RoutedNode, *, name: str = "worker_node", library: str = "worker_library"
 ) -> Any:
@@ -100,6 +108,44 @@ def _make_workflow(existing_node: MagicMock | BaseNode | None = None) -> MagicMo
     workflow.objects.get_as_type.return_value = existing_node
     workflow.nodes.orch_worker_requests = {}
     return workflow
+
+
+_SHAPE_PARAMETER: dict[str, Any] = {
+    "name": "text",
+    "type": "str",
+    "input_types": ["str"],
+    "output_type": "str",
+    "default_value": None,
+    "tooltip": "text",
+    "mode_allowed_input": True,
+    "mode_allowed_property": True,
+    "mode_allowed_output": True,
+    "parent_element_name": None,
+}
+
+
+def _make_workflow_node(*, name: str = "worker_node", library: str = "worker_library") -> Any:
+    """A real Workflow node without its `workflow_node` metadata key.
+
+    Only its `is_worker_compatible` class attribute keeps it out of workers.
+    """
+    node_class = build_workflow_node_class(
+        node_type="SomeWorkflow",
+        workflow_file_path=Path("/library/some_workflow.py"),
+        workflow_metadata=WorkflowMetadata(
+            name="demo",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="0.0.0",
+            node_libraries_referenced=[],
+            workflow_shape=WorkflowShape(
+                inputs={"Start Flow": {"text": _SHAPE_PARAMETER}}, outputs={"End Flow": {"result": _SHAPE_PARAMETER}}
+            ),
+        ),
+    )
+    node = node_class(name=name, metadata={"library": library, "node_type": "SomeWorkflow"})
+    del node.metadata[WORKFLOW_NODE_KEY]
+    node.aprocess = AsyncMock()
+    return node
 
 
 def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) -> MagicMock:
@@ -1006,6 +1052,38 @@ class TestPreparingTheRequestForAWorker:
         assert _what_the_worker_holds(worker.engine) == {_WORKER_COPIES_FLOW}
 
 
+class TestIsWorkerCompatible:
+    """Which nodes `NodeManager._is_worker_compatible` keeps out of every worker."""
+
+    @pytest.fixture
+    def node_manager(self) -> NodeManager:
+        return _make_node_manager()
+
+    def test_a_node_whose_class_is_not_worker_compatible_is_not(self, node_manager: NodeManager) -> None:
+        node = _make_routed_node(_WorkerIncompatibleNode)
+
+        assert node_manager._is_worker_compatible(node) is False
+
+    def test_a_node_with_only_the_workflow_node_metadata_key_is_not(self, node_manager: NodeManager) -> None:
+        """Fallback for library nodes that set the key but do not set the class attribute."""
+        node = _make_routed_node()
+        node.metadata[WORKFLOW_NODE_KEY] = True
+
+        assert node_manager._is_worker_compatible(node) is False
+
+    def test_a_workflow_node_without_the_metadata_key_is_not(self, node_manager: NodeManager) -> None:
+        node = _make_workflow_node()
+        assert WORKFLOW_NODE_KEY not in node.metadata
+
+        assert node_manager._is_worker_compatible(node) is False
+
+    def test_an_ordinary_node_is(self, node_manager: NodeManager) -> None:
+        node = _make_routed_node()
+        assert WORKFLOW_NODE_KEY not in node.metadata
+
+        assert node_manager._is_worker_compatible(node) is True
+
+
 class TestExecuteNodeWorkerRoute:
     """Orchestrator-side worker routing for ExecuteNodeRequest.
 
@@ -1105,6 +1183,60 @@ class TestExecuteNodeWorkerRoute:
         await node_manager.on_execute_node_request(request, workflow)
 
         wm.acquire_lease.assert_not_awaited()
+
+    def _make_library_route_worker_manager(self) -> MagicMock:
+        wm = MagicMock(spec=WorkerManager)
+        wm.worker_unavailable_reason.return_value = None
+        wm.wait_until_executable = AsyncMock()
+        wm.acquire_lease = AsyncMock(return_value=None)
+        wm.release_after_node = MagicMock()
+        wm.route_to_worker = AsyncMock(
+            return_value={
+                "result_type": ExecuteNodeResultSuccess.__name__,
+                "result": {"parameter_output_values": {"out": 1}, "result_details": "ok"},
+            }
+        )
+        return wm
+
+    async def _execute_through_library_route(self, node: Any, wm: MagicMock) -> Any:
+        workflow = _make_workflow(existing_node=node)
+        lib_mgr = MagicMock(spec=LibraryManager)
+        lib_mgr.workers = MagicMock(spec=LibraryWorkers)
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        return await node_manager.on_execute_node_request(request, workflow)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_node_is_forwarded_to_its_library_worker(self) -> None:
+        """Control for the not-forwarded tests: the same setup does forward a compatible node."""
+        node = _make_routed_node()
+
+        wm = self._make_library_route_worker_manager()
+
+        result = await self._execute_through_library_route(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_awaited_once()
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_is_not_worker_compatible_is_not_forwarded_to_a_worker(self) -> None:
+        """Proves this route sits behind the worker-compatibility check."""
+        node = _make_routed_node(_WorkerIncompatibleNode)
+        wm = self._make_library_route_worker_manager()
+
+        result = await self._execute_through_library_route(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
@@ -1299,6 +1431,18 @@ class TestExecuteNodePrivateExecutionRoute:
         wm.get_worker_for_key.assert_called_once_with(None)
         assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_is_not_worker_compatible_is_not_sent_to_the_worker(self) -> None:
+        """Proves this route sits behind the worker-compatibility check."""
+        node = _make_routed_node(_WorkerIncompatibleNode, name="test_node", library="some_library")
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_library_worker_takes_precedence_over_the_private_execution_worker(self) -> None:
