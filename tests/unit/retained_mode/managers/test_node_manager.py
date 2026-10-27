@@ -435,6 +435,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {"result": output_value}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
@@ -465,6 +466,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
@@ -495,6 +497,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 

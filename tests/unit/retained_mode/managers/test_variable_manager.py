@@ -731,7 +731,7 @@ class TestReservedNames:
         it, a no-op rename of a reserved-named variable would surface a spurious 'that name is
         reserved' failure.
         """
-        engine.variables_manager._global_layer.set(
+        engine.current_workflow().variables.global_layer.set(
             FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/g")
         )
         result = engine.handle_request(
