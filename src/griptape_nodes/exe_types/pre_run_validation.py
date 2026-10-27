@@ -9,7 +9,7 @@ read, so the machine can tell the user it wasn't checked.
 from __future__ import annotations
 
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.input_checks import input_subject, read_media
@@ -25,14 +25,23 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.validators.base import PreRunValidator
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["run_pre_run_validators", "unchecked_inputs_message", "unchecked_locations_by_name"]
+__all__ = ["UncheckedInput", "run_pre_run_validators", "unchecked_inputs_message", "unchecked_locations_by_name"]
 
 # What an input is called in a message, by the kind of media its parameter holds.
 _NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
 _DEFAULT_NOUN = "input"
 
 
-def run_pre_run_validators(node: BaseNode, *, unchecked: list[tuple[str, str]] | None = None) -> list[NodeError]:
+class UncheckedInput(NamedTuple):
+    """An input with declared validators whose video or audio probe ran out of time."""
+
+    location: str
+    """Where the input was read from."""
+    subject: str
+    """How a message names it, such as "The video in 'Video'"."""
+
+
+def run_pre_run_validators(node: BaseNode, *, unchecked: list[UncheckedInput] | None = None) -> list[NodeError]:
     """Every error the node's inputs break its declared limits with, or an empty list.
 
     For each parameter with `pre_run_validators`, reads its value once, for every reading those
@@ -213,18 +222,18 @@ def _noun(parameter: Parameter, kind: MediaKind | None) -> str:
     return _NOUN_FOR_KIND[kind]
 
 
-def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> list[tuple[str, str]]:
+def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> list[UncheckedInput]:
     """Each of the parameter's inputs whose probe ran out of time, as its location and its subject."""
     shown_name = parameter.display_name or parameter.name
     noun = _noun(parameter, media_kind_of(parameter))
-    subjects: list[tuple[str, str]] = []
+    subjects: list[UncheckedInput] = []
     for position, reading in enumerate(readings, start=1):
         if not reading.timed_out or reading.location is None:
             continue
         if holds_list(parameter):
-            subjects.append((reading.location, input_subject(shown_name, noun=noun, position=position)))
+            subjects.append(UncheckedInput(reading.location, input_subject(shown_name, noun=noun, position=position)))
         else:
-            subjects.append((reading.location, input_subject(shown_name, noun=noun)))
+            subjects.append(UncheckedInput(reading.location, input_subject(shown_name, noun=noun)))
     return subjects
 
 

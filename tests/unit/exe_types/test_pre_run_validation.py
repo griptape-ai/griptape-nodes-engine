@@ -42,6 +42,7 @@ from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
 from griptape_nodes.exe_types.pre_run_validation import (
+    UncheckedInput,
     run_pre_run_validators,
     unchecked_inputs_message,
     unchecked_locations_by_name,
@@ -606,8 +607,8 @@ class TestUncheckedInputs:
         return str(clip)
 
     @staticmethod
-    def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[tuple[str, str]]]:
-        unchecked: list[tuple[str, str]] = []
+    def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[UncheckedInput]]:
+        unchecked: list[UncheckedInput] = []
         with input_check_readings():
             errors = run_pre_run_validators(node, unchecked=unchecked)
         return errors, unchecked
