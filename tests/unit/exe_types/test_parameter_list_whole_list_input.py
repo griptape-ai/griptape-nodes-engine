@@ -101,33 +101,20 @@ class TestWholeListInput:
             assert node.get_parameter_value("nums") == [9, 8, 1, 2, 3, 4, 5, 6]
 
     @pytest.mark.usefixtures("connected")
-    def test_dispatching_the_list_as_read_does_not_store_the_rows_again(self, node: MockNode) -> None:
-        refs = node.get_parameter_by_name("refs")
-        assert isinstance(refs, ParameterList)
-        row = refs.add_child_parameter()
-        node.set_parameter_value(row.name, "manual")
-        node.set_parameter_value("refs", ["a", "b"])
-        dispatched = node._list_rows.values_for_dispatch()["refs"]
-
-        assert node._list_rows.set_as_rows_if_unconnected(refs, dispatched)
-
-        assert node.parameter_values["refs"] == ["a", "b"]
-        assert node.get_parameter_value("refs") == ["a", "b", "manual"]
-
-    @pytest.mark.usefixtures("connected")
     @pytest.mark.parametrize("upstream", [[], None])
-    def test_dispatching_an_empty_connected_list_does_not_store_the_rows(self, node: MockNode, upstream: Any) -> None:
+    def test_a_request_matching_what_the_node_reads_is_still_stored(self, node: MockNode, upstream: Any) -> None:
+        """A request that happens to equal what the node reads is a new value, and is stored."""
         refs = node.get_parameter_by_name("refs")
         assert isinstance(refs, ParameterList)
         row = refs.add_child_parameter()
-        node.set_parameter_value(row.name, "manual")
+        node.set_parameter_value(row.name, "x")
         node.parameter_values["refs"] = upstream
-        dispatched = node._list_rows.values_for_dispatch()["refs"]
 
-        assert node._list_rows.set_as_rows_if_unconnected(refs, dispatched)
+        assert not node._list_rows.set_as_rows_if_unconnected(refs, ["x"])
+        node.set_parameter_value("refs", ["x"])
 
-        assert node.parameter_values["refs"] == upstream
-        assert node.get_parameter_value("refs") == ["manual"]
+        assert node.parameter_values["refs"] == ["x"]
+        assert node.get_parameter_value("refs") == ["x", "x"]
 
     @pytest.mark.usefixtures("connected")
     def test_row_edits_on_a_connected_list_run_validators_and_hooks_with_the_combined_list(
@@ -147,6 +134,52 @@ class TestWholeListInput:
         refs.remove_child(row)
 
         assert validated[-1] == ["a", "b"]
+
+    @pytest.mark.usefixtures("connected")
+    def test_a_connected_value_runs_validators_and_hooks_with_the_combined_list(self, node: MockNode) -> None:
+        """They see the list the node reads, as they do when a row changes."""
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+        validated: list[Any] = []
+        refs._validators.append(lambda _param, value: validated.append(value))
+        after: list[Any] = []
+        with patch.object(
+            MockNode,
+            "after_value_set",
+            side_effect=lambda parameter, value: after.append(value) if parameter is refs else None,
+        ):
+            node.set_parameter_value("refs", ["a", "b"])
+
+        assert validated == [["a", "b", "manual"]]
+        assert after == [["a", "b", "manual"]]
+        assert node.parameter_values["refs"] == ["a", "b"]
+
+    @pytest.mark.usefixtures("connected")
+    def test_saving_a_connected_list_keeps_only_the_connected_items(self, node: MockNode) -> None:
+        """Its rows are saved on their own, so saving them in the list too would duplicate them on load."""
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, SerializedParameterValueTracker
+
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+        node.set_parameter_value("refs", ["a", "b"])
+        saved: list[Any] = []
+        with patch.object(
+            NodeManager,
+            "_serialize_one_parameter_value_for_save",
+            side_effect=lambda *, value, value_kind, **_: saved.append((value_kind, value)),
+        ):
+            NodeManager.handle_parameter_value_saving(
+                refs, node, {}, SerializedParameterValueTracker(), CreateNodeRequest(node_type="T", node_name="n")
+            )
+
+        assert ("set", ["a", "b"]) in saved
+        node.set_parameter_value("refs", ["a", "b"], initial_setup=True)
+        assert node.get_parameter_value("refs") == ["a", "b", "manual"]
 
     def test_removed_row_value_does_not_resurrect(self, node: MockNode) -> None:
         """An unconnected list keeps no value of its own, so nothing is left behind to read."""

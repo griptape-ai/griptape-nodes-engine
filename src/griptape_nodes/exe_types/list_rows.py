@@ -107,10 +107,8 @@ class ListRows:
         if not _accepts_whole_list(parameter):
             return False
         if self._node._param_has_incoming_connection(parameter.name):
-            # A connected list keeps the value as it arrived. A dispatch sends the list as the node reads
-            # it, the rows' items included, so storing that would add the rows a second time. This runs
-            # before the rows check below, which an empty or missing connected value would also satisfy.
-            return value == self._node._get_raw_parameter_value(parameter.name)
+            # A connected list keeps the value as it arrived, ahead of its rows.
+            return False
         if isinstance(value, list) and value == handle_container_parameter(self._node, parameter):
             # Already what the rows hold.
             return False
@@ -118,12 +116,32 @@ class ListRows:
         return True
 
     def convert_and_validate(self, parameter: Parameter, value: Any) -> Any:
-        """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds."""
-        convert_and_validate = self._node._convert_and_validate
+        """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds.
+
+        A connected list's validators check the list the node will read: `value`, then its rows' items.
+        """
+        node = self._node
+        if isinstance(parameter, ParameterList):
+            candidate_value = node._convert_value(parameter, value)
+            read_value = self.read_with_rows(parameter, candidate_value)
+            for validator in parameter.validators:
+                validator(parameter, read_value)
+            return candidate_value
+        convert_and_validate = node._convert_and_validate
         container = self._container_of(parameter)
         if not isinstance(container, ParameterList) or not container.row_value_is_items(value):
             return convert_and_validate(parameter, value)
         return [convert_and_validate(parameter, item) for item in value]
+
+    def read_with_rows(self, parameter: Parameter, value: Any) -> Any:
+        """What the node reads once a list it sets stores `value`: those items, then its rows' items.
+
+        Only for a value `write_from_node` declined, and it declines every list that isn't connected.
+        Any other value is returned as it is.
+        """
+        if not isinstance(parameter, ParameterList) or not isinstance(value, list):
+            return value
+        return [*value, *handle_container_parameter(self._node, parameter)]
 
     def check_row_within_max_items(self, row: Parameter, value: Any, *, initial_setup: bool) -> None:
         if initial_setup:

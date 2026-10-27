@@ -1175,8 +1175,11 @@ class BaseNode(ABC):
                 self._also_record_as_result(parameter, final_value)
 
                 # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
+                # A connected list's hook sees the list the node now reads, its rows' items included.
                 with self._reporting_state_set_by("after_value_set"):
-                    self.after_value_set(parameter=parameter, value=final_value)
+                    self.after_value_set(
+                        parameter=parameter, value=self._list_rows.read_with_rows(parameter, final_value)
+                    )
             if emit_change:
                 self._emit_parameter_lifecycle_event(parameter)
         else:

@@ -181,7 +181,7 @@ class ParameterList(ParameterContainer):
         return self._with_list_variants(super()._custom_getter_for_property_input_types())
 
     @property
-    def rows_add_list_items(self) -> bool:
+    def _rows_add_list_items(self) -> bool:
         """Whether a list handed to a row adds its items.
 
         False when the list's items may themselves be lists (`any`, `all` or `list`), where it is one item.
@@ -313,7 +313,7 @@ class ParameterList(ParameterContainer):
 
     def row_value_is_items(self, value: Any) -> bool:
         """Return whether a row's `value` contributes its items rather than one item."""
-        return isinstance(value, list) and self.rows_add_list_items
+        return isinstance(value, list) and self._rows_add_list_items
 
     def _widen_all_row_input_types(self) -> None:
         rows = [child for child in self._children if isinstance(child, Parameter)]
