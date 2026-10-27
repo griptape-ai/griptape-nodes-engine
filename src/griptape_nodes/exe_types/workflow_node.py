@@ -17,7 +17,7 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import WORKFLOW_NODE_KEY, Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
 from griptape_nodes.files.path_utils import (
@@ -71,11 +71,6 @@ STATUS_PARAMETER_NAMES = frozenset({"was_successful", "result_details"})
 # value a save happened to bake into a file is inert when that file is loaded. The editor reads it to
 # offer a "view the subflow" affordance during a session.
 SUBFLOW_NAME_KEY = "subflow_name"
-
-# Node-metadata flag the editor uses to recognize a node that runs a workflow. Presence of this key
-# is what makes the editor render the node with its subflow-preview wrapper (see
-# `determineNodeType` in the editor's ConstructNode.ts), which offers a "View Subflow" button.
-WORKFLOW_NODE_KEY = "workflow_node"
 
 # Node-metadata key holding the registry key of the backing workflow. The editor's preview reads
 # this to import and display the workflow when the node has not run yet and therefore has no live

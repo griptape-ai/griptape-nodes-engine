@@ -1,0 +1,31 @@
+{
+  "name": "Worker Leaf Library",
+  "library_schema_version": "0.11.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Library holding a failing node that the worker-boundary e2e tests host in a stand-in worker",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "WorkerFailingNode",
+      "file_path": "worker_leaf_nodes.py",
+      "metadata": {"category": "test", "description": "always fails", "display_name": "Worker Failing"}
+    }
+  ]
+}

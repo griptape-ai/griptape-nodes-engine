@@ -38,9 +38,15 @@ from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
 from griptape_nodes.serialization.values import SavesState, register_value_codec
 
+# Node-metadata flag the editor uses to recognize a node that runs a workflow. Presence of this key
+# makes the editor render the node with its subflow-preview wrapper, and makes the engine run the
+# node in the orchestrator rather than its library's worker.
+WORKFLOW_NODE_KEY = "workflow_node"
+
 __all__ = [
     "VALID_BADGE_VARIANTS",
     "VALID_PARAMETER_RENDER_LOCATIONS",
+    "WORKFLOW_NODE_KEY",
     "BadgeData",
     "BadgeVariantType",
     "BaseNodeElement",

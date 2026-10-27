@@ -36,6 +36,7 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeStartNode,
 )
 from griptape_nodes.exe_types.core_types import (
+    WORKFLOW_NODE_KEY,
     BaseNodeElement,
     Parameter,
     ParameterContainer,
@@ -3448,7 +3449,10 @@ class NodeManager(EngineScoped):
         node if not.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
-        a worker, the request is forwarded over the wire to that worker.
+        a worker, the request is forwarded over the wire to that worker. A node that
+        runs a workflow (metadata key `WORKFLOW_NODE_KEY`) is the exception: it reads
+        this process's flows, so it always runs here, and the nodes in its subflow are
+        routed on their own.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3476,7 +3480,12 @@ class NodeManager(EngineScoped):
         # the node runs, so strict-mode attribution belongs to the worker's
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
-        if node is not None:
+        #
+        # A Workflow node only orchestrates: it imports its workflow, starts the subflow
+        # and collects the outputs, all by reading this process's flows. It stays here,
+        # and the nodes inside its subflow are routed on their own, so each still
+        # reaches its own library's worker.
+        if node is not None and not node.metadata.get(WORKFLOW_NODE_KEY):
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that

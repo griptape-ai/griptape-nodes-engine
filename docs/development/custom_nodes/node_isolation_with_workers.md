@@ -133,6 +133,19 @@ other:
 
 Only `process` goes to the worker.
 
+A node that runs a workflow, such as the node Griptape Nodes makes from a
+workflow file, always runs in the orchestrator, even when its library
+declares execution dependencies. It reads the flows it imports directly,
+and those exist only in the orchestrator. The nodes inside that workflow
+are sent to their own libraries' workers as usual.
+
+The engine recognizes such a node by `node.metadata[WORKFLOW_NODE_KEY] = True`,
+where `WORKFLOW_NODE_KEY` is imported from `griptape_nodes.exe_types.core_types`.
+Set it only on a node that runs a workflow. It also makes the editor show the
+node with the subflow preview and a "View Subflow" button, which read the node's
+`subflow_name` and `_workflow_file_value` metadata. Setting it on any other
+node takes that node out of its library's worker.
+
 ## What you give up
 
 Cross-process serialization tax. When your worker-side node calls
