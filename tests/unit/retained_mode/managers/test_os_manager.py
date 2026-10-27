@@ -14,6 +14,12 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.artifact_events import (
+    GetPreviewForArtifactResultFailure,
+    GetPreviewForArtifactResultSuccess,
+    RegisterArtifactProviderRequest,
+    RegisterArtifactProviderResultSuccess,
+)
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
@@ -64,6 +70,8 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
+from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
 
@@ -296,6 +304,135 @@ class TestReadFileRequest:
         assert isinstance(result, ReadFileResultFailure)
         # INVALID_PATH is returned for empty path
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+
+class TestReadFileRequestImagePreview:
+    """Test ReadFileRequest's image thumbnail generation consults the artifact provider registry.
+
+    Formats without a registered ArtifactProvider (e.g. EXR) must never reach the raw Pillow
+    decode -- that path hung the engine on large/multi-part files. See os_manager.py's
+    _generate_thumbnail_from_image_content and _preview_via_registered_provider.
+    """
+
+    # Minimal valid 1x1 red PNG, built by hand so the test has no binary fixture dependency.
+    _ONE_PIXEL_PNG = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        """Point the workspace somewhere other than temp_dir so files aren't treated as already-served."""
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir / "workspace"
+        yield
+        engine.config_manager.workspace_path = original_workspace
+
+    @pytest.fixture(autouse=True)
+    def isolated_provider_registry(self, engine: Engine) -> Generator[None, None, None]:
+        """Swap in a fresh ProviderRegistry so tests don't depend on or pollute app-init registration.
+
+        Providers normally register on the AppInitializationComplete broadcast, which the
+        `engine` fixture never sends, so the shared engine's registry starts empty. Each test
+        registers exactly the providers it needs onto a throwaway registry instead.
+        """
+        original_registry = engine.artifact_manager._registry
+        engine.artifact_manager._registry = ProviderRegistry(engine=engine)
+        yield
+        engine.artifact_manager._registry = original_registry
+
+    @staticmethod
+    def _register_image_provider(engine: Engine) -> None:
+        result = engine.artifact_manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+        assert isinstance(result, RegisterArtifactProviderResultSuccess)
+
+    def test_unregistered_format_skips_decode_entirely(self, engine: Engine, temp_dir: Path) -> None:
+        """A format with no registered ArtifactProvider (e.g. EXR) must not be handed to Pillow."""
+        file_path = temp_dir / "test.exr"
+        content = b"not a real exr, just needs to never be decoded"
+        file_path.write_bytes(content)
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+        ) as mock_create_preview:
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        mock_create_preview.assert_not_called()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/aces;base64,")
+
+    def test_registered_format_uses_provider_preview(self, engine: Engine, temp_dir: Path) -> None:
+        """A format with a registered ArtifactProvider (PNG) routes through GetPreviewForArtifactRequest."""
+        self._register_image_provider(engine)
+        file_path = temp_dir / "test.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        preview_path = temp_dir / "test.png.webp"
+        preview_path.write_bytes(b"fake webp preview bytes")
+
+        mock_result = GetPreviewForArtifactResultSuccess(paths_to_preview=str(preview_path), result_details="ok")
+
+        with (
+            patch.object(engine, "ahandle_request", AsyncMock(return_value=mock_result)) as mock_ahandle,
+            patch(
+                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+            ) as mock_create_preview,
+        ):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        mock_create_preview.assert_not_called()
+        mock_ahandle.assert_awaited_once()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/webp;base64,")
+
+    def test_registered_format_falls_back_to_pillow_when_provider_preview_fails(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """If the registered provider can't produce a preview, PNG still falls back to legacy Pillow handling."""
+        self._register_image_provider(engine)
+        file_path = temp_dir / "test.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        mock_result = GetPreviewForArtifactResultFailure(result_details="no preview generator configured")
+
+        with patch.object(engine, "ahandle_request", AsyncMock(return_value=mock_result)) as mock_ahandle:
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        mock_ahandle.assert_awaited_once()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        # Legacy Pillow path still successfully thumbnails a real PNG.
+        assert result.content.startswith("data:image/webp;base64,")
+
+    def test_should_transform_image_content_to_thumbnail_false_skips_provider_lookup(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """Opting out of thumbnailing bypasses provider lookup and the legacy preview path alike."""
+        file_path = temp_dir / "test.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        with patch.object(engine, "ahandle_request", AsyncMock()) as mock_ahandle:
+            request = ReadFileRequest(file_path=str(file_path), should_transform_image_content_to_thumbnail=False)
+            result = engine.handle_request(request)
+
+        mock_ahandle.assert_not_awaited()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert result.content == self._ONE_PIXEL_PNG
 
 
 class TestCreateFileRequest:
