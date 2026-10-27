@@ -54,12 +54,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from griptape_nodes.node_library.workflow_registry import (
+        Workflow,
         WorkflowShape,
     )
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -133,6 +135,26 @@ class WorkflowRunner(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
+    async def load_workflow_file(
+        self, relative_file_path: str, *, workflow: Workflow | None = None
+    ) -> WorkflowExecutionResult:
+        """Run a workflow file into the workflow it opens, and close a library workflow's copy it fails to build.
+
+        `workflow` opens first when given. Otherwise the file opens its own entry when no workflow
+        is open (`push_workflow(file_path=__file__)`). Both go through
+        `ContextManager.open_registered_workflow`, so a library workflow opens as a new unsaved copy.
+
+        Raises:
+            WorkflowAlreadyOpenError: `workflow` is given while a workflow is open.
+        """
+        open_before = self.engine.current_workflow_or_none()
+        if workflow is not None:
+            self.engine.context_manager.open_registered_workflow(workflow)
+        execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+        if not execution_result.execution_successful:
+            await self._close_copy_a_failed_load_opened(open_before)
+        return execution_result
+
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
@@ -165,7 +187,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # Run the file, goddamn it
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+            execution_result = await self.load_workflow_file(relative_file_path)
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
@@ -198,7 +220,7 @@ class WorkflowRunner(EngineScoped):
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
             return RunWorkflowWithCurrentStateResultFailure(result_details=details)
-        execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+        execution_result = await self.load_workflow_file(relative_file_path)
 
         if execution_result.execution_successful:
             return RunWorkflowWithCurrentStateResultSuccess(
@@ -255,16 +277,14 @@ class WorkflowRunner(EngineScoped):
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
-            self.engine.context_manager.push_workflow(request.workflow_name)
-            # run file
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+            execution_result = await self.load_workflow_file(relative_file_path, workflow=workflow)
 
             if not execution_result.execution_successful:
                 result_messages = execution_result_details(execution_result, level=logging.ERROR)
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
+                await self.engine.ahandle_request(clear_all_request)
 
                 # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
@@ -273,7 +293,7 @@ class WorkflowRunner(EngineScoped):
         result_messages = execution_result_details(execution_result, level=logging.DEBUG)
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
-            workflow_id=workflow.workflow_id,
+            workflow_id=self._current_workflow_id(),
             result_details=ResultDetails(*result_messages),
         )
 
@@ -392,6 +412,23 @@ class WorkflowRunner(EngineScoped):
             engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
+
+    async def _close_copy_a_failed_load_opened(self, open_before: WorkflowRuntime | None) -> None:
+        """Close the open workflow if the failed load opened it as a library workflow's copy.
+
+        Nothing else refers to the half-built copy, so its registry entry is removed too. A
+        workflow open before the load, or one with a file of its own, is left open.
+        """
+        opened = self.engine.current_workflow_or_none()
+        if opened is None or opened is open_before:
+            return
+        entry = self.engine.workflow_registry.find_by_id(opened.workflow_id)
+        if entry is None or entry.seeded_from_workflow_id is None:
+            return
+        self.engine.close_workflow(opened)
+        # close_workflow releases what this process holds; the workers hold their own.
+        await self.engine.worker_manager.broadcast_local_object_teardown()
+        self.engine.workflow_registry.remove(entry.workflow_id)
 
     def _current_workflow_id(self) -> str | None:
         """The id of the workflow a load left in context, or None if it left none."""

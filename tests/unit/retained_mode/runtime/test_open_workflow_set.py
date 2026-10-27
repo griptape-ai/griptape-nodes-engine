@@ -45,35 +45,6 @@ class TestOpenWorkflowSet:
 
         assert workflows.all_open() == [reopened]
 
-    def test_move_keeps_the_runtime_under_its_new_id_only(self) -> None:
-        workflows = OpenWorkflowSet()
-        workflow = workflows.open("abc")
-
-        workflows.move(workflow, "def")
-
-        assert workflow.workflow_id == "def"
-        assert workflows.get("def") is workflow
-        assert not workflows.is_open("abc")
-
-    def test_move_refuses_an_id_already_open(self) -> None:
-        workflows = OpenWorkflowSet()
-        workflow = workflows.open("abc")
-
-        with pytest.raises(OpenWorkflowError, match="'abc' is already open"):
-            workflows.move(workflow, "abc")
-
-        assert workflows.get("abc") is workflow
-
-    def test_move_refuses_a_runtime_that_is_not_open(self) -> None:
-        workflows = OpenWorkflowSet()
-        stale = workflows.open("abc")
-        workflows.close(stale)
-
-        with pytest.raises(OpenWorkflowError, match="not open"):
-            workflows.move(stale, "def")
-
-        assert workflows.all_open() == []
-
 
 class TestOpenWorkflowsFollowTheContext:
     """A workflow is open exactly while it is the Workflow context."""
@@ -98,13 +69,3 @@ class TestOpenWorkflowsFollowTheContext:
 
         assert engine.worker_workflows.find(peer_id) is workflow
         assert engine.open_workflows.all_open() == []
-
-    def test_moving_the_open_workflow_moves_its_runtime(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="outer")
-        [workflow] = engine.open_workflows.all_open()
-        copy = engine.workflow_registry.register_unsaved("copy")
-
-        engine.context_manager.move_current_workflow_onto(copy.workflow_id)
-
-        assert engine.open_workflows.all_open() == [workflow]
-        assert workflow.workflow_id == copy.workflow_id

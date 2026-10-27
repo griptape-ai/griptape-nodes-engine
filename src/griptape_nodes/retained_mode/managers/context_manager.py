@@ -67,6 +67,9 @@ class ContextManager(EngineScoped):
     class OrchestratorWorkflowError(WorkflowContextError):
         """A worker could not adopt the workflow its orchestrator ran a node for."""
 
+    class LibraryWorkflowOpenError(WorkflowContextError):
+        """A push named a library-provided workflow, which never becomes the open workflow itself."""
+
     class WorkflowContext:
         """A context manager for a Workflow."""
 
@@ -214,7 +217,11 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        resolved_name = self.push_workflow(workflow_name, working_directory=working_directory)
+        # Setting the context opens no file to copy from, so a library workflow is refused here.
+        try:
+            resolved_name = self.push_workflow(workflow_name, working_directory=working_directory)
+        except self.LibraryWorkflowOpenError as err:
+            return SetWorkflowContextFailure(result_details=str(err))
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
             workflow_name=resolved_name, workflow_id=self.get_current_workflow_id(), result_details=msg
@@ -623,23 +630,6 @@ class ContextManager(EngineScoped):
         """
         return self.get_current_workflow().working_directory
 
-    def move_current_workflow_onto(self, workflow_id: str) -> None:
-        """Make the registry entry `workflow_id` the current Workflow, keeping the open flows.
-
-        For the one case where an open workflow becomes a different registry entry: saving an
-        open library workflow writes a copy, and the editor keeps working in the copy.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        current = self._current_or_none()
-        if current is None:
-            msg = "No active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
-
-        # The open workflow's runtime follows it, so a request naming the copy's id reaches it.
-        self.engine.open_workflows.move(current, workflow_id)
-
     def get_current_flow(self) -> ControlFlow:
         """Get the current Flow object.
 
@@ -709,7 +699,8 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while a workflow is in context is refused,
-        so saved workflow files push only when none is.
+        so saved workflow files push only when none is. A library-provided workflow's file opens
+        as a new unsaved copy (`open_registered_workflow`), and naming it is refused.
 
         Args:
             workflow_name: The legacy registry name of the Workflow to enter. A name the registry
@@ -726,21 +717,19 @@ class ContextManager(EngineScoped):
                 reaches here.
 
         Returns:
-            The name of the Workflow that was entered.
+            The name of the Workflow that was entered: the copy's "unsaved:<id>" name when a
+            library workflow's file opened as a copy.
 
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
             WorkflowAlreadyOpenError: If a workflow is already in context.
+            LibraryWorkflowOpenError: If the push would open a library-provided workflow named by
+                workflow_name.
         """
         if workflow_name is not None and file_path is not None:
             msg = "Provide either workflow_name or file_path, not both."
             raise ValueError(msg)
-        if self.has_current_workflow():
-            msg = (
-                f"Attempted to open workflow '{workflow_name or file_path}'. Failed because workflow "
-                f"'{self.get_current_workflow_name()}' is already open. Close or clear the open workflow first."
-            )
-            raise self.WorkflowAlreadyOpenError(msg)
+        self._raise_if_workflow_open(workflow_name or file_path)
         if workflow_name is not None:
             workflow = self.engine.workflow_registry.find_by_name(workflow_name)
             if workflow is None:
@@ -752,10 +741,53 @@ class ContextManager(EngineScoped):
             msg = "Either workflow_name or file_path must be provided."
             raise ValueError(msg)
 
+        # Naming a library workflow opens no file to copy from. A library workflow's file run on
+        # its own, as a script does, opens as a copy.
+        if workflow.metadata.is_griptape_provided and file_path is None:
+            msg = (
+                f"Attempted to open workflow '{workflow.name}'. Failed because a library provides it, and "
+                "library workflows open only as copies so the library's file is never changed. "
+                "Open it from the workflow list to work on a copy, or create a workflow from it."
+            )
+            raise self.LibraryWorkflowOpenError(msg)
+
+        return self.open_registered_workflow(workflow, working_directory=working_directory).name
+
+    def open_registered_workflow(self, workflow: Workflow, *, working_directory: str | None = None) -> Workflow:
+        """Open `workflow` as the Workflow context, and return the registry entry that actually opened.
+
+        Every workflow opens through here. A library-provided workflow never opens itself, so the
+        library's file is never changed: a new unsaved copy of it opens instead
+        (`register_unsaved_copy`). Any other workflow opens itself.
+
+        Args:
+            workflow: The registry entry to open.
+            working_directory: Folder the opened workflow belongs to while it has no file of its
+                own (see `push_workflow`).
+
+        Raises:
+            WorkflowAlreadyOpenError: If a workflow is already in context.
+        """
+        self._raise_if_workflow_open(workflow.name)
+        if workflow.metadata.is_griptape_provided:
+            workflow = self.engine.workflow_registry.register_unsaved_copy(workflow)
         if working_directory is not None:
             workflow.working_directory = working_directory
         self.engine.open_workflow(workflow.workflow_id)
-        return workflow.name
+        return workflow
+
+    def _raise_if_workflow_open(self, opening: str | None) -> None:
+        """Refuse to open the workflow named `opening` while one is in context, since workflows do not nest.
+
+        Raises:
+            WorkflowAlreadyOpenError: If a workflow is already in context.
+        """
+        if self.has_current_workflow():
+            msg = (
+                f"Attempted to open workflow '{opening}'. Failed because workflow "
+                f"'{self.get_current_workflow_name()}' is already open. Close or clear the open workflow first."
+            )
+            raise self.WorkflowAlreadyOpenError(msg)
 
     def _find_or_register_open_file(self, file_path: str) -> Workflow:
         """The registry entry for a workflow file being opened, registered unlisted when there is none.

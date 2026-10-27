@@ -560,11 +560,26 @@ class _WorkflowRegistry:
         self._add(workflow)
         return workflow
 
+    def register_unsaved_copy(self, source: Workflow) -> Workflow:
+        """Register a new unsaved workflow seeded from `source`, which is how a library workflow opens.
+
+        The copy has an id of its own and no file. It takes the source's display name, description
+        and image, is neither library-provided nor a template, and records the source's id as its
+        `seeded_from_workflow_id`. It is unlisted until its first save, so the workflow list does
+        not show it beside the source. The source entry is not changed.
+        """
+        workflow = self.register_unsaved(source.metadata.name, listed=False)
+        workflow.metadata.description = source.metadata.description
+        workflow.metadata.image = source.metadata.image
+        workflow.seeded_from_workflow_id = source.workflow_id
+        return workflow
+
     def set_file_path(self, workflow: Workflow, new_path: str | Path) -> None:
         """Move `workflow` to the file at `new_path`. The only way an entry's path changes.
 
         Its id stays the same; its legacy name follows the path. An unsaved workflow becomes a
-        saved one. Aliases of the old path are dropped, since they named the old file.
+        saved one, and a library workflow's copy stops being one (`seeded_from_workflow_id` is
+        cleared). Aliases of the old path are dropped, since they named the old file.
 
         Raises:
             KeyError: `workflow` is not this registry's entry.
@@ -583,6 +598,7 @@ class _WorkflowRegistry:
         workflow._absolute_path = absolute_path
         workflow._alias_paths = []
         workflow._keys = self._entry_keys(workflow.workflow_id, absolute_path, [])
+        workflow.seeded_from_workflow_id = None
 
     def raise_if_path_taken(self, workflow: Workflow, new_path: str | Path) -> None:
         """Refuse `new_path` for `workflow` as `set_file_path` would, without the file having to exist.
@@ -986,6 +1002,8 @@ class Workflow:
         # True when `metadata` was made up for a header that could not be read, so it must not be
         # written back to a file. A save replaces it with real metadata.
         self.metadata_is_placeholder = metadata_is_placeholder
+        # The library workflow this one was opened as a copy of, until it is saved.
+        self.seeded_from_workflow_id: str | None = None
         # Path in the registry's form, legacy names, and path keys: the registry sets them whenever the paths change.
         self._keys = _NO_KEYS
 

@@ -352,12 +352,27 @@ class WorkflowSaver(EngineScoped):
         except ValueError:
             workflow_shape = None
 
-        # Build save request inline (preserve existing display_name/description/image/is_template if present)
-        existing = self._get_existing_metadata(registry_key)
+        continues_open_workflow = self._save_continues_open_workflow(
+            scenario=save_target.scenario,
+            destination=destination,
+            current_workflow=current_workflow,
+            keep_open_workflow_identity=keep_open_workflow_identity,
+        )
+
+        # Build save request inline (preserve existing display_name/description/image/is_template if present).
+        # A save that continues the open workflow reads them from the open workflow, since a first
+        # save or a rename has no entry at the destination yet: a library workflow's copy keeps
+        # what it was opened with, and edits made before the first save survive.
+        if continues_open_workflow and current_workflow is not None:
+            existing = self._existing_metadata_of_open_workflow(current_workflow)
+        else:
+            existing = self._get_existing_metadata(registry_key)
         # Display name precedence (high to low):
         # 1. Caller-supplied request.display_name — explicit intent always wins.
-        # 2. existing.display_name from the registry — preserves the human-readable label
-        #    across re-saves and version bumps (one workflow named "a" with v001, v002, ...).
+        # 2. existing.display_name — the open workflow's name when the save continues a saved
+        #    workflow or a library workflow's copy, else the registry entry at the destination.
+        #    Preserves the human-readable label across re-saves and version bumps (one workflow
+        #    named "a" with v001, v002, ...).
         # 3. The resolved local file_name from _determine_save_target — this is either the
         #    user's typed Save-As stem (so "a" stays "a" and doesn't become "a_v001"), or
         #    the sanitized display-name-derived stem for a first-save-of-unsaved-workflow
@@ -374,13 +389,6 @@ class WorkflowSaver(EngineScoped):
             resolved_display_name = file_name
         else:
             resolved_display_name = None
-
-        continues_open_workflow = self._save_continues_open_workflow(
-            scenario=save_target.scenario,
-            destination=destination,
-            current_workflow=current_workflow,
-            keep_open_workflow_identity=keep_open_workflow_identity,
-        )
 
         save_file_result = self._save_workflow_file_inline(
             destination=destination,
@@ -417,7 +425,6 @@ class WorkflowSaver(EngineScoped):
             workflow_metadata=save_file_result.workflow_metadata,
             current_workflow=current_workflow,
             continues_open_workflow=continues_open_workflow,
-            scenario=save_target.scenario,
         )
 
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
@@ -473,7 +480,6 @@ class WorkflowSaver(EngineScoped):
         workflow_metadata: WorkflowMetadata,
         current_workflow: Workflow | None,
         continues_open_workflow: bool,
-        scenario: SaveWorkflowScenario,
     ) -> Workflow:
         """Update the registry for a file a save just wrote, and return the workflow it holds.
 
@@ -498,17 +504,7 @@ class WorkflowSaver(EngineScoped):
 
         if displaced is not None:
             registry.remove(displaced.workflow_id)
-        saved_workflow = registry.register_file(written_path, workflow_metadata)
-
-        # Saving an open library workflow wrote a copy instead of the library's file. Move the
-        # current context onto the copy, so the next save lands in it rather than in yet another copy.
-        if (
-            current_workflow is not None
-            and scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE
-            and current_workflow.metadata.is_griptape_provided
-        ):
-            self.engine.context_manager.move_current_workflow_onto(saved_workflow.workflow_id)
-        return saved_workflow
+        return registry.register_file(written_path, workflow_metadata)
 
     def generate_unique_filename(self, base_name: str) -> str:
         """Generate a unique filename for a workflow, avoiding collisions.
@@ -769,6 +765,25 @@ class WorkflowSaver(EngineScoped):
                 is_template=existing.metadata.is_template,
             )
 
+    def _existing_metadata_of_open_workflow(self, workflow: Workflow) -> _ExistingMetadata:
+        """Return the open workflow's metadata for a save that continues it.
+
+        A plain unsaved workflow's display name is left out, so its first save is named after its
+        file. A library workflow's copy keeps the name it was opened with.
+        """
+        # Made up for a header that could not be read, so there is nothing to preserve.
+        if workflow.metadata_is_placeholder:
+            return _ExistingMetadata(None, None, None, None)
+        display_name = workflow.metadata.name
+        if not workflow.is_saved and workflow.seeded_from_workflow_id is None:
+            display_name = None
+        return _ExistingMetadata(
+            display_name=display_name,
+            description=workflow.metadata.description,
+            image=workflow.metadata.image,
+            is_template=workflow.metadata.is_template,
+        )
+
     def _determine_save_target(  # noqa: C901, PLR0912, PLR0915
         self,
         requested_file_name: str | None,
@@ -850,20 +865,18 @@ class WorkflowSaver(EngineScoped):
         # A workflow a library provides is never saved over: saving it writes a new copy
         # (SAVE_FROM_TEMPLATE), whether or not it is marked as a template. User-marked templates
         # (is_template=True but is_griptape_provided=False) are the user's own files and save normally.
-        target_is_library_workflow = target_workflow and target_workflow.metadata.is_griptape_provided
-        current_is_library_workflow = current_workflow and current_workflow.metadata.is_griptape_provided
+        # The open workflow is never a library's: a library workflow opens as an unsaved copy.
         destination: ProjectFileDestination | None = None
         file_path: Path | None = None
-        if target_is_library_workflow or current_is_library_workflow:
+        if target_workflow is not None and target_workflow.metadata.is_griptape_provided:
             # Library-provided workflows always create new copies with unique names.
             # Library-provided workflows are always disk-backed, so file_path is guaranteed.
             scenario = SaveWorkflowScenario.SAVE_FROM_TEMPLATE
-            template_workflow = target_workflow or current_workflow
-            if template_workflow is None or template_workflow.file_path is None:
+            if target_workflow.file_path is None:
                 msg = "Save From Template scenario requires a disk-backed template workflow."
                 raise ValueError(msg)
             # Use the registry key as base name, independent of the display name in metadata.
-            base_name = requested_file_name or derive_registry_key(template_workflow.file_path)
+            base_name = requested_file_name or derive_registry_key(target_workflow.file_path)
             file_name = self.generate_unique_filename(base_name)
             creation_date = datetime.now(tz=UTC)
             branched_from = None

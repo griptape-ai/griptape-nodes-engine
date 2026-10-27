@@ -52,31 +52,6 @@ class OpenWorkflowSet:
             raise OpenWorkflowError(msg)
         del self._by_id[workflow.workflow_id]
 
-    def move(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
-        """Keep an open workflow open under another id, as when saving it writes a copy it continues in.
-
-        The old id stops naming it: an open workflow has exactly one id.
-
-        Raises:
-            OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.
-        """
-        if self._by_id.get(workflow.workflow_id) is not workflow:
-            msg = (
-                f"Attempted to move workflow '{workflow.workflow_id}' to '{workflow_id}'. "
-                "Failed because it is not open."
-            )
-            raise OpenWorkflowError(msg)
-        if workflow_id in self._by_id:
-            msg = (
-                f"Attempted to move workflow '{workflow.workflow_id}' to '{workflow_id}'. "
-                f"Failed because workflow '{workflow_id}' is already open."
-            )
-            raise OpenWorkflowError(msg)
-
-        del self._by_id[workflow.workflow_id]
-        workflow.workflow_id = workflow_id
-        self._by_id[workflow_id] = workflow
-
     def is_open(self, workflow_id: str) -> bool:
         return workflow_id in self._by_id
 
