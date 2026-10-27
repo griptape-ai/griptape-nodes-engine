@@ -27,7 +27,8 @@ class SetWorkflowContextRequest(RequestPayload):
                        the handler auto-registers a fresh unsaved entry keyed by
                        that exact value if one does not already exist. The prefix
                        must be followed by a workflow id (32 lowercase hex digits);
-                       any other "unsaved:" name fails.
+                       any other "unsaved:" name fails. Any other name the registry
+                       does not hold fails.
         display_name: Human-readable name used when auto-registering an unsaved entry.
                       Ignored when the workflow is already in the registry. Defaults to
                       None; in that case the auto-registered entry gets a placeholder
@@ -42,7 +43,7 @@ class SetWorkflowContextRequest(RequestPayload):
                       when None, `{workflow_dir}` answers the folder this workflow's first save
                       would land in, read from the project's `save_workflow` situation.
 
-    Results: SetWorkflowContextSuccess (carries the resolved workflow_name) |
+    Results: SetWorkflowContextSuccess (carries the resolved workflow_name and workflow_id) |
              SetWorkflowContextFailure (workflow not found, working_directory names an
              existing non-directory)
     """
@@ -60,10 +61,14 @@ class SetWorkflowContextSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     Args:
         workflow_name: Resolved registry key for the workflow now in context. When the
                        request omitted `workflow_name`, this is the freshly minted
-                       "unsaved:<uuid>" key. Otherwise it echoes the requested key.
+                       "unsaved:<uuid>" key. When the request named no registered workflow,
+                       this is the new unsaved workflow's key. Otherwise it echoes the
+                       requested key.
+        workflow_id: Id of the workflow now in context.
     """
 
     workflow_name: str = ""
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -92,11 +97,13 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         workflow_name: Name of the current workflow context (None if no context set)
         is_saved: Whether the current workflow is backed by a file on disk. None when
-                  no context is set or the context key is not in the registry.
+                  no context is set.
+        workflow_id: Id of the current workflow (None if no context set).
     """
 
     workflow_name: str | None
     is_saved: bool | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -116,10 +123,11 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     creating new ones. Only creates the pieces that are missing.
 
     Args:
-        workflow_name: Name to use if a new workflow must be created. Ignored when a
-            workflow is already in context. When None or starting with the unsaved
-            registry-key prefix ("unsaved:"), the engine auto-registers an unsaved
-            entry and the resolved key is returned in the success result.
+        workflow_name: Registered workflow to enter if no workflow is in context. Ignored
+            when a workflow is already in context. When None or an unregistered
+            "unsaved:<workflow id>" name, the engine auto-registers an unsaved entry and the
+            resolved key is returned in the success result. Any other name the registry does
+            not hold fails; pass display_name to name a new workflow.
         display_name: Human-readable name attached to the auto-registered unsaved
             entry. Ignored when the workflow is already in context or when a saved
             workflow_name is supplied.
@@ -148,12 +156,14 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
         flow_name: Name of the flow in the current context.
         created_workflow: True if this call created the workflow; False if an existing one was reused.
         created_flow: True if this call created the flow; False if an existing one was reused.
+        workflow_id: Id of the workflow in the current context.
     """
 
     workflow_name: str
     flow_name: str
     created_workflow: bool
     created_flow: bool
+    workflow_id: str | None = None
 
 
 @dataclass

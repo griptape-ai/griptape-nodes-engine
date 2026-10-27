@@ -231,12 +231,16 @@ class Engine:
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
-        self._workflow_registry = _WorkflowRegistry(self._config_manager)
+        # Ahead of the registry, which asks it whether a workflow is open.
+        self._context_manager = ContextManager(self._event_manager, engine=self)
+        self._workflow_registry = _WorkflowRegistry(
+            self._config_manager,
+            is_workflow_open=self._context_manager.is_workflow_in_context,
+        )
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
-        self._context_manager = ContextManager(self._event_manager, engine=self)
         self._worker_manager = WorkerManager(engine=self, event_manager=self._event_manager)
         self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager, engine=self)
         self._model_manager = ModelManager(self._event_manager, engine=self)
@@ -748,6 +752,7 @@ class Engine:
         """
         workflow_info = {
             "current_workflow": None,
+            "current_workflow_id": None,
             "workflow_file_path": None,
             "has_active_flow": False,
         }
@@ -757,16 +762,13 @@ class Engine:
 
             # Check if there's an active workflow
             if context_manager.has_current_workflow():
-                workflow_name = context_manager.get_current_workflow_name()
-                workflow_info["current_workflow"] = workflow_name
+                workflow = context_manager.get_current_workflow()
+                workflow_info["current_workflow"] = workflow.name
+                workflow_info["current_workflow_id"] = workflow.workflow_id
                 workflow_info["has_active_flow"] = context_manager.has_current_flow()
-
-                # Get workflow file path from registry (None for unsaved workflows).
-                if self._workflow_registry.has_workflow_with_name(workflow_name):
-                    workflow = self._workflow_registry.get_workflow_by_name(workflow_name)
-                    if workflow.file_path is not None:
-                        absolute_path = self._workflow_registry.get_complete_file_path(workflow.file_path)
-                        workflow_info["workflow_file_path"] = absolute_path
+                # None for unsaved workflows.
+                if workflow.absolute_path is not None:
+                    workflow_info["workflow_file_path"] = str(workflow.absolute_path)
 
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
