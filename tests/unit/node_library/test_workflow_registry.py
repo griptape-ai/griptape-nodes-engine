@@ -699,8 +699,8 @@ class TestGetWorkflowMetadata:
             metadata=mock_metadata,
             absolute_path=absolute_path,
         )
-        # The registry form `file_path` reports, set as the registry would when it indexes the entry.
-        workflow._file_path = file_path
+        # The registry form `file_path` reports, set as the registry would when it registers the entry.
+        workflow._keys = workflow._keys._replace(file_path=file_path)
         return workflow
 
     def test_uses_precomputed_paths_instead_of_is_synced_property(self, engine: Engine) -> None:
