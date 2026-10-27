@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -18,9 +18,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
-    RegisterWorkflowRequest,
-    RegisterWorkflowResultFailure,
-    RegisterWorkflowResultSuccess,
     SaveWorkflowRequest,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -123,31 +120,22 @@ class WorkflowPublishing(EngineScoped):
                 load_workflow_metadata_request
             )
             if isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-                workflow_registry_key = derive_registry_key(workflow_file.name)
+                # The scan's path: a workflow published before keeps its entry, and with it its id,
+                # and takes the metadata just read.
                 try:
-                    self.engine.workflow_registry.get_workflow_by_name(workflow_registry_key)
-                    # This workflow was registered previously, but now it's been updated (potentially including the metadata), so let's re-register
-                    self.engine.workflow_registry.delete_workflow_by_name(workflow_registry_key)
-                except KeyError:
-                    pass
-
-                register_workflow_result = self.engine.workflow_manager.on_register_workflow_request(
-                    RegisterWorkflowRequest(
-                        metadata=load_metadata_result.metadata,
-                        file_name=workflow_file.name,
+                    self.engine.workflow_manager.refresh_workflow_file(
+                        workflow_file.name, load_metadata_result.metadata
                     )
-                )
-                if isinstance(register_workflow_result, RegisterWorkflowResultSuccess):
+                except ValueError as err:
+                    failure_message = f"Failed to register workflow with file '{workflow_file.name}': {err}"
+                    result_messages.append(ResultDetail(message=failure_message, level=logging.ERROR))
+                    final_result = PublishWorkflowResultFailure(
+                        result_details=ResultDetails(*result_messages), exception=err
+                    )
+                else:
                     success_message = f"Successfully registered new workflow with file '{workflow_file.name}'."
                     result_messages.append(ResultDetail(message=success_message, level=logging.INFO))
                     final_result.result_details = ResultDetails(*result_messages)
-                else:
-                    exception = cast("RegisterWorkflowResultFailure", register_workflow_result).exception
-                    failure_message = f"Failed to register workflow with file '{workflow_file.name}': {exception}"
-                    result_messages.append(ResultDetail(message=failure_message, level=logging.ERROR))
-                    final_result = PublishWorkflowResultFailure(
-                        result_details=ResultDetails(*result_messages), exception=exception
-                    )
             else:
                 metadata_failure_message = (
                     f"Failed to load metadata for workflow file '{workflow_file.name}'. Not registering workflow."

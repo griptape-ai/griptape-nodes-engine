@@ -429,10 +429,9 @@ class WorkflowSaver(EngineScoped):
                 self.engine.workflow_registry.delete_workflow_by_name(unsaved_source_key)
                 self.engine.workflow_manager.variable_substitution.drop(unsaved_source_key)
             else:
-                self.engine.workflow_registry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
+                unsaved_workflow = self.engine.workflow_registry.get_workflow_by_name(unsaved_source_key)
+                self.engine.workflow_registry.set_file_path(unsaved_workflow, relative_file_path)
                 self.engine.workflow_manager.variable_substitution.rekey(unsaved_source_key, registry_key)
-                rekeyed_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
-                rekeyed_workflow.file_path = relative_file_path
             for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == unsaved_source_key:
                     workflow_context_state._name = registry_key
@@ -450,9 +449,6 @@ class WorkflowSaver(EngineScoped):
 
         existing_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
         existing_workflow.metadata = workflow_metadata
-        # Ensure file_path is populated even for pre-existing entries (defensive).
-        if existing_workflow.file_path is None:
-            existing_workflow.file_path = relative_file_path
 
         # Saving an open library workflow wrote a copy instead of the library's file. Move the
         # current context onto the copy, so the next save lands in it rather than in yet another copy.
