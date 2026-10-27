@@ -531,6 +531,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
         current_workflow: Name of active workflow (None if none)
+        current_workflow_id: Id of active workflow (None if none)
         workflow_file_path: Path to workflow file (None if none)
         has_active_flow: Whether there's an active flow running
         engine_name: Human-readable engine name
@@ -580,6 +581,8 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # Entries leave when the host is displaced or the session ends; nothing expires them, so a
     # host that crashed stays listed until then. Defaulted for backward compatibility.
     clients: list[SessionClient] = field(default_factory=list)
+    # Id of the active workflow (None if none). Defaulted for backward compatibility.
+    current_workflow_id: str | None = None
 
 
 @dataclass

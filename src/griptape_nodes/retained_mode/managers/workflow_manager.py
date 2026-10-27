@@ -492,6 +492,7 @@ class WorkflowManager(EngineScoped):
             return RegisterWorkflowResultFailure(result_details=details)
         return RegisterWorkflowResultSuccess(
             workflow_name=workflow.name,
+            workflow_id=workflow.workflow_id,
             result_details=ResultDetails(
                 message=f"Successfully registered workflow: {workflow.name}",
                 level=logging.DEBUG,
@@ -540,14 +541,14 @@ class WorkflowManager(EngineScoped):
         if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
             return ImportWorkflowResultFailure(result_details=load_metadata_result.result_details)
 
-        # Check if workflow is already registered by file path (registry key).
-        # The registry key is derived from the file path, not metadata.name (the display name).
-        workflow_name = derive_registry_key(request.file_path)
-        if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
-            # Workflow already exists - no need to re-register
+        # Check if the file is already registered. A file registered only because it was opened
+        # is registered below, which lists it.
+        existing = self.engine.workflow_registry.find_by_path(request.file_path)
+        if existing is not None and existing.listed:
             return ImportWorkflowResultSuccess(
-                workflow_name=workflow_name,
-                result_details=f"Workflow '{workflow_name}' already exists - no need to re-import.",
+                workflow_name=existing.name,
+                workflow_id=existing.workflow_id,
+                result_details=f"Workflow '{existing.name}' already exists - no need to re-import.",
             )
 
         # Now register the workflow with the extracted metadata
@@ -564,6 +565,7 @@ class WorkflowManager(EngineScoped):
 
         return ImportWorkflowResultSuccess(
             workflow_name=register_result.workflow_name,
+            workflow_id=register_result.workflow_id,
             result_details=ResultDetails(
                 message=f"Successfully imported workflow: {register_result.workflow_name}", level=logging.INFO
             ),

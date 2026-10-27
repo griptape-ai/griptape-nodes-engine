@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -40,6 +41,7 @@ from tests.simulated_worker import simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata as ExecutionNodeMetadata
@@ -529,12 +531,48 @@ class TestTheWorkerLoadsACopy:
         assert result.parameter_output_values["source"] == "Echo@abc"
 
     @pytest.mark.asyncio
+    async def test_a_workflow_file_gone_since_dispatch_fails_the_node_readably(
+        self, worker_engine: Engine, tmp_path: Path
+    ) -> None:
+        """The worker cannot open the orchestrator's workflow; the node fails with its own error, not an engine one."""
+        moved_away = tmp_path / "shots" / "lighting.py"
+
+        result = await worker_engine.ahandle_request(
+            _request_for(
+                "_EchoNode",
+                orchestrator_workflow_id="lighting-id",
+                workflow_name="shots/lighting",
+                workflow_file_path=str(moved_away),
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        message = str(result.result_details)
+        assert message == (
+            "Attempted to run a node of workflow 'shots/lighting'. Failed because the workflow's file "
+            f"'{moved_away}' could not be opened: it was moved or deleted while the node was starting. Run it again."
+        )
+        assert result.error is not None
+        assert isinstance(result.exception, ContextManager.MirroredWorkflowError)
+        assert _what_the_worker_holds(worker_engine) == set()
+
+    @pytest.mark.asyncio
     async def test_the_copy_and_its_flow_are_gone_after_the_run(self, worker_engine: Engine) -> None:
         result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         assert _what_the_worker_holds(worker_engine) == {_WORKER_COPIES_FLOW}
         assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_the_workflow_supplied_for_the_copy_flow_leaves_the_registry(self, worker_engine: Engine) -> None:
+        """With no orchestrator workflow, the workflow made to hold the copy's flow is not left registered."""
+        workflow_ids_before = worker_engine.workflow_registry.workflow_ids()
+
+        result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert worker_engine.workflow_registry.workflow_ids() == workflow_ids_before
 
     @pytest.mark.asyncio
     async def test_the_structure_it_was_sent_is_built_before_the_values_are_set(self, worker_engine: Engine) -> None:
