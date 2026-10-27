@@ -25,7 +25,9 @@ class SetWorkflowContextRequest(RequestPayload):
                        auto-registers an unsaved entry under it. When provided and
                        starting with the unsaved-registry-key prefix ("unsaved:"),
                        the handler auto-registers a fresh unsaved entry keyed by
-                       that exact value if one does not already exist.
+                       that exact value if one does not already exist. The prefix
+                       must be followed by a workflow id (32 lowercase hex digits);
+                       any other "unsaved:" name fails.
         display_name: Human-readable name used when auto-registering an unsaved entry.
                       Ignored when the workflow is already in the registry. Defaults to
                       None; in that case the auto-registered entry gets a placeholder

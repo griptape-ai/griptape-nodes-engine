@@ -3,9 +3,9 @@
 import ast
 import logging
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
 )
+from tests.workflow_context import empty_workflow_registry
 
 
 class TestPushWorkflow:
@@ -146,7 +147,7 @@ class TestPushWorkflow:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                with patch.dict(engine.workflow_registry._workflows, {}, clear=True):
+                with empty_workflow_registry(engine):
                     # Registered workspace-RELATIVE, so resolving the key genuinely depends on
                     # which workspace is active.
                     engine.workflow_registry.generate_new_workflow(
@@ -488,6 +489,34 @@ class TestWorkflowWorkingDirectory:
 
         with pytest.raises(context_manager.NoActiveWorkflowError):
             context_manager.get_current_workflow_working_directory()
+
+
+class TestUnsavedWorkflowNames:
+    """An "unsaved:" name only opens a new workflow when it carries a workflow id the engine could mint."""
+
+    def test_an_unsaved_name_with_a_hex_id_registers_the_workflow(self, engine: Engine) -> None:
+        name = f"unsaved:{uuid.uuid4().hex}"
+
+        with empty_workflow_registry(engine):
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(workflow_name=name))
+
+                assert isinstance(result, SetWorkflowContextSuccess)
+                assert engine.workflow_registry.has_workflow_with_name(name)
+            finally:
+                while engine.context_manager.has_current_workflow():
+                    engine.context_manager.pop_workflow()
+
+    @pytest.mark.parametrize("suffix", [str(uuid.UUID(int=1)), "abc-123", ""])
+    def test_an_unsaved_name_without_a_hex_id_is_refused(self, engine: Engine, suffix: str) -> None:
+        name = f"unsaved:{suffix}"
+
+        with empty_workflow_registry(engine):
+            result = engine.handle_request(SetWorkflowContextRequest(workflow_name=name))
+
+            assert isinstance(result, SetWorkflowContextFailure)
+            assert not engine.context_manager.has_current_workflow()
+            assert not engine.workflow_registry.has_workflow_with_name(name)
 
 
 class TestGeneratedWorkflowCode:

@@ -156,7 +156,7 @@ class WorkflowFileOperations(EngineScoped):
         )
 
     @handles(MoveWorkflowRequest)
-    def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0915
+    def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         try:
             # Validate source workflow exists
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
@@ -209,6 +209,13 @@ class WorkflowFileOperations(EngineScoped):
             )
             return MoveWorkflowResultFailure(result_details=details)
 
+        # A stale entry can still hold the target path after its file is gone, and the registry
+        # refuses to give one path to two workflows.
+        target_holder = self.engine.workflow_registry.find_by_path(new_absolute_path)
+        if target_holder is not None:
+            details = f"Failed to move workflow '{request.workflow_name}': Workflow '{target_holder.name}' is already registered at '{new_absolute_path}'."
+            return MoveWorkflowResultFailure(result_details=details)
+
         old_registry_key = derive_registry_key(old_relative_path)
         new_registry_key = derive_registry_key(new_relative_path)
 
@@ -217,14 +224,13 @@ class WorkflowFileOperations(EngineScoped):
             Path(current_file_path).rename(new_absolute_path)
 
             # Update workflow registry with new file path
-            workflow.file_path = new_relative_path
+            self.engine.workflow_registry.set_file_path(workflow, new_relative_path)
 
             # Remove old config entry if it existed (e.g. workflow was externally imported)
             config_manager.delete_user_workflow(old_relative_path)
 
-            # Update registry key if directory changed
+            # Update the rest of the bookkeeping if directory changed
             if old_registry_key != new_registry_key:
-                self.engine.workflow_registry.rekey_workflow(old_registry_key, new_registry_key)
                 self.engine.workflow_manager.variable_substitution.rekey(old_registry_key, new_registry_key)
                 context_manager = self.engine.context_manager
                 if (
