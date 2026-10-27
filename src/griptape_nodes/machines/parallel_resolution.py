@@ -742,10 +742,6 @@ class ExecuteDagState(State):
                     *(entry.subject for entry in unchecked),
                     *unchecked_locations_by_name(timed_out_locations(), {entry.location for entry in unchecked}),
                 ]
-            if unchecked_inputs:
-                await ExecuteDagState._report_unchecked_inputs(
-                    context, node_reference.node_reference.name, unchecked_inputs
-                )
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
@@ -768,6 +764,13 @@ class ExecuteDagState(State):
                 context.error_message = msg
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
+
+            # Only a node that goes on to run is told its unchecked inputs may still be rejected; a node
+            # that failed a check shows just that error, and the timeout is still in the log.
+            if unchecked_inputs:
+                await ExecuteDagState._report_unchecked_inputs(
+                    context, node_reference.node_reference.name, unchecked_inputs
+                )
 
             # We've set up the node for success completely. Now we check and handle accordingly if it's a for-each-start node
             # if False:

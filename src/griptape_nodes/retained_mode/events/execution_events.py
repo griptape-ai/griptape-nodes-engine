@@ -498,8 +498,9 @@ class NodeErrorEvent(ExecutionPayload):
 class NodeInputsNotCheckedEvent(ExecutionPayload):
     """Some of a node's inputs weren't checked before it ran, because reading them took too long.
 
-    The node still runs; the provider may still reject an input that wasn't checked. Sent once per
-    node, after its pre-run checks, when any video or audio input's probe ran out of time.
+    Sent once per node, when any video or audio input's probe ran out of time and the node passed
+    its other pre-run checks, so it runs; the provider may still reject an input that wasn't
+    checked. A node that fails a check gets only its `NodeErrorEvent`.
 
     Args:
         node_name: The node about to run.

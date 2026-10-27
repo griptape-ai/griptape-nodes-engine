@@ -157,8 +157,8 @@ async def test_tells_the_user_an_input_was_not_checked_and_runs_the_node(tmp_pat
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("slow_ffprobe")
-async def test_tells_the_user_before_failing_on_the_nodes_own_check(tmp_path: Path) -> None:
-    """The report goes out even when the node then fails its own check."""
+async def test_says_nothing_about_unchecked_inputs_when_the_node_fails_a_check(tmp_path: Path) -> None:
+    """A node that fails a check doesn't run, so it gets only its error, not the not-checked warning."""
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"video")
     node = _VideoNode(own_errors=[ValueError("A prompt is required.")])
@@ -168,7 +168,7 @@ async def test_tells_the_user_before_failing_on_the_nodes_own_check(tmp_path: Pa
     await asyncio.wait_for(machine.resolve_node(), timeout=5)
 
     assert "A prompt is required." in (machine.get_error_message() or "")
-    assert len(_unchecked_events(put_event)) == 1
+    assert _unchecked_events(put_event) == []
     assert len(_node_error_events(put_event)) == 1
 
 
