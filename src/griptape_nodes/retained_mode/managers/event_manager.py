@@ -347,11 +347,12 @@ class EventManager(EngineScoped):
             event: The event to publish to the queue
 
         Returns:
-            True once the event is on the queue, False when there is no queue to put it on --
-            which is the state before `initialize_queue` runs, so an event emitted during engine
-            construction or by a workflow file a script replays reaches nobody. Most callers can
-            ignore this; a caller that tracks what it has already announced needs it, so a
-            dropped event stays owed rather than being remembered as sent.
+            True once the event is on the queue, False when it never reached the queue -- either
+            there is no queue yet, which is the state before `initialize_queue` runs, so an event
+            emitted during engine construction or by a workflow file a script replays reaches
+            nobody, or the event is suppressed for the current context. Most callers can ignore
+            this; a caller that tracks what it has already announced needs it, so a dropped event
+            stays owed rather than being remembered as sent.
         """
         if self._event_queue is None:
             return False
