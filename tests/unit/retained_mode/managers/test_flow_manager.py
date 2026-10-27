@@ -361,6 +361,7 @@ class TestStartFlowFailureMessage:
 
     @pytest.fixture
     def ready_flow_manager(self, engine: Engine) -> Generator[Any, None, None]:
+        engine.context_manager.push_workflow(workflow_name="f_workflow")
         flow_manager = engine.flow_manager
         validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
         with (
@@ -384,10 +385,8 @@ class TestStartFlowFailureMessage:
         machine = MagicMock()
         machine.resolution_machine.is_errored.return_value = True
         machine.resolution_machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
-        with (
-            patch.object(ready_flow_manager, "start_flow"),
-            patch.object(ready_flow_manager, "_global_control_flow_machine", machine),
-        ):
+        ready_flow_manager._global_control_flow_machine = machine
+        with patch.object(ready_flow_manager, "start_flow"):
             result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
 
         assert isinstance(result, StartFlowResultFailure)
