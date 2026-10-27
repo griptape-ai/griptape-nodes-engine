@@ -498,6 +498,26 @@ class TestProbeTimeouts:
             # Read again from the block's readings, it still says the probe timed out.
             assert read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
 
+    def test_does_not_mark_the_audio_when_only_the_same_files_video_timed_out(
+        self, clip: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+            if "v:0" in cmd:
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac", "duration": "1.0"}]}
+                )
+            )
+
+        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(input_checks.subprocess, "run", run)
+        with input_check_readings():
+            assert read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
+            audio = read_media(str(clip), {MediaNeed.AUDIO}, kind="audio")
+        assert audio.audio is not None
+        assert audio.timed_out is False
+
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_forgets_timeouts_when_the_block_ends(self, clip: Path) -> None:
         with input_check_readings():

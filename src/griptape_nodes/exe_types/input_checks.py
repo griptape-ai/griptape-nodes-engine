@@ -116,9 +116,10 @@ _HALF_TURN_DEGREES = 180
 # None outside one. A reading that came back None is kept too, so an unreadable input isn't retried.
 _readings: ContextVar[dict[tuple[MediaNeed, str], Any] | None] = ContextVar("input_check_readings", default=None)
 
-# The locations whose probe ran out of time in the current `input_check_readings` block, or None
-# outside one.
-_timed_out: ContextVar[set[str] | None] = ContextVar("input_check_timed_out", default=None)
+# The probes that ran out of time in the current `input_check_readings` block, by the reading they
+# were for and location, or None outside one. A file's video and audio are probed separately, and
+# only one of them may time out.
+_timed_out: ContextVar[set[tuple[MediaNeed, str]] | None] = ContextVar("input_check_timed_out", default=None)
 
 
 class ImageInfo(NamedTuple):
@@ -164,8 +165,13 @@ def input_check_readings() -> Iterator[None]:
         _readings.reset(token)
 
 
-# The readings that run ffprobe, and so can run out of time.
+# The readings that run ffprobe, and so can run out of time, and which one probes each kind of media.
 _PROBE_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
+_PROBE_NEED_FOR_KIND: dict[MediaKind, MediaNeed] = {
+    "image": MediaNeed.IMAGE,
+    "video": MediaNeed.VIDEO,
+    "audio": MediaNeed.AUDIO,
+}
 
 
 def timed_out_locations() -> frozenset[str]:
@@ -174,7 +180,7 @@ def timed_out_locations() -> frozenset[str]:
     Includes probes a node's own checks ran by calling the readers directly, not only those its
     declared validators asked for. Empty outside a block.
     """
-    return frozenset(_timed_out.get() or ())
+    return frozenset(location for _need, location in _timed_out.get() or ())
 
 
 def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> MediaInfo:
@@ -185,9 +191,10 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
     `local_audio_probe` for `AUDIO`. A reading not asked for, or that couldn't be taken, is None.
     An image Pillow can't open, such as a HEIC photo, still has its format read from its file
     signature where that names one, so a format check can judge it while the size checks skip.
-    Inside `input_check_readings`, `timed_out` says whether this call asked for a video or audio
-    reading that was skipped because the input's probe ran out of time, in this call or an earlier
-    one in the block. A call that asked only for size or an image isn't marked, since its checks ran.
+    Inside `input_check_readings`, `timed_out` says whether a video or audio reading this call asked
+    for was skipped because its probe ran out of time, in this call or an earlier one in the block. A
+    reading it didn't ask for doesn't count, so an audio input isn't marked because the same file's
+    video probe timed out, and a call that asked only for size or an image isn't marked at all.
 
     Args:
         value: The media input: an artifact, a path, a URL or a data URI.
@@ -219,7 +226,7 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
         video=video,
         audio=audio,
         location=location,
-        timed_out=not _PROBE_NEEDS.isdisjoint(needs) and location in timed_out_locations(),
+        timed_out=any((need, location) in (_timed_out.get() or ()) for need in _PROBE_NEEDS.intersection(needs)),
     )
 
 
@@ -1116,11 +1123,11 @@ _INPUT_NOUN: dict[MediaKind, str] = {"image": "an image", "video": "a video", "a
 
 
 def _note_timed_out(location: str, kind: MediaKind, reason: str) -> None:
-    """Log that a probe ran out of time, and note its location in the current `input_check_readings` block."""
+    """Log that a probe ran out of time, and note it in the current `input_check_readings` block."""
     logger.warning("Skipped checking %s before the run because %s: %s", _INPUT_NOUN[kind], reason, location)
-    timed_out_locations = _timed_out.get()
-    if timed_out_locations is not None:
-        timed_out_locations.add(location)
+    timed_out = _timed_out.get()
+    if timed_out is not None:
+        timed_out.add((_PROBE_NEED_FOR_KIND[kind], location))
 
 
 def _record_matroska_doctype(data: dict[str, Any], path: Path) -> None:
