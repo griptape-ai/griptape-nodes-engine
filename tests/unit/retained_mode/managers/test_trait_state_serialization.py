@@ -132,9 +132,7 @@ def _registered_node_type() -> Generator[None, None, None]:
 
 
 def _add_node(engine: Engine, name: str) -> _ModelPicker:
-    context = engine.handle_request(
-        EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")
-    )
+    context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
     assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
     node = _ModelPicker(name=name, metadata={"library": _LIBRARY_NAME, "node_type": _ModelPicker.__name__})
     engine.object_manager.add_object_by_name(name, node)
@@ -316,9 +314,7 @@ class TestAnUnsaveableTraitValueDegradesTheSaveInsteadOfFailingIt:
     """A value with no saved form costs that one value, not the whole save."""
 
     def test_serializing_still_succeeds(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
-        context = engine.handle_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")
-        )
+        context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
         assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
         node = _MisdeclaredTraitNode(
             name="broken_node", metadata={"library": _LIBRARY_NAME, "node_type": _MisdeclaredTraitNode.__name__}
@@ -472,9 +468,7 @@ class TestFromStateRaisingAnUnexpectedError:
 
 
 def _add_declared_node(engine: Engine, name: str) -> _DeclaredControls:
-    context = engine.handle_request(
-        EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")
-    )
+    context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
     assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
     node = _DeclaredControls(name=name, metadata={"library": _LIBRARY_NAME, "node_type": _DeclaredControls.__name__})
     engine.object_manager.add_object_by_name(name, node)

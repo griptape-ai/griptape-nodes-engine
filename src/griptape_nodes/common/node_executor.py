@@ -45,7 +45,6 @@ from griptape_nodes.exe_types.node_types import (
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
-from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
@@ -417,6 +416,7 @@ class NodeExecutor(EngineScoped):
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
                     local_object_source=node.local_object_source,
+                    orchestrator_workflow_id=workflow_context.workflow_id,
                     workflow_name=workflow_context.name,
                     workflow_file_path=workflow_context.file_path,
                     workflow_working_directory=workflow_context.working_directory,
@@ -4277,32 +4277,28 @@ class NodeExecutor(EngineScoped):
         )
 
     async def _delete_workflow(self, workflow_path: Path) -> None:
-        # Derive the registry key from the workflow path using workspace-relative logic so it
-        # matches the key used during registration (push_workflow(file_path=__file__) in the workflow).
-        workspace_path = await anyio.Path(self.engine.config_manager.workspace_path).resolve()
-        resolved = await anyio.Path(workflow_path).resolve()
-        if resolved.is_relative_to(workspace_path):
-            path_for_key = str(resolved.relative_to(workspace_path))
-        else:
-            path_for_key = str(resolved)
-        workflow_name = derive_registry_key(path_for_key)
-
-        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
+        workflow = self.engine.workflow_registry.find_by_path(workflow_path)
+        if workflow is None:
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
+            # Unlisted: it is registered only to be deleted.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
             result = await self.engine.ahandle_request(load_workflow_metadata_request)
-            if isinstance(result, LoadWorkflowMetadataResultSuccess):
-                self.engine.workflow_registry.generate_new_workflow(
-                    registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
-                )
+            if not isinstance(result, LoadWorkflowMetadataResultSuccess):
+                logger.debug("Could not read workflow '%s' to clean it up: %s", workflow_path, result.result_details)
+                return
+            try:
+                workflow = self.engine.workflow_registry.register_file(workflow_path, result.metadata, listed=False)
+            except ValueError as err:
+                logger.debug("Could not register workflow '%s' to clean it up: %s", workflow_path, err)
+                return
 
-        delete_request = DeleteWorkflowRequest(name=workflow_name)
+        delete_request = DeleteWorkflowRequest(name=workflow.name)
         delete_result = await self.engine.ahandle_request(delete_request)
         if not isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.debug(
                 "Cleanup result for workflow '%s': %s",
-                workflow_name,
+                workflow.name,
                 delete_result.result_details,
             )
 

@@ -169,6 +169,7 @@ class WorkflowRunner(EngineScoped):
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
+                    workflow_id=self._current_workflow_id(),
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
@@ -202,6 +203,7 @@ class WorkflowRunner(EngineScoped):
         if execution_result.execution_successful:
             return RunWorkflowWithCurrentStateResultSuccess(
                 status=execution_result.status,
+                workflow_id=self._current_workflow_id(),
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
         return RunWorkflowWithCurrentStateResultFailure(
@@ -274,7 +276,9 @@ class WorkflowRunner(EngineScoped):
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
         result_messages.extend(execution_result_details(execution_result, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(
-            status=execution_result.status, result_details=ResultDetails(*result_messages)
+            status=execution_result.status,
+            workflow_id=workflow.workflow_id,
+            result_details=ResultDetails(*result_messages),
         )
 
     @handles(GetWorkflowRunCommandRequest)
@@ -392,6 +396,13 @@ class WorkflowRunner(EngineScoped):
             engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
+
+    def _current_workflow_id(self) -> str | None:
+        """The id of the workflow a load left in context, or None if it left none."""
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return None
+        return context_manager.get_current_workflow_id()
 
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, _WorkflowRegistry
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -46,8 +47,13 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
+
+# Workflow ids another engine minted, in the registry's form.
+_PEER_WORKFLOW_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+_OTHER_PEER_WORKFLOW_ID = "1f2e3d4c5b6a79808f9e8d7c6b5a4f3e"
 
 
 def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
@@ -710,9 +716,27 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result.result_details, ResultDetails)
         assert "project_name not yet implemented" in str(result.result_details)
 
+    @staticmethod
+    def _mirroring_context_manager(workspace: Path) -> ContextManager:
+        """A real ContextManager and registry with an empty stack: exactly a worker before adopting."""
+        engine = MagicMock()
+        engine.config_manager.workspace_path = workspace
+        context_manager = ContextManager(event_manager=MagicMock(), engine=engine)
+        engine.workflow_registry = _WorkflowRegistry(
+            engine.config_manager, is_workflow_open=context_manager.is_workflow_in_context
+        )
+        return context_manager
+
+    @staticmethod
+    def _workflow_file(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# stub")
+        return path
+
     def test_mirrored_workflow_context_resolves_the_lenders_folder(
         self,
         project_manager_with_template: ProjectManager,
+        tmp_path: Path,
     ) -> None:
         """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
 
@@ -721,12 +745,11 @@ class TestProjectManagerBuiltinVariables:
         worker writes where the orchestrator does not read, with no error at the divergence.
         """
         from griptape_nodes.common.macro_parser import ParsedMacro
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 
-        # A real ContextManager with an empty stack: exactly a worker before adopting.
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        show_folder = tmp_path / "orchestrator" / "shows" / "my_show"
+        workflow_file = self._workflow_file(show_folder / "my_show.py")
+        context_manager = self._mirroring_context_manager(show_folder)
         project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
         project_manager_with_template._engine.context_manager = context_manager
 
         dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
@@ -738,48 +761,178 @@ class TestProjectManagerBuiltinVariables:
             GetPathForMacroResultSuccess,
         )
 
-        context_manager.mirror_workflow_context("my_show", "/orchestrator/shows/my_show/my_show.py", None)
+        context_manager.mirror_workflow_context("show-id", "my_show", str(workflow_file), None)
 
         resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
         resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
 
         assert isinstance(resolved_dir, GetPathForMacroResultSuccess)
-        assert resolved_dir.resolved_path == Path("/orchestrator/shows/my_show/output.txt")
+        assert resolved_dir.resolved_path == show_folder / "output.txt"
         # workflow_name is the same defect, fixed by the same adoption rather than a second handoff.
         assert isinstance(resolved_name, GetPathForMacroResultSuccess)
         assert resolved_name.resolved_path.name == "my_show.txt"
-        mock_workflow_registry.get_workflow_by_name.assert_not_called()
 
-    def test_mirroring_keeps_the_stack_indexable(self) -> None:
+    def test_mirroring_registers_the_peers_workflow_unlisted_under_its_id(self, tmp_path: Path) -> None:
+        """The worker's entry carries the orchestrator's id and stays out of the worker's workflow list."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "w.py")
+
+        context_manager.mirror_workflow_context("peer-id", "w", str(workflow_file), None)
+
+        registry = context_manager.engine.workflow_registry
+        assert context_manager.get_current_workflow_id() == "peer-id"
+        assert registry.get("peer-id").listed is False
+        assert registry.list_workflows() == {}
+
+    def test_mirroring_an_unsaved_workflow_answers_its_working_directory(self, tmp_path: Path) -> None:
+        context_manager = self._mirroring_context_manager(tmp_path)
+
+        context_manager.mirror_workflow_context(
+            _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, str(tmp_path / "shots")
+        )
+
+        assert context_manager.get_current_workflow_name() == f"unsaved:{_PEER_WORKFLOW_ID}"
+        assert context_manager.get_current_workflow_file_path() is None
+        assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
+
+    def test_mirroring_follows_the_peer_saving_its_workflow(self, tmp_path: Path) -> None:
+        """A peer that first saved the workflow since the last mirror moves this engine's entry, same id."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        workflow_file = self._workflow_file(tmp_path / "saved.py")
+
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "saved", str(workflow_file), None)
+
+        assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+        assert context_manager.get_current_workflow_name() == "saved"
+        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+
+    def test_mirroring_takes_the_peers_id_for_a_file_known_here_under_another(self, tmp_path: Path) -> None:
+        """The peer's id is the authority: this engine's stale entry for the file is replaced, not used."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        workflow_file = self._workflow_file(tmp_path / "w.py")
+        local = registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="w",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
+
+        context_manager.mirror_workflow_context("orchestrator-id", "w", str(workflow_file), None)
+
+        assert context_manager.get_current_workflow_id() == "orchestrator-id"
+        assert registry.find_by_id(local.workflow_id) is None
+        assert registry.find_by_path(workflow_file) is registry.get("orchestrator-id")
+
+    def test_mirroring_moves_the_peers_unsaved_entry_onto_a_file_known_here_under_another_id(
+        self, tmp_path: Path
+    ) -> None:
+        """The peer first saved its unsaved workflow onto a file this engine scanned under another id."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        workflow_file = self._workflow_file(tmp_path / "b.py")
+        local = registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="b",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
+
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "b", str(workflow_file), None)
+
+        assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+        assert registry.find_by_id(local.workflow_id) is None
+        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+
+    def test_mirroring_a_file_that_is_gone_fails_naming_the_workflow_and_file(self, tmp_path: Path) -> None:
+        context_manager = self._mirroring_context_manager(tmp_path)
+        missing = tmp_path / "moved_away.py"
+
+        with pytest.raises(context_manager.MirroredWorkflowError) as raised:
+            context_manager.mirror_workflow_context("peer-id", "moved_away", str(missing), None)
+
+        assert "workflow 'moved_away'" in str(raised.value)
+        assert str(missing) in str(raised.value)
+
+    def test_replacing_the_mirror_drops_the_entry_it_registered(self, tmp_path: Path) -> None:
+        """A long-lived worker does not keep an entry for every peer workflow it ever ran a node for."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+
+        context_manager.mirror_workflow_context(
+            _OTHER_PEER_WORKFLOW_ID, f"unsaved:{_OTHER_PEER_WORKFLOW_ID}", None, None
+        )
+
+        assert registry.find_by_id(_PEER_WORKFLOW_ID) is None
+        assert registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is not None
+
+        context_manager.mirror_workflow_context(None, None, None, None)
+
+        assert registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is None
+
+    def test_replacing_the_mirror_keeps_an_entry_from_this_engines_scan(self, tmp_path: Path) -> None:
+        """The scanned entry goes to the peer's id, and stays listed, so dropping the mirror keeps it."""
+        context_manager = self._mirroring_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        workflow_file = self._workflow_file(tmp_path / "scanned.py")
+        registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="scanned",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
+        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "scanned", str(workflow_file), None)
+
+        context_manager.mirror_workflow_context(
+            _OTHER_PEER_WORKFLOW_ID, f"unsaved:{_OTHER_PEER_WORKFLOW_ID}", None, None
+        )
+
+        kept = registry.find_by_id(_PEER_WORKFLOW_ID)
+        assert kept is not None
+        assert kept.listed
+        assert registry.find_by_path(workflow_file) is kept
+
+    def test_mirroring_keeps_the_stack_indexable(self, tmp_path: Path) -> None:
         """Adoption installs a REAL entry, so stack-indexing readers stay safe.
 
         `has_current_workflow()` also means "there is an entry to index", so answering it True
         without one raises IndexError in has_current_flow, push_flow, pop_flow and the setters.
         """
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("w", "/a/b/w.py", None)
+        context_manager = self._mirroring_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "w.py")
+        context_manager.mirror_workflow_context("w-id", "w", str(workflow_file), None)
 
         assert context_manager.has_current_workflow() is True
         assert context_manager.has_current_flow() is False
         assert context_manager.get_current_workflow_name() == "w"
-        assert context_manager.get_current_workflow_file_path() == "/a/b/w.py"
+        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-    def test_mirroring_replaces_rather_than_stacks(self) -> None:
+    def test_mirroring_replaces_rather_than_stacks(self, tmp_path: Path) -> None:
         """A mirror tracks ONE peer context; stacking would leave a stale workflow to be read."""
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("first", "/a/first.py", None)
-        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+        context_manager = self._mirroring_context_manager(tmp_path)
+        first = self._workflow_file(tmp_path / "first.py")
+        second = self._workflow_file(tmp_path / "second.py")
+        context_manager.mirror_workflow_context("first-id", "first", str(first), None)
+        context_manager.mirror_workflow_context("second-id", "second", str(second), None)
         # Re-adopting the same context must not grow the stack either.
-        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+        context_manager.mirror_workflow_context("second-id", "second", str(second), None)
 
         assert len(context_manager._workflow_stack) == 1
         assert context_manager.get_current_workflow_name() == "second"
 
-    def test_mirroring_an_empty_context_drops_the_previous_one(self) -> None:
+    def test_mirroring_an_empty_context_drops_the_previous_one(self, tmp_path: Path) -> None:
         """A peer with no workflow must leave this engine with none either.
 
         The mirror is replaced in place and never popped, so skipping the empty case left the
@@ -787,12 +940,11 @@ class TestProjectManagerBuiltinVariables:
         folder while the orchestrator degraded to workspace-relative, and wrote a real file
         where the orchestrator does not read.
         """
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        context_manager = self._mirroring_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "showA.py")
+        context_manager.mirror_workflow_context("show-a", "showA", str(workflow_file), None)
 
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("showA", "/a/showA.py", None)
-
-        context_manager.mirror_workflow_context(None, None, None)
+        context_manager.mirror_workflow_context(None, None, None, None)
 
         assert context_manager.has_current_workflow() is False
 
@@ -815,6 +967,7 @@ class TestProjectManagerBuiltinVariables:
         """Raw context, not a resolved path: derived values are then computed by the peer."""
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_id.return_value = "show_id"
         mock_context_manager.get_current_workflow_name.return_value = "my_show"
         mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
         mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
@@ -823,6 +976,7 @@ class TestProjectManagerBuiltinVariables:
 
         snapshot = project_manager_with_template.workflow_context_for_dispatch()
 
+        assert snapshot.workflow_id == "show_id"
         assert snapshot.name == "my_show"
         assert snapshot.file_path == "/shows/my_show/my_show.py"
         assert snapshot.working_directory == "/shows/my_show"

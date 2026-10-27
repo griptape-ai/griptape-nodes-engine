@@ -4990,6 +4990,7 @@ class ProjectManager(EngineScoped):
             return WorkflowContextSnapshot()
 
         return WorkflowContextSnapshot(
+            workflow_id=context_manager.get_current_workflow_id(),
             name=context_manager.get_current_workflow_name(),
             file_path=context_manager.get_current_workflow_file_path(),
             working_directory=context_manager.get_current_workflow_working_directory(),

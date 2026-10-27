@@ -226,7 +226,9 @@ class TestGetFlowSummary:
     def test_untouched_nodes_have_no_values(self, engine: Engine) -> None:
         summary = _summary(engine)
 
-        assert summary.workflow_name == "flow_summary_wf"
+        # An unregistered name opens an unsaved workflow, whose registry name is "unsaved:<id>".
+        assert summary.workflow_name == engine.context_manager.get_current_workflow_name()
+        assert (summary.workflow_name or "").startswith("unsaved:")
         assert summary.flow_name == "main"
         assert summary.nodes == [
             FlowSummaryNode(
