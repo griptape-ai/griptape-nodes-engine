@@ -56,6 +56,12 @@ class AppStartSessionRequest(RequestPayload):
     Results: AppStartSessionResultSuccess (with session ID) | AppStartSessionResultFailure (session creation error)
     """
 
+    # A client that names itself is listed on the session (see SessionClient) so engine
+    # discovery can show who is attached. Blank client_id keeps today's anonymous join.
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
 
 @dataclass
 @PayloadRegistry.register
@@ -435,6 +441,53 @@ class AppEndSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class AppJoinSessionRequest(RequestPayload):
+    """Join the named session, which must be the active one, and list the client on it.
+
+    Start creates-or-joins without naming a session; Join is for a client that already holds a
+    session id, e.g. one restored from storage, and wants the engine to refuse a stale id.
+    """
+
+    session_id: str
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+    session_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultFailure(ResultPayloadFailure):
+    """Join failed: no session is active, or the named one is not the active session."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionRequest(RequestPayload):
+    """Delist a client from the active session without ending it."""
+
+    client_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+    """The client is no longer listed; leaving when never listed succeeds too."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultFailure(ResultPayloadFailure):
+    """Leave failed because no session is active."""
+
+
+@dataclass
+@PayloadRegistry.register
 class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use ensure the engine session is still active."""
 
@@ -462,6 +515,16 @@ class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """
 
     heartbeat_id: str
+
+
+@dataclass
+class SessionClient:
+    """A client registered on the active session: an opaque id the client minted, its kind, and a display label."""
+
+    client_id: str
+    client_type: str
+    connected_at: str
+    client_label: str = ""
 
 
 @dataclass
@@ -524,6 +587,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # always fills this in, so the "" default means the heartbeat came from an engine too old
     # to report it -- a client should show nothing rather than guess.
     engine_os: str = ""
+    # Clients that identified themselves to the active session (SessionManager.attach_client),
+    # so a discovery client can tell a free engine from one another host is already driving.
+    # Entries leave when the host is displaced or the session ends; nothing expires them, so a
+    # host that crashed stays listed until then. Defaulted for backward compatibility.
+    clients: list[SessionClient] = field(default_factory=list)
 
 
 @dataclass

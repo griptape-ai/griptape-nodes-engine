@@ -655,6 +655,7 @@ class Engine:
                 engine_os=self._os_manager.platform_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
+                clients=self._session_manager.clients,
                 timestamp=datetime.now(tz=UTC).isoformat(),
                 user=user,
                 user_organization=user_organization,
