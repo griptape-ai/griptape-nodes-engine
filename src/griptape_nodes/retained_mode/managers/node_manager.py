@@ -1433,18 +1433,20 @@ class NodeManager(EngineScoped):
         # affect it.
         releasable_handle_keys = self._cached_objects_owned_by(node)
 
+        parent_flow_name = self._name_to_parent_flow_name[node_name]
+        try:
+            parent_flow = self.engine.flow_manager.get_flow_by_name(parent_flow_name)
+        except KeyError as err:
+            details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
+            return DeleteNodeResultFailure(result_details=details)
+
+        # Awaited outside the node context: the context stack is shared, so holding the node on it
+        # across an await lets another request's push or pop land on top of it.
+        cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
+        if cancel_outcome.failure is not None:
+            return cancel_outcome.failure
+
         with self.engine.context_manager.node(node=node):
-            parent_flow_name = self._name_to_parent_flow_name[node_name]
-            try:
-                parent_flow = self.engine.flow_manager.get_flow_by_name(parent_flow_name)
-            except KeyError as err:
-                details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
-                return DeleteNodeResultFailure(result_details=details)
-
-            cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
-            if cancel_outcome.failure is not None:
-                return cancel_outcome.failure
-
             # The node is leaving, so the live DAG has to stop naming it: it is published to the
             # editor as an involved node, iterated on cancel, and checked before a node is allowed
             # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
