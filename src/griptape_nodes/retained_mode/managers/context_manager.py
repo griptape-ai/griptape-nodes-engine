@@ -24,6 +24,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
+from griptape_nodes.retained_mode.managers.event_manager import current_request_type
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
@@ -898,7 +899,11 @@ class ContextManager(EngineScoped):
             workflow.working_directory = working_directory
         if not self._workflow_stack:
             # The workflow at the bottom of the stack is the open one. A push onto it opens nothing.
-            self.engine.open_workflows.open(workflow.workflow_id)
+            opened = self.engine.open_workflows.open(workflow.workflow_id)
+            if current_request_type() is not None:
+                # A request that opens a workflow acts on it for the rest of the request. Outside a
+                # request nothing is bound: the work acts on the only open workflow.
+                self.engine.enter_opened_workflow(opened)
         self._workflow_stack.append(self.WorkflowContextState(workflow.workflow_id))
         return workflow.name
 

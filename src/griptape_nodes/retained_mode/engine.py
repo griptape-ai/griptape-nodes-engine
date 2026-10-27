@@ -644,6 +644,14 @@ class Engine:
         finally:
             bound_workflow.reset(token)
 
+    def enter_opened_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Act on `workflow`, which the current request just opened, for the rest of that request.
+
+        A load acts on the workflow it opens, so the loaded file builds into it. Only the current
+        context is bound, so dispatch's token reset ends the binding with the request.
+        """
+        bound_workflow.set(workflow)
+
     def leave_closed_workflow(self, workflow: WorkflowRuntime) -> None:
         """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
 
