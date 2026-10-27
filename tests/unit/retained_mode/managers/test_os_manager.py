@@ -362,9 +362,13 @@ class TestReadFileRequestImagePreview:
         content = b"not a real exr, just needs to never be decoded"
         file_path.write_bytes(content)
 
-        with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
-        ) as mock_create_preview:
+        # Windows' mimetypes table has no .exr entry; pin the image/aces guess Linux and macOS make.
+        with (
+            patch("mimetypes.guess_type", return_value=("image/aces", None)),
+            patch(
+                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+            ) as mock_create_preview,
+        ):
             request = ReadFileRequest(file_path=str(file_path))
             result = engine.handle_request(request)
 
