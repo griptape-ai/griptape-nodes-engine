@@ -775,6 +775,19 @@ class _WorkflowRegistry:
         return [kept, followed]
 
 
+# The engine version that removes the deprecated `WorkflowRegistry` classmethods.
+_DEPRECATED_METHODS_REMOVAL_VERSION = "0.110.0"
+
+
+def _log_deprecated(method_name: str, replacement: str) -> None:
+    logger.warning(
+        "WorkflowRegistry.%s() is deprecated and will be removed in version %s. Use %s instead.",
+        method_name,
+        _DEPRECATED_METHODS_REMOVAL_VERSION,
+        replacement,
+    )
+
+
 class WorkflowRegistry:
     """The current engine's workflow registry, for node libraries.
 
@@ -791,12 +804,14 @@ class WorkflowRegistry:
         metadata: WorkflowMetadata,
         file_path: str | None = None,
     ) -> Workflow:
+        _log_deprecated("generate_new_workflow", "RegisterWorkflowRequest")
         return _current_registry().generate_new_workflow(
             registry_key=registry_key, metadata=metadata, file_path=file_path
         )
 
     @classmethod
     def ensure_unsaved(cls, key: str, display_name: str) -> Workflow:
+        _log_deprecated("ensure_unsaved", "SetWorkflowContextRequest")
         return _current_registry().ensure_unsaved(key=key, display_name=display_name)
 
     @classmethod
@@ -817,10 +832,12 @@ class WorkflowRegistry:
 
     @classmethod
     def delete_workflow_by_name(cls, name: str) -> Workflow:
+        _log_deprecated("delete_workflow_by_name", "DeleteWorkflowRequest")
         return _current_registry().delete_workflow_by_name(name)
 
     @classmethod
     def clear_user_workflows(cls) -> None:
+        _log_deprecated("clear_user_workflows", "RefreshWorkflowRegistryRequest")
         # Test suites call this right after reset_root_engine(). Building an engine here would boot
         # it before their config patches apply, and a fresh engine has nothing to clear anyway.
         # Deferred import: see _current_registry.
@@ -832,6 +849,7 @@ class WorkflowRegistry:
 
     @classmethod
     def rekey_workflow(cls, old_key: str, new_key: str) -> None:
+        _log_deprecated("rekey_workflow", "MoveWorkflowRequest or RenameWorkflowRequest")
         _current_registry().rekey_workflow(old_key, new_key)
 
     @classmethod
