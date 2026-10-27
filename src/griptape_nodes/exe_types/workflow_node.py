@@ -72,9 +72,9 @@ STATUS_PARAMETER_NAMES = frozenset({"was_successful", "result_details"})
 # offer a "view the subflow" affordance during a session.
 SUBFLOW_NAME_KEY = "subflow_name"
 
-# Node-metadata flag the editor uses to recognize a node that runs a workflow. Presence of this key
-# is what makes the editor render the node with its subflow-preview wrapper (see
-# `determineNodeType` in the editor's ConstructNode.ts), which offers a "View Subflow" button.
+# Node-metadata flag the editor uses to recognize a node that runs a workflow. When its value is
+# True, the editor renders the node with its subflow-preview wrapper (see `determineNodeType` in the
+# editor's ConstructNode.ts), which offers a "View Subflow" button. Only the editor reads it.
 WORKFLOW_NODE_KEY = "workflow_node"
 
 # Node-metadata key holding the registry key of the backing workflow. The editor's preview reads
@@ -329,6 +329,7 @@ class WorkflowNode(ControlNode):
         # subflow it names is transient and never serialized, so any name that reaches us here is
         # stale (or, after a copy/paste, belongs to a different node).
         self.metadata.pop(SUBFLOW_NAME_KEY, None)
+        # The editor reads this key to show the subflow preview and "View Subflow" button.
         self.metadata[WORKFLOW_NODE_KEY] = True
         self._publish_workflow_registry_key()
 
