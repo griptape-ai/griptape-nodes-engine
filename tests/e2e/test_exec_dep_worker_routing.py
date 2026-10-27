@@ -21,17 +21,26 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import pytest
 
+from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.execution_events import (
+    ExecuteNodeRequest,
+    ExecuteNodeResultSuccess,
+    NodeMetadata,
+)
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     SendNodeMessageRequest,
     SendNodeMessageResultSuccess,
 )
@@ -43,6 +52,7 @@ from griptape_nodes.testing.offline_wheels import build_wheel, offline_install_f
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
 from griptape_nodes.utils.version_utils import engine_version
 from tests.e2e.fixtures.behavior_preservation_library.behavior_preservation_node import CLICK_ACKNOWLEDGEMENT
+from tests.simulated_worker import simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -343,36 +353,38 @@ class TestUnshippableOutputIsKept:
     @pytest.mark.asyncio
     async def test_worker_producing_an_unshippable_value_ships_a_reference(self, tmp_path: Path) -> None:
         """A serializable=False output stays in the worker and a reference crosses in its place."""
-        from griptape_nodes.exe_types.local_objects import is_reference
-        from griptape_nodes.retained_mode.events.execution_events import (
-            ExecuteNodeRequest,
-            ExecuteNodeResultSuccess,
-        )
-
         _register(
             tmp_path,
             fixture_dir=NONSERIALIZABLE_FIXTURE,
             node_file="nonserializable_nodes.py",
             name="Guardrail Library",
         )
-        library_manager = current_engine().library_manager
-        library_manager._is_worker = True
-        node = LibraryRegistry.create_node(
-            node_type="ProducerNode", name="Producer", specific_library_name="Guardrail Library"
+        engine = current_engine()
+        engine.context_manager.push_workflow(workflow_name="unshippable_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="unshippable_flow", set_as_new_context=False)
         )
-        current_engine().object_manager.add_object_by_name("Producer", node)
-
-        result = await current_engine().ahandle_request(
-            ExecuteNodeRequest(
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+        create_result = engine.handle_request(
+            CreateNodeRequest(
+                node_type="ProducerNode",
+                specific_library_name="Guardrail Library",
                 node_name="Producer",
-                node_metadata={"node_type": "ProducerNode", "library": "Guardrail Library"},
+                override_parent_flow_name=flow_result.flow_name,
             )
         )
+        assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        node = engine.node_manager.get_node_by_name("Producer")
+
+        with simulated_worker(engine, "Guardrail Library") as worker:
+            result = await engine.ahandle_request(
+                ExecuteNodeRequest(node_name="Producer", node_metadata=cast("NodeMetadata", dict(node.metadata)))
+            )
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         sent = result.parameter_output_values["session"]
         assert is_reference(sent), sent
-        entry = current_engine().resource_manager.entry_for(sent["key"])
+        entry = worker.engine.resource_manager.entry_for(sent["key"])
         assert entry is not None
         assert entry.value.marker == "live-session-marker"
 
