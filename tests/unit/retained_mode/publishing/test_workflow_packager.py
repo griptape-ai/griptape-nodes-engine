@@ -2137,6 +2137,6 @@ def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
         metadata=metadata,
         absolute_path=Path(file_path),
     )
-    # The registry form `file_path` reports, set as the registry would when it indexes the entry.
-    workflow._file_path = file_path
+    # The registry form `file_path` reports, set as the registry would when it registers the entry.
+    workflow._keys = workflow._keys._replace(file_path=file_path)
     return workflow
