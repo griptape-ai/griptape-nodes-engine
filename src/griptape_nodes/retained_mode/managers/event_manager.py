@@ -385,7 +385,7 @@ class EventManager(EngineScoped):
             event: The event to publish to the queue
 
         Returns:
-            True once the event is on the queue, False when there is no queue to put it on. See
+            True once the event is on the queue, False when it never reached the queue. See
             `put_event`.
         """
         if self._event_queue is None:

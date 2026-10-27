@@ -1057,14 +1057,13 @@ class ContextManager(EngineScoped):
             )
             return
 
-        # No queue yet means no client is attached yet, so this is a normal startup state rather
-        # than a fault -- an engine under construction, or a workflow file a script or the CLI
-        # replays before the queue exists -- which is why it is logged quietly. It is still a
-        # dropped event, and it is left owed for the same reason as the raise above.
+        # Not queued means no queue yet (an engine under construction, or a workflow file a script
+        # or the CLI replays) or a suppressed event. Neither is a fault, so it is logged quietly,
+        # but it is still a dropped event and is left owed for the same reason as the raise above.
         if not event_was_queued:
             self._switch_owed = True
             logger.debug(
-                "Did not tell connected editors that %s: the engine has no event queue yet. They will be "
+                "Did not tell connected editors that %s: the event was not broadcast. They will be "
                 "told at the next switch; a client that connects in between reads the current workflow "
                 "with a GetWorkflowContext request.",
                 switched_to,
