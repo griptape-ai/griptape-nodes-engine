@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -103,6 +104,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from contextvars import Token
     from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -115,6 +117,14 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+# How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
+#
+# Scoped to the context rather than to the manager because a squelch belongs to the load that
+# entered it, not to a workflow: a load closes the workflow it starts from and opens the one it
+# loads. A ContextVar is inherited by the requests the load dispatches, the tasks it spawns, and
+# `asyncio.to_thread` work, so edits made from any other task are still reported as edits.
+_squelch_workflow_altered_depth: ContextVar[int] = ContextVar("_squelch_workflow_altered_depth", default=0)
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -167,9 +177,10 @@ class WorkflowManager(EngineScoped):
 
         def __init__(self, manager: WorkflowManager):
             self.manager = manager
+            self._token: Token[int] | None = None
 
         def __enter__(self) -> None:
-            self.manager._squelch_workflow_altered_count += 1
+            self._token = _squelch_workflow_altered_depth.set(_squelch_workflow_altered_depth.get() + 1)
 
         def __exit__(
             self,
@@ -177,9 +188,8 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._squelch_workflow_altered_count -= 1
-
-    _squelch_workflow_altered_count: int = 0
+            if self._token is not None:
+                _squelch_workflow_altered_depth.reset(self._token)
 
     # Track referenced workflow import context stack
     class ReferencedWorkflowContext:
@@ -190,7 +200,9 @@ class WorkflowManager(EngineScoped):
             self.workflow_name = workflow_name
 
         def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            self.manager._referenced_workflow_stack.append(self.workflow_name)
+            # Held so the exit pops the stack the enter pushed onto.
+            self._referenced_workflow_stack = self.manager._referenced_workflow_stack
+            self._referenced_workflow_stack.append(self.workflow_name)
             return self
 
         def __exit__(
@@ -199,15 +211,11 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._referenced_workflow_stack.pop()
-
-    _referenced_workflow_stack: list[str] = field(default_factory=list)
+            self._referenced_workflow_stack.pop()
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
-        self._squelch_workflow_altered_count = 0
-        self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -227,15 +235,28 @@ class WorkflowManager(EngineScoped):
         self.referenced_import = ReferencedWorkflowImport(event_manager, engine=engine)
         event_manager.register_request_handlers(self)
 
+    @property
+    def _referenced_workflow_stack(self) -> list[str]:
+        """The current workflow's referenced-import stack.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        return self.engine.current_workflow().loading.referenced_workflow_stack
+
     def has_current_referenced_workflow(self) -> bool:
-        """Check if there is currently a referenced workflow context active."""
-        return len(self._referenced_workflow_stack) > 0
+        """Check if there is currently a referenced workflow context active. False when no workflow is current."""
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return False
+        return len(workflow.loading.referenced_workflow_stack) > 0
 
     def get_current_referenced_workflow(self) -> str:
         """Get the current workflow source path from the context stack.
 
         Raises:
             IndexError: If no referenced workflow context is active.
+            NoOpenWorkflowError: No workflow is current.
         """
         return self._referenced_workflow_stack[-1]
 
@@ -455,7 +476,7 @@ class WorkflowManager(EngineScoped):
         return self.WorkflowSquelchContext(self)
 
     def should_squelch_workflow_altered(self) -> bool:
-        return self._squelch_workflow_altered_count > 0
+        return _squelch_workflow_altered_depth.get() > 0
 
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.

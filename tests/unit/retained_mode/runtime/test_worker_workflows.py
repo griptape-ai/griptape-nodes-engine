@@ -60,6 +60,9 @@ class TestWorkerWorkflows:
         assert engine._get_current_workflow_info()["current_workflow_id"] is None
         with engine.run_in_worker_workflow(workflow):
             assert engine.context_manager.get_current_workflow_id() == PEER_ID
+            # The workflow manager reads the same current workflow as the context manager.
+            with engine.workflow_manager.referenced_workflow("library_workflow"):
+                assert workflow.loading.referenced_workflow_stack == ["library_workflow"]
             with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
                 engine.context_manager.push_workflow(workflow_name="local")
 
