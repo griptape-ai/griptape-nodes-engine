@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 
 
 class RunState(StrEnum):
@@ -52,6 +53,8 @@ class Run:
     run_id: str
     spec: RunSpec
     flow_name: str
+    # The run state of the workflow the run belongs to: the line it waits in and the machine it runs on.
+    flows: WorkflowFlows
     queued_at: datetime
     state: RunState
     # What the run's request returns, set once the request is done.
