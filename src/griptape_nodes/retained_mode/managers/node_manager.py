@@ -65,6 +65,7 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.files.directory import DirectoryDestinationProvider
 from griptape_nodes.files.file import FileDestinationProvider
 from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
@@ -3664,6 +3665,12 @@ class NodeManager(EngineScoped):
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
+
+        Like node groups and loops, a Workflow node is the exception and stays in this
+        process: it imports, starts and reads its subflow from this process's flows. The
+        nodes inside its subflow are still routed to their own workers. The check sits here
+        rather than in `NodeExecutor._run_node` beside the group and loop checks, so the
+        node keeps the request path's hydration and failure reporting.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3686,7 +3693,9 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        if node is not None and workflow is not None:
+        #
+        # Workflow nodes stay in this process; see the docstring.
+        if node is not None and workflow is not None and not isinstance(node, WorkflowNode):
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
