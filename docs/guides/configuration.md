@@ -248,7 +248,7 @@ Your workstation looks the engine up by its ID in the engine registry, on the ad
 A few things to know:
 
 - Both engines must run the same engine version and the same version of each library you send there, and see the same workspace, such as a shared network drive. If something doesn't match, or the engine can't be reached, the node fails with a message that says what is wrong.
-- The nodes run on your Griptape Nodes license and Griptape Cloud API key, never the GPU engine's, and ask your workstation for secrets.
+- The nodes run on the Griptape Nodes license or Griptape Cloud API key set up on the GPU computer, in its `GRIPTAPE_NODES_LICENSE` or `GT_CLOUD_API_KEY` environment variable, the same way the GPU engine itself does. Your workstation never sends its license or API key there. Other secrets a node asks for come from your workstation.
 - Use one GPU engine per artist for now. Sharing an engine between artists is not supported yet: if two artists send work to the same engine, their nodes run there at the same time.
 - Library names are case-sensitive, so set this in a `griptape_nodes_config.json` file rather than an environment variable, whose name is lowercased before it becomes a config key.
 

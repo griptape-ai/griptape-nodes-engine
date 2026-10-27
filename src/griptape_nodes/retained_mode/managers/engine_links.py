@@ -46,7 +46,7 @@ class EngineLinks(Protocol):
         """The environment a worker this engine runs for `engine_id` needs to reach that engine.
 
         A worker reaches the engine whose session it joins the way that engine reached this one:
-        over this engine's own server, or over the Griptape Cloud relay with the artist's credentials.
+        over this engine's own server, or over the Griptape Cloud relay.
         """
         ...
 

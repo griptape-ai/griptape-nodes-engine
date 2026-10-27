@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 
-from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME, LICENSE_SECRET_NAME
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import converters, worker_events
@@ -78,9 +77,7 @@ class _SessionRegistration:
     """What an engine knows about an artist's session on another engine it runs workers for."""
 
     engine_id: str
-    license_token: str | None
     static_server_base_url: str | None
-    api_key: str | None
     refused_libraries: dict[str, str]
     # The libraries the session declared, each checked against this engine's when it registered.
     declared_libraries: frozenset[str]
@@ -1328,9 +1325,7 @@ class WorkerManager(EngineScoped):
             schema_version=DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
             engine_version=engine_version,
             library_versions=library_versions,
-            license_token=self.engine.secrets_manager.get_secret(LICENSE_SECRET_NAME, should_error_on_not_found=False),
             static_server_base_url=await self._orchestrator_static_server_base_url(),
-            api_key=self.engine.secrets_manager.get_secret(API_KEY_SECRET_NAME, should_error_on_not_found=False),
         )
         result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         # Catches a registry record or address that leads to the wrong engine. It cannot catch one
@@ -1437,9 +1432,7 @@ class WorkerManager(EngineScoped):
                 )
         self._sessions[session_id] = _SessionRegistration(
             engine_id=sender.engine_id,
-            license_token=request.license_token,
             static_server_base_url=request.static_server_base_url,
-            api_key=request.api_key,
             refused_libraries=refused,
             declared_libraries=frozenset(request.library_versions),
         )
@@ -1471,12 +1464,8 @@ class WorkerManager(EngineScoped):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
         # Read before anything awaits, since a lost link can forget the session meanwhile.
         session = self._sessions[session_id]
-        # The worker runs on the artist's credentials, never this engine's: one the artist has none
-        # of is set empty, which hides this engine's from the worker.
-        environ_overrides = {
-            LICENSE_SECRET_NAME: session.license_token or "",
-            API_KEY_SECRET_NAME: session.api_key or "",
-        }
+        # The worker runs on this machine's license or API key, which it inherits like a local worker.
+        environ_overrides: dict[str, str] = {}
         # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
         if session.static_server_base_url is not None:
             environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
@@ -1652,7 +1641,7 @@ class WorkerManager(EngineScoped):
         await self._forget_engine(engine_id, why="lost its link")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
-        """Forget the sessions `engine_id` offered this engine, with their credentials, and stop their workers."""
+        """Forget the sessions `engine_id` offered this engine, and stop their workers."""
         offered = [session_id for session_id, session in self._sessions.items() if session.engine_id == engine_id]
         for session_id in offered:
             del self._sessions[session_id]

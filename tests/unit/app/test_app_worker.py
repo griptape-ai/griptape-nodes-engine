@@ -2552,9 +2552,8 @@ class TestStartingAWorkerOnAnotherEngine:
         assert isinstance(registration[1], worker_events.OfferSessionForWorkersRequest)
         assert registration[1].engine_version == engine_version
         assert registration[1].library_versions == {_LIBRARY: "1.0.0"}
-        assert registration[1].license_token == _LICENSE
-        # The fixture's secrets answer every name with _LICENSE, the API key included.
-        assert registration[1].api_key == _LICENSE
+        # The fixture's secrets answer every name with _LICENSE, so a credential sent would show up here.
+        assert _LICENSE not in vars(registration[1]).values()
         assert start[0] == _HOST_ENGINE
         assert isinstance(start[1], worker_events.StartWorkerForEngineRequest)
         assert _started_worker_id(links) in worker_manager._remote_starts
@@ -2971,8 +2970,6 @@ def _register_session(worker_manager: WorkerManager, **overrides: object) -> obj
         "schema_version": DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
         "engine_version": engine_version,
         "library_versions": {_LIBRARY: "1.0.0"},
-        "license_token": _LICENSE,
-        "api_key": "artist-api-key",
         "static_server_base_url": "http://workstation:8124",
     }
     fields.update(overrides)
@@ -3041,7 +3038,9 @@ class TestServingAnotherEnginesSession:
         assert "not installed" in result.refused_libraries[_LIBRARY]
 
     @pytest.mark.asyncio
-    async def test_the_worker_joins_the_session_under_its_license_and_id(self, worker_manager: WorkerManager) -> None:
+    async def test_the_worker_joins_the_session_under_its_id_on_this_machines_credentials(
+        self, worker_manager: WorkerManager
+    ) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         spawned: dict[str, object] = {}
@@ -3057,29 +3056,8 @@ class TestServingAnotherEnginesSession:
         args = cast("list[str]", spawned["args"])
         assert args[args.index("--session-id") + 1] == _ARTIST_SESSION
         assert spawned["library_name"] == _LIBRARY
-        assert spawned["environ_overrides"] == {
-            "GRIPTAPE_NODES_LICENSE": _LICENSE,
-            "GT_CLOUD_API_KEY": "artist-api-key",
-            ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124",
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_credential_the_artist_has_none_of_hides_this_engines_from_the_worker(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager, license_token=None, api_key=None)
-        spawned: dict[str, object] = {}
-
-        async def record_spawn(_args: list[str], _worker_key: str, **kwargs: object) -> None:
-            spawned.update(kwargs)
-
-        with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
-            await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
-
-        environ = cast("dict[str, str]", spawned["environ_overrides"])
-        assert environ["GRIPTAPE_NODES_LICENSE"] == ""
-        assert environ["GT_CLOUD_API_KEY"] == ""
+        # Nothing overrides the license or API key, so the worker inherits this machine's.
+        assert spawned["environ_overrides"] == {ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124"}
 
     @pytest.mark.asyncio
     async def test_the_worker_reaches_the_artist_the_way_the_artist_reached_this_engine(

@@ -213,19 +213,14 @@ class OfferSessionForWorkersRequest(RequestPayload):
         schema_version: The version of the distributed execution contract the artist's engine speaks.
         engine_version: The artist's engine version.
         library_versions: The version of each library the artist's engine will send to that engine.
-        license_token: The artist's Griptape Nodes license, or None when it has none.
         static_server_base_url: Where the artist's engine serves the shared workspace, so the asset
             URLs its workers mint are ones the artist's editor can open.
-        api_key: The artist's Griptape Cloud API key, or None when it has none. Workers started
-            for the session run on the artist's license and API key, never the other engine's own.
     """
 
     schema_version: str
     engine_version: str
     library_versions: dict[str, str]
-    license_token: str | None = None
     static_server_base_url: str | None = None
-    api_key: str | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
@@ -256,7 +251,7 @@ class WithdrawSessionOfferRequest(RequestPayload):
     """Sent by the artist's engine to each engine it offered its session to, once it is done with them.
 
     Sent when the artist's engine resets its workers, as when its session ends or it shuts down. The
-    other engine forgets every session the sender offered, with their credentials, and stops the
+    other engine forgets every session the sender offered and stops the
     workers it runs for them, as it does when the link to the sender is lost.
     """
 
