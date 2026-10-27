@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +13,9 @@ from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
+from griptape_nodes.exe_types.workflow_node import WORKFLOW_NODE_KEY, build_workflow_node_class
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
-from griptape_nodes.node_library.workflow_registry import new_workflow_id
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape, new_workflow_id
 from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -40,9 +42,10 @@ from griptape_nodes.retained_mode.events.worker_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
-from griptape_nodes.retained_mode.managers.worker_manager import EngineLease
+from griptape_nodes.retained_mode.managers.worker_manager import EngineLease, WorkerManager
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import UndecodedValue, encode_value
 from tests.simulated_worker import simulated_worker
@@ -50,7 +53,6 @@ from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata as ExecutionNodeMetadata
@@ -101,6 +103,40 @@ def _make_workflow(existing_node: MagicMock | BaseNode | None = None) -> MagicMo
     workflow.objects.get_as_type.return_value = existing_node
     workflow.nodes.orch_worker_requests = {}
     return workflow
+
+
+_SHAPE_PARAMETER: dict[str, Any] = {
+    "name": "text",
+    "type": "str",
+    "input_types": ["str"],
+    "output_type": "str",
+    "default_value": None,
+    "tooltip": "text",
+    "mode_allowed_input": True,
+    "mode_allowed_property": True,
+    "mode_allowed_output": True,
+    "parent_element_name": None,
+}
+
+
+def _make_workflow_node(*, name: str = "worker_node", library: str = "worker_library") -> Any:
+    """A real Workflow node, with its aprocess mocked."""
+    node_class = build_workflow_node_class(
+        node_type="SomeWorkflow",
+        workflow_file_path=Path("/library/some_workflow.py"),
+        workflow_metadata=WorkflowMetadata(
+            name="demo",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="0.0.0",
+            node_libraries_referenced=[],
+            workflow_shape=WorkflowShape(
+                inputs={"Start Flow": {"text": _SHAPE_PARAMETER}}, outputs={"End Flow": {"result": _SHAPE_PARAMETER}}
+            ),
+        ),
+    )
+    node = node_class(name=name, metadata={"library": library, "node_type": "SomeWorkflow"})
+    node.aprocess = AsyncMock()
+    return node
 
 
 def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) -> MagicMock:
@@ -1107,6 +1143,73 @@ class TestExecuteNodeWorkerRoute:
 
         wm.acquire_lease.assert_not_awaited()
 
+    def _make_library_route_worker_manager(self) -> MagicMock:
+        wm = MagicMock(spec=WorkerManager)
+        wm.worker_unavailable_reason.return_value = None
+        wm.wait_until_executable = AsyncMock()
+        wm.acquire_lease = AsyncMock(return_value=None)
+        wm.release_after_node = MagicMock()
+        wm.route_to_worker = AsyncMock(
+            return_value={
+                "result_type": ExecuteNodeResultSuccess.__name__,
+                "result": {"parameter_output_values": {"out": 1}, "result_details": "ok"},
+            }
+        )
+        return wm
+
+    async def _execute_through_library_route(self, node: Any, wm: MagicMock) -> Any:
+        workflow = _make_workflow(existing_node=node)
+        lib_mgr = MagicMock(spec=LibraryManager)
+        lib_mgr.workers = MagicMock(spec=LibraryWorkers)
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        return await node_manager.on_execute_node_request(request, workflow)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_node_is_forwarded_to_its_library_worker(self) -> None:
+        """Control for the Workflow-node test: the same setup does forward an ordinary node."""
+        node = _make_routed_node()
+
+        wm = self._make_library_route_worker_manager()
+
+        result = await self._execute_through_library_route(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_awaited_once()
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_workflow_node_is_not_forwarded_to_a_worker(self) -> None:
+        """A Workflow node runs here, whatever worker its library has."""
+        node = _make_workflow_node()
+        wm = self._make_library_route_worker_manager()
+
+        result = await self._execute_through_library_route(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_node_carrying_only_the_workflow_node_metadata_key_is_forwarded(self) -> None:
+        """The editor's metadata key does not affect routing; the node's type does."""
+        node = _make_routed_node()
+        node.metadata[WORKFLOW_NODE_KEY] = True
+        wm = self._make_library_route_worker_manager()
+
+        result = await self._execute_through_library_route(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_awaited_once()
+        node.aprocess.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
         """A retired worker must fail the node, not cancel it, and say why.
@@ -1298,6 +1401,30 @@ class TestExecuteNodePrivateExecutionRoute:
         assert isinstance(result, ExecuteNodeResultSuccess)
         wm.wait_until_executable.assert_any_await(None)
         wm.get_worker_for_key.assert_called_once_with(None)
+        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_workflow_node_run_in_the_scope_is_not_sent_to_the_worker(self) -> None:
+        node = _make_workflow_node(name="test_node", library="some_library")
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        wm.route_to_worker.assert_not_awaited()
+        node.aprocess.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_node_carrying_only_the_workflow_node_metadata_key_goes_to_the_worker(self) -> None:
+        """The editor's metadata key does not affect routing; the node's type does."""
+        node = self._make_node()
+        node.metadata[WORKFLOW_NODE_KEY] = True
+        wm = self._make_worker_manager(self._PRIVATE_WORKER)
+
+        result = await self._execute(node, wm)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
         assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()
 
