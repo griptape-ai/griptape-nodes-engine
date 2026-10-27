@@ -134,10 +134,8 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     discarding unsaved changes in whatever workflow is currently open. Save first
     (SaveWorkflowRequest) if that matters.
 
-    The engine emits CurrentWorkflowChanged app events as the Current Context moves; see that
-    event for how many to expect. Wait for the workflow you asked for rather than a fixed
-    count. Opening a large workflow can take a while, and a timeout on your side does not
-    cancel it -- wait and read the graph back (ListNodesInFlowRequest) rather than resending.
+    Opening a large workflow can take a while, and a timeout on your side does not cancel it --
+    wait and read the graph back (ListNodesInFlowRequest) rather than resending.
 
     Args:
         workflow_name: Registry key of the workflow to open. These are the keys of the

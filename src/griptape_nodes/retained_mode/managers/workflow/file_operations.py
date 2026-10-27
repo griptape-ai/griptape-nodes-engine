@@ -231,12 +231,8 @@ class WorkflowFileOperations(EngineScoped):
                     context_manager.has_current_workflow()
                     and context_manager.get_current_workflow_name() == old_registry_key
                 ):
-                    # The context also retains the workflow's path, and that is what
-                    # `workflow_dir` answers with. Move is the one operation that changes the
-                    # directory, so without repointing it the builtin keeps resolving to the
-                    # folder the file just left. Key and path move in one call: `rekey_workflow`
-                    # notifies clients only once both are in place, so nobody is told the
-                    # workflow switched while its retained path still points at the old folder.
+                    # The context also retains the workflow's path (`workflow_dir` answers with
+                    # it), so key and path move together here.
                     context_manager.rekey_workflow(
                         old_name=old_registry_key,
                         new_name=new_registry_key,
@@ -367,23 +363,12 @@ class WorkflowFileOperations(EngineScoped):
                 )
 
         # If the renamed workflow is still the current context, repoint it so the heartbeat and
-        # other callers reflect the new registry key immediately. The retained path moves with it:
-        # rename keeps the directory, so `workflow_dir` is unaffected, but the path itself would
-        # otherwise name a file that no longer exists. Both land in one `rekey_workflow` call so
-        # the CurrentWorkflowChanged it emits describes an entry that is already wholly renamed --
-        # setting the name first would announce the switch while the retained path still named the
-        # old file, and that path is what `workflow_dir` answers with.
-        #
-        # "Still" is load-bearing: renaming a registered workflow that is open normally does not
-        # reach here. The delete above drops the old registry entry while that entry is the one in
-        # context, and `on_delete_workflows_request` tears the context down for exactly that case
-        # -- so what clients hear from an ordinary rename is the teardown, not a new key. This
-        # branch serves the renames that skip the delete: a Save As of an unregistered workflow,
-        # and a rename that resolves to the key it already had (which rekeys the retained path and
-        # is deduped into silence, since the key clients hold has not moved). It also catches the
-        # one open-and-registered case the teardown does not finish: the same key stacked twice by
-        # a `run_with_clean_slate=False` open, where popping one entry leaves the duplicate
-        # underneath still naming the workflow the delete just dropped.
+        # other callers reflect the new registry key (and path) immediately. "Still" is
+        # load-bearing: an ordinary rename of a registered open workflow already had its context
+        # torn down by the delete above, via `on_delete_workflows_request`, so clients hear that
+        # teardown rather than a new key. This branch only catches renames that skip the delete
+        # (a Save As, or a rename resolving to the same key) and the stacked-duplicate case a
+        # `run_with_clean_slate=False` open leaves behind.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.rekey_workflow(

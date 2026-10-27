@@ -102,11 +102,8 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
-    # RunWorkflowFromRegistryRequest is how an external client OPENS a workflow: it loads the
-    # saved file's nodes, connections, and values into the engine and puts it in the Current
-    # Context. SetWorkflowContextRequest only does the bookkeeping half, so without this an
-    # agent had no way to open anything -- and, because the editor always keeps a workflow in
-    # context, no way to get past SetWorkflowContext's already-in-context refusal either.
+    # RunWorkflowFromRegistryRequest is how an external client OPENS a workflow; without it an
+    # agent has no way past SetWorkflowContext's already-in-context refusal.
     "RunWorkflowFromRegistryRequest": RunWorkflowFromRegistryRequest,
     "RunWorkflowWithCurrentStateRequest": RunWorkflowWithCurrentStateRequest,
     "ListAllWorkflowsRequest": ListAllWorkflowsRequest,
@@ -197,12 +194,9 @@ _SINGLE_REQUEST_TIMEOUT_MS = 30000
 # Hard ceiling for an auto-computed batch timeout. Long enough to accommodate a large build phase
 # without letting a runaway batch hold the connection open indefinitely.
 _BATCH_MAX_AUTO_TIMEOUT_MS = 300000
-# Tools that routinely need longer than the default, and what they get instead. Opening a workflow
-# resolves the node libraries it needs and replays the whole saved file, which on a large workflow --
-# the kind this tool exists for -- is minutes of work. Timing it out is worse than slow: dispatch
-# shields the engine-side coroutine, so the open runs to completion either way and the agent only
-# stops hearing how it went, which invites the one response that does damage -- a retry whose clean
-# slate lands partway through the first replay.
+# Tools that routinely need longer than the default, and what they get instead. Opening a large
+# workflow can take minutes to replay; the request still runs to completion on the engine side
+# after a timeout, so a retry would just run it a second time on top of the first.
 _REQUEST_TIMEOUT_OVERRIDES_MS: dict[str, int] = {
     "RunWorkflowFromRegistryRequest": _BATCH_MAX_AUTO_TIMEOUT_MS,
 }
@@ -436,9 +430,8 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     request to completion even after the client stopped waiting, and shielding preserves that
     contract: the caller still sees a ``TimeoutError`` and can poll for state afterwards.
 
-    A bare ``TimeoutError`` stringifies to the empty string, and ``call_tool`` reports whatever it
-    catches, so the timeout is re-raised carrying a message: an agent that gets back an error with
-    nothing in it learns neither that it timed out nor that retrying is the wrong move.
+    A bare ``TimeoutError`` stringifies to the empty string, so it's re-raised below carrying a
+    message instead.
     """
     engine_loop = GriptapeNodes.EventManager().event_loop
     if engine_loop is None:
@@ -519,9 +512,8 @@ async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], tim
 
     Mirrors the single-request path but gathers the per-request futures. Failures are returned
     in their slot (return_exceptions semantics) so one bad inner request does not abort the rest;
-    _trim_batch_results maps those exceptions to ok=false responses. The batch-wide timeout is
-    re-raised with a message for the same reason the single-request one is: an empty error tells
-    the agent nothing about what happened or what to do next.
+    _trim_batch_results maps those exceptions to ok=false responses. The timeout is re-raised with
+    a message for the same reason as in _dispatch_to_engine.
     """
     coros = [_dispatch_to_engine(SUPPORTED_REQUEST_EVENTS[request_type](**payload)) for request_type, payload in pairs]
     gather = asyncio.gather(*coros, return_exceptions=True)

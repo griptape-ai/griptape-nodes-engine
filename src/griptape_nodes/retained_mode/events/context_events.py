@@ -90,9 +90,8 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         workflow_name: Name of the current workflow context (None if no context set)
         is_saved: Whether the current workflow is backed by a file on disk. None when
-                  no context is set or the context key is not in the registry. Reported
-                  identically by the CurrentWorkflowChanged app event, which carries both
-                  fields, so a client following that event does not need to poll this.
+                  no context is set or the context key is not in the registry. Also
+                  carried by the CurrentWorkflowChanged app event.
     """
 
     workflow_name: str | None
@@ -167,39 +166,24 @@ class EnsureWorkflowAndFlowResultFailure(ResultPayloadFailure):
 class CurrentWorkflowChanged(AppPayload):
     """Current workflow switched notification.
 
-    Emitted by ContextManager whenever the workflow it reports as current changes: opening
-    a saved workflow, starting a scratch one, its first save (which rekeys it from
-    "unsaved:<uuid>" to the key derived from its new path), a move, a clear, or a delete.
-    It is the authoritative "you are now looking at a different workflow" signal, observed
-    by every attached client -- including one that did not make the change itself, such as
-    a second editor or an agent driving the engine over MCP.
+    Emitted by ContextManager whenever the workflow it reports as current changes: opening a
+    saved workflow, starting a scratch one, its first save, a move, a clear, or a delete. Observed
+    by every attached client, including one that did not make the change itself (a second editor,
+    an agent over MCP).
 
-    It reports which workflow, not whether its contents have finished loading:
-    RunWorkflowFromRegistry switches the context before replaying the saved file, so this
-    arrives first and the nodes follow as ordinary creation events. GetWorkflowContextRequest
-    answers the same way, so it is not a readiness check either.
+    Reports which workflow, not whether its contents finished loading: RunWorkflowFromRegistry
+    switches the context before replaying the saved file, so this arrives first and the nodes
+    follow as ordinary creation events.
 
-    One operation can move the context more than once, and the last event is the truth. An
-    open while another workflow is open emits None (the wipe) then the new workflow; a failed
-    open adds a trailing None, since the failure reverts to an empty engine. A request
-    rejected before the switch -- an unknown registry key, an unsaved workflow with no file
-    to replay -- leaves the context alone and emits nothing.
-
-    Renaming the open saved workflow is the one surprise: the rename deletes the old registry
-    entry while it is still in context, and that delete tears the context down, so this
-    reports the teardown's result (None, or whatever was underneath on the stack) rather than
-    the new name. Renaming an open workflow that was never saved goes through the inner save
-    instead, so it reports the new key as expected.
+    One operation can move the context more than once; the last event is the truth. Renaming the
+    open saved workflow reports the teardown that rename causes (deleting the old registry entry
+    while it's in context), not the new name -- renaming an unsaved workflow goes through the
+    inner save instead and reports the new key as expected.
 
     Args:
-        workflow_name: Registry key of the workflow now in context, or None when the engine
-            has no current workflow. A workflow that has never been saved reports its
-            "unsaved:<uuid>" key. No default: None is a meaningful answer, so a field that
-            never arrived must not be able to deserialize into it.
-        is_saved: Whether that workflow is backed by a file on disk -- the same answer
-            GetWorkflowContextRequest gives, so a client can drive save/dirty UI from this
-            event alone. False for a workflow that has never been saved, None when none is
-            open. No default, for the same reason as workflow_name.
+        workflow_name: Registry key of the workflow now in context, or None when nothing is open.
+        is_saved: Whether that workflow is backed by a file on disk. False for a workflow that has
+            never been saved, None when none is open.
     """
 
     workflow_name: str | None

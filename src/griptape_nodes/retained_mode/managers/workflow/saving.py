@@ -433,13 +433,9 @@ class WorkflowSaver(EngineScoped):
                 self.engine.workflow_manager.variable_substitution.rekey(unsaved_source_key, registry_key)
                 rekeyed_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
-            # The context also retains the workflow's path, and `workflow_dir` prefers it over a
-            # registry lookup. An unsaved context has no path; this save is where it gets one, so
-            # record it here or the builtin keeps falling back to the registry key -- the thing
-            # that goes stale on the next project switch. Going through the ContextManager (rather
-            # than walking its stack here) is also what tells clients the current workflow's key
-            # changed: the first save is the one rename an editor cannot predict, because the key
-            # is derived from the path the artist just picked.
+            # The context also retains the workflow's path (`workflow_dir` prefers it over a
+            # registry lookup); this first save is where an unsaved context gets one. Going
+            # through the ContextManager also notifies clients of the key change.
             self.engine.context_manager.rekey_workflow(
                 old_name=unsaved_source_key,
                 new_name=registry_key,
