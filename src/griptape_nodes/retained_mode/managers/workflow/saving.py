@@ -911,15 +911,21 @@ class WorkflowSaver(EngineScoped):
             # (e.g. the auto-generated "workflow_25" for a freshly-created unsaved flow)
             # over a timestamp so the on-disk filename matches what the user sees.
             scenario = SaveWorkflowScenario.FIRST_SAVE
+            suggested_file_stem = None
+            names_library_copy = False
             if not requested_file_name and current_workflow is not None:
-                candidate_name = (current_workflow.metadata.name or "").strip()
-                sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", candidate_name).strip("_/")
-                raw_name = sanitized or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
-            else:
-                raw_name = requested_file_name or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
+                suggested_file_stem = self.engine.workflow_registry.suggested_file_stem(current_workflow)
+                names_library_copy = current_workflow.seeded_from_workflow_id is not None
+            raw_name = requested_file_name or suggested_file_stem or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_name, destination, relative_file_path = self._resolve_named_save_path(raw_name)
+            if suggested_file_stem is not None and names_library_copy:
+                # A library workflow's copy is named after the library's file, under a name no
+                # file has yet.
+                file_name = self.generate_unique_filename(suggested_file_stem)
+                destination, relative_file_path = self._build_workflow_save_path(f"{file_name}.py")
+            else:
+                file_name, destination, relative_file_path = self._resolve_named_save_path(raw_name)
 
         # Ensure creation date is valid (backcompat)
         if (creation_date is None) or (creation_date == EPOCH_START):
@@ -962,8 +968,10 @@ class WorkflowSaver(EngineScoped):
            ``_resolve_named_save_path`` plumbing the same way a
            non-versioned SAVE_AS does. The versioned situation's macro
            decides where the new file lands.
-        4. Candidate workflow with no ``file_path`` (unsaved). Sanitize
-           ``metadata.name`` and route through ``_resolve_named_save_path``.
+        4. Candidate workflow with no ``file_path`` (unsaved). Use its
+           ``suggested_file_stem`` (the library file's stem for a library
+           workflow's copy, else its sanitized ``metadata.name``), and route
+           through ``_resolve_named_save_path``.
         5. Timestamp fallback when no candidate workflow exists.
         """
         # Step 1 only fires for a truly novel requested name. If the name
@@ -991,10 +999,9 @@ class WorkflowSaver(EngineScoped):
             return self._resolve_named_save_path(stem, situation_name=situation_name)
 
         if candidate_workflow is not None:
-            display_name = (candidate_workflow.metadata.name or "").strip()
-            sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
-            if sanitized:
-                return self._resolve_named_save_path(sanitized, situation_name=situation_name)
+            suggested_file_stem = self.engine.workflow_registry.suggested_file_stem(candidate_workflow)
+            if suggested_file_stem is not None:
+                return self._resolve_named_save_path(suggested_file_stem, situation_name=situation_name)
 
         timestamp_name = datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
         return self._resolve_named_save_path(timestamp_name, situation_name=situation_name)

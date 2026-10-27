@@ -442,6 +442,8 @@ class TestWorkflowIdAcrossALibraryReload:
         _register(engine, library_dir, _library_info(library_json))
         first = engine.workflow_registry.find_by_path(workflow_path)
         assert first is not None
+        # An open copy of the library workflow names it by id, and is named after its file by that id.
+        copy = engine.workflow_registry.register_unsaved_copy(first)
 
         # The reload builds the node type again, with metadata of its own, then refreshes the registry.
         reloaded_info = _register(engine, library_dir, _library_info(library_json))
@@ -455,6 +457,7 @@ class TestWorkflowIdAcrossALibraryReload:
         assert again.workflow_id == first.workflow_id
         assert again.metadata is reloaded_info.workflow_node_classes[0].workflow_metadata
         assert again.metadata.is_griptape_provided is True
+        assert engine.workflow_registry.suggested_file_stem(copy) == "demo_workflow"
 
     @pytest.mark.usefixtures("workspace")
     def test_the_workflow_of_an_unloaded_library_drops_out_on_refresh(

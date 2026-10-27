@@ -107,13 +107,24 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             await self._save_failed_workflow(exc_val)
 
     def _get_workflow_name(self) -> str:
+        """The name a failed workflow's file starts with.
+
+        A saved workflow's registry name. A workflow with no file takes the name its first save
+        would (`suggested_file_stem`), since its "unsaved:<id>" registry name is not a valid file
+        name; "workflow" if that leaves nothing.
+        """
         try:
-            context_manager = GriptapeNodes.ContextManager()
-            return context_manager.get_current_workflow_name()
+            workflow = GriptapeNodes.ContextManager().get_current_workflow()
+            suggested_file_stem = GriptapeNodes.get_instance().workflow_registry.suggested_file_stem(workflow)
         except Exception as e:
             msg = f"Failed to get current workflow from context manager: {e}"
             logger.exception(msg)
             raise LocalExecutorError(msg) from e
+        if workflow.is_saved:
+            return workflow.name
+        if suggested_file_stem is None:
+            return "workflow"
+        return suggested_file_stem
 
     def _load_flow_for_workflow(self) -> str:
         try:

@@ -407,6 +407,23 @@ class _WorkflowRegistry:
             return None
         return workflow_id
 
+    def suggested_file_stem(self, workflow: Workflow) -> str | None:
+        """The file stem `workflow` is named by before it has a file, or None if nothing file-safe is left.
+
+        A library workflow's unsaved copy takes the library file's stem. Any other workflow takes
+        its display name, with each run of characters a file name cannot hold replaced by "_". A
+        first save with no requested name, and a failed run's file, are named this way.
+        """
+        if not workflow.is_saved and workflow.seeded_from_workflow_id is not None:
+            library_workflow = self.find_by_id(workflow.seeded_from_workflow_id)
+            if library_workflow is not None and library_workflow.absolute_path is not None:
+                return library_workflow.absolute_path.stem
+        display_name = (workflow.metadata.name or "").strip()
+        sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+        if not sanitized:
+            return None
+        return sanitized
+
     def find_by_path(self, path: str | Path) -> Workflow | None:
         """Return the entry for the file at `path`, or None. Accepts any path the entry is known by."""
         for path_key in self._path_keys(self.canonical_path(path)):

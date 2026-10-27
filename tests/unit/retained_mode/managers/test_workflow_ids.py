@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalWorkflowExecutor
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
@@ -1225,3 +1226,90 @@ class TestLibraryWorkflowsOpenAsUnsavedCopies:
         assert project_engine.context_manager.get_current_workflow_id() == copy_id
         assert library_file.read_bytes() == library_content
         assert project_engine.workflow_registry.get(library.workflow_id).absolute_path == library_file
+
+
+class TestFirstSaveOfALibraryWorkflowCopy:
+    """A copy's first save is an unsaved workflow's first save, named after the library's file."""
+
+    def test_first_save_writes_a_new_file_named_after_the_library_file(
+        self, project_engine: Engine, tmp_path: Path, workspace: Path
+    ) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        library_file = library.absolute_path
+        assert library_file is not None
+        library_content = library_file.read_bytes()
+        copy_id = _open_library_workflow(project_engine, library)
+
+        saved = _save(project_engine)
+
+        assert Path(saved.file_path) == workspace / "collage_poster.py"
+        assert saved.workflow_id == copy_id
+        assert _id_at(project_engine, saved.file_path) == copy_id
+        # Named after the library's file, the copy keeps the library workflow's display name.
+        written = read_workflow_metadata(Path(saved.file_path))
+        assert written.name == "Poster Collage"
+        assert written.description == "Lays out a poster."
+        assert written.image == "thumbnail.webp"
+        assert written.is_griptape_provided is False
+        # The copy stays the open workflow, now saved and no longer a copy; the library is untouched.
+        assert project_engine.context_manager.get_current_workflow_id() == copy_id
+        saved_workflow = project_engine.context_manager.get_current_workflow()
+        assert saved_workflow.absolute_path == Path(saved.file_path)
+        assert saved_workflow.seeded_from_workflow_id is None
+        assert library_file.read_bytes() == library_content
+        assert project_engine.workflow_registry.get(library.workflow_id).absolute_path == library_file
+
+    def test_the_first_save_of_a_second_copy_never_overwrites_the_first(
+        self, project_engine: Engine, tmp_path: Path, workspace: Path
+    ) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        _open_library_workflow(project_engine, library)
+        first = _save(project_engine)
+        _open_library_workflow(project_engine, library)
+
+        second = _save(project_engine)
+
+        assert Path(first.file_path) == workspace / "collage_poster.py"
+        assert Path(second.file_path) == workspace / "collage_poster_1.py"
+        assert _id_at(project_engine, first.file_path) == first.workflow_id
+        assert second.workflow_id != first.workflow_id
+
+    def test_a_versioned_first_save_is_named_after_the_library_file(
+        self, project_engine: Engine, tmp_path: Path
+    ) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        copy_id = _open_library_workflow(project_engine, library)
+
+        saved = _save(project_engine, SaveWorkflowRequest(create_versioned=True))
+
+        assert Path(saved.file_path).name.startswith("collage_poster")
+        assert saved.workflow_id == copy_id
+
+    def test_a_failed_script_run_of_a_library_file_is_saved_under_the_library_file_name(
+        self, project_engine: Engine, tmp_path: Path, workspace: Path
+    ) -> None:
+        """The copy's registry name holds a colon, which no file name on Windows may."""
+        library = _library_workflow(project_engine, tmp_path / "library")
+        _open_library_workflow(project_engine, library)
+        executor = LocalWorkflowExecutor(save_on_failure_path="")
+
+        asyncio.run(executor._save_failed_workflow(RuntimeError("The run failed.")))
+
+        failure_files = list(workspace.rglob("*_failed_*.py"))
+        assert len(failure_files) == 1
+        assert failure_files[0].name.startswith("collage_poster_failed_")
+
+
+class TestAFailedScriptRunsFileName:
+    def test_a_failed_script_run_of_an_unsaved_workflow_is_saved_under_its_display_name(
+        self, project_engine: Engine, workspace: Path
+    ) -> None:
+        """Not under its "unsaved:<id>" registry name, which holds a colon."""
+        _open_new_workflow(project_engine, "Shot 10")
+        executor = LocalWorkflowExecutor(save_on_failure_path="")
+
+        asyncio.run(executor._save_failed_workflow(RuntimeError("The run failed.")))
+
+        failure_files = list(workspace.rglob("*_failed_*.py"))
+        assert len(failure_files) == 1
+        assert failure_files[0].name.startswith("Shot_10_failed_")
