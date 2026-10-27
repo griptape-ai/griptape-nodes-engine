@@ -687,7 +687,11 @@ class TestTheWorkerLoadsACopy:
     @pytest.mark.asyncio
     async def test_a_copy_that_cannot_take_the_nodes_name_is_refused(self, worker_engine: Engine) -> None:
         """Requests the node's code sends name the orchestrator's node, so a renamed copy would answer for nothing."""
-        worker_engine.object_manager.add_object_by_name("Echo", object())
+        workflow = worker_engine.context_manager.adopt_orchestrator_workflow(
+            _ORCHESTRATOR_WORKFLOW_ID, None, None, None
+        )
+        with worker_engine.run_in_worker_workflow(workflow):
+            worker_engine.object_manager.add_object_by_name("Echo", object())
 
         result = await worker_engine.ahandle_request(_request_for("_EchoNode"))
 

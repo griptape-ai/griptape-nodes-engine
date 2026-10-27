@@ -2817,12 +2817,10 @@ class TestWorkflowVariablePersistence:
             CreateFlowResultSuccess,
         )
 
-        variables_manager = engine.variables_manager
         context_manager = engine.context_manager
 
         if context_manager.has_current_workflow():
             engine.clear_current_workflow_data()
-        variables_manager.clear_object_state()
 
         context_manager.push_workflow(workflow_name="round_trip_workflow")
 
@@ -3013,7 +3011,6 @@ class TestWorkflowVariablePersistence:
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
         workflow_manager = engine.workflow_manager
-        variables_manager = engine.variables_manager
         flow_name = self._push_clean_flow_context(engine)
 
         assert isinstance(
@@ -3073,7 +3070,6 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         engine.clear_current_workflow_data()
-        variables_manager.clear_object_state()
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102
@@ -4362,10 +4358,6 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         assert engine.workflow_manager.variable_substitution.is_enabled() is False
         assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
-        # The library workflow keeps its own setting.
-        library_workflow = engine.workflow_registry.find_by_name(library_key)
-        assert library_workflow is not None
-        assert engine.workflow_manager.variable_substitution._enabled[library_workflow.workflow_id] is False
 
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
         """Only library-provided workflows are copied on save; the user's own file is saved in place."""

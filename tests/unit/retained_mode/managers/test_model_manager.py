@@ -392,6 +392,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             name=node_name,
             metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
         )
+        engine.context_manager.push_workflow(workflow_name="model_workflow")
         engine.object_manager.add_object_by_name(node_name, node)
 
     def test_checkpoint_carries_family_and_provider_for_declared_model(

@@ -453,10 +453,6 @@ class WorkflowManager(EngineScoped):
     def should_squelch_workflow_altered(self) -> bool:
         return self._squelch_workflow_altered_count > 0
 
-    def clear_object_state(self) -> None:
-        """Clear per-workflow state when the engine is reset."""
-        self.variable_substitution.clear()
-
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
 
