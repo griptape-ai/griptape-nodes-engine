@@ -95,6 +95,7 @@ class EventConverter(JsonConverter):
             "result": _unstructure(GenericResultFailure(result_details=str(error)), self),
             "request_id": event.request_id,
             "response_topic": event.response_topic,
+            "workflow_id": event.workflow_id,
         }
         if event.retained_mode:
             failure["retained_mode"] = event.retained_mode

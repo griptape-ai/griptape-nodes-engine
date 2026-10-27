@@ -172,6 +172,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "request_id",
         "response_topic",
         "retained_mode",
+        "workflow_id",
         "event_type",
         "request_type",
         "result_type",

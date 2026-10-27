@@ -212,9 +212,12 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 class ResultContext(TypedDict, total=False):
+    """Request envelope fields dispatch carries to the result. All but `sender` are echoed on the result envelope."""
+
     response_topic: str | None
     request_id: str | None
     sender: RequestSender | None
+    workflow_id: str | None
 
 
 @dataclass(frozen=True)
@@ -1240,6 +1243,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
+                    workflow_id=context.get("workflow_id"),
                 )
             else:
                 result_event = EventResultFailure(
@@ -1248,6 +1252,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
+                    workflow_id=context.get("workflow_id"),
                 )
 
         # Fired here rather than in the two dispatch methods because every path that
@@ -1279,16 +1284,20 @@ class EventManager(EngineScoped):
         request: RP,
         *,
         result_context: ResultContext | None = None,
+        workflow_id: str | None = None,
     ) -> EventResultSuccess | EventResultFailure:
         """Publish an event to the manager assigned to its type.
 
         Args:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
+            workflow_id: The request envelope's workflow_id, echoed on the result. Not routed on.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
+        if workflow_id is not None:
+            result_context = {**result_context, "workflow_id": workflow_id}
 
         # Notify the manager of the event type
         request_type = type(request)
@@ -1377,16 +1386,20 @@ class EventManager(EngineScoped):
         request: RP,
         *,
         result_context: ResultContext | None = None,
+        workflow_id: str | None = None,
     ) -> EventResultSuccess | EventResultFailure:
         """Publish an event to the manager assigned to its type (sync version).
 
         Args:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
+            workflow_id: The request envelope's workflow_id, echoed on the result. Not routed on.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
+        if workflow_id is not None:
+            result_context = {**result_context, "workflow_id": workflow_id}
 
         # Notify the manager of the event type
         request_type = type(request)

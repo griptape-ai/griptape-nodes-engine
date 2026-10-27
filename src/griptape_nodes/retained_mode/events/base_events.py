@@ -319,7 +319,15 @@ class BaseEvent(BaseModel, ABC):
 
 
 class EventRequest[P: Payload](BaseEvent):
-    """Request event."""
+    """Request event.
+
+    Args:
+        request: The request payload.
+        request_id: Id the caller matches the result by. Echoed on the result.
+        response_topic: Where the result is sent. Echoed on the result.
+        workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
+            engine does not route by it yet, and never rejects a request for carrying one.
+    """
 
     request: P
     request_id: str | None = None
@@ -327,6 +335,7 @@ class EventRequest[P: Payload](BaseEvent):
     # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
     # `require_request_sender()`.
     sender: RequestSender | None = None
+    workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -372,6 +381,8 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     request_id: str | None = None
     response_topic: str | None = None
     retained_mode: str | None = None
+    # The request envelope's workflow_id, echoed back.
+    workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""

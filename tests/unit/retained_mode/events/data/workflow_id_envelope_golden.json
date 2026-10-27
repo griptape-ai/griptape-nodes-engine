@@ -1,0 +1,21 @@
+{
+  "EventRequest": {
+    "event_type": "EventRequest",
+    "request_type": "GetWorkflowContextRequest",
+    "request_id": "golden-request-1",
+    "workflow_id": "5b0f6c3e8d1a4f7e9c2b6a4d3e1f0b97",
+    "request": {}
+  },
+  "EventRequestBatch": {
+    "event_type": "EventRequestBatch",
+    "requests": [
+      {
+        "event_type": "EventRequest",
+        "request_type": "GetWorkflowContextRequest",
+        "request_id": "golden-request-2",
+        "workflow_id": "5b0f6c3e8d1a4f7e9c2b6a4d3e1f0b97",
+        "request": {}
+      }
+    ]
+  }
+}
