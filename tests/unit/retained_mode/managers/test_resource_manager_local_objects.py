@@ -486,10 +486,10 @@ class TestWorkflowStateClearReleasesObjects:
         Deleting the open workflow reaches teardown without going through that handler, and without this
         every worker keeps its objects.
         """
-        engine.context_manager.push_workflow("wf")
+        workflow_name = engine.context_manager.push_workflow("wf")
 
         with patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast:
-            engine.handle_request(DeleteWorkflowRequest(name="wf"))
+            engine.handle_request(DeleteWorkflowRequest(name=workflow_name))
 
         assert broadcast.await_count == 1
 

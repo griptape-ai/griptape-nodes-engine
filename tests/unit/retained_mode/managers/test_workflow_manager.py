@@ -274,7 +274,7 @@ class TestWorkflowManager:
                     return_value=LoadWorkflowMetadataResultSuccess(metadata=mock_metadata, result_details="Success")
                 ),
             ),
-            patch.object(engine.workflow_registry, "has_workflow_with_name", return_value=False),
+            patch.object(engine.workflow_registry, "find_by_path", return_value=None),
             patch.object(
                 workflow_manager,
                 "on_register_workflow_request",
@@ -296,6 +296,10 @@ class TestWorkflowManager:
 
         mock_metadata = MagicMock()
         mock_metadata.name = "test_workflow"
+        registered = MagicMock()
+        registered.name = "/path/to/workflow"
+        registered.workflow_id = "registered-id"
+        registered.listed = True
 
         with (
             patch.object(
@@ -305,13 +309,14 @@ class TestWorkflowManager:
                     return_value=LoadWorkflowMetadataResultSuccess(metadata=mock_metadata, result_details="Success")
                 ),
             ),
-            patch.object(engine.workflow_registry, "has_workflow_with_name", return_value=True),
+            patch.object(engine.workflow_registry, "find_by_path", return_value=registered),
         ):
             result = asyncio.run(workflow_manager.on_import_workflow_request(request))
 
             assert isinstance(result, ImportWorkflowResultSuccess)
-            # Registry key is derived from the file path (minus extension), not from metadata.name.
+            # The registered entry answers, by its name and id.
             assert result.workflow_name == "/path/to/workflow"
+            assert result.workflow_id == "registered-id"
 
     def test_on_import_workflow_request_metadata_load_failure(self, engine: Engine) -> None:
         """Test import when metadata loading fails."""
@@ -345,7 +350,7 @@ class TestWorkflowManager:
                     return_value=LoadWorkflowMetadataResultSuccess(metadata=mock_metadata, result_details="Success")
                 ),
             ),
-            patch.object(engine.workflow_registry, "has_workflow_with_name", return_value=False),
+            patch.object(engine.workflow_registry, "find_by_path", return_value=None),
             patch.object(
                 workflow_manager,
                 "on_register_workflow_request",
@@ -366,6 +371,7 @@ class TestWorkflowManager:
         mock_metadata = MagicMock()
         mock_workflow = MagicMock()
         mock_workflow.metadata = mock_metadata
+        mock_workflow.metadata_is_placeholder = False
 
         with patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow):
             result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
@@ -450,6 +456,7 @@ class TestWorkflowManager:
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
+        mock_workflow.metadata_is_placeholder = False
         existing_content = "# /// script\n# [tool]\n# ///\nprint('body')\n"
 
         with (
@@ -519,7 +526,6 @@ class TestWorkflowManager:
                     "replace_workflow_metadata_header",
                     return_value="updated_content",
                 ),
-                patch.object(engine.workflow_registry, "generate_new_workflow"),
             ):
                 result = workflow_manager.branching.on_create_workflow_from_template_request(request)
         finally:
@@ -583,7 +589,6 @@ class TestWorkflowManager:
                 return_value="updated_content",
             ),
             patch.object(Path, "write_text"),
-            patch.object(engine.workflow_registry, "generate_new_workflow"),
         ):
             result = workflow_manager.branching.on_create_workflow_from_template_request(request)
 
@@ -700,113 +705,73 @@ class TestWorkflowManager:
         assert isinstance(result, MoveWorkflowResultFailure)
         assert "already exists" in str(result.result_details)
 
-    def test_on_move_workflow_request_success_directory_change(self, engine: Engine) -> None:
+    @staticmethod
+    def _register_workspace_file(engine: Engine, workspace: Path, relative_path: str) -> Workflow:
+        file_path = workspace / relative_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("# stub")
+        metadata = WorkflowMetadata(
+            name=Path(relative_path).stem,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+        )
+        return engine.workflow_registry.register_file(relative_path, metadata)
+
+    def test_on_move_workflow_request_success_directory_change(self, engine: Engine, tmp_path: Path) -> None:
+        """Move keeps the workflow's id; its path and name follow the file."""
         workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+        config_manager = engine.config_manager
+        workspace = tmp_path.resolve()
 
-        mock_workflow = MagicMock()
-        mock_workflow.file_path = "my_workflow.py"
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with empty_workflow_registry(engine):
+                workflow = self._register_workspace_file(engine, workspace, "my_workflow.py")
+                original_id = workflow.workflow_id
 
-        config_mgr = engine.config_manager
-        with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
-            patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
-            patch.object(Path, "exists", side_effect=[True, False]),
-            patch.object(Path, "mkdir"),
-            patch.object(Path, "rename"),
-            patch.object(engine.workflow_registry, "set_file_path") as mock_set_file_path,
-            patch.object(config_mgr, "delete_user_workflow"),
-        ):
-            result = workflow_manager.file_operations.on_move_workflow_request(request)
+                result = workflow_manager.file_operations.on_move_workflow_request(
+                    MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                )
 
-        assert isinstance(result, MoveWorkflowResultSuccess)
-        assert result.moved_file_path == "subdir/my_workflow.py"
-        assert result.new_workflow_name == "subdir/my_workflow"
-        mock_set_file_path.assert_called_once_with(mock_workflow, "subdir/my_workflow.py")
+                assert isinstance(result, MoveWorkflowResultSuccess)
+                assert result.moved_file_path == "subdir/my_workflow.py"
+                assert result.new_workflow_name == "subdir/my_workflow"
+                assert result.workflow_id == original_id
+                assert engine.workflow_registry.get(original_id) is workflow
+                assert engine.workflow_registry.find_by_name("my_workflow") is None
+                assert (workspace / "subdir" / "my_workflow.py").is_file()
+        finally:
+            config_manager.workspace_path = original_workspace
 
-    def test_on_move_workflow_request_no_rekey_same_directory(self, engine: Engine) -> None:
-        """Moving within the same directory level produces the same registry key; no rekey occurs."""
+    def test_on_move_workflow_request_leaves_the_open_workflow_alone_when_moving_another(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
         workflow_manager = engine.workflow_manager
-        # Workflow already in "subdir", moving target is also "subdir" — key stays the same.
-        request = MoveWorkflowRequest(workflow_name="subdir/my_workflow", target_directory="subdir")
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+        workspace = tmp_path.resolve()
 
-        mock_workflow = MagicMock()
-        mock_workflow.file_path = "subdir/my_workflow.py"
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with empty_workflow_registry(engine):
+                self._register_workspace_file(engine, workspace, "my_workflow.py")
+                open_workflow = self._register_workspace_file(engine, workspace, "other_workflow.py")
+                context_manager.push_workflow(open_workflow.name)
+                try:
+                    result = workflow_manager.file_operations.on_move_workflow_request(
+                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                    )
 
-        config_mgr = engine.config_manager
-        with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
-            patch.object(
-                engine.workflow_registry, "get_complete_file_path", return_value="/workspace/subdir/my_workflow.py"
-            ),
-            patch.object(Path, "exists", side_effect=[True, False]),
-            patch.object(Path, "mkdir"),
-            patch.object(Path, "rename"),
-            patch.object(engine.workflow_registry, "set_file_path"),
-            patch.object(workflow_manager.variable_substitution, "rekey") as mock_rekey,
-            patch.object(config_mgr, "delete_user_workflow"),
-        ):
-            result = workflow_manager.file_operations.on_move_workflow_request(request)
-
-        assert isinstance(result, MoveWorkflowResultSuccess)
-        assert result.new_workflow_name == "subdir/my_workflow"
-        mock_rekey.assert_not_called()
-
-    def test_on_move_workflow_request_updates_context_for_current_workflow(self, engine: Engine) -> None:
-        workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
-
-        mock_workflow = MagicMock()
-        mock_workflow.file_path = "my_workflow.py"
-
-        context_mgr = engine.context_manager
-        config_mgr = engine.config_manager
-        with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
-            patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
-            patch.object(Path, "exists", side_effect=[True, False]),
-            patch.object(Path, "mkdir"),
-            patch.object(Path, "rename"),
-            patch.object(engine.workflow_registry, "set_file_path"),
-            patch.object(config_mgr, "delete_user_workflow"),
-            patch.object(context_mgr, "has_current_workflow", return_value=True),
-            patch.object(context_mgr, "get_current_workflow_name", return_value="my_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
-            patch.object(context_mgr, "set_current_workflow_file_path") as mock_set_file_path,
-        ):
-            result = workflow_manager.file_operations.on_move_workflow_request(request)
-
-        assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_called_once_with("subdir/my_workflow")
-        # The retained path travels with the key: `workflow_dir` reads it in preference to the
-        # registry, so a rekey without a repoint leaves the builtin on the pre-move directory.
-        mock_set_file_path.assert_called_once_with(str(config_mgr.workspace_path / "subdir" / "my_workflow.py"))
-
-    def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, engine: Engine) -> None:
-        workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
-
-        mock_workflow = MagicMock()
-        mock_workflow.file_path = "my_workflow.py"
-
-        context_mgr = engine.context_manager
-        config_mgr = engine.config_manager
-        with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
-            patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
-            patch.object(Path, "exists", side_effect=[True, False]),
-            patch.object(Path, "mkdir"),
-            patch.object(Path, "rename"),
-            patch.object(engine.workflow_registry, "set_file_path"),
-            patch.object(config_mgr, "delete_user_workflow"),
-            patch.object(context_mgr, "has_current_workflow", return_value=True),
-            patch.object(context_mgr, "get_current_workflow_name", return_value="other_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
-        ):
-            result = workflow_manager.file_operations.on_move_workflow_request(request)
-
-        assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_not_called()
+                    assert isinstance(result, MoveWorkflowResultSuccess)
+                    assert context_manager.get_current_workflow_id() == open_workflow.workflow_id
+                    assert context_manager.get_current_workflow_name() == "other_workflow"
+                finally:
+                    context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original_workspace
 
     def test_on_move_workflow_request_updates_context_file_path_for_current_workflow(
         self, engine: Engine, tmp_path: Path
@@ -1233,33 +1198,6 @@ class TestWorkflowManager:
         # The new absolute path is handed to the external-registration helper.
         persist_calls = captured["persist_calls"]
         assert persist_calls == [call("/ext/new_name.py")]
-
-    def test_rename_updates_context_file_path(self, engine: Engine) -> None:
-        """Renaming the open workflow moves the context's retained path onto the new file.
-
-        Rename keeps the directory, so `workflow_dir` survives either way; the path itself would
-        otherwise keep naming a file that no longer exists on disk.
-        """
-        context_manager = engine.context_manager
-
-        context_manager.push_workflow(workflow_name="bar/workflow")
-        context_manager.set_current_workflow_file_path("/workspace/bar/workflow.py")
-        try:
-            self._run_rename(
-                engine.workflow_manager,
-                self._RenameScenario(
-                    workflow_name="bar/workflow",
-                    requested_name="new_name",
-                    source_file_path="bar/workflow.py",
-                    save_file_path="/workspace/bar/new_name.py",
-                    save_workflow_name="bar/new_name",
-                ),
-            )
-
-            assert context_manager.get_current_workflow_name() == "bar/new_name"
-            assert context_manager.get_current_workflow_file_path() == "/workspace/bar/new_name.py"
-        finally:
-            context_manager.pop_workflow()
 
     def test_rename_returns_new_registry_key(self, engine: Engine) -> None:
         """The returned new_workflow_name is the real directory-qualified key, not the bare stem."""
@@ -2269,7 +2207,7 @@ class TestWorkflowManager:
             workflow_name="my_workflow",
         )
 
-        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info)
+        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info, "workflow-id")
 
         assert isinstance(payload, WorkflowInfoSummary)
         assert payload.status == "GOOD"
@@ -2296,7 +2234,7 @@ class TestWorkflowManager:
             ],
         )
 
-        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info)
+        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info, "workflow-id")
 
         assert len(payload.problems) == 1
         assert "lib-a" in payload.problems[0]
@@ -2321,7 +2259,7 @@ class TestWorkflowManager:
             ],
         )
 
-        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info)
+        payload = workflow_manager.catalog._build_workflow_info_payload(wf_info, "workflow-id")
 
         assert len(payload.workflow_dependencies) == 1
         dep = payload.workflow_dependencies[0]
@@ -4417,7 +4355,9 @@ class TestWorkflowCreationOnTheDefaultProject:
         assert engine.workflow_manager.variable_substitution.is_enabled() is False
         assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
         # The library workflow keeps its own setting.
-        assert engine.workflow_manager.variable_substitution._enabled[library_key] is False
+        library_workflow = engine.workflow_registry.find_by_name(library_key)
+        assert library_workflow is not None
+        assert engine.workflow_manager.variable_substitution._enabled[library_workflow.workflow_id] is False
 
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
         """Only library-provided workflows are copied on save; the user's own file is saved in place."""
