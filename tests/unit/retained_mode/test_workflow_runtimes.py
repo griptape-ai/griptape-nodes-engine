@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
@@ -431,3 +432,51 @@ class TestNodesAndFlowsOnTheRuntime:
         assert run_state["dag_builder"] is first.flows.global_dag_builder
         assert run_state["flow_queue"] is first.flows.global_flow_queue
         assert run_state["single_node_resolution"] is False
+
+
+class TestLoadingOnTheRuntime:
+    def test_the_referenced_workflow_being_imported_is_held_by_the_open_workflow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        workflow_manager = engine.workflow_manager
+
+        with workflow_manager.referenced_workflow("library_workflow"):
+            assert engine.current_workflow().loading.referenced_workflow_stack == ["library_workflow"]
+            assert workflow_manager.get_current_referenced_workflow() == "library_workflow"
+
+        assert not workflow_manager.has_current_referenced_workflow()
+
+    def test_importing_a_referenced_workflow_with_none_open_raises(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+
+        with pytest.raises(NoOpenWorkflowError), workflow_manager.referenced_workflow("library_workflow"):
+            pass
+
+        assert not workflow_manager.has_current_referenced_workflow()
+
+
+class TestSquelchWorkflowAltered:
+    @pytest.mark.asyncio
+    async def test_a_squelch_covers_its_own_task_and_not_another(self, engine: Engine) -> None:
+        """A load reports its own edits as unaltered; an edit made meanwhile from another task still counts."""
+        engine.context_manager.push_workflow(workflow_name="outer")
+        load_holds_squelch = asyncio.Event()
+        other_edit_done = asyncio.Event()
+
+        async def load() -> ResultPayload:
+            with engine.workflow_manager.squelch_workflow_altered():
+                load_holds_squelch.set()
+                await other_edit_done.wait()
+                return await engine.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name="loaded"))
+
+        async def edit_from_another_task() -> ResultPayload:
+            await load_holds_squelch.wait()
+            result = await engine.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name="edited"))
+            other_edit_done.set()
+            return result
+
+        loaded, edited = await asyncio.gather(load(), edit_from_another_task())
+
+        assert isinstance(loaded, CreateFlowResultSuccess)
+        assert isinstance(edited, CreateFlowResultSuccess)
+        assert loaded.altered_workflow_state is False
+        assert edited.altered_workflow_state is True
