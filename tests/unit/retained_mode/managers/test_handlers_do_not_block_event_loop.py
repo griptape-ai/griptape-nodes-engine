@@ -17,12 +17,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.retained_mode.events.artifact_events import (
+    RegisterArtifactProviderRequest,
+    RegisterArtifactProviderResultSuccess,
+)
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
@@ -32,14 +36,17 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
     PILRoundedPreviewGenerator,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
     PILThumbnailGenerator,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -220,6 +227,23 @@ def _read_max_nodes_in_parallel(user_config: Path) -> int:
 class TestReadFileThumbnail:
     """ReadFileRequest turns an image into a thumbnail data URL unless it is already in the workspace."""
 
+    @pytest.fixture(autouse=True)
+    def registered_image_provider(self, engine: Engine) -> Generator[None, None, None]:
+        """Register ImageArtifactProvider, as the real app does on AppInitializationComplete.
+
+        ReadFileRequest's thumbnail step only attempts a Pillow decode for formats a registered
+        provider claims; this fixture's engine never broadcasts AppInitializationComplete, so
+        without this the registry stays empty and PNG would (correctly) skip decoding too.
+        """
+        original_registry = engine.artifact_manager._registry
+        engine.artifact_manager._registry = ProviderRegistry(engine=engine)
+        result = engine.artifact_manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+        assert isinstance(result, RegisterArtifactProviderResultSuccess)
+        yield
+        engine.artifact_manager._registry = original_registry
+
     @pytest.mark.asyncio
     async def test_engine_answers_while_a_read_makes_its_thumbnail(
         self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -228,6 +252,11 @@ class TestReadFileThumbnail:
         source = tmp_path / "source.png"
         source.write_bytes(_png_bytes())
         step = _SlowStep()
+        # Force the fallback to the legacy Pillow path this test targets, rather than the
+        # registered-provider pipeline (already verified off-loop by TestPreviewGenerators).
+        monkeypatch.setattr(
+            engine.os_manager, "_preview_via_registered_provider", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(
             engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data, _mime: step.run("data:thumb")
         )
