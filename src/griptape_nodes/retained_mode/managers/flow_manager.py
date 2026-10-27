@@ -17,7 +17,6 @@ from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
-from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
@@ -189,10 +188,12 @@ from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_l
 from griptape_nodes.serialization.values import Unencodable, decode_value, encodable_default, try_encode, value_key
 
 if TYPE_CHECKING:
+    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
@@ -312,31 +313,52 @@ class DeserializedFlowNodes:
 
 
 class FlowManager(EngineScoped):
-    _name_to_parent_name: dict[str, str | None]
-    _flow_to_referenced_workflow_name: dict[ControlFlow, str]
-    _connections: Connections
-
-    # Global execution state (moved from individual ControlFlows)
-    _global_flow_queue: Queue[QueueItem]
-    _global_control_flow_machine: ControlFlowMachine | None
-    _global_single_node_resolution: bool
-    _global_dag_builder: DagBuilder
     _node_executor: NodeExecutor
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-        self._name_to_parent_name = {}
-        self._flow_to_referenced_workflow_name = {}
-        self._connections = Connections()
-
-        # Initialize global execution state
-        self._global_flow_queue = Queue[QueueItem]()
-        self._global_control_flow_machine = None  # Track the current control flow machine
-        self._global_single_node_resolution = False
-        self._global_dag_builder = DagBuilder(self.engine)
+        # The flow hierarchy, connections and run state belong to the open workflow and live on its runtime.
+        # The properties below need a current workflow and raise without one. Lookups that can run with
+        # no workflow open use `_current_flows_or_none()`, and a run uses the flows it captured at its start.
         self._node_executor = NodeExecutor(self.engine)
+
+    @property
+    def _name_to_parent_name(self) -> dict[str, str | None]:
+        return self._current_flows().name_to_parent_name
+
+    @property
+    def _flow_to_referenced_workflow_name(self) -> dict[ControlFlow, str]:
+        return self._current_flows().flow_to_referenced_workflow_name
+
+    @property
+    def _connections(self) -> Connections:
+        return self._current_flows().connections
+
+    @property
+    def _global_flow_queue(self) -> Queue[QueueItem]:
+        return self._current_flows().global_flow_queue
+
+    @property
+    def _global_control_flow_machine(self) -> ControlFlowMachine | None:
+        return self._current_flows().global_control_flow_machine
+
+    @_global_control_flow_machine.setter
+    def _global_control_flow_machine(self, machine: ControlFlowMachine | None) -> None:
+        self._current_flows().global_control_flow_machine = machine
+
+    @property
+    def _global_single_node_resolution(self) -> bool:
+        return self._current_flows().global_single_node_resolution
+
+    @_global_single_node_resolution.setter
+    def _global_single_node_resolution(self, value: bool) -> None:
+        self._current_flows().global_single_node_resolution = value
+
+    @property
+    def _global_dag_builder(self) -> DagBuilder:
+        return self._current_flows().global_dag_builder
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -357,6 +379,21 @@ class FlowManager(EngineScoped):
     def get_connections(self) -> Connections:
         """Get the connections instance."""
         return self._connections
+
+    def _current_flows(self) -> WorkflowFlows:
+        """The current workflow's flows, for changes and runs, which need a workflow to hold them.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        return self.engine.current_workflow().flows
+
+    def _current_flows_or_none(self) -> WorkflowFlows | None:
+        """The current workflow's flows, or None for lookups that find nothing without a workflow."""
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
+        return workflow.flows
 
     def _cleanup_flow_on_failed_deserialization(self, flow_name: str, *, pushed_flow_context: bool) -> None:
         """Clean up a flow that failed during deserialization.
@@ -518,11 +555,13 @@ class FlowManager(EngineScoped):
 
     @handles(GetTopLevelFlowRequest)
     def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
-        for flow_name, parent in self._name_to_parent_name.items():
-            if parent is None:
-                return GetTopLevelFlowResultSuccess(
-                    flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
-                )
+        flows = self._current_flows_or_none()
+        if flows is not None:
+            for flow_name, parent in flows.name_to_parent_name.items():
+                if parent is None:
+                    return GetTopLevelFlowResultSuccess(
+                        flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
+                    )
         msg = "Attempted to get top level flow, but no such flow exists"
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
@@ -623,7 +662,10 @@ class FlowManager(EngineScoped):
 
     def does_canvas_exist(self) -> bool:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
-        return any([parent is None for parent in self._name_to_parent_name.values()])  # noqa: C419
+        flows = self._current_flows_or_none()
+        if flows is None:
+            return False
+        return any([parent is None for parent in flows.name_to_parent_name.values()])  # noqa: C419
 
     @handles(CreateFlowRequest)
     def on_create_flow_request(self, request: CreateFlowRequest) -> ResultPayload:
@@ -2870,6 +2912,8 @@ class FlowManager(EngineScoped):
             details = f"Couldn't start flow with name {flow_name}. Flow Validation Failed: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
+        # Read the run's outcome from its own workflow, even if another opened while it ran.
+        flows = self._current_flows()
         try:
             await self.start_flow(
                 flow,
@@ -2880,8 +2924,8 @@ class FlowManager(EngineScoped):
             details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+        if flows.global_control_flow_machine:
+            resolution_machine = flows.global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
                 result_details = f"Attempted to run flow '{flow_name}'. Failed due to: {error_message}"
@@ -2948,6 +2992,8 @@ class FlowManager(EngineScoped):
             details = f"Couldn't start flow with name {flow_name}. Flow Validation Failed: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
+        # Read the run's outcome from its own workflow, even if another opened while it ran.
+        flows = self._current_flows()
         try:
             await self.start_flow(
                 flow,
@@ -2958,8 +3004,8 @@ class FlowManager(EngineScoped):
             details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+        if flows.global_control_flow_machine:
+            resolution_machine = flows.global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
                 # Pass through the error message without adding extra wrapping
@@ -3139,6 +3185,7 @@ class FlowManager(EngineScoped):
 
         subflow_machine = ControlFlowMachine(
             flow.name,
+            dag_builder=DagBuilder(self._current_flows().connections),
             is_isolated=True,
             engine=self.engine,
         )
@@ -4540,27 +4587,29 @@ class FlowManager(EngineScoped):
         *,
         debug_mode: bool = False,
     ) -> None:
-        if self.check_for_existing_running_flow():
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
+        if self._run_in_progress(flows):
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
             raise RuntimeError(errormsg)
 
         if start_node is None:
-            if self._global_flow_queue.empty():
+            if flows.global_flow_queue.empty():
                 errormsg = "No Flow exists. You must create at least one control connection."
                 raise RuntimeError(errormsg)
-            queue_item = self._global_flow_queue.get()
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
+            flows.global_flow_queue.task_done()
 
         # Initialize global control flow machine and DAG builder
-
-        self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
+        machine = self._make_control_flow_machine(flows, flow.name)
+        flows.global_control_flow_machine = machine
         # Set off the request here.
         try:
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            await machine.start_flow(start_node, debug_mode=debug_mode)
         except Exception:
-            await self._abandon_running_flow()
+            await self._abandon_running_flow(flows)
             raise
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
@@ -4698,22 +4747,17 @@ class FlowManager(EngineScoped):
             raise ImageFlowCommandsError(str(error)) from error
 
     def check_for_existing_running_flow(self) -> bool:
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None:
             return False
-        current_state = self._global_control_flow_machine.current_state
-        if current_state and current_state is not CompleteState:
-            # Flow already exists in progress
-            return True
-        return bool(
-            not self._global_control_flow_machine.context.resolution_machine.is_complete()
-            and self._global_control_flow_machine.context.resolution_machine.is_started()
-        )
+        return self._run_in_progress(flows)
 
     def running_flow_is_stopping_after_failure(self) -> bool:
         """True while the running flow has failed and is waiting for its other nodes to finish."""
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None or flows.global_control_flow_machine is None:
             return False
-        return self._global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -4725,31 +4769,34 @@ class FlowManager(EngineScoped):
         and stops when that node finishes -- which is why callers apply their
         debug-mode change before consulting this.
         """
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None:
             return False
-        return (
-            self._global_control_flow_machine.is_advancing
-            or self._global_control_flow_machine.resolution_machine.is_advancing
-        )
+        return self._run_is_advancing(flows)
 
     async def cancel_flow_run(self) -> None:
-        if not self.check_for_existing_running_flow():
+        await self._cancel_run(self._current_flows())
+
+    async def _cancel_run(self, flows: WorkflowFlows) -> None:
+        """Cancel the run in `flows`, the run state of the workflow the run belongs to."""
+        if not self._run_in_progress(flows):
             errormsg = "Flow has not yet been started. Cannot cancel flow that hasn't begun."
             raise RuntimeError(errormsg)
-        self._global_flow_queue.queue.clear()
+        flows.global_flow_queue.queue.clear()
 
         # Request cancellation on all nodes and wait for them to complete
         run_seconds = None
-        if self._global_control_flow_machine is not None:
-            await self._global_control_flow_machine.cancel_flow()
+        machine = flows.global_control_flow_machine
+        if machine is not None:
+            await machine.cancel_flow()
             # Read before the reset below clears the run's start time.
-            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
+            run_seconds = machine.context.seconds_since_run_started()
 
         # Reset control flow machine
-        if self._global_control_flow_machine is not None:
-            self._global_control_flow_machine.reset_machine(cancel=True)
-        self._global_single_node_resolution = False
-        self._global_dag_builder.clear()
+        if flows.global_control_flow_machine is not None:
+            flows.global_control_flow_machine.reset_machine(cancel=True)
+        flows.global_single_node_resolution = False
+        flows.global_dag_builder.clear()
         logger.debug("Cancelling flow run")
 
         self.engine.event_manager.put_event(
@@ -4761,7 +4808,7 @@ class FlowManager(EngineScoped):
             )
         )
 
-    async def _abandon_running_flow(self) -> None:
+    async def _abandon_running_flow(self, flows: WorkflowFlows) -> None:
         """Give up on a run that has already failed, leaving the engine able to start another.
 
         `FSM._advance` leaves `_current_state` pointing at the state that raised, and that state is
@@ -4775,9 +4822,9 @@ class FlowManager(EngineScoped):
         rather than raised, because the error worth reporting is the one that ended the run.
         """
         cancelled_gracefully = False
-        if self.check_for_existing_running_flow():
+        if self._run_in_progress(flows):
             try:
-                await self.cancel_flow_run()
+                await self._cancel_run(flows)
                 cancelled_gracefully = True
             except Exception:
                 # Cancelling awaits arbitrary node code, so there is no narrower type to catch.
@@ -4788,11 +4835,11 @@ class FlowManager(EngineScoped):
             return
 
         run_seconds = None
-        if self._global_control_flow_machine is not None:
-            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
-            self._global_control_flow_machine.reset_machine(cancel=True)
-        self._global_single_node_resolution = False
-        self._global_dag_builder.clear()
+        if flows.global_control_flow_machine is not None:
+            run_seconds = flows.global_control_flow_machine.context.seconds_since_run_started()
+            flows.global_control_flow_machine.reset_machine(cancel=True)
+        flows.global_single_node_resolution = False
+        flows.global_dag_builder.clear()
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
@@ -4800,6 +4847,15 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
             )
+        )
+
+    def _make_control_flow_machine(self, flows: WorkflowFlows, flow_name: str) -> ControlFlowMachine:
+        """A machine for a top-level run of `flow_name` over the run state in `flows`."""
+        return ControlFlowMachine(
+            flow_name,
+            dag_builder=flows.global_dag_builder,
+            flow_queue=flows.global_flow_queue,
+            engine=self.engine,
         )
 
     def reset_global_execution_state(self) -> None:
@@ -4851,41 +4907,44 @@ class FlowManager(EngineScoped):
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
         self,
+        flows: WorkflowFlows,
         flow: ControlFlow,
         *,
         debug_mode: bool,
         error_message: str,
     ) -> None:
         """Common logic for starting flow execution if not already running."""
-        if not self.check_for_existing_running_flow():
-            if self._global_flow_queue.empty():
+        if not self._run_in_progress(flows):
+            if flows.global_flow_queue.empty():
                 raise RuntimeError(error_message)
-            queue_item = self._global_flow_queue.get()
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
+            flows.global_flow_queue.task_done()
             # Get or create machine
-            if self._global_control_flow_machine is None:
-                self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            if flows.global_control_flow_machine is None:
+                flows.global_control_flow_machine = self._make_control_flow_machine(flows, flow.name)
+            await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def _handle_post_execution_queue_processing(self, *, debug_mode: bool) -> None:
+    async def _handle_post_execution_queue_processing(self, flows: WorkflowFlows, *, debug_mode: bool) -> None:
         """Handle execution queue processing after execution completes."""
-        if not self.check_for_existing_running_flow() and not self._global_flow_queue.empty():
-            queue_item = self._global_flow_queue.get()
+        if not self._run_in_progress(flows) and not flows.global_flow_queue.empty():
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
-            machine = self._global_control_flow_machine
+            flows.global_flow_queue.task_done()
+            machine = flows.global_control_flow_machine
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # We are now going to have different behavior depending on how the node is behaving.
-        if self.check_for_existing_running_flow():
+        if self._run_in_progress(flows):
             # Now we know something is running, it's ParallelResolutionMachine, and that we are in single_node_resolution.
             # Nothing below awaits before inject_node: that is what lets the running driver
             # see this as one atomic change, rather than catching it half-applied or tearing
             # the DAG down between the check above and the mutation.
-            machine = self._global_control_flow_machine
+            machine = flows.global_control_flow_machine
             if machine is None:
                 msg = f"Attempted to run '{node.name}' as part of the workflow already in progress, but that workflow could not be found. Wait for it to finish and try again."
                 raise RuntimeError(msg)
@@ -4895,7 +4954,7 @@ class FlowManager(EngineScoped):
             node.prepare_to_run_again()
             machine.resolution_machine.inject_node(node)
             # Emit involved nodes update after adding node to DAG
-            involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
+            involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
@@ -4903,16 +4962,17 @@ class FlowManager(EngineScoped):
             )
         else:
             # Set that we are only working on one node right now!
-            self._global_single_node_resolution = True
+            flows.global_single_node_resolution = True
             # Get or create machine
-            self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
-            self._global_control_flow_machine.context.current_nodes = [node]
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+            machine = self._make_control_flow_machine(flows, flow.name)
+            flows.global_control_flow_machine = machine
+            machine.context.current_nodes = [node]
+            resolution_machine = machine.resolution_machine
             resolution_machine.change_debug_mode(debug_mode=debug_mode)
             node.state = NodeResolutionState.UNRESOLVED
             # Build the DAG for the node
-            self._global_dag_builder.add_node_with_dependencies(node)
-            resolution_machine.context.dag_builder = self._global_dag_builder
+            flows.global_dag_builder.add_node_with_dependencies(node)
+            resolution_machine.context.dag_builder = flows.global_dag_builder
 
             # In SEQUENTIAL mode, show all flow nodes as involved. In PARALLEL mode, show only DAG nodes.
             execution_type = self.engine.config_manager.get_config_value(
@@ -4921,7 +4981,7 @@ class FlowManager(EngineScoped):
             if execution_type == WorkflowExecutionMode.SEQUENTIAL:
                 involved_nodes = self.get_involved_node_names(flow)
             else:
-                involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
+                involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             # Send a InvolvedNodesRequest
 
             self.engine.event_manager.put_event(
@@ -4930,20 +4990,18 @@ class FlowManager(EngineScoped):
                 )
             )
             try:
-                await self._global_control_flow_machine.start_flow(
-                    start_node=node, end_node=node, debug_mode=debug_mode
-                )
+                await machine.start_flow(start_node=node, end_node=node, debug_mode=debug_mode)
             except Exception as e:
                 logger.exception("Exception during single node resolution")
                 # Single-node mode was raised before the run began, so a run that never begins still
                 # has to drop it -- which is why this cleanup cannot be conditional on liveness.
-                await self._abandon_running_flow()
+                await self._abandon_running_flow(flows)
                 raise RuntimeError(e) from e
 
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                self._global_single_node_resolution = False
-                self._global_control_flow_machine.context.current_nodes = []
+                flows.global_single_node_resolution = False
+                machine.context.current_nodes = []
                 self.engine.event_manager.put_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[]))
@@ -4953,75 +5011,93 @@ class FlowManager(EngineScoped):
                 raise RuntimeError(error_message or "Node resolution failed")
 
             if resolution_machine.is_complete():
-                self._global_single_node_resolution = False
-                self._global_control_flow_machine.context.current_nodes = []
+                flows.global_single_node_resolution = False
+                machine.context.current_nodes = []
             self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
             )
 
     async def single_execution_step(self, flow: ControlFlow, change_debug_mode: bool) -> None:  # noqa: FBT001
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # do a granular step
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=True, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=True,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._run_in_progress(flows):
             return
-        if self._global_control_flow_machine is None:
+        machine = flows.global_control_flow_machine
+        if machine is None:
             return
         # The only path that pauses a live run, so it applies whether or not we go
         # on to drive.
         if change_debug_mode:
-            self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=True)
-        if self.execution_is_advancing():
+            machine.resolution_machine.change_debug_mode(debug_mode=True)
+        if self._run_is_advancing(flows):
             return
-        await self._global_control_flow_machine.granular_step()
-        if self._global_control_flow_machine.resolution_machine.is_complete():
-            self._global_single_node_resolution = False
+        await machine.granular_step()
+        if machine.resolution_machine.is_complete():
+            flows.global_single_node_resolution = False
 
     async def single_node_step(self, flow: ControlFlow) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # It won't call single_node_step without an existing flow running from US.
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=True, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=True,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._run_in_progress(flows):
             return
         # Step over a whole node
-        if self._global_single_node_resolution:
+        if flows.global_single_node_resolution:
             msg = "Cannot step through the Control Flow in Single Node Execution"
             raise RuntimeError(msg)
-        if self._global_control_flow_machine is None:
+        machine = flows.global_control_flow_machine
+        if machine is None:
             return
         # Clearing the paused flag is what resumes a paused run, so it applies
         # whether or not we go on to drive.
-        self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=False)
-        if self.execution_is_advancing():
+        machine.resolution_machine.change_debug_mode(debug_mode=False)
+        if self._run_is_advancing(flows):
             return
-        await self._global_control_flow_machine.node_step()
+        await machine.node_step()
         # Start the next resolution step now please.
-        await self._handle_post_execution_queue_processing(debug_mode=True)
+        await self._handle_post_execution_queue_processing(flows, debug_mode=True)
 
     async def continue_executing(self, flow: ControlFlow) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=False, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=False,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._run_in_progress(flows):
             return
         # Turn all debugging to false and continue on. This resumes a paused run,
         # so it applies whether or not we go on to drive.
-        if self._global_control_flow_machine is not None:
-            self._global_control_flow_machine.change_debug_mode(False)
-        if self.execution_is_advancing():
+        machine = flows.global_control_flow_machine
+        if machine is not None:
+            machine.change_debug_mode(False)
+        if self._run_is_advancing(flows):
             return
-        if self._global_control_flow_machine is not None:
-            if self._global_single_node_resolution:
-                if self._global_control_flow_machine.resolution_machine.is_complete():
-                    self._global_single_node_resolution = False
+        if machine is not None:
+            if flows.global_single_node_resolution:
+                if machine.resolution_machine.is_complete():
+                    flows.global_single_node_resolution = False
                 else:
-                    await self._global_control_flow_machine.resolution_machine.update()
+                    await machine.resolution_machine.update()
             else:
-                await self._global_control_flow_machine.node_step()
+                await machine.node_step()
         # Now it is done executing. make sure it's actually done?
-        await self._handle_post_execution_queue_processing(debug_mode=False)
+        await self._handle_post_execution_queue_processing(flows, debug_mode=False)
 
     def unresolve_whole_flow(self, flow: ControlFlow) -> None:
         for node in flow.nodes.values():
@@ -5406,3 +5482,25 @@ class FlowManager(EngineScoped):
                         node_list.append(input_node)
                         node_queue.put(input_node)
         return node_list
+
+    @staticmethod
+    def _run_in_progress(flows: WorkflowFlows) -> bool:
+        """True while the run in `flows` has started and not finished."""
+        machine = flows.global_control_flow_machine
+        if machine is None:
+            return False
+        current_state = machine.current_state
+        if current_state and current_state is not CompleteState:
+            # Flow already exists in progress
+            return True
+        return bool(
+            not machine.context.resolution_machine.is_complete() and machine.context.resolution_machine.is_started()
+        )
+
+    @staticmethod
+    def _run_is_advancing(flows: WorkflowFlows) -> bool:
+        """True while a coroutine is already driving the run in `flows`. See `execution_is_advancing`."""
+        machine = flows.global_control_flow_machine
+        if machine is None:
+            return False
+        return machine.is_advancing or machine.resolution_machine.is_advancing

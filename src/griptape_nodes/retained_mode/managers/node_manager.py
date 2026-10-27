@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
+    from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
 from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -383,18 +384,10 @@ class _NodeInstantiationDeniedError(Exception):
 
 
 class NodeManager(EngineScoped):
-    _name_to_parent_flow_name: dict[str, str]
-
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        self._name_to_parent_flow_name = {}
-
-        # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
-        # for ExecuteNodeRequests currently routed to a worker. Populated in
-        # _execute_node_via_worker, cleared in its finally. Used by
-        # cancel_worker_execution to dispatch a CancelExecuteNodeRequest to the
-        # correct worker.
-        self._orch_worker_requests: dict[str, tuple[str, str, str]] = {}
+        # Each node's parent flow and the nodes routed to a worker belong to the open workflow and
+        # live on its runtime.
 
         # Worker-side: request_id → (asyncio.Task, BaseNode) for the aprocess
         # task currently handling an ExecuteNodeRequest. Populated in
@@ -404,6 +397,20 @@ class NodeManager(EngineScoped):
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
         event_manager.register_request_handlers(self)
+
+    @property
+    def _name_to_parent_flow_name(self) -> dict[str, str]:
+        return self._current_nodes().name_to_parent_flow_name
+
+    @property
+    def _orch_worker_requests(self) -> dict[str, tuple[str, str, str]]:
+        """Orchestrator-side: node_name -> (target_request_id, worker_engine_id, worker_request_topic).
+
+        For ExecuteNodeRequests currently routed to a worker. Populated in _execute_node_via_worker,
+        cleared in its finally. Used by cancel_worker_execution to dispatch a CancelExecuteNodeRequest
+        to the correct worker.
+        """
+        return self._current_nodes().orch_worker_requests
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
@@ -449,6 +456,21 @@ class NodeManager(EngineScoped):
         for node_name, parent_flow_name in self._name_to_parent_flow_name.items():
             if parent_flow_name == old_name:
                 self._name_to_parent_flow_name[node_name] = new_name
+
+    def _current_nodes(self) -> WorkflowNodes:
+        """The current workflow's node bookkeeping, which needs a workflow to hold it.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        return self.engine.current_workflow().nodes
+
+    def _current_nodes_or_none(self) -> WorkflowNodes | None:
+        """The current workflow's node bookkeeping, or None for lookups that find nothing without a workflow."""
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
+        return workflow.nodes
 
     def _cleanup_node_on_failed_deserialization(self, node_name: str) -> None:
         """Clean up a node that failed during deserialization.
@@ -3282,10 +3304,11 @@ class NodeManager(EngineScoped):
         return node
 
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
-        if node_name not in self._name_to_parent_flow_name:
+        nodes = self._current_nodes_or_none()
+        if nodes is None or node_name not in nodes.name_to_parent_flow_name:
             msg = f"Node '{node_name}' could not be found."
             raise KeyError(msg)
-        return self._name_to_parent_flow_name[node_name]
+        return nodes.name_to_parent_flow_name[node_name]
 
     @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
@@ -3773,7 +3796,9 @@ class NodeManager(EngineScoped):
         if not request.request_id:
             request.request_id = str(uuid4())
         target_request_id = request.request_id
-        self._orch_worker_requests[request.node_name] = (
+        # The same dict is cleared below even if the workflow closes while the node runs.
+        orch_worker_requests = self._orch_worker_requests
+        orch_worker_requests[request.node_name] = (
             target_request_id,
             worker_engine_id,
             worker_request_topic,
@@ -3799,7 +3824,7 @@ class NodeManager(EngineScoped):
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation
             # so a subsequent execute on the same node doesn't see a stale record.
-            self._orch_worker_requests.pop(request.node_name, None)
+            orch_worker_requests.pop(request.node_name, None)
         result_type_name = execute_raw.get("result_type", "")
         result_data = execute_raw.get("result", {})
         # Route through cattrs structure (not ``**result_data`` spread)
@@ -3824,7 +3849,10 @@ class NodeManager(EngineScoped):
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
         """
-        entry = self._orch_worker_requests.get(node_name)
+        nodes = self._current_nodes_or_none()
+        if nodes is None:
+            return
+        entry = nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry
