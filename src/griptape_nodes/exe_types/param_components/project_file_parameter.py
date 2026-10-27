@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.project_output_parameter import ProjectOutputParameter
 from griptape_nodes.files.file import FileDestination, FileDestinationProvider
+from griptape_nodes.files.path_utils import with_default_extension
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
 
@@ -89,7 +90,8 @@ class ProjectFileParameter(ProjectOutputParameter):
         user intent.
 
         Otherwise the parameter's string value is combined with this component's
-        situation to build a ``FileDestination``.
+        situation to build a ``FileDestination``. A value with no extension takes the
+        extension of the default filename.
 
         Args:
             **extra_vars: Additional variables for the macro (e.g., sub_dirs="renders")
@@ -109,6 +111,7 @@ class ProjectFileParameter(ProjectOutputParameter):
 
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
+        filename = with_default_extension(filename, self._default_value)
 
         if "node_name" not in extra_vars:
             extra_vars["node_name"] = self._node.name
