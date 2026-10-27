@@ -254,9 +254,7 @@ class TestReadFileThumbnail:
         step = _SlowStep()
         # Force the fallback to the legacy Pillow path this test targets, rather than the
         # registered-provider pipeline (already verified off-loop by TestPreviewGenerators).
-        monkeypatch.setattr(
-            engine.os_manager, "_preview_via_registered_provider", AsyncMock(return_value=None)
-        )
+        monkeypatch.setattr(engine.os_manager, "_preview_via_registered_provider", AsyncMock(return_value=None))
         monkeypatch.setattr(
             engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data, _mime: step.run("data:thumb")
         )
