@@ -1,8 +1,10 @@
 # Running the Editor Locally
 
-The engine can serve the editor itself, so you can build workflows without opening the hosted editor at [nodes.griptape.ai](https://nodes.griptape.ai). The editor loads from your own machine and talks to the engine over the [direct WebSocket](transports.md), so editor traffic never leaves the machine.
+!!! note
 
-[Griptape Nodes Desktop](desktop/app_settings.md) already works this way. This page is for running the engine yourself with `gtn`.
+    This page is for running Griptape Nodes from the command line with `gtn`. If you use [Griptape Nodes Desktop](desktop/app_settings.md), skip it: the desktop app already runs the editor locally.
+
+The engine can serve the editor itself, so you can build workflows without opening the hosted editor at [nodes.griptape.ai](https://nodes.griptape.ai). The editor loads from your own machine and talks to the engine over the [direct WebSocket](transports.md), so editor traffic never leaves the machine.
 
 ![The editor served by the engine at 127.0.0.1:8126](../assets/img/local_editor/local-editor.png)
 
