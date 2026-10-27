@@ -195,7 +195,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Turn on `websocket_direct` first. Griptape Nodes Desktop uses this transport for its own editor; its **Direct Engine WebSocket URL** setting must match `host` and `port` here (see [App Settings](desktop/app_settings.md)).
+Turn on `websocket_direct` first. The [local editor](local_editor.md) and Griptape Nodes Desktop use this transport. Desktop's **Direct Engine WebSocket URL** setting must match `host` and `port` here (see [App Settings](desktop/app_settings.md)).
 
 ### Calling from a web page
 
