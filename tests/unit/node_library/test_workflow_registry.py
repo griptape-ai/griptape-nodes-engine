@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import uuid
@@ -552,7 +553,7 @@ class TestWorkflowRegistryOperations:
 
 
 class TestNameKeyedMethods:
-    """The name-keyed methods node libraries reach through the `WorkflowRegistry` classmethods."""
+    """The name-keyed methods node libraries reach through the deprecated `WorkflowRegistry` classmethods."""
 
     def test_generate_new_workflow_registers_the_file(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)
@@ -676,6 +677,30 @@ class TestWorkflowRegistryShim:
 
     def test_unsaved_key_prefix_matches(self) -> None:
         assert WorkflowRegistry.UNSAVED_KEY_PREFIX == _WorkflowRegistry.UNSAVED_KEY_PREFIX
+
+    @pytest.mark.parametrize(
+        ("method_name", "replacement"),
+        [
+            ("ensure_unsaved", "SetWorkflowContextRequest"),
+            ("delete_workflow_by_name", "DeleteWorkflowRequest"),
+            ("clear_user_workflows", "RefreshWorkflowRegistryRequest"),
+        ],
+    )
+    def test_deprecated_methods_log_their_replacement(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture, method_name: str, replacement: str
+    ) -> None:
+        workflow = engine.workflow_registry.register_unsaved("Untitled")
+        arguments = {
+            "ensure_unsaved": {"key": workflow.name, "display_name": "Untitled"},
+            "delete_workflow_by_name": {"name": workflow.name},
+            "clear_user_workflows": {},
+        }[method_name]
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            getattr(WorkflowRegistry, method_name)(**arguments)
+
+        assert f"WorkflowRegistry.{method_name}() is deprecated" in caplog.text
+        assert replacement in caplog.text
 
     def test_clear_user_workflows_does_not_build_an_engine(self) -> None:
         reset_root_engine()
