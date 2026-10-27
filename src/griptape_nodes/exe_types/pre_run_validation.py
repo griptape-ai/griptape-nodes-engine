@@ -94,12 +94,24 @@ def unchecked_inputs_message(inputs: Sequence[str]) -> str:
             f"{inputs[0]} wasn't checked before the run because reading it took too long. "
             "The provider may still reject it."
         )
-    rest = [subject[0].lower() + subject[1:] for subject in inputs[1:]]
+    rest = [_mid_sentence(subject) for subject in inputs[1:]]
     listed = ", ".join([inputs[0], *rest[:-1]]) + f" and {rest[-1]}"
     return (
         f"{listed} weren't checked before the run because reading them took too long. "
         "The provider may still reject them."
     )
+
+
+def _mid_sentence(subject: str) -> str:
+    """A subject as it reads after the first in a list: "The video" and "Audio clip 2" lowercased.
+
+    A first word with capitals after its first letter, such as "HDR" or "LoRA", is a name the node
+    author wrote and stays as it is; so does a quoted file name.
+    """
+    first_word = subject.split(" ", 1)[0]
+    if first_word[1:].islower():
+        return subject[:1].lower() + subject[1:]
+    return subject
 
 
 def _check_parameter(

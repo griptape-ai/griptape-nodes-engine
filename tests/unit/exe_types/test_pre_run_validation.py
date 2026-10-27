@@ -652,6 +652,16 @@ class TestUncheckedInputs:
         node.set_parameter_value("end", clip)
         assert self._unchecked(node)[1] == [(clip, "The video in 'Start'"), (clip, "The video in 'End'")]
 
+    def test_does_not_name_an_input_sharing_the_file_whose_checks_all_ran(self, tmp_path: Path) -> None:
+        clip = self._clip(tmp_path)
+        node = _node_with(
+            ParameterVideo(name="start", display_name="Start", pre_run_validators=[Duration(max=5)]),
+            ParameterVideo(name="end", display_name="End", pre_run_validators=[MaxFileSize(10_000)]),
+        )
+        node.set_parameter_value("start", clip)
+        node.set_parameter_value("end", clip)
+        assert self._unchecked(node)[1] == [(clip, "The video in 'Start'")]
+
     def test_names_nothing_when_only_the_size_is_read(self, tmp_path: Path) -> None:
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(10_000)]))
         node.set_parameter_value("video", self._clip(tmp_path))
@@ -709,6 +719,13 @@ class TestValuesHeldInAnotherProcess:
 
 
 class TestUncheckedInputsMessage:
+    def test_keeps_a_custom_nouns_capitals_after_the_first_input(self) -> None:
+        assert unchecked_inputs_message(
+            ["The video in 'Video'", "HDR clip 1 in 'Clips'", "LoRA file 2 in 'Files'", "'own.mp4'"]
+        ).startswith(
+            "The video in 'Video', HDR clip 1 in 'Clips', LoRA file 2 in 'Files' and 'own.mp4' weren't checked"
+        )
+
     def test_one_input(self) -> None:
         assert unchecked_inputs_message(["The video in 'Video'"]) == (
             "The video in 'Video' wasn't checked before the run because reading it took too long. "

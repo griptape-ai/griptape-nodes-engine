@@ -164,6 +164,10 @@ def input_check_readings() -> Iterator[None]:
         _readings.reset(token)
 
 
+# The readings that run ffprobe, and so can run out of time.
+_PROBE_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
+
+
 def timed_out_locations() -> frozenset[str]:
     """Every location whose video or audio probe ran out of time in the current `input_check_readings` block.
 
@@ -181,8 +185,9 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
     `local_audio_probe` for `AUDIO`. A reading not asked for, or that couldn't be taken, is None.
     An image Pillow can't open, such as a HEIC photo, still has its format read from its file
     signature where that names one, so a format check can judge it while the size checks skip.
-    Inside `input_check_readings`, `timed_out` says whether a video or audio probe of the input ran
-    out of time, in this call or an earlier one in the block.
+    Inside `input_check_readings`, `timed_out` says whether this call asked for a video or audio
+    reading that was skipped because the input's probe ran out of time, in this call or an earlier
+    one in the block. A call that asked only for size or an image isn't marked, since its checks ran.
 
     Args:
         value: The media input: an artifact, a path, a URL or a data URI.
@@ -214,7 +219,7 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
         video=video,
         audio=audio,
         location=location,
-        timed_out=location in timed_out_locations(),
+        timed_out=not _PROBE_NEEDS.isdisjoint(needs) and location in timed_out_locations(),
     )
 
 
