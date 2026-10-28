@@ -245,15 +245,18 @@ class WorkflowManager(EngineScoped):
         A file found again keeps its entry and its id, and takes its freshly read metadata. Saved
         entries the scan did not find (files deleted, moved, or made unreadable outside the
         engine, and an unloaded library's workflows) are removed once the scan has finished.
-        If the scan raises, nothing is removed. Unsaved workflows and entries registered while the
-        scan runs stay. Each refresh tracks only what its own scan found, so overlapping refreshes
-        share no state.
+        If the scan raises, nothing is removed. Unsaved workflows stay, and so do entries whose path
+        changed while the scan ran (registered, saved for the first time, or moved), since the scan
+        listed the files before that. Each refresh tracks only what its own scan found, so
+        overlapping refreshes share no state.
         """
         registry = self.engine.workflow_registry
         # Names are derived workspace-relative, so after a workspace change (e.g. a project
         # switch) a name kept from before would be wrong.
         registry.reindex_workflows()
-        workflow_ids_before_scan = registry.workflow_ids()
+        paths_before_scan = {
+            workflow_id: registry.get(workflow_id).absolute_path for workflow_id in registry.workflow_ids()
+        }
         found_workflow_ids: set[str] = set()
 
         # Discover workflows from libraries, config, and workspace.
@@ -289,8 +292,12 @@ class WorkflowManager(EngineScoped):
             scan_result = await self._process_workflows_for_registration(workflows_to_register)
             found_workflow_ids.update(scan_result.workflow_ids)
 
-            registered_during_scan = registry.workflow_ids() - workflow_ids_before_scan
-            registry.remove_saved_workflows_except(found_workflow_ids | registered_during_scan)
+            changed_during_scan = {
+                workflow_id
+                for workflow_id in registry.workflow_ids()
+                if registry.get(workflow_id).absolute_path != paths_before_scan.get(workflow_id)
+            }
+            registry.remove_saved_workflows_except(found_workflow_ids | changed_during_scan)
 
             # Now remove any workflows that were missing files.
             paths_to_remove = set()
