@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.files.path_utils import (
     derive_registry_key,
 )
+from griptape_nodes.node_library.workflow_registry import WorkflowPathTakenError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
@@ -209,11 +210,13 @@ class WorkflowFileOperations(EngineScoped):
             )
             return MoveWorkflowResultFailure(result_details=details)
 
-        # A stale entry can still hold the target path after its file is gone, and the registry
-        # refuses to give one path to two workflows.
-        target_holder = self.engine.workflow_registry.find_by_path(new_absolute_path)
-        if target_holder is not None:
-            details = f"Failed to move workflow '{request.workflow_name}': Workflow '{target_holder.name}' is already registered at '{new_absolute_path}'."
+        # A stale entry can still hold the target path, or the name it gives, after its file is
+        # gone, and the registry refuses to give one path or name to two workflows. Ask before
+        # the file moves, so a refusal leaves it where it is.
+        try:
+            self.engine.workflow_registry.raise_if_path_taken(workflow, new_relative_path)
+        except WorkflowPathTakenError as err:
+            details = f"Failed to move workflow '{request.workflow_name}': Workflow '{err.existing.name}' is already registered at '{new_absolute_path}'."
             return MoveWorkflowResultFailure(result_details=details)
 
         old_registry_key = derive_registry_key(old_relative_path)
