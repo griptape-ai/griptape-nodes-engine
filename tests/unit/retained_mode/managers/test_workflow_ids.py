@@ -61,6 +61,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowRequest,
     RegisterWorkflowResultSuccess,
     RenameWorkflowRequest,
+    RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
@@ -69,6 +70,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
+    SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
@@ -882,3 +884,37 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         _scan(restarted, workspace)
         assert restarted.workflow_registry.get(found.workflow_id).name == "shots/renamed"
         restarted.handle_request(SetCurrentProjectRequest(project_id=None))
+
+
+class TestAWorkflowOpenBeneathTheCurrentOne:
+    """Pushing B while A is open puts B on top. Saves act on B, so A's file and name stay A's."""
+
+    def _open_a_beneath_b(self, engine: Engine) -> tuple[SaveWorkflowResultSuccess, str]:
+        b = _saved_workflow(engine, "b")
+        _open_new_workflow(engine, "a")
+        a = _save(engine)
+        engine.context_manager.push_workflow(b.workflow_name)
+        assert engine.workflow_registry.is_open(a.workflow_id or "")
+        assert engine.context_manager.get_current_workflow_id() != a.workflow_id
+        return a, Path(a.file_path).read_text(encoding="utf-8")
+
+    def test_renaming_it_is_refused(self, project_engine: Engine, workspace: Path) -> None:
+        a, a_content = self._open_a_beneath_b(project_engine)
+
+        renamed = _run(project_engine, RenameWorkflowRequest(workflow_name=a.workflow_name, requested_name="a2"))
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "is open on top of it" in str(renamed.result_details)
+        assert not (workspace / "a2.py").exists()
+        assert Path(a.file_path).read_text(encoding="utf-8") == a_content
+        assert _id_at(project_engine, a.file_path) == a.workflow_id
+
+    def test_saving_over_its_file_is_refused_before_writing(self, project_engine: Engine) -> None:
+        a, a_content = self._open_a_beneath_b(project_engine)
+
+        saved = _run(project_engine, SaveWorkflowRequest(file_name=a.workflow_name, overwrite_existing=True))
+
+        assert isinstance(saved, SaveWorkflowResultFailure)
+        assert "is open and saved in that file" in str(saved.result_details)
+        assert Path(a.file_path).read_text(encoding="utf-8") == a_content
+        assert _id_at(project_engine, a.file_path) == a.workflow_id

@@ -160,6 +160,17 @@ class WorkflowFileOperations(EngineScoped):
             ),
         )
 
+    def _open_beneath_current_error(self, request: RenameWorkflowRequest, source: Workflow) -> str | None:
+        """Why an open `source` cannot be renamed: a rename saves the current workflow, which is another one."""
+        current_workflow_id = self.engine.context_manager.get_current_workflow_id()
+        if current_workflow_id == source.workflow_id:
+            return None
+        current_name = self.engine.workflow_registry.get(current_workflow_id).name
+        return (
+            f"Attempted to rename workflow '{request.workflow_name}'. Failed because workflow "
+            f"'{current_name}' is open on top of it. Close '{current_name}' first."
+        )
+
     async def _rename_open_workflow(
         self,
         *,
@@ -172,6 +183,10 @@ class WorkflowFileOperations(EngineScoped):
 
         The workflow stays open and keeps its id; only its file and name change.
         """
+        beneath_error = self._open_beneath_current_error(request, source)
+        if beneath_error is not None:
+            return RenameWorkflowResultFailure(result_details=beneath_error)
+
         previous_absolute_path = source.absolute_path
         previous_file_path = source.file_path
 
