@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, override
 
@@ -71,7 +72,6 @@ from tests.unit.exe_types.validators.media_files import image_file
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.engine import Engine
@@ -593,7 +593,7 @@ class TestRulesAcrossInputs:
 
         def counting(location: str) -> ImageInfo:
             reads.append(location)
-            side = sizes[location.rsplit("/", 1)[-1]]
+            side = sizes[Path(location).name]
             return ImageInfo(side, side, "image/png")
 
         monkeypatch.setattr(input_checks, "_read_image_info", counting)
