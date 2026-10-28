@@ -358,7 +358,8 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    return asyncio.run(engine.workflow_manager.runner.run_workflow(relative_file_path=relative_file_path))
+    """Run a saved file as node libraries do: into the current workflow, else opened as one."""
+    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path))
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:
@@ -907,11 +908,14 @@ class TestConcurrentLoadsDoNotCrossContaminate:
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path),
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path, opens_workflow=False),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path, opens_workflow=False),
             )
 
-        host_result, sibling_result = asyncio.run(load_both())
+        # The loads run inside a run of the open workflow, as a WorkflowNode's do, so both build into it.
+        reopened.context_manager.push_workflow(workflow_name="running")
+        with reopened.bind_workflow(reopened.current_workflow()):
+            host_result, sibling_result = asyncio.run(load_both())
 
         # The host's own problem came from its subflow, and it has to survive the sibling load
         # running alongside it -- otherwise the host reports GOOD over placeholder nodes.

@@ -38,9 +38,12 @@ class OpenWorkflowSet:
         if workflow_id in self._by_id:
             msg = f"Attempted to open workflow '{workflow_id}'. Failed because it is already open."
             raise OpenWorkflowError(msg)
-        if self._by_id and not self._allow_several_open:
-            open_id = next(iter(self._by_id))
-            msg = f"Attempted to open workflow '{workflow_id}'. Failed because workflow '{open_id}' is already open."
+        blocking = self.workflow_blocking_open()
+        if blocking is not None:
+            msg = (
+                f"Attempted to open workflow '{workflow_id}'. Failed because workflow '{blocking.workflow_id}' "
+                "is already open."
+            )
             raise OpenWorkflowError(msg)
 
         workflow = WorkflowRuntime(workflow_id)
@@ -83,6 +86,12 @@ class OpenWorkflowSet:
         del self._by_id[workflow.workflow_id]
         workflow.workflow_id = workflow_id
         self._by_id[workflow_id] = workflow
+
+    def workflow_blocking_open(self) -> WorkflowRuntime | None:
+        """The open workflow that keeps another from opening: the one open, when only one may be."""
+        if self._allow_several_open or not self._by_id:
+            return None
+        return next(iter(self._by_id.values()))
 
     def is_open(self, workflow_id: str) -> bool:
         return workflow_id in self._by_id

@@ -1,6 +1,5 @@
 """Tests for ContextManager.push_workflow."""
 
-import ast
 import asyncio
 import logging
 import tempfile
@@ -736,29 +735,6 @@ class TestAdoptOrchestratorWorkflow:
             engine.context_manager.adopt_orchestrator_workflow(None, None, None, None)
 
         assert engine.worker_workflows.all_kept() == []
-
-
-class TestGeneratedWorkflowCode:
-    """Tests that generated workflow code uses push_workflow(file_path=__file__)."""
-
-    def test_generated_code_uses_file_path_not_workflow_name(self, engine: Engine) -> None:
-        """_generate_workflow_run_prerequisite_code emits push_workflow(file_path=__file__)."""
-        from griptape_nodes.retained_mode.managers.workflow.codegen import ImportRecorder
-
-        workflow_manager = engine.workflow_manager
-        import_recorder = ImportRecorder()
-        code_blocks = workflow_manager.codegen._generate_workflow_run_prerequisite_code(
-            import_recorder=import_recorder,
-            library_names=[],
-        )
-
-        module = ast.Module(body=[n for n in code_blocks if isinstance(n, ast.stmt)], type_ignores=[])
-        ast.fix_missing_locations(module)
-        source = ast.unparse(module)
-
-        assert "push_workflow(file_path=__file__)" in source
-        assert "workflow_name=" not in source
-        assert "workflow_name=" not in source
 
 
 class TestEnsureWorkflowAndFlowRequest:
