@@ -7,13 +7,19 @@ resolves which workflow's objects the current work means.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from griptape_nodes.exe_types.node_types import BaseNode
 
 
 class WorkflowObjects:
-    """The flows and nodes of one open workflow, by name."""
+    """The flows and nodes of one open workflow, by name, and which of its nodes have queued UI changes."""
 
     def __init__(self) -> None:
         self._name_to_objects: dict[str, object] = {}
+        # Its nodes with queued UI changes, keyed by id() because a node hashes by its mutable name.
+        self._nodes_with_queued_changes: dict[int, BaseNode] = {}
 
     def __len__(self) -> int:
         return len(self._name_to_objects)
@@ -141,3 +147,28 @@ class WorkflowObjects:
             raise ValueError(msg)
 
         return name_to_return
+
+    def note_queued_changes(self, node: BaseNode) -> None:
+        """Remember that `node` queued a UI change, for the next `take_nodes_with_queued_changes`."""
+        self._nodes_with_queued_changes[id(node)] = node
+
+    def forget_queued_changes(self, node: BaseNode) -> None:
+        """Forget `node`'s queued UI changes, as when it is deleted."""
+        self._nodes_with_queued_changes.pop(id(node), None)
+
+    def take_nodes_with_queued_changes(self) -> list[BaseNode]:
+        """Return the nodes with queued UI changes, in queue order, and forget them.
+
+        Drained one atomic ``popitem`` at a time: a node can queue a change from another thread
+        mid-drain, and copying then clearing would drop it while its element stays queued. The
+        empty check is the pop itself, because another thread may be draining too.
+        """
+        nodes = []
+        while True:
+            try:
+                _, node = self._nodes_with_queued_changes.popitem()
+            except KeyError:
+                break
+            nodes.append(node)
+        nodes.reverse()
+        return nodes
