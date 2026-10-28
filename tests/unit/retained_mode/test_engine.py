@@ -9,6 +9,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Iterator
+from unittest.mock import patch
 
 import pytest
 
@@ -369,5 +370,21 @@ class TestRequestingAnotherEngine:
 
         assert isinstance(result, ResultPayloadFailure)
         assert links.asked == [("gpu-01", request, 1.0)]
-        assert links.link_lost == engine.worker_manager.on_engine_lost
+        assert links.link_lost is not None
         assert engine.can_reach_other_engines
+
+    @pytest.mark.asyncio
+    async def test_a_link_lost_on_the_transports_loop_is_settled_on_the_engine_loop(self) -> None:
+        engine = Engine()
+        engine.event_manager.initialize_queue()
+        links = _Links()
+        engine.attach_engine_links(links)  # type: ignore[arg-type]
+        settled_on: list[asyncio.AbstractEventLoop] = []
+
+        async def record_loop(_engine_id: str) -> None:
+            settled_on.append(asyncio.get_running_loop())
+
+        with patch.object(engine.worker_manager, "on_engine_lost", side_effect=record_loop):
+            await asyncio.to_thread(asyncio.run, links.link_lost("artist"))  # type: ignore[operator]
+
+        assert settled_on == [asyncio.get_running_loop()]

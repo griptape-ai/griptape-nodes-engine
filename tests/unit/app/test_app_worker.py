@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.managers.engine_links import (
     EngineNotFoundError,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
+from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
@@ -2498,7 +2499,7 @@ def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None
     engine = worker_manager.engine
     engine.secrets_manager.get_secret.return_value = _LICENSE  # type: ignore[union-attr]
     engine.library_manager.get_library_info_by_library_name.return_value = MagicMock(  # type: ignore[union-attr]
-        library_version="1.0.0"
+        library_version="1.0.0", lifecycle_state=LibraryLifecycleState.LOADED
     )
     links = _FakeEngineLinks(refuse=refuse)
     # As Engine.attach_engine_links does: requests go through the links, and a lost link reaches here.
@@ -2657,9 +2658,17 @@ class TestStartingAWorkerOnAnotherEngine:
         self, worker_manager: WorkerManager
     ) -> None:
         links = _host_engine(worker_manager)
-        with patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)):
-            await worker_manager._register_with_engine(_HOST_ENGINE, _SESSION, _LIBRARY)
-        links.not_found = "gpu-01 did not answer within 60 seconds."
+        answer = links.request
+
+        async def leave_the_start_unanswered(
+            engine_id: str, request: RequestPayload, *, timeout_s: float | None
+        ) -> ResultPayload:
+            if type(request).__name__ == "StartWorkerForEngineRequest":
+                msg = "gpu-01 did not answer within 60 seconds."
+                raise EngineNotFoundError(msg)
+            return await answer(engine_id, request, timeout_s=timeout_s)
+
+        worker_manager.engine.request = leave_the_start_unanswered  # type: ignore[method-assign]
 
         await _start_on_host_engine(worker_manager)
 
@@ -2686,7 +2695,9 @@ class TestStartingAWorkerOnAnotherEngine:
         assert links.sent_types() == ["OfferSessionForWorkersRequest"]
 
     @pytest.mark.asyncio
-    async def test_two_libraries_on_one_engine_register_with_it_once(self, worker_manager: WorkerManager) -> None:
+    async def test_every_start_registers_anew_so_the_engine_checks_the_libraries_as_they_are_now(
+        self, worker_manager: WorkerManager
+    ) -> None:
         links = _host_engine(worker_manager)
         _assign_libraries(worker_manager, {_LIBRARY: _HOST_ENGINE, "Other": _HOST_ENGINE})
 
@@ -2696,6 +2707,7 @@ class TestStartingAWorkerOnAnotherEngine:
         assert links.sent_types() == [
             "OfferSessionForWorkersRequest",
             "StartWorkerForEngineRequest",
+            "OfferSessionForWorkersRequest",
             "StartWorkerForEngineRequest",
         ]
 
@@ -2744,6 +2756,30 @@ class TestStartingAWorkerOnAnotherEngine:
         (stop,) = links.sent_of(worker_events.StopWorkerForEngineRequest)
         assert stop == worker_events.StopWorkerForEngineRequest(worker_engine_id=worker_engine_id)
         assert worker_manager._remote_starts == {}
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_fails_unexpectedly_is_forgotten_and_that_worker_stopped(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise the library reads as still starting, and is never started again this session."""
+        links = _host_engine(worker_manager)
+        answer = links.request
+
+        async def fail_the_start(engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+            result = await answer(engine_id, request, timeout_s=timeout_s)
+            if type(request).__name__ == "StartWorkerForEngineRequest":
+                msg = "the link's driver is not running"
+                raise RuntimeError(msg)
+            return result
+
+        worker_manager.engine.request = fail_the_start  # type: ignore[method-assign]
+        with patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)):
+            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
+            await asyncio.gather(worker_manager._requested_spawns[_LIBRARY], return_exceptions=True)
+            await asyncio.gather(*worker_manager._stop_requests)
+
+        assert worker_manager._remote_starts == {}
+        assert links.sent_of(worker_events.StopWorkerForEngineRequest)
 
     @pytest.mark.asyncio
     async def test_a_lost_link_settles_the_starts_sent_to_that_engine(self, worker_manager: WorkerManager) -> None:
@@ -3167,6 +3203,53 @@ class TestServingAnotherEnginesSession:
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
         assert "2.0.0" in str(result.result_details)
         assert not result.session_unknown
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stopping_a_library_stops_its_workers_run_for_other_engines(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Resetting a library replaces the environment its hosted workers run in."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        proc = await _host(worker_manager, exits=asyncio.Event())
+
+        with patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()) as terminate:
+            await worker_manager.stop_worker_for_library(_LIBRARY)
+
+        terminate.assert_awaited_once_with(f"{_ARTIST_SESSION}/{_LIBRARY}", proc)
+
+    @pytest.mark.asyncio
+    async def test_a_library_this_engine_updated_since_the_session_registered_is_refused(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = MagicMock(  # type: ignore[union-attr]
+            library_version="1.1.0", lifecycle_state=LibraryLifecycleState.LOADED
+        )
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "1.1.0" in str(result.result_details)
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_library_this_engine_has_not_loaded_is_refused(self, worker_manager: WorkerManager) -> None:
+        """A disabled library, one that failed to load, or one still installing has no environment to run in."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = MagicMock(  # type: ignore[union-attr]
+            library_version="1.0.0", lifecycle_state=LibraryLifecycleState.DISABLED
+        )
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "not loaded" in str(result.result_details)
         spawn.assert_not_awaited()
 
     @pytest.mark.asyncio

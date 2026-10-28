@@ -12,6 +12,7 @@ thing that should read it. Everything else receives its dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -569,7 +570,7 @@ class Engine:
     def attach_engine_links(self, engine_links: EngineLinks) -> None:
         """Give this engine the app's transport to other engines. The app attaches it at startup."""
         self._engine_links = engine_links
-        engine_links.on_link_lost(self._worker_manager.on_engine_lost)
+        engine_links.on_link_lost(self._on_engine_link_lost)
 
     async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
         """Send `request` to the engine `engine_id`, wherever it runs, and return its result.
@@ -708,6 +709,20 @@ class Engine:
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
+
+    async def _on_engine_link_lost(self, engine_id: str) -> None:
+        """Settle what a lost engine left behind, on the engine loop.
+
+        The transport reports a lost link from its own loop, but the worker state this changes is
+        written by request handlers on the engine loop.
+        """
+        engine_loop = self._event_manager.event_loop
+        if engine_loop is None:
+            await self._worker_manager.on_engine_lost(engine_id)
+            return
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._worker_manager.on_engine_lost(engine_id), engine_loop)
+        )
 
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.
