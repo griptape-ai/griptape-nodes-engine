@@ -6400,6 +6400,80 @@ situations:
         assert any("Failed to load registered project" in msg for msg in warning_messages)
 
     @pytest.mark.asyncio
+    async def test_repeated_load_failure_is_warned_once_per_path(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Repeated startup scans keep the failure visible without duplicate warnings."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        project_path = str(tmp_path / "missing.yml")
+        failure = LoadProjectTemplateResultFailure(
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.MISSING),
+            result_details="file not found",
+        )
+        cast("Mock", pm._config_manager).get_config_value.return_value = [project_path]
+
+        with (
+            patch.object(pm, "on_load_project_template_request", new=AsyncMock(return_value=failure)),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            await pm._load_registered_projects()
+            await pm._load_registered_projects()
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("Failed to load registered project" in msg for msg in warning_messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_boot_id_index_does_not_record_read_failures(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """The id pre-pass is read-only; the load pass owns failed-load status."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        readable_path = (tmp_path / "project.yml").resolve()
+        readable_path.write_text("placeholder")
+        failure = LoadProjectTemplateResultFailure(
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.MISSING),
+            result_details="file not found",
+        )
+        with patch.object(pm, "_read_overlay", new=AsyncMock(return_value=failure)) as read_overlay:
+            await pm._build_boot_id_index([readable_path])
+
+        read_overlay.assert_awaited_once_with(readable_path, record_status=False)
+
+    @pytest.mark.asyncio
+    async def test_missing_registration_is_read_once_and_remains_listed(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, ReadFileResultFailure
+        from griptape_nodes.retained_mode.events.project_events import ListProjectTemplatesRequest
+
+        path = (tmp_path / "missing.yml").resolve()
+        cast("Mock", pm._config_manager).get_config_value.return_value = [str(path)]
+        mock_engine = MagicMock()
+        mock_engine.ahandle_request = AsyncMock(
+            return_value=ReadFileResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="file not found"
+            )
+        )
+        with patch.object(pm, "_engine", mock_engine), caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            await pm._load_registered_projects()
+            assert mock_engine.ahandle_request.await_count == 1
+            request = mock_engine.ahandle_request.await_args.args[0]
+            assert request.failure_log_level == logging.DEBUG
+            assert pm._registered_template_status[path].status == ProjectValidationStatus.MISSING
+            with patch.object(pm, "_build_unloaded_id_index", new=AsyncMock(return_value={})):
+                listing = await pm.on_list_project_templates_request(ListProjectTemplatesRequest())
+            assert [item.project_id for item in listing.failed_to_load] == [str(path)]
+            await pm._load_registered_projects()
+
+        warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "Manage Projects" in warnings[0]
+        assert cast("Mock", pm._config_manager).set_config_value.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_app_initialization_complete_loads_registered_projects(
         self, pm: ProjectManager, tmp_path: Path
     ) -> None:

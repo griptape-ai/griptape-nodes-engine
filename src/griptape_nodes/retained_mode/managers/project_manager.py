@@ -748,6 +748,10 @@ class ProjectManager(EngineScoped):
         # Track validation status for ALL load attempts (including MISSING/UNUSABLE)
         # This allows UI to query why a project failed to load
         self._registered_template_status: dict[Path, ProjectValidationInfo] = {}
+        # Startup can run more than once in a process (for example after a worker
+        # adopts a project). Keep a missing registration visible to the UI while
+        # avoiding repeated identical warnings for the same persisted path.
+        self._warned_registered_project_paths: dict[Path, str] = {}
 
         # Snapshot of os.environ entries mutated by the currently-active project.
         # Maps env var name -> original value (or None if the var was not set before).
@@ -762,6 +766,7 @@ class ProjectManager(EngineScoped):
         # re-reading every overlay when the index is legitimately empty (registered
         # files exist but none declare an id).
         self._boot_id_to_file_path: dict[str, Path] = {}
+        self._boot_read_failures: dict[Path, LoadProjectTemplateResultFailure] = {}
         self._boot_id_index_built: bool = False
 
         # Register event handlers
@@ -989,6 +994,7 @@ class ProjectManager(EngineScoped):
             file_path=str(project_file_path),
             encoding="utf-8",
             workspace_only=False,
+            failure_log_level=logging.DEBUG if not record_status else None,
         )
         read_result = await self.engine.ahandle_request(read_request)
 
@@ -4084,6 +4090,7 @@ class ProjectManager(EngineScoped):
         self.engine.variables_manager.remove_project_variables(project_id)
         if file_path is not None:
             self._registered_template_status.pop(file_path, None)
+            self._warned_registered_project_paths.pop(file_path, None)
 
         # Remove from persisted config so it is not reloaded on restart.
         # PROJECTS_TO_REGISTER_KEY stores file paths, so filter by canonical-path
@@ -5392,14 +5399,23 @@ class ProjectManager(EngineScoped):
                 if already_loaded:
                     continue
                 load_request = LoadProjectTemplateRequest(project_path=canonical_path)
-                result = await self.on_load_project_template_request(load_request)
-                if result.failed():
-                    logger.warning(
-                        "Failed to load registered project '%s' on startup: %s",
-                        canonical_path,
-                        result.result_details,
-                    )
+                result = self._boot_read_failures.get(canonical_path)
+                if result is None:
+                    result = await self.on_load_project_template_request(load_request)
                 else:
+                    self._registered_template_status[canonical_path] = result.validation
+                if result.failed():
+                    detail = str(result.result_details)
+                    if self._warned_registered_project_paths.get(canonical_path) != detail:
+                        logger.warning(
+                            "Failed to load registered project '%s' on startup: %s. "
+                            "Remove it from Manage Projects if it is no longer needed.",
+                            canonical_path,
+                            result.result_details,
+                        )
+                        self._warned_registered_project_paths[canonical_path] = detail
+                else:
+                    self._warned_registered_project_paths.pop(canonical_path, None)
                     logger.debug("Reloaded registered project from '%s'", canonical_path)
 
             for directory in directory_paths:
@@ -5432,8 +5448,9 @@ class ProjectManager(EngineScoped):
             file_paths = [path for path in resolved_paths if not path.is_dir()]
 
         for canonical_path in file_paths:
-            read_load = await self._read_overlay(canonical_path)
+            read_load = await self._read_overlay(canonical_path, record_status=False)
             if isinstance(read_load, LoadProjectTemplateResultFailure):
+                self._boot_read_failures[canonical_path] = read_load
                 continue
             _, overlay = read_load
             if overlay.id is not None:
@@ -5443,6 +5460,7 @@ class ProjectManager(EngineScoped):
     def _clear_boot_id_index(self) -> None:
         """Reset the boot id-index and its built-guard so a later boot loader rebuilds it."""
         self._boot_id_to_file_path = {}
+        self._boot_read_failures = {}
         self._boot_id_index_built = False
 
     def _resolve_registered_entry_paths(
