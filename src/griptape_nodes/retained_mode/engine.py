@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -227,6 +228,9 @@ class Engine:
             WorkflowManager,
         )
 
+        # Workflow ids live only as long as this engine, so clients compare this to notice a
+        # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
+        self._engine_run_id = uuid.uuid4().hex
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -700,6 +704,7 @@ class Engine:
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
                 clients=self._session_manager.clients,
+                engine_run_id=self._engine_run_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
                 user=user,
                 user_organization=user_organization,
