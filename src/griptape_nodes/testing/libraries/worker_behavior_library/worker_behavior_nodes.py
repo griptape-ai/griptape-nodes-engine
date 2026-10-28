@@ -10,10 +10,9 @@ the minimal fixtures did not cover:
   refused and a local read would answer from the wrong process.
 - ``UnshippableOutputNode``: outputs a value its author declared unserializable, which a
   worker must refuse to ship rather than drop on the wire.
-- ``DerivedStructureNode``: the authoring contract's reference shape -- parameter structure
-  derives from parameter values. Its value hook creates and removes a parameter as a pure
-  function of ``shape``, so any fresh copy of the node converges on the right structure the
-  moment its values hydrate, in any order.
+- ``DerivedStructureNode``: parameter structure derived from parameter values. Its value hook
+  creates and removes a parameter as a pure function of ``shape``, on the node being edited; a
+  worker's copy receives that structure from the orchestrator instead of re-running the hook.
 - ``WriteBytesNode``: writes binary through ``File``, the ordinary way a node emits a file.
   Reads it back and reports whether the bytes survived, so a routing change that sends file
   I/O across the process boundary fails a test instead of silently writing mojibake.
@@ -27,24 +26,50 @@ the minimal fixtures did not cover:
 - ``EditorBehaviorNode``: converters, validators, and parameters added and removed from
   ``after_value_set`` -- all of which now run orchestrator-side on the real class instead of
   being lost to a schema stub.
-- ``ReportsHydrationNode``: reports whether its value hook and its ``process`` ran inside the
-  rebuild a worker does before running a node, during which graph edits are refused.
+- ``ReportsHydrationNode``: reports whether its value hook ran on the copy that runs it, and
+  whether its ``process`` ran inside the rebuild a worker does before running a node.
 - ``ProcessInfoNode``: reports the process that ran it and that process's parent, so a test
   driving real engine processes can tell which process executed the node.
+- ``EditsTheGraphWhileLoadingNode``: sends requests that edit other nodes and their connections while
+  its value is applied on load (strict-mode rule ``graph-access-while-loading``). Nothing it sends
+  while a worker loads its copy may reach the orchestrator's graph.
+- ``ReadsConnectionsWhileLoadingNode``: only asks about its own connections while loading, the
+  harmless form of the same mistake, so the rule can be watched in-process too.
+- ``WaitsUntilReleasedNode``: runs until a test releases it, so another node can load while it runs,
+  and a run can be cancelled mid-way.
+- ``FailsInProcessNode`` / ``RefusesToRunNode``: a run that raises, and one refused by
+  ``validate_in_execution_environment``.
+- ``RecordsDeletionNode``: records each ``after_node_deleted`` call, which discarding a worker's copy
+  must not make.
+- ``ListSourceNode`` / ``ReadsABoundedListNode``: a list output feeding a ``ParameterList`` that holds
+  at most two rows, so a connection can deliver more items than rows could.
+- ``ReadsAManagerNode``: reads config through a manager while running (strict-mode rule
+  ``state-read-bypassing-requests``).
+- ``SetsAnAttributeInItsHookNode``: sets attributes from ``after_value_set`` (strict-mode rule
+  ``state-outside-parameters``), one replaced, one declared in ``attributes_outside_parameters``, and
+  one changed in place.
+- ``PlainGroupNode``: a node group, which runs where its workflow is open and is never copied to a
+  worker.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import AsyncResult, DataNode
 from griptape_nodes.files.file import File
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    DeleteConnectionRequest,
+    ListConnectionsForNodeRequest,
+)
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     RemoveParameterFromNodeRequest,
@@ -52,6 +77,9 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    import asyncio
 
 MEDIA_BYTES = b"\x89PNG\r\n\x1a\n" + b"fixture-media-payload"
 
@@ -382,9 +410,8 @@ class EditorBehaviorNode(DataNode):
     def process(self) -> None:
         self.parameter_output_values["observed_mode"] = self.get_parameter_value("mode")
         # Whether the parameter this node's own after_value_set added is present on the instance
-        # that is executing. In a worker the add is a REQUEST, and requests are answered by the
-        # orchestrator -- so the parameter can land on the orchestrator's node while this copy,
-        # the one running process(), never sees it.
+        # that is executing. A worker's copy has it when the orchestrator's node had it as the run
+        # was sent, since the copy gets the node's structure rather than re-running the hook.
         self.parameter_output_values["dynamic_visible_in_process"] = (
             self.get_parameter_by_name(self.DYNAMIC_PARAMETER) is not None
         )
@@ -530,12 +557,10 @@ class WriteBytesNode(DataNode):
 class DerivedStructureNode(DataNode):
     """Parameter structure as a deterministic function of parameter values.
 
-    This is the sanctioned dynamic-structure pattern (the diffusers VAE decoder's, minus the
-    pipeline): the value hook mutates the LOCAL node directly, so the derivation runs wherever
-    the values land -- on the orchestrator at edit time, and again on a fresh worker copy as
-    hydration applies the same values. Nothing needs to sync structure, because structure is
-    recomputed. Contrast EditorBehaviorNode, whose hook goes through a request and therefore
-    mutates only the authoritative node.
+    The diffusers VAE decoder's dynamic-structure pattern, minus the pipeline: the value hook
+    mutates the node directly as it is edited. A worker's copy runs no value hooks, so it gets
+    the derived parameters from the orchestrator's node, the way a saved workflow reloads them.
+    Contrast EditorBehaviorNode, whose hook goes through a request.
     """
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
@@ -611,15 +636,18 @@ class DerivedStructureNode(DataNode):
 
 
 class ReportsHydrationNode(DataNode):
-    """Reports whether its value hook and its process() each ran while the node was being rebuilt.
+    """Reports whether its value hook ran on the copy that runs it, and whether process() ran inside the rebuild.
 
-    A worker refuses graph edits only while it rebuilds a node from the values it was sent, so the
-    rebuild has to cover the value hooks and end before process() runs.
+    A worker loads its copy without running value hooks, and answers requests locally only while it
+    rebuilds, so the rebuild has to end before process() runs.
     """
+
+    # Only this node's own report reads it, which is the point.
+    attributes_outside_parameters = frozenset({"_hook_ran"})
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata=metadata)
-        self._hook_saw_hydration = False
+        self._hook_ran = False
         self.add_parameter(
             Parameter(
                 name="trigger",
@@ -629,7 +657,7 @@ class ReportsHydrationNode(DataNode):
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
             )
         )
-        for output_name in ("hook_saw_hydration", "process_saw_hydration"):
+        for output_name in ("hook_ran", "process_saw_rebuild"):
             self.add_parameter(
                 Parameter(
                     name=output_name,
@@ -642,12 +670,12 @@ class ReportsHydrationNode(DataNode):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:  # noqa: ARG002
         if parameter.name == "trigger":
-            self._hook_saw_hydration = current_engine().event_manager.hydrating_node_name() == self.name
+            self._hook_ran = True
 
     def process(self) -> None:
-        self.parameter_output_values["hook_saw_hydration"] = self._hook_saw_hydration
-        self.parameter_output_values["process_saw_hydration"] = (
-            current_engine().event_manager.hydrating_node_name() is not None
+        self.parameter_output_values["hook_ran"] = self._hook_ran
+        self.parameter_output_values["process_saw_rebuild"] = (
+            current_engine().event_manager.rebuilding_node_name() is not None
         )
 
 
@@ -703,3 +731,299 @@ class WriteProjectFileNode(DataNode):
             self.parameter_output_values["saved_as"] = location.parsed_macro.template
         else:
             self.parameter_output_values["saved_as"] = str(location)
+
+
+class EditsTheGraphWhileLoadingNode(DataNode):
+    """Edits other nodes and their connections while its ``trigger`` value is applied on load.
+
+    The mistake ``graph-access-while-loading`` names, in its most harmful form: run on the
+    orchestrator's graph, these would remove a parameter and rewire the nodes around it. The names
+    are fixed so a test can build the graph they aim at.
+    """
+
+    TARGET_NODE = "Graph Edit Target"
+    UPSTREAM_NODE = "Graph Edit Upstream"
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="trigger",
+                type="str",
+                default_value="",
+                tooltip="Any value set on load sends the edits",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        if initial_setup and param_name == "trigger":
+            GriptapeNodes.handle_request(
+                RemoveParameterFromNodeRequest(node_name=self.TARGET_NODE, parameter_name="in_value")
+            )
+            GriptapeNodes.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=self.UPSTREAM_NODE,
+                    source_parameter_name="out",
+                    target_node_name=self.TARGET_NODE,
+                    target_parameter_name="in_value",
+                )
+            )
+            GriptapeNodes.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=self.UPSTREAM_NODE,
+                    source_parameter_name="out",
+                    target_node_name=self.name,
+                    target_parameter_name="trigger",
+                )
+            )
+        super().set_parameter_value(
+            param_name,
+            value,
+            initial_setup=initial_setup,
+            emit_change=emit_change,
+            skip_before_value_set=skip_before_value_set,
+        )
+
+    def process(self) -> None:
+        pass
+
+
+class ReadsConnectionsWhileLoadingNode(DataNode):
+    """Asks about its own connections while its ``trigger`` value is applied on load.
+
+    Harmless anywhere, so ``graph-access-while-loading`` can be watched in-process as well as in a worker.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="trigger",
+                type="str",
+                default_value="",
+                tooltip="Any value set on load sends the question",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        if initial_setup and param_name == "trigger":
+            GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=self.name))
+        super().set_parameter_value(
+            param_name,
+            value,
+            initial_setup=initial_setup,
+            emit_change=emit_change,
+            skip_before_value_set=skip_before_value_set,
+        )
+
+    def process(self) -> None:
+        pass
+
+
+class WaitsUntilReleasedNode(DataNode):
+    """Runs until a test sets ``release``, recording in ``running`` the names of the nodes that started.
+
+    A test sets ``release`` to a fresh ``asyncio.Event`` before running one, on the loop that runs it.
+    """
+
+    running: ClassVar[set[str]] = set()
+    release: ClassVar[asyncio.Event | None] = None
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(name="done", type="bool", default_value=False, tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        )
+
+    async def aprocess(self) -> None:
+        release = type(self).release
+        if release is None:
+            msg = "Attempted to run WaitsUntilReleasedNode. Failed because no release event was set."
+            raise RuntimeError(msg)
+        type(self).running.add(self.name)
+        await release.wait()
+        self.parameter_output_values["done"] = True
+
+    def process(self) -> None:
+        pass
+
+
+class FailsInProcessNode(DataNode):
+    """Raises while running."""
+
+    def process(self) -> None:
+        msg = "this node always fails"
+        raise RuntimeError(msg)
+
+
+class RefusesToRunNode(DataNode):
+    """Refused by ``validate_in_execution_environment``, so it never runs."""
+
+    def validate_in_execution_environment(self) -> list[Exception] | None:
+        return [ValueError("this node never runs here")]
+
+    def process(self) -> None:
+        pass
+
+
+class RecordsDeletionNode(DataNode):
+    """Records in ``deleted`` the name of each node of its type whose ``after_node_deleted`` ran."""
+
+    deleted: ClassVar[list[str]] = []
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(name="ran", type="bool", default_value=False, tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        )
+
+    def after_node_deleted(self) -> None:
+        type(self).deleted.append(self.name)
+
+    def process(self) -> None:
+        self.parameter_output_values["ran"] = True
+
+
+class ListSourceNode(DataNode):
+    """Outputs a list of three strings, more than ``ReadsABoundedListNode`` has rows for."""
+
+    ITEMS = ("first", "second", "third")
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="items",
+                type="list[str]",
+                output_type="list[str]",
+                default_value=[],
+                tooltip="",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+
+    def process(self) -> None:
+        self.parameter_output_values["items"] = list(self.ITEMS)
+
+
+class ReadsABoundedListNode(DataNode):
+    """Echoes an input ``ParameterList`` that holds at most two rows."""
+
+    MAX_ITEMS = 2
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            ParameterList(
+                name="items",
+                input_types=["str"],
+                type="str",
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                max_items=self.MAX_ITEMS,
+            )
+        )
+        self.add_parameter(Parameter(name="echo", type="list", tooltip="", allowed_modes={ParameterMode.OUTPUT}))
+
+    def process(self) -> None:
+        self.parameter_output_values["echo"] = self.get_parameter_list_value("items")
+
+
+class ReadsAManagerNode(DataNode):
+    """Reads config through a manager while running, instead of with a request."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="config_value",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+
+    def process(self) -> None:
+        value = GriptapeNodes.ConfigManager().get_config_value("workspace_directory")
+        self.parameter_output_values["config_value"] = str(value)
+
+
+class SetsAnAttributeInItsHookNode(DataNode):
+    """Sets attributes from ``after_value_set`` on ``note``, chosen by ``mode``.
+
+    - ``replace``: sets ``stash``, which nothing declares.
+    - ``declared``: sets ``declared_stash``, listed in ``attributes_outside_parameters``.
+    - ``in_place``: appends to ``seen``, a list made in ``__init__``.
+
+    Running sets ``note`` itself, so the hook runs during execution too.
+    """
+
+    attributes_outside_parameters = frozenset({"declared_stash"})
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.seen: list[Any] = []
+        self.add_parameter(
+            Parameter(
+                name="mode",
+                type="str",
+                default_value="replace",
+                tooltip="Which attribute the hook sets",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="note",
+                type="str",
+                default_value="",
+                tooltip="Setting it runs the hook",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name != "note":
+            return
+        mode = self.get_parameter_value("mode")
+        if mode == "replace":
+            self.stash = value
+        elif mode == "declared":
+            self.declared_stash = value
+        elif mode == "in_place":
+            self.seen.append(value)
+
+    def process(self) -> None:
+        self.set_parameter_value("note", "set while running")
+
+
+class PlainGroupNode(BaseNodeGroup):
+    """A node group with no subflow of its own."""
+
+    def run(self) -> None:
+        pass
+
+    def initialize(self) -> None:
+        pass
+
+    def process(self) -> None:
+        pass

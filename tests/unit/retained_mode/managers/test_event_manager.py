@@ -49,6 +49,32 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 )
 
 
+class TestEventsWhileRebuildingACopy:
+    """A worker building or discarding its copy of a node changes only its own graph, so nothing it does is published."""
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_queued_inside_a_rebuild(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        with event_manager.rebuild_scope("Copied Node"):
+            event_manager.put_event("from the rebuild")
+            await event_manager.aput_event("from the rebuild, async")
+
+        assert event_manager.event_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_events_are_queued_again_once_the_rebuild_ends(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        with event_manager.rebuild_scope("Copied Node"):
+            pass
+
+        event_manager.put_event("after the rebuild")
+
+        assert event_manager.event_queue.get_nowait() == "after the rebuild"
+
+
 class TestEventManagerBroadcasting:
     """Test event broadcasting functionality in EventManager."""
 

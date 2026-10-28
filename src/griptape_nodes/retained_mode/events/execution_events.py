@@ -4,6 +4,7 @@ from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
+    GraphAccessMixin,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
@@ -21,7 +22,7 @@ from griptape_nodes.serialization.values import DisplayValue, Value
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeRequest(RequestPayload):
+class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
     """Resolve (execute) a specific node.
 
     Use when: Running individual nodes, testing node execution, debugging workflows,
@@ -58,7 +59,7 @@ class ResolveNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowRequest(RequestPayload):
+class StartFlowRequest(RequestPayload, GraphAccessMixin):
     """Start executing a flow.
 
     Use when: Running workflows, beginning automated execution, testing complete flows.
@@ -103,7 +104,7 @@ class StartFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowRequest(RequestPayload):
+class StartLocalSubflowRequest(RequestPayload, GraphAccessMixin):
     """Start an independent local subflow that runs concurrently with the main flow.
 
     Use when: Running loop iterations or other independent subflows that need their own
@@ -138,7 +139,7 @@ class StartLocalSubflowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeRequest(RequestPayload):
+class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin):
     """Start executing a flow from a specific node.
 
     Use when: Resuming execution from a particular node, debugging specific parts of a flow,
@@ -179,7 +180,7 @@ class StartFlowFromNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelFlowRequest(RequestPayload):
+class CancelFlowRequest(RequestPayload, GraphAccessMixin):
     """Cancel a running flow execution.
 
     Use when: Stopping long-running workflows, handling user cancellation,
@@ -210,7 +211,7 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveFlowRequest(RequestPayload):
+class UnresolveFlowRequest(RequestPayload, GraphAccessMixin):
     """Reset every node in a flow back to unresolved.
 
     Use when: Clearing cached results so the next run re-executes every node.
@@ -245,7 +246,7 @@ class UnresolveFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 # Step In: Execute one resolving step at a time (per parameter)
 @dataclass
 @PayloadRegistry.register
-class SingleExecutionStepRequest(RequestPayload):
+class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -264,7 +265,7 @@ class SingleExecutionStepResultFailure(ResultPayloadFailure):
 # Step Over: Execute one node at a time (execute whole node and move on) IS THIS CONTROL NODE OR ANY NODE?
 @dataclass
 @PayloadRegistry.register
-class SingleNodeStepRequest(RequestPayload):
+class SingleNodeStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -284,7 +285,7 @@ class SingleNodeStepResultFailure(ResolveNodeResultFailure):
 # Continue
 @dataclass
 @PayloadRegistry.register
-class ContinueExecutionStepRequest(RequestPayload):
+class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -303,7 +304,7 @@ class ContinueExecutionStepResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowStateRequest(RequestPayload):
+class GetFlowStateRequest(RequestPayload, GraphAccessMixin):
     """Get the current execution state of a flow.
 
     Use when: Monitoring execution progress, debugging workflow state,
@@ -339,7 +340,7 @@ class GetFlowStateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetIsFlowRunningRequest(RequestPayload):
+class GetIsFlowRunningRequest(RequestPayload, GraphAccessMixin):
     """Check if a flow is currently running.
 
     Use when: Monitoring execution status, preventing concurrent execution,
@@ -610,17 +611,24 @@ class ExecuteNodeRequest(RequestPayload):
       not, the request fails; node_metadata is ignored on this path. The
       orchestrator is the sole source of truth for node identity and parameter
       values.
-    - **Worker**: a fresh transient node is constructed from node_metadata on
-      every call via LibraryRegistry.create_node, hydrated, run, and discarded.
-      The worker never persists nodes across requests. node_metadata is
-      therefore required on this path.
+    - **Worker**: a copy of the node is loaded into the worker's own graph the way a saved
+      workflow loads it -- created from node_metadata, given element_modification_commands,
+      then parameter_values with initial_setup -- run, and discarded. The worker never persists
+      nodes across requests, and nothing in the load reaches the orchestrator.
 
     Args:
         node_name: Name of the node to execute.
-        parameter_values: Input parameter values to set before execution.
+        parameter_values: On the orchestrator path, values to set on the node before execution. On
+            the worker path, the node's own stored values, which the orchestrator fills in when it
+            forwards the request: a list's rows by row name, and a list fed whole by a connection
+            under the list's name.
         node_metadata: Full node metadata from the orchestrator. Required when
-            the target library spawns a worker (used to construct the transient
-            worker-side node). Ignored on the orchestrator path.
+            the target library spawns a worker (used to create the worker's copy).
+            Ignored on the orchestrator path.
+        element_modification_commands: The groups and parameters the orchestrator's node has beyond
+            its ``__init__`` shape, as a saved workflow records them, list rows included. The
+            orchestrator fills them in when it forwards the request. Only the element request types a
+            save writes are accepted. Ignored on the orchestrator path.
         local_object_source: The orchestrator's identity for this node in the process-local object
             cache. The worker's transient node adopts it so the objects it caches land in the same slots
             across runs, and survive the node being renamed. Carried as its own field rather than inside
@@ -657,6 +665,7 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_name: str | None = None
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
+    element_modification_commands: list[RequestPayload] = field(default_factory=list)
 
 
 @dataclass

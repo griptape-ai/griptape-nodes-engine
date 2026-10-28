@@ -5,15 +5,16 @@ and starts a process for it. It runs the group like Local Execution, inside a sc
 general-purpose worker, and `NodeManager` sends every node the group runs to that worker.
 
 The worker here is a stand-in: it records each node it is sent, with the scope the node arrived
-in, then runs the node in this process. Everything up to that hand-off is the real engine,
-including PARALLEL resolution, whose concurrent node tasks are what has to carry the scope.
+in, then has a second engine in this process load its copy of the node and run it, as a worker does.
+Everything up to that hand-off is the real engine, including PARALLEL resolution, whose concurrent
+node tasks are what has to carry the scope.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,7 +29,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
-    ExecuteNodeResultFailure,
     StartFlowRequest,
     StartFlowResultSuccess,
 )
@@ -40,11 +40,13 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerRegistration
+from tests.simulated_worker import SimulatedWorker, simulated_worker_engine
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import EventRequest
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -75,10 +77,17 @@ def parallel_mode(engine: Engine) -> Iterator[None]:
 
 @dataclass
 class _StandInWorker:
-    """A general-purpose worker that records what it is sent and runs it in this process."""
+    """A general-purpose worker that records what it is sent and runs it on a worker engine in this process."""
 
     engine: Engine
+    worker: SimulatedWorker
     received: list[tuple[str, IsolatedExecutionScope | None]] = field(default_factory=list)
+
+    async def route_to_worker(self, event_request: EventRequest, *worker_id: Any) -> dict[str, Any]:
+        """Record the node the orchestrator sends, with the scope it was sent in, and have the worker run it."""
+        request = cast("ExecuteNodeRequest", event_request.request)
+        self.received.append((request.node_name, current_isolated_execution_scope.get()))
+        return await self.worker.route_to_worker(event_request, *worker_id)
 
     def start(self) -> None:
         """Register it as up, at the library count it would have loaded.
@@ -96,25 +105,10 @@ class _StandInWorker:
 @pytest.fixture
 def general_purpose_worker(engine: Engine) -> Iterator[_StandInWorker]:
     """Stand in for the general-purpose worker at the hand-off, so everything before it is the real engine."""
-    worker = _StandInWorker(engine=engine)
-    node_manager = engine.node_manager
-
-    async def run_on_worker(request: ExecuteNodeRequest, *_args: Any) -> Any:
-        worker.received.append((request.node_name, current_isolated_execution_scope.get()))
-        # Run the node as a worker does: on a fresh copy built from the request's metadata, which has
-        # only the parameters its type declares, with the request's values applied to it. The worker
-        # has no scope of its own.
-        token = current_isolated_execution_scope.set(None)
-        try:
-            fresh_copy = node_manager._materialize_transient_node_from_metadata(request)
-            if isinstance(fresh_copy, ExecuteNodeResultFailure):
-                return fresh_copy
-            return await node_manager._hydrate_and_run_node(fresh_copy, request)
-        finally:
-            current_isolated_execution_scope.reset(token)
-
-    with patch.object(node_manager, "_execute_node_via_worker", side_effect=run_on_worker):
-        yield worker
+    with simulated_worker_engine(engine) as worker:
+        stand_in = _StandInWorker(engine=engine, worker=worker)
+        with patch.object(engine.worker_manager, "route_to_worker", side_effect=stand_in.route_to_worker):
+            yield stand_in
     engine.worker_manager._workers.pop(_GENERAL_PURPOSE_WORKER, None)
 
 
@@ -351,8 +345,8 @@ async def test_a_private_loop_sends_its_iterations_to_the_worker(
     assert scopes == {IsolatedExecutionScope(owner_name=group_name)}, general_purpose_worker.received
     body_runs = [name for name, _scope in general_purpose_worker.received if name.startswith("Body")]
     assert len(body_runs) >= len(_LOOP_ITEMS), general_purpose_worker.received
-    # The packager's StartFlow and EndFlow stayed here: the packager gives them their parameters by
-    # request, and a worker's fresh copy would not have them. Only the body's copies reached the worker.
+    # The packager's StartFlow and EndFlow stayed here: they are the flow's boundary and only pass values
+    # in and out. Only the body's copies reached the worker.
     assert all(name.startswith("Body") for name, _scope in general_purpose_worker.received), (
         general_purpose_worker.received
     )

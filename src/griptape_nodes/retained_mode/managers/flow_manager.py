@@ -784,12 +784,7 @@ class FlowManager(EngineScoped):
 
             # If we've made it this far, we have deleted all the children Flows and their nodes.
             # Remove the flow from our map.
-            obj_mgr.del_obj_by_name(flow.name)
-            del self._name_to_parent_name[flow.name]
-
-            # Clean up referenced workflow tracking
-            if flow in self._flow_to_referenced_workflow_name:
-                del self._flow_to_referenced_workflow_name[flow]
+            self.forget_empty_flow(flow)
 
             # Clean up ControlFlowMachine and DAG orchestrator only if this is the global flow.
             # Isolated subflows have their own machines and should not clear the global state.
@@ -803,6 +798,19 @@ class FlowManager(EngineScoped):
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)
         return result
+
+    def forget_empty_flow(self, flow: ControlFlow) -> None:
+        """Drop an empty flow from the records.
+
+        The part of deleting a flow that a worker discarding its copy's flow shares. Not a delete:
+        ``DeleteFlowRequest`` deletes the flow's nodes as well, which releases what they cached.
+        """
+        self.engine.object_manager.del_obj_by_name(flow.name)
+        del self._name_to_parent_name[flow.name]
+
+        # Clean up referenced workflow tracking
+        if flow in self._flow_to_referenced_workflow_name:
+            del self._flow_to_referenced_workflow_name[flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(self, request: GetIsFlowRunningRequest) -> ResultPayload:
@@ -1136,16 +1144,18 @@ class FlowManager(EngineScoped):
             return CreateConnectionResultFailure(result_details=details)
 
         # Let the source make any internal handling decisions now that the Connection has been made.
-        source_node.after_outgoing_connection(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection"):
+            source_node.after_outgoing_connection(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection"):
+            target_node.after_incoming_connection(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         # Check if either node is in a NodeGroup and track connections
 
@@ -1414,16 +1424,18 @@ class FlowManager(EngineScoped):
                 except KeyError as e:
                     logger.warning(e)
         # Let the source make any internal handling decisions now that the Connection has been REMOVED.
-        source_node.after_outgoing_connection_removed(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection_removed"):
+            source_node.after_outgoing_connection_removed(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection_removed(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection_removed"):
+            target_node.after_incoming_connection_removed(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" deleted.'
 
