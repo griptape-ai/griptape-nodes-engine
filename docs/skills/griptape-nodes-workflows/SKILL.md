@@ -380,7 +380,8 @@ EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today
 
 `StartFlowRequest` holds the call until the run finishes or errors. A subsequent
 `StartFlowRequest` waits for that run to finish, then starts. `ListRunsRequest` shows the
-run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a waiting run.
+run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a waiting run,
+and `CancelAllRunsRequest` cancels everything. A run request's result carries its `run_id`.
 
 ## Tool Cheat Sheet
 

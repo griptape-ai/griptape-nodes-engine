@@ -62,6 +62,9 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ReplacedConnection,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelAllRunsRequest,
+    CancelAllRunsResultFailure,
+    CancelAllRunsResultSuccess,
     CancelFlowRequest,
     CancelFlowResultFailure,
     CancelFlowResultSuccess,
@@ -81,6 +84,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     InvolvedNodesEvent,
     ListRunsRequest,
     ListRunsResultSuccess,
+    RunIdMixin,
     RunInfo,
     RunQueuedEvent,
     SingleExecutionStepRequest,
@@ -3301,6 +3305,16 @@ class FlowManager(EngineScoped):
             return CancelRunResultFailure(result_details=details)
         return CancelRunResultSuccess(result_details=f"Cancelled run '{request.run_id}'.")
 
+    @handles(CancelAllRunsRequest)
+    async def on_cancel_all_runs_request(self, _request: CancelAllRunsRequest) -> ResultPayload:
+        try:
+            await self.cancel_all_runs()
+        except Exception as e:
+            # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
+            details = f"Attempted to cancel every run. Failed because the run in progress could not be cancelled: {e}"
+            return CancelAllRunsResultFailure(result_details=details)
+        return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
+
     @handles(ListRunsRequest)
     def on_list_runs_request(self, _request: ListRunsRequest) -> ResultPayload:
         runs: list[RunInfo] = []
@@ -4809,7 +4823,7 @@ class FlowManager(EngineScoped):
         queueing it would wait on itself.
         """
         if self._is_inside_run_in_progress():
-            return await spec.execute(self.engine)
+            return await self.join_run_in_progress(spec)
         run = self.submit_run(spec)
         try:
             return await asyncio.shield(run.outcome)
@@ -4817,6 +4831,13 @@ class FlowManager(EngineScoped):
             # Nothing will wait for this run any more, so if it has not started it never should.
             self._turn_away([run], "its request was cancelled.")
             raise
+
+    async def join_run_in_progress(self, spec: RunSpec) -> ResultPayload:
+        """Execute `spec` at once as part of the run in progress, returning what its request returns."""
+        run_id = None
+        if self._run_in_progress is not None:
+            run_id = self._run_in_progress.run_id
+        return self._of_run(await spec.execute(self.engine), run_id)
 
     def submit_run(self, spec: RunSpec) -> Run:
         """Queue a run of `spec`, starting it at once if no run is in progress."""
@@ -4856,12 +4877,15 @@ class FlowManager(EngineScoped):
             raise
         return True
 
-    def turn_away_waiting_runs(self, reason: str) -> None:
-        """Fail every waiting run without executing it, before the workflows its spec names go away.
-
-        Call it before cancelling the run in progress: that cancel starts the next waiting run.
-        """
-        self._turn_away(self._run_queue.snapshot(), reason)
+    async def cancel_all_runs(self) -> None:
+        """Cancel every waiting run, then the run in progress, without starting another."""
+        # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
+        self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
+        if not self.check_for_existing_running_flow():
+            return
+        if self._run_in_progress is not None:
+            self._run_in_progress.state = RunState.CANCELLED
+        await self.cancel_flow_run()
 
     def _turn_away(self, runs: list[Run], reason: str) -> None:
         """Take waiting runs out of the line without executing them; each one's request returns `reason`."""
@@ -4870,8 +4894,16 @@ class FlowManager(EngineScoped):
                 continue
             run.state = RunState.CANCELLED
             self._leave_line(run)
-            self._on_run_loop(run, run.outcome.set_result, run.spec.failure(f"The run did not start: {reason}"))
+            failure = self._of_run(run.spec.failure(f"The run did not start: {reason}"), run.run_id)
+            self._on_run_loop(run, run.outcome.set_result, failure)
         self._report_places_in_line()
+
+    @staticmethod
+    def _of_run(result: ResultPayload, run_id: str | None) -> ResultPayload:
+        """`result`, naming the run its request started or joined."""
+        if isinstance(result, RunIdMixin):
+            result.run_id = run_id
+        return result
 
     def _start_next_run_if_idle(self) -> None:
         if self._run_in_progress is not None:
@@ -4906,7 +4938,7 @@ class FlowManager(EngineScoped):
             self._driving = False
             self._finish_run(run)
             return
-        run.outcome.set_result(result)
+        run.outcome.set_result(self._of_run(result, run.run_id))
         self._driving = False
         if self.check_for_existing_running_flow():
             run.state = RunState.PAUSED

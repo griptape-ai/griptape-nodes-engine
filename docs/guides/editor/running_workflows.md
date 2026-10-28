@@ -85,8 +85,10 @@ time, in the order they were started. **Cancel Run** stops only the run in
 progress; the next waiting run then starts.
 
 A script can see the run in progress and the runs waiting behind it with
-`ListRunsRequest`, and withdraw a waiting run with `CancelRunRequest`,
-which takes the run's id from that list.
+`ListRunsRequest`, withdraw a waiting run with `CancelRunRequest`, which
+takes the run's id from that list, and cancel everything with
+`CancelAllRunsRequest`. The result of a run request also names its run, in
+`run_id`.
 
 ## Stopping a run
 

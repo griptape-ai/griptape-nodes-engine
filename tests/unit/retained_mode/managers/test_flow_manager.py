@@ -23,6 +23,8 @@ from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode,
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelAllRunsRequest,
+    CancelAllRunsResultSuccess,
     CancelRunRequest,
     CancelRunResultFailure,
     CancelRunResultSuccess,
@@ -1221,9 +1223,10 @@ class TestRunsEndCleanly:
 
             assert first_run.state is RunState.PAUSED
             assert executed == [], "the next run started while the first still held the machine"
-            flow_manager.turn_away_waiting_runs("the workflow was closed.")
+            (still_waiting,) = flow_manager._run_queue.snapshot()
+            await flow_manager.cancel_run(still_waiting.run_id)
         result = await asyncio.wait_for(waiting, timeout=1.0)
-        assert "the workflow was closed" in str(result.result_details)
+        assert "did not start: it was cancelled" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_clearing_the_workflows_turns_away_the_run_waiting_behind_a_paused_one(self, engine: Engine) -> None:
@@ -1255,7 +1258,7 @@ class TestRunsEndCleanly:
             await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
             result = await asyncio.wait_for(waiting, timeout=1.0)
 
-        assert "were cleared" in str(result.result_details)
+        assert "did not start: it was cancelled" in str(result.result_details)
         assert executed == []
 
     @pytest.mark.asyncio
@@ -1390,3 +1393,92 @@ class TestRunRequests:
 
         assert isinstance(result, CancelRunResultFailure)
         assert "no run with that id" in str(result.result_details)
+
+
+class TestRunResultsNameTheirRun:
+    """A run request's result says which run it started or joined."""
+
+    @pytest.mark.asyncio
+    async def test_a_runs_result_carries_its_run_id(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        seen: list[str | None] = []
+
+        async def body() -> Any:
+            run = flow_manager._run_in_progress
+            assert run is not None
+            seen.append(run.run_id)
+            return _ran("run")
+
+        result = await flow_manager.start_run(_Spec("flow", body))
+
+        assert isinstance(result, StartFlowResultSuccess)
+        assert result.run_id == seen[0]
+
+    @pytest.mark.asyncio
+    async def test_a_request_from_inside_a_run_names_the_run_it_joined(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        nested_results: list[Any] = []
+
+        async def nested() -> Any:
+            return _ran("nested")
+
+        async def outer() -> Any:
+            nested_results.append(await flow_manager.start_run(_Spec("flow", nested)))
+            return _ran("outer")
+
+        outer_result = await flow_manager.start_run(_Spec("flow", outer))
+
+        assert isinstance(outer_result, StartFlowResultSuccess)
+        assert nested_results[0].run_id == outer_result.run_id
+
+    @pytest.mark.asyncio
+    async def test_a_turned_away_runs_failure_names_the_run(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting_run = flow_manager.submit_run(_Spec("second", second))
+
+        await flow_manager.cancel_run(waiting_run.run_id)
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        failure = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
+        assert isinstance(failure, StartFlowResultFailure)
+        assert failure.run_id == waiting_run.run_id
+
+    @pytest.mark.asyncio
+    async def test_cancelling_all_runs_turns_away_the_waiting_ones_and_starts_none(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        executed: list[str] = []
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("second", second)))
+        await asyncio.sleep(0)
+
+        result = await flow_manager.on_cancel_all_runs_request(CancelAllRunsRequest())
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert isinstance(result, CancelAllRunsResultSuccess)
+        turned_away = await asyncio.wait_for(waiting, timeout=1.0)
+        assert "did not start: it was cancelled" in str(turned_away.result_details)
+        assert executed == []

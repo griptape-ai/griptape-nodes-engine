@@ -39,7 +39,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
-    CancelFlowRequest,
+    CancelAllRunsRequest,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
@@ -557,7 +557,7 @@ class Engine:
     def get_engine_id(self) -> str | None:
         return self._engine_identity_manager.active_engine_id
 
-    def clear_current_workflow_data(self) -> None:  # noqa: C901
+    def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
         Requires an active workflow on the ContextManager stack. Order matters:
@@ -570,12 +570,9 @@ class Engine:
             msg = "Cannot clear current workflow data without an active workflow context."
             raise RuntimeError(msg)
 
-        # Cancel any running flow so the delete path doesn't race with execution.
+        # Cancel every run so the delete path doesn't race with execution.
         flow_manager = self._flow_manager
-        flow_manager.turn_away_waiting_runs("the workflow it belonged to was closed.")
-        for flow_name in self._object_manager.get_filtered_subset(type=ControlFlow):
-            if flow_manager.check_for_existing_running_flow():
-                self.handle_request(CancelFlowRequest(flow_name=flow_name))
+        self.handle_request(CancelAllRunsRequest())
 
         # Delete all orphan (top-level) flows. We can't rely on
         # `ListFlowsInCurrentContextRequest` here because the caller may only have a

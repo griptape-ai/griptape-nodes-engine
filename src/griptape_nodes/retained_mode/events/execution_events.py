@@ -20,6 +20,16 @@ from griptape_nodes.serialization.values import DisplayValue, Value
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
 
+@dataclass(kw_only=True)
+class RunIdMixin:
+    """For the result of a request that starts a run: the run it started or joined.
+
+    None when the request failed before it became a run, such as a flow name that names no flow.
+    """
+
+    run_id: str | None = None
+
+
 @dataclass
 @PayloadRegistry.register
 class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
@@ -41,13 +51,13 @@ class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class ResolveNodeResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Node resolved successfully. Node execution completed and outputs are available."""
 
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeResultFailure(ResultPayloadFailure):
+class ResolveNodeResultFailure(RunIdMixin, ResultPayloadFailure):
     """Node resolution failed. Contains validation errors that prevented execution.
 
     Args:
@@ -86,13 +96,13 @@ class StartFlowRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class StartFlowResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Flow ran to completion."""
 
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowResultFailure(ResultPayloadFailure):
+class StartFlowResultFailure(RunIdMixin, ResultPayloadFailure):
     """Flow start failed. Contains validation errors that prevented execution.
 
     Args:
@@ -162,13 +172,13 @@ class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class StartFlowFromNodeResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Flow started from node successfully. Execution is now running from the specified node."""
 
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeResultFailure(ResultPayloadFailure):
+class StartFlowFromNodeResultFailure(RunIdMixin, ResultPayloadFailure):
     """Flow start from node failed. Contains validation errors that prevented execution.
 
     Args:
@@ -236,6 +246,29 @@ class CancelRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The run was not cancelled. Common causes: no run with that id, or its flow has not started yet."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsRequest(RequestPayload, GraphAccessMixin):
+    """Cancel every waiting run, then the run in progress, without starting another.
+
+    Use when: closing a workflow, or stopping everything a script queued.
+
+    Results: CancelAllRunsResultSuccess | CancelAllRunsResultFailure (the run in progress could not be cancelled)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Every run was cancelled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The waiting runs were cancelled, but the run in progress could not be."""
 
 
 @dataclass

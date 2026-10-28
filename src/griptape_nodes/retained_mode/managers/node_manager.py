@@ -3313,7 +3313,6 @@ class NodeManager(EngineScoped):
     @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: PLR0911
         node_name = request.node_name
-        debug_mode = request.debug_mode
 
         if node_name is None:
             details = "No Node name was provided. Failed to resolve node."
@@ -3345,10 +3344,11 @@ class NodeManager(EngineScoped):
             return ResolveNodeResultFailure(validation_exceptions=[], result_details=details)
 
         flow_mgr = self.engine.flow_manager
+        spec = ResolveNodeSpec(request=request, flow_name=flow.name, node_name=node.name)
         # A node run while another node's run is in progress joins that run, so the two run side by side.
         if flow_mgr.check_for_existing_running_flow() and flow_mgr.global_single_node_resolution:
-            return await self.execute_resolve_node(node, flow, debug_mode=debug_mode)
-        return await flow_mgr.start_run(ResolveNodeSpec(request=request, flow_name=flow.name, node_name=node.name))
+            return await flow_mgr.join_run_in_progress(spec)
+        return await flow_mgr.start_run(spec)
 
     async def execute_resolve_node(self, node: BaseNode, flow: ControlFlow, *, debug_mode: bool) -> ResultPayload:  # noqa: C901, PLR0911
         node_name = node.name
