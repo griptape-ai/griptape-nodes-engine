@@ -16,11 +16,17 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
     ListAllWorkflowsResultSuccess,
     MoveWorkflowRequest,
     MoveWorkflowResultFailure,
+    SaveWorkflowRequest,
+    SaveWorkflowResultFailure,
 )
 
 if TYPE_CHECKING:
@@ -324,3 +330,46 @@ class TestMoveWorkflow:
         assert mover.is_file()
         assert not stale.exists()
         assert engine.workflow_registry.get(mover_id).absolute_path == mover
+
+    def test_move_onto_a_name_another_entry_holds_is_refused_before_the_file_moves(self, workspace: Path) -> None:
+        engine = current_engine()
+        engine.config_manager.workspace_path = workspace
+        mover = _write_workflow_file(workspace / "a" / "foo.py")
+        # Another file in the target folder that gives the same name, "b/foo", at a different path.
+        namesake = _write_workflow_file(workspace / "b" / "foo.json")
+        _scan(engine, mover)
+        engine.workflow_registry.register_file(namesake, read_workflow_metadata(namesake))
+        mover_id = _id_at(engine, mover)
+        assert mover_id is not None
+
+        moved = engine.handle_request(MoveWorkflowRequest(workflow_name="a/foo", target_directory="b"))
+
+        assert isinstance(moved, MoveWorkflowResultFailure)
+        assert "already registered" in str(moved.result_details)
+        assert mover.is_file()
+        assert not (workspace / "b" / "foo.py").exists()
+        assert engine.workflow_registry.get(mover_id).absolute_path == mover
+
+
+class TestFirstSave:
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink creation needs privileges on Windows")
+    def test_a_first_save_onto_a_file_another_entry_holds_through_a_link_writes_nothing(
+        self, workspace: Path, tmp_path: Path
+    ) -> None:
+        engine = current_engine()
+        engine.config_manager.workspace_path = workspace
+        stale = _write_workflow_file(tmp_path / "elsewhere" / "sh010" / "comp.py")
+        (workspace / "current").symlink_to(stale.parent, target_is_directory=True)
+        _scan(engine, stale)
+        # Deleted outside the engine: its entry stays until the next scan.
+        stale.unlink()
+        opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="Scratch"))
+        assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess)
+
+        saved = _run(engine, SaveWorkflowRequest(file_name="current/comp"))
+
+        assert isinstance(saved, SaveWorkflowResultFailure)
+        assert "already registered" in str(saved.result_details)
+        assert not stale.exists()
+        assert engine.context_manager.get_current_workflow_name() == opened.workflow_name
+        assert not engine.workflow_registry.get_workflow_by_name(opened.workflow_name).is_saved

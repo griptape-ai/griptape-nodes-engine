@@ -20,6 +20,7 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowPathTakenError,
     WorkflowShape,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -246,7 +247,7 @@ class WorkflowSaver(EngineScoped):
         return WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @handles(SaveWorkflowRequest)
-    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
+    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
         context_manager = self.engine.context_manager
         current_workflow_name = (
@@ -268,6 +269,29 @@ class WorkflowSaver(EngineScoped):
         creation_date = save_target.creation_date
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
+
+        unsaved_source_key: str | None = None
+        if (
+            current_workflow_name is not None
+            and current_workflow_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX)
+            and self.engine.workflow_registry.has_workflow_with_name(current_workflow_name)
+        ):
+            unsaved_source_key = current_workflow_name
+
+        # A first save moves the unsaved workflow onto its new file, unless a workflow already
+        # has the file's name and takes the save instead. Ask the registry before writing
+        # whether it accepts the move, so a refusal leaves the disk untouched.
+        if (
+            unsaved_source_key is not None
+            and unsaved_source_key != registry_key
+            and self.engine.workflow_registry.find_by_name(registry_key) is None
+        ):
+            unsaved_workflow = self.engine.workflow_registry.get_workflow_by_name(unsaved_source_key)
+            try:
+                self.engine.workflow_registry.raise_if_path_taken(unsaved_workflow, relative_file_path)
+            except WorkflowPathTakenError as err:
+                details = f"Attempted to save workflow '{relative_file_path}'. Failed because workflow '{err.existing.name}' is already registered at that path or under its name."
+                return SaveWorkflowResultFailure(result_details=details)
 
         # Re-saving the workflow that's currently open is always allowed; writing over a
         # *different* workflow's file needs the caller's explicit say-so. Both sides are
@@ -411,21 +435,12 @@ class WorkflowSaver(EngineScoped):
         # remain valid) while transitioning it to the "saved" state. Also walks the
         # ContextManager's workflow stack in-place so any active context referencing
         # the old unsaved key is updated to the new registry key.
-        unsaved_source_key: str | None = None
-        if (
-            current_workflow_name is not None
-            and current_workflow_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX)
-            and self.engine.workflow_registry.has_workflow_with_name(current_workflow_name)
-        ):
-            unsaved_source_key = current_workflow_name
-
-        registered_workflows = self.engine.workflow_registry.list_workflows()
         if unsaved_source_key is not None and unsaved_source_key != registry_key:
             # Rekey the unsaved entry to the path-derived key if the new key is not already
             # occupied by a separate entry. If the new key already exists (e.g. a saved
             # workflow with the same target path is already registered), fall back to
             # dropping the unsaved entry and updating the existing saved entry below.
-            if registry_key in registered_workflows:
+            if self.engine.workflow_registry.find_by_name(registry_key) is not None:
                 self.engine.workflow_registry.delete_workflow_by_name(unsaved_source_key)
                 self.engine.workflow_manager.variable_substitution.drop(unsaved_source_key)
             else:
@@ -440,9 +455,8 @@ class WorkflowSaver(EngineScoped):
                     # where it gets one, so record it here or the builtin keeps falling back to
                     # the registry key -- the thing that goes stale on the next project switch.
                     workflow_context_state._file_path = str(save_file_result.file_path)
-            registered_workflows = self.engine.workflow_registry.list_workflows()
 
-        if registry_key not in registered_workflows:
+        if self.engine.workflow_registry.find_by_name(registry_key) is None:
             self.engine.workflow_registry.generate_new_workflow(
                 registry_key=registry_key, metadata=workflow_metadata, file_path=relative_file_path
             )
