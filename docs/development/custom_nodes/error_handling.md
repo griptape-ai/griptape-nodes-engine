@@ -443,31 +443,30 @@ ParameterList(
 ```
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a total
-length across several clips, write a `NodeValidator` and put it in the node's `node_validators` tuple.
-It runs after every parameter's validators. Its `media` holds what they read, by parameter name,
-but only the readings some validator on that parameter asked for: a parameter with no validator
-that reads its video has `info.video` set to None. To be sure of a reading, call the reader
-yourself; during the node's checks it returns what was already read, so no file is read twice.
+length across several clips, check it in the node's `validate_before_node_run`. The engine runs it
+right after the declared validators, in the same pass, so a reader from
+`griptape_nodes.exe_types.input_checks` called there returns what the validators already read, and
+no file is read twice. A video it reads itself counts toward the same 5-second limit on probing.
 
 ```python
-from typing import ClassVar
-
 from griptape_nodes.exe_types.input_checks import local_video_probe
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import NodeValidator
 
-
-class TotalLength(NodeValidator):
-    def check(self, node, *, media, docs_url) -> list[NodeError]:
-        probes = [local_video_probe(video) for video in node.get_parameter_list_value("reference_videos")]
-        total = sum(probe.shortest_seconds or 0 for probe in probes if probe is not None)
-        if total <= 30:
-            return []
-        return [NodeError(f"'Reference Videos' are {total:.1f} seconds long together and the limit is 30.")]
+MAX_TOTAL_SECONDS = 30
 
 
 class ReferenceToVideo(SuccessFailureNode):
-    node_validators: ClassVar[tuple[NodeValidator, ...]] = (TotalLength(),)
+    def validate_before_node_run(self) -> list[Exception] | None:
+        probes = [local_video_probe(video) for video in self.get_parameter_list_value("reference_videos")]
+        total = sum(probe.shortest_seconds or 0 for probe in probes if probe is not None)
+        if total <= MAX_TOTAL_SECONDS:
+            return None
+        return [
+            NodeError(
+                f"The videos in 'Reference Videos' are {total:.1f} seconds long together "
+                f"and the limit is {MAX_TOTAL_SECONDS}. Use shorter clips."
+            )
+        ]
 ```
 
 **Your own validator.** Subclass `PreRunValidator`, set `needs` to the readings it uses

@@ -6,8 +6,8 @@ Import them from here:
 from griptape_nodes.exe_types.validators import AllowedFormats, DependsOn, MaxFileSize
 ```
 
-- `base`: what a validator is (`PreRunValidator`, `NodeValidator`) and what the engine reads for it
-  (`MediaNeed`, `MediaInfo`, and `EMPTY_MEDIA` when it read nothing).
+- `base`: what a validator is (`PreRunValidator`) and what the engine reads for it (`MediaNeed`,
+  `MediaInfo`, and `EMPTY_MEDIA` when it read nothing).
 - `media`: limits on an image, video or audio file, such as `MaxFileSize` or `Duration`.
 - `common`: `MaxCount` for a list's length, and `DependsOn` for limits that depend on another
   parameter's value.
@@ -18,13 +18,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.exe_types.validators.base import (
-    EMPTY_MEDIA,
-    MediaInfo,
-    MediaNeed,
-    NodeValidator,
-    PreRunValidator,
-)
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
@@ -56,7 +50,6 @@ __all__ = [
     "MaxFileSize",
     "MediaInfo",
     "MediaNeed",
-    "NodeValidator",
     "PixelArea",
     "PreRunValidator",
     "SideRange",

@@ -50,7 +50,7 @@ from griptape_nodes.exe_types.pre_run_validation import (
     validate_inputs,
     validate_node,
 )
-from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, NodeValidator, PreRunValidator
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
 from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -70,7 +70,7 @@ from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import image_file
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
     from pathlib import Path
 
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -216,40 +216,6 @@ class TestReadOnce:
         node.set_parameter_value("video", str(clip))
         assert len(validate_inputs(node)) == 1
         assert video_reads == []
-
-    def test_a_node_validator_and_the_nodes_own_checks_reuse_the_reading(
-        self, tmp_path: Path, video_reads: list[str]
-    ) -> None:
-        clip = tmp_path / "clip.mp4"
-        clip.write_bytes(b"video")
-        seen: list[MediaInfo] = []
-
-        class Reads(NodeValidator):
-            def check(
-                self,
-                node: BaseNode,
-                *,
-                media: Mapping[str, Sequence[MediaInfo]],
-                docs_url: str | None,  # noqa: ARG002
-            ) -> list[NodeError]:
-                seen.extend(media["video"])
-                # A custom check that calls a reader itself gets the same reading.
-                local_video_probe(node.get_parameter_value("video"))
-                return []
-
-        class ReadingNode(MockNode):
-            node_validators: ClassVar[tuple[NodeValidator, ...]] = (Reads(),)
-
-        node = ReadingNode(name="node")
-        node.add_parameter(ParameterVideo(name="video", pre_run_validators=[Duration(max=30)]))
-        node.set_parameter_value("video", str(clip))
-        with input_check_readings():
-            validate_inputs(node)
-            local_video_probe(str(clip))
-        assert video_reads == [str(clip)]
-        assert len(seen) == 1
-        assert seen[0].video is not None
-        assert seen[0].video.seconds == 40.0
 
     def test_reads_again_in_the_next_pass(self, tmp_path: Path, video_reads: list[str]) -> None:
         clip = tmp_path / "clip.mp4"
@@ -459,51 +425,43 @@ class TestDependsOn:
         assert parameter.copy().pre_run_validators == parameter.pre_run_validators
 
 
-class TestNodeValidators:
-    def test_runs_after_the_parameter_validators_with_what_they_read(self, tmp_path: Path) -> None:
-        class SameSize(NodeValidator):
-            def check(
-                self,
-                node: BaseNode,  # noqa: ARG002
-                *,
-                media: Mapping[str, Sequence[MediaInfo]],
-                docs_url: str | None,  # noqa: ARG002
-            ) -> list[NodeError]:
-                (first,) = media["first"]
-                (second,) = media["second"]
-                if first.frame == second.frame:
-                    return []
-                return [NodeError("'first' and 'second' must be the same size.", links=None)]
+class TestRulesAcrossInputs:
+    """A rule across several inputs goes in `validate_before_node_run`, which reuses what the validators read."""
 
-        class PairNode(_LimitedNode):
-            node_validators: ClassVar[tuple[NodeValidator, ...]] = (SameSize(),)
+    class _PairNode(_LimitedNode):
+        def __init__(self) -> None:
+            super().__init__(name="node")
+            self.add_parameter(ParameterImage(name="first", pre_run_validators=[SideRange(min=300)]))
+            self.add_parameter(ParameterImage(name="second", pre_run_validators=[SideRange(min=1)]))
 
-        node = PairNode(name="node")
-        node.add_parameter(ParameterImage(name="first", pre_run_validators=[SideRange(min=300)]))
-        node.add_parameter(ParameterImage(name="second", pre_run_validators=[SideRange(min=1)]))
-        node.set_parameter_value("first", str(image_file(tmp_path, 200, 200)))
-        node.set_parameter_value("second", str(image_file(tmp_path, 400, 400)))
-        assert _messages(validate_inputs(node)) == [
+        def validate_before_node_run(self) -> list[Exception] | None:
+            first = local_image_info(self.get_parameter_value("first"))
+            second = local_image_info(self.get_parameter_value("second"))
+            if first is None or second is None or first[:2] == second[:2]:
+                return None
+            return [NodeError("'first' and 'second' must be the same size.")]
+
+    def test_runs_after_the_validators_and_reuses_their_readings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[str] = []
+        sizes = {"a.png": 200, "b.png": 400}
+
+        def counting(location: str) -> ImageInfo:
+            reads.append(location)
+            side = sizes[location.rsplit("/", 1)[-1]]
+            return ImageInfo(side, side, "image/png")
+
+        monkeypatch.setattr(input_checks, "_read_image_info", counting)
+        node = self._PairNode()
+        first, second = str(tmp_path / "a.png"), str(tmp_path / "b.png")
+        node.set_parameter_value("first", first)
+        node.set_parameter_value("second", second)
+        assert _messages(validate_node(node).errors) == [
             "The image in 'first' is 200x200 and each side must be at least 300 pixels. Use a larger one.",
             "'first' and 'second' must be the same size.",
         ]
-
-    def test_runs_on_a_node_with_no_parameter_validators(self) -> None:
-        class Always(NodeValidator):
-            def check(
-                self,
-                node: BaseNode,
-                *,
-                media: Mapping[str, Sequence[MediaInfo]],
-                docs_url: str | None,
-            ) -> list[NodeError]:
-                assert media == {}
-                return [NodeError(f"{node.name} refused: {docs_url}", links=None)]
-
-        class RuleNode(_LimitedNode):
-            node_validators: ClassVar[tuple[NodeValidator, ...]] = (Always(),)
-
-        assert _messages(validate_inputs(RuleNode(name="rule"))) == [f"rule refused: {DOCS}"]
+        assert reads == [first, second]
 
 
 class TestParameterTypes:

@@ -147,8 +147,8 @@ def input_subject(parameter: str, *, noun: str, position: int | None = None) -> 
 def input_check_readings() -> Iterator[None]:
     """Read each media location at most once per reader inside this block.
 
-    The engine opens one around each node's pre-run checks, so the validators on a parameter, a
-    node's `NodeValidator`s and its own `validate_before_node_run` share one read of each input. What
+    The engine opens one around each node's pre-run checks, so the validators on a parameter and
+    the node's own `validate_before_node_run` share one read of each input. What
     was read is dropped when the block ends, so nothing carries over to the next run or another node.
     It also notes which locations' probes ran out of time, for `MediaInfo.timed_out`.
     Opened inside another one, it shares the outer block's readings.

@@ -86,9 +86,8 @@ def validate_inputs(node: BaseNode, *, unchecked: list[UncheckedInput] | None = 
 
     For each parameter with `pre_run_validators`, reads its value once, for every reading those
     validators need together, and runs each one. A list parameter's validators run on each item,
-    named by its position, except those that check the whole list. Then the node's
-    `node_validators` run with what was read. A value that can't be read locally is skipped, as the
-    checks underneath skip it.
+    named by its position, except those that check the whole list. A value that can't be read
+    locally is skipped, as the checks underneath skip it.
 
     Args:
         node: The node about to run.
@@ -98,31 +97,25 @@ def validate_inputs(node: BaseNode, *, unchecked: list[UncheckedInput] | None = 
             listed. `unchecked_locations_by_name` names the rest.
     """
     declared = [parameter for parameter in node.parameters if parameter.pre_run_validators]
-    if not declared and not node.node_validators:
+    if not declared:
         return []
     docs_url = node.input_limits_url()
     errors: list[NodeError] = []
-    media: dict[str, list[MediaInfo]] = {}
     for parameter in declared:
         validators = _selected_validators(node, parameter)
         if not validators:
             continue
         readings = _check_parameter(node, parameter, validators, docs_url=docs_url, errors=errors)
-        if readings is None:
-            continue
-        media[parameter.name] = readings
         if unchecked is not None:
             unchecked.extend(_timed_out_subjects(parameter, readings))
-    for node_validator in node.node_validators:
-        errors.extend(node_validator.check(node, media=media, docs_url=docs_url))
     return errors
 
 
 def unchecked_locations_by_name(timed_out: Collection[str], named: Collection[str]) -> list[str]:
     """Subjects for timed-out locations no declared input accounts for, named by their file names.
 
-    A node's `validate_before_node_run` or a `NodeValidator` can probe a file directly; when that
-    times out there is no parameter to name, so the file is named instead, such as "'clip.mp4'".
+    A node's `validate_before_node_run` can probe a file directly; when that times out there is no
+    parameter to name, so the file is named instead, such as "'clip.mp4'".
 
     Args:
         timed_out: Every location that timed out during the node's checks, from `timed_out_locations`.
@@ -166,22 +159,19 @@ def _check_parameter(
     *,
     docs_url: str | None,
     errors: list[NodeError],
-) -> list[MediaInfo] | None:
-    """Run one parameter's validators, appending their errors, and return what was read for it.
-
-    None when the parameter holds no media, so nothing was read.
-    """
+) -> list[MediaInfo]:
+    """Run one parameter's validators, appending their errors, and return what was read for each value."""
     kind = media_kind_of(parameter)
     shown_name = parameter.display_name or parameter.name
     noun = _noun(kind)
     if not holds_list(parameter):
         value = _value_here(node, parameter.name)
         if value is None:
-            return None
+            return []
         info = _read(value, validators, kind)
         subject = input_subject(shown_name, noun=noun)
         errors.extend(_collect(validators, value, subject=subject, media=info, docs_url=docs_url))
-        return _readings_if_media([info], kind)
+        return [info]
 
     items = _list_items(node, parameter)
     whole_list = [validator for validator in validators if validator.checks_whole_list]
@@ -193,7 +183,7 @@ def _check_parameter(
         readings.append(info)
         subject = input_subject(shown_name, noun=noun, position=position)
         errors.extend(_collect(per_item, item, subject=subject, media=info, docs_url=docs_url))
-    return _readings_if_media(readings, kind)
+    return readings
 
 
 def _selected_validators(node: BaseNode, parameter: Parameter) -> list[PreRunValidator]:
@@ -279,10 +269,3 @@ def _file_name(location: str) -> str:
     """
     without_query = location.split("?", 1)[0] if is_url(location) else location
     return PureWindowsPath(without_query.rstrip("/\\")).name or location
-
-
-def _readings_if_media(readings: list[MediaInfo], kind: MediaKind | None) -> list[MediaInfo] | None:
-    """The readings for a parameter that holds media, or None for one that doesn't."""
-    if kind is None:
-        return None
-    return readings

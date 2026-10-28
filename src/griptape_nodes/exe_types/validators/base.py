@@ -14,7 +14,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Sequence
 
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.input_checks import AudioProbe, ImageInfo, VideoProbe
@@ -26,7 +26,6 @@ __all__ = [
     "EMPTY_MEDIA",
     "MediaInfo",
     "MediaNeed",
-    "NodeValidator",
     "PreRunValidator",
     "media_kind_of",
     "require_validators_fit",
@@ -142,27 +141,6 @@ class PreRunValidator(ABC):
     def candidates(self) -> Sequence[PreRunValidator]:
         """Every validator `selected` can return, so a parameter can refuse one that can't go on it."""
         return (self,)
-
-
-class NodeValidator(ABC):
-    """A rule across several of a node's inputs, declared in the node's `node_validators`.
-
-    Runs after every parameter's validators, at the node's turn.
-    """
-
-    @abstractmethod
-    def check(
-        self, node: BaseNode, *, media: Mapping[str, Sequence[MediaInfo]], docs_url: str | None
-    ) -> list[NodeError]:
-        """Every error the node's inputs break this rule with, or an empty list.
-
-        Args:
-            node: The node about to run.
-            media: What the parameter validators read, by parameter name: one `MediaInfo` for a single
-                input, one per item, in order, for a list. A parameter none of them read is absent;
-                a reader called directly reuses this pass's readings, so reading again costs nothing.
-            docs_url: The node's page documenting its input limits, from `BaseNode.input_limits_url`.
-        """
 
 
 def media_kind_of(parameter: Parameter) -> MediaKind | None:
