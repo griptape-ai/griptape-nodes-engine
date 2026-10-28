@@ -729,7 +729,7 @@ class ContextManager(EngineScoped):
         file_path: str | None = None,
         working_directory: str | None = None,
     ) -> str:
-        """Open a workflow as the Workflow context.
+        """Open a workflow as the Workflow context, through `Engine.open_workflow`.
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
@@ -784,7 +784,7 @@ class ContextManager(EngineScoped):
 
         if working_directory is not None:
             workflow.working_directory = working_directory
-        opened = self.engine.open_workflows.open(workflow.workflow_id)
+        opened = self.engine.open_workflow(workflow.workflow_id)
         if current_request_type() is not None:
             # Outside a request nothing is bound: the work acts on the only open workflow, so no
             # binding is left behind in a context a later close does not reach.
@@ -812,14 +812,14 @@ class ContextManager(EngineScoped):
         )
 
     def pop_workflow(self) -> str:
-        """Close the open workflow, dropping its runtime with its Flow, Node and Element contexts.
+        """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
         Returns:
-            The name of the Workflow that was popped. `get_current_workflow_id` gives its id
+            The name of the Workflow that was closed. `get_current_workflow_id` gives its id
             beforehand.
 
         Raises:
-            EmptyStackError: If there are no active Workflows.
+            EmptyStackError: If no workflow is current.
             WorkerWorkflowNotClosableError: If the current workflow is one this worker keeps for its
                 orchestrator, which closes it when the orchestrator closes that workflow.
         """
@@ -835,8 +835,7 @@ class ContextManager(EngineScoped):
             )
             raise self.WorkerWorkflowNotClosableError(msg)
 
-        self.engine.open_workflows.close(workflow)
-        self.engine.leave_closed_workflow(workflow)
+        self.engine.close_workflow(workflow)
         return name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:

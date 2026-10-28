@@ -665,6 +665,16 @@ class TestAHookRunsOncePerObject:
 
         assert producer.released == ["shared"]
 
+    def test_popping_the_workflow_releases_what_its_nodes_hold(self, engine: Engine, flow_name: str) -> None:
+        """Closing the workflow by popping it is a teardown too, not a drop of live nodes."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("shared")
+        _egress(producer)
+
+        engine.context_manager.pop_workflow()
+
+        assert producer.released == ["shared"]
+
     def test_deleting_a_node_leaves_its_library_cached_copy_usable(self, engine: Engine, flow_name: str) -> None:
         """The parked entry goes with the node; the cache entry is the library's.
 

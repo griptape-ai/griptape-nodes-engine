@@ -55,7 +55,11 @@ from griptape_nodes.retained_mode.runtime.binding import (
     WorkflowNotOpenError,
     bound_workflow,
 )
-from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
+from griptape_nodes.retained_mode.runtime.open_workflow_set import (
+    NoOpenWorkflowError,
+    OpenWorkflowError,
+    OpenWorkflowSet,
+)
 from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -760,60 +764,154 @@ class Engine:
             return bound
         return None
 
-    def clear_current_workflow_data(self) -> None:
-        """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
+    def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
+        """Open the registered workflow with this id and return its empty runtime.
 
-        Requires an active workflow on the ContextManager stack. Order matters:
-        `on_delete_flow_request` pushes a flow context via `ContextManager().flow(...)`,
-        which raises `NoActiveWorkflowError` if the workflow has already been popped.
-        So we delete flows first and pop the workflow last.
+        Raises:
+            OpenWorkflowError: That workflow, or another one, is already open.
         """
-        context_manager = self._context_manager
-        if not context_manager.has_current_workflow():
+        return self._open_workflows.open(workflow_id)
+
+    def close_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Close an open workflow, tearing down everything it holds, here and in the workers.
+
+        Cancels its run and resets its run state, deletes its flows (and with them their nodes)
+        through the normal delete path, then forgets its runtime, which takes its context stack and
+        queued UI changes with it, and releases the held objects this process kept for it. The
+        workers hold their own: this is sync, so telling them is scheduled on the engine loop
+        (`WorkerManager.schedule_local_object_teardown`). `aclose_workflow` awaits it instead.
+
+        The flows are deleted while the workflow is still open, because deleting one enters its
+        context. A teardown that raises leaves the workflow open, rather than dropping live nodes
+        without deleting them. The workers are told either way, as nothing retries the close.
+
+        Raises:
+            OpenWorkflowError: That runtime is not open, or its teardown failed.
+        """
+        self._raise_if_not_open(workflow)
+        try:
+            self._tear_down_workflow(workflow)
+        finally:
+            self._worker_manager.schedule_local_object_teardown(workflow.workflow_id)
+
+    async def aclose_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Close an open workflow like `close_workflow`, awaiting its run's cancel and the workers' release.
+
+        Raises:
+            OpenWorkflowError: That runtime is not open, or its teardown failed.
+        """
+        self._raise_if_not_open(workflow)
+        try:
+            await self._cancel_workflow_runs(workflow)
+            self._tear_down_workflow(workflow)
+        finally:
+            await self._worker_manager.broadcast_local_object_teardown(workflow.workflow_id)
+
+    async def aclose_all_workflows(self) -> None:
+        """Close every open workflow, release the held objects kept for no workflow, and tell the workers to release everything.
+
+        Raises:
+            OpenWorkflowError: A workflow's teardown failed. It and the ones after it stay open.
+        """
+        try:
+            for workflow in self._open_workflows.all_open():
+                await self._cancel_workflow_runs(workflow)
+                self._tear_down_workflow(workflow)
+            dropped = self._resource_manager.drop_all_local_objects()
+            if dropped:
+                logger.debug("Released %d held object(s) kept for no workflow while closing every workflow.", dropped)
+        finally:
+            await self._worker_manager.broadcast_local_object_teardown(None)
+
+    def clear_current_workflow_data(self) -> None:
+        """Close the current workflow (see `close_workflow`).
+
+        Raises:
+            RuntimeError: No workflow is current.
+        """
+        workflow = self.current_workflow_or_none()
+        if workflow is None:
             msg = "Cannot clear current workflow data without an active workflow context."
             raise RuntimeError(msg)
+        self.close_workflow(workflow)
 
-        # Cancel every run so the delete path doesn't race with execution.
-        flow_manager = self._flow_manager
-        self.handle_request(CancelAllRunsRequest())
+    def _raise_if_not_open(self, workflow: WorkflowRuntime) -> None:
+        if self._open_workflows.get(workflow.workflow_id) is not workflow:
+            msg = f"Attempted to close workflow '{workflow.workflow_id}'. Failed because it is not open."
+            raise OpenWorkflowError(msg)
 
-        # Delete all orphan (top-level) flows. We can't rely on
-        # `ListFlowsInCurrentContextRequest` here because the caller may only have a
-        # workflow on the context stack (no child flow), and that request requires a
-        # current flow. Instead, repeatedly find a flow with no parent and delete it;
-        # `on_delete_flow_request` cascades into its children and nodes.
-        more_flows = True
-        while more_flows:
-            flows = self._object_manager.get_filtered_subset(type=ControlFlow)
-            found_orphan = False
-            for flow_name in flows:
-                parent = flow_manager.get_parent_flow(flow_name)
-                if not parent:
-                    self.handle_request(DeleteFlowRequest(flow_name=flow_name))
-                    found_orphan = True
-                    break
-            if not flows or not found_orphan:
-                more_flows = False
+    async def _cancel_workflow_runs(self, workflow: WorkflowRuntime) -> None:
+        """Turn away `workflow`'s waiting runs and cancel its run in progress, awaiting its nodes.
 
-        # Drain this workflow's context substack before popping the workflow itself.
-        while context_manager.has_current_flow():
-            while context_manager.has_current_node():
-                while context_manager.has_current_element():
-                    context_manager.pop_element()
-                context_manager.pop_node()
-            context_manager.pop_flow()
-        context_manager.pop_workflow()
+        Best-effort: a node that refuses to cancel must not block the teardown. A driver still
+        parked holds its machine until it wakes and abandons the run; harmless, because the
+        teardown drops the machine it holds.
+        """
+        with self.bind_workflow(workflow):
+            try:
+                await self._flow_manager.cancel_all_runs()
+            except Exception as e:
+                # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
+                logger.warning("Could not cancel the running workflow before closing it. Continuing anyway: %s", e)
 
-        # Every key referring to a held object lived on a node just deleted, so each entry would hold
-        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
-        #
-        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
-        # teardown shares: deleting the open workflow reaches this without going through that handler.
-        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
-        # workers about theirs.
-        dropped = self._resource_manager.drop_all_local_objects()
+    def _tear_down_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Stop `workflow`'s run, delete its flows, close it, and release the held objects kept for it.
+
+        Raises:
+            OpenWorkflowError: A flow could not be deleted, or objects remained after its flows were.
+                The workflow stays open.
+        """
+        with self.bind_workflow(workflow):
+            # Runs still waiting or going (a sync close, or an async cancel that failed) are cancelled
+            # here, the waiting ones first so none starts against the flows being deleted. The reset
+            # after it drops the run's bookkeeping, so it must not run ahead of the cancel: the flow
+            # would look idle and the cancel would be skipped.
+            self.handle_request(CancelAllRunsRequest())
+            self._flow_manager.reset_global_execution_state()
+            self._delete_workflow_flows()
+        if len(workflow.objects) > 0:
+            msg = (
+                f"Attempted to close workflow '{workflow.workflow_id}'. Failed because {len(workflow.objects)} "
+                "object(s) remained after its flows were deleted."
+            )
+            raise OpenWorkflowError(msg)
+        self._open_workflows.close(workflow)
+        self.leave_closed_workflow(workflow)
+
+        # Every key referring to a held object kept for it lived on a node just deleted, so each entry
+        # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
+        dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
-            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
+            logger.debug("Released %d held object(s) while closing the workflow.", dropped)
+
+    def _delete_workflow_flows(self) -> None:
+        """Delete the current workflow's flows, which deletes their nodes.
+
+        Deletes a flow with no parent until none is left; `on_delete_flow_request` cascades into
+        its children and nodes. `ListFlowsInCurrentContextRequest` can't be used: the workflow may
+        have no current flow, and that request requires one.
+
+        Raises:
+            OpenWorkflowError: A flow could not be deleted.
+        """
+        flow_manager = self._flow_manager
+        deleted: set[str] = set()
+        while True:
+            flows = self._object_manager.get_filtered_subset(type=ControlFlow)
+            orphan = next((name for name in flows if not flow_manager.get_parent_flow(name)), None)
+            if orphan is None:
+                return
+            failure = None
+            if orphan in deleted:
+                failure = "it was still there after it was deleted"
+            else:
+                result = self.handle_request(DeleteFlowRequest(flow_name=orphan))
+                if result.failed():
+                    failure = str(result.result_details)
+            if failure is not None:
+                msg = f"Attempted to close the workflow. Failed because flow '{orphan}' could not be deleted: {failure}"
+                raise OpenWorkflowError(msg)
+            deleted.add(orphan)
 
     @handles(GetEngineVersionRequest, scope=RequestScope.HOST)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002

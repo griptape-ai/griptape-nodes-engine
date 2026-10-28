@@ -2080,18 +2080,53 @@ class WorkerManager(EngineScoped):
                 e,
             )
 
-    async def broadcast_local_object_teardown(self) -> None:
-        """Tell every worker to release named pending keys, then everything its libraries hold.
+    async def broadcast_local_object_teardown(self, closed_workflow_id: str | None = None) -> None:
+        """Tell every worker to release named pending keys, then everything its libraries hold for the closed workflow.
 
         One method because both halves are required: the named-key broadcast is what drains the
         orchestrator's pending-release queue, and the drop-all is what covers whatever a worker still holds.
-        Two teardown sites call this; neither may take half of it.
+        The engine's close operations call this (`Engine.aclose_workflow`, `Engine.aclose_all_workflows`,
+        and through `schedule_local_object_teardown`, `Engine.close_workflow`); none may take half of it.
+
+        Naming `closed_workflow_id`, a worker releases only that workflow's objects and runtime. With
+        no workflow named, every workflow was cleared: it releases everything.
         """
         await self.broadcast_pending_local_object_releases()
-        await self.broadcast_drop_all_local_objects()
+        await self.broadcast_drop_all_local_objects(workflow_id=closed_workflow_id)
 
-    async def broadcast_drop_all_local_objects(self) -> None:
-        """Tell every worker to release the objects its libraries parked in it.
+    def schedule_local_object_teardown(self, closed_workflow_id: str | None) -> None:
+        """Run `broadcast_local_object_teardown` for a sync teardown, on the engine loop.
+
+        A sync close cannot await the fan-out. It goes to the engine loop rather than the caller's,
+        because a sync request can run on a transient side loop, and a task left there dies with it.
+        With no engine loop there is nothing to send it on, and the workers keep the objects until a
+        later teardown.
+        """
+        if self._transport is None or not self._workers:
+            # Nothing to tell. Draining keeps the queue from growing for the life of the process.
+            self.engine.resource_manager.drain_pending_worker_releases()
+            return
+        engine_loop = self.engine.event_manager.event_loop
+        if engine_loop is None or engine_loop.is_closed():
+            logger.warning(
+                "Could not tell the workers to release the objects held for a closed workflow: the engine has "
+                "no event loop to send on. A worker keeps them until a later teardown."
+            )
+            return
+        teardown = self.broadcast_local_object_teardown(closed_workflow_id)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not engine_loop:
+            asyncio.run_coroutine_threadsafe(teardown, engine_loop)
+            return
+        task = engine_loop.create_task(teardown)
+        self._inflight_broadcast_tasks.add(task)
+        task.add_done_callback(self._inflight_broadcast_tasks.discard)
+
+    async def broadcast_drop_all_local_objects(self, *, workflow_id: str | None = None) -> None:
+        """Tell every worker to release the objects its libraries parked in it for `workflow_id`, or all of them.
 
         Awaited rather than scheduled, for the reason recorded on `_on_config_changed` above: this one is
         called from a workflow teardown that can be dispatched synchronously, and a task created on a
@@ -2109,7 +2144,7 @@ class WorkerManager(EngineScoped):
         if self._transport is None or not self._workers:
             return
         try:
-            await self.broadcast_to_workers(EventRequest(request=DropAllLocalObjectsRequest()))
+            await self.broadcast_to_workers(EventRequest(request=DropAllLocalObjectsRequest(workflow_id=workflow_id)))
         except Exception as e:
             logger.warning(
                 "Could not tell the workers to release the objects held for their libraries: %s. "
