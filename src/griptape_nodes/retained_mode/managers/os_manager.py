@@ -2418,8 +2418,8 @@ class OSManager(EngineScoped):
         """Encode a small WEBP preview of the image as a data URL. CPU-bound and touches no engine state.
 
         Returns:
-            The preview data URL, or None if Pillow could not decode the image (the caller falls
-            back to a registered artifact provider, then to the original bytes).
+            The preview data URL, or None if Pillow could not decode the image (the caller then
+            returns the original bytes under the size cap, or a no-preview sentinel over it).
         """
         preview_data_url = create_image_preview_from_bytes(
             image_bytes,  # type: ignore[arg-type]
