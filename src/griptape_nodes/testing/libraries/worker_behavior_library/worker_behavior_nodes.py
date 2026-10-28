@@ -50,6 +50,10 @@ the minimal fixtures did not cover:
   one changed in place.
 - ``PlainGroupNode``: a node group, which runs where its workflow is open and is never copied to a
   worker.
+- ``OutputSettingsNode`` / ``SavesThroughOutputParametersNode``: a settings node supplying a file,
+  directory and file sequence destination, as File Output Settings does, and a node saving through
+  the three project output parameters wired to it. A worker's copy has no settings node beside it,
+  so it gets the destinations only by asking where the settings node lives.
 """
 
 from __future__ import annotations
@@ -57,11 +61,17 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import AsyncResult, DataNode
+from griptape_nodes.exe_types.param_components.project_directory_parameter import ProjectDirectoryParameter
+from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
+from griptape_nodes.exe_types.param_components.project_file_sequence_parameter import ProjectFileSequenceParameter
+from griptape_nodes.files.directory import DirectoryDestination
 from griptape_nodes.files.file import File
+from griptape_nodes.files.file_sequence import FileSequenceDestination
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
@@ -70,6 +80,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
     ListConnectionsForNodeRequest,
 )
+from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     RemoveParameterFromNodeRequest,
@@ -1027,3 +1038,116 @@ class PlainGroupNode(BaseNodeGroup):
 
     def process(self) -> None:
         pass
+
+
+class OutputSettingsNode(DataNode):
+    """Supplies destinations under ``{outputs}/settings`` named by ``name_base``, as File Output Settings does.
+
+    An empty ``name_base`` means no destination is set. ``if_exists`` is ``overwrite`` or ``fail``.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="name_base",
+                type="str",
+                default_value="",
+                tooltip="Name every destination is built from",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="if_exists",
+                type="str",
+                default_value="overwrite",
+                tooltip="overwrite or fail",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
+        for output_name in ("file_destination", "directory_destination", "file_sequence_destination"):
+            self.add_parameter(
+                Parameter(
+                    name=output_name,
+                    type="str",
+                    default_value=None,
+                    tooltip="Wire to a project output parameter",
+                    allowed_modes={ParameterMode.OUTPUT},
+                    output_type="str",
+                )
+            )
+
+    @property
+    def file_destination(self) -> ProjectFileDestination | None:
+        macro_path = self._macro_path("{outputs}/settings/{name_base}.bin")
+        if macro_path is None:
+            return None
+        return ProjectFileDestination(macro_path, existing_file_policy=self._policy(), create_parents=True)
+
+    @property
+    def directory_destination(self) -> DirectoryDestination | None:
+        macro_path = self._macro_path("{outputs}/settings/{name_base}_dir")
+        if macro_path is None:
+            return None
+        return DirectoryDestination(macro_path, existing_dir_policy=self._policy(), create_parents=True)
+
+    @property
+    def file_sequence_destination(self) -> FileSequenceDestination | None:
+        macro_path = self._macro_path("{outputs}/settings/{name_base}_seq/{name_base}.####.bin")
+        if macro_path is None:
+            return None
+        return FileSequenceDestination(macro_path, existing_file_policy=self._policy(), create_parents=True)
+
+    def process(self) -> None:
+        pass
+
+    def _macro_path(self, template: str) -> MacroPath | None:
+        name_base = self.get_parameter_value("name_base")
+        if not name_base:
+            return None
+        return MacroPath(ParsedMacro(template), {"name_base": name_base})
+
+    def _policy(self) -> ExistingFilePolicy:
+        if self.get_parameter_value("if_exists") == "fail":
+            return ExistingFilePolicy.FAIL
+        return ExistingFilePolicy.OVERWRITE
+
+
+class SavesThroughOutputParametersNode(DataNode):
+    """Writes a file, creates a directory and writes one sequence frame through the project output parameters.
+
+    Reports where each landed: the file and directory in the macro form the destination maps them
+    back to, and the frame as the absolute path it was written to.
+    """
+
+    PAYLOAD = b"output-settings-payload"
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self._file_parameter = ProjectFileParameter(self, "output_file", default_filename="default_output.bin")
+        self._file_parameter.add_parameter()
+        self._directory_parameter = ProjectDirectoryParameter(self, "output_dir", default_dirname="default_dir")
+        self._directory_parameter.add_parameter()
+        self._sequence_parameter = ProjectFileSequenceParameter(
+            self, "output_sequence", default_filename="default_sequence.bin"
+        )
+        self._sequence_parameter.add_parameter()
+        for output_name in ("saved_file", "created_dir", "written_frame"):
+            self.add_parameter(
+                Parameter(
+                    name=output_name,
+                    type="str",
+                    default_value="",
+                    tooltip="Where it landed",
+                    allowed_modes={ParameterMode.OUTPUT},
+                )
+            )
+
+    def process(self) -> None:
+        saved = self._file_parameter.build_file().write_bytes(self.PAYLOAD)
+        self.parameter_output_values["saved_file"] = saved.location
+        directory = self._directory_parameter.build_directory().create()
+        self.parameter_output_values["created_dir"] = directory.location
+        frame = self._sequence_parameter.build_sequence().entry(1).write_bytes(self.PAYLOAD)
+        self.parameter_output_values["written_frame"] = frame.location

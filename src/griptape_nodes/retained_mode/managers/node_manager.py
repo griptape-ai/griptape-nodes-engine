@@ -63,6 +63,9 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.files.directory import DirectoryDestinationProvider
+from griptape_nodes.files.file import FileDestinationProvider
+from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
@@ -94,6 +97,17 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultFailure,
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
+)
+from griptape_nodes.retained_mode.events.destination_events import (
+    GetConnectedDirectoryDestinationRequest,
+    GetConnectedDirectoryDestinationResultFailure,
+    GetConnectedDirectoryDestinationResultSuccess,
+    GetConnectedFileDestinationRequest,
+    GetConnectedFileDestinationResultFailure,
+    GetConnectedFileDestinationResultSuccess,
+    GetConnectedFileSequenceDestinationRequest,
+    GetConnectedFileSequenceDestinationResultFailure,
+    GetConnectedFileSequenceDestinationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
@@ -315,6 +329,22 @@ class _FlowCancelOutcome:
 
     failure: ResultPayload | None = None
     cancelled_for_node_name: str | None = None
+
+
+@dataclass
+class _ConnectedProviderLookup[ProviderT]:
+    """A settings node connected to a parameter: a failure to look, the provider found, or neither."""
+
+    failure_details: str | None = None
+    source_node_name: str | None = None
+    provider: ProviderT | None = None
+
+
+def _unset_destination_details(node_name: str, parameter_name: str, lookup: _ConnectedProviderLookup[Any]) -> str:
+    return (
+        f"Attempted to read the output settings connected to '{node_name}.{parameter_name}'. "
+        f"Failed because '{lookup.source_node_name}' has no destination set (likely missing a filename or path)."
+    )
 
 
 @dataclass
@@ -1893,6 +1923,93 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
         return result
+
+    @handles(GetConnectedFileDestinationRequest)
+    def on_get_connected_file_destination_request(
+        self, request: GetConnectedFileDestinationRequest
+    ) -> GetConnectedFileDestinationResultSuccess | GetConnectedFileDestinationResultFailure:
+        lookup = self._find_connected_destination_provider(
+            request.node_name, request.parameter_name, FileDestinationProvider
+        )
+        if lookup.failure_details is not None:
+            return GetConnectedFileDestinationResultFailure(result_details=lookup.failure_details)
+        if lookup.provider is None:
+            details = f"No file output settings are connected to '{request.node_name}.{request.parameter_name}'."
+            return GetConnectedFileDestinationResultSuccess(destination=None, result_details=details)
+        destination = lookup.provider.file_destination
+        if destination is None:
+            details = _unset_destination_details(request.node_name, request.parameter_name, lookup)
+            return GetConnectedFileDestinationResultFailure(result_details=details)
+        details = f"Read the file destination '{lookup.source_node_name}' supplies to '{request.node_name}.{request.parameter_name}'."
+        return GetConnectedFileDestinationResultSuccess(destination=destination.to_spec(), result_details=details)
+
+    @handles(GetConnectedDirectoryDestinationRequest)
+    def on_get_connected_directory_destination_request(
+        self, request: GetConnectedDirectoryDestinationRequest
+    ) -> GetConnectedDirectoryDestinationResultSuccess | GetConnectedDirectoryDestinationResultFailure:
+        lookup = self._find_connected_destination_provider(
+            request.node_name, request.parameter_name, DirectoryDestinationProvider
+        )
+        if lookup.failure_details is not None:
+            return GetConnectedDirectoryDestinationResultFailure(result_details=lookup.failure_details)
+        if lookup.provider is None:
+            details = f"No directory output settings are connected to '{request.node_name}.{request.parameter_name}'."
+            return GetConnectedDirectoryDestinationResultSuccess(destination=None, result_details=details)
+        destination = lookup.provider.directory_destination
+        if destination is None:
+            details = _unset_destination_details(request.node_name, request.parameter_name, lookup)
+            return GetConnectedDirectoryDestinationResultFailure(result_details=details)
+        details = f"Read the directory destination '{lookup.source_node_name}' supplies to '{request.node_name}.{request.parameter_name}'."
+        return GetConnectedDirectoryDestinationResultSuccess(destination=destination.to_spec(), result_details=details)
+
+    @handles(GetConnectedFileSequenceDestinationRequest)
+    def on_get_connected_file_sequence_destination_request(
+        self, request: GetConnectedFileSequenceDestinationRequest
+    ) -> GetConnectedFileSequenceDestinationResultSuccess | GetConnectedFileSequenceDestinationResultFailure:
+        lookup = self._find_connected_destination_provider(
+            request.node_name, request.parameter_name, FileSequenceDestinationProvider
+        )
+        if lookup.failure_details is not None:
+            return GetConnectedFileSequenceDestinationResultFailure(result_details=lookup.failure_details)
+        if lookup.provider is None:
+            details = (
+                f"No file sequence output settings are connected to '{request.node_name}.{request.parameter_name}'."
+            )
+            return GetConnectedFileSequenceDestinationResultSuccess(destination=None, result_details=details)
+        destination = lookup.provider.file_sequence_destination
+        if destination is None:
+            details = _unset_destination_details(request.node_name, request.parameter_name, lookup)
+            return GetConnectedFileSequenceDestinationResultFailure(result_details=details)
+        details = f"Read the file sequence destination '{lookup.source_node_name}' supplies to '{request.node_name}.{request.parameter_name}'."
+        return GetConnectedFileSequenceDestinationResultSuccess(
+            destination=destination.to_spec(), result_details=details
+        )
+
+    def _find_connected_destination_provider[ProviderT](
+        self, node_name: str, parameter_name: str, provider_type: type[ProviderT]
+    ) -> _ConnectedProviderLookup[ProviderT]:
+        """Find the first node connected to ``node_name.parameter_name`` that implements ``provider_type``."""
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+        if node is None:
+            details = (
+                f"Attempted to read the output settings connected to '{node_name}.{parameter_name}'. "
+                f"Failed because no node named '{node_name}' exists."
+            )
+            return _ConnectedProviderLookup(failure_details=details)
+        if node.get_parameter_by_name(parameter_name) is None:
+            details = (
+                f"Attempted to read the output settings connected to '{node_name}.{parameter_name}'. "
+                f"Failed because '{node_name}' has no parameter named '{parameter_name}'."
+            )
+            return _ConnectedProviderLookup(failure_details=details)
+
+        connection_mgr = self.engine.flow_manager.get_connections()
+        connection_ids = connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, [])
+        for connection_id in connection_ids:
+            source_node = connection_mgr.connections[connection_id].source_node
+            if isinstance(source_node, provider_type):
+                return _ConnectedProviderLookup(source_node_name=source_node.name, provider=source_node)
+        return _ConnectedProviderLookup()
 
     @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(self, request: ListParametersOnNodeRequest) -> ResultPayload:

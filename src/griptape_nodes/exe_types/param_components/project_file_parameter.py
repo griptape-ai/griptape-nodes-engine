@@ -8,8 +8,12 @@ from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.project_output_parameter import ProjectOutputParameter
-from griptape_nodes.files.file import FileDestination, FileDestinationProvider
-from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.files.file import FileDestination
+from griptape_nodes.files.project_file import ProjectFileDestination, file_destination_from_spec
+from griptape_nodes.retained_mode.events.destination_events import (
+    GetConnectedFileDestinationRequest,
+    GetConnectedFileDestinationResultSuccess,
+)
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
 
 
@@ -82,10 +86,9 @@ class ProjectFileParameter(ProjectOutputParameter):
     def build_file(self, **extra_vars: str | int) -> FileDestination:
         """Build a FileDestination with a MacroPath from the parameter's current value.
 
-        If an upstream node (e.g. FileOutputSettings) exposes a ``file_destination``
-        attribute, its ``FileDestination`` is retrieved directly without deserialising
-        from the wire. A node that exposes the attribute but returns None raises instead
-        of silently falling back to the default situation, since that fallback hides
+        If a settings node (e.g. FileOutputSettings) is connected to this parameter, its
+        ``FileDestination`` is used. A connected settings node with no destination set raises
+        instead of silently falling back to the default situation, since that fallback hides
         user intent.
 
         Otherwise the parameter's string value is combined with this component's
@@ -98,11 +101,13 @@ class ProjectFileParameter(ProjectOutputParameter):
             FileDestination with a MacroPath and baked-in write policy for deferred path resolution
 
         Raises:
-            ValueError: If an upstream FileDestinationProvider is connected but returns None,
+            ValueError: If the connected settings node can't be read or has no destination set,
                 or if the parameter's value is a URL that names no local file.
         """
         upstream = self._get_upstream_destination(
-            FileDestinationProvider, lambda provider: provider.file_destination, "FileDestination"
+            GetConnectedFileDestinationRequest(node_name=self._node.name, parameter_name=self._name),
+            GetConnectedFileDestinationResultSuccess,
+            file_destination_from_spec,
         )
         if upstream is not None:
             return upstream

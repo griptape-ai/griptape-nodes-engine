@@ -19,6 +19,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
 )
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.destination_events import FileDestinationSpec
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -966,10 +967,38 @@ class FileDestination:
         )
         return File(str(path))
 
+    def to_spec(self) -> FileDestinationSpec:
+        """Return this destination as plain data that can be sent to another process."""
+        return FileDestinationSpec(
+            file_path=self._file._file_path,
+            existing_file_policy=self._existing_file_policy,
+            append=self._append,
+            create_parents=self._create_parents,
+            coerce_extension_to_match_bytes=self._coerce_extension_to_match_bytes,
+            file_metadata=self._file._file_metadata,
+            map_to_project=False,
+        )
+
+    @classmethod
+    def from_spec(cls, spec: FileDestinationSpec) -> FileDestination:
+        """Rebuild a destination from ``to_spec`` output. ``spec.map_to_project`` is not consulted here."""
+        return cls(
+            spec.file_path,
+            existing_file_policy=spec.existing_file_policy,
+            append=spec.append,
+            create_parents=spec.create_parents,
+            file_metadata=spec.file_metadata,
+            coerce_extension_to_match_bytes=spec.coerce_extension_to_match_bytes,
+        )
+
 
 @runtime_checkable
 class FileDestinationProvider(Protocol):
-    """Protocol for nodes that provide a FileDestination without serializing it over the wire."""
+    """Protocol for nodes that provide a FileDestination to a connected output parameter.
+
+    The engine reads the property where the node lives and sends the destination as plain data, so
+    a node running in a worker receives it too.
+    """
 
     @property
     def file_destination(self) -> FileDestination | None:

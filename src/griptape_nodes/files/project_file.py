@@ -1,5 +1,6 @@
 """ProjectFileDestination - project-aware FileDestination built from a situation template."""
 
+import dataclasses
 import logging
 from pathlib import Path, PureWindowsPath
 
@@ -7,6 +8,7 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.path_utils import FilenameParts, is_url, parse_file_uri
 from griptape_nodes.files.situation_resolver import resolve_situation
+from griptape_nodes.retained_mode.events.destination_events import FileDestinationSpec
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -30,6 +32,13 @@ def _attempt_map_to_project(absolute_path: Path) -> str | None:
     if isinstance(map_result, AttemptMapAbsolutePathToProjectResultSuccess) and map_result.mapped_path is not None:
         return map_result.mapped_path
     return None
+
+
+def file_destination_from_spec(spec: FileDestinationSpec) -> FileDestination:
+    """Rebuild the destination ``FileDestination.to_spec`` described, keeping its project mapping."""
+    if spec.map_to_project:
+        return ProjectFileDestination.from_spec(spec)
+    return FileDestination.from_spec(spec)
 
 
 class ProjectFileDestination(FileDestination):
@@ -59,6 +68,9 @@ class ProjectFileDestination(FileDestination):
 
     async def awrite_text(self, content: str, encoding: str = "utf-8") -> File:
         return self._map_to_macro_file(await super().awrite_text(content, encoding))
+
+    def to_spec(self) -> FileDestinationSpec:
+        return dataclasses.replace(super().to_spec(), map_to_project=True)
 
     def _map_to_macro_file(self, result_file: File) -> File:
         """Attempt to convert the written path to its portable macro form.

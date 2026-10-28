@@ -1,33 +1,20 @@
 """Unit tests for ProjectOutputParameter._get_upstream_destination."""
 
-from typing import Protocol, runtime_checkable
+from typing import cast
 from unittest import mock
 
 import pytest
 
 from griptape_nodes.exe_types import core_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
-from griptape_nodes.retained_mode.events import connection_events
+from griptape_nodes.retained_mode.events import destination_events
+from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 
-
-@runtime_checkable
-class _TestProvider(Protocol):
-    @property
-    def test_destination(self) -> object | None:
-        """Stand-in destination the lookup under test reads from a provider node."""
-
-
-class _ProviderNode:
-    def __init__(self, destination: object | None) -> None:
-        self._destination = destination
-
-    @property
-    def test_destination(self) -> object | None:
-        return self._destination
-
-
-class _PlainNode:
-    pass
+_SPEC = destination_events.DirectoryDestinationSpec(
+    dir_path="/renders/out",
+    existing_dir_policy=ExistingFilePolicy.FAIL,
+    create_parents=False,
+)
 
 
 class _ConcreteParam(project_output_parameter.ProjectOutputParameter):
@@ -50,105 +37,78 @@ class _ConcreteParam(project_output_parameter.ProjectOutputParameter):
         return "str"
 
 
-def _make_param(
-    connections_result: connection_events.ListConnectionsForNodeResultSuccess
-    | connection_events.ListConnectionsForNodeResultFailure,
-    nodes_by_name: dict[str, object] | None = None,
-    param_name: str = "output",
-) -> _ConcreteParam:
+def _make_param(result: object, param_name: str = "output") -> _ConcreteParam:
     mock_node = mock.MagicMock()
     mock_node.name = "MyNode"
-    mock_node.engine.handle_request.return_value = connections_result
-    lookup = nodes_by_name or {}
-    mock_node.engine.object_manager.attempt_get_object_by_name.side_effect = lookup.get
+    mock_node.engine.handle_request.return_value = result
     return _ConcreteParam(mock_node, param_name, default_value="default.txt", situation="save_node_output")
 
 
-def _get(param: _ConcreteParam) -> object | None:
-    return param._get_upstream_destination(_TestProvider, lambda p: p.test_destination, "TestDestination")
+def _mock_node(param: _ConcreteParam) -> mock.MagicMock:
+    return cast("mock.MagicMock", param._node)
 
 
-def _make_connections_result(
-    *connections: connection_events.IncomingConnection,
-) -> connection_events.ListConnectionsForNodeResultSuccess:
-    return connection_events.ListConnectionsForNodeResultSuccess(
-        result_details="ok",
-        incoming_connections=list(connections),
-        outgoing_connections=[],
+def _request(param: _ConcreteParam) -> destination_events.GetConnectedDirectoryDestinationRequest:
+    return destination_events.GetConnectedDirectoryDestinationRequest(
+        node_name=param._node.name, parameter_name=param._name
     )
 
 
-def _make_connection(
-    target_param: str,
-    source_node: str = "UpstreamNode",
-    source_param: str = "test_destination",
-) -> connection_events.IncomingConnection:
-    return connection_events.IncomingConnection(
-        source_node_name=source_node,
-        source_parameter_name=source_param,
-        target_parameter_name=target_param,
+def _get(param: _ConcreteParam) -> object | None:
+    return param._get_upstream_destination(
+        _request(param),
+        destination_events.GetConnectedDirectoryDestinationResultSuccess,
+        lambda spec: ("rebuilt", spec),
     )
 
 
 class TestGetUpstreamDestination:
-    """Tests for _get_upstream_destination, which finds an upstream node implementing a provider protocol."""
+    """Tests for _get_upstream_destination, which asks for the destination a connected settings node supplies."""
 
-    def test_returns_none_when_list_connections_fails(self) -> None:
-        param = _make_param(connection_events.ListConnectionsForNodeResultFailure(result_details="error"))
-        assert _get(param) is None
-
-    def test_returns_none_when_no_incoming_connections(self) -> None:
-        param = _make_param(_make_connections_result())
-        assert _get(param) is None
-
-    def test_returns_none_when_connection_targets_different_parameter(self) -> None:
+    def test_sends_the_request_through_the_nodes_engine(self) -> None:
         param = _make_param(
-            _make_connections_result(_make_connection(target_param="other_param")),
-            {"UpstreamNode": _ProviderNode(object())},
+            destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=None, result_details="ok")
         )
+
+        _get(param)
+
+        _mock_node(param).engine.handle_request.assert_called_once_with(_request(param))
+
+    def test_returns_none_when_no_settings_node_is_connected(self) -> None:
+        param = _make_param(
+            destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=None, result_details="ok")
+        )
+
         assert _get(param) is None
 
-    def test_returns_none_when_source_node_not_found(self) -> None:
-        param = _make_param(_make_connections_result(_make_connection(target_param="output")))
-        assert _get(param) is None
-
-    def test_returns_none_when_source_node_is_not_a_provider(self) -> None:
+    def test_rebuilds_the_destination_from_its_spec(self) -> None:
         param = _make_param(
-            _make_connections_result(_make_connection(target_param="output")),
-            {"UpstreamNode": _PlainNode()},
+            destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=_SPEC, result_details="ok")
         )
-        assert _get(param) is None
 
-    def test_returns_destination_from_provider(self) -> None:
-        expected_dest = object()
-        param = _make_param(
-            _make_connections_result(_make_connection(target_param="output")),
-            {"UpstreamNode": _ProviderNode(expected_dest)},
-        )
-        assert _get(param) is expected_dest
+        assert _get(param) == ("rebuilt", _SPEC)
 
-    def test_raises_when_provider_returns_none(self) -> None:
+    def test_raises_with_the_failure_details(self) -> None:
         param = _make_param(
-            _make_connections_result(_make_connection(target_param="output")),
-            {"UpstreamNode": _ProviderNode(None)},
+            destination_events.GetConnectedDirectoryDestinationResultFailure(
+                result_details="'UpstreamNode' has no destination set"
+            )
         )
+
         with pytest.raises(ValueError, match="UpstreamNode"):
             _get(param)
 
-    def test_skips_non_provider_and_returns_provider_destination(self) -> None:
-        """A non-provider connection followed by a provider: skips first, returns second."""
-        expected_dest = object()
+    def test_never_reads_the_local_object_store(self) -> None:
         param = _make_param(
-            _make_connections_result(
-                _make_connection(target_param="output", source_node="PlainNode"),
-                _make_connection(target_param="output", source_node="ProviderNode"),
-            ),
-            {"PlainNode": _PlainNode(), "ProviderNode": _ProviderNode(expected_dest)},
+            destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=_SPEC, result_details="ok")
         )
-        assert _get(param) is expected_dest
+
+        _get(param)
+
+        _mock_node(param).engine.object_manager.attempt_get_object_by_name.assert_not_called()
 
     def test_allowed_modes_default(self) -> None:
-        param = _make_param(_make_connections_result())
+        param = _make_param(None)
         assert param._allowed_modes == {core_types.ParameterMode.INPUT, core_types.ParameterMode.PROPERTY}
 
     def test_custom_allowed_modes(self) -> None:
