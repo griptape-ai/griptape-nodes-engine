@@ -948,7 +948,7 @@ class TestProjectManagerBuiltinVariables:
 
         `{workflow_dir?:/}outputs/image.png` degrades to a PLAUSIBLE workspace-relative path
         rather than an error, so without a log line the only symptom is media that resolves to a
-        file which was never written there. `_ProjectVariableResolver._resolve_macro_string` warns
+        file which was never written there. `ProjectVariableResolver._resolve_macro_string` warns
         on its own copy of this degradation; this is the path GetPathForMacro takes, and it is the
         one the `workflow_dir` regression tests above drive.
         """

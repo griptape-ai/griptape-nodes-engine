@@ -662,6 +662,9 @@ class _GateProbe(BaseNode):
     def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
         super().__init__(name=name, metadata=metadata)
 
+    def process(self) -> None:
+        pass
+
 
 class TestNodeInstantiationAuthorizationCheckpoint:
     """The license-policy checkpoint wired into node instantiation."""
@@ -789,8 +792,9 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             event_manager=engine.event_manager,
         )
 
-    def test_worker_materialize_denied_returns_failure(self, engine: Engine) -> None:
-        """Worker-side construction from caller-supplied metadata is gated by the same checkpoint."""
+    @pytest.mark.asyncio
+    async def test_a_worker_copy_the_policy_denies_is_not_run(self, engine: Engine) -> None:
+        """A worker loads its copy through CreateNode, so caller-supplied metadata meets the same checkpoint."""
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.events.execution_events import (
             ExecuteNodeRequest,
@@ -806,27 +810,28 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             return None
 
         engine.event_manager.add_authorization_hook(deny)
+        engine.library_manager._is_worker = True
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
         )
-        result = engine.node_manager._materialize_transient_node_from_metadata(request)
+        result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "Labs nodes are disabled." in str(result.result_details)
 
-    def test_worker_materialize_allows_without_hook(self, engine: Engine) -> None:
-        """With no policy hook the worker path builds the node, matching the no-denial contract."""
-        from griptape_nodes.exe_types.node_types import BaseNode
-        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+    @pytest.mark.asyncio
+    async def test_a_worker_copy_runs_without_a_policy_hook(self, engine: Engine) -> None:
+        """With no policy hook the worker loads and runs its copy, matching the no-denial contract."""
+        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 
         self._register()
+        engine.library_manager._is_worker = True
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
         )
-        result = engine.node_manager._materialize_transient_node_from_metadata(request)
-        assert isinstance(result, BaseNode)
-        assert result.name == "probe-1"
+        result = await engine.ahandle_request(request)
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
 
     def test_schema_preview_returns_denied_node_types(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
@@ -1152,13 +1157,16 @@ class TestNodeCreationFailureDescription:
 
 
 class TestApplyHydratedValues:
-    """Values a worker receives are set on its copy of the node."""
+    """Values an ExecuteNodeRequest carries are set on the orchestrator's node before it runs."""
 
     def test_value_this_process_cannot_rebuild_is_set_and_warned(
         self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         node = MagicMock(spec=BaseNode)
+        node.name = "Worker Node"
         node.parameter_values = {}
+        node._list_rows = MagicMock()
+        node._list_rows.set_as_rows_if_unconnected.return_value = False
         undecoded = UndecodedValue({"$type": "other_library.mod:Thing"}, "its library is not loaded here")
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):

@@ -176,6 +176,15 @@ class WorkflowNotAlteredMixin:
     altered_workflow_state: bool = field(default=False, init=False)
 
 
+class GraphAccessMixin:
+    """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
+
+    A node must not send one while it is being created or having its saved state applied (strict-mode
+    rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
+    would depend on how the node was loaded.
+    """
+
+
 class SkipTheLineMixin:
     """Mixin for events that should skip the event queue and be processed immediately.
 

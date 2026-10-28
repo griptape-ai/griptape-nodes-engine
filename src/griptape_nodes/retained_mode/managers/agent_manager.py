@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import os
 import textwrap
 import threading
 from dataclasses import asdict, dataclass, replace
@@ -60,11 +59,10 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import (
     pending_tool_calls,
 )
 from griptape_nodes.drivers.cloud_credentials import (
-    BASE_URL_SETTING_NAME,
-    DEFAULT_CLOUD_BASE_URL,
     MISSING_CREDENTIAL_MESSAGE,
     POLICY_DENIED_HINT,
     is_license_credential,
+    resolve_cloud_base_url,
     resolve_cloud_credential,
     resolve_cloud_host,
 )
@@ -1231,10 +1229,7 @@ class AgentManager(EngineScoped):
             if not api_key:
                 msg = f"Attempted to start the agent. Failed because {MISSING_CREDENTIAL_MESSAGE}"
                 raise ValueError(msg)
-            # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
-            # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
-            # malformed endpoint, so the chat and image paths agree.
-            cloud_base_url = os.environ.get(BASE_URL_SETTING_NAME) or DEFAULT_CLOUD_BASE_URL
+            cloud_base_url = resolve_cloud_base_url()
             model_base_url: str | None = cloud_base_url
             image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url

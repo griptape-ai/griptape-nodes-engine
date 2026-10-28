@@ -128,6 +128,7 @@ plugins:
           - guides/agent/providers/custom.md: Custom OpenAI-compatible endpoint setup
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
+          - guides/local_editor.md: Serving the editor from the engine at 127.0.0.1:8126 instead of using the hosted editor
           - guides/libraries.md: Installing and managing node libraries
           - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by, worker command prefix)
         Project system:
@@ -313,6 +314,7 @@ nav:
       - Engine:
           - Configuration: guides/configuration.md
           - Transports: guides/transports.md
+          - Running the Editor Locally: guides/local_editor.md
           - Libraries: guides/libraries.md
           - Managed Environment: guides/managed_environment.md
       - Projects:
