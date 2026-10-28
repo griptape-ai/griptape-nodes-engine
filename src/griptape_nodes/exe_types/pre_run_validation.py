@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.input_check_budget import input_check_budget
 from griptape_nodes.exe_types.input_checks import input_check_readings, input_subject, read_media, timed_out_locations
-from griptape_nodes.exe_types.validators.base import MediaInfo, holds_list, media_kind_of, needs_for_kind
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, holds_list, media_kind_of, needs_for_kind
 from griptape_nodes.files.path_utils import is_url
 
 if TYPE_CHECKING:
@@ -186,7 +186,7 @@ def _check_parameter(
     items = _list_items(node, parameter)
     whole_list = [validator for validator in validators if validator.checks_whole_list]
     per_item = [validator for validator in validators if not validator.checks_whole_list]
-    errors.extend(_collect(whole_list, items, subject=shown_name, media=MediaInfo(), docs_url=docs_url))
+    errors.extend(_collect(whole_list, items, subject=shown_name, media=EMPTY_MEDIA, docs_url=docs_url))
     readings: list[MediaInfo] = []
     for position, item in enumerate(items, start=1):
         info = _read(item, per_item, kind)
@@ -208,7 +208,7 @@ def _read(value: Any, validators: Sequence[PreRunValidator], kind: MediaKind | N
     """One read of a value, for every reading these validators need together."""
     needs = needs_for_kind(validators, kind)
     if kind is None or not needs:
-        return MediaInfo()
+        return EMPTY_MEDIA
     return read_media(value, needs, kind=kind)
 
 
@@ -218,7 +218,7 @@ def _collect(
     """Each error these validators report for one value."""
     errors: list[NodeError] = []
     for validator in validators:
-        error = validator.check(value, subject=subject, media=media, docs_url=docs_url)
+        error = validator.check(value, subject=subject, docs_url=docs_url, media=media)
         if error is not None:
             errors.append(error)
     return errors

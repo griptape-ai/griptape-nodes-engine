@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, override
 
 from griptape_nodes.exe_types.input_checks import check_count
-from griptape_nodes.exe_types.validators.base import MediaInfo, PreRunValidator
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, PreRunValidator
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -31,7 +31,10 @@ class MaxCount(PreRunValidator):
     maximum: int
     noun: str = "items"
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
 
 
@@ -73,7 +76,10 @@ class DependsOn(PreRunValidator):
         object.__setattr__(self, "choices", tuple((value, tuple(validators)) for value, validators in choices.items()))
         object.__setattr__(self, "default", tuple(default))
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         # The engine runs the validators `selected` picks; this one has nothing of its own to check.
         return None
 

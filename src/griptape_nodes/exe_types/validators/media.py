@@ -27,7 +27,7 @@ ParameterImage(
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, override
 
 from griptape_nodes.exe_types.input_checks import (
     FRAME_RATE_TOLERANCE,
@@ -42,7 +42,7 @@ from griptape_nodes.exe_types.input_checks import (
     check_size,
     check_video_codec,
 )
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, PreRunValidator
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -91,7 +91,10 @@ class MaxFileSize(PreRunValidator):
     strict: bool = False
     fix: str | None = None
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return check_size(
             media.size_bytes,
             maximum_bytes=self.maximum_bytes,
@@ -122,7 +125,10 @@ class AllowedFormats(PreRunValidator):
         _require_names(mime_types, what="format", example="'image/png'")
         object.__setattr__(self, "mime_types", mime_types)
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         if media.audio is not None:
             return check_mime_type(
                 media.audio.mime_type, subject=subject, allowed=self.mime_types, docs_url=docs_url, audio=True
@@ -142,7 +148,10 @@ class SideRange(PreRunValidator):
     min: int | None = None
     max: int | None = None
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return check_dimensions(media.frame, subject=subject, min_side=self.min, max_side=self.max, docs_url=docs_url)
 
 
@@ -155,7 +164,10 @@ class PixelArea(PreRunValidator):
     min_megapixels: float | None = None
     max_megapixels: float | None = None
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return check_dimensions(
             media.frame,
             subject=subject,
@@ -184,7 +196,10 @@ class AspectRatioRange(PreRunValidator):
     def __post_init__(self) -> None:
         check_aspect_ratio_range(None, subject=_NO_SUBJECT, widest=self.widest, tallest=self.tallest)
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return _easier_shape(
             media,
             lambda frame: check_aspect_ratio_range(
@@ -214,7 +229,10 @@ class ExactAspectRatios(PreRunValidator):
         check_aspect_ratio_exact(None, subject=_NO_SUBJECT, ratios=ratios)
         object.__setattr__(self, "ratios", ratios)
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         return _easier_shape(
             media,
             lambda frame: check_aspect_ratio_exact(frame, subject=subject, ratios=self.ratios, docs_url=docs_url),
@@ -241,7 +259,10 @@ class Duration(PreRunValidator):
     max: float | None = None
     fix: str | None = None
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         probe = media.video
         too_long_fix = self.fix
         if probe is None:
@@ -275,7 +296,10 @@ class FrameRate(PreRunValidator):
     max: float | None = None
     tolerance: float = FRAME_RATE_TOLERANCE
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         if media.video is None:
             return None
         rates = [rate for rate in (media.video.fps, media.video.nominal_fps) if rate is not None]
@@ -309,7 +333,10 @@ class FrameCount(PreRunValidator):
     min: int | None = None
     max: int | None = None
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         if media.video is None:
             return None
         if self.max is not None:
@@ -341,7 +368,10 @@ class VideoCodecs(PreRunValidator):
         check_video_codec(None, subject=_NO_SUBJECT, allowed=codecs)
         object.__setattr__(self, "codecs", codecs)
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         if media.video is None:
             return None
         return check_video_codec(media.video.codec, subject=subject, allowed=self.codecs, docs_url=docs_url)
@@ -367,7 +397,10 @@ class AudioCodecs(PreRunValidator):
         check_audio_codec(None, subject=_NO_SUBJECT, allowed=codecs)
         object.__setattr__(self, "codecs", codecs)
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         if media.audio is None:
             return None
         return check_audio_codec(media.audio.codec, subject=subject, allowed=self.codecs, docs_url=docs_url)

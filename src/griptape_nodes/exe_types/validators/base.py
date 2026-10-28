@@ -22,7 +22,15 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["MediaInfo", "MediaNeed", "NodeValidator", "PreRunValidator", "media_kind_of", "require_validators_fit"]
+__all__ = [
+    "EMPTY_MEDIA",
+    "MediaInfo",
+    "MediaNeed",
+    "NodeValidator",
+    "PreRunValidator",
+    "media_kind_of",
+    "require_validators_fit",
+]
 
 
 class MediaNeed(StrEnum):
@@ -95,6 +103,10 @@ class MediaInfo:
         return None
 
 
+# What a validator gets when nothing was read: the value holds no media, or no validator asked.
+EMPTY_MEDIA = MediaInfo()
+
+
 class PreRunValidator(ABC):
     """A limit on one input, checked at the node's turn, before it runs.
 
@@ -109,15 +121,18 @@ class PreRunValidator(ABC):
     checks_whole_list: ClassVar[bool] = False
 
     @abstractmethod
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         """An error when `value` breaks this limit, or None when it is within it or couldn't be read.
 
         Args:
             value: The parameter's value; for a list, one item, or the whole list with `checks_whole_list`.
             subject: The start of the message naming the input, such as "Image 2 in 'reference images'".
                 With `checks_whole_list`, the parameter's name as the UI shows it.
-            media: The readings `needs` asked for, read once for this value.
             docs_url: The node's page documenting its input limits, from `BaseNode.input_limits_url`.
+            media: The readings `needs` asked for, read once for this value. Empty for a validator
+                that needs none.
         """
 
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:  # noqa: ARG002

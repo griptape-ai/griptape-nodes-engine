@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
-from griptape_nodes.exe_types.validators.base import MediaInfo
 from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import MaxFileSize, SideRange
 from tests.unit.exe_types.mocks import MockNode
@@ -15,12 +14,10 @@ DOCS = "https://example.com/limits"
 
 class TestMaxCount:
     def test_allows_the_maximum(self) -> None:
-        assert MaxCount(3).check([1, 2, 3], subject="images", media=MediaInfo(), docs_url=None) is None
+        assert MaxCount(3).check([1, 2, 3], subject="images", docs_url=None) is None
 
     def test_refuses_more_than_the_maximum(self) -> None:
-        error = MaxCount(2, noun="images").check(
-            [1, 2, 3], subject="reference images", media=MediaInfo(), docs_url=DOCS
-        )
+        error = MaxCount(2, noun="images").check([1, 2, 3], subject="reference images", docs_url=DOCS)
         assert str(error) == "3 images are connected to 'reference images' and the limit is 2. Remove 1."
         assert error is not None
         assert error.links
@@ -72,7 +69,7 @@ class TestDependsOn:
 
     def test_checks_nothing_itself(self) -> None:
         depends_on_model = DependsOn("model", {"pro": self.PRO})
-        assert depends_on_model.check("x", subject="s", media=MediaInfo(), docs_url=None) is None
+        assert depends_on_model.check("x", subject="s", docs_url=None) is None
 
     def test_is_frozen_and_hashable(self) -> None:
         first = DependsOn("model", {"pro": self.PRO}, default=self.DEFAULT)

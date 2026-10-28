@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 import pytest
 
@@ -50,7 +50,7 @@ from griptape_nodes.exe_types.pre_run_validation import (
     validate_inputs,
     validate_node,
 )
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, NodeValidator, PreRunValidator
 from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -156,7 +156,10 @@ class TestSingleInputs:
     def test_runs_a_custom_validator_on_a_string_parameter(self) -> None:
         @dataclass(frozen=True)
         class NotEmpty(PreRunValidator):
-            def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+            @override
+            def check(
+                self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+            ) -> NodeError | None:
                 if value.strip():
                     return None
                 return NodeError(f"{subject} is blank. Write a prompt.")
@@ -851,7 +854,10 @@ class TestUncheckedInputsMessage:
 class _Records(PreRunValidator):
     seen: ClassVar[list[Any]] = []
 
-    def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+    ) -> NodeError | None:
         _Records.seen.append(value)
         return None
 
