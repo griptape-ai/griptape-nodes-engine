@@ -68,7 +68,6 @@ class ParameterImage(Parameter):
         parent_element_name: str | None = None,
         badge: BadgeData | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ) -> None:
         """Initialize an image parameter with enhanced UI options.
 
@@ -110,7 +109,6 @@ class ParameterImage(Parameter):
             parent_element_name: Name of parent element (e.g. a ParameterGroup) to nest this parameter under
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
             pre_run_validators: Limits the engine checks the value against before the node runs
-            pre_run_noun: What the input is called in a pre-run message, when its type does not say
         """
         # Build ui_options dictionary from the provided UI-specific parameters
         if ui_options is None:
@@ -182,7 +180,6 @@ class ParameterImage(Parameter):
             parent_element_name=parent_element_name,
             badge=badge,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     @property

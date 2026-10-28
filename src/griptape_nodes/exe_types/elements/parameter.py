@@ -126,7 +126,6 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _pre_run_validators: tuple[PreRunValidator, ...]
-    _pre_run_noun: str | None
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
     _on_outgoing_connection_removed: list[Callable[[Parameter, str, str], None]]
     _ui_options: dict
@@ -173,7 +172,6 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         badge: BadgeData
         | None = None,  # Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ):
         if not element_id:
             element_id = str(uuid.uuid4().hex)
@@ -244,7 +242,6 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
             self._pre_run_validators = ()
         else:
             self._pre_run_validators = tuple(pre_run_validators)
-        self._pre_run_noun = pre_run_noun
 
         self._on_incoming_connection_removed = []
         self._on_outgoing_connection_removed = []
@@ -418,14 +415,6 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         `griptape_nodes.exe_types.validators`.
         """
         return self._pre_run_validators
-
-    @property
-    def pre_run_noun(self) -> str | None:
-        """What this parameter's input is called in a pre-run message, such as "prompt", or None.
-
-        None names an image, video or audio parameter's input after its kind, and any other "input".
-        """
-        return self._pre_run_noun
 
     @property
     def has_directly_attached_converters(self) -> bool:

@@ -50,7 +50,6 @@ class ParameterContainer(Parameter, ABC):
         element_id: str | None = None,
         element_type: str | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ):
         super().__init__(
             name=name,
@@ -76,7 +75,6 @@ class ParameterContainer(Parameter, ABC):
             element_id=element_id,
             element_type=element_type,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     def __bool__(self) -> bool:
@@ -137,7 +135,6 @@ class ParameterList(ParameterContainer):
         grid: bool | None = None,
         grid_columns: int | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ):
         if traits:
             self._original_traits = traits
@@ -177,7 +174,6 @@ class ParameterList(ParameterContainer):
             element_id=element_id,
             element_type=element_type,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     @property

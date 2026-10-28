@@ -65,7 +65,6 @@ class ParameterHtml(ParameterXml):
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -101,7 +100,6 @@ class ParameterHtml(ParameterXml):
             parent_container_name=parent_container_name,
             badge=badge,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     def _convert(self, value: Any) -> str:

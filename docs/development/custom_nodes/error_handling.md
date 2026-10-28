@@ -414,9 +414,8 @@ work too, so translate the provider's wording into these names in your limits ta
 
 **Messages name the input.** Each message starts with the parameter's display name and what it
 holds: "The image in 'Start Frame'", "The video in 'Reference Video'", "The audio clip in 'Voice'".
-Pass `pre_run_noun="mask"` to call it something else. On a `ParameterList`, each item is checked on
-its own and named by its position, "Image 2 in 'reference images'", while `MaxCount` checks the
-list's length.
+On a `ParameterList`, each item is checked on its own and named by its position, "Image 2 in
+'reference images'", while `MaxCount` checks the list's length.
 
 **Limits that depend on a setting.** When the limits change with the selected model, wrap them in
 `ByParameter`. At the node's turn it picks the list for the other parameter's current value, or

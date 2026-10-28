@@ -58,7 +58,6 @@ class ParameterDict(Parameter):
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ) -> None:
         """Initialize a dictionary parameter with enhanced UI options.
 
@@ -95,7 +94,6 @@ class ParameterDict(Parameter):
             parent_container_name: Name of parent container
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
             pre_run_validators: Limits the engine checks the value against before the node runs
-            pre_run_noun: What the input is called in a pre-run message, when its type does not say
         """
         # Build ui_options dictionary from the provided UI-specific parameters
         if ui_options is None:
@@ -149,7 +147,6 @@ class ParameterDict(Parameter):
             parent_container_name=parent_container_name,
             badge=badge,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     def _convert_to_dict(self, value: Any) -> dict:

@@ -113,12 +113,6 @@ class TestSingleInputs:
         (message,) = _messages(run_pre_run_validators(node))
         assert message.startswith("The image in 'image_tail' is 200x200")
 
-    def test_uses_a_parameters_own_noun(self, tmp_path: Path) -> None:
-        node = _node_with(ParameterImage(name="mask", pre_run_noun="mask", pre_run_validators=[SideRange(min=300)]))
-        node.set_parameter_value("mask", str(image_file(tmp_path, 200, 200)))
-        (message,) = _messages(run_pre_run_validators(node))
-        assert message.startswith("The mask in 'mask' is 200x200")
-
     def test_names_audio_as_an_audio_clip(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         clip = tmp_path / "clip.mp3"
         clip.write_bytes(b"audio")
@@ -164,9 +158,9 @@ class TestSingleInputs:
                     return None
                 return NodeError(f"{subject} is blank. Write a prompt.")
 
-        node = _node_with(ParameterString(name="prompt", pre_run_noun="prompt", pre_run_validators=[NotEmpty()]))
+        node = _node_with(ParameterString(name="prompt", pre_run_validators=[NotEmpty()]))
         node.set_parameter_value("prompt", "   ")
-        assert _messages(run_pre_run_validators(node)) == ["The prompt in 'prompt' is blank. Write a prompt."]
+        assert _messages(run_pre_run_validators(node)) == ["The input in 'prompt' is blank. Write a prompt."]
 
 
 class TestReadOnce:
@@ -549,9 +543,8 @@ class TestParameterTypes:
     )
     def test_every_parameter_type_keeps_its_pre_run_validators(self, parameter_class: type[Parameter]) -> None:
         validator = _Records()
-        parameter = parameter_class(name="p", pre_run_validators=[validator], pre_run_noun="setting")
+        parameter = parameter_class(name="p", pre_run_validators=[validator])
         assert list(parameter.pre_run_validators) == [validator]
-        assert parameter.pre_run_noun == "setting"
 
     def test_a_3d_parameter_keeps_its_pre_run_validators(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Parameter3D imports its artifact from the standard library, which the engine's tests don't install.
@@ -564,9 +557,8 @@ class TestParameterTypes:
         parameter_3d = importlib.import_module("griptape_nodes.exe_types.param_types.parameter_three_d").Parameter3D
 
         validator = _Records()
-        parameter = parameter_3d(name="model", pre_run_validators=[validator], pre_run_noun="model")
+        parameter = parameter_3d(name="model", pre_run_validators=[validator])
         assert list(parameter.pre_run_validators) == [validator]
-        assert parameter.pre_run_noun == "model"
 
     def test_keeps_on_set_validators_as_they_were(self) -> None:
         def refuse_blank(_parameter: Parameter, value: Any) -> None:
@@ -724,11 +716,9 @@ class TestValuesHeldInAnotherProcess:
 
 
 class TestUncheckedInputsMessage:
-    def test_keeps_a_custom_nouns_capitals_after_the_first_input(self) -> None:
-        assert unchecked_inputs_message(
-            ["The video in 'Video'", "HDR clip 1 in 'Clips'", "LoRA file 2 in 'Files'", "'own.mp4'"]
-        ).startswith(
-            "The video in 'Video', HDR clip 1 in 'Clips', LoRA file 2 in 'Files' and 'own.mp4' weren't checked"
+    def test_keeps_a_file_names_capitals_after_the_first_input(self) -> None:
+        assert unchecked_inputs_message(["The video in 'Video'", "'Own Clip.mp4'"]).startswith(
+            "The video in 'Video' and 'Own Clip.mp4' weren't checked"
         )
 
     def test_one_input(self) -> None:

@@ -114,13 +114,9 @@ def unchecked_inputs_message(inputs: Sequence[str]) -> str:
 def _mid_sentence(subject: str) -> str:
     """A subject as it reads after the first in a list: "The video" and "Audio clip 2" lowercased.
 
-    A first word with capitals after its first letter, such as "HDR" or "LoRA", is a name the node
-    author wrote and stays as it is; so does a quoted file name.
+    A quoted file name starts with its quote, so it stays as it is.
     """
-    first_word = subject.split(" ", 1)[0]
-    if first_word[1:].islower():
-        return subject[:1].lower() + subject[1:]
-    return subject
+    return subject[:1].lower() + subject[1:]
 
 
 def _check_parameter(
@@ -137,7 +133,7 @@ def _check_parameter(
     """
     kind = media_kind_of(parameter)
     shown_name = parameter.display_name or parameter.name
-    noun = _noun(parameter, kind)
+    noun = _noun(kind)
     if not holds_list(parameter):
         value = _value_here(node, parameter.name)
         if value is None:
@@ -213,10 +209,8 @@ def _list_items(node: BaseNode, parameter: Parameter) -> list[Any]:
     return [item for item in value if item is not None]
 
 
-def _noun(parameter: Parameter, kind: MediaKind | None) -> str:
-    """What the parameter's input is called in a message."""
-    if parameter.pre_run_noun is not None:
-        return parameter.pre_run_noun
+def _noun(kind: MediaKind | None) -> str:
+    """What an input is called in a message, by the kind of media its parameter holds."""
     if kind is None:
         return _DEFAULT_NOUN
     return _NOUN_FOR_KIND[kind]
@@ -225,7 +219,7 @@ def _noun(parameter: Parameter, kind: MediaKind | None) -> str:
 def _timed_out_subjects(parameter: Parameter, readings: Sequence[MediaInfo]) -> list[UncheckedInput]:
     """Each of the parameter's inputs whose probe ran out of time, as its location and its subject."""
     shown_name = parameter.display_name or parameter.name
-    noun = _noun(parameter, media_kind_of(parameter))
+    noun = _noun(media_kind_of(parameter))
     subjects: list[UncheckedInput] = []
     for position, reading in enumerate(readings, start=1):
         if not reading.timed_out or reading.location is None:

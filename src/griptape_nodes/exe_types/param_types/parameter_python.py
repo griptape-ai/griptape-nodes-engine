@@ -58,7 +58,6 @@ class ParameterPython(Parameter):
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
         pre_run_validators: Sequence[PreRunValidator] | None = None,
-        pre_run_noun: str | None = None,
     ) -> None:
         if ui_options is None:
             ui_options = {}
@@ -112,7 +111,6 @@ class ParameterPython(Parameter):
             parent_container_name=parent_container_name,
             badge=badge,
             pre_run_validators=pre_run_validators,
-            pre_run_noun=pre_run_noun,
         )
 
     def _convert_to_python(self, value: Any) -> str:
