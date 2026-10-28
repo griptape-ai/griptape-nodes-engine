@@ -337,7 +337,7 @@ anything `validate_before_node_run` returns. The node never starts.
 
 ```python
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
-from griptape_nodes.exe_types.validators.media import (
+from griptape_nodes.exe_types.validators import (
     AllowedFormats,
     AspectRatioRange,
     MaxFileSize,
@@ -381,8 +381,7 @@ class ImageToVideo(SuccessFailureNode):
 A too-small start frame then fails with "The image in 'Start Frame' is 200x300 and each side must be
 at least 300 pixels. Use a larger one." and a "Provider limits" link to `input_limits_url()`.
 
-The validators are in `griptape_nodes.exe_types.validators.media`, and the last two in
-`griptape_nodes.exe_types.validators.common`:
+Import the validators from `griptape_nodes.exe_types.validators`:
 
 | Validator                                  | Checks                                                                               |
 | ------------------------------------------ | ------------------------------------------------------------------------------------ |
@@ -425,7 +424,7 @@ list's length.
 model too.
 
 ```python
-from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
+from griptape_nodes.exe_types.validators import ByParameter, MaxCount
 
 ParameterList(
     name="reference_images",
@@ -456,7 +455,7 @@ from typing import ClassVar
 
 from griptape_nodes.exe_types.input_checks import local_video_probe
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators.base import NodeValidator
+from griptape_nodes.exe_types.validators import NodeValidator
 
 
 class TotalLength(NodeValidator):
