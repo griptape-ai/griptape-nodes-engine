@@ -1208,6 +1208,22 @@ class TestLibraryWorkflowsOpenAsUnsavedCopies:
         assert written.description == "My poster."
         assert written.image == "mine.webp"
 
+    def test_opening_without_a_clean_slate_while_a_workflow_is_open_is_refused(
+        self, project_engine: Engine, tmp_path: Path
+    ) -> None:
+        library = _library_workflow(project_engine, tmp_path / "library")
+        open_id = _open_new_workflow(project_engine, "kept")
+        listed_before = set(_listed(project_engine))
+
+        refused = _run(
+            project_engine, RunWorkflowFromRegistryRequest(workflow_name=library.name, run_with_clean_slate=False)
+        )
+
+        assert isinstance(refused, RunWorkflowFromRegistryResultFailure)
+        assert "run_with_clean_slate" in str(refused.result_details)
+        assert project_engine.context_manager.get_current_workflow_id() == open_id
+        assert set(_listed(project_engine)) == listed_before
+
     def test_closing_an_unsaved_copy_forgets_it(self, project_engine: Engine, tmp_path: Path) -> None:
         library = _library_workflow(project_engine, tmp_path / "library")
         listed_before = set(_listed(project_engine))
