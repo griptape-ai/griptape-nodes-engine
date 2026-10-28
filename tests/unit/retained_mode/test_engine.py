@@ -21,10 +21,10 @@ from griptape_nodes.retained_mode.engine import (
     has_current_engine,
     reset_root_engine,
 )
+from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
 from griptape_nodes.retained_mode.events.secrets_events import SetSecretValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.engine_links import EngineNotFoundError
 
 
 def _engine_scoped_children(path: str, value: object) -> Iterator[tuple[str, EngineScoped]]:
@@ -345,7 +345,7 @@ class _Links:
         self.asked.append((engine_id, request, timeout_s))
         return ResultPayloadFailure(result_details="answered")
 
-    def on_link_lost(self, callback: object) -> None:
+    def on_engine_lost(self, callback: object) -> None:
         self.link_lost = callback
 
 
@@ -363,7 +363,7 @@ class TestRequestingAnotherEngine:
     async def test_a_request_goes_through_the_attached_links(self) -> None:
         engine = Engine()
         links = _Links()
-        engine.attach_engine_links(links)  # type: ignore[arg-type]
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
         request = SetSecretValueRequest(key="k", value="v")
 
         result = await engine.request("gpu-01", request, timeout_s=1.0)
@@ -378,7 +378,7 @@ class TestRequestingAnotherEngine:
         engine = Engine()
         engine.event_manager.initialize_queue()
         links = _Links()
-        engine.attach_engine_links(links)  # type: ignore[arg-type]
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
         settled_on: list[asyncio.AbstractEventLoop] = []
 
         async def record_loop(_engine_id: str) -> None:

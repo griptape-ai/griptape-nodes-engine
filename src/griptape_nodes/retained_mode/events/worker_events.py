@@ -252,7 +252,7 @@ class WithdrawSessionOfferRequest(RequestPayload):
 
     Sent when the artist's engine resets its workers, as when its session ends or it shuts down. The
     other engine forgets every session the sender offered and stops the
-    workers it runs for them, as it does when the link to the sender is lost.
+    workers it runs for them, as it does when the connection to the sender is lost.
     """
 
     broadcast_result: bool = field(default=False, kw_only=True)

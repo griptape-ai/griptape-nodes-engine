@@ -24,8 +24,8 @@ class EngineNotFoundError(Exception):
     """Raised when an engine cannot be reached or stops answering, carrying why, written for an artist."""
 
 
-class EngineLinks(Protocol):
-    """The transport an engine uses to reach other engines, by engine ID."""
+class EngineTransports(Protocol):
+    """The transports an engine uses to reach other engines, by engine ID."""
 
     async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
         """Send `request` to the engine `engine_id` and return its result.
@@ -33,12 +33,12 @@ class EngineLinks(Protocol):
         Args:
             engine_id: The engine to ask.
             request: What to ask it.
-            timeout_s: How long to wait for the result, or None to wait until it arrives or the link
-                to that engine is lost.
+            timeout_s: How long to wait for the result, or None to wait until it arrives or the
+                connection to that engine is lost.
 
         Raises:
             EngineNotFoundError: The engine cannot be found or reached, did not answer within
-                `timeout_s`, or its link was lost while waiting.
+                `timeout_s`, or the connection to it was lost while waiting.
         """
         ...
 
@@ -50,6 +50,6 @@ class EngineLinks(Protocol):
         """
         ...
 
-    def on_link_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
-        """Call `callback` with an engine's ID once its link has been down longer than the heartbeat timeout."""
+    def on_engine_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Call `callback` with an engine's ID once the connection to it has been down longer than the heartbeat timeout."""
         ...

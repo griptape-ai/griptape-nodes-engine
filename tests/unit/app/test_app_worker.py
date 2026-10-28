@@ -24,6 +24,10 @@ import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.retained_mode.engine_transports import (
+    DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+    EngineNotFoundError,
+)
 from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess, RequestSender
@@ -36,10 +40,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.retained_mode.managers.engine_links import (
-    DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
-    EngineNotFoundError,
-)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
@@ -2415,8 +2415,8 @@ _ARTIST_ENGINE = "artist-engine-id"
 _ARTIST_SESSION = "artist-sess"
 
 
-class _FakeEngineLinks:
-    """An in-process `EngineLinks` whose other engine answers like an engine that runs workers.
+class _FakeEngineTransports:
+    """An in-process `EngineTransports` whose other engine answers like an engine that runs workers.
 
     Each request succeeds unless `refuse` names its type, in which case it fails with that reason.
     `answers` queues results to return, per request type, ahead of the default answer, in the wire
@@ -2464,7 +2464,7 @@ class _FakeEngineLinks:
             result["engine_id"] = _HOST_ENGINE
         return _read_back({"result_type": request_type.replace("Request", "ResultSuccess"), "result": result})
 
-    def on_link_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
+    def on_engine_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self.link_lost = callback
 
     def sent_types(self) -> list[str]:
@@ -2493,7 +2493,7 @@ def _assign_libraries(worker_manager: WorkerManager, libraries: dict[str, str]) 
     worker_manager.engine.config_manager.get_config_value.side_effect = get_config_value  # type: ignore[union-attr]
 
 
-def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = None) -> _FakeEngineLinks:
+def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None = None) -> _FakeEngineTransports:
     """Assign `_LIBRARY` to `_HOST_ENGINE` and attach links whose other engine answers, refusing what `refuse` names."""
     _assign_libraries(worker_manager, {_LIBRARY: _HOST_ENGINE})
     engine = worker_manager.engine
@@ -2501,12 +2501,12 @@ def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None
     engine.library_manager.get_library_info_by_library_name.return_value = MagicMock(  # type: ignore[union-attr]
         library_version="1.0.0", lifecycle_state=LibraryLifecycleState.LOADED
     )
-    links = _FakeEngineLinks(refuse=refuse)
-    # As Engine.attach_engine_links does: requests go through the links, and a lost link reaches here.
+    links = _FakeEngineTransports(refuse=refuse)
+    # As Engine.attach_engine_transports does: requests go through the transports, and a lost connection reaches here.
     engine.can_reach_other_engines = True  # type: ignore[misc]
     engine.request = links.request  # type: ignore[method-assign]
     engine.hosted_worker_environment = links.hosted_worker_environment  # type: ignore[method-assign]
-    links.on_link_lost(worker_manager.on_engine_lost)
+    links.on_engine_lost(worker_manager.on_engine_lost)
     return links
 
 
@@ -2516,7 +2516,7 @@ async def _start_on_host_engine(worker_manager: WorkerManager, library_name: str
         await worker_manager._requested_spawns[library_name]
 
 
-def _started_worker_id(links: _FakeEngineLinks) -> str:
+def _started_worker_id(links: _FakeEngineTransports) -> str:
     """The engine ID the last StartWorkerForEngineRequest named."""
     start = cast(
         "worker_events.StartWorkerForEngineRequest", links.sent_of(worker_events.StartWorkerForEngineRequest)[-1]
@@ -2712,7 +2712,7 @@ class TestStartingAWorkerOnAnotherEngine:
         ]
 
     @pytest.mark.asyncio
-    async def test_without_engine_links_the_library_is_unavailable_rather_than_run_here(
+    async def test_without_engine_transports_the_library_is_unavailable_rather_than_run_here(
         self, worker_manager: WorkerManager
     ) -> None:
         """Running it here would run it in the one place it was assigned away from."""

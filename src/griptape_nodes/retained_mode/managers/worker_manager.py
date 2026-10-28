@@ -17,6 +17,10 @@ import anyio
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.engine_transports import (
+    DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+    EngineNotFoundError,
+)
 from griptape_nodes.retained_mode.events import converters, worker_events
 from griptape_nodes.retained_mode.events.app_events import (
     ConfigChanged,
@@ -27,10 +31,6 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
-from griptape_nodes.retained_mode.managers.engine_links import (
-    DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
-    EngineNotFoundError,
-)
 from griptape_nodes.retained_mode.managers.event_manager import require_request_sender
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommand,
@@ -1227,7 +1227,7 @@ class WorkerManager(EngineScoped):
         try:
             result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
-            # That engine may still get the start, such as once a link that was down comes back.
+            # That engine may still get the start, such as once a connection that was down comes back.
             self._schedule_remote_stop(worker_engine_id, host_engine_id)
             logger.error("Not starting a worker for library '%s': %s", library_name, e)
             self.note_worker_unavailable(library_name, str(e))
@@ -1271,7 +1271,7 @@ class WorkerManager(EngineScoped):
         """Tell each engine this one offered its session to that it is done with them, and forget the offers.
 
         Sent without waiting, best effort: an engine that cannot be reached forgets the offer anyway
-        once its link to this one is lost.
+        once its connection to this one is lost.
         """
         host_engine_ids = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
         self._engine_registrations.clear()
@@ -1470,7 +1470,7 @@ class WorkerManager(EngineScoped):
         resolved = self._worker_command(library_name, session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
-        # Read before anything awaits, since a lost link can forget the session meanwhile.
+        # Read before anything awaits, since a lost connection can forget the session meanwhile.
         session = self._sessions[session_id]
         # The worker runs on this machine's license or API key, which it inherits like a local worker.
         environ_overrides: dict[str, str] = {}
@@ -1648,7 +1648,7 @@ class WorkerManager(EngineScoped):
         await self._terminate_via_spawn_loop(hosted.worker_key, proc)
 
     async def on_engine_lost(self, engine_id: str) -> None:
-        """Settle the starts sent to an engine whose link was lost, or forget an artist's engine whose link was.
+        """Settle the starts sent to an engine whose connection was lost, or forget an artist's engine whose connection was.
 
         On the artist's side, a start the other engine accepted but whose worker never registered would
         otherwise wait out the library load timeout. On the other engine's side, that artist's sessions are
@@ -1661,7 +1661,7 @@ class WorkerManager(EngineScoped):
             self.note_worker_unavailable(
                 start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
             )
-        await self._forget_engine(engine_id, why="lost its link")
+        await self._forget_engine(engine_id, why="lost its connection")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
         """Forget the sessions `engine_id` offered this engine, and stop their workers."""
