@@ -498,13 +498,22 @@ class _WorkflowRegistry:
         if not absolute_path.is_file():
             msg = f"File path '{absolute_path}' does not exist."
             raise ValueError(msg)
-
-        keys = self._entry_keys(workflow.workflow_id, absolute_path, [])
-        self._raise_if_taken(workflow, keys, self._by_id.values())
+        self.raise_if_path_taken(workflow, absolute_path)
 
         workflow._absolute_path = absolute_path
         workflow._alias_paths = []
-        workflow._keys = keys
+        workflow._keys = self._entry_keys(workflow.workflow_id, absolute_path, [])
+
+    def raise_if_path_taken(self, workflow: Workflow, new_path: str | Path) -> None:
+        """Refuse `new_path` for `workflow` as `set_file_path` would, without the file having to exist.
+
+        Call it before writing or moving the file, so a refusal leaves the disk untouched.
+
+        Raises:
+            WorkflowPathTakenError: Another entry holds the path, or the name derived from it.
+        """
+        keys = self._entry_keys(workflow.workflow_id, self.canonical_path(new_path), [])
+        self._raise_if_taken(workflow, keys, self._by_id.values())
 
     def remove(self, workflow_id: str) -> Workflow:
         """Remove the entry with this id and return it. A file registered at its path later gets an id of its own.
