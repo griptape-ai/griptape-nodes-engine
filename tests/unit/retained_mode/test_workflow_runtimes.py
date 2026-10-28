@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -207,14 +207,29 @@ class TestObjectsOnTheRuntime:
         assert objects.has("renamed")
         assert not objects.has("canvas")
 
-    def test_popping_the_last_entry_drops_objects_left_in_it(self, engine: Engine) -> None:
+    def test_popping_the_workflow_deletes_its_flows_before_closing_it(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        closed = engine.current_workflow()
 
         engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name="next")
 
+        assert len(closed.objects) == 0
+        assert closed.flows.name_to_parent_name == {}
         assert not engine.object_manager.has_object_with_name("canvas")
+
+    def test_a_teardown_that_fails_leaves_the_workflow_open(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        workflow = engine.current_workflow()
+
+        with (
+            patch.object(engine, "_delete_workflow_flows", side_effect=RuntimeError("delete blew up")),
+            pytest.raises(RuntimeError, match="delete blew up"),
+        ):
+            engine.context_manager.pop_workflow()
+
+        assert engine.open_workflows.all_open() == [workflow]
 
     def test_a_closed_workflows_queued_ui_changes_go_with_it(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")

@@ -17,6 +17,7 @@ class OpenWorkflowSet:
     """The runtimes of the workflows the engine has open, by workflow id.
 
     One workflow is open at a time. Reads never open anything: only `open` adds a runtime.
+    `Engine.open_workflow` and `Engine.close_workflow` are the operations that open and close one.
     """
 
     def __init__(self) -> None:
@@ -41,7 +42,7 @@ class OpenWorkflowSet:
         return workflow
 
     def close(self, workflow: WorkflowRuntime) -> None:
-        """Forget an open workflow. Tearing down its state is the caller's job.
+        """Forget an open workflow. Call `Engine.close_workflow`, which tears its state down first.
 
         Raises:
             OpenWorkflowError: That runtime is not the one open under its id.
