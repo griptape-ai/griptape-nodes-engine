@@ -62,21 +62,22 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowRequest,
     RegisterWorkflowResultSuccess,
     RenameWorkflowRequest,
-    RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
     RunWorkflowFromRegistryRequest,
+    RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromRegistryResultSuccess,
+    RunWorkflowFromScratchRequest,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
-    SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -906,35 +907,56 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         restarted.handle_request(SetCurrentProjectRequest(project_id=None))
 
 
-class TestAWorkflowOpenBeneathTheCurrentOne:
-    """Pushing B while A is open puts B on top. Saves act on B, so A's file and name stay A's."""
+class TestWorkflowsDoNotNest:
+    """Only one workflow is open at a time, so opening another one on top of it is refused."""
 
-    def _open_a_beneath_b(self, engine: Engine) -> tuple[SaveWorkflowResultSuccess, str]:
-        b = _saved_workflow(engine, "b")
-        _open_new_workflow(engine, "a")
-        a = _save(engine)
-        engine.context_manager.push_workflow(b.workflow_name)
-        assert engine.workflow_registry.is_open(a.workflow_id or "")
-        assert engine.context_manager.get_current_workflow_id() != a.workflow_id
-        return a, Path(a.file_path).read_text(encoding="utf-8")
+    def test_pushing_a_workflow_while_one_is_open_is_refused(self, project_engine: Engine) -> None:
+        other = _saved_workflow(project_engine, "other")
+        open_id = _open_new_workflow(project_engine, "open")
 
-    def test_renaming_it_is_refused(self, project_engine: Engine, workspace: Path) -> None:
-        a, a_content = self._open_a_beneath_b(project_engine)
+        with pytest.raises(ContextManager.WorkflowAlreadyOpenError, match="is already open"):
+            project_engine.context_manager.push_workflow(other.workflow_name)
 
-        renamed = _run(project_engine, RenameWorkflowRequest(workflow_name=a.workflow_name, requested_name="a2"))
+        assert project_engine.context_manager.get_current_workflow_id() == open_id
+        assert not project_engine.workflow_registry.is_open(other.workflow_id or "")
 
-        assert isinstance(renamed, RenameWorkflowResultFailure)
-        assert "is open on top of it" in str(renamed.result_details)
-        assert not (workspace / "a2.py").exists()
-        assert Path(a.file_path).read_text(encoding="utf-8") == a_content
-        assert _id_at(project_engine, a.file_path) == a.workflow_id
+    def test_a_run_without_a_clean_slate_while_one_is_open_is_refused(self, project_engine: Engine) -> None:
+        other = _saved_workflow(project_engine, "other")
+        open_id = _open_new_workflow(project_engine, "open")
+        registered_before = set(project_engine.workflow_registry._by_id)
 
-    def test_saving_over_its_file_is_refused_before_writing(self, project_engine: Engine) -> None:
-        a, a_content = self._open_a_beneath_b(project_engine)
+        refused = _run(
+            project_engine,
+            RunWorkflowFromRegistryRequest(workflow_name=other.workflow_name, run_with_clean_slate=False),
+        )
 
-        saved = _run(project_engine, SaveWorkflowRequest(file_name=a.workflow_name, overwrite_existing=True))
+        assert isinstance(refused, RunWorkflowFromRegistryResultFailure)
+        assert "Clear the open workflow first" in str(refused.result_details)
+        assert project_engine.context_manager.get_current_workflow_id() == open_id
+        assert set(project_engine.workflow_registry._by_id) == registered_before
 
-        assert isinstance(saved, SaveWorkflowResultFailure)
-        assert "is open and saved in that file" in str(saved.result_details)
-        assert Path(a.file_path).read_text(encoding="utf-8") == a_content
-        assert _id_at(project_engine, a.file_path) == a.workflow_id
+
+class TestASavedFileOpensTheWorkflowItLoads:
+    """A saved file pushes itself only when no workflow is current (`codegen.py`'s guard)."""
+
+    @pytest.mark.parametrize("load", ["from_registry", "from_scratch"])
+    def test_a_load_bound_to_the_workflow_it_replaces_builds_into_the_one_it_opens(
+        self, project_engine: Engine, load: str
+    ) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        replaced_id = _open_new_workflow(project_engine, "replaced")
+        replaced = project_engine.current_workflow()
+        if load == "from_registry":
+            request: object = RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name)
+        else:
+            request = RunWorkflowFromScratchRequest(file_path=saved.file_path)
+
+        loaded = asyncio.run(project_engine.event_manager.ahandle_request(request, workflow_id=replaced_id))  # type: ignore[arg-type]
+
+        assert loaded.result.succeeded(), loaded.result.result_details
+        opened = project_engine.current_workflow()
+        assert opened is not replaced
+        assert opened.workflow_id == saved.workflow_id
+        assert project_engine.context_manager.has_current_flow()
+        assert len(opened.objects) > 0
+        assert len(replaced.objects) == 0

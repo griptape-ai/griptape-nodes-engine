@@ -233,14 +233,16 @@ class WorkflowRunner(EngineScoped):
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Update current context for workflow. The editor always keeps a workflow in the
-        # Current Context (a blank canvas is itself an "unsaved:" workflow), so replacing an
-        # existing context is the steady state, not an anomaly. When the caller passes
-        # run_with_clean_slate=True, replacement is the explicitly requested behavior, so
-        # only warn when clobbering the context was NOT asked for.
-        context_warning = None
-        if not request.run_with_clean_slate and self.engine.context_manager.has_current_workflow():
-            context_warning = f"Started a new workflow '{request.workflow_name}' but a workflow '{self.engine.context_manager.get_current_workflow_name()}' was already in the Current Context. Replacing the old with the new."
+        # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
+        # Refused before anything is registered or run.
+        context_manager = self.engine.context_manager
+        if not request.run_with_clean_slate and context_manager.has_current_workflow():
+            details = (
+                f"Attempted to run workflow '{request.workflow_name}'. Failed because workflow "
+                f"'{context_manager.get_current_workflow_name()}' is open. Clear the open workflow first, "
+                "or run it with a clean slate (run_with_clean_slate=True)."
+            )
+            return RunWorkflowFromRegistryResultFailure(result_details=details)
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
@@ -258,10 +260,7 @@ class WorkflowRunner(EngineScoped):
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
             if not execution_result.execution_successful:
-                result_messages = []
-                if context_warning:
-                    result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.extend(execution_result_details(execution_result, level=logging.ERROR))
+                result_messages = execution_result_details(execution_result, level=logging.ERROR)
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
@@ -271,10 +270,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
         # Success!
-        result_messages = []
-        if context_warning:
-            result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.extend(execution_result_details(execution_result, level=logging.DEBUG))
+        result_messages = execution_result_details(execution_result, level=logging.DEBUG)
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
             workflow_id=workflow.workflow_id,

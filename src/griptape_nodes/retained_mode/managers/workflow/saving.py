@@ -250,7 +250,7 @@ class WorkflowSaver(EngineScoped):
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:
         return await self.save_open_workflow(request)
 
-    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def save_open_workflow(  # noqa: C901, PLR0912, PLR0915
         self, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
     ) -> ResultPayload:
         """Save the open workflow as `request` describes.
@@ -382,15 +382,6 @@ class WorkflowSaver(EngineScoped):
             keep_open_workflow_identity=keep_open_workflow_identity,
         )
 
-        # The write would replace an open workflow's file, whose entry cannot be removed while open.
-        open_at_destination = self._other_open_workflow_at(destination, current_workflow)
-        if open_at_destination is not None:
-            details = (
-                f"Attempted to save workflow '{relative_file_path}'. Failed because workflow "
-                f"'{open_at_destination.name}' is open and saved in that file. Save under another name."
-            )
-            return SaveWorkflowResultFailure(result_details=details)
-
         save_file_result = self._save_workflow_file_inline(
             destination=destination,
             serialized_flow_commands=commands,
@@ -460,22 +451,6 @@ class WorkflowSaver(EngineScoped):
         if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
             return False
         return self._destination_is_file_of(destination, current_workflow)
-
-    def _other_open_workflow_at(
-        self, destination: ProjectFileDestination, current_workflow: Workflow | None
-    ) -> Workflow | None:
-        """The open workflow, other than `current_workflow`, whose file a write to `destination` replaces."""
-        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
-            return None
-        try:
-            resolved_path = destination.resolve()
-        except FileLoadError:
-            return None
-        registry = self.engine.workflow_registry
-        workflow = registry.find_by_path(resolved_path)
-        if workflow is None or workflow is current_workflow or not registry.is_open(workflow.workflow_id):
-            return None
-        return workflow
 
     def _destination_is_file_of(self, destination: ProjectFileDestination, workflow: Workflow) -> bool:
         """Whether a write to `destination` lands on `workflow`'s own file.
