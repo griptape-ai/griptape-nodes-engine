@@ -50,7 +50,7 @@ from griptape_nodes.exe_types.pre_run_validation import (
     validate_inputs,
     validate_node,
 )
-from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
+from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator, reads
 from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -158,7 +158,14 @@ class TestSingleInputs:
         class NotEmpty(PreRunValidator):
             @override
             def check(
-                self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+                self,
+                value: Any,
+                *,
+                subject: str,
+                docs_url: str | None,
+                media: MediaInfo = EMPTY_MEDIA,
+                node: BaseNode | None = None,
+                position: int | None = None,
             ) -> NodeError | None:
                 if value.strip():
                     return None
@@ -422,6 +429,149 @@ class TestDependsOn:
 
     def test_survives_a_parameter_copy(self) -> None:
         parameter = ParameterImage(name="image", pre_run_validators=[DependsOn("model", {"pro": [SideRange(min=1)]})])
+        assert parameter.copy().pre_run_validators == parameter.pre_run_validators
+
+
+def _model_is(name: str) -> Any:
+    return lambda node, _media: node.get_parameter_value("model") == name
+
+
+@reads(MediaNeed.IMAGE)
+def _no_image_read(_node: BaseNode, media: MediaInfo) -> bool:
+    return media.image is None
+
+
+class TestConditions:
+    """`when`, `unless` and `first` narrow where a validator applies."""
+
+    @staticmethod
+    def _image_node(*validators: PreRunValidator, model: str = "pro") -> MockNode:
+        node = _node_with(
+            ParameterString(name="model", default_value=model),
+            ParameterImage(name="image", pre_run_validators=validators),
+        )
+        node.set_parameter_value("model", model)
+        return node
+
+    @pytest.mark.parametrize(("model", "expected"), [("pro", 1), ("lite", 0)])
+    def test_when_applies_only_while_the_condition_holds_for_the_node(
+        self, tmp_path: Path, model: str, expected: int
+    ) -> None:
+        node = self._image_node(SideRange(min=300).when(_model_is("pro")), model=model)
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert len(validate_inputs(node)) == expected
+
+    @pytest.mark.parametrize(("model", "expected"), [("pro", 0), ("lite", 1)])
+    def test_unless_applies_only_while_the_condition_does_not_hold(
+        self, tmp_path: Path, model: str, expected: int
+    ) -> None:
+        node = self._image_node(SideRange(min=300).unless(_model_is("pro")), model=model)
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert len(validate_inputs(node)) == expected
+
+    def test_a_condition_sees_what_was_read(self, tmp_path: Path) -> None:
+        node = self._image_node(MaxFileSize(1).unless(_no_image_read))
+        node.set_parameter_value("image", str(image_file(tmp_path, 20, 20)))
+        assert len(validate_inputs(node)) == 1
+        unreadable = tmp_path / "not-an-image.png"
+        unreadable.write_bytes(b"not an image")
+        node.set_parameter_value("image", str(unreadable))
+        assert validate_inputs(node) == []
+
+    def test_reads_what_a_condition_declares_along_with_the_validators_needs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads_seen: list[str] = []
+
+        def counting(location: str) -> ImageInfo:
+            reads_seen.append(location)
+            return ImageInfo(10, 10, "image/png")
+
+        monkeypatch.setattr(input_checks, "_read_image_info", counting)
+        wrapped = MaxFileSize(1).when(_no_image_read)
+        assert wrapped.needs == {MediaNeed.SIZE, MediaNeed.IMAGE}
+        node = self._image_node(wrapped)
+        image = str(image_file(tmp_path, 10, 10))
+        node.set_parameter_value("image", image)
+        with input_check_readings():
+            # The image was read for the condition, which then held false, so the size limit was skipped.
+            assert validate_inputs(node) == []
+        assert reads_seen == [image]
+
+    def test_a_condition_without_declared_needs_reads_only_the_validators(self) -> None:
+        assert SideRange(min=1).when(_model_is("pro")).needs == SideRange.needs
+
+    def test_wraps_each_pick_of_a_depends_on(self, tmp_path: Path) -> None:
+        by_model = DependsOn("model", {"pro": [SideRange(min=300)]}, default=[SideRange(min=1000)])
+        node = self._image_node(by_model.unless(_no_image_read), model="pro")
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert _messages(validate_inputs(node)) == [
+            "The image in 'image' is 200x200 and each side must be at least 300 pixels. Use a larger one."
+        ]
+
+    def test_a_depends_on_can_hold_a_conditional_validator(self, tmp_path: Path) -> None:
+        strict = lambda node, _media: node.get_parameter_value("strict") is True  # noqa: E731
+        node = self._image_node(DependsOn("model", {"pro": [SideRange(min=300).when(strict)]}), model="pro")
+        node.add_parameter(ParameterBool(name="strict", default_value=False))
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert validate_inputs(node) == []
+        node.set_parameter_value("strict", True)
+        assert len(validate_inputs(node)) == 1
+
+    def test_first_checks_only_the_first_items_of_a_list(self, tmp_path: Path) -> None:
+        node = TestLists._list_node(SideRange(min=300).first(2), MaxCount(3, noun="images").first(1))
+        images = [str(image_file(tmp_path, 200 + i, 200)) for i in range(4)]
+        node.set_parameter_value("reference_images", images)
+        # A whole-list validator has no position, so `first` doesn't narrow it.
+        assert [message.split(" is ")[0].split(" are ")[0] for message in _messages(validate_inputs(node))] == [
+            "4 images",
+            "Image 1 in 'reference images'",
+            "Image 2 in 'reference images'",
+        ]
+
+    def test_first_applies_to_a_single_input(self, tmp_path: Path) -> None:
+        node = self._image_node(SideRange(min=300).first(1))
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert len(validate_inputs(node)) == 1
+
+    def test_first_refuses_a_count_below_one(self) -> None:
+        with pytest.raises(ValueError, match="first 0 items"):
+            SideRange(min=1).first(0)
+
+    @pytest.mark.parametrize(
+        ("build", "match"),
+        [
+            (lambda: ParameterImage(name="p", pre_run_validators=[Duration(max=1).when(_model_is("x"))]), "Duration"),
+            (
+                lambda: ParameterImage(
+                    name="p", pre_run_validators=[DependsOn("m", {"x": [AudioCodecs("mp3")]}).first(1)]
+                ),
+                "AudioCodecs",
+            ),
+            (lambda: ParameterImage(name="p", pre_run_validators=[MaxCount(2).unless(_model_is("x"))]), "a list"),
+            (
+                lambda: ParameterVideo(name="p", pre_run_validators=[MaxFileSize(1).when(_no_image_read)]),
+                "checks image, and the parameter holds video",
+            ),
+            (
+                lambda: Parameter(
+                    name="p", type="list[ImageUrlArtifact]", pre_run_validators=[MaxCount(2).when(_no_image_read)]
+                ),
+                "checks the whole list and reads media",
+            ),
+        ],
+        ids=["conditional", "first-of-depends-on", "whole-list-on-single", "condition-reads", "whole-list-reads"],
+    )
+    def test_the_build_time_fit_check_sees_through_wrappers(self, build: Any, match: str) -> None:
+        with pytest.raises(TypeError, match=match):
+            build()
+
+    def test_a_conditional_validator_needs_the_node(self) -> None:
+        with pytest.raises(ValueError, match="conditional SideRange"):
+            SideRange(min=1).when(_model_is("x")).check(None, subject="s", docs_url=None)
+
+    def test_survives_a_parameter_copy(self) -> None:
+        parameter = ParameterImage(name="image", pre_run_validators=[SideRange(min=1).when(_no_image_read).first(2)])
         assert parameter.copy().pre_run_validators == parameter.pre_run_validators
 
 
@@ -814,7 +964,14 @@ class _Records(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         _Records.seen.append(value)
         return None

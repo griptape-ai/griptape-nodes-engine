@@ -33,7 +33,14 @@ class MaxCount(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
 
@@ -78,7 +85,14 @@ class DependsOn(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         # The engine runs the validators `selected` picks; this one has nothing of its own to check.
         return None

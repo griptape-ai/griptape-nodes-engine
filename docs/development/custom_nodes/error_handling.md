@@ -442,6 +442,35 @@ ParameterList(
 )
 ```
 
+**Limits that apply only sometimes.** `.when(condition)` and `.unless(condition)` wrap any validator,
+`DependsOn` included, so it applies only to a value the condition holds, or doesn't hold, for. A
+condition is a function given the node and the value's `MediaInfo`, returning True or False. One
+that looks at the file marks what it reads with `@reads(...)`, so the engine reads that along with
+the validator's own readings; without it, the condition sees only what the validator asked for. On
+a list, `.first(n)` checks only the first `n` items, for a provider that reads only that many.
+
+```python
+from griptape_nodes.exe_types.validators import MaxFileSize, MediaNeed, SideRange, reads
+
+
+@reads(MediaNeed.IMAGE)
+def is_png(node, media) -> bool:
+    return media.mime_type == "image/png"
+
+
+def upscaling(node, media) -> bool:
+    return node.get_parameter_value("upscale") is True
+
+
+ParameterImage(
+    name="image",
+    pre_run_validators=[
+        MaxFileSize(5 * MB).when(is_png),
+        SideRange(min=512).unless(upscaling),
+    ],
+)
+```
+
 **Rules across several inputs.** For a limit that involves more than one input, such as a total
 length across several clips, check it in the node's `validate_before_node_run`. The engine runs it
 right after the declared validators, in the same pass, so a reader from

@@ -170,19 +170,21 @@ def _check_parameter(
             return []
         info = _read(value, validators, kind)
         subject = input_subject(shown_name, noun=noun)
-        errors.extend(_collect(validators, value, subject=subject, media=info, docs_url=docs_url))
+        errors.extend(_collect(validators, value, node=node, subject=subject, media=info, docs_url=docs_url))
         return [info]
 
     items = _list_items(node, parameter)
     whole_list = [validator for validator in validators if validator.checks_whole_list]
     per_item = [validator for validator in validators if not validator.checks_whole_list]
-    errors.extend(_collect(whole_list, items, subject=shown_name, media=EMPTY_MEDIA, docs_url=docs_url))
+    errors.extend(_collect(whole_list, items, node=node, subject=shown_name, media=EMPTY_MEDIA, docs_url=docs_url))
     readings: list[MediaInfo] = []
     for position, item in enumerate(items, start=1):
         info = _read(item, per_item, kind)
         readings.append(info)
         subject = input_subject(shown_name, noun=noun, position=position)
-        errors.extend(_collect(per_item, item, subject=subject, media=info, docs_url=docs_url))
+        errors.extend(
+            _collect(per_item, item, node=node, subject=subject, media=info, docs_url=docs_url, position=position)
+        )
     return readings
 
 
@@ -202,13 +204,20 @@ def _read(value: Any, validators: Sequence[PreRunValidator], kind: MediaKind | N
     return read_media(value, needs, kind=kind)
 
 
-def _collect(
-    validators: Sequence[PreRunValidator], value: Any, *, subject: str, media: MediaInfo, docs_url: str | None
+def _collect(  # noqa: PLR0913
+    validators: Sequence[PreRunValidator],
+    value: Any,
+    *,
+    node: BaseNode,
+    subject: str,
+    media: MediaInfo,
+    docs_url: str | None,
+    position: int | None = None,
 ) -> list[NodeError]:
     """Each error these validators report for one value."""
     errors: list[NodeError] = []
     for validator in validators:
-        error = validator.check(value, subject=subject, docs_url=docs_url, media=media)
+        error = validator.check(value, subject=subject, docs_url=docs_url, media=media, node=node, position=position)
         if error is not None:
             errors.append(error)
     return errors

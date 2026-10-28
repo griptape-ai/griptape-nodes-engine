@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.input_checks import ImageInfo
     from griptape_nodes.exe_types.node_error import NodeError
+    from griptape_nodes.exe_types.node_types import BaseNode
 
 __all__ = [
     "AllowedFormats",
@@ -93,7 +94,14 @@ class MaxFileSize(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return check_size(
             media.size_bytes,
@@ -127,7 +135,14 @@ class AllowedFormats(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         if media.audio is not None:
             return check_mime_type(
@@ -150,7 +165,14 @@ class SideRange(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return check_dimensions(media.frame, subject=subject, min_side=self.min, max_side=self.max, docs_url=docs_url)
 
@@ -166,7 +188,14 @@ class PixelArea(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return check_dimensions(
             media.frame,
@@ -198,7 +227,14 @@ class AspectRatioRange(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return _easier_shape(
             media,
@@ -231,7 +267,14 @@ class ExactAspectRatios(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         return _easier_shape(
             media,
@@ -261,7 +304,14 @@ class Duration(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         probe = media.video
         too_long_fix = self.fix
@@ -298,7 +348,14 @@ class FrameRate(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -335,7 +392,14 @@ class FrameCount(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -370,7 +434,14 @@ class VideoCodecs(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -399,7 +470,14 @@ class AudioCodecs(PreRunValidator):
 
     @override
     def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA
+        self,
+        value: Any,
+        *,
+        subject: str,
+        docs_url: str | None,
+        media: MediaInfo = EMPTY_MEDIA,
+        node: BaseNode | None = None,
+        position: int | None = None,
     ) -> NodeError | None:
         if media.audio is None:
             return None
