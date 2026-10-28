@@ -87,6 +87,10 @@ def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
             "commit.gpgsign=false",
             "-c",
             "tag.gpgsign=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
             *args,
         ],
         cwd=cwd,
@@ -96,24 +100,115 @@ def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+class RepoTemplates:
+    """Builds each repository shape once per session and copies it for every test.
+
+    Tests mutate their repositories, so a test only ever receives its own copy. Shapes that
+    reference each other are built so the copy needs no URL rewriting, or only one git call:
+    a clone's origin URL is the relative path "../origin", and submodule URLs are relative
+    to the superproject.
+    """
+
+    def __init__(self) -> None:
+        self._root: Path | None = None
+        self._origins: dict[str, Path] = {}
+        self._origin_with_clone: Path | None = None
+        self._origin_with_submodule: Path | None = None
+
+    def start(self, root: Path) -> None:
+        self._root = root
+        self._origins = {}
+        self._origin_with_clone = None
+        self._origin_with_submodule = None
+
+    def copy_origin(self, origin_path: Path, library_version: str) -> None:
+        origin_path.parent.mkdir(parents=True, exist_ok=True)
+        if library_version not in self._origins:
+            self._origins[library_version] = self._build_origin(self._new_dir(), library_version)
+        shutil.copytree(self._origins[library_version] / "origin", origin_path, symlinks=True)
+
+    def copy_clone_of_origin(self, clone_path: Path) -> None:
+        if self._origin_with_clone is None:
+            self._origin_with_clone = self._build_origin_with_clone(self._new_dir())
+        shutil.copytree(self._origin_with_clone / "clone", clone_path, symlinks=True)
+
+    def copy_origin_with_submodule(self, parent: Path) -> None:
+        if self._origin_with_submodule is None:
+            self._origin_with_submodule = self._build_origin_with_submodule(self._new_dir())
+        shutil.copytree(self._origin_with_submodule, parent, symlinks=True, dirs_exist_ok=True)
+        run_git(parent / "origin", "submodule", "sync")
+
+    def _new_dir(self) -> Path:
+        if self._root is None:
+            msg = "RepoTemplates.start() must run before any template is requested."
+            raise RuntimeError(msg)
+        return Path(tempfile.mkdtemp(dir=self._root))
+
+    def _build_origin(self, parent: Path, library_version: str) -> Path:
+        origin_path = parent / "origin"
+        origin_path.mkdir()
+        run_git(origin_path, "init", "-b", "main")
+        library_json = origin_path / "griptape_nodes_library.json"
+        library_json.write_text(json.dumps({"metadata": {"library_version": library_version}}), encoding="utf-8")
+        run_git(origin_path, "add", ".")
+        run_git(origin_path, "commit", "-m", "initial commit")
+        return parent
+
+    def _build_origin_with_clone(self, parent: Path) -> Path:
+        self._build_origin(parent, "1.2.3")
+        run_git(parent, "clone", str(parent / "origin"), str(parent / "clone"))
+        run_git(parent / "clone", "remote", "set-url", "origin", "../origin")
+        return parent
+
+    def _build_origin_with_submodule(self, parent: Path) -> Path:
+        upstream = parent / "upstream"
+        upstream.mkdir()
+        run_git(upstream, "init", "-b", "main")
+        (upstream / "code.py").write_text("v1", encoding="utf-8")
+        run_git(upstream, "add", ".")
+        run_git(upstream, "commit", "-m", "write code.py")
+        self._build_origin(parent, "1.2.3")
+        run_git(parent / "origin", "submodule", "add", "../upstream", "vendor/upstream")
+        run_git(parent / "origin", "commit", "-m", "add submodule")
+        return parent
+
+
+REPO_TEMPLATES = RepoTemplates()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def repo_templates_root(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Give REPO_TEMPLATES a session-lifetime directory to build its templates in."""
+    REPO_TEMPLATES.start(tmp_path_factory.mktemp("git_repo_templates"))
+
+
 def make_origin_repo(origin_path: Path, *, library_version: str = "1.2.3") -> Path:
     """Create a git repository at origin_path with a committed griptape_nodes_library.json.
 
-    Pins the initial branch to "main" instead of relying on the local machine's
-    init.defaultBranch configuration.
+    The repository is a copy of a session template whose initial branch is pinned to "main"
+    instead of relying on the local machine's init.defaultBranch configuration.
     """
-    origin_path.mkdir(parents=True, exist_ok=True)
-    run_git(origin_path, "init", "-b", "main")
-    library_json = origin_path / "griptape_nodes_library.json"
-    library_json.write_text(json.dumps({"metadata": {"library_version": library_version}}), encoding="utf-8")
-    run_git(origin_path, "add", ".")
-    run_git(origin_path, "commit", "-m", "initial commit")
+    REPO_TEMPLATES.copy_origin(origin_path, library_version)
     return origin_path
 
 
 def clone_repo(origin_path: Path, clone_path: Path) -> Path:
     """Clone origin_path into clone_path with the git CLI directly, bypassing the code under test."""
     run_git(clone_path.parent, "clone", str(origin_path), str(clone_path))
+    return clone_path
+
+
+def clone_repo_of_unmodified_origin(origin_path: Path, clone_path: Path) -> Path:
+    """Give clone_path the state clone_repo would, for a default origin_path from make_origin_repo.
+
+    Copies a session template instead of cloning. The copy's origin remote is the relative path
+    "../origin", so it must sit next to an origin_path named "origin". Use clone_repo when the
+    origin has gained refs or commits since make_origin_repo.
+    """
+    if origin_path.name != "origin" or clone_path.parent != origin_path.parent:
+        msg = f"Expected {clone_path} next to an origin named 'origin', got origin {origin_path}."
+        raise ValueError(msg)
+    REPO_TEMPLATES.copy_clone_of_origin(clone_path)
     return clone_path
 
 
@@ -1008,7 +1103,7 @@ class TestGitUpdateFromRemote:
     def test_git_update_from_remote_raises_error_when_head_detached(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when HEAD is detached."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "checkout", "--detach", head_sha(clone))
 
         with pytest.raises(GitPullError, match="detached HEAD"):
@@ -1017,7 +1112,7 @@ class TestGitUpdateFromRemote:
     def test_git_update_from_remote_raises_error_when_no_upstream_branch(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when no upstream branch is set."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "checkout", "-b", "untracked")
 
         with pytest.raises(GitPullError, match="No upstream branch"):
@@ -1026,7 +1121,7 @@ class TestGitUpdateFromRemote:
     def test_git_update_from_remote_raises_error_when_no_origin_remote(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when no origin remote exists."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         # Renaming keeps the branch's upstream tracking resolvable while origin disappears,
         # isolating the "no origin remote" check from the "no upstream" check.
         run_git(clone, "remote", "rename", "origin", "other")
@@ -1039,7 +1134,7 @@ class TestGitUpdateFromRemote:
     ) -> None:
         """Test that GitPullError is raised when uncommitted changes exist and overwrite_existing is False."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
 
         with pytest.raises(GitPullError, match="uncommitted changes"):
@@ -1050,7 +1145,7 @@ class TestGitUpdateFromRemote:
     ) -> None:
         """Test that uncommitted changes are discarded when overwrite_existing is True."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
 
         git_update_from_remote(clone, overwrite_existing=True)
@@ -1060,7 +1155,7 @@ class TestGitUpdateFromRemote:
     def test_git_update_from_remote_resets_to_upstream_tip_after_origin_moves_forward(self, temp_dir: Path) -> None:
         """Test that the local branch is reset to match the remote after origin advances."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         (origin / "extra.txt").write_text("extra", encoding="utf-8")
         run_git(origin, "add", ".")
         run_git(origin, "commit", "-m", "advance origin")
@@ -1098,7 +1193,7 @@ class TestUpdateToMovingTag:
     def test_update_to_moving_tag_raises_error_when_tag_not_found_on_remote(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when the tag does not exist on the remote."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitPullError, match="not found"):
             update_to_moving_tag(clone, "latest")
@@ -1166,7 +1261,7 @@ class TestUpdateLibraryGit:
     def test_update_library_git_dispatches_to_branch_update_when_on_branch(self, temp_dir: Path) -> None:
         """Test that update_library_git resets to the remote tip for a branch-based checkout."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         (origin / "extra.txt").write_text("extra", encoding="utf-8")
         run_git(origin, "add", ".")
         run_git(origin, "commit", "-m", "advance origin")
@@ -1282,7 +1377,7 @@ class TestUpdateLibraryGit:
     def test_update_library_git_raises_error_when_detached_head_without_known_tag(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised for a detached HEAD that isn't on a known tag."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "checkout", "--detach", head_sha(clone))
 
         with pytest.raises(GitPullError, match="not on a known tag"):
@@ -1306,7 +1401,7 @@ class TestSwitchBranch:
     def test_switch_branch_raises_error_when_no_origin_remote(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised when no origin remote exists."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "remote", "rename", "origin", "other")
 
         with pytest.raises(GitRefError, match="No origin remote"):
@@ -1315,7 +1410,7 @@ class TestSwitchBranch:
     def test_switch_branch_checks_out_existing_local_branch(self, temp_dir: Path) -> None:
         """Test that an existing local branch is checked out."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "branch", "feature")
 
         switch_branch(clone, "feature")
@@ -1325,7 +1420,7 @@ class TestSwitchBranch:
     def test_switch_branch_creates_tracking_branch_from_remote_when_only_remote_has_it(self, temp_dir: Path) -> None:
         """Test that a tracking branch is created from the remote when only origin has it."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(origin, "branch", "feature")
 
         switch_branch(clone, "feature")
@@ -1335,7 +1430,7 @@ class TestSwitchBranch:
     def test_switch_branch_raises_error_when_branch_not_found(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised when the branch doesn't exist locally or remotely."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitRefError, match="not found"):
             switch_branch(clone, "nonexistent")
@@ -1421,7 +1516,7 @@ class TestSwitchBranchOrTag:
     def test_switch_branch_or_tag_checks_out_remote_only_branch(self, temp_dir: Path) -> None:
         """Test that a branch only present on the remote is checked out as a tracking branch."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(origin, "branch", "feature")
 
         switch_branch_or_tag(clone, "feature")
@@ -1431,7 +1526,7 @@ class TestSwitchBranchOrTag:
     def test_switch_branch_or_tag_checks_out_local_branch(self, temp_dir: Path) -> None:
         """Test that a local-only branch is checked out."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         run_git(clone, "branch", "localonly")
 
         switch_branch_or_tag(clone, "localonly")
@@ -1441,7 +1536,7 @@ class TestSwitchBranchOrTag:
     def test_switch_branch_or_tag_raises_error_for_unknown_ref(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised when the ref doesn't exist anywhere."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitRefError, match="not found"):
             switch_branch_or_tag(clone, "nonexistent")
@@ -1533,14 +1628,8 @@ class TestSubmodules:
         return head_sha(repo)
 
     def make_origin_with_submodule(self, temp_dir: Path) -> Path:
-        upstream = temp_dir / "upstream"
-        upstream.mkdir()
-        run_git(upstream, "init", "-b", "main")
-        self.commit_file(upstream, "code.py", "v1")
-        origin = make_origin_repo(temp_dir / "origin")
-        run_git(origin, "submodule", "add", str(upstream), "vendor/upstream")
-        run_git(origin, "commit", "-m", "add submodule")
-        return origin
+        REPO_TEMPLATES.copy_origin_with_submodule(temp_dir)
+        return temp_dir / "origin"
 
     def bump_submodule(self, origin: Path, upstream: Path) -> str:
         sha = self.commit_file(upstream, "code.py", "v2")
@@ -1892,7 +1981,7 @@ class TestOptionLikeArguments:
     def test_switch_branch_rejects_option_like_branch(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised for a branch name that git would parse as an option."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitRefError, match="must not start with"):
             switch_branch(clone, "--track")
@@ -1900,7 +1989,7 @@ class TestOptionLikeArguments:
     def test_switch_branch_or_tag_rejects_option_like_ref(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised for a ref name that git would parse as an option."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitRefError, match="must not start with"):
             switch_branch_or_tag(clone, "--detach")
@@ -1908,7 +1997,7 @@ class TestOptionLikeArguments:
     def test_update_to_moving_tag_rejects_option_like_tag(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised for a tag name that git would parse as an option."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with pytest.raises(GitPullError, match="must not start with"):
             update_to_moving_tag(clone, "--force")
@@ -2033,7 +2122,7 @@ class TestVanishedRepository:
     def test_mutator_names_the_missing_folder_rather_than_blaming_git(self, temp_dir: Path) -> None:
         """Test that a mutator reports the deleted folder, not a missing git installation."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
         # Pass is_git_repository's filesystem check, then delete the directory so the git call
         # itself is the thing that finds it gone.
         with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
@@ -2060,7 +2149,7 @@ class TestVanishedRepository:
     def test_accessor_reports_no_answer_rather_than_raising(self, temp_dir: Path) -> None:
         """Test that a query accessor treats a deleted folder as "no answer", as it does a detached HEAD."""
         origin = make_origin_repo(temp_dir / "origin")
-        clone = clone_repo(origin, temp_dir / "clone")
+        clone = clone_repo_of_unmodified_origin(origin, temp_dir / "clone")
 
         with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
             remove_repo(clone)
