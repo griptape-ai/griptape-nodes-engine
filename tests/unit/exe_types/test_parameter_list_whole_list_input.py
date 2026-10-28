@@ -157,6 +157,36 @@ class TestWholeListInput:
         assert node.parameter_values["refs"] == ["a", "b"]
 
     @pytest.mark.usefixtures("connected")
+    def test_before_value_set_on_a_connected_list_only_sees_what_the_connection_delivers(self, node: MockNode) -> None:
+        """Its return is stored as the connected value, so it never gets the rows' items, and a row change skips it."""
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+        before: list[Any] = []
+
+        def record_before(parameter: Any, value: Any) -> Any:
+            if parameter is refs:
+                before.append(value)
+            return value
+
+        with patch.object(MockNode, "before_value_set", side_effect=record_before):
+            node.set_parameter_value("refs", ["a", "b"])
+            node.set_parameter_value(row.name, "edited")
+            refs.remove_child(row)
+
+        assert before == [["a", "b"]]
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_read_with_rows_leaves_a_list_read_from_its_rows_alone(self, node: MockNode) -> None:
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        row = refs.add_child_parameter()
+        node.set_parameter_value(row.name, "manual")
+
+        assert node._list_rows.read_with_rows(refs, ["manual"]) == ["manual"]
+
+    @pytest.mark.usefixtures("connected")
     def test_saving_a_connected_list_keeps_only_the_connected_items(self, node: MockNode) -> None:
         """Its rows are saved on their own, so saving them in the list too would duplicate them on load."""
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest

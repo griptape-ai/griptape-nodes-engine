@@ -744,7 +744,9 @@ class BaseNode(ABC):
 
         Args:
             parameter: the Parameter on this node that is about to be changed
-            value: the value intended to be set (this has already gone through any converters and validators on the Parameter)
+            value: the value intended to be set (this has already gone through any converters and validators on the Parameter).
+                For a ParameterList fed by a connection to the list itself, this is only what the connection
+                delivered, and the list's own items are not included. It isn't called when one of those items changes.
 
         Returns:
             The final value to set for the Parameter. This gives the Node logic one last opportunity to mutate the value
@@ -779,7 +781,9 @@ class BaseNode(ABC):
 
         Args:
             parameter: the Parameter on this node that was just changed
-            value: the value that was set (already converted, validated, and possibly mutated by the node code)
+            value: the value that was set (already converted, validated, and possibly mutated by the node code).
+                For a ParameterList fed by a connection to the list itself, this is the list the node reads:
+                what the connection delivered, then the list's own items.
 
         Returns:
             Nothing
@@ -1945,7 +1949,7 @@ class BaseNode(ABC):
 
         Warns when the result overruns `max_items`, since the extra items may otherwise go unnoticed.
         """
-        items = [*self.parameter_values[parameter_list.name], *handle_container_parameter(self, parameter_list)]
+        items = self._list_rows.connected_then_rows(parameter_list, self.parameter_values[parameter_list.name])
         max_items = parameter_list.max_items
         if max_items is not None and len(items) > max_items:
             logger.warning(
