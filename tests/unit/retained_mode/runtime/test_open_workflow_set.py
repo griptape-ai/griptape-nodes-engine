@@ -1,4 +1,4 @@
-"""The open workflows: the single-open rule, and opening and closing with the context stack."""
+"""The open workflows: the single-open rule, and opening and closing with the Workflow context."""
 
 from __future__ import annotations
 
@@ -75,8 +75,8 @@ class TestOpenWorkflowSet:
         assert workflows.all_open() == []
 
 
-class TestOpenWorkflowsFollowTheContextStack:
-    """A workflow is open exactly while the context stack holds it at the bottom."""
+class TestOpenWorkflowsFollowTheContext:
+    """A workflow is open exactly while it is the Workflow context."""
 
     def test_a_push_onto_an_empty_stack_opens_the_pushed_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -84,21 +84,9 @@ class TestOpenWorkflowsFollowTheContextStack:
         [workflow] = engine.open_workflows.all_open()
         assert workflow.workflow_id == engine.context_manager.get_current_workflow_id()
 
-    def test_a_nested_push_and_pop_keep_the_outer_workflow_open(self, engine: Engine) -> None:
+    def test_popping_the_workflow_closes_it(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
-        [outer] = engine.open_workflows.all_open()
 
-        engine.context_manager.push_workflow(workflow_name="inner")
-        assert engine.open_workflows.all_open() == [outer]
-
-        engine.context_manager.pop_workflow()
-        assert engine.open_workflows.all_open() == [outer]
-
-    def test_popping_the_last_entry_closes_the_workflow(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="outer")
-        engine.context_manager.push_workflow(workflow_name="inner")
-
-        engine.context_manager.pop_workflow()
         engine.context_manager.pop_workflow()
 
         assert engine.open_workflows.all_open() == []
@@ -120,15 +108,3 @@ class TestOpenWorkflowsFollowTheContextStack:
 
         assert engine.open_workflows.all_open() == [workflow]
         assert workflow.workflow_id == copy.workflow_id
-
-    def test_moving_a_nested_workflow_leaves_the_open_one_alone(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="outer")
-        [outer] = engine.open_workflows.all_open()
-        outer_id = outer.workflow_id
-        engine.context_manager.push_workflow(workflow_name="inner")
-        copy = engine.workflow_registry.register_unsaved("copy")
-
-        engine.context_manager.move_current_workflow_onto(copy.workflow_id)
-
-        assert engine.open_workflows.all_open() == [outer]
-        assert outer.workflow_id == outer_id

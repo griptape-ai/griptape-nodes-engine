@@ -246,16 +246,12 @@ class Engine:
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
-        # Ahead of the registry, which asks it whether a workflow is open.
-        self._context_manager = ContextManager(self._event_manager, engine=self)
-        self._workflow_registry = _WorkflowRegistry(
-            self._config_manager,
-            is_workflow_open=self._holds_workflow,
-        )
+        self._workflow_registry = _WorkflowRegistry(self._config_manager, is_workflow_open=self._holds_workflow)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
+        self._context_manager = ContextManager(self._event_manager, engine=self)
         self._worker_manager = WorkerManager(engine=self, event_manager=self._event_manager)
         self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager, engine=self)
         self._model_manager = ModelManager(self._event_manager, engine=self)
@@ -596,6 +592,16 @@ class Engine:
         finally:
             bound_workflow.reset(token)
 
+    def unbind_closed_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Stop the current work acting on `workflow`, which it just closed, so it acts on the next one it opens.
+
+        A load is bound to the workflow it closes before it opens the one it loads. Only the current
+        context is unbound: tasks spawned earlier keep their binding, so a run that wakes after the
+        close never reaches the next workflow.
+        """
+        if bound_workflow.get() is workflow:
+            bound_workflow.set(None)
+
     @contextmanager
     def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
         """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
@@ -791,11 +797,11 @@ class Engine:
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
 
     def _holds_workflow(self, workflow_id: str) -> bool:
-        """Whether the workflow with this id is in this engine's context, or is one a worker keeps a runtime for.
+        """Whether the workflow with this id is open here, or is one a worker keeps a runtime for.
 
         The registry protects these entries from rescans and reindexing.
         """
-        return self._context_manager.is_workflow_in_context(workflow_id) or self._worker_workflows.holds(workflow_id)
+        return self._open_workflows.is_open(workflow_id) or self._worker_workflows.holds(workflow_id)
 
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.

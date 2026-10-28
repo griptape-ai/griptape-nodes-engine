@@ -134,9 +134,10 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        run_with_clean_slate: Whether to clear the open workflow first (default: True). With False, the
+            request fails while a workflow is open.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
 
     workflow_name: str
