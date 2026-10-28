@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.events import (
     parameter_events,
     validation_events,
     variable_events,
+    workflow_events,
 )
 from griptape_nodes.retained_mode.events.base_events import GraphAccessMixin, RequestPayload
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -70,6 +71,7 @@ GRAPH_REQUESTS_ELSEWHERE = (
     parameter_events.GetConnectionsForParameterRequest,
     parameter_events.RemoveParameterFromNodeRequest,
     validation_events.ValidateFlowDependenciesRequest,
+    workflow_events.GetWorkflowShapeRequest,
 )
 
 
