@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_error import NodeError
 
 
-BYTES_PER_MB = 1024 * 1024
+_BYTES_PER_MB = 1024 * 1024
 
 
 # How far past a frame-rate limit still passes, as a fraction of the limit. Providers write limits
@@ -51,19 +51,19 @@ def check_size(  # noqa: PLR0913
         return None
     fix = fix or "Use a smaller file."
     if strict and size_bytes >= maximum_bytes:
-        limit = _format_limit(maximum_bytes / BYTES_PER_MB)
+        limit = _format_limit(maximum_bytes / _BYTES_PER_MB)
         # A file at exactly the limit is the one a strict limit adds; printed past it, it would round
         # onto the allowed side and read as smaller than the limit.
         if size_bytes == maximum_bytes:
             shown = f"exactly {limit}"
         else:
-            shown = _format_past(size_bytes / BYTES_PER_MB, maximum_bytes / BYTES_PER_MB, 1)
+            shown = _format_past(size_bytes / _BYTES_PER_MB, maximum_bytes / _BYTES_PER_MB, 1)
         return limit_error(f"{subject} is {shown} MB and it must be under {limit} MB. {fix}", docs_url)
     if size_bytes <= maximum_bytes:
         return None
     return limit_error(
-        f"{subject} is {_format_past(size_bytes / BYTES_PER_MB, maximum_bytes / BYTES_PER_MB, 1)} MB and the limit "
-        f"is {_format_limit(maximum_bytes / BYTES_PER_MB)} MB. {fix}",
+        f"{subject} is {_format_past(size_bytes / _BYTES_PER_MB, maximum_bytes / _BYTES_PER_MB, 1)} MB and the limit "
+        f"is {_format_limit(maximum_bytes / _BYTES_PER_MB)} MB. {fix}",
         docs_url,
     )
 

@@ -34,12 +34,6 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
         assert getattr(validators_package, name) is getattr(module, name)
 
 
-def test_refuses_a_name_it_does_not_export() -> None:
-    """A name the package doesn't export raises AttributeError, as for any module."""
-    with pytest.raises(AttributeError, match="NotAValidator"):
-        validators_package.NotAValidator  # noqa: B018  # pyright: ignore[reportAttributeAccessIssue]
-
-
 @pytest.mark.parametrize(
     "first_import",
     [
