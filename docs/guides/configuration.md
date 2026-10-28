@@ -205,53 +205,9 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 
 A value of `0` scans only the top-level directory (no subdirectories).
 
-## Running a Library's Nodes on Another Engine
+## Running a Library's Nodes on Another Computer
 
-You can run a library's nodes on another Griptape Nodes engine, such as one on a shared GPU computer, while you keep working in the editor on your own workstation. Results, progress, logs, and previews come back to your editor just as they do when the nodes run locally.
-
-Your workstation reaches the GPU engine in one of two ways, and picks the way itself:
-
-- **Directly**, when the GPU engine publishes an address your workstation can reach. This works without Griptape Cloud, and the traffic stays on your network.
-- **Through Griptape Cloud**, when the GPU engine publishes no address and both engines are connected to Griptape Cloud (`websocket_api`). The GPU engine then needs no address of its own that your workstation can reach. Both engines must connect to Griptape Cloud as the same identity, such as one organization API key. Connecting through Griptape Cloud with a Griptape Nodes license isn't available yet; with a license, connect directly.
-
-If the GPU engine publishes an address, your workstation always connects directly. If that connection fails, the node fails with a message saying so; it doesn't switch to Griptape Cloud on its own.
-
-To let workstations connect directly, have the GPU engine serve its `websocket_direct` transport on an address they can reach, and publish that address in `transports.websocket_direct.advertise_url`. On the GPU engine:
-
-```json
-{
-  "transports": {
-    "websocket_direct": {
-      "enabled": true,
-      "host": "0.0.0.0",
-      "port": 18125,
-      "advertise_url": "ws://gpu-01:18125"
-    }
-  }
-}
-```
-
-On your workstation, list each library that should run elsewhere in `distributed_execution.libraries`, with the ID of the engine that runs it:
-
-```json
-{
-  "distributed_execution": {
-    "libraries": {
-      "Griptape Nodes Diffusers Library": "3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70"
-    }
-  }
-}
-```
-
-Your workstation looks the engine up by its ID in the engine registry, on the admin server or Griptape Cloud that `GT_CLOUD_BASE_URL` points to, so you never type its address. An engine keeps its ID when it restarts. The ID changes only if the engine's data directory is deleted, unless `GTN_ENGINE_ID` sets it. If the GPU engine moves to a new address, restart Griptape Nodes on your workstation so it looks the engine up again. Libraries you don't list run on your workstation. A change to this setting takes effect the next time that library's worker starts.
-
-A few things to know:
-
-- Only a library that runs its nodes in a separate worker process, because it declares execution dependencies, can run on another engine. A library listed here that runs its nodes in the engine itself still runs on your workstation.
-- Both engines must run the same engine version and the same version of each library you send there, and see the same workspace, such as a shared network drive. If something doesn't match, or the engine can't be reached, the node fails with a message that says what is wrong.
-- The nodes run on the Griptape Nodes license or Griptape Cloud API key set up on the GPU computer, in its `GRIPTAPE_NODES_LICENSE` or `GT_CLOUD_API_KEY` environment variable, the same way the GPU engine itself does. Your workstation doesn't send its own license or API key with the work. A secret a node asks for by name comes from your workstation.
-- Use one GPU engine per artist for now. Sharing an engine between artists is not supported yet: if two artists send work to the same engine, their nodes run there at the same time.
-- Library names are case-sensitive, so set this in a `griptape_nodes_config.json` file rather than an environment variable, whose name is lowercased before it becomes a config key.
+To run a library's nodes on a different computer, such as one with a more powerful GPU, while you keep working in the editor on your own, list the library in `distributed_execution.libraries` with that computer's engine ID. See [Running Nodes on Another Computer](run_nodes_on_another_computer.md) for the steps and requirements.
 
 ## Workspace Directory
 
