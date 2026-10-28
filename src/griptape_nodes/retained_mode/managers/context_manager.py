@@ -571,9 +571,10 @@ class ContextManager(EngineScoped):
         its own, so this engine usually holds the peer's file under an id of its own. That entry is
         dropped and the file is registered again under the peer's id.
 
+        A file that no longer exists is mirrored as a workflow without a file, in that file's folder.
+
         Raises:
-            MirroredWorkflowError: The peer's file could not be registered here, for example because
-                it moved or was deleted while the node was being dispatched.
+            MirroredWorkflowError: Another workflow here already uses the peer's file.
         """
         registry = self.engine.workflow_registry
         workflow = registry.find_by_id(workflow_id)
@@ -621,16 +622,32 @@ class ContextManager(EngineScoped):
                 )
         except ValueError as err:
             logger.debug("Could not mirror workflow '%s' from '%s': %s", workflow_id, file_path, err)
-            if Path(file_path).exists():
-                reason = "another workflow is already using that file"
-            else:
-                reason = "it was moved or deleted while the node was starting. Run it again"
+            self._mirror_unregistrable_file(err, workflow_id, name, file_path, known_here=workflow is not None)
+        return workflow_id
+
+    def _mirror_unregistrable_file(
+        self, err: ValueError, workflow_id: str, name: str | None, file_path: str, *, known_here: bool
+    ) -> None:
+        """Mirror the peer's workflow when its file could not be registered here, or raise why not.
+
+        A file that is gone was deleted or moved outside the engine, but the peer still has the
+        workflow open at that path, so the workflow is mirrored with no file, in that file's folder,
+        where the peer resolves its paths. An entry already known here under the peer's id stays.
+
+        Raises:
+            MirroredWorkflowError: The file exists and another workflow here already uses it.
+        """
+        if Path(file_path).exists():
             msg = (
                 f"Attempted to run a node of workflow '{name or workflow_id}'. Failed because the workflow's "
-                f"file '{file_path}' could not be opened: {reason}."
+                f"file '{file_path}' could not be opened: another workflow is already using that file."
             )
             raise self.MirroredWorkflowError(msg) from err
-        return workflow_id
+        if known_here:
+            return
+        self.engine.workflow_registry.register_unsaved(
+            name or "Untitled", str(Path(file_path).parent), workflow_id=workflow_id, listed=False
+        )
 
     def _drop_mirror_entry(self, workflow_id: str) -> None:
         """Remove the entry an earlier mirror registered, now that another workflow is mirrored.
