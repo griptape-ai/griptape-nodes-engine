@@ -491,10 +491,14 @@ async def _handle_drop_all_local_objects(
     it is already holding. The cost is that a node which has not run yet asks for a library-named key and is
     told no, and pays to rebuild -- on a workflow that is being torn down.
 
+    The orchestrator sends this when it tears its workflow down, so the runtimes this worker keeps for
+    its workflows go too, except one a node is still running in.
+
     Takes the event manager because that is how it reaches this engine; the process-global engine would
     silently no-op for an engine an embedder built directly.
     """
     resource_manager = event_manager.engine.resource_manager
+    event_manager.engine.sweep_worker_workflows()
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the

@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -495,7 +496,12 @@ def worker_engine(engine: Engine, library_name: str) -> Engine:  # noqa: ARG001
     return engine
 
 
+# The workflow the orchestrator has open, which a worker builds its copy in.
+_ORCHESTRATOR_WORKFLOW_ID = "00000000000000000000000000000abc"
+
+
 def _request_for(node_type: str, name: str = "Echo", **fields: Any) -> ExecuteNodeRequest:
+    fields.setdefault("orchestrator_workflow_id", _ORCHESTRATOR_WORKFLOW_ID)
     return ExecuteNodeRequest(
         node_name=name,
         node_metadata=cast("ExecutionNodeMetadata", {"node_type": node_type, "library": _LIBRARY_NAME}),
@@ -533,7 +539,7 @@ class TestTheWorkerLoadsACopy:
     async def test_a_workflow_file_gone_since_dispatch_still_runs_the_node(
         self, worker_engine: Engine, tmp_path: Path
     ) -> None:
-        """The orchestrator still has the workflow open at that path, so the worker mirrors it in that folder."""
+        """The orchestrator still has the workflow open at that path, so the worker registers it in that folder."""
         moved_away = tmp_path / "shots" / "lighting.py"
 
         result = await worker_engine.ahandle_request(
@@ -546,9 +552,9 @@ class TestTheWorkerLoadsACopy:
         )
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        context_manager = worker_engine.context_manager
-        assert context_manager.get_current_workflow_id() == "lighting-id"
-        assert context_manager.get_current_workflow_working_directory() == str(moved_away.parent)
+        entry = worker_engine.workflow_registry.get("lighting-id")
+        assert entry.file_path is None
+        assert entry.working_directory == str(moved_away.parent)
 
     @pytest.mark.asyncio
     async def test_the_copy_and_its_flow_are_gone_after_the_run(self, worker_engine: Engine) -> None:
@@ -559,14 +565,18 @@ class TestTheWorkerLoadsACopy:
         assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
 
     @pytest.mark.asyncio
-    async def test_the_workflow_supplied_for_the_copy_flow_leaves_the_registry(self, worker_engine: Engine) -> None:
-        """With no orchestrator workflow, the workflow made to hold the copy's flow is not left registered."""
-        workflow_ids_before = worker_engine.workflow_registry.workflow_ids()
+    async def test_a_node_sent_with_no_workflow_open_is_refused(self, worker_engine: Engine) -> None:
+        """The copy is built in the orchestrator's workflow, so with none open there is nowhere to build it."""
+        result = await worker_engine.ahandle_request(_request_for("_EchoNode", orchestrator_workflow_id=None))
 
-        result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
-
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        assert worker_engine.workflow_registry.workflow_ids() == workflow_ids_before
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert str(result.result_details) == (
+            "Attempted to run a node in a separate process. Failed because no workflow was open when it was sent. "
+            "Open a workflow and run it again."
+        )
+        assert result.error is not None
+        assert isinstance(result.exception, ContextManager.OrchestratorWorkflowError)
+        assert _what_the_worker_holds(worker_engine) == set()
 
     @pytest.mark.asyncio
     async def test_the_structure_it_was_sent_is_built_before_the_values_are_set(self, worker_engine: Engine) -> None:
@@ -686,7 +696,9 @@ class TestTheWorkerLoadsACopy:
 
     @pytest.mark.asyncio
     async def test_missing_metadata_fails(self, worker_engine: Engine) -> None:
-        result = await worker_engine.ahandle_request(ExecuteNodeRequest(node_name="nonexistent_node"))
+        result = await worker_engine.ahandle_request(
+            ExecuteNodeRequest(node_name="nonexistent_node", orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID)
+        )
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
@@ -695,7 +707,9 @@ class TestTheWorkerLoadsACopy:
     async def test_missing_node_type_in_metadata_fails(self, worker_engine: Engine) -> None:
         result = await worker_engine.ahandle_request(
             ExecuteNodeRequest(
-                node_name="some_node", node_metadata=cast("ExecutionNodeMetadata", {"library": _LIBRARY_NAME})
+                node_name="some_node",
+                node_metadata=cast("ExecutionNodeMetadata", {"library": _LIBRARY_NAME}),
+                orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
             )
         )
 
@@ -739,6 +753,7 @@ class TestTheWorkerLoadsACopy:
                     node_metadata=cast(
                         "ExecutionNodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}
                     ),
+                    orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
                 )
             )
 
@@ -886,6 +901,7 @@ class TestPreparingTheRequestForAWorker:
                     node_name=node.name,
                     node_metadata=cast("ExecutionNodeMetadata", dict(node.metadata)),
                     local_object_source=node.local_object_source,
+                    orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
                 )
             )
 

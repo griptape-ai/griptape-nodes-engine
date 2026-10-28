@@ -5,7 +5,7 @@ import asyncio
 import logging
 import tempfile
 import uuid
-from collections.abc import Generator, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -641,16 +641,11 @@ class TestSetWorkflowContextUnsavedNames:
             context_manager.pop_workflow()
 
 
-class TestMirrorWorkflowContext:
+class TestAdoptOrchestratorWorkflow:
     PEER_ID = "00000000000000000000000000000abc"
     LOCAL_ID = "00000000000000000000000000000def"
 
-    @pytest.fixture(autouse=True)
-    def _clean_context(self, engine: Engine) -> Generator[None, None, None]:
-        yield
-        engine.context_manager.mirror_workflow_context(None, None, None, None)
-
-    def test_a_stale_entry_that_is_the_current_mirror_is_replaced_by_the_peers_id(
+    def test_a_stale_entry_kept_for_an_earlier_id_is_replaced_by_the_peers_id(
         self, engine: Engine, tmp_path: Path
     ) -> None:
         workflow_file = tmp_path / "shared.py"
@@ -658,11 +653,12 @@ class TestMirrorWorkflowContext:
         engine.workflow_registry.register_file(
             workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID, listed=False
         )
-        engine.context_manager.push_workflow(file_path=str(workflow_file))
+        engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
 
-        engine.context_manager.mirror_workflow_context(self.PEER_ID, "shared", str(workflow_file), None)
+        workflow = engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
 
-        assert engine.context_manager.get_current_workflow_id() == self.PEER_ID
+        assert workflow is engine.worker_workflows.find(self.PEER_ID)
+        assert engine.worker_workflows.find(self.LOCAL_ID) is None
         assert engine.workflow_registry.find_by_id(self.LOCAL_ID) is None
         assert engine.workflow_registry.find_by_path(workflow_file) is engine.workflow_registry.get(self.PEER_ID)
 
@@ -674,22 +670,29 @@ class TestMirrorWorkflowContext:
         engine.workflow_registry.register_file(holder_file, _metadata("taken"), workflow_id=self.LOCAL_ID, listed=False)
 
         try:
-            with pytest.raises(ContextManager.MirroredWorkflowError) as exc_info:
-                engine.context_manager.mirror_workflow_context(self.PEER_ID, "taken", str(peer_file), None)
+            with pytest.raises(ContextManager.OrchestratorWorkflowError) as exc_info:
+                engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "taken", str(peer_file), None)
         finally:
             engine.workflow_registry.remove(self.LOCAL_ID)
 
         assert "another workflow is already using that file" in str(exc_info.value)
 
-    def test_a_workflow_name_without_an_id_fails_and_keeps_the_mirror(self, engine: Engine) -> None:
-        """A peer older than workflow ids sends only a name; clearing would run the node without its workflow."""
-        engine.context_manager.mirror_workflow_context(self.PEER_ID, f"unsaved:{self.PEER_ID}", None, None)
+    def test_a_workflow_name_without_an_id_fails(self, engine: Engine) -> None:
+        """A peer older than workflow ids sends only a name; running in no workflow would lose its paths."""
+        engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, f"unsaved:{self.PEER_ID}", None, None)
 
-        with pytest.raises(ContextManager.MirroredWorkflowError) as exc_info:
-            engine.context_manager.mirror_workflow_context(None, "shots/sh010", None, None)
+        with pytest.raises(ContextManager.OrchestratorWorkflowError) as exc_info:
+            engine.context_manager.adopt_orchestrator_workflow(None, "shots/sh010", None, None)
 
         assert "different version" in str(exc_info.value)
-        assert engine.context_manager.get_current_workflow_id() == self.PEER_ID
+        assert engine.worker_workflows.holds(self.PEER_ID)
+
+    def test_no_workflow_fails(self, engine: Engine) -> None:
+        """The worker builds its copy of the node in the orchestrator's workflow, so it needs one."""
+        with pytest.raises(ContextManager.OrchestratorWorkflowError, match="no workflow was open"):
+            engine.context_manager.adopt_orchestrator_workflow(None, None, None, None)
+
+        assert engine.worker_workflows.all_kept() == []
 
 
 class TestGeneratedWorkflowCode:
@@ -854,7 +857,7 @@ def _recording_library() -> Iterator[None]:
         LibraryRegistry._clear()
 
 
-class TestMirroringAnotherEngineProcess:
+class TestRunningANodeForAnotherEngineProcess:
     """An orchestrator and a worker are separate engines: each gives the files it scans ids of its own."""
 
     def test_the_worker_takes_the_orchestrators_id_for_the_file_and_runs_the_node_in_it(self, tmp_path: Path) -> None:
@@ -908,3 +911,20 @@ class TestMirroringAnotherEngineProcess:
         assert worker.workflow_registry.find_by_id(worker_entry.workflow_id) is None
         # The orchestrator's registry is its own: nothing the worker did reached it.
         assert orchestrator.workflow_registry.find_by_path(workflow_file) is orchestrator_entry
+
+    def test_a_rescan_on_the_worker_keeps_the_entry_of_the_workflow_it_keeps_a_runtime_for(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan does not find a file outside the workspace, but the worker still runs that workflow's nodes."""
+        workspace = tmp_path.resolve() / "workspace"
+        workspace.mkdir()
+        workflow_file = tmp_path.resolve() / "elsewhere" / "shot.py"
+        workflow_file.parent.mkdir()
+        workflow_file.write_text("print('body')\n", encoding="utf-8")
+        worker = Engine()
+        worker.context_manager.adopt_orchestrator_workflow("orchestrator-id", "shot", str(workflow_file), None)
+
+        _scan_into(worker, workspace)
+
+        assert worker.workflow_registry.is_open("orchestrator-id")
+        assert worker.workflow_registry.find_by_path(workflow_file) is worker.workflow_registry.get("orchestrator-id")

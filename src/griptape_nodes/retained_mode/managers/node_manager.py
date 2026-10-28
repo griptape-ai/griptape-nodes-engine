@@ -3491,25 +3491,31 @@ class NodeManager(EngineScoped):
     async def _run_worker_copy(self, request: ExecuteNodeRequest) -> ResultPayload:
         """Load a copy of the node from `request`, run it, and discard it. Worker side only.
 
-        The copy lives in a flow of its own in this process's graph. Loading and discarding run in a
-        rebuild scope, so every request either makes, its node's code included, is answered here and none
-        reaches the orchestrator. Running it is ordinary execution, whose requests go to the orchestrator.
+        The copy lives in a flow of its own in the runtime this worker keeps for the orchestrator's
+        workflow. Loading and discarding run in a rebuild scope, so every request either makes, its
+        node's code included, is answered here and none reaches the orchestrator. Running it is
+        ordinary execution, whose requests go to the orchestrator.
         """
-        # Adopt the orchestrator's workflow context before anything resolves a path. Loading resolves
-        # paths too, so this comes first.
+        # Run in the orchestrator's workflow before anything resolves a path. Loading resolves paths
+        # too, so this comes first.
         try:
-            self.engine.context_manager.mirror_workflow_context(
+            workflow = self.engine.context_manager.adopt_orchestrator_workflow(
                 request.orchestrator_workflow_id,
                 request.workflow_name,
                 request.workflow_file_path,
                 request.workflow_working_directory,
             )
-        except ContextManager.MirroredWorkflowError as err:
+        except ContextManager.OrchestratorWorkflowError as err:
             return ExecuteNodeResultFailure(
                 result_details=str(err),
                 exception=err,
                 error=build_node_error_details(request.node_name, err),
             )
+        with self.engine.run_in_worker_workflow(workflow):
+            return await self._run_worker_copy_in_workflow(request)
+
+    async def _run_worker_copy_in_workflow(self, request: ExecuteNodeRequest) -> ResultPayload:
+        """Load, run and discard the copy in the worker runtime bound for it."""
         event_manager = self.engine.event_manager
         with event_manager.rebuild_scope(request.node_name):
             flow_name = self._create_worker_copy_flow(request.node_name)
@@ -3526,42 +3532,21 @@ class NodeManager(EngineScoped):
                 self._discard_worker_copy(flow_name)
 
     def _create_worker_copy_flow(self, node_name: str) -> str | ExecuteNodeResultFailure:
-        """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name.
-
-        Creating a flow needs a workflow in the current context, which a worker only mirrors from the
-        orchestrator and which is empty when the orchestrator has none open, so one is supplied while
-        the flows are made, and its registry entry is removed afterwards. Nothing awaits in between,
-        so no other chain sees it.
-        """
-        context_manager = self.engine.context_manager
-        supplies_workflow = not context_manager.has_current_workflow()
-        if supplies_workflow:
-            context_manager.push_workflow(workflow_name=_WORKER_COPIES_FLOW_NAME)
-        try:
-            if (
-                self.engine.object_manager.attempt_get_object_by_name_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow)
-                is None
-            ):
-                top_result = self.engine.handle_request(
-                    CreateFlowRequest(
-                        parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False
-                    )
-                )
-                if not isinstance(top_result, CreateFlowResultSuccess):
-                    details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
-                    return ExecuteNodeResultFailure(result_details=details)
-            flow_result = self.engine.handle_request(
-                CreateFlowRequest(
-                    parent_flow_name=_WORKER_COPIES_FLOW_NAME,
-                    flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
-                    set_as_new_context=False,
-                )
+        """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name."""
+        if self.engine.object_manager.attempt_get_object_by_name_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow) is None:
+            top_result = self.engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False)
             )
-        finally:
-            if supplies_workflow:
-                supplied_workflow_id = context_manager.get_current_workflow_id()
-                context_manager.pop_workflow()
-                self.engine.workflow_registry.remove(supplied_workflow_id)
+            if not isinstance(top_result, CreateFlowResultSuccess):
+                details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
+                return ExecuteNodeResultFailure(result_details=details)
+        flow_result = self.engine.handle_request(
+            CreateFlowRequest(
+                parent_flow_name=_WORKER_COPIES_FLOW_NAME,
+                flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
+                set_as_new_context=False,
+            )
+        )
         if not isinstance(flow_result, CreateFlowResultSuccess):
             details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {flow_result.result_details}"
             return ExecuteNodeResultFailure(result_details=details)

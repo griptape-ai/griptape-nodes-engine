@@ -366,7 +366,7 @@ class _WorkflowRegistry:
         self._by_id: dict[str, Workflow] = {}
 
     def is_open(self, workflow_id: str) -> bool:
-        """Whether the workflow with this id is open in the engine."""
+        """Whether the workflow with this id is open in the engine, or a worker keeps a runtime for it."""
         if self._is_workflow_open is None:
             return False
         return self._is_workflow_open(workflow_id)
@@ -426,9 +426,9 @@ class _WorkflowRegistry:
     ) -> Workflow:
         """Register the workflow file at `path` (workspace-relative or absolute).
 
-        The file gets a new id, unless `workflow_id` is given. Only a mirror of another engine's
-        workflow gives one, so that both engines call the workflow by the same id. A path the
-        registry already holds is refused; a rescan uses `refresh_file`, which keeps it. A link
+        The file gets a new id, unless `workflow_id` is given. Only a worker registering its
+        orchestrator's workflow gives one, so that both engines call the workflow by the same id. A
+        path the registry already holds is refused; a rescan uses `refresh_file`, which keeps it. A link
         to a file the registry already holds under another path becomes an alias of that entry,
         which is returned.
 
@@ -529,8 +529,8 @@ class _WorkflowRegistry:
     ) -> Workflow:
         """Register a new unsaved (in-memory) workflow, named "unsaved:<id>".
 
-        `workflow_id` is minted unless given. Only a mirror of another engine's workflow passes
-        one, so that both engines call the workflow by the same id.
+        `workflow_id` is minted unless given. Only a worker registering its orchestrator's workflow
+        passes one, so that both engines call the workflow by the same id.
 
         Raises:
             DuplicateWorkflowIdError: `workflow_id` is already registered.
