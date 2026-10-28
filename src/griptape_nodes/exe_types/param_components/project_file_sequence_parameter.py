@@ -95,7 +95,8 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
         Raises:
-            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
+            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None,
+                or if the parameter's value names a folder rather than a file.
             FileSequenceError: If no available version index can be found.
         """
         upstream = self._get_upstream_destination(

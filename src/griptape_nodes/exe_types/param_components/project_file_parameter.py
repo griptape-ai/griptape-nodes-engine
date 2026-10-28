@@ -4,12 +4,14 @@ Wraps a MacroPath into a FileDestination with a baked-in write policy, deferring
 path resolution to execution time via the situation-based macro system.
 """
 
+from pathlib import Path
+
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.project_output_parameter import ProjectOutputParameter
 from griptape_nodes.files.file import FileDestination, FileDestinationProvider
-from griptape_nodes.files.path_utils import with_default_extension
+from griptape_nodes.files.path_utils import is_url, with_default_extension
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
 
@@ -90,8 +92,10 @@ class ProjectFileParameter(ProjectOutputParameter):
         user intent.
 
         Otherwise the parameter's string value is combined with this component's
-        situation to build a ``FileDestination``. A value with no extension takes the
-        extension of the default filename.
+        situation to build a ``FileDestination``. A filename with no extension takes the
+        extension of the default filename. An absolute path or URL is passed through as
+        typed: the destination honors an explicit location verbatim, and a URL it
+        refuses is quoted back as entered.
 
         Args:
             **extra_vars: Additional variables for the macro (e.g., sub_dirs="renders")
@@ -101,7 +105,8 @@ class ProjectFileParameter(ProjectOutputParameter):
 
         Raises:
             ValueError: If an upstream FileDestinationProvider is connected but returns None,
-                or if the parameter's value is a URL that names no local file.
+                if the parameter's value is a URL that names no local file, or if it
+                names a folder rather than a file.
         """
         upstream = self._get_upstream_destination(
             FileDestinationProvider, lambda provider: provider.file_destination, "FileDestination"
@@ -111,7 +116,8 @@ class ProjectFileParameter(ProjectOutputParameter):
 
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
-        filename = with_default_extension(filename, self._default_value)
+        if not is_url(filename) and not Path(filename).is_absolute():
+            filename = with_default_extension(filename, self._default_value)
 
         if "node_name" not in extra_vars:
             extra_vars["node_name"] = self._node.name
