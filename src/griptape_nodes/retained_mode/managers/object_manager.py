@@ -41,12 +41,8 @@ class ObjectManager(EngineScoped):
     open workflow to hold it.
     """
 
-    # Registered nodes with queued UI changes, keyed by id() because a node hashes by its mutable name.
-    _nodes_with_queued_changes: dict[int, BaseNode]
-
     def __init__(self, _event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        self._nodes_with_queued_changes = {}
         _event_manager.register_request_handlers(self)
 
     @handles(RenameObjectRequest)
@@ -186,9 +182,11 @@ class ObjectManager(EngineScoped):
         return self._objects_or_empty().generate_name(type_name=type_name, requested_name=requested_name)
 
     def add_object_by_name(self, name: str, obj: object) -> None:
-        self.engine.current_workflow().objects.add(name, obj)
+        objects = self.engine.current_workflow().objects
+        objects.add(name, obj)
         if isinstance(obj, BaseNode):
-            obj.set_change_listener(self._note_queued_changes)
+            # The workflow holding the node queues its changes, so they go when it closes.
+            obj.set_change_listener(objects.note_queued_changes)
 
     def get_object_by_name(self, name: str) -> object:
         obj = self._objects_or_empty().get(name)
@@ -223,28 +221,18 @@ class ObjectManager(EngineScoped):
                     return
         if isinstance(obj, BaseNode):
             obj.set_change_listener(None)
-            self._nodes_with_queued_changes.pop(id(obj), None)
+            objects.forget_queued_changes(obj)
         objects.remove(name)
 
     def take_nodes_with_queued_changes(self) -> list[BaseNode]:
-        """Return the registered nodes with queued UI changes, in queue order, and forget them.
+        """Return the current workflow's nodes with queued UI changes, in queue order, and forget them.
 
-        Drained one atomic ``popitem`` at a time: a node can queue a change from another thread
-        mid-drain, and copying then clearing would drop it while its element stays queued. The
-        empty check is the pop itself, because another thread may be draining too.
+        None when no workflow is current: a closed workflow's queued changes went with it.
         """
-        nodes = []
-        while True:
-            try:
-                _, node = self._nodes_with_queued_changes.popitem()
-            except KeyError:
-                break
-            nodes.append(node)
-        nodes.reverse()
-        return nodes
-
-    def _note_queued_changes(self, node: BaseNode) -> None:
-        self._nodes_with_queued_changes[id(node)] = node
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return []
+        return workflow.objects.take_nodes_with_queued_changes()
 
     def _objects_or_empty(self) -> WorkflowObjects:
         """The open workflow's objects for a lookup, which finds none when no workflow is open.

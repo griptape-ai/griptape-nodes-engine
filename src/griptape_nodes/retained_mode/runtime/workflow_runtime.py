@@ -14,9 +14,9 @@ class WorkflowRuntime:
     """The state of one open workflow, made when it opens and dropped when it closes.
 
     Holds the workflow's context stack (the flows, nodes and elements entered in it), its objects
-    (its flows and nodes by name), its node bookkeeping, its flow hierarchy, connections and run
-    state, its flow and global variables, and the referenced workflows it is importing, one typed
-    attribute per concern.
+    (its flows and nodes by name, and their queued UI changes), its node bookkeeping, its flow
+    hierarchy, connections and run state, its flow and global variables, and the referenced
+    workflows it is importing, one typed attribute per concern.
     """
 
     def __init__(self, workflow_id: str) -> None:

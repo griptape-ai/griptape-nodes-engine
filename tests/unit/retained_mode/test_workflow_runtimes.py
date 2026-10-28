@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayloadSuccess
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultFailure
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
@@ -33,6 +34,7 @@ from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_m
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
+from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -213,6 +215,19 @@ class TestObjectsOnTheRuntime:
         engine.context_manager.push_workflow(workflow_name="next")
 
         assert not engine.object_manager.has_object_with_name("canvas")
+
+    def test_a_closed_workflows_queued_ui_changes_go_with_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        node = MockNode(name="node")
+        parameter = Parameter(name="text", tooltip="Text", type="str")
+        node.add_parameter(parameter)
+        engine.object_manager.add_object_by_name("node", node)
+        parameter.track_change("tooltip", "Changed")
+
+        engine.context_manager.pop_workflow()
+        engine.context_manager.push_workflow(workflow_name="next")
+
+        assert engine.object_manager.take_nodes_with_queued_changes() == []
 
 
 class TestVariablesOnTheRuntime:
