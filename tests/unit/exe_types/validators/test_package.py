@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from griptape_nodes.exe_types import validators as validators_package
-from griptape_nodes.exe_types.validators import base, common, media
+import griptape_nodes.exe_types.validators as validators_package
+import griptape_nodes.exe_types.validators.base as validators_base
+import griptape_nodes.exe_types.validators.common as validators_common
+import griptape_nodes.exe_types.validators.media as validators_media
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -17,8 +19,8 @@ if TYPE_CHECKING:
 
 def test_exports_every_public_validator_and_the_types_they_use() -> None:
     """Every `media` and `common` validator, and the base types, are the same objects from the package."""
-    source: dict[str, ModuleType] = dict.fromkeys(media.__all__, media)
-    source.update(dict.fromkeys(common.__all__, common))
+    source: dict[str, ModuleType] = dict.fromkeys(validators_media.__all__, validators_media)
+    source.update(dict.fromkeys(validators_common.__all__, validators_common))
     base_exports = (
         "EMPTY_MEDIA",
         "LIMITS_LINK_LABEL",
@@ -28,7 +30,7 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
         "PreRunValidator",
         "reads",
     )
-    source.update(dict.fromkeys(base_exports, base))
+    source.update(dict.fromkeys(base_exports, validators_base))
     assert set(validators_package.__all__) == set(source)
     for name, module in source.items():
         assert getattr(validators_package, name) is getattr(module, name)

@@ -120,7 +120,9 @@ class Condition(Protocol):
     file with `reads`, so the engine reads that too.
     """
 
-    def __call__(self, node: BaseNode, media: MediaInfo, /) -> bool: ...
+    def __call__(self, node: BaseNode, media: MediaInfo, /) -> bool:
+        """True when the validator should check this value."""
+        raise NotImplementedError
 
 
 def reads(*needs: MediaNeed) -> Callable[[Callable[[BaseNode, MediaInfo], bool]], Condition]:
