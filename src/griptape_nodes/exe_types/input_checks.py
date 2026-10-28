@@ -1,4 +1,4 @@
-"""Reading a media input's properties locally, and checking them against a provider's documented limits.
+"""Reading a media input's properties locally, for the pre-run validators and a node's own checks.
 
 A request a provider is certain to reject still costs the artist an upload and a wait, and sometimes
 credits. A node declares the limits on its parameters with `pre_run_validators=` (see
@@ -46,7 +46,7 @@ from PIL import Image, UnidentifiedImageError
 from static_ffmpeg import run as static_ffmpeg_run
 
 from griptape_nodes.exe_types.input_check_budget import input_check_budget, probe_deadline
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed
+from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, MediaInfo, MediaNeed
 from griptape_nodes.files.file import File, FileLoadError
 from griptape_nodes.files.path_utils import is_url
 from griptape_nodes.utils.media_values import MediaKind, coerce_media_url_or_data_uri
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 __all__ = [
+    "LIMITS_LINK_LABEL",
     "AudioProbe",
     "ImageInfo",
     "VideoProbe",
@@ -71,9 +72,6 @@ __all__ = [
     "read_media",
     "timed_out_locations",
 ]
-
-
-LIMITS_LINK_LABEL = "Provider limits"
 
 
 # Validation runs on the engine's event loop, so every probe blocks it. A local probe takes tens of

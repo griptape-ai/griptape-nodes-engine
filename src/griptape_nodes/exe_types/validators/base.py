@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "EMPTY_MEDIA",
+    "LIMITS_LINK_LABEL",
     "Condition",
     "MediaInfo",
     "MediaNeed",
@@ -32,6 +33,10 @@ __all__ = [
     "reads",
     "require_validators_fit",
 ]
+
+
+# The label on the docs link every validator's error carries.
+LIMITS_LINK_LABEL = "Provider limits"
 
 
 class MediaNeed(StrEnum):

@@ -19,9 +19,16 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
     """Every `media` and `common` validator, and the base types, are the same objects from the package."""
     source: dict[str, ModuleType] = dict.fromkeys(media.__all__, media)
     source.update(dict.fromkeys(common.__all__, common))
-    source.update(
-        dict.fromkeys(("EMPTY_MEDIA", "Condition", "MediaInfo", "MediaNeed", "PreRunValidator", "reads"), base)
+    base_exports = (
+        "EMPTY_MEDIA",
+        "LIMITS_LINK_LABEL",
+        "Condition",
+        "MediaInfo",
+        "MediaNeed",
+        "PreRunValidator",
+        "reads",
     )
+    source.update(dict.fromkeys(base_exports, base))
     assert set(validators_package.__all__) == set(source)
     for name, module in source.items():
         assert getattr(validators_package, name) is getattr(module, name)

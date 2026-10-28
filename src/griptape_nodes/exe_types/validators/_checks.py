@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from griptape_nodes.exe_types.input_checks import LIMITS_LINK_LABEL
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
+from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
