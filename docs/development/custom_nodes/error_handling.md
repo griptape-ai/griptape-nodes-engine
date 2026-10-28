@@ -498,13 +498,35 @@ class ReferenceToVideo(SuccessFailureNode):
         ]
 ```
 
-**Your own validator.** Subclass `PreRunValidator`, set `needs` to the readings it uses
-(`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or `AUDIO`), and return a `NodeError` from `check`, or None. The
-engine reads the input once for all the validators on a parameter and hands each the same
-`MediaInfo`. The readers (`local_size_bytes`, `local_image_info`, `local_image_format`,
-`local_video_probe`, `local_audio_probe`) and single checks (`check_size`, `check_dimensions`, `check_duration` and the
-rest) in `griptape_nodes.exe_types.input_checks` are there to build it from, and a reader called
-during the node's checks returns what was already read.
+**Your own validator.** Most limits are a built-in validator, narrowed where needed with
+`.when()`, `.unless()`, `DependsOn` or `.first(n)`. For one none of them covers, subclass
+`PreRunValidator`, set `needs` to the readings it uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or
+`AUDIO`), and return a `NodeError` from `check`, or None. The engine reads the input once for all
+the validators on a parameter and hands each the same `MediaInfo`. For a reading `MediaInfo` doesn't
+carry, call a reader (`local_size_bytes`, `local_image_info`, `local_image_format`,
+`local_video_probe`, `local_audio_probe`) from `griptape_nodes.exe_types.input_checks`; during the
+node's checks it returns what was already read. `check` is also given the `node` and, for a list
+item, its `position`; take `**_` for any you don't use.
+
+```python
+from typing import Any, override
+
+from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.exe_types.validators import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
+
+
+class EvenSides(PreRunValidator):
+    needs = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
+
+    @override
+    def check(
+        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA, **_: Any
+    ) -> NodeError | None:
+        frame = media.frame
+        if frame is None or (frame.width % 2 == 0 and frame.height % 2 == 0):
+            return None
+        return NodeError(f"{subject} is {frame.width}x{frame.height} and each side must be even. Crop it.")
+```
 
 The checks follow these rules:
 

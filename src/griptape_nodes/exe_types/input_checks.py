@@ -3,7 +3,8 @@
 A request a provider is certain to reject still costs the artist an upload and a wait, and sometimes
 credits. A node declares the limits on its parameters with `pre_run_validators=` (see
 `griptape_nodes.exe_types.validators`), and the engine checks them at the node's turn, before it
-runs. The validators are built from the parts here, which a custom validator can use too:
+runs. This module reads what they check, and a custom validator or a node's own
+`validate_before_node_run` can read with it too:
 
 - **Readers** (`local_size_bytes`, `local_image_info`, `local_image_format`, `local_video_probe`,
   `local_audio_probe`) read a media input's properties from data already on this machine. `local_video_probe` reads a
@@ -17,10 +18,9 @@ runs. The validators are built from the parts here, which a custom validator can
   that input wasn't checked, whether a declared validator or the node's own check asked for it;
   `timed_out_locations` lists them.
 - **`read_media`** takes the readings a set of validators needs from one value, in one call.
-- **Checks** (`check_count`, `check_size`, `check_dimensions`, `check_aspect_ratio_range`,
-  `check_aspect_ratio_exact`, `check_mime_type`, `check_video_codec`, `check_audio_codec`,
-  `check_duration`, `check_frame_rate`, `check_frame_count`) compare one value with a limit and
-  return a `NodeError`, or None when the value is within the limit or unknown.
+
+The private `_check_*` functions compare one reading with a limit and write the message; the
+validators in `griptape_nodes.exe_types.validators` are their public form.
 
 A limit is enforced only where it can be read cheaply; anything else is left for the provider.
 """
@@ -61,17 +61,6 @@ __all__ = [
     "AudioProbe",
     "ImageInfo",
     "VideoProbe",
-    "check_aspect_ratio_exact",
-    "check_aspect_ratio_range",
-    "check_audio_codec",
-    "check_count",
-    "check_dimensions",
-    "check_duration",
-    "check_frame_count",
-    "check_frame_rate",
-    "check_mime_type",
-    "check_size",
-    "check_video_codec",
     "input_check_budget",
     "input_check_readings",
     "input_subject",
@@ -568,7 +557,7 @@ def _probe_audio(location: str) -> AudioProbe | None:
     )
 
 
-def check_count(
+def _check_count(
     count: int, *, maximum: int, parameter: str, noun: str = "items", docs_url: str | None = None
 ) -> NodeError | None:
     """An error when more inputs are connected than the provider accepts.
@@ -588,7 +577,7 @@ def check_count(
     )
 
 
-def check_size(  # noqa: PLR0913
+def _check_size(  # noqa: PLR0913
     size_bytes: int | None,
     *,
     maximum_bytes: int,
@@ -630,7 +619,7 @@ def check_size(  # noqa: PLR0913
     )
 
 
-def check_dimensions(  # noqa: PLR0913
+def _check_dimensions(  # noqa: PLR0913
     info: ImageInfo | None,
     *,
     subject: str,
@@ -679,7 +668,7 @@ def check_dimensions(  # noqa: PLR0913
     return None
 
 
-def check_aspect_ratio_range(
+def _check_aspect_ratio_range(
     info: ImageInfo | None, *, subject: str, widest: str, tallest: str, docs_url: str | None = None
 ) -> NodeError | None:
     """An error when an image or video frame is wider or taller than the provider accepts.
@@ -720,7 +709,7 @@ def check_aspect_ratio_range(
     )
 
 
-def check_aspect_ratio_exact(
+def _check_aspect_ratio_exact(
     info: ImageInfo | None, *, subject: str, ratios: Sequence[str], docs_url: str | None = None
 ) -> NodeError | None:
     """An error when an image or video frame isn't one of the exact aspect ratios the provider accepts.
@@ -754,7 +743,7 @@ def check_aspect_ratio_exact(
     )
 
 
-def check_mime_type(
+def _check_mime_type(
     mime_type: str | None,
     *,
     subject: str,
@@ -789,7 +778,7 @@ def _mime_type_error(
     docs_url: str | None,
     also_matching: Sequence[str] = (),
 ) -> NodeError | None:
-    """`check_mime_type`, with `also_matching` names that widen the match but aren't listed in the message."""
+    """`_check_mime_type`, with `also_matching` names that widen the match but aren't listed in the message."""
     if mime_type is None or not allowed or _is_allowed(mime_type, (*allowed, *also_matching)):
         return None
     # Names that differ but read the same, such as audio/wav and audio/x-wav, are listed once.
@@ -799,7 +788,7 @@ def _mime_type_error(
     return _error(f"{subject} is in {current} format. Convert it to {formats}.", docs_url)
 
 
-def check_video_codec(
+def _check_video_codec(
     codec: str | None, *, subject: str, allowed: Sequence[str], docs_url: str | None = None
 ) -> NodeError | None:
     """An error when a video's codec isn't one the provider accepts.
@@ -819,7 +808,7 @@ def check_video_codec(
     return _codec_error(codec, subject=subject, allowed=allowed, docs_url=docs_url)
 
 
-def check_audio_codec(
+def _check_audio_codec(
     codec: str | None, *, subject: str, allowed: Sequence[str], docs_url: str | None = None
 ) -> NodeError | None:
     """An error when an audio input's codec isn't one the provider accepts.
@@ -840,7 +829,7 @@ def check_audio_codec(
     return _codec_error(codec, subject=subject, allowed=allowed, docs_url=docs_url)
 
 
-def check_duration(  # noqa: PLR0913
+def _check_duration(  # noqa: PLR0913
     seconds: float | None,
     *,
     subject: str,
@@ -878,7 +867,7 @@ def check_duration(  # noqa: PLR0913
     return None
 
 
-def check_frame_rate(  # noqa: PLR0913
+def _check_frame_rate(  # noqa: PLR0913
     fps: float | None,
     *,
     subject: str,
@@ -915,7 +904,7 @@ def check_frame_rate(  # noqa: PLR0913
     return None
 
 
-def check_frame_count(
+def _check_frame_count(
     frames: int | None,
     *,
     subject: str,
@@ -948,9 +937,9 @@ def check_frame_count(
 
 
 def _codec_error(codec: str | None, *, subject: str, allowed: Sequence[str], docs_url: str | None) -> NodeError | None:
-    """`check_video_codec` and `check_audio_codec`."""
+    """`_check_video_codec` and `_check_audio_codec`."""
     accepted = _require_known_codecs(allowed)
-    # An empty list is no limit, as `check_mime_type` treats it.
+    # An empty list is no limit, as `_check_mime_type` treats it.
     if codec is None or not accepted:
         return None
     if codec.strip().lower() in accepted:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
-from griptape_nodes.exe_types.input_checks import check_count
+from griptape_nodes.exe_types.input_checks import _check_count
 from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, PreRunValidator
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ class MaxCount(PreRunValidator):
         node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
-        return check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
+        return _check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
 
 
 @dataclass(frozen=True, init=False)
