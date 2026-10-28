@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -183,6 +184,7 @@ class Engine:
     _worker_manager: WorkerManager
     _lifecycle: EngineLifecycle
     _workflow_registry: _WorkflowRegistry
+    _open_workflows: OpenWorkflowSet
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -231,6 +233,7 @@ class Engine:
         # Workflow ids live only as long as this engine, so clients compare this to notice a
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
+        self._open_workflows = OpenWorkflowSet()
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -407,6 +410,10 @@ class Engine:
     @property
     def workflow_registry(self) -> _WorkflowRegistry:
         return self._workflow_registry
+
+    @property
+    def open_workflows(self) -> OpenWorkflowSet:
+        return self._open_workflows
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
