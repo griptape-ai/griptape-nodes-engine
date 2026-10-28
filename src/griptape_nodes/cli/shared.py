@@ -7,6 +7,7 @@ from typing import Any
 
 from rich.console import Console
 
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_base_url
 from griptape_nodes.utils.engine_dirs import engine_config_dir, engine_data_dir
 
 
@@ -40,7 +41,7 @@ CONFIG_FILE = CONFIG_DIR / "griptape_nodes_config.json"
 PACKAGE_NAME = "griptape-nodes-engine"
 NODES_APP_URL = "https://nodes.griptape.ai"
 NODES_TARBALL_URL = "https://github.com/griptape-ai/griptape-nodes/archive/refs/tags/{tag}.tar.gz"
-GT_CLOUD_BASE_URL = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+GT_CLOUD_BASE_URL = resolve_cloud_base_url()
 
 # Environment variable defaults for init configuration
 ENV_WORKSPACE_DIRECTORY = os.getenv("GTN_WORKSPACE_DIRECTORY")

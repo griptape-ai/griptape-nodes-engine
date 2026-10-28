@@ -786,12 +786,7 @@ class FlowManager(EngineScoped):
 
             # If we've made it this far, we have deleted all the children Flows and their nodes.
             # Remove the flow from our map.
-            obj_mgr.del_obj_by_name(flow.name)
-            del self._name_to_parent_name[flow.name]
-
-            # Clean up referenced workflow tracking
-            if flow in self._flow_to_referenced_workflow_name:
-                del self._flow_to_referenced_workflow_name[flow]
+            self.forget_empty_flow(flow)
 
             # Clean up ControlFlowMachine and DAG orchestrator only if this is the global flow.
             # Isolated subflows have their own machines and should not clear the global state.
@@ -805,6 +800,19 @@ class FlowManager(EngineScoped):
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)
         return result
+
+    def forget_empty_flow(self, flow: ControlFlow) -> None:
+        """Drop an empty flow from the records.
+
+        The part of deleting a flow that a worker discarding its copy's flow shares. Not a delete:
+        ``DeleteFlowRequest`` deletes the flow's nodes as well, which releases what they cached.
+        """
+        self.engine.object_manager.del_obj_by_name(flow.name)
+        del self._name_to_parent_name[flow.name]
+
+        # Clean up referenced workflow tracking
+        if flow in self._flow_to_referenced_workflow_name:
+            del self._flow_to_referenced_workflow_name[flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(self, request: GetIsFlowRunningRequest) -> ResultPayload:
@@ -1138,16 +1146,18 @@ class FlowManager(EngineScoped):
             return CreateConnectionResultFailure(result_details=details)
 
         # Let the source make any internal handling decisions now that the Connection has been made.
-        source_node.after_outgoing_connection(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection"):
+            source_node.after_outgoing_connection(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection"):
+            target_node.after_incoming_connection(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         # Check if either node is in a NodeGroup and track connections
 
@@ -1412,16 +1422,18 @@ class FlowManager(EngineScoped):
                 except KeyError as e:
                     logger.warning(e)
         # Let the source make any internal handling decisions now that the Connection has been REMOVED.
-        source_node.after_outgoing_connection_removed(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection_removed"):
+            source_node.after_outgoing_connection_removed(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection_removed(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection_removed"):
+            target_node.after_incoming_connection_removed(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" deleted.'
 
@@ -1756,6 +1768,7 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 include_existing_subflow_in_group=True,
+                values_supplied_by_connections=self._package_parameters_fed_by_connections(node),
             )
             serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request)
 
@@ -1815,6 +1828,23 @@ class FlowManager(EngineScoped):
         internal_connections.extend(connections_result)
         serialized_node_commands.extend(serialized_node_group_commands)
         return serialized_node_commands
+
+    def _package_parameters_fed_by_connections(self, node: BaseNode) -> set[str]:
+        """Names of the node's parameters whose values the packaged flow's connections will supply.
+
+        A connected input gets its value inside the rebuilt flow before its node runs: from the Start
+        node when the connection comes from outside the package, from the upstream node's output when
+        it is internal. The value the canvas node holds is overwritten either way, so the package
+        leaves it out rather than replaying it, where it would be validated against the parameter's
+        current rules and could abort the whole rebuild (issue #5889).
+
+        A locked node is the exception: its copy never runs (the paths that rebuild the package from
+        a workflow file lock it too), so nothing would feed its inputs, and a downstream node reading
+        a passthrough parameter would see the default instead of the frozen value. It keeps them all.
+        """
+        if node.lock:
+            return set()
+        return set(self.get_connections().incoming_index.get(node.name, {}))
 
     def _get_internal_connections_for_package(
         self,
@@ -4495,7 +4525,10 @@ class FlowManager(EngineScoped):
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
         if set_parameter_value_result.failed():
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}'."
+            msg = (
+                f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
+                f"{set_parameter_value_result.result_details}"
+            )
             raise FlowDeserializationError(msg)
 
     async def start_flow(

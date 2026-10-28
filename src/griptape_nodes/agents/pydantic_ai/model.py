@@ -12,7 +12,6 @@ flow through the standard client.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -20,9 +19,9 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from griptape_nodes.drivers.cloud_credentials import (
-    BASE_URL_SETTING_NAME,
-    DEFAULT_CLOUD_BASE_URL,
     MISSING_CREDENTIAL_MESSAGE,
+    join_cloud_url,
+    resolve_cloud_base_url,
     resolve_cloud_credential,
 )
 from griptape_nodes.drivers.cloud_models import (
@@ -59,8 +58,7 @@ def build_griptape_cloud_model(
             License, then the ``GT_CLOUD_API_KEY`` environment variable, per
             :func:`resolve_cloud_credential`. Sent as ``Authorization: Bearer <key>``.
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
-            the ``GT_CLOUD_BASE_URL`` environment variable, then to
-            :data:`DEFAULT_CLOUD_BASE_URL`.
+            :func:`resolve_cloud_base_url`.
         settings: Default :class:`ModelSettings` for the returned model. ``None``
             falls back to the catalog preset for ``model_name`` via
             :func:`model_settings_for`; pass a dict to override it. Without
@@ -84,10 +82,10 @@ def build_griptape_cloud_model(
         # ModelSettings fields there and asserted in the catalog's tests, so this
         # is the boundary where that guarantee becomes the static type.
         resolved_settings = cast("ModelSettings", preset) if preset is not None else None
-    cloud_root = (base_url or os.environ.get(BASE_URL_SETTING_NAME, DEFAULT_CLOUD_BASE_URL)).rstrip("/")
+    cloud_root = base_url or resolve_cloud_base_url()
     return OpenAIChatModel(
         model_name,
-        provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
+        provider=OpenAIProvider(base_url=join_cloud_url(cloud_root, "/api/v1"), api_key=resolved_key),
         settings=_with_request_timeout(resolved_settings),
     )
 

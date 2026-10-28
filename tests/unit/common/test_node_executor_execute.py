@@ -52,8 +52,6 @@ def _make_node(
     # None of these values are held, so the egress pass must not treat them as parkable. A MagicMock
     # parameter answers truthy to is_process_local, which would swap every value for a mock key.
     node.get_parameter_by_name.return_value = None
-    # No lists, so what is dispatched is the values themselves.
-    node._list_rows.values_for_dispatch.side_effect = lambda: dict(node.parameter_values)
     return node
 
 
@@ -95,7 +93,8 @@ class TestExecuteDispatchContract:
         assert request.node_name == "Greeter"
 
     @pytest.mark.asyncio
-    async def test_dispatches_current_parameter_values(self) -> None:
+    async def test_dispatches_no_values_since_the_node_already_holds_them(self) -> None:
+        """The handler reads the node's own values, and fills them in itself when it forwards to a worker."""
         node = _make_node(parameter_values={"in": "hi", "n": 3})
 
         executor = _make_executor()
@@ -104,26 +103,8 @@ class TestExecuteDispatchContract:
         await executor.execute(node)
 
         request = mock_engine.ahandle_request.call_args.args[0]
-        assert request.parameter_values == {"in": "hi", "n": 3}
-
-    @pytest.mark.asyncio
-    async def test_dispatched_parameter_values_are_independent_copy(self) -> None:
-        """Mutating node.parameter_values after dispatch must not leak into the request."""
-        node = _make_node(parameter_values={"in": "hi"})
-        captured: dict[str, Any] = {}
-
-        async def capture(req: Any) -> ExecuteNodeResultSuccess:
-            # Mutate the node's live dict; the request's snapshot must not change.
-            node.parameter_values["in"] = "MUTATED"
-            captured["params"] = req.parameter_values
-            return _success_result()
-
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=capture)
-        await executor.execute(node)
-
-        assert captured["params"] == {"in": "hi"}
+        assert request.parameter_values == {}
+        assert request.element_modification_commands == []
 
     @pytest.mark.asyncio
     async def test_dispatches_node_metadata(self) -> None:

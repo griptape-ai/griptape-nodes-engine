@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -104,7 +105,7 @@ class GetWorkflowContextFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class EnsureWorkflowAndFlowRequest(RequestPayload):
+class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     """Ensure a workflow + flow context exists, creating scratch ones if needed.
 
     Use when: Bootstrapping from a cold engine state. This is the typical opening call from

@@ -414,7 +414,6 @@ class NodeExecutor(EngineScoped):
             result = await self.engine.ahandle_request(
                 ExecuteNodeRequest(
                     node_name=node.name,
-                    parameter_values=node._list_rows.values_for_dispatch(),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
                     local_object_source=node.local_object_source,
