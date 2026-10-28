@@ -553,14 +553,8 @@ class TestConditions:
                 lambda: ParameterVideo(name="p", pre_run_validators=[MaxFileSize(1).when(_no_image_read)]),
                 "checks image, and the parameter holds video",
             ),
-            (
-                lambda: Parameter(
-                    name="p", type="list[ImageUrlArtifact]", pre_run_validators=[MaxCount(2).when(_no_image_read)]
-                ),
-                "checks the whole list and reads media",
-            ),
         ],
-        ids=["conditional", "first-of-depends-on", "whole-list-on-single", "condition-reads", "whole-list-reads"],
+        ids=["conditional", "first-of-depends-on", "whole-list-on-single", "condition-reads"],
     )
     def test_the_build_time_fit_check_sees_through_wrappers(self, build: Any, match: str) -> None:
         with pytest.raises(TypeError, match=match):

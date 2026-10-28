@@ -332,12 +332,6 @@ def require_validators_fit(parameter: Parameter) -> None:
                     "Failed because it checks a list, and the parameter holds a single value."
                 )
                 raise TypeError(msg)
-            if validator.checks_whole_list and validator.needs:
-                msg = (
-                    f"Attempted to add {name} to parameter '{parameter.name}'. "
-                    "Failed because it checks the whole list and reads media, which is read per item, not per list."
-                )
-                raise TypeError(msg)
             if not validator.needs:
                 continue
             if kind is None:
