@@ -99,7 +99,7 @@ Every transport carries the same requests: the ones the editor sends to create n
 - `request_type` names the request, and `request` holds its fields. For example, `StartFlowRequest` with `{}` runs the flow that's currently open, and `ListFlowsInCurrentContextRequest` lists the flows you can name instead.
 - `request_id` is any string you choose. The result carries it back so you can match the two.
 - `response_topic` is where the result is sent. Choose a name for your program and listen on it (see the next section).
-- `workflow_id` is optional. It names the open workflow the request runs in, and the result carries it back. Workflow ids last only until the engine restarts: the `engine_run_id` that `EngineHeartbeatRequest` reports changes on every restart, so when it changes, drop the ids you kept. Requests about saved workflows name them by name or path, not by id.
+- `workflow_id` is optional. It names the open workflow the request runs in, and the result carries it back. If no open workflow has that id, the request fails with `WorkflowNotOpenResultFailure` and does nothing. Leave it out to act on the workflow that's open. Workflow ids last only until the engine restarts: the `engine_run_id` that `EngineHeartbeatRequest` reports changes on every restart, so when it changes, drop the ids you kept. Requests about saved workflows name them by name or path, not by id.
 
 [Retained Mode Scripting](../development/retained_mode.md) describes the same operations from Python inside the editor.
 
