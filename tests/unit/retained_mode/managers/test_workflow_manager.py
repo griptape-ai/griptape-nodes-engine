@@ -31,7 +31,12 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails, ResultPayload
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineInitializationProgress,
+    InitializationPhase,
+    InitializationStatus,
+)
+from griptape_nodes.retained_mode.events.base_events import AppEvent, RequestPayload, ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
@@ -106,6 +111,7 @@ from griptape_nodes.retained_mode.managers.workflow.shape import (
 )
 from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
+    WorkflowRegistrationProgressReporter,
 )
 
 
@@ -1828,6 +1834,57 @@ class TestWorkflowManager:
 
         assert len(result.succeeded) == file_count
         assert list_libraries_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registration_scan_throttles_progress_but_keeps_failures_and_final(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A scan sends far fewer progress events than two per file, but never drops a failure or the end.
+
+        Clients list failed items from the failure events and leave their loading state on the
+        final one, so those two must survive throttling. The interval is made huge so every
+        other event falls inside it, whatever the machine's speed.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        file_count = 20
+        for index in range(file_count):
+            (tmp_path / f"workflow_{index:02}.py").write_text(
+                _valid_workflow_source(f"workflow_{index:02}"), encoding="utf-8"
+            )
+
+        original_process = workflow_manager._process_single_workflow_file
+
+        async def fail_one(workflow_file: Path, **kwargs: Any) -> str | None:
+            if workflow_file.name == "workflow_07.py":
+                return None
+            return await original_process(workflow_file, **kwargs)
+
+        sent: list[EngineInitializationProgress] = []
+
+        def record(event: Any) -> None:
+            if isinstance(event, AppEvent) and isinstance(event.payload, EngineInitializationProgress):
+                sent.append(event.payload)
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.workflow_manager.WORKFLOW_PROGRESS_MIN_INTERVAL_S", 3600),
+            patch.object(workflow_manager, "_process_single_workflow_file", side_effect=fail_one),
+            patch.object(engine.event_manager, "put_event", side_effect=record),
+        ):
+            result = await workflow_manager._process_workflows_for_registration([str(tmp_path)])
+
+        assert len(result.succeeded) == file_count - 1
+        assert len(result.failed) == 1
+        # Scan order isn't fixed, so the failure may itself be the final event: two or three events.
+        assert len(sent) <= 3  # noqa: PLR2004
+        assert (sent[0].status, sent[0].current) == (InitializationStatus.LOADING, 1)
+        assert sent[-1].current == file_count
+        assert sent[-1].status != InitializationStatus.LOADING
+        failures = [p for p in sent if p.status == InitializationStatus.FAILED]
+        assert [(p.item_name, p.error) for p in failures] == [("workflow_07.py", "Failed to process workflow file")]
+        assert all(p.phase == InitializationPhase.WORKFLOWS and p.total == file_count for p in sent)
 
     @pytest.mark.parametrize(
         ("file_name", "source"),
@@ -6260,3 +6317,62 @@ class TestNodeLibraryDelegates:
         ) as extract_mock:
             assert workflow_manager.extract_workflow_shape("wf", flow_name="f") == {"x": 1}
         extract_mock.assert_called_once_with(engine.flow_manager, "wf", "f")
+
+
+class TestWorkflowRegistrationProgressReporter:
+    """Throttling rules for workflow-registration progress events."""
+
+    @staticmethod
+    def _reporter(total: int, times: list[float]) -> tuple[WorkflowRegistrationProgressReporter, list[Any]]:
+        sent: list[Any] = []
+        clock_values = iter(times)
+        reporter = WorkflowRegistrationProgressReporter(
+            lambda event: sent.append(event.payload), total, min_interval_s=0.1, clock=lambda: next(clock_values)
+        )
+        return reporter, sent
+
+    def test_sends_first_event_then_drops_events_inside_the_interval(self) -> None:
+        reporter, sent = self._reporter(total=10, times=[0.0, 0.05, 0.09])
+        reporter.report(item_name="a.py", status=InitializationStatus.LOADING, current=1)
+        reporter.report(item_name="a.py", status=InitializationStatus.COMPLETE, current=1)
+        reporter.report(item_name="b.py", status=InitializationStatus.LOADING, current=2)
+        assert [(p.item_name, p.status) for p in sent] == [("a.py", InitializationStatus.LOADING)]
+
+    def test_sends_again_once_the_interval_has_passed(self) -> None:
+        reporter, sent = self._reporter(total=10, times=[0.0, 0.05, 0.1, 0.15, 0.25])
+        for current, t in enumerate([0.0, 0.05, 0.1, 0.15, 0.25], start=1):
+            reporter.report(item_name=f"{t}.py", status=InitializationStatus.COMPLETE, current=current)
+        assert [p.current for p in sent] == [1, 3, 5]
+
+    def test_always_sends_failures(self) -> None:
+        reporter, sent = self._reporter(total=10, times=[0.0, 0.01, 0.02])
+        reporter.report(item_name="a.py", status=InitializationStatus.LOADING, current=1)
+        reporter.report(item_name="a.py", status=InitializationStatus.FAILED, current=1, error="boom")
+        reporter.report(item_name="b.py", status=InitializationStatus.FAILED, current=2, error="bang")
+        assert [(p.item_name, p.status, p.error) for p in sent] == [
+            ("a.py", InitializationStatus.LOADING, None),
+            ("a.py", InitializationStatus.FAILED, "boom"),
+            ("b.py", InitializationStatus.FAILED, "bang"),
+        ]
+
+    def test_always_sends_the_final_event_but_not_the_final_loading_event(self) -> None:
+        reporter, sent = self._reporter(total=2, times=[0.0, 0.01, 0.02, 0.03])
+        reporter.report(item_name="a.py", status=InitializationStatus.LOADING, current=1)
+        reporter.report(item_name="a.py", status=InitializationStatus.COMPLETE, current=1)
+        reporter.report(item_name="b.py", status=InitializationStatus.LOADING, current=2)
+        reporter.report(item_name="b.py", status=InitializationStatus.COMPLETE, current=2)
+        assert [(p.current, p.status) for p in sent] == [
+            (1, InitializationStatus.LOADING),
+            (2, InitializationStatus.COMPLETE),
+        ]
+
+    def test_events_carry_the_workflow_phase_and_total(self) -> None:
+        reporter, sent = self._reporter(total=3, times=[0.0])
+        reporter.report(item_name="a.py", status=InitializationStatus.LOADING, current=1)
+        assert sent[0] == EngineInitializationProgress(
+            phase=InitializationPhase.WORKFLOWS,
+            item_name="a.py",
+            status=InitializationStatus.LOADING,
+            current=1,
+            total=3,
+        )

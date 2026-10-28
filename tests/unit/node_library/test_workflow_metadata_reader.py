@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.node_library.workflow_registry import (
+    _METADATA_BLOCK_PATTERN,
     METADATA_TABLE_PATH,
     WorkflowMetadataError,
     WorkflowMetadataFileError,
@@ -59,6 +60,48 @@ class TestFindMetadataBlocks:
 
     def test_no_block_at_all(self) -> None:
         assert find_metadata_blocks("print('hello')\n", "script") == []
+
+    def test_finds_every_block(self) -> None:
+        content = _header() + "print('body')\n" + _header(name='"second"')
+
+        matches = find_metadata_blocks(content, "script")
+
+        assert [m.span() for m in matches] == [m.span() for m in _METADATA_BLOCK_PATTERN.finditer(content)]
+        assert len(matches) == 2  # noqa: PLR2004
+
+    def test_matches_finditer_for_back_to_back_blocks(self) -> None:
+        # The body pattern is greedy, so a block directly followed by another swallows it.
+        content = "# /// other\n# a = 1\n# ///\n" + _header()
+
+        matches = find_metadata_blocks(content, "other")
+
+        assert [m.span() for m in matches] == [m.span() for m in _METADATA_BLOCK_PATTERN.finditer(content)]
+        assert find_metadata_blocks(content, "script") == []
+
+    def test_ignores_block_nested_in_another_blocks_body(self) -> None:
+        # The "# /// script" line is body text of the outer block, so finditer never reports it.
+        content = "# /// outer\n# /// script\n# a = 1\n# ///\n"
+
+        assert find_metadata_blocks(content, "script") == []
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("  # /// script\n# a = 1\n# ///\n", id="indented opener"),
+            pytest.param("x = '# /// script'\n# a = 1\n# ///\n", id="opener mid-line"),
+            pytest.param("# /// script\n# a = 1\n", id="no closing line"),
+            pytest.param("#/// script\n# a = 1\n# ///\n", id="no space after hash"),
+        ],
+    )
+    def test_ignores_malformed_openers(self, content: str) -> None:
+        assert find_metadata_blocks(content, "script") == []
+
+    def test_matches_finditer_on_large_body(self) -> None:
+        content = _header() + "data = '" + "x" * 300_000 + "'\n# not a block\n# /// stray\n"
+
+        matches = find_metadata_blocks(content, "script")
+
+        assert [m.span() for m in matches] == [m.span() for m in _METADATA_BLOCK_PATTERN.finditer(content)]
 
 
 class TestReadWorkflowMetadata:

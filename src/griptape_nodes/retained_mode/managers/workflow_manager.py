@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -110,6 +111,62 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+# Minimum gap between workflow-registration progress events. Each workflow used to send two
+# events, so a 500-workflow scan put ~1,000 messages on the websocket ahead of the request's own
+# result. Ten updates a second is still smooth for a progress readout.
+WORKFLOW_PROGRESS_MIN_INTERVAL_S = 0.1
+
+
+class WorkflowRegistrationProgressReporter:
+    """Sends workflow-registration progress events, at most one per interval.
+
+    Two kinds of event always go out, because clients depend on each one: a failure (clients list
+    the failed items) and the scan's final event (clients end their loading state on it). Anything
+    else is dropped if the previous event went out less than ``min_interval_s`` ago.
+    """
+
+    def __init__(
+        self,
+        put_event: Callable[[AppEvent], None],
+        total: int,
+        *,
+        min_interval_s: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._put_event = put_event
+        self._total = total
+        # Resolved here rather than as defaults so the module constant can be patched in tests.
+        self._min_interval_s = WORKFLOW_PROGRESS_MIN_INTERVAL_S if min_interval_s is None else min_interval_s
+        self._clock = clock or time.monotonic
+        self._last_sent_at: float | None = None
+
+    def report(
+        self,
+        *,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        error: str | None = None,
+    ) -> None:
+        is_final = current >= self._total and status != InitializationStatus.LOADING
+        must_send = is_final or status == InitializationStatus.FAILED
+        now = self._clock()
+        if not must_send and self._last_sent_at is not None and now - self._last_sent_at < self._min_interval_s:
+            return
+        self._last_sent_at = now
+        self._put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=self._total,
+                    error=error,
+                )
+            )
+        )
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -940,7 +997,7 @@ class WorkflowManager(EngineScoped):
                 ),
             )
 
-    async def _process_workflows_for_registration(  # noqa: C901
+    async def _process_workflows_for_registration(  # noqa: C901, PLR0915
         self, workflows_to_register: list[str]
     ) -> WorkflowRegistrationResult:
         """Process a list of workflow paths for registration.
@@ -970,8 +1027,24 @@ class WorkflowManager(EngineScoped):
         # existing per-failure-type error reporting runs unchanged for them.
         parsed_metadata_by_file: dict[Path, WorkflowMetadata] = {}
 
+        # _____TEST____ temporary diagnostics: where does the scan spend its time?
+        test_scan_start = time.perf_counter()
+        test_walk_ms = 0.0
+        test_py_files_seen = 0
+        test_bytes_read = 0
+        test_classify_times: list[tuple[float, int, Path]] = []
+
         def try_parse_workflow_metadata(workflow_file: Path) -> None:
+            nonlocal test_py_files_seen, test_bytes_read
+            test_py_files_seen += 1
+            try:
+                test_size = workflow_file.stat().st_size
+            except OSError:
+                test_size = -1
+            test_bytes_read += max(test_size, 0)
+            test_classify_start = time.perf_counter()
             candidate = self._classify_workflow_candidate(workflow_file)
+            test_classify_times.append(((time.perf_counter() - test_classify_start) * 1000, test_size, workflow_file))
             if not candidate.is_workflow:
                 return
             all_workflow_files.add(workflow_file)
@@ -984,12 +1057,21 @@ class WorkflowManager(EngineScoped):
             if not await apath.exists():
                 return
             if await apath.is_dir():
+                nonlocal test_walk_ms
                 # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await find_files_recursive(
+                test_walk_start = time.perf_counter()
+                test_found_files = await find_files_recursive(
                     path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
-                ):
+                )
+                test_walk_ms += (time.perf_counter() - test_walk_start) * 1000
+                logger.info(
+                    "_____TEST____ [project-switch] scan walk of %s found %d .py files",
+                    path,
+                    len(test_found_files),
+                )
+                for workflow_file in test_found_files:
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
@@ -1010,6 +1092,28 @@ class WorkflowManager(EngineScoped):
         # Track progress
         total_workflows = len(all_workflow_files)
 
+        test_scan_ms = (time.perf_counter() - test_scan_start) * 1000
+        logger.info(
+            "_____TEST____ [project-switch] scan pass 1 took %.0fms (folder walk %.0fms, reading/parsing %.0fms): "
+            "%d .py files read (%.1f MB), %d are workflows (%d parsed cleanly)",
+            test_scan_ms,
+            test_walk_ms,
+            sum(t for t, _, _ in test_classify_times),
+            test_py_files_seen,
+            test_bytes_read / 1_000_000,
+            total_workflows,
+            len(parsed_metadata_by_file),
+        )
+        for test_ms, test_size, test_file in sorted(test_classify_times, key=lambda x: x[0], reverse=True)[:5]:
+            logger.info(
+                "_____TEST____ [project-switch]   slowest read: %.1fms, %.1f KB, %s",
+                test_ms,
+                test_size / 1000,
+                test_file,
+            )
+        test_pass2_start = time.perf_counter()
+        test_register_times: list[tuple[float, Path]] = []
+
         # The registered-library set can't change mid-scan, so fetch it once here instead of
         # once per file. Every caller reaches this scan after library loading has already
         # completed, so this wait doesn't block.
@@ -1025,57 +1129,38 @@ class WorkflowManager(EngineScoped):
             registered_libraries = []
 
         # Second pass: process each workflow file with progress events
+        progress = WorkflowRegistrationProgressReporter(self.engine.event_manager.put_event, total_workflows)
         for current_index, workflow_file in enumerate(all_workflow_files, start=1):
             workflow_name = str(workflow_file.name)
+            progress.report(item_name=workflow_name, status=InitializationStatus.LOADING, current=current_index)
 
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
-
-            # Process the workflow
+            test_register_start = time.perf_counter()
             result_name = await self._process_single_workflow_file(
                 workflow_file,
                 pre_parsed_metadata=parsed_metadata_by_file.get(workflow_file),
                 registered_libraries=registered_libraries,
             )
+            test_register_times.append(((time.perf_counter() - test_register_start) * 1000, workflow_file))
             if result_name:
                 succeeded.append(result_name)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
+                progress.report(item_name=workflow_name, status=InitializationStatus.COMPLETE, current=current_index)
             else:
                 failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
+                progress.report(
+                    item_name=workflow_name,
+                    status=InitializationStatus.FAILED,
+                    current=current_index,
+                    error="Failed to process workflow file",
                 )
+
+        logger.info(
+            "_____TEST____ [project-switch] scan pass 2 (register) took %.0fms for %d workflows, %d failed",
+            (time.perf_counter() - test_pass2_start) * 1000,
+            total_workflows,
+            len(failed),
+        )
+        for test_ms, test_file in sorted(test_register_times, key=lambda x: x[0], reverse=True)[:5]:
+            logger.info("_____TEST____ [project-switch]   slowest register: %.1fms, %s", test_ms, test_file)
 
         return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
 

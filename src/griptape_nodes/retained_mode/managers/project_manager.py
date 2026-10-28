@@ -8,6 +8,7 @@ import os
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -3146,6 +3147,11 @@ class ProjectManager(EngineScoped):
         activation lands back on the fallback on_app_initialization_complete
         expects; the failure is still returned to the caller.
         """
+        handler_start = time.perf_counter()
+        logger.info(
+            "_____TEST____ [project-switch] SetCurrentProjectRequest handler entered at %s",
+            datetime.now(UTC).isoformat(timespec="milliseconds"),
+        )
         # Remember the project that was active before this switch so a failed
         # activation can roll back to it. SYSTEM_DEFAULTS_KEY is a valid target.
         previous_project_id = self._current_project_id
@@ -3230,7 +3236,17 @@ class ProjectManager(EngineScoped):
             # and a worker that has not yet adopted would run it against the old workspace.
             # The queued copy above passes through these listeners a second time; the workers'
             # generation guard skips that pass (or retries an adoption that failed here).
+            broadcast_start = time.perf_counter()
             await self._event_manager.abroadcast_app_event(changed)
+            logger.info(
+                "_____TEST____ [project-switch] CurrentProjectChanged worker broadcast took %.0fms",
+                (time.perf_counter() - broadcast_start) * 1000,
+            )
+        logger.info(
+            "_____TEST____ [project-switch] SetCurrentProjectRequest handler total %.0fms, returning at %s",
+            (time.perf_counter() - handler_start) * 1000,
+            datetime.now(UTC).isoformat(timespec="milliseconds"),
+        )
         return result
 
     def _refuse_unresolvable_declared_paths(

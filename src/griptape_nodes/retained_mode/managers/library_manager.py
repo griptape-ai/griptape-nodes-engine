@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -278,10 +279,20 @@ class LibraryManager(EngineScoped):
         # is in flight on the current loop.
         self._close_libraries_loading_gate()
         try:
+            test_phase_start = time.perf_counter()
             reconcile_failures = await self.provisioning.reconcile_libraries_from_config()
+            logger.info(
+                "_____TEST____ [project-switch] library reconcile (git provisioning) took %.0fms",
+                (time.perf_counter() - test_phase_start) * 1000,
+            )
 
             # Discover all available libraries (config + sandbox)
+            test_phase_start = time.perf_counter()
             discover_result = await self.discovery.discover_libraries_request(DiscoverLibrariesRequest())
+            logger.info(
+                "_____TEST____ [project-switch] library discovery took %.0fms",
+                (time.perf_counter() - test_phase_start) * 1000,
+            )
             if isinstance(discover_result, DiscoverLibrariesResultFailure):
                 logger.error("Failed to discover libraries: %s", discover_result.result_details)
                 return reconcile_failures
@@ -325,7 +336,13 @@ class LibraryManager(EngineScoped):
                 ):
                     continue
 
+                test_phase_start = time.perf_counter()
                 await self._load_and_track_library(lib_path, current_library_index, total_libraries)
+                logger.info(
+                    "_____TEST____ [project-switch] library load took %.0fms: %s",
+                    (time.perf_counter() - test_phase_start) * 1000,
+                    lib_path,
+                )
 
             # Remove any missing libraries AFTER we've loaded them for the user. Not when the
             # environment provides the libraries: the config's entries were not what loaded, and a
