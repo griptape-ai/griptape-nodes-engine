@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-import griptape_nodes.exe_types.validators as validators_package
+from griptape_nodes.exe_types import validators as validators_package
 from griptape_nodes.exe_types.validators import base, common, media
 
 if TYPE_CHECKING:
