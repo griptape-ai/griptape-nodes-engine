@@ -1,4 +1,4 @@
-"""Unit tests for _build_sequence_destination_from_situation."""
+"""Unit tests for ProjectFileSequenceParameter and _build_sequence_destination_from_situation."""
 
 from unittest import mock
 
@@ -248,3 +248,26 @@ class TestBuildSequenceDestinationFromSituation:
         assert macro_path.variables["sub_dirs"] == "pass_1"
         assert macro_path.variables["file_name_base"] == "render"
         assert macro_path.variables["file_extension"] == "exr"
+
+
+def _built_filename(value: object) -> str:
+    """Run build_sequence with the given parameter value and return the filename it saves under."""
+    mock_node = mock.MagicMock()
+    mock_node.get_parameter_value.return_value = value
+    param = project_file_sequence_parameter.ProjectFileSequenceParameter(
+        mock_node, "output_sequence", default_filename="render.exr"
+    )
+    with (
+        mock.patch.object(param, "_get_upstream_destination", return_value=None),
+        mock.patch.object(project_file_sequence_parameter, "_build_sequence_destination_from_situation") as build,
+    ):
+        param.build_sequence()
+    return build.call_args.args[0]
+
+
+class TestBuildSequence:
+    def test_adds_default_extension_when_value_has_none(self) -> None:
+        assert _built_filename("render_####") == "render_####.exr"
+
+    def test_keeps_value_extension(self) -> None:
+        assert _built_filename("render_####.png") == "render_####.png"
