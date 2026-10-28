@@ -12,6 +12,7 @@ thing that should read it. Everything else receives its dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -25,6 +26,7 @@ import semver
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
 from griptape_nodes.retained_mode.engine_lifecycle import EngineLifecycle
+from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     EngineHeartbeatRequest,
@@ -50,6 +52,7 @@ from griptape_nodes.utils.version_utils import engine_version
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from griptape_nodes.retained_mode.engine_transports import EngineTransports
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
         RequestPayload,
@@ -259,6 +262,8 @@ class Engine:
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
         self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
+        # Attached by the app; None while this engine cannot reach other engines.
+        self._engine_transports: EngineTransports | None = None
         self._lifecycle = EngineLifecycle(self)
         self._event_manager.add_listener_to_app_event(
             AppInitializationComplete, self._lifecycle.on_app_initialization_complete
@@ -557,6 +562,41 @@ class Engine:
     def get_engine_id(self) -> str | None:
         return self._engine_identity_manager.active_engine_id
 
+    @property
+    def can_reach_other_engines(self) -> bool:
+        """Whether the app gave this engine a way to reach other engines."""
+        return self._engine_transports is not None
+
+    def attach_engine_transports(self, engine_transports: EngineTransports) -> None:
+        """Give this engine the app's transport to other engines. The app attaches it at startup."""
+        self._engine_transports = engine_transports
+        engine_transports.on_engine_lost(self._on_engine_lost)
+
+    async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+        """Send `request` to the engine `engine_id`, wherever it runs, and return its result.
+
+        The app finds that engine and chooses how to reach it.
+
+        Raises:
+            EngineNotFoundError: The engine cannot be reached, did not answer within `timeout_s`,
+                or this engine has no way to reach other engines.
+        """
+        if self._engine_transports is None:
+            msg = f"Attempted to reach engine {engine_id}. Failed because this engine has no connections to other engines."
+            raise EngineNotFoundError(msg)
+        return await self._engine_transports.request(engine_id, request, timeout_s=timeout_s)
+
+    def hosted_worker_environment(self, engine_id: str) -> dict[str, str]:
+        """The environment a worker this engine runs for `engine_id` needs to reach that engine.
+
+        Raises:
+            EngineNotFoundError: This engine has no way to reach other engines.
+        """
+        if self._engine_transports is None:
+            msg = f"Attempted to start a worker for engine {engine_id}. Failed because this engine has no connections to other engines."
+            raise EngineNotFoundError(msg)
+        return self._engine_transports.hosted_worker_environment(engine_id)
+
     def clear_current_workflow_data(self) -> None:  # noqa: C901
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
@@ -670,6 +710,20 @@ class Engine:
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
+
+    async def _on_engine_lost(self, engine_id: str) -> None:
+        """Settle what a lost engine left behind, on the engine loop.
+
+        The transport reports a lost connection from its own loop, but the worker state this changes is
+        written by request handlers on the engine loop.
+        """
+        engine_loop = self._event_manager.event_loop
+        if engine_loop is None:
+            await self._worker_manager.on_engine_lost(engine_id)
+            return
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._worker_manager.on_engine_lost(engine_id), engine_loop)
+        )
 
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.
