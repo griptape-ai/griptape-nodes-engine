@@ -6474,6 +6474,66 @@ situations:
         assert cast("Mock", pm._config_manager).set_config_value.call_count == 0
 
     @pytest.mark.asyncio
+    async def test_missing_registration_can_be_removed(self, pm: ProjectManager, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, ReadFileResultFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            UnregisterProjectTemplateRequest,
+            UnregisterProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        path = (tmp_path / "missing.yml").resolve()
+        config = cast("Mock", pm._config_manager)
+        config.get_config_value.return_value = [str(path)]
+        mock_engine = MagicMock()
+        mock_engine.ahandle_request = AsyncMock(
+            return_value=ReadFileResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="file not found"
+            )
+        )
+        with patch.object(pm, "_engine", mock_engine):
+            await pm._load_registered_projects()
+            result = pm.on_unregister_project_template_request(UnregisterProjectTemplateRequest(project_id=str(path)))
+
+        assert isinstance(result, UnregisterProjectTemplateResultSuccess)
+        assert path not in pm._registered_template_status
+        assert path not in pm._warned_registered_project_paths
+        config.set_config_value.assert_called_once_with(PROJECTS_TO_REGISTER_KEY, [])
+
+    @pytest.mark.asyncio
+    async def test_recovered_registration_can_warn_again(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            ReadFileResultFailure,
+            ReadFileResultSuccess,
+        )
+
+        path = (tmp_path / "project.yml").resolve()
+        cast("Mock", pm._config_manager).get_config_value.return_value = [str(path)]
+        mock_engine = MagicMock()
+        missing = ReadFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="not found")
+        content = self.VALID_PROJECT_YAML
+        present = ReadFileResultSuccess(
+            content=content, file_size=len(content), mime_type="text/plain", encoding="utf-8", result_details="ok"
+        )
+        mock_engine.ahandle_request = AsyncMock(side_effect=[missing, present, present, missing])
+        cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+        with patch.object(pm, "_engine", mock_engine), caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            await pm._load_registered_projects()
+            await pm._load_registered_projects()
+            assert path not in pm._warned_registered_project_paths
+            pm._successfully_loaded_project_templates.pop(str(path))
+            await pm._load_registered_projects()
+
+        warnings = [
+            record.message for record in caplog.records if "Failed to load registered project" in record.message
+        ]
+        expected_warnings = 2
+        assert len(warnings) == expected_warnings
+
+    @pytest.mark.asyncio
     async def test_app_initialization_complete_loads_registered_projects(
         self, pm: ProjectManager, tmp_path: Path
     ) -> None:
