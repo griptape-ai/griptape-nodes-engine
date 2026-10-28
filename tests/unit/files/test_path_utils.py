@@ -102,10 +102,19 @@ class TestWithDefaultExtension:
         """A trailing dot after an extension is dropped rather than kept as an empty suffix."""
         assert with_default_extension("shot.jpg.", "image.png") == "shot.jpg"
 
-    @pytest.mark.parametrize("file_name", ["", ".", "..", "/", "./", "renders/", "file:///", "file:///C:/"])
-    def test_unchanged_when_value_names_no_file(self, file_name: str) -> None:
-        """A value naming no file is left for the save path to refuse or route."""
-        assert with_default_extension(file_name, "image.png") == file_name
+    @pytest.mark.parametrize("file_name", ["bedroom. ", "bedroom .", "bedroom "])
+    def test_drops_trailing_dots_and_spaces(self, file_name: str) -> None:
+        """Trailing spaces are dropped along with trailing dots."""
+        assert with_default_extension(file_name, "image.png") == "bedroom.png"
+
+    @pytest.mark.parametrize(
+        "file_name",
+        ["", ".", "..", "/", "./", "renders/", "renders/..", "renders\\..", "renders/. ", "file:///", "file:///C:/"],
+    )
+    def test_raises_when_value_names_no_file(self, file_name: str) -> None:
+        """A value whose last component is empty or only dots names a folder, not a file."""
+        with pytest.raises(ValueError, match="names a folder"):
+            with_default_extension(file_name, "image.png")
 
     def test_without_default_extension_only_drops_trailing_dot(self) -> None:
         """With no default extension to borrow, only the trailing dot is dropped."""
