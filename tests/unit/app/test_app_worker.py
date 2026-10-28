@@ -2737,6 +2737,18 @@ class TestStartingAWorkerOnAnotherEngine:
         assert links.sent == []
 
     @pytest.mark.asyncio
+    async def test_a_library_assigned_to_this_engine_spawns_here(self, worker_manager: WorkerManager) -> None:
+        """As when engines that share a workspace share its config file."""
+        links = _host_engine(worker_manager)
+        worker_manager.engine.get_engine_id.return_value = _HOST_ENGINE  # type: ignore[union-attr]
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            await _start_on_host_engine(worker_manager)
+
+        spawn.assert_awaited_once()
+        assert links.sent == []
+
+    @pytest.mark.asyncio
     async def test_a_start_withdrawn_while_the_engine_answers_tells_it_to_stop_that_worker(
         self, worker_manager: WorkerManager
     ) -> None:

@@ -1726,9 +1726,16 @@ class WorkerManager(EngineScoped):
         )
 
     def _engine_for_library(self, library_name: str) -> str | None:
-        """The ID of the engine the distribution settings send `library_name` to, or None for here."""
+        """The ID of the engine the distribution settings send `library_name` to, or None for here.
+
+        Settings that name this engine mean here too, as when engines that share a workspace share its
+        config file.
+        """
         libraries = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_LIBRARIES_KEY, default={})
-        return libraries.get(library_name)
+        engine_id = libraries.get(library_name)
+        if engine_id is None or engine_id == self.engine.get_engine_id():
+            return None
+        return engine_id
 
     async def _spawn_general_purpose_worker_when_session_ready(self) -> None:
         """Wait for an active session, then spawn the general-purpose worker.

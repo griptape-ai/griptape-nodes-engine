@@ -325,7 +325,7 @@ class EventRequest[P: Payload](BaseEvent):
     request_id: str | None = None
     response_topic: str | None = None
     # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
-    # `current_request_sender()`.
+    # `require_request_sender()`.
     sender: RequestSender | None = None
 
     def __init__(self, **data) -> None:
