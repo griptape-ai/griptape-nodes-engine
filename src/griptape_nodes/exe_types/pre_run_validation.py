@@ -1,6 +1,6 @@
 """Running a node's pre-run checks at its turn, before it runs.
 
-The resolution machine calls `run_pre_run_checks`, which runs the node's declared validators and then
+The resolution machine calls `validate_node`, which runs the node's declared validators and then
 its `validate_before_node_run`, inside one `input_check_budget` and one `input_check_readings`. It
 returns both methods' errors together, and names each input whose video or audio took too long to
 read, so the machine can tell the user it wasn't checked.
@@ -28,12 +28,12 @@ if TYPE_CHECKING:
     from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = [
-    "PreRunCheckResult",
     "UncheckedInput",
-    "run_pre_run_checks",
-    "run_pre_run_validators",
+    "ValidationResult",
     "unchecked_inputs_message",
     "unchecked_locations_by_name",
+    "validate_inputs",
+    "validate_node",
 ]
 
 # What an input is called in a message, by the kind of media its parameter holds.
@@ -51,7 +51,7 @@ class UncheckedInput(NamedTuple):
 
 
 @dataclass(frozen=True)
-class PreRunCheckResult:
+class ValidationResult:
     """What a node's pre-run checks found."""
 
     errors: list[Exception]
@@ -61,7 +61,7 @@ class PreRunCheckResult:
     file the node read itself, such as "'clip.mp4'". Empty when every input was read in time."""
 
 
-def run_pre_run_checks(node: BaseNode) -> PreRunCheckResult:
+def validate_node(node: BaseNode) -> ValidationResult:
     """Run a node's declared validators, then its `validate_before_node_run`, and collect what they found.
 
     Both run inside one `input_check_budget`, which stops their video and audio probes (they block
@@ -70,7 +70,7 @@ def run_pre_run_checks(node: BaseNode) -> PreRunCheckResult:
     """
     unchecked: list[UncheckedInput] = []
     with input_check_budget(), input_check_readings():
-        errors: list[Exception] = [*run_pre_run_validators(node, unchecked=unchecked)]
+        errors: list[Exception] = [*validate_inputs(node, unchecked=unchecked)]
         errors.extend(node.validate_before_node_run() or [])
         # The node's own checks can probe files directly; name any of those that timed out too.
         named = {entry.location for entry in unchecked}
@@ -78,10 +78,10 @@ def run_pre_run_checks(node: BaseNode) -> PreRunCheckResult:
             *(entry.subject for entry in unchecked),
             *unchecked_locations_by_name(timed_out_locations(), named),
         ]
-    return PreRunCheckResult(errors=errors, unchecked_inputs=unchecked_inputs)
+    return ValidationResult(errors=errors, unchecked_inputs=unchecked_inputs)
 
 
-def run_pre_run_validators(node: BaseNode, *, unchecked: list[UncheckedInput] | None = None) -> list[NodeError]:
+def validate_inputs(node: BaseNode, *, unchecked: list[UncheckedInput] | None = None) -> list[NodeError]:
     """Every error the node's inputs break its declared limits with, or an empty list.
 
     For each parameter with `pre_run_validators`, reads its value once, for every reading those
@@ -126,7 +126,7 @@ def unchecked_locations_by_name(timed_out: Collection[str], named: Collection[st
 
     Args:
         timed_out: Every location that timed out during the node's checks, from `timed_out_locations`.
-        named: The locations `run_pre_run_validators` already named through `unchecked`.
+        named: The locations `validate_inputs` already named through `unchecked`.
     """
     return [f"'{_file_name(location)}'" for location in sorted(set(timed_out) - set(named))]
 
@@ -135,7 +135,7 @@ def unchecked_inputs_message(inputs: Sequence[str]) -> str:
     """One sentence telling the user these inputs weren't checked before the run, and why.
 
     Args:
-        inputs: Each input's subject, as `PreRunCheckResult.unchecked_inputs` gives them, such as
+        inputs: Each input's subject, as `ValidationResult.unchecked_inputs` gives them, such as
             "The video in 'Video'".
     """
     if len(inputs) == 1:

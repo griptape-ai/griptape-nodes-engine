@@ -43,12 +43,12 @@ from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
 from griptape_nodes.exe_types.pre_run_validation import (
-    PreRunCheckResult,
     UncheckedInput,
-    run_pre_run_checks,
-    run_pre_run_validators,
+    ValidationResult,
     unchecked_inputs_message,
     unchecked_locations_by_name,
+    validate_inputs,
+    validate_node,
 )
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
 from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
@@ -99,21 +99,21 @@ class TestSingleInputs:
     def test_reports_nothing_for_a_node_without_validators(self, tmp_path: Path) -> None:
         node = _node_with(ParameterImage(name="image"))
         node.set_parameter_value("image", str(image_file(tmp_path, 10, 10)))
-        assert run_pre_run_validators(node) == []
+        assert validate_inputs(node) == []
 
     def test_names_the_input_by_its_display_name_and_kind(self, tmp_path: Path) -> None:
         node = _node_with(
             ParameterImage(name="image", display_name="Start Frame", pre_run_validators=[SideRange(min=300)])
         )
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "The image in 'Start Frame' is 200x200 and each side must be at least 300 pixels. Use a larger one."
         ]
 
     def test_falls_back_to_the_parameter_name(self, tmp_path: Path) -> None:
         node = _node_with(ParameterImage(name="image_tail", pre_run_validators=[SideRange(min=300)]))
         node.set_parameter_value("image_tail", str(image_file(tmp_path, 200, 200)))
-        (message,) = _messages(run_pre_run_validators(node))
+        (message,) = _messages(validate_inputs(node))
         assert message.startswith("The image in 'image_tail' is 200x200")
 
     def test_names_audio_as_an_audio_clip(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -123,7 +123,7 @@ class TestSingleInputs:
         monkeypatch.setattr(input_checks, "_probe_audio", lambda _location: probe)
         node = _node_with(ParameterAudio(name="voice", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("voice", str(clip))
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "The audio clip in 'voice' is 9.00 seconds long and the limit is 5. Trim it in an audio editor."
         ]
 
@@ -131,14 +131,14 @@ class TestSingleInputs:
         node = _LimitedNode(name="node")
         node.add_parameter(ParameterImage(name="image", pre_run_validators=[SideRange(min=300)]))
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
-        (error,) = run_pre_run_validators(node)
+        (error,) = validate_inputs(node)
         assert isinstance(error, NodeError)
         assert error.links
         assert error.links[0].url == DOCS
 
     def test_skips_an_empty_input(self) -> None:
         node = _node_with(ParameterImage(name="image", pre_run_validators=[SideRange(min=300)]))
-        assert run_pre_run_validators(node) == []
+        assert validate_inputs(node) == []
 
     def test_collects_every_error_from_every_parameter(self, tmp_path: Path) -> None:
         node = _node_with(
@@ -147,7 +147,7 @@ class TestSingleInputs:
         )
         node.set_parameter_value("first", str(image_file(tmp_path, 200, 100)))
         node.set_parameter_value("second", str(image_file(tmp_path, 400, 400)))
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "The image in 'first' is 200x100 and each side must be at least 300 pixels. Use a larger one.",
             "The image in 'first' is 200x100, which is too wide. The aspect ratio must be between 1:1 and 1:1. Crop it.",
             "The image in 'second' is in PNG format. Convert it to JPEG.",
@@ -163,7 +163,7 @@ class TestSingleInputs:
 
         node = _node_with(ParameterString(name="prompt", pre_run_validators=[NotEmpty()]))
         node.set_parameter_value("prompt", "   ")
-        assert _messages(run_pre_run_validators(node)) == ["The input in 'prompt' is blank. Write a prompt."]
+        assert _messages(validate_inputs(node)) == ["The input in 'prompt' is blank. Write a prompt."]
 
 
 class TestReadOnce:
@@ -198,7 +198,7 @@ class TestReadOnce:
         )
         node.set_parameter_value("video", str(clip))
         with input_check_readings():
-            messages = _messages(run_pre_run_validators(node))
+            messages = _messages(validate_inputs(node))
         assert messages == [
             "The video in 'video' is 4000x1000 and each side must be at most 2048 pixels. Resize it smaller.",
             "The video in 'video' is 4000x1000, which is too wide. The aspect ratio must be between 1:3 and 3:1. Crop it.",
@@ -211,7 +211,7 @@ class TestReadOnce:
         clip.write_bytes(b"video")
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(1)]))
         node.set_parameter_value("video", str(clip))
-        assert len(run_pre_run_validators(node)) == 1
+        assert len(validate_inputs(node)) == 1
         assert video_reads == []
 
     def test_a_node_validator_and_the_nodes_own_checks_reuse_the_reading(
@@ -241,7 +241,7 @@ class TestReadOnce:
         node.add_parameter(ParameterVideo(name="video", pre_run_validators=[Duration(max=30)]))
         node.set_parameter_value("video", str(clip))
         with input_check_readings():
-            run_pre_run_validators(node)
+            validate_inputs(node)
             local_video_probe(str(clip))
         assert video_reads == [str(clip)]
         assert len(seen) == 1
@@ -308,7 +308,7 @@ class TestLists:
         node = self._list_node(SideRange(min=300))
         images = [str(image_file(tmp_path, 400, 400)), str(image_file(tmp_path, 200, 1000))]
         node.set_parameter_value("reference_images", images)
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "Image 2 in 'reference images' is 200x1000 and each side must be at least 300 pixels. Use a larger one."
         ]
 
@@ -319,7 +319,7 @@ class TestLists:
         for size in (100, 400, 200):
             row = parameter.add_child_parameter()
             node.set_parameter_value(row.name, str(image_file(tmp_path, size, size)))
-        messages = _messages(run_pre_run_validators(node))
+        messages = _messages(validate_inputs(node))
         assert [message.split(" is ")[0] for message in messages] == [
             "Image 1 in 'reference images'",
             "Image 3 in 'reference images'",
@@ -329,7 +329,7 @@ class TestLists:
         node = self._list_node(MaxCount(2, noun="images"), SideRange(min=1))
         images = [str(image_file(tmp_path, 10 + i, 10)) for i in range(4)]
         node.set_parameter_value("reference_images", images)
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "4 images are connected to 'reference images' and the limit is 2. Remove 2."
         ]
 
@@ -345,7 +345,7 @@ class TestLists:
         images = [str(tmp_path / "a.png"), str(tmp_path / "b.png")]
         node.set_parameter_value("reference_images", images)
         with input_check_readings():
-            assert len(run_pre_run_validators(node)) == 2
+            assert len(validate_inputs(node)) == 2
         assert reads == images
 
     def test_rows_get_no_copy_of_the_lists_validators(self) -> None:
@@ -375,7 +375,7 @@ class TestPlainListParameters:
         node.set_parameter_value(
             "reference_images", [str(image_file(tmp_path, 400, 400)), None, str(image_file(tmp_path, 200, 1000))]
         )
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "Image 2 in 'reference images' is 200x1000 and each side must be at least 300 pixels. Use a larger one."
         ]
 
@@ -384,7 +384,7 @@ class TestPlainListParameters:
         node = self._node(SideRange(min=300), _Records())
         _Records.seen.clear()
         node.set_parameter_value("reference_images", value)
-        assert run_pre_run_validators(node) == []
+        assert validate_inputs(node) == []
         assert _Records.seen == []
 
 
@@ -420,7 +420,7 @@ class TestByParameter:
         node = self._node()
         node.set_parameter_value("model", model)
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
-        messages = _messages(run_pre_run_validators(node))
+        messages = _messages(validate_inputs(node))
         assert len(messages) == len(expected)
         for message, fragment in zip(messages, expected, strict=True):
             assert fragment in message
@@ -441,7 +441,7 @@ class TestByParameter:
         reads: list[str] = []
         monkeypatch.setattr(input_checks, "_read_image_info", reads.append)
         with input_check_readings():
-            assert run_pre_run_validators(node) == []
+            assert validate_inputs(node) == []
         assert reads == []
 
     def test_refuses_a_picked_validator_the_parameter_cannot_hold(self) -> None:
@@ -477,7 +477,7 @@ class TestNodeValidators:
         node.add_parameter(ParameterImage(name="second", pre_run_validators=[SideRange(min=1)]))
         node.set_parameter_value("first", str(image_file(tmp_path, 200, 200)))
         node.set_parameter_value("second", str(image_file(tmp_path, 400, 400)))
-        assert _messages(run_pre_run_validators(node)) == [
+        assert _messages(validate_inputs(node)) == [
             "The image in 'first' is 200x200 and each side must be at least 300 pixels. Use a larger one.",
             "'first' and 'second' must be the same size.",
         ]
@@ -497,7 +497,7 @@ class TestNodeValidators:
         class RuleNode(_LimitedNode):
             node_validators: ClassVar[tuple[NodeValidator, ...]] = (Always(),)
 
-        assert _messages(run_pre_run_validators(RuleNode(name="rule"))) == [f"rule refused: {DOCS}"]
+        assert _messages(validate_inputs(RuleNode(name="rule"))) == [f"rule refused: {DOCS}"]
 
 
 class TestParameterTypes:
@@ -580,7 +580,7 @@ class TestParameterTypes:
         node.set_parameter_value("prompt", "a cat")
         # Setting a value runs no pre-run validator; only the node's turn does.
         assert _Records.seen == []
-        run_pre_run_validators(node)
+        validate_inputs(node)
         assert _Records.seen == ["a cat"]
 
 
@@ -609,7 +609,7 @@ class TestUncheckedInputs:
     def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[UncheckedInput]]:
         unchecked: list[UncheckedInput] = []
         with input_check_readings():
-            errors = run_pre_run_validators(node, unchecked=unchecked)
+            errors = validate_inputs(node, unchecked=unchecked)
         return errors, unchecked
 
     def test_names_a_video_that_took_too_long(self, tmp_path: Path) -> None:
@@ -682,7 +682,7 @@ class TestUncheckedInputs:
         assert self._unchecked(node) == ([], [])
 
 
-class TestRunPreRunChecks:
+class TestValidateNode:
     """One call runs the declared validators and the node's own checks, as the engine does at its turn."""
 
     class _OwnChecks(MockNode):
@@ -705,19 +705,19 @@ class TestRunPreRunChecks:
         own = ValueError("A prompt is required.")
         node = self._OwnChecks(own_errors=[own])
         node.set_parameter_value("video", _clip(tmp_path))
-        result = run_pre_run_checks(node)
+        result = validate_node(node)
         assert len(result.errors) == 2
         assert str(result.errors[0]).startswith("The video in 'Video' is")
         assert result.errors[1] is own
 
     def test_reports_nothing_for_a_node_that_passes(self) -> None:
-        assert run_pre_run_checks(self._OwnChecks()) == PreRunCheckResult(errors=[], unchecked_inputs=[])
+        assert validate_node(self._OwnChecks()) == ValidationResult(errors=[], unchecked_inputs=[])
 
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_names_an_input_whose_probe_timed_out(self, tmp_path: Path) -> None:
         node = self._OwnChecks()
         node.set_parameter_value("video", _clip(tmp_path))
-        assert run_pre_run_checks(node).unchecked_inputs == ["The video in 'Video'"]
+        assert validate_node(node).unchecked_inputs == ["The video in 'Video'"]
 
     def test_names_nothing_when_every_input_was_read_in_time(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -730,26 +730,26 @@ class TestRunPreRunChecks:
         )
         node = self._OwnChecks()
         node.set_parameter_value("video", _clip(tmp_path))
-        assert run_pre_run_checks(node).unchecked_inputs == []
+        assert validate_node(node).unchecked_inputs == []
 
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_names_a_file_the_nodes_own_check_could_not_read(self, tmp_path: Path) -> None:
         node = self._OwnChecks(reads=_clip(tmp_path, "own.mp4"))
-        assert run_pre_run_checks(node).unchecked_inputs == ["'own.mp4'"]
+        assert validate_node(node).unchecked_inputs == ["'own.mp4'"]
 
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_names_a_declared_input_once_when_the_node_also_reads_it(self, tmp_path: Path) -> None:
         clip = _clip(tmp_path)
         node = self._OwnChecks(reads=clip)
         node.set_parameter_value("video", clip)
-        assert run_pre_run_checks(node).unchecked_inputs == ["The video in 'Video'"]
+        assert validate_node(node).unchecked_inputs == ["The video in 'Video'"]
 
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_reports_unchecked_inputs_alongside_errors(self, tmp_path: Path) -> None:
         # The machine decides not to warn a node that failed; the result still carries both.
         node = self._OwnChecks(own_errors=[ValueError("A prompt is required.")])
         node.set_parameter_value("video", _clip(tmp_path))
-        result = run_pre_run_checks(node)
+        result = validate_node(node)
         assert _messages(result.errors)[-1] == "A prompt is required."
         assert result.unchecked_inputs == ["The video in 'Video'"]
 
@@ -773,7 +773,7 @@ class TestRunPreRunChecks:
 
         node = Records(reads=clip)
         node.set_parameter_value("video", clip)
-        run_pre_run_checks(node)
+        validate_node(node)
         assert deadlines[0] is not None
         # The validators' probe and the node's own share one reading.
         assert reads == [clip]
@@ -806,7 +806,7 @@ class TestValuesHeldInAnotherProcess:
     def test_skips_a_single_input_held_elsewhere(self) -> None:
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("video", self._ELSEWHERE)
-        assert run_pre_run_validators(node) == []
+        assert validate_inputs(node) == []
 
     def test_skips_a_list_held_elsewhere(self) -> None:
         node = _node_with(
@@ -820,7 +820,7 @@ class TestValuesHeldInAnotherProcess:
             )
         )
         node.set_parameter_value("clips", [self._ELSEWHERE, self._ELSEWHERE])
-        assert run_pre_run_validators(node) == []
+        assert validate_inputs(node) == []
 
 
 class TestUncheckedInputsMessage:
@@ -891,8 +891,8 @@ class TestNodeInAGroup:
             inner.set_parameter_value("image", image)
 
             assert proxy.pre_run_validators == ()
-            assert run_pre_run_validators(group) == []
-            assert _messages(run_pre_run_validators(inner)) == [
+            assert validate_inputs(group) == []
+            assert _messages(validate_inputs(inner)) == [
                 "The image in 'image' is 200x200 and each side must be at least 300 pixels. Use a larger one."
             ]
         finally:

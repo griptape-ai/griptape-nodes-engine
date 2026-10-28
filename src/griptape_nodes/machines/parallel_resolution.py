@@ -14,7 +14,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
-from griptape_nodes.exe_types.pre_run_validation import run_pre_run_checks, unchecked_inputs_message
+from griptape_nodes.exe_types.pre_run_validation import unchecked_inputs_message, validate_node
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
@@ -722,7 +722,7 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            check_result = run_pre_run_checks(node_reference.node_reference)
+            check_result = validate_node(node_reference.node_reference)
             exceptions = check_result.errors
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
