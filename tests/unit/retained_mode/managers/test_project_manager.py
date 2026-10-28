@@ -846,15 +846,16 @@ class TestProjectManagerBuiltinVariables:
         assert registry.find_by_id(local.workflow_id) is None
         assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-    def test_mirroring_a_file_that_is_gone_fails_naming_the_workflow_and_file(self, tmp_path: Path) -> None:
+    def test_mirroring_a_file_that_is_gone_resolves_paths_in_its_folder(self, tmp_path: Path) -> None:
+        """The peer still has the workflow open at that path, so it resolves paths in that folder."""
         context_manager = self._mirroring_context_manager(tmp_path)
-        missing = tmp_path / "moved_away.py"
+        missing = tmp_path / "shots" / "moved_away.py"
 
-        with pytest.raises(context_manager.MirroredWorkflowError) as raised:
-            context_manager.mirror_workflow_context("peer-id", "moved_away", str(missing), None)
+        context_manager.mirror_workflow_context("peer-id", "moved_away", str(missing), None)
 
-        assert "workflow 'moved_away'" in str(raised.value)
-        assert str(missing) in str(raised.value)
+        assert context_manager.get_current_workflow_id() == "peer-id"
+        assert context_manager.get_current_workflow_file_path() is None
+        assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
 
     def test_replacing_the_mirror_drops_the_entry_it_registered(self, tmp_path: Path) -> None:
         """A long-lived worker does not keep an entry for every peer workflow it ever ran a node for."""
