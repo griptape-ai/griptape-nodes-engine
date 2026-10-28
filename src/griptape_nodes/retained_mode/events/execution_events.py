@@ -269,7 +269,7 @@ class ListRunsRequest(RequestPayload, GraphAccessMixin):
 @dataclass
 @PayloadRegistry.register
 class ListRunsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """The runs, the one in progress first, then the waiting runs next first.
+    """The runs: the one in progress first, then the waiting runs in the order they will start.
 
     Args:
         runs: The runs.

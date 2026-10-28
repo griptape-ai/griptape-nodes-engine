@@ -401,9 +401,9 @@ class FlowManager(EngineScoped):
         self._node_executor = NodeExecutor(self.engine)
         self._run_queue = RunQueue()
         self._run_in_progress: Run | None = None
-        # True from when the run in progress starts until its request returns. While it is, only `_drive`
-        # may end the run: its flow can be not running yet (still validating) or stopped mid-request
-        # (cancelled), and the paths that end a paused run must not take either as the run being over.
+        # True from when the run in progress starts until its request returns. Until then only `_drive` may
+        # end the run: its flow may not have started yet (still validating) or may have just been cancelled,
+        # and the paths that end a paused run must not mistake either for the run being over.
         self._driving = False
 
     @property
@@ -4842,7 +4842,7 @@ class FlowManager(EngineScoped):
         """
         waiting = [run for run in self._run_queue.snapshot() if run.run_id == run_id]
         if waiting:
-            self._turn_away(waiting, "it was cancelled before it started.")
+            self._turn_away(waiting, "it was cancelled.")
             return True
         run = self._run_in_progress
         if run is None or run.run_id != run_id:

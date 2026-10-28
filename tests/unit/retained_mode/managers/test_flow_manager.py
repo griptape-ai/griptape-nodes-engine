@@ -1131,7 +1131,7 @@ class TestRunsTakeTurns:
         await asyncio.wait_for(running, timeout=1.0)
 
         result = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
-        assert "cancelled before it started" in str(result.result_details)
+        assert "did not start: it was cancelled" in str(result.result_details)
         assert executed == []
 
     @pytest.mark.asyncio
@@ -1381,7 +1381,7 @@ class TestRunRequests:
 
         assert isinstance(result, CancelRunResultSuccess)
         outcome = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
-        assert "cancelled before it started" in str(outcome.result_details)
+        assert "did not start: it was cancelled" in str(outcome.result_details)
         assert executed == []
 
     @pytest.mark.asyncio
