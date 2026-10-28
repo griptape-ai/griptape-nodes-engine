@@ -68,7 +68,8 @@ __all__ = [
 
 # The module each `media` and `common` validator is loaded from on first use. They can't be imported
 # above: `Parameter` imports `validators.base`, which runs this file first, and `media` and `common`
-# import `input_checks`, whose imports lead back to `Parameter` before it is defined.
+# import `_checks`, which imports `input_checks`, whose imports lead back to `Parameter` before it is
+# defined.
 _LAZY_MODULES: dict[str, str] = {
     "AllowedFormats": "media",
     "AspectRatioRange": "media",
