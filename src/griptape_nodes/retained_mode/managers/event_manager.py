@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import inspect
 import logging
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from asyncio_thread_runner import ThreadRunner
@@ -30,6 +31,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     GraphAccessMixin,
     ProgressEvent,
     RequestPayload,
+    RequestSender,
     ResultDetails,
     ResultPayload,
     StrictModeViolationDetail,
@@ -41,7 +43,12 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
-from griptape_nodes.retained_mode.request_handlers import handled_request_types
+from griptape_nodes.retained_mode.request_handlers import (
+    RequiredSender,
+    SenderRule,
+    handled_request_types,
+    sender_rules,
+)
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -64,6 +71,10 @@ EP = TypeVar("EP", bound=ExecutionPayload, default=ExecutionPayload)
 
 _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
     "_event_manager_active_request_type", default=None
+)
+
+_active_request_sender: ContextVar[RequestSender | None] = ContextVar(
+    "_event_manager_active_request_sender", default=None
 )
 
 # The node the current logical chain is rebuilding as a worker's copy, if any. Per chain rather than
@@ -166,6 +177,25 @@ def current_request_type() -> type[RequestPayload] | None:
     return _active_request_type.get()
 
 
+def current_request_sender() -> RequestSender | None:
+    """Return the engine that sent the request being dispatched on this task, or None if no other engine did."""
+    return _active_request_sender.get()
+
+
+def require_request_sender() -> RequestSender:
+    """Return the engine that sent the request being dispatched, in a handler marked to require one.
+
+    Raises:
+        RuntimeError: No other engine sent the request, so the handler was not marked with
+            `@handles(..., sender=...)`.
+    """
+    sender = _active_request_sender.get()
+    if sender is None:
+        msg = "require_request_sender() was called for a request no other engine sent; mark its handler with @handles(..., sender=...)."
+        raise RuntimeError(msg)
+    return sender
+
+
 # Result types that should NOT trigger a flush request.
 #
 # Add result types to this set if they should never trigger a flush (typically because they ARE
@@ -184,6 +214,40 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 class ResultContext(TypedDict, total=False):
     response_topic: str | None
     request_id: str | None
+    sender: RequestSender | None
+
+
+@dataclass(frozen=True)
+class _AssignedSenderRule:
+    """A request type's `SenderRule`, with its owner lookup bound to the manager that handles it."""
+
+    required: RequiredSender
+    owner: Callable[[RequestPayload, RequestSender], str | None] | None
+
+
+def _why_local_request_is_refused(rule: _AssignedSenderRule | None) -> str | None:
+    """Why a request no other engine sent must not run its handler, or None if it may."""
+    if rule is None:
+        return None
+    if rule.required is RequiredSender.SESSION:
+        return "it did not come from another engine's session"
+    return "it did not come from another engine"
+
+
+def _why_engine_request_is_refused(
+    rule: _AssignedSenderRule | None, request: RequestPayload, sender: RequestSender
+) -> str | None:
+    """Why a request another engine sent must not run its handler, or None if it may."""
+    if rule is None:
+        return "another engine may not send it"
+    if rule.required is RequiredSender.SESSION and sender.session_id is None:
+        return "it did not come from one of that engine's sessions"
+    owner_id = None
+    if rule.owner is not None:
+        owner_id = rule.owner(request, sender)
+    if owner_id is None or owner_id == sender.engine_id:
+        return None
+    return f"what it names belongs to engine {owner_id}"
 
 
 class EventManager(EngineScoped):
@@ -191,6 +255,8 @@ class EventManager(EngineScoped):
         super().__init__(engine)
         # Dictionary to store the SPECIFIC manager for each request type
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
+        # The request types another engine may send, and which engines. Any other is refused. See `@handles`.
+        self._sender_rules: dict[type[RequestPayload], _AssignedSenderRule] = {}
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
         # Libraries subscribe while they load, which runs in asyncio.to_thread, while a broadcast
@@ -839,30 +905,52 @@ class EventManager(EngineScoped):
         self,
         request_type: type[RP],
         callback: Callable[[RP], ResultPayload] | Callable[[RP], Awaitable[ResultPayload]],
+        *,
+        sender: RequiredSender | None = None,
+        owner: Callable[[RP, RequestSender], str | None] | None = None,
     ) -> None:
         """Assign a manager to handle a request.
 
         Args:
             request_type: The type of request to assign the manager to
             callback: Function to be called when event occurs
+            sender: Which other engines may send the request, or None for none: only local clients.
+            owner: Given the request and its sender, the one engine allowed to send it, or None when
+                the request names nothing an engine owns. Only with `sender`.
         """
         existing_manager = self._request_type_to_manager.get(request_type)
         if existing_manager is not None:
             msg = f"Attempted to assign an event of type {request_type} to manager {callback.__name__}, but that request is already assigned to manager {existing_manager.__name__}."
             raise ValueError(msg)
         self._request_type_to_manager[request_type] = callback
+        if sender is not None:
+            self._sender_rules[request_type] = _AssignedSenderRule(
+                required=sender,
+                owner=cast("Callable[[RequestPayload, RequestSender], str | None] | None", owner),
+            )
 
     def register_request_handlers(self, owner: object) -> None:
         """Assign each `@handles` method on `owner`. An unmarked override keeps its parent's marks."""
         marks: dict[str, tuple[type[RequestPayload], ...]] = {}
+        rules: dict[str, dict[type[RequestPayload], SenderRule]] = {}
         for klass in reversed(type(owner).__mro__):
             for name, attr in vars(klass).items():
                 request_types = handled_request_types(attr)
                 if request_types:
                     marks[name] = request_types
+                    rules[name] = sender_rules(attr)
         for name, request_types in marks.items():
             for request_type in request_types:
-                self.assign_manager_to_request_type(request_type, getattr(owner, name))
+                rule = rules[name].get(request_type)
+                if rule is None:
+                    self.assign_manager_to_request_type(request_type, getattr(owner, name))
+                    continue
+                owner_of = None
+                if rule.owner is not None:
+                    owner_of = functools.partial(rule.owner, owner)
+                self.assign_manager_to_request_type(
+                    request_type, getattr(owner, name), sender=rule.required, owner=owner_of
+                )
 
     def configure_worker_forwarding(
         self,
@@ -1023,6 +1111,26 @@ class EventManager(EngineScoped):
             response_topic=result_context.get("response_topic"),
         )
 
+    def _refusal_for_sender(
+        self, request: RequestPayload, result_context: ResultContext
+    ) -> GenericResultFailure | None:
+        """The failure to answer with instead of running a request's handler, given who sent it, or None if it may run.
+
+        A request from another engine is refused unless its handler admits that engine; one from a
+        local client is refused only by a handler that admits other engines alone.
+        """
+        rule = self._sender_rules.get(type(request))
+        sender = result_context.get("sender")
+        if sender is None:
+            reason = _why_local_request_is_refused(rule)
+            attempted = f"Attempted to handle a {type(request).__name__}."
+        else:
+            reason = _why_engine_request_is_refused(rule, request, sender)
+            attempted = f"Attempted to handle a {type(request).__name__} from engine {sender.engine_id}."
+        if reason is None:
+            return None
+        return GenericResultFailure(result_details=f"{attempted} Failed because {reason}.")
+
     def remove_manager_from_request_type(self, request_type: type[RP]) -> None:
         """Unsubscribe the manager from the request of a specific type.
 
@@ -1031,6 +1139,7 @@ class EventManager(EngineScoped):
         """
         if request_type in self._request_type_to_manager:
             del self._request_type_to_manager[request_type]
+        self._sender_rules.pop(request_type, None)
 
     def _override_result_log_level(self, result: ResultPayload, level: int) -> None:
         """Override the log level on all result details.
@@ -1189,6 +1298,10 @@ class EventManager(EngineScoped):
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
 
+        refusal = self._refusal_for_sender(request, result_context)
+        if refusal is not None:
+            return self._handle_request_core(request, refusal, context=result_context)
+
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
         short_circuit = self._run_pre_dispatch_hooks(request, result_context)
@@ -1201,6 +1314,7 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
+        sender_token = _active_request_sender.set(result_context.get("sender"))
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
@@ -1219,6 +1333,7 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
 
     @staticmethod
@@ -1281,6 +1396,10 @@ class EventManager(EngineScoped):
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
 
+        refusal = self._refusal_for_sender(request, result_context)
+        if refusal is not None:
+            return self._handle_request_core(request, refusal, context=result_context)
+
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
         short_circuit = self._run_pre_dispatch_hooks(request, result_context)
@@ -1293,6 +1412,7 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
+        sender_token = _active_request_sender.set(result_context.get("sender"))
         try:
             try:
                 result_payload = self._invoke_handler_from_sync(callback, request)
@@ -1310,6 +1430,7 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:

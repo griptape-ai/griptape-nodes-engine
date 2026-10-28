@@ -29,7 +29,8 @@ the minimal fixtures did not cover:
 - ``ReportsHydrationNode``: reports whether its value hook ran on the copy that runs it, and
   whether its ``process`` ran inside the rebuild a worker does before running a node.
 - ``ProcessInfoNode``: reports the process that ran it and that process's parent, so a test
-  driving real engine processes can tell which process executed the node.
+  driving real engine processes can tell which process executed the node. Logs a line starting
+  with ``PROCESS_INFO_LOG_PREFIX`` so such a test can see where its logs arrive.
 - ``EditsTheGraphWhileLoadingNode``: sends requests that edit other nodes and their connections while
   its value is applied on load (strict-mode rule ``graph-access-while-loading``). Nothing it sends
   while a worker loads its copy may reach the orchestrator's graph.
@@ -54,6 +55,7 @@ the minimal fixtures did not cover:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -82,6 +84,9 @@ if TYPE_CHECKING:
     import asyncio
 
 MEDIA_BYTES = b"\x89PNG\r\n\x1a\n" + b"fixture-media-payload"
+PROCESS_INFO_LOG_PREFIX = "ProcessInfoNode"
+
+logger = logging.getLogger("griptape_nodes")
 
 
 class SaveMediaNode(DataNode):
@@ -475,6 +480,7 @@ class ProcessInfoNode(DataNode):
     def process(self) -> None:
         self.parameter_output_values["pid"] = os.getpid()
         self.parameter_output_values["parent_pid"] = os.getppid()
+        logger.info("%s '%s' ran in process %s", PROCESS_INFO_LOG_PREFIX, self.name, os.getpid())
 
 
 class UnshippableOutputNode(DataNode):
