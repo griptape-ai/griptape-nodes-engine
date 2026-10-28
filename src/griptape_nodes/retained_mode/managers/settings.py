@@ -24,7 +24,7 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
-DISTRIBUTED_EXECUTION_LIBRARIES_KEY = "distributed_execution.libraries"
+DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -445,7 +445,7 @@ class WorkerSettings(BaseModel):
 
 
 class DistributedExecutionSettings(BaseModel):
-    libraries: dict[str, str] = Field(
+    library_engines: dict[str, str] = Field(
         default_factory=dict,
         description=(
             "Libraries whose nodes run on another computer's engine. Each entry pairs a library's name with "
@@ -457,12 +457,12 @@ class DistributedExecutionSettings(BaseModel):
         ),
     )
 
-    @field_validator("libraries", mode="after")
+    @field_validator("library_engines", mode="after")
     @classmethod
-    def validate_libraries(cls, v: dict[str, str]) -> dict[str, str]:
+    def validate_library_engines(cls, v: dict[str, str]) -> dict[str, str]:
         for library_name, engine_id in v.items():
             if not engine_id.strip():
-                msg = f"{DISTRIBUTED_EXECUTION_LIBRARIES_KEY} entry for '{library_name}' must be an engine ID"
+                msg = f"{DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY} entry for '{library_name}' must be an engine ID"
                 raise ValueError(msg)
         return v
 

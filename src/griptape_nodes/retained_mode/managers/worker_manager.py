@@ -42,7 +42,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.settings import (
-    DISTRIBUTED_EXECUTION_LIBRARIES_KEY,
+    DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
@@ -1329,7 +1329,7 @@ class WorkerManager(EngineScoped):
         Raises:
             EngineNotFoundError: That engine cannot be reached, or the engine that answered is another one.
         """
-        assigned = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_LIBRARIES_KEY, default={})
+        assigned = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY, default={})
         library_versions: dict[str, str] = {}
         for library_name, assigned_engine in assigned.items():
             info = self.engine.library_manager.get_library_info_by_library_name(library_name)
@@ -1731,7 +1731,7 @@ class WorkerManager(EngineScoped):
         Settings that name this engine mean here too, as when engines that share a workspace share its
         config file.
         """
-        libraries = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_LIBRARIES_KEY, default={})
+        libraries = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY, default={})
         engine_id = libraries.get(library_name)
         if engine_id is None or engine_id == self.engine.get_engine_id():
             return None

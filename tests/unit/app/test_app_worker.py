@@ -43,7 +43,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARIES_KEY
+from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _STATIC_URL_SETTLE_TIMEOUT_S,
     WorkerManager,
@@ -2486,7 +2486,7 @@ def _assign_libraries(worker_manager: WorkerManager, libraries: dict[str, str]) 
     read_default = worker_manager.engine.config_manager.get_config_value.side_effect  # type: ignore[union-attr]
 
     def get_config_value(key: str, default: object = None, cast_type: type | None = None, **kwargs: object) -> object:
-        if key == DISTRIBUTED_EXECUTION_LIBRARIES_KEY:
+        if key == DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY:
             return libraries
         return read_default(key, default, cast_type, **kwargs)
 

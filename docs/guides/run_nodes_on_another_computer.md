@@ -79,12 +79,12 @@ Connecting through Griptape Cloud with a Griptape Nodes license isn't available 
 
 ## Step 3: Send a library to the remote computer
 
-On your **workstation**, add the library to `distributed_execution.libraries` in your `griptape_nodes_config.json`, paired with the remote engine's ID from step 1:
+On your **workstation**, add the library to `distributed_execution.library_engines` in your `griptape_nodes_config.json`, paired with the remote engine's ID from step 1:
 
 ```json
 {
   "distributed_execution": {
-    "libraries": {
+    "library_engines": {
       "Griptape Nodes Diffusers Library": "3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70"
     }
   }
@@ -101,7 +101,7 @@ When your engine loads the library, it asks the remote computer to start the lib
 
 Then run your workflow as you normally would. The library's nodes run on the remote computer, and their results come back to your editor.
 
-A change to `distributed_execution.libraries` takes effect the next time that library's worker starts, for example after you reload the library.
+A change to `distributed_execution.library_engines` takes effect the next time that library's worker starts, for example after you reload the library.
 
 ## Good to know
 
@@ -117,7 +117,7 @@ Each message below is how the error starts, or a part of it you'll find in the n
 
 | What the error says                                                                  | What to do                                                                                                                                                                            |
 | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Failed because the engine registry has no engine with that ID                        | Check the engine ID in `distributed_execution.libraries` against `gtn self info` on the remote computer, and that both engines use the same `GT_CLOUD_BASE_URL`.                      |
+| Failed because the engine registry has no engine with that ID                        | Check the engine ID in `distributed_execution.library_engines` against `gtn self info` on the remote computer, and that both engines use the same `GT_CLOUD_BASE_URL`.                |
 | Machine ... is not running: it stopped reporting to the engine registry              | Start Griptape Nodes on the remote computer.                                                                                                                                          |
 | Both engines must run the same engine version                                        | Update Griptape Nodes so both computers run the same version.                                                                                                                         |
 | the library is not installed on it                                                   | Install the library on the remote computer.                                                                                                                                           |
