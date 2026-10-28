@@ -814,6 +814,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id="orchestrator-workflow-id",
         )
         result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultFailure)
@@ -829,6 +830,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id="orchestrator-workflow-id",
         )
         result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details

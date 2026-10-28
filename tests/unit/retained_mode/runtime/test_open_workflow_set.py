@@ -103,10 +103,12 @@ class TestOpenWorkflowsFollowTheContextStack:
 
         assert engine.open_workflows.all_open() == []
 
-    def test_mirroring_a_peers_workflow_opens_nothing(self, engine: Engine) -> None:
-        engine.context_manager.mirror_workflow_context("00000000000000000000000000000abc", None, None, None)
+    def test_adopting_an_orchestrators_workflow_opens_nothing(self, engine: Engine) -> None:
+        peer_id = "00000000000000000000000000000abc"
 
-        assert engine.context_manager.has_current_workflow()
+        workflow = engine.context_manager.adopt_orchestrator_workflow(peer_id, None, None, None)
+
+        assert engine.worker_workflows.find(peer_id) is workflow
         assert engine.open_workflows.all_open() == []
 
     def test_moving_the_open_workflow_moves_its_runtime(self, engine: Engine) -> None:

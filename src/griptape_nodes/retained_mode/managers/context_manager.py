@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -42,11 +44,15 @@ class ContextManager(EngineScoped):
     """Context manager for Workflow, Flow, Node, and Element contexts.
 
     Workflows own Flows, Flows own Nodes, and Nodes own Elements.
-    There must always be a Workflow context active.
+    The Workflow context is the top of the context stack. A worker pushes none: while it runs a
+    node, the Workflow context is the one it keeps for the runtime of the node's orchestrator
+    workflow (`adopt_orchestrator_workflow`).
     Clients can push/pop Workflow contexts, Flow contexts, Node contexts, and Element contexts.
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    # Weak, so a context goes with the worker runtime it belongs to.
+    _worker_contexts: weakref.WeakKeyDictionary[WorkflowRuntime, ContextManager.WorkflowContextState]
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -60,8 +66,8 @@ class ContextManager(EngineScoped):
     class EmptyStackError(WorkflowContextError):
         """Empty stack error."""
 
-    class MirroredWorkflowError(WorkflowContextError):
-        """A peer engine's workflow could not be registered in this engine's registry."""
+    class OrchestratorWorkflowError(WorkflowContextError):
+        """A worker could not adopt the workflow its orchestrator ran a node for."""
 
     class WorkflowContextState:
         """Internal class that represents a Workflow's state which owns a stack of flow names.
@@ -265,6 +271,7 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        self._worker_contexts = weakref.WeakKeyDictionary()
         event_manager.register_request_handlers(self)
 
     @handles(SetWorkflowContextRequest)
@@ -495,86 +502,78 @@ class ContextManager(EngineScoped):
                 raise ValueError(msg) from e
         return self.ElementContext(self, element)
 
-    def mirror_workflow_context(
+    def adopt_orchestrator_workflow(
         self,
         workflow_id: str | None,
         name: str | None,
         file_path: str | None,
         working_directory: str | None,
-    ) -> None:
-        """Adopt another engine's workflow context as this engine's own.
+    ) -> WorkflowRuntime:
+        """The runtime this worker keeps for the workflow its orchestrator ran a node for.
 
-        A real stack entry rather than an override of the getters, because `has_current_workflow()`
-        answers two questions at once -- "is identity resolvable" and "is there an entry to index"
-        -- and satisfying only the first raises IndexError in `has_current_flow`, `push_flow`,
-        `pop_flow`, and the context setters.
+        The node runs bound to it (`Engine.run_in_worker_workflow`), so its context and paths resolve
+        against the orchestrator's workflow. The runtime is an ordinary `WorkflowRuntime` in
+        `Engine.worker_workflows`, never an open workflow here.
 
-        The entry it points at is this engine's registry entry under the peer's workflow id,
-        registered unlisted when this engine does not know the workflow, and moved when the peer
-        has saved or moved it since. `name` is the peer's legacy name, used only for messages. The
-        entry an earlier mirror registered is dropped once another workflow is mirrored.
-
-        Idempotent and never popped: this MIRRORS a peer's context rather than nesting under it, so
-        one entry is replaced in place. There is no push/pop pair whose ordering could interleave
-        while a worker runs nodes concurrently.
+        Its registry entry is this engine's entry under the orchestrator's workflow id, registered
+        unlisted when this engine does not know the workflow, and moved when the orchestrator has
+        saved or moved it since. `name` is the orchestrator's legacy name, used only for messages.
+        The runtime and its entry go when the orchestrator tears its workflow down
+        (`Engine.sweep_worker_workflows`).
 
         Raises:
-            MirroredWorkflowError: The peer named a workflow without its id, or the workflow could
-                not be registered.
+            OrchestratorWorkflowError: A workflow is open in this engine; the orchestrator has no
+                workflow open; the orchestrator named a workflow without its id; or the workflow
+                could not be registered.
         """
+        if self.engine.open_workflows.all_open():
+            msg = (
+                "Attempted to run a node for another engine's workflow. "
+                "Failed because a workflow is open in this engine."
+            )
+            raise self.OrchestratorWorkflowError(msg)
+
         if workflow_id is None and name is not None:
-            # A peer that names a workflow but sends no id predates workflow ids. Clearing would
-            # run the node without the workflow, resolving its paths workspace-relative.
+            # An orchestrator that names a workflow but sends no id predates workflow ids. Running in no
+            # workflow would resolve the node's paths workspace-relative.
             msg = (
                 f"Attempted to run a node for workflow '{name}'. Failed because the engine that sent it "
                 f"did not say which workflow it is, which happens when it runs a different version of "
                 f"Griptape Nodes. Run the same version on both."
             )
-            raise self.MirroredWorkflowError(msg)
-
-        previous_id = None
-        if self._workflow_stack:
-            previous_id = self._workflow_stack[-1].workflow_id
+            raise self.OrchestratorWorkflowError(msg)
 
         if workflow_id is None:
-            # The peer has no workflow, so this engine must have none either. A mirror left from an
-            # earlier execution would resolve paths against that workflow's folder while the peer
-            # resolves them workspace-relative -- the divergence this mirror exists to prevent,
-            # reached from the other direction. Only a mirror is ever on a worker's stack.
-            self._workflow_stack.clear()
-            if previous_id is not None:
-                self._drop_mirror_entry(previous_id)
-            return
+            # The node's copy is built in the workflow it runs for, so there is nowhere to build it.
+            msg = (
+                "Attempted to run a node in a separate process. Failed because no workflow was open when it "
+                "was sent. Open a workflow and run it again."
+            )
+            raise self.OrchestratorWorkflowError(msg)
 
-        mirrored_id = self._mirror_registry_entry(workflow_id, name, file_path, working_directory)
-        state = self.WorkflowContextState(mirrored_id)
-        if not self._workflow_stack:
-            self._workflow_stack.append(state)
-        elif self._workflow_stack[-1].workflow_id != mirrored_id:
-            # Replace rather than append: a mirror tracks one peer context, and stacking would leave
-            # the previous workflow's entry to be read by whatever runs next.
-            self._workflow_stack[-1] = state
+        self._register_orchestrator_workflow(workflow_id, name, file_path, working_directory)
+        workflow = self.engine.worker_workflows.runtime_for(workflow_id)
+        if workflow not in self._worker_contexts:
+            self._worker_contexts[workflow] = self.WorkflowContextState(workflow_id)
+        return workflow
 
-        if previous_id is not None and previous_id != mirrored_id:
-            self._drop_mirror_entry(previous_id)
-
-    def _mirror_registry_entry(
+    def _register_orchestrator_workflow(
         self,
         workflow_id: str,
         name: str | None,
         file_path: str | None,
         working_directory: str | None,
-    ) -> str:
-        """Make this engine's registry describe the peer's workflow under the peer's id, and return that id.
+    ) -> None:
+        """Make this engine's registry describe the orchestrator's workflow under the orchestrator's id.
 
         The peer's id is the authority. Ids last only while an engine runs and each engine mints
         its own, so this engine usually holds the peer's file under an id of its own. That entry is
         dropped and the file is registered again under the peer's id.
 
-        A file that no longer exists is mirrored as a workflow without a file, in that file's folder.
+        A file that no longer exists is registered as a workflow without a file, in that file's folder.
 
         Raises:
-            MirroredWorkflowError: Another workflow here already uses the peer's file.
+            OrchestratorWorkflowError: Another workflow here already uses the peer's file.
         """
         registry = self.engine.workflow_registry
         workflow = registry.find_by_id(workflow_id)
@@ -585,13 +584,13 @@ class ContextManager(EngineScoped):
                     name or "Untitled", working_directory, workflow_id=workflow_id, listed=False
                 )
             workflow.working_directory = working_directory
-            return workflow_id
+            return
 
         known = registry.find_by_path(file_path)
         if known is not None and known.workflow_id == workflow_id:
-            return workflow_id
-        # An entry this engine's scan listed stays listed under the peer's id, so dropping the
-        # mirror later does not drop the file from this engine's workflows.
+            return
+        # An entry this engine's scan listed stays listed under the peer's id, so closing the
+        # runtime kept for it later does not drop the file from this engine's workflows.
         keeps_listing = known is not None and known.listed
         if known is not None:
             logger.debug(
@@ -600,14 +599,15 @@ class ContextManager(EngineScoped):
                 known.workflow_id,
                 workflow_id,
             )
-            if self.is_workflow_in_context(known.workflow_id):
-                # The stale entry is the current mirror; the caller puts the peer's id in its place.
-                self._workflow_stack.clear()
+            # A runtime kept under the stale id goes with it; the caller keeps one under the peer's id.
+            stale = self.engine.worker_workflows.find(known.workflow_id)
+            if stale is not None:
+                self.engine.worker_workflows.close(stale)
             registry.remove(known.workflow_id)
 
         try:
             if workflow is not None:
-                # The peer saved or moved the workflow since this engine last mirrored it.
+                # The peer saved or moved the workflow since this engine last ran a node for it.
                 registry.set_file_path(workflow, file_path)
                 if keeps_listing:
                     workflow.listed = True
@@ -621,56 +621,44 @@ class ContextManager(EngineScoped):
                     metadata_is_placeholder=opened.metadata_is_placeholder,
                 )
         except ValueError as err:
-            logger.debug("Could not mirror workflow '%s' from '%s': %s", workflow_id, file_path, err)
-            self._mirror_unregistrable_file(err, workflow_id, name, file_path, known_here=workflow is not None)
-        return workflow_id
+            logger.debug("Could not register workflow '%s' from '%s': %s", workflow_id, file_path, err)
+            self._register_unregistrable_file(err, workflow_id, name, file_path, known_here=workflow is not None)
 
-    def _mirror_unregistrable_file(
+    def _register_unregistrable_file(
         self, err: ValueError, workflow_id: str, name: str | None, file_path: str, *, known_here: bool
     ) -> None:
-        """Mirror the peer's workflow when its file could not be registered here, or raise why not.
+        """Register the peer's workflow when its file could not be registered here, or raise why not.
 
         A file that is gone was deleted or moved outside the engine, but the peer still has the
-        workflow open at that path, so the workflow is mirrored with no file, in that file's folder,
-        where the peer resolves its paths. An entry already known here under the peer's id stays.
+        workflow open at that path, so the workflow is registered with no file, in that file's
+        folder, where the peer resolves its paths. An entry already known here under the peer's id
+        stays.
 
         Raises:
-            MirroredWorkflowError: The file exists and another workflow here already uses it.
+            OrchestratorWorkflowError: The file exists and another workflow here already uses it.
         """
         if Path(file_path).exists():
             msg = (
                 f"Attempted to run a node of workflow '{name or workflow_id}'. Failed because the workflow's "
                 f"file '{file_path}' could not be opened: another workflow is already using that file."
             )
-            raise self.MirroredWorkflowError(msg) from err
+            raise self.OrchestratorWorkflowError(msg) from err
         if known_here:
             return
         self.engine.workflow_registry.register_unsaved(
             name or "Untitled", str(Path(file_path).parent), workflow_id=workflow_id, listed=False
         )
 
-    def _drop_mirror_entry(self, workflow_id: str) -> None:
-        """Remove the entry an earlier mirror registered, now that another workflow is mirrored.
-
-        Only unlisted entries are the mirror's own; a listed one came from this engine's scan.
-        Without this a long-lived worker keeps one entry per peer workflow it ever ran a node for.
-        """
-        registry = self.engine.workflow_registry
-        workflow = registry.find_by_id(workflow_id)
-        if workflow is None or workflow.listed or self.is_workflow_in_context(workflow_id):
-            return
-        registry.remove(workflow_id)
-
     def has_current_workflow(self) -> bool:
-        """Check if there is an active Workflow context."""
-        return len(self._workflow_stack) > 0
+        """Check if there is an active Workflow context: the top of the stack, or a worker's for its current runtime."""
+        return self._current_state_or_none() is not None
 
     def has_current_flow(self) -> bool:
         """Check if there is an active Flow context within the current Workflow."""
         if not self.has_current_workflow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         return current_workflow.has_current_flow()
 
     def has_current_node(self) -> bool:
@@ -678,7 +666,7 @@ class ContextManager(EngineScoped):
         if not self.has_current_flow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
         return current_flow.has_current_node()
 
@@ -687,7 +675,7 @@ class ContextManager(EngineScoped):
         if not self.has_current_node():
             return False
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
         current_node = current_flow._node_stack[-1]
         return current_node.has_current_element()
@@ -706,7 +694,7 @@ class ContextManager(EngineScoped):
             msg = "No active Workflow context"
             raise self.NoActiveWorkflowError(msg)
 
-        return self._workflow_stack[-1].workflow_id
+        return self._current_state().workflow_id
 
     def get_current_workflow(self) -> Workflow:
         """Get the registry entry of the current Workflow context.
@@ -795,7 +783,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         return current_workflow.get_current_flow()
 
     def get_current_node(self) -> BaseNode:
@@ -812,7 +800,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
         return current_flow.get_current_node()
 
@@ -830,7 +818,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
 
         if not current_flow.has_current_node():
@@ -931,7 +919,6 @@ class ContextManager(EngineScoped):
         name = self.get_current_workflow_name()
         popped = self._workflow_stack.pop()
         open_workflows = self.engine.open_workflows
-        # Not open when the entry is a worker's mirror, which opens nothing.
         if not self._workflow_stack and open_workflows.is_open(popped.workflow_id):
             open_workflows.close(open_workflows.get(popped.workflow_id))
         return name
@@ -952,7 +939,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
             raise self.NoActiveWorkflowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         return current_workflow.push_flow(flow)
 
     def pop_flow(self) -> ControlFlow:
@@ -968,7 +955,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Flow: stack is empty"
             raise self.EmptyStackError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         return current_workflow.pop_flow()
 
     def push_node(self, node: BaseNode) -> BaseNode:
@@ -987,7 +974,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Node context '{node.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
         result = current_flow.push_node(node)
         return result
@@ -1006,7 +993,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Node: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
         result = current_flow.pop_node()
         return result
@@ -1028,7 +1015,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter an Element context '{element.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
 
         if not current_flow.has_current_node():
@@ -1052,7 +1039,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Element: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
+        current_workflow = self._current_state()
         current_flow = current_workflow._flow_stack[-1]
 
         if not current_flow.has_current_node():
@@ -1061,6 +1048,27 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _current_state(self) -> ContextManager.WorkflowContextState:
+        """The current Workflow context. Callers check `has_current_workflow` first.
+
+        Raises:
+            NoActiveWorkflowError: If no Workflow context is active.
+        """
+        state = self._current_state_or_none()
+        if state is None:
+            msg = "No active Workflow context"
+            raise self.NoActiveWorkflowError(msg)
+        return state
+
+    def _current_state_or_none(self) -> ContextManager.WorkflowContextState | None:
+        """The top of the context stack, or on a worker the context of its current runtime, or None."""
+        if self._workflow_stack:
+            return self._workflow_stack[-1]
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
+        return self._worker_contexts.get(workflow)
 
 
 class OpenedFileMetadata(NamedTuple):

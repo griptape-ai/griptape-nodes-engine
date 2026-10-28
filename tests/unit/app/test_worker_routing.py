@@ -355,6 +355,24 @@ class TestDropAllLocalObjectsHandler:
         assert release_threads[0] != threading.get_ident()
 
     @pytest.mark.asyncio
+    async def test_closes_the_runtimes_kept_for_the_orchestrators_workflows_except_one_a_node_runs_in(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator tore its workflow down, so a later node of it gets a fresh runtime."""
+        engine.context_manager.adopt_orchestrator_workflow("idle-id", None, None, None)
+        busy = engine.context_manager.adopt_orchestrator_workflow("busy-id", None, None, None)
+
+        with engine.run_in_worker_workflow(busy):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds("idle-id")
+        assert engine.workflow_registry.find_by_id("idle-id") is None
+        assert engine.worker_workflows.find("busy-id") is busy
+
+    @pytest.mark.asyncio
     async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
         with patch.object(engine.resource_manager, "drop_all_local_objects", side_effect=RuntimeError("boom")):
             result = await _handle_drop_all_local_objects(

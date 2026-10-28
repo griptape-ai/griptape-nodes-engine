@@ -69,7 +69,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowResultSuccess,
 )
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
-from tests.simulated_worker import SimulatedWorker, simulated_worker
+from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -91,6 +91,10 @@ def _register_library(tmp_path: Path) -> None:
     library_json = materialize_worker_behavior_library(tmp_path)
     result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), getattr(result, "result_details", result)
+
+
+# The workflow a request sent straight to the worker names, as an orchestrator's open workflow.
+_ORCHESTRATOR_WORKFLOW_ID = "00000000000000000000000000000abc"
 
 
 @pytest.fixture
@@ -143,9 +147,9 @@ def _connect(source_node: str, source_parameter: str, target_node: str, target_p
 
 async def _run(node: BaseNode) -> ResultPayload:
     """Run `node` on the orchestrator, which sends it to the worker. The executor sends no values of its own."""
-    return await current_engine().ahandle_request(
-        ExecuteNodeRequest(node_name=node.name, node_metadata=dict(node.metadata))  # type: ignore[arg-type]
-    )
+    engine = current_engine()
+    request = ExecuteNodeRequest(node_name=node.name, node_metadata=dict(node.metadata))  # type: ignore[arg-type]
+    return await engine.ahandle_request(sent_from_open_workflow(request, engine))
 
 
 async def _run_successfully(node: BaseNode) -> ExecuteNodeResultSuccess:
@@ -440,6 +444,7 @@ class TestRequestsAWorkerRefuses:
         request = ExecuteNodeRequest(
             node_name="Smuggler",
             node_metadata={"node_type": "ChainStartNode", "library": WORKER_BEHAVIOR_LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
             element_modification_commands=[
                 DeleteConnectionRequest(
                     source_node_name="Elsewhere",
@@ -462,6 +467,7 @@ class TestRequestsAWorkerRefuses:
         request = ExecuteNodeRequest(
             node_name="Group",
             node_metadata={"node_type": "PlainGroupNode", "library": WORKER_BEHAVIOR_LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
         )
 
         result = await worker.execute(request)
