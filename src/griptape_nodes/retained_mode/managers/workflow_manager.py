@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -1013,11 +1014,17 @@ class WorkflowManager(EngineScoped):
         # (listed in griptape_nodes_library.json) are registered separately via
         # LibraryManager.collect_library_workflow_files before this scan runs. Sandbox
         # libraries are intentionally left scannable so in-development workflows appear.
-        library_exclusion_roots: list[Path] = []
+        # Checked once per scanned file, so the roots become plain string prefixes up front:
+        # Path.is_relative_to walks every parent of the file and showed up as seconds on
+        # large workspaces. A trailing separator keeps `lib2/` from matching `lib/`, and
+        # normcase gives the same case-insensitive match Windows paths get.
+        library_exclusion_prefixes: list[str] = []
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
                 continue
-            library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
+            root = os.path.normcase(str(Path(library_info.library_path).parent.resolve()))
+            library_exclusion_prefixes.append(root if root.endswith(os.sep) else root + os.sep)
+        library_exclusion_prefix_tuple = tuple(library_exclusion_prefixes)
 
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
@@ -1077,9 +1084,9 @@ class WorkflowManager(EngineScoped):
                     # rejects unsaved keys paired with a file path).
                     if workflow_file.name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
                         continue
-                    if library_exclusion_roots:
-                        resolved_workflow_file = workflow_file.resolve()
-                        if any(resolved_workflow_file.is_relative_to(root) for root in library_exclusion_roots):
+                    if library_exclusion_prefix_tuple:
+                        resolved_workflow_file = os.path.normcase(str(workflow_file.resolve()))
+                        if (resolved_workflow_file + os.sep).startswith(library_exclusion_prefix_tuple):
                             continue
                     try_parse_workflow_metadata(workflow_file)
             elif path.suffix == ".py":

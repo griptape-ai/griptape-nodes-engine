@@ -1713,6 +1713,109 @@ class TestWorkflowManager:
         # Sanity check: a regular file in the same directory still reaches the processor.
         assert good_path.name in scanned_names
 
+    @pytest.fixture
+    def resolved_tmp_path(self, tmp_path: Path) -> Path:
+        """tmp_path with symlinks resolved (macOS /var -> /private/var), matching what the scan compares."""
+        return tmp_path.resolve()
+
+    @staticmethod
+    async def _scan_and_collect_candidates(engine: Engine, workspace: Path, libraries: dict[Path, bool]) -> set[Path]:
+        """Scan `workspace` with `libraries` ({library dir: is_sandbox}) registered.
+
+        Returns every file the scan looked at after the library skip rule, i.e. every
+        file handed to `_classify_workflow_candidate`.
+        """
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = workspace
+        engine.library_manager._libraries_loading_complete.set()
+
+        library_infos = {
+            str(library_dir / "griptape_nodes_library.json"): LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+                library_path=str(library_dir / "griptape_nodes_library.json"),
+                is_sandbox=is_sandbox,
+                library_name=library_dir.name,
+                library_version="1.0.0",
+                fitness=LibraryManager.LibraryFitness.GOOD,
+                problems=[],
+            )
+            for library_dir, is_sandbox in libraries.items()
+        }
+        candidates: set[Path] = set()
+        original_classify = workflow_manager._classify_workflow_candidate
+
+        def record_candidate(workflow_file: Path) -> Any:
+            candidates.add(workflow_file)
+            return original_classify(workflow_file)
+
+        with (
+            patch.dict(engine.library_manager._library_file_path_to_info, library_infos, clear=True),
+            patch.object(workflow_manager, "_classify_workflow_candidate", side_effect=record_candidate),
+        ):
+            await workflow_manager._process_workflows_for_registration([str(workspace)])
+        return candidates
+
+    @pytest.mark.asyncio
+    async def test_scan_skips_files_inside_registered_library_dirs(
+        self, engine: Engine, resolved_tmp_path: Path
+    ) -> None:
+        """Files under a non-sandbox library dir are skipped; similarly named sibling dirs are not.
+
+        `lib2/` shares a string prefix with `lib/`, so a naive prefix check would wrongly skip it.
+        """
+        workspace = resolved_tmp_path
+        library_dir = workspace / "libraries" / "lib"
+        sibling_dir = workspace / "libraries" / "lib2"
+        for directory in (library_dir / "workflows", sibling_dir):
+            directory.mkdir(parents=True)
+        inside_library = library_dir / "workflows" / "bundled.py"
+        at_library_root = library_dir / "nodes.py"
+        in_sibling = sibling_dir / "user_workflow.py"
+        in_workspace = workspace / "user_workflow.py"
+        for file in (inside_library, at_library_root, in_sibling, in_workspace):
+            file.write_text("x = 1\n", encoding="utf-8")
+
+        candidates = await self._scan_and_collect_candidates(engine, workspace, {library_dir: False})
+
+        assert inside_library not in candidates
+        assert at_library_root not in candidates
+        assert in_sibling in candidates
+        assert in_workspace in candidates
+
+    @pytest.mark.asyncio
+    async def test_scan_keeps_files_inside_sandbox_library_dirs(self, engine: Engine, resolved_tmp_path: Path) -> None:
+        """Sandbox libraries stay scannable so in-development workflows appear."""
+        workspace = resolved_tmp_path
+        sandbox_dir = workspace / "sandbox_library"
+        sandbox_dir.mkdir()
+        sandbox_workflow = sandbox_dir / "wip.py"
+        sandbox_workflow.write_text("x = 1\n", encoding="utf-8")
+
+        candidates = await self._scan_and_collect_candidates(engine, workspace, {sandbox_dir: True})
+
+        assert sandbox_workflow in candidates
+
+    @pytest.mark.asyncio
+    async def test_scan_skips_library_files_reached_through_a_symlink(
+        self, engine: Engine, resolved_tmp_path: Path
+    ) -> None:
+        """The skip rule compares resolved paths, so a symlink into a library dir is still skipped."""
+        workspace = resolved_tmp_path / "workspace"
+        library_dir = resolved_tmp_path / "outside" / "lib"
+        library_dir.mkdir(parents=True)
+        workspace.mkdir()
+        (library_dir / "bundled.py").write_text("x = 1\n", encoding="utf-8")
+        (workspace / "linked_lib").symlink_to(library_dir, target_is_directory=True)
+        user_workflow = workspace / "user_workflow.py"
+        user_workflow.write_text("x = 1\n", encoding="utf-8")
+
+        candidates = await self._scan_and_collect_candidates(engine, workspace, {library_dir: False})
+
+        assert workspace / "linked_lib" / "bundled.py" not in candidates
+        assert user_workflow in candidates
+
     @pytest.mark.asyncio
     async def test_refresh_reresolves_library_templates_against_new_workspace(
         self, engine: Engine, tmp_path: Path
