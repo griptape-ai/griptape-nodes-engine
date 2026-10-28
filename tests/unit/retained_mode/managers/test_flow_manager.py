@@ -1,5 +1,6 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
+import asyncio
 import itertools
 import json
 import tempfile
@@ -1044,3 +1045,48 @@ class TestReparentFlow:
         # The rejected move must leave the hierarchy untouched.
         assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
         assert flow_manager.get_parent_flow(outer.flow_name) is None
+
+
+class TestRecordCreatedFlows:
+    """`record_created_flows` collects the flows the current task creates, and nothing else."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_records_only_flows_created_inside_the_block(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+
+        with engine.flow_manager.record_created_flows() as recorded:
+            inside = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="inside", set_as_new_context=False)
+            )
+        assert isinstance(inside, CreateFlowResultSuccess)
+        outside = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="outside", set_as_new_context=False)
+        )
+        assert isinstance(outside, CreateFlowResultSuccess)
+
+        assert recorded == [inside.flow_name]
+
+    @pytest.mark.usefixtures("clean_object_state")
+    @pytest.mark.asyncio
+    async def test_concurrent_recorders_do_not_see_each_others_flows(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_concurrent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        both_recording = {"a": asyncio.Event(), "b": asyncio.Event()}
+        recorded_by_task: dict[str, list[str]] = {}
+
+        async def record(own: str, other: str) -> None:
+            with engine.flow_manager.record_created_flows() as recorded:
+                both_recording[own].set()
+                await asyncio.wait_for(both_recording[other].wait(), 5)
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=top.flow_name, flow_name=f"flow_{own}", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+            recorded_by_task[own] = list(recorded)
+
+        await asyncio.gather(record("a", "b"), record("b", "a"))
+
+        assert recorded_by_task == {"a": ["flow_a"], "b": ["flow_b"]}
