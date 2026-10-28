@@ -48,7 +48,13 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
+from griptape_nodes.retained_mode.runtime.binding import (
+    NO_WORKFLOW,
+    NoWorkflow,
+    WorkflowNotNamedError,
+    bound_workflow,
+)
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -100,6 +106,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -611,6 +618,53 @@ class Engine:
             msg = f"Attempted to start a worker for engine {engine_id}. Failed because this engine has no connections to other engines."
             raise EngineNotFoundError(msg)
         return self._engine_transports.hosted_worker_environment(engine_id)
+
+    @contextmanager
+    def bind_workflow(self, workflow: WorkflowRuntime | NoWorkflow) -> Iterator[None]:
+        """Act on `workflow`, or on no workflow, for the duration of the block and in tasks it spawns."""
+        token = bound_workflow.set(workflow)
+        try:
+            yield
+        finally:
+            bound_workflow.reset(token)
+
+    def current_workflow(self) -> WorkflowRuntime:
+        """The open workflow the current work acts on, for writes and runs that need one.
+
+        The workflow the current work is bound to, else the engine's only open workflow.
+
+        Raises:
+            NoOpenWorkflowError: The work is bound to no workflow, or is unbound and none is open.
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        workflow = self.current_workflow_or_none()
+        if workflow is None:
+            msg = "Attempted to change the open workflow. Failed because no workflow is open. Open or create a workflow first."
+            raise NoOpenWorkflowError(msg)
+        return workflow
+
+    def current_workflow_or_none(self) -> WorkflowRuntime | None:
+        """Like `current_workflow`, but None when there is none, for reads that find nothing without one.
+
+        Raises:
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        bound = bound_workflow.get()
+        if bound is NO_WORKFLOW:
+            return None
+        if bound is not None:
+            return bound
+
+        open_workflows = self._open_workflows.all_open()
+        if len(open_workflows) > 1:
+            msg = (
+                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
+                "open and the request did not name one."
+            )
+            raise WorkflowNotNamedError(msg)
+        if not open_workflows:
+            return None
+        return open_workflows[0]
 
     def clear_current_workflow_data(self) -> None:  # noqa: C901
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.

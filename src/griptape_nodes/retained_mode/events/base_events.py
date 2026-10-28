@@ -326,7 +326,10 @@ class EventRequest[P: Payload](BaseEvent):
         request_id: Id the caller matches the result by. Echoed on the result.
         response_topic: Where the result is sent. Echoed on the result.
         workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
-            engine does not route by it yet, and never rejects a request for carrying one.
+            handler, and every task it starts, acts on that workflow. Whatever the request, an id
+            that names no open workflow fails it with `WorkflowNotOpenResultFailure`, unhandled.
+            Left out, the request acts on the engine's only open workflow, unless another engine
+            sent it: then it acts on no workflow.
     """
 
     request: P

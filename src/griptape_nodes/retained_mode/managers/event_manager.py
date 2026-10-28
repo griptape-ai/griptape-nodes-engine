@@ -8,7 +8,7 @@ import logging
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
@@ -36,7 +36,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayload,
     StrictModeViolationDetail,
 )
-from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -49,6 +49,7 @@ from griptape_nodes.retained_mode.request_handlers import (
     handled_request_types,
     sender_rules,
 )
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
     # A post-dispatch hook observes a completed request. It may be sync or async;
     # its return value is ignored because nothing awaits the notification.
@@ -1279,6 +1281,47 @@ class EventManager(EngineScoped):
             context=context,
         )
 
+    def _workflow_not_open_failure(
+        self, request: RP, workflow_id: str | None, *, context: ResultContext
+    ) -> EventResultFailure | None:
+        """The failure result for a request whose envelope names a workflow that isn't open, else None."""
+        if workflow_id is None or self.engine.open_workflows.is_open(workflow_id):
+            return None
+
+        msg = (
+            f"Attempted to handle {type(request).__name__} in workflow '{workflow_id}'. "
+            "Failed because that workflow isn't open in the engine anymore. Reopen the workflow and try again."
+        )
+        result_event = self._handle_request_core(
+            request,
+            WorkflowNotOpenResultFailure(result_details=msg),
+            context=context,
+        )
+        return cast("EventResultFailure", result_event)
+
+    def _bind_request_workflow(
+        self, workflow_id: str | None, sender: RequestSender | None
+    ) -> Token[WorkflowRuntime | NoWorkflow | None] | None:
+        """Bind the workflow a request acts on, returning the token to reset, or None when nothing was bound.
+
+        The open workflow the envelope names. With no envelope id, a request from another engine is
+        bound to NO_WORKFLOW: it is host-level and must not act in this engine's open workflow.
+        Otherwise the caller's binding stays, and unbound work is bound to the only open workflow, so
+        a run it starts keeps that workflow across awaits as one started with an id does. With none
+        open, or several, it stays unbound.
+        """
+        if workflow_id is not None:
+            return bound_workflow.set(self.engine.open_workflows.get(workflow_id))
+        if sender is not None:
+            return bound_workflow.set(NO_WORKFLOW)
+        if bound_workflow.get() is not None:
+            return None
+
+        open_workflows = self.engine.open_workflows.all_open()
+        if len(open_workflows) != 1:
+            return None
+        return bound_workflow.set(open_workflows[0])
+
     async def ahandle_request(
         self,
         request: RP,
@@ -1291,7 +1334,8 @@ class EventManager(EngineScoped):
         Args:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
-            workflow_id: The request envelope's workflow_id, echoed on the result. Not routed on.
+            workflow_id: The request envelope's workflow_id, echoed on the result. The handler runs
+                bound to that open workflow; one that names no open workflow fails the request.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
@@ -1311,6 +1355,10 @@ class EventManager(EngineScoped):
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context)
 
+        workflow_failure = self._workflow_not_open_failure(request, workflow_id, context=result_context)
+        if workflow_failure is not None:
+            return workflow_failure
+
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
         short_circuit = self._run_pre_dispatch_hooks(request, result_context)
@@ -1324,6 +1372,9 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
+        # Act on the workflow the envelope names, else none for another engine's request, else the
+        # caller's or the only open one, in the handler and every task it spawns.
+        binding_token = self._bind_request_workflow(workflow_id, result_context.get("sender"))
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
@@ -1344,6 +1395,8 @@ class EventManager(EngineScoped):
         finally:
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
+            if binding_token is not None:
+                bound_workflow.reset(binding_token)
 
     @staticmethod
     def _report_graph_access_while_loading(request: RequestPayload) -> None:
@@ -1393,7 +1446,8 @@ class EventManager(EngineScoped):
         Args:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
-            workflow_id: The request envelope's workflow_id, echoed on the result. Not routed on.
+            workflow_id: The request envelope's workflow_id, echoed on the result. The handler runs
+                bound to that open workflow; one that names no open workflow fails the request.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
@@ -1413,6 +1467,10 @@ class EventManager(EngineScoped):
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context)
 
+        workflow_failure = self._workflow_not_open_failure(request, workflow_id, context=result_context)
+        if workflow_failure is not None:
+            return workflow_failure
+
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
         short_circuit = self._run_pre_dispatch_hooks(request, result_context)
@@ -1426,6 +1484,9 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
+        # Act on the workflow the envelope names, else none for another engine's request, else the
+        # caller's or the only open one, in the handler and every task it spawns.
+        binding_token = self._bind_request_workflow(workflow_id, result_context.get("sender"))
         try:
             try:
                 result_payload = self._invoke_handler_from_sync(callback, request)
@@ -1445,6 +1506,8 @@ class EventManager(EngineScoped):
         finally:
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
+            if binding_token is not None:
+                bound_workflow.reset(binding_token)
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
         """Call a request handler from sync code, bridging async handlers onto a loop."""
