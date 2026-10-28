@@ -383,21 +383,21 @@ at least 300 pixels. Use a larger one." and a "Provider limits" link to `input_l
 
 Import the validators from `griptape_nodes.exe_types.validators`:
 
-| Validator                                  | Checks                                                                               |
-| ------------------------------------------ | ------------------------------------------------------------------------------------ |
-| `AllowedFormats("image/png", ...)`         | The format, read from the file: an image's, a video's container, an audio container. |
-| `MaxFileSize(maximum_bytes, strict=False)` | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
-| `SideRange(min=..., max=...)`              | Each side of an image or video frame, in pixels.                                     |
-| `PixelArea(min_megapixels=..., ...)`       | The pixels in an image or video frame, in millions.                                  |
-| `AspectRatioRange(tallest, widest)`        | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
-| `ExactAspectRatios("16:9", "9:16")`        | The aspect ratio, for a provider that takes only certain shapes.                     |
-| `Duration(min=..., max=..., fix=...)`      | A video's or audio clip's length, in seconds.                                        |
-| `FrameRate(min=..., max=...)`              | A video's frame rate.                                                                |
-| `FrameCount(min=..., max=...)`             | A video's frame count.                                                               |
-| `VideoCodecs("h264", ...)`                 | A video's codec.                                                                     |
-| `AudioCodecs("mp3", ...)`                  | An audio clip's codec.                                                               |
-| `MaxCount(maximum, noun="images")`         | How many items a list parameter holds.                                               |
-| `DependsOn(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.            |
+| Validator                                     | Checks                                                                               |
+| --------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `AllowedFormats("image/png", ...)`            | The format, read from the file: an image's, a video's container, an audio container. |
+| `MaxFileSize(maximum_bytes, strict=False)`    | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
+| `SideRange(min=..., max=...)`                 | Each side of an image or video frame, in pixels.                                     |
+| `PixelArea(min_megapixels=..., ...)`          | The pixels in an image or video frame, in millions.                                  |
+| `AspectRatioRange(tallest, widest)`           | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
+| `ExactAspectRatios("16:9", "9:16")`           | The aspect ratio, for a provider that takes only certain shapes.                     |
+| `Duration(min=..., max=..., fix=...)`         | A video's or audio clip's length, in seconds.                                        |
+| `FrameRate(min=..., max=...)`                 | A video's frame rate.                                                                |
+| `FrameCount(min=..., max=...)`                | A video's frame count.                                                               |
+| `VideoCodecs("h264", ...)`                    | A video's codec.                                                                     |
+| `AudioCodecs("mp3", ...)`                     | An audio clip's codec.                                                               |
+| `MaxCount(maximum, noun="images")`            | How many items a list parameter holds.                                               |
+| `DependsOn(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.               |
 
 A validator that fits more than one kind of media, such as `SideRange`, checks the kind its
 parameter holds: a `ParameterImage`'s image, a `ParameterVideo`'s video, a `ParameterAudio`'s
