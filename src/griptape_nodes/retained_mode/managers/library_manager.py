@@ -73,7 +73,7 @@ from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -339,7 +339,7 @@ class LibraryManager(EngineScoped):
         finally:
             self._libraries_loading_complete.set()
 
-    @handles(ReloadAllLibrariesRequest)
+    @handles(ReloadAllLibrariesRequest, scope=RequestScope.HOST)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # The heartbeat reports is_initializing during a mid-session reload too.
         with self.engine.lifecycle.reloading():
