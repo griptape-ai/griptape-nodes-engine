@@ -130,7 +130,14 @@ class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
 
     SkipTheLineMixin for the same reason as its siblings: the alternative is a queued ExecuteNodeRequest
     running against objects belonging to a workflow that is already gone.
+
+    A field rather than the envelope's `open_workflow_id`, because the envelope names a workflow open
+    in the receiving engine and a worker opens none.
     """
+
+    # The orchestrator workflow that closed, so only its objects and runtime go. None when every
+    # workflow did.
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -484,26 +491,34 @@ def register_remote_handlers(event_manager: EventManager) -> None:
 
 
 async def _handle_drop_all_local_objects(
-    request: DropAllLocalObjectsRequest,  # noqa: ARG001
+    request: DropAllLocalObjectsRequest,
     *,
     event_manager: EventManager,
 ) -> ResultPayload:
-    """Release every object this process is holding for its libraries.
+    """Release the objects this process is holding for its libraries for the workflow that closed, or all of them.
 
     Accepted while a node is executing, like its targeted sibling: the store takes the entries out now and
     holds their release hooks back until nothing is running, so a forward pass mid-flight keeps the object
     it is already holding. The cost is that a node which has not run yet asks for a library-named key and is
     told no, and pays to rebuild -- on a workflow that is being torn down.
 
+    The orchestrator sends this when it tears a workflow down, so the runtime this worker keeps for
+    that workflow goes too, unless a node is still running in it. Naming no workflow, every workflow
+    was torn down: every object goes, and every runtime no node is running in.
+
     Takes the event manager because that is how it reaches this engine; the process-global engine would
     silently no-op for an engine an embedder built directly.
     """
     resource_manager = event_manager.engine.resource_manager
+    event_manager.engine.sweep_worker_workflows(request.workflow_id)
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
         # worker's loop past the heartbeat timeout gets it evicted mid-load.
-        dropped = await to_thread(resource_manager.drop_all_local_objects)
+        if request.workflow_id is None:
+            dropped = await to_thread(resource_manager.drop_all_local_objects)
+        else:
+            dropped = await to_thread(resource_manager.drop_objects_for_workflow, request.workflow_id)
     except Exception as e:
         details = (
             f"Attempted to release objects held for this worker's libraries. Failed because of {type(e).__name__}: {e}."

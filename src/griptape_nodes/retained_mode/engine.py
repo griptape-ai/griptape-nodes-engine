@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.runtime.binding import (
     bound_workflow,
 )
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
+from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -193,6 +194,7 @@ class Engine:
     _lifecycle: EngineLifecycle
     _workflow_registry: _WorkflowRegistry
     _open_workflows: OpenWorkflowSet
+    _worker_workflows: WorkerWorkflowSet
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -242,6 +244,8 @@ class Engine:
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet()
+        # Always empty on the orchestrator. See `run_in_worker_workflow`.
+        self._worker_workflows = WorkerWorkflowSet()
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -250,7 +254,7 @@ class Engine:
         self._context_manager = ContextManager(self._event_manager, engine=self)
         self._workflow_registry = _WorkflowRegistry(
             self._config_manager,
-            is_workflow_open=self._context_manager.is_workflow_in_context,
+            is_workflow_open=self._holds_workflow,
         )
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
@@ -422,6 +426,10 @@ class Engine:
     @property
     def open_workflows(self) -> OpenWorkflowSet:
         return self._open_workflows
+
+    @property
+    def worker_workflows(self) -> WorkerWorkflowSet:
+        return self._worker_workflows
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -646,6 +654,43 @@ class Engine:
         if bound_workflow.get() is workflow:
             bound_workflow.set(NO_WORKFLOW)
 
+    @contextmanager
+    def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
+        """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
+
+        Binds `workflow` for the block, so the node's context, paths and imports resolve against the
+        workflow the orchestrator has open, and keeps `sweep_worker_workflows` from closing it while
+        the node runs.
+        """
+        with self._worker_workflows.running(workflow), self.bind_workflow(workflow):
+            yield
+
+    def close_worker_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Forget a runtime this worker kept for an orchestrator workflow, and the registry entry made for it.
+
+        Only an unlisted entry was made for it; a listed one came from this engine's scan and stays.
+        Does nothing for a runtime already forgotten.
+        """
+        if not self._worker_workflows.close(workflow):
+            return
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.listed:
+            self._workflow_registry.remove(workflow.workflow_id)
+
+    def sweep_worker_workflows(self, workflow_id: str | None = None) -> int:
+        """Close the runtimes this worker keeps that no node is running in, and return how many.
+
+        For when the orchestrator tears a workflow down: only the runtime kept for `workflow_id`,
+        or, when it names none, every idle runtime. A node still running keeps its runtime until a
+        later sweep.
+        """
+        idle = self._worker_workflows.idle()
+        if workflow_id is not None:
+            idle = [workflow for workflow in idle if workflow.workflow_id == workflow_id]
+        for workflow in idle:
+            self.close_worker_workflow(workflow)
+        return len(idle)
+
     def current_workflow(self) -> WorkflowRuntime:
         """The open workflow the current work acts on, for writes and runs that need one.
 
@@ -664,6 +709,9 @@ class Engine:
 
     def current_workflow_or_none(self) -> WorkflowRuntime | None:
         """Like `current_workflow`, but None when there is none, for reads that find nothing without one.
+
+        A worker opens no workflow, so unbound work there finds none: its node work is bound to the
+        runtime it keeps for the node's workflow (`run_in_worker_workflow`).
 
         Raises:
             WorkflowNotOpenError: The work is bound to a workflow that has closed.
@@ -819,6 +867,13 @@ class Engine:
             asyncio.run_coroutine_threadsafe(self._worker_manager.on_engine_lost(engine_id), engine_loop)
         )
 
+    def _holds_workflow(self, workflow_id: str) -> bool:
+        """Whether the workflow with this id is in this engine's context, or is one a worker keeps a runtime for.
+
+        The registry protects these entries from rescans and reindexing.
+        """
+        return self._context_manager.is_workflow_in_context(workflow_id) or self._worker_workflows.holds(workflow_id)
+
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.
 
@@ -850,8 +905,8 @@ class Engine:
         try:
             context_manager = self._context_manager
 
-            # Check if there's an active workflow
-            if context_manager.has_current_workflow():
+            # What the engine has open, not the current workflow: a worker's runtimes never show here.
+            if self._open_workflows.all_open() and context_manager.has_current_workflow():
                 workflow = context_manager.get_current_workflow()
                 workflow_info["current_workflow"] = workflow.name
                 workflow_info["current_workflow_id"] = workflow.workflow_id
