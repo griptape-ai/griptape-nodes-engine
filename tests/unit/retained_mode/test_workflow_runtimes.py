@@ -11,7 +11,7 @@ import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionContext
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayloadSuccess
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayloadSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
@@ -43,16 +43,19 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotOpenError
-from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
+from griptape_nodes.retained_mode.request_handlers import RequiredSender
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotOpenError, bound_workflow
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 def _live_machine() -> MagicMock:
@@ -84,8 +87,114 @@ class _RunSpec:
         return StartFlowResultFailure(validation_exceptions=[], result_details=details)
 
 
+@dataclass(kw_only=True)
+class _ReplaceWorkflowRequest(RequestPayload):
+    """Closes the open workflow and opens another, as a load does."""
+
+
 class TestRuntimeLifecycle:
-    """The runtime is open exactly while the context stack holds a workflow."""
+    """The runtime is open exactly while a workflow is in context."""
+
+    def test_a_push_onto_an_empty_stack_opens_the_pushed_workflow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+
+        workflow = engine.current_workflow()
+        assert workflow.workflow_id == engine.context_manager.get_current_workflow_id()
+        assert len(workflow.objects) == 0
+
+    def test_a_push_while_a_workflow_is_open_is_refused(self, engine: Engine, tmp_path: Path) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        runtime = engine.current_workflow()
+        unregistered_file = tmp_path / "never_registered.py"
+        unregistered_file.write_text("# stub")
+
+        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError, match="is already open"):
+            engine.context_manager.push_workflow(workflow_name="inner")
+        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
+            engine.context_manager.push_workflow(file_path=str(unregistered_file))
+
+        assert engine.current_workflow() is runtime
+        # Refused before anything is registered.
+        assert engine.workflow_registry.find_by_name("inner") is None
+        assert engine.workflow_registry.find_by_path(str(unregistered_file)) is None
+
+    def test_popping_the_workflow_closes_it_with_its_context(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        flow = MagicMock(name="flow")
+        engine.context_manager.push_flow(flow)
+        assert engine.current_workflow().context.get_current_flow() is flow
+
+        name = engine.context_manager.pop_workflow()
+        engine.context_manager.push_workflow(workflow_name=name)
+
+        assert not engine.context_manager.has_current_flow()
+
+    def test_the_workflow_context_is_the_engines_current_workflow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            assert not engine.context_manager.has_current_workflow()
+        assert engine.context_manager.has_current_workflow()
+
+    def test_closing_the_bound_workflow_leaves_the_work_on_no_workflow_not_another_open_one(
+        self, engine: Engine
+    ) -> None:
+        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine.context_manager.push_workflow(workflow_name="other")
+        other = engine.current_workflow()
+        closed = engine.open_workflows.open(
+            engine.workflow_registry.register_unsaved("closed", listed=False).workflow_id
+        )
+
+        with engine.bind_workflow(closed):
+            engine.context_manager.pop_workflow()
+            assert engine.current_workflow_or_none() is None
+
+        assert engine.open_workflows.all_open() == [other]
+
+    def test_a_request_acts_on_the_workflow_it_opens_until_it_ends(self, engine: Engine) -> None:
+        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine.context_manager.push_workflow(workflow_name="other")
+        acted_on: list[WorkflowRuntime] = []
+
+        def open_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
+            # Two workflows are open once this one opens, so only the binding finds it.
+            engine.context_manager.push_workflow(workflow_name="opened")
+            acted_on.append(engine.current_workflow())
+            return ResultPayloadSuccess(result_details="ok")
+
+        # A request from another engine starts bound to no workflow, so it can open one beside "other".
+        engine.event_manager.assign_manager_to_request_type(
+            _ReplaceWorkflowRequest, open_workflow, sender=RequiredSender.ENGINE
+        )
+
+        engine.event_manager.handle_request(
+            _ReplaceWorkflowRequest(), result_context=ResultContext(sender=RequestSender(engine_id="another-engine"))
+        )
+
+        assert engine.open_workflows.all_open()[1] is acted_on[0]
+        assert bound_workflow.get() is None
+
+    def test_a_request_with_no_envelope_id_that_replaces_the_workflow_acts_on_the_next_one(
+        self, engine: Engine
+    ) -> None:
+        engine.context_manager.push_workflow(workflow_name="closed")
+        closed = engine.current_workflow()
+        acted_on: list[WorkflowRuntime] = []
+
+        def replace_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
+            # Dispatch bound the request to the only open workflow, the one it closes.
+            engine.context_manager.pop_workflow()
+            engine.context_manager.push_workflow(workflow_name="next")
+            acted_on.append(engine.current_workflow())
+            return ResultPayloadSuccess(result_details="ok")
+
+        engine.event_manager.assign_manager_to_request_type(_ReplaceWorkflowRequest, replace_workflow)
+
+        engine.handle_request(_ReplaceWorkflowRequest())
+
+        assert acted_on[0] is not closed
+        assert engine.open_workflows.all_open() == acted_on
 
     def test_clear_all_object_state_closes_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")

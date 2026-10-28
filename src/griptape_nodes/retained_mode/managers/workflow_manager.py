@@ -905,8 +905,12 @@ class WorkflowManager(EngineScoped):
         return self.engine.workflow_registry.refresh_file(file_path, metadata)
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
-        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`."""
-        return await self.runner.run_workflow(relative_file_path)
+        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`.
+
+        Builds into the current workflow, else opens the file as one.
+        """
+        opens_workflow = not self.engine.context_manager.has_current_workflow()
+        return await self.runner.run_workflow(relative_file_path, opens_workflow=opens_workflow)
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""

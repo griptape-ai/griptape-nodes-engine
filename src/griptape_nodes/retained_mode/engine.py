@@ -250,16 +250,12 @@ class Engine:
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
-        # Ahead of the registry, which asks it whether a workflow is open.
-        self._context_manager = ContextManager(self._event_manager, engine=self)
-        self._workflow_registry = _WorkflowRegistry(
-            self._config_manager,
-            is_workflow_open=self._holds_workflow,
-        )
+        self._workflow_registry = _WorkflowRegistry(self._config_manager, is_workflow_open=self._holds_workflow)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
+        self._context_manager = ContextManager(self._event_manager, engine=self)
         self._worker_manager = WorkerManager(engine=self, event_manager=self._event_manager)
         self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager, engine=self)
         self._model_manager = ModelManager(self._event_manager, engine=self)
@@ -656,7 +652,8 @@ class Engine:
         """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
 
         Bound to NO_WORKFLOW rather than unbound, so the rest of the work never falls back to another
-        open workflow. Only the current context is rebound: tasks spawned earlier keep their
+        open workflow. A load bound to the workflow it closes then acts on the one it opens
+        (`enter_opened_workflow`). Only the current context is rebound: tasks spawned earlier keep their
         binding, so a run that wakes after the close never reaches the next workflow.
         """
         if bound_workflow.get() is workflow:
@@ -747,6 +744,21 @@ class Engine:
         if not open_workflows:
             return None
         return open_workflows[0]
+
+    def bound_live_workflow_or_none(self) -> WorkflowRuntime | None:
+        """The workflow the current work is bound to, while it is still open here or kept by this worker.
+
+        Unlike `current_workflow_or_none`, it never falls back to the only open workflow, so it never
+        raises however many are open. A binding to a workflow closed since it was made finds none.
+        """
+        bound = bound_workflow.get()
+        if bound is None or bound is NO_WORKFLOW:
+            return None
+        if self._open_workflows.is_open(bound.workflow_id) and self._open_workflows.get(bound.workflow_id) is bound:
+            return bound
+        if self._worker_workflows.find(bound.workflow_id) is bound:
+            return bound
+        return None
 
     def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
@@ -876,11 +888,11 @@ class Engine:
         )
 
     def _holds_workflow(self, workflow_id: str) -> bool:
-        """Whether the workflow with this id is in this engine's context, or is one a worker keeps a runtime for.
+        """Whether the workflow with this id is open here, or is one a worker keeps a runtime for.
 
         The registry protects these entries from rescans and reindexing.
         """
-        return self._context_manager.is_workflow_in_context(workflow_id) or self._worker_workflows.holds(workflow_id)
+        return self._open_workflows.is_open(workflow_id) or self._worker_workflows.holds(workflow_id)
 
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.
@@ -913,8 +925,14 @@ class Engine:
         try:
             context_manager = self._context_manager
 
-            # What the engine has open, not the current workflow: a worker's runtimes never show here.
-            if self._open_workflows.all_open() and context_manager.has_current_workflow():
+            # What the engine has open, not the current workflow: the heartbeat is a host request
+            # bound to no workflow, and a worker's runtimes never show here.
+            open_workflows = self._open_workflows.all_open()
+            if len(open_workflows) != 1:
+                return workflow_info
+            with self.bind_workflow(open_workflows[0]):
+                if not context_manager.has_current_workflow():
+                    return workflow_info
                 workflow = context_manager.get_current_workflow()
                 workflow_info["current_workflow"] = workflow.name
                 workflow_info["current_workflow_id"] = workflow.workflow_id

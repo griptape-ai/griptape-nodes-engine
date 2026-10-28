@@ -128,9 +128,10 @@ from griptape_nodes.retained_mode.events.flow_events import (
 
 
 async def _e2e_run() -> None:
-    # Mirror generator-emitted aexecute_workflow ordering: build the graph first, then
-    # enter the executor. This is the path #4584 describes, where the standalone
-    # subprocess has no engine bootstrap registering libraries before build_workflow.
+    # Mirror generator-emitted aexecute_workflow ordering: open the file as the workflow and
+    # build the graph first, then enter the executor. This is the path #4584 describes, where
+    # the standalone subprocess has no engine bootstrap registering libraries before build_workflow.
+    GriptapeNodes.ContextManager().push_workflow(file_path=__file__)  # noqa: F821
     await build_workflow()  # noqa: F821 - defined by exec'd workflow source above
     top_level = await GriptapeNodes.ahandle_request(_E2EGetTopLevelFlowRequest())  # noqa: F821
     if not isinstance(top_level, _E2EGetTopLevelFlowResultSuccess) or top_level.flow_name is None:
