@@ -48,7 +48,6 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.input_checks import ImageInfo
     from griptape_nodes.exe_types.node_error import NodeError
-    from griptape_nodes.exe_types.node_types import BaseNode
 
 __all__ = [
     "AllowedFormats",
@@ -99,7 +98,6 @@ class MaxFileSize(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return check_size(
@@ -140,7 +138,6 @@ class AllowedFormats(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         if media.audio is not None:
@@ -170,7 +167,6 @@ class SideRange(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return check_dimensions(media.frame, subject=subject, min_side=self.min, max_side=self.max, docs_url=docs_url)
@@ -193,7 +189,6 @@ class PixelArea(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return check_dimensions(
@@ -232,7 +227,6 @@ class AspectRatioRange(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return _easier_shape(
@@ -272,7 +266,6 @@ class ExactAspectRatios(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return _easier_shape(
@@ -309,7 +302,6 @@ class Duration(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         probe = media.video
@@ -353,7 +345,6 @@ class FrameRate(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
@@ -397,7 +388,6 @@ class FrameCount(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
@@ -439,7 +429,6 @@ class VideoCodecs(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         if media.video is None:
@@ -475,7 +464,6 @@ class AudioCodecs(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         if media.audio is None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import ParameterList, ParameterMode
+from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import MaxFileSize, SideRange
@@ -66,6 +68,30 @@ class TestDependsOn:
     def test_lists_every_validator_reachable_through_nesting(self) -> None:
         nested = DependsOn("model", {"pro": [DependsOn("size", {"large": self.PRO})]}, default=self.DEFAULT)
         assert list(nested.candidates()) == [*self.PRO, *self.DEFAULT]
+
+    @pytest.mark.parametrize(("upscale", "expected"), [(True, []), (False, [SideRange(min=512)])])
+    def test_picks_by_a_value_that_is_not_text(self, upscale: bool, expected: list) -> None:  # noqa: FBT001
+        node = MockNode(name="node")
+        node.add_parameter(ParameterBool(name="upscale"))
+        node.set_parameter_value("upscale", upscale)
+        depends_on_upscale = DependsOn("upscale", {True: []}, default=[SideRange(min=512)])
+        assert list(depends_on_upscale.selected(node)) == expected
+
+    @pytest.mark.parametrize(("images", "expected"), [([], list(PRO)), (["a.png"], list(DEFAULT))])
+    def test_key_turns_the_value_into_what_is_looked_up(self, images: list[str], expected: list) -> None:
+        node = MockNode(name="node")
+        node.add_parameter(
+            ParameterList(
+                name="reference_images",
+                tooltip="",
+                input_types=["ImageUrlArtifact"],
+                type="ImageUrlArtifact",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        node.set_parameter_value("reference_images", images)
+        depends_on_images = DependsOn("reference_images", {False: self.PRO}, default=self.DEFAULT, key=bool)
+        assert list(depends_on_images.selected(node)) == expected
 
     def test_checks_nothing_itself(self) -> None:
         depends_on_model = DependsOn("model", {"pro": self.PRO})

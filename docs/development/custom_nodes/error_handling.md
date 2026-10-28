@@ -397,7 +397,7 @@ Import the validators from `griptape_nodes.exe_types.validators`:
 | `VideoCodecs("h264", ...)`                 | A video's codec.                                                                     |
 | `AudioCodecs("mp3", ...)`                  | An audio clip's codec.                                                               |
 | `MaxCount(maximum, noun="images")`         | How many items a list parameter holds.                                               |
-| `DependsOn(parameter, {...}, default=)`    | Picks one of several lists of validators by another parameter's value.               |
+| `DependsOn(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.            |
 
 A validator that fits more than one kind of media, such as `SideRange`, checks the kind its
 parameter holds: a `ParameterImage`'s image, a `ParameterVideo`'s video, a `ParameterAudio`'s
@@ -422,6 +422,14 @@ On a `ParameterList`, each item is checked on its own and named by its position,
 `default` for any other value. A list can hold another `DependsOn`, for limits that depend on two
 settings. Override `input_limits_url()` to return the page for the current model too.
 
+The values it looks up can be anything a parameter holds, such as `True` for a switch. `key=` turns
+the value into what's looked up first: `key=bool` asks whether a list has any items.
+
+```python
+DependsOn("upscale", {True: []}, default=[SideRange(min=512)])
+DependsOn("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
+```
+
 ```python
 from griptape_nodes.exe_types.validators import DependsOn, MaxCount
 
@@ -442,31 +450,28 @@ ParameterList(
 )
 ```
 
-**Limits that apply only sometimes.** `.when(condition)` and `.unless(condition)` wrap any validator,
-`DependsOn` included, so it applies only to a value the condition holds, or doesn't hold, for. A
-condition is a function given the node and the value's `MediaInfo`, returning True or False. One
-that looks at the file marks what it reads with `@reads(...)`, so the engine reads that along with
-the validator's own readings; without it, the condition sees only what the validator asked for. On
-a list, `.first(n)` checks only the first `n` items, for a provider that reads only that many.
+**Limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap any
+validator, `DependsOn` included, so it applies only to a value whose file the condition holds, or
+doesn't hold, for. A condition is a function given the value's `MediaInfo`, returning True or
+False; it marks what it reads with `@reads(...)`, so the engine reads that along with the
+validator's own readings. A condition sees only the file: a limit that depends on a setting is a
+`DependsOn`. On a list, `.first(n)` checks only the first `n` items, for a provider that reads only
+that many.
 
 ```python
-from griptape_nodes.exe_types.validators import MaxFileSize, MediaNeed, SideRange, reads
+from griptape_nodes.exe_types.validators import DependsOn, MaxFileSize, MediaNeed, SideRange, reads
 
 
 @reads(MediaNeed.IMAGE)
-def is_png(node, media) -> bool:
+def is_png(media) -> bool:
     return media.mime_type == "image/png"
-
-
-def upscaling(node, media) -> bool:
-    return node.get_parameter_value("upscale") is True
 
 
 ParameterImage(
     name="image",
     pre_run_validators=[
         MaxFileSize(5 * MB).when(is_png),
-        SideRange(min=512).unless(upscaling),
+        DependsOn("upscale", {True: []}, default=[SideRange(min=512)]),
     ],
 )
 ```
@@ -505,8 +510,8 @@ class ReferenceToVideo(SuccessFailureNode):
 the validators on a parameter and hands each the same `MediaInfo`. For a reading `MediaInfo` doesn't
 carry, call a reader (`local_size_bytes`, `local_image_info`, `local_image_format`,
 `local_video_probe`, `local_audio_probe`) from `griptape_nodes.exe_types.input_checks`; during the
-node's checks it returns what was already read. `check` is also given the `node` and, for a list
-item, its `position`; take `**_` for any you don't use.
+node's checks it returns what was already read. `check` is also given a list item's `position`;
+take `**_` for any argument you don't use.
 
 ```python
 from typing import Any, override

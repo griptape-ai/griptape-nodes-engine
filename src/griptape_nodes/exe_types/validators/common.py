@@ -9,7 +9,7 @@ from griptape_nodes.exe_types.validators._checks import check_count
 from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, PreRunValidator
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Hashable, Mapping, Sequence
 
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -39,7 +39,6 @@ class MaxCount(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         return check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
@@ -51,7 +50,8 @@ class DependsOn(PreRunValidator):
 
     At the node's turn, the validators listed for the other parameter's current value apply, or
     `default` for a value not listed. A list can hold another `DependsOn`, for limits that depend
-    on two settings; it picks in turn.
+    on two settings; it picks in turn. This is how a limit depends on a setting; a limit that
+    depends on the file itself uses `PreRunValidator.when` or `unless`.
 
     ```python
     DependsOn(
@@ -59,29 +59,37 @@ class DependsOn(PreRunValidator):
         {"pro": [SideRange(min=300), MaxFileSize(10 * MB)]},
         default=[SideRange(min=512)],
     )
+    # A switch, and whether a list has items:
+    DependsOn("upscale", {True: []}, default=[SideRange(min=512)])
+    DependsOn("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
     ```
 
     Args:
         parameter: The name of the parameter whose value picks the limits.
-        choices: The validators for each value of that parameter.
+        choices: The validators for each value of that parameter, or of `key` applied to it.
         default: The validators for any other value.
+        key: Turns the parameter's value into the value looked up in `choices`, such as `bool`
+            for whether a list has items. The value is looked up as it is when None.
     """
 
     parameter: str
     # Pairs rather than a dict, so the validator stays frozen and hashable.
-    choices: tuple[tuple[str, tuple[PreRunValidator, ...]], ...]
+    choices: tuple[tuple[Hashable, tuple[PreRunValidator, ...]], ...]
     default: tuple[PreRunValidator, ...]
+    key: Callable[[Any], Hashable] | None
 
     def __init__(
         self,
         parameter: str,
-        choices: Mapping[str, Sequence[PreRunValidator]],
+        choices: Mapping[Hashable, Sequence[PreRunValidator]],
         *,
         default: Sequence[PreRunValidator] = (),
+        key: Callable[[Any], Hashable] | None = None,
     ) -> None:
         object.__setattr__(self, "parameter", parameter)
         object.__setattr__(self, "choices", tuple((value, tuple(validators)) for value, validators in choices.items()))
         object.__setattr__(self, "default", tuple(default))
+        object.__setattr__(self, "key", key)
 
     @override
     def check(
@@ -91,7 +99,6 @@ class DependsOn(PreRunValidator):
         subject: str,
         docs_url: str | None,
         media: MediaInfo = EMPTY_MEDIA,
-        node: BaseNode | None = None,
         position: int | None = None,
     ) -> NodeError | None:
         # The engine runs the validators `selected` picks; this one has nothing of its own to check.
@@ -100,7 +107,10 @@ class DependsOn(PreRunValidator):
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:
         """The validators listed for the other parameter's current value, or `default`, each picking in turn."""
         picked: list[PreRunValidator] = []
-        for validator in self._listed_for(node.get_parameter_value(self.parameter)):
+        current = node.get_parameter_value(self.parameter)
+        if self.key is not None:
+            current = self.key(current)
+        for validator in self._listed_for(current):
             picked.extend(validator.selected(node))
         return picked
 
