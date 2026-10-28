@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
+from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionContext
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayloadSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -269,6 +270,43 @@ class TestObjectsOnTheRuntime:
         engine.context_manager.push_workflow(workflow_name="next")
 
         assert not engine.object_manager.has_object_with_name("canvas")
+
+    def test_a_closed_workflows_queued_ui_changes_go_with_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        node = MockNode(name="node")
+        parameter = Parameter(name="text", tooltip="Text", type="str")
+        node.add_parameter(parameter)
+        engine.object_manager.add_object_by_name("node", node)
+        parameter.track_change("tooltip", "Changed")
+
+        engine.context_manager.pop_workflow()
+        engine.context_manager.push_workflow(workflow_name="next")
+
+        assert engine.object_manager.take_nodes_with_queued_changes() == []
+
+    def test_queued_ui_changes_are_taken_from_the_bound_workflow_or_every_open_one(self, engine: Engine) -> None:
+        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine.context_manager.push_workflow(workflow_name="first")
+        first = engine.current_workflow()
+        second = engine.open_workflows.open(
+            engine.workflow_registry.register_unsaved("second", listed=False).workflow_id
+        )
+        nodes = {}
+        for workflow in (first, second):
+            node = MockNode(name="node")
+            parameter = Parameter(name="text", tooltip="Text", type="str")
+            node.add_parameter(parameter)
+            with engine.bind_workflow(workflow):
+                engine.object_manager.add_object_by_name("node", node)
+            parameter.track_change("tooltip", "Changed")
+            nodes[workflow] = node
+
+        with engine.bind_workflow(second):
+            taken_bound = engine.object_manager.take_nodes_with_queued_changes()
+        taken_unbound = engine.object_manager.take_nodes_with_queued_changes()
+
+        assert taken_bound == [nodes[second]]
+        assert taken_unbound == [nodes[first]]
 
 
 class TestVariablesOnTheRuntime:
