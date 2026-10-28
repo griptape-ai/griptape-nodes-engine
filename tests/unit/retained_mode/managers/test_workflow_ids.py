@@ -235,6 +235,46 @@ class TestRegistryRefresh:
 
         assert _id_at(engine, imported_file) is not None
 
+    def test_a_workflow_saved_for_the_first_time_while_the_scan_runs_survives_it(
+        self, workspace: Path, tmp_path: Path
+    ) -> None:
+        engine = current_engine()
+        engine.config_manager.workspace_path = workspace
+        unsaved = engine.workflow_registry.register_unsaved("Scratch")
+        saved_file = _write_workflow_file(tmp_path / "elsewhere" / "scratch.py")
+        real_scan = engine.workflow_manager._process_workflows_for_registration
+
+        async def scan_with_a_first_save(workflows_to_register: list[str]) -> object:
+            result = await real_scan(workflows_to_register)
+            engine.workflow_registry.set_file_path(unsaved, saved_file)
+            return result
+
+        with patch.object(engine.workflow_manager, "_process_workflows_for_registration", scan_with_a_first_save):
+            _scan(engine, workspace)
+
+        assert _id_at(engine, saved_file) == unsaved.workflow_id
+
+    def test_a_workflow_moved_while_the_scan_runs_survives_it(self, workspace: Path, tmp_path: Path) -> None:
+        engine = current_engine()
+        engine.config_manager.workspace_path = workspace
+        workflow_file = _write_workflow_file(workspace / "flow.py")
+        _scan(engine, workspace)
+        workflow = engine.workflow_registry.find_by_path(workflow_file)
+        assert workflow is not None
+        moved_file = tmp_path / "elsewhere" / "flow.py"
+        real_scan = engine.workflow_manager._process_workflows_for_registration
+
+        async def scan_with_a_move(workflows_to_register: list[str]) -> object:
+            moved_file.parent.mkdir(parents=True)
+            workflow_file.rename(moved_file)
+            engine.workflow_registry.set_file_path(workflow, moved_file)
+            return await real_scan(workflows_to_register)
+
+        with patch.object(engine.workflow_manager, "_process_workflows_for_registration", scan_with_a_move):
+            _scan(engine, workspace)
+
+        assert _id_at(engine, moved_file) == workflow.workflow_id
+
     def test_overlapping_refreshes_keep_each_others_finds(self, workspace: Path) -> None:
         engine = current_engine()
         engine.config_manager.workspace_path = workspace
