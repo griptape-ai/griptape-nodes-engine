@@ -6,11 +6,11 @@ import pytest
 
 from griptape_nodes.exe_types.input_checks import ImageInfo
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators._checks import (
+from griptape_nodes.exe_types.validators._checks import check_count
+from griptape_nodes.exe_types.validators._media_checks import (
     check_aspect_ratio_exact,
     check_aspect_ratio_range,
     check_audio_codec,
-    check_count,
     check_dimensions,
     check_duration,
     check_frame_count,

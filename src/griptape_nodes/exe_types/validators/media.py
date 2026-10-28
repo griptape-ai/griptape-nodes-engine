@@ -1,6 +1,6 @@
 """Limits on an image, video or audio input, declared on its parameter with `pre_run_validators=`.
 
-Each validator wraps one of the checks in `_checks`, which writes its message. A validator skips
+Each validator wraps one of the checks in `_media_checks`, which writes its message. A validator skips
 anything the engine couldn't read locally, such as a remote URL, and leaves it for the provider.
 
 A validator whose limit fits more than one kind of media (`AllowedFormats`, `SideRange`,
@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
-from griptape_nodes.exe_types.validators._checks import (
+from griptape_nodes.exe_types.validators._media_checks import (
     FRAME_RATE_TOLERANCE,
     check_aspect_ratio_exact,
     check_aspect_ratio_range,
@@ -419,7 +419,7 @@ class VideoCodecs(PreRunValidator):
 
     Raises:
         TypeError: If a codec isn't a string, such as a tuple passed as one argument.
-        ValueError: If a codec isn't one `_checks` knows.
+        ValueError: If a codec isn't one `_media_checks` knows.
     """
 
     needs = frozenset({MediaNeed.VIDEO})
@@ -455,7 +455,7 @@ class AudioCodecs(PreRunValidator):
 
     Raises:
         TypeError: If a codec isn't a string, such as a tuple passed as one argument.
-        ValueError: If a codec isn't one `_checks` knows.
+        ValueError: If a codec isn't one `_media_checks` knows.
     """
 
     needs = frozenset({MediaNeed.AUDIO})
