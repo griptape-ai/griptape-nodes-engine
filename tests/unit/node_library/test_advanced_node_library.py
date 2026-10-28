@@ -68,3 +68,11 @@ class TestGetRequestHandlers:
         assert len(handlers) == 1
         assert handlers[0][0] is FakeRequest
         assert handlers[0][1] is handler
+
+
+class TestGetEventListeners:
+    def test_execution_event_listeners_default_to_none(self) -> None:
+        assert AdvancedNodeLibrary().get_execution_event_listeners() == []
+
+    def test_app_event_listeners_default_to_none(self) -> None:
+        assert AdvancedNodeLibrary().get_app_event_listeners() == []

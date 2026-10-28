@@ -8,10 +8,25 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from griptape_nodes.retained_mode.events.flow_events import (
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
+from griptape_nodes.retained_mode.events.library_events import (
+    RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultSuccess,
+    UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultSuccess,
+)
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.parameter_events import (
+    SetParameterValueRequest,
+    SetParameterValueResultSuccess,
+)
 from griptape_nodes.serialization.values import TYPE_KEY, VALUE_KEY, decode_value, encode_value
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import ModuleType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -65,3 +80,22 @@ class TestLibraryValueNames:
             TYPE_KEY: f"{_STABLE_MODULE}:FixtureMode",
             VALUE_KEY: "slow",
         }
+
+    def test_value_saves_after_its_library_reloads(
+        self, engine: Engine, library_name: str, library_json: Path, library_module: ModuleType
+    ) -> None:
+        """Updating a library reloads it under the open workflow, whose values keep the old classes."""
+        result = engine.handle_request(
+            SetParameterValueRequest(node_name="Holder", parameter_name="mode", value=library_module.FixtureMode.SLOW)
+        )
+        assert isinstance(result, SetParameterValueResultSuccess), result
+        result = engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
+        assert isinstance(result, UnloadLibraryFromRegistryResultSuccess), result
+        result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+        assert isinstance(result, RegisterLibraryFromFileResultSuccess), result
+
+        result = engine.handle_request(SerializeFlowToCommandsRequest())
+
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
+        saved_values = list(result.serialized_flow_commands.unique_parameter_uuid_to_values.values())
+        assert {TYPE_KEY: f"{_STABLE_MODULE}:FixtureMode", VALUE_KEY: "slow"} in saved_values

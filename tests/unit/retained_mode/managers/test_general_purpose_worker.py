@@ -389,14 +389,10 @@ class TestRestartWhenLibrariesChange:
 
 
 def _initializing_library_manager() -> LibraryManager:
-    """A LibraryManager whose app-init steps around the library load are inert."""
+    """A LibraryManager whose startup steps around the library load are inert."""
     manager = _library_manager()
-    engine = cast("MagicMock", manager._engine)
-    engine.get_session_id.return_value = None
-    engine.workflow_manager = AsyncMock()
     manager.provisioning.ensure_libraries_from_config = AsyncMock()  # type: ignore[method-assign]
     manager.discovery.migrate_old_xdg_library_paths = MagicMock()  # type: ignore[method-assign]
-    manager.workers.maybe_start_workers_for_existing_session = AsyncMock()  # type: ignore[method-assign]
     manager._collect_library_workflow_files = AsyncMock(return_value=[])  # type: ignore[method-assign]
     manager.load_all_libraries_from_config = AsyncMock(return_value=[])  # type: ignore[method-assign]
     manager.workers.report_general_purpose_worker_ready = AsyncMock()  # type: ignore[method-assign]
@@ -408,7 +404,7 @@ class TestWorkerSideLoading:
     async def test_loads_every_library_and_then_reports_ready(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(
+        await manager.load_libraries_for_startup(
             AppInitializationComplete(is_worker=True, is_general_purpose_worker=True)
         )
 
@@ -420,7 +416,7 @@ class TestWorkerSideLoading:
     async def test_a_library_worker_still_loads_only_its_library_and_reports_no_readiness(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(
+        await manager.load_libraries_for_startup(
             AppInitializationComplete(is_worker=True, libraries_to_register=["Heavy Library"])
         )
 
@@ -434,7 +430,7 @@ class TestWorkerSideLoading:
     async def test_the_flag_means_nothing_on_the_orchestrator(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(AppInitializationComplete(is_general_purpose_worker=True))
+        await manager.load_libraries_for_startup(AppInitializationComplete(is_general_purpose_worker=True))
 
         cast("AsyncMock", manager.workers.report_general_purpose_worker_ready).assert_not_awaited()
         assert not manager.is_general_purpose_worker

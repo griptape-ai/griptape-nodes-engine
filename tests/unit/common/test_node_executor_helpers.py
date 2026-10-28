@@ -33,6 +33,9 @@ def _make_executor() -> NodeExecutor:
 def _make_subflow_node(execution_type: str) -> MagicMock:
     node = MagicMock(spec=SubflowNodeGroup)
     node.name = "Subflow"
+    # Read by execute() to describe the node in its start and finish events.
+    node.metadata = {}
+    node.is_cancellation_requested = False
     node.execution_environment = MagicMock()
     node.execution_environment.name = "execution_environment"
     node.get_parameter_value = MagicMock(return_value=execution_type)

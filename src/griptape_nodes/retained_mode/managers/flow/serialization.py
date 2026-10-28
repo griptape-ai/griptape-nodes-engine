@@ -1196,7 +1196,10 @@ class FlowSerialization(EngineScoped):
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
         if set_parameter_value_result.failed():
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}'."
+            msg = (
+                f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
+                f"{set_parameter_value_result.result_details}"
+            )
             raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)

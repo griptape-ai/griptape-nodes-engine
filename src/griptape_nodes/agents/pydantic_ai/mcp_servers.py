@@ -16,7 +16,11 @@ combinators rather than hand-rolled logic:
   tool names.
 * **Approval** - calls that spend credits or run work wait for the user via
   :meth:`AbstractToolset.approval_required`, which runs against the prefixed
-  names, since those are what grant keys are built from.
+  names, since those are what grant keys are built from. This is the chat
+  sidebar's policy, so :func:`mcp_server_from_config` leaves it off: node
+  libraries build agents from it too, and a node run has no one to ask. The
+  sidebar applies it with :func:`require_user_tool_approval`, and
+  :func:`streamable_http_local` applies it to the engine's own server.
 
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
@@ -125,7 +129,8 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServ
 
     Never raises: returns ``None`` and logs a warning for any config it cannot
     build from, so one bad server doesn't stop the others being attached. The
-    returned toolset is prefixed with ``name``.
+    returned toolset is prefixed with ``name`` and runs every call without asking;
+    wrap it in :func:`require_user_tool_approval` to attach it to the chat sidebar.
     """
     transport = config.get("transport", "stdio")
 
@@ -155,11 +160,7 @@ def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPS
         cwd=config.get("cwd"),
     )
     return BuiltMCPServer(
-        toolset=_compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES),
-            requires_approval=_user_tool_requires_approval,
-        ),
+        toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
         transport=client,
     )
 
@@ -187,7 +188,6 @@ def _http_server_from_config(name: str, config: Mapping[str, Any], transport: st
         toolset=_compose(
             name,
             MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-            requires_approval=_user_tool_requires_approval,
         ),
         transport=client,
     )
@@ -218,9 +218,17 @@ def streamable_http_local(url: str) -> AbstractToolset[Any]:
     return _compose(
         GTN_SERVER_NAME,
         MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES),
-        requires_approval=_gtn_tool_requires_approval,
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
-    )
+    ).approval_required(_gtn_tool_requires_approval)
+
+
+def require_user_tool_approval(toolset: AbstractToolset[Any]) -> AbstractToolset[Any]:
+    """Make every call on a user-configured server's toolset wait for the user's approval.
+
+    Takes a toolset from :func:`mcp_server_from_config`. The gate reads the run's
+    ``ToolApprovalDeps``, so only a run that carries them may use the result.
+    """
+    return toolset.approval_required(_user_tool_requires_approval)
 
 
 def grant_keys_for_call(tool_name: str, args: Mapping[str, Any]) -> list[str]:
@@ -286,20 +294,17 @@ def _compose(
     name: str,
     toolset: AbstractToolset[Any],
     *,
-    requires_approval: Callable[[RunContext[Any], ToolDefinition, dict[str, Any]], bool],
     tool_blocklist: frozenset[str] = frozenset(),
 ) -> AbstractToolset[Any]:
-    """Apply the optional blocklist, the name prefix, and the approval gate to a raw MCP toolset.
+    """Apply the optional blocklist and the name prefix to a raw MCP toolset.
 
     Order matters: the blocklist filter runs on bare tool names, so it must be
-    applied *before* :meth:`prefixed` adds the ``<name>_`` prefix, and the
-    approval gate runs on prefixed names, so it goes on *after*.
-    ``requires_approval`` has no default so no server can be attached ungated by
-    omission.
+    applied *before* :meth:`prefixed` adds the ``<name>_`` prefix. An approval
+    gate runs on prefixed names, so callers add it on top of the result.
     """
     if tool_blocklist:
         toolset = toolset.filtered(_blocklist_filter(tool_blocklist))
-    return toolset.prefixed(name).approval_required(requires_approval)
+    return toolset.prefixed(name)
 
 
 def _blocklist_filter(

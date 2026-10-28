@@ -128,6 +128,7 @@ plugins:
           - guides/agent/providers/custom.md: Custom OpenAI-compatible endpoint setup
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
+          - guides/local_editor.md: Serving the editor from the engine at 127.0.0.1:8126 instead of using the hosted editor
           - guides/libraries.md: Installing and managing node libraries
           - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by, worker command prefix)
         Project system:
@@ -183,7 +184,7 @@ plugins:
           - development/custom_nodes/direct_provider_budgets.md: Checking Griptape Cloud budgets before a direct provider call and reporting its cost after
           - development/custom_nodes/error_handling.md: Best practices for secrets, imports, parameter payload size, validation, error handling, and logging
           - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
-          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
+          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, post-dispatch hooks, execution and app event listeners, and registering node types without listing them in the manifest
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library's node execution in a worker subprocess for dependency isolation
@@ -313,6 +314,7 @@ nav:
       - Engine:
           - Configuration: guides/configuration.md
           - Transports: guides/transports.md
+          - Running the Editor Locally: guides/local_editor.md
           - Libraries: guides/libraries.md
           - Managed Environment: guides/managed_environment.md
       - Projects:

@@ -8,6 +8,7 @@ from uuid import uuid4
 from griptape_nodes.exe_types.core_types import NodeMessagePayload
 from griptape_nodes.exe_types.node_types import NodeDependencies, NodeResolutionState
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -135,7 +136,7 @@ class CreateNodeGroupRequest:
 
 @dataclass
 @PayloadRegistry.register
-class DeleteNodeRequest(RequestPayload):
+class DeleteNodeRequest(RequestPayload, GraphAccessMixin):
     """Delete a node from a workflow.
 
     Use when: Removing obsolete nodes, cleaning up failed nodes, restructuring workflows,
@@ -355,7 +356,7 @@ class BatchSetNodeMetadataResultFailure(ResultPayloadFailure):
 # ...jumbode?
 @dataclass
 @PayloadRegistry.register
-class GetAllNodeInfoRequest(RequestPayload):
+class GetAllNodeInfoRequest(RequestPayload, GraphAccessMixin):
     """Retrieve comprehensive information about a node in a single call.
 
     Use when: Populating UIs, implementing node inspection/debugging, gathering complete state
@@ -570,6 +571,8 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
+        values_supplied_by_connections: Names of parameters whose set values are left out, because a
+            connection in the flow the commands are replayed into supplies them. Output values are kept.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -586,6 +589,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
     serialize_all_parameter_values: bool = False
     # If True, keep subflow_name in group metadata for workflow file generation (defaults to False for copy/paste)
     include_existing_subflow_in_group: bool = False
+    values_supplied_by_connections: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -639,7 +643,7 @@ class SerializedSelectedNodesCommands:
 
 @dataclass
 @PayloadRegistry.register
-class SerializeSelectedNodesToCommandsRequest(WorkflowNotAlteredMixin, RequestPayload):
+class SerializeSelectedNodesToCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Serialize multiple selected nodes into commands.
 
     Use when: Implementing copy/paste, exporting workflow sections, creating templates,
@@ -686,7 +690,7 @@ class SerializeSelectedNodesToCommandsResultFailure(WorkflowNotAlteredMixin, Res
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeSelectedNodesFromCommandsRequest(WorkflowNotAlteredMixin, RequestPayload):
+class DeserializeSelectedNodesFromCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Recreate nodes from serialized commands.
 
     Use when: Implementing paste functionality, importing configurations, restoring from backups,
@@ -768,7 +772,7 @@ class DeserializeNodeFromCommandsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DuplicateSelectedNodesRequest(WorkflowNotAlteredMixin, RequestPayload):
+class DuplicateSelectedNodesRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Duplicate selected nodes with new positions.
 
     Use when: Implementing duplicate functionality, creating multiple instances of same configuration,
@@ -860,7 +864,7 @@ class SendNodeMessageResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowForNodeRequest(RequestPayload):
+class GetFlowForNodeRequest(RequestPayload, GraphAccessMixin):
     """Get the flow name that contains a specific node.
 
     Use when: Need to determine which flow a node belongs to for variable scoping,
@@ -983,7 +987,7 @@ class ResetNodeToDefaultsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AddNodesToNodeGroupRequest(RequestPayload):
+class AddNodesToNodeGroupRequest(RequestPayload, GraphAccessMixin):
     """Adds nodes to a NodeGroup.
 
     Use when: Need to add nodes to an existing NodeGroup, building node groups programmatically,
@@ -1030,7 +1034,7 @@ class AddNodesToNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveNodeFromNodeGroupRequest(RequestPayload):
+class RemoveNodeFromNodeGroupRequest(RequestPayload, GraphAccessMixin):
     """Remove nodes from a NodeGroup.
 
     Use when: Need to remove nodes from a NodeGroup, reorganizing workflow structure,
@@ -1077,7 +1081,7 @@ class RemoveNodeFromNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class MoveNodeToNewFlowRequest(RequestPayload):
+class MoveNodeToNewFlowRequest(RequestPayload, GraphAccessMixin):
     """Move a node from one flow to another flow.
 
     Use when: Reorganizing nodes between flows, adding nodes to NodeGroup subflows,
@@ -1125,7 +1129,7 @@ class MoveNodeToNewFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveNodeRequest(RequestPayload):
+class UnresolveNodeRequest(RequestPayload, GraphAccessMixin):
     """Mark a node UNRESOLVED without resetting its parameter values.
 
     Use when: Forcing a node to re-execute without resetting its parameter values.
