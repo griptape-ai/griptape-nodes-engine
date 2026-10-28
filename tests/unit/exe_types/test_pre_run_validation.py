@@ -16,6 +16,7 @@ import pytest
 
 from griptape_nodes.exe_types import input_checks
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.input_check_budget import probe_deadline
 from griptape_nodes.exe_types.input_checks import (
     ImageInfo,
     VideoProbe,
@@ -42,7 +43,9 @@ from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
 from griptape_nodes.exe_types.pre_run_validation import (
+    PreRunCheckResult,
     UncheckedInput,
+    run_pre_run_checks,
     run_pre_run_validators,
     unchecked_inputs_message,
     unchecked_locations_by_name,
@@ -581,22 +584,26 @@ class TestParameterTypes:
         assert _Records.seen == ["a cat"]
 
 
+@pytest.fixture
+def slow_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every ffprobe run time out."""
+
+    def run(cmd: list[str], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+    monkeypatch.setattr(input_checks.subprocess, "run", run)
+
+
+def _clip(tmp_path: Path, name: str = "clip.mp4") -> str:
+    clip = tmp_path / name
+    clip.write_bytes(b"video")
+    return str(clip)
+
+
+@pytest.mark.usefixtures("slow_ffprobe")
 class TestUncheckedInputs:
     """An input that took too long to read is named, so the user can be told; the node still runs."""
-
-    @pytest.fixture(autouse=True)
-    def slow_ffprobe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def run(cmd: list[str], **kwargs: Any) -> None:
-            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", run)
-
-    @staticmethod
-    def _clip(tmp_path: Path, name: str = "clip.mp4") -> str:
-        clip = tmp_path / name
-        clip.write_bytes(b"video")
-        return str(clip)
 
     @staticmethod
     def _unchecked(node: BaseNode) -> tuple[list[NodeError], list[UncheckedInput]]:
@@ -606,13 +613,13 @@ class TestUncheckedInputs:
         return errors, unchecked
 
     def test_names_a_video_that_took_too_long(self, tmp_path: Path) -> None:
-        clip = self._clip(tmp_path)
+        clip = _clip(tmp_path)
         node = _node_with(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("video", clip)
         assert self._unchecked(node) == ([], [(clip, "The video in 'Video'")])
 
     def test_still_reports_what_it_could_read(self, tmp_path: Path) -> None:
-        clip = self._clip(tmp_path)
+        clip = _clip(tmp_path)
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(1), Duration(max=5)]))
         node.set_parameter_value("video", clip)
         errors, unchecked = self._unchecked(node)
@@ -621,7 +628,7 @@ class TestUncheckedInputs:
         assert unchecked == [(clip, "The video in 'video'")]
 
     def test_names_each_list_item_by_its_position(self, tmp_path: Path) -> None:
-        first, second = self._clip(tmp_path, "a.mp4"), self._clip(tmp_path, "b.mp4")
+        first, second = _clip(tmp_path, "a.mp4"), _clip(tmp_path, "b.mp4")
         node = _node_with(
             ParameterList(
                 name="clips",
@@ -640,7 +647,7 @@ class TestUncheckedInputs:
         ]
 
     def test_names_both_inputs_that_hold_the_same_file(self, tmp_path: Path) -> None:
-        clip = self._clip(tmp_path)
+        clip = _clip(tmp_path)
         node = _node_with(
             ParameterVideo(name="start", display_name="Start", pre_run_validators=[Duration(max=5)]),
             ParameterVideo(name="end", display_name="End", pre_run_validators=[Duration(max=5)]),
@@ -650,7 +657,7 @@ class TestUncheckedInputs:
         assert self._unchecked(node)[1] == [(clip, "The video in 'Start'"), (clip, "The video in 'End'")]
 
     def test_does_not_name_an_input_sharing_the_file_whose_checks_all_ran(self, tmp_path: Path) -> None:
-        clip = self._clip(tmp_path)
+        clip = _clip(tmp_path)
         node = _node_with(
             ParameterVideo(name="start", display_name="Start", pre_run_validators=[Duration(max=5)]),
             ParameterVideo(name="end", display_name="End", pre_run_validators=[MaxFileSize(10_000)]),
@@ -661,7 +668,7 @@ class TestUncheckedInputs:
 
     def test_names_nothing_when_only_the_size_is_read(self, tmp_path: Path) -> None:
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxFileSize(10_000)]))
-        node.set_parameter_value("video", self._clip(tmp_path))
+        node.set_parameter_value("video", _clip(tmp_path))
         assert self._unchecked(node) == ([], [])
 
     def test_names_nothing_for_an_input_read_in_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -671,8 +678,109 @@ class TestUncheckedInputs:
             lambda *_a, **_k: SimpleNamespace(stdout=json.dumps({"format": {"duration": "4.0"}})),
         )
         node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
-        node.set_parameter_value("video", self._clip(tmp_path))
+        node.set_parameter_value("video", _clip(tmp_path))
         assert self._unchecked(node) == ([], [])
+
+
+class TestRunPreRunChecks:
+    """One call runs the declared validators and the node's own checks, as the engine does at its turn."""
+
+    class _OwnChecks(MockNode):
+        """A node with a declared limit on its video, and its own check that may read a file and fail."""
+
+        def __init__(self, *, own_errors: list[Exception] | None = None, reads: str | None = None) -> None:
+            super().__init__(name="node")
+            self._own_errors = own_errors
+            self._reads = reads
+            self.add_parameter(
+                ParameterVideo(name="video", display_name="Video", pre_run_validators=[MaxFileSize(1), Duration(max=5)])
+            )
+
+        def validate_before_node_run(self) -> list[Exception] | None:
+            if self._reads is not None:
+                local_video_probe(self._reads)
+            return self._own_errors
+
+    def test_reports_validator_errors_then_the_nodes_own(self, tmp_path: Path) -> None:
+        own = ValueError("A prompt is required.")
+        node = self._OwnChecks(own_errors=[own])
+        node.set_parameter_value("video", _clip(tmp_path))
+        result = run_pre_run_checks(node)
+        assert len(result.errors) == 2
+        assert str(result.errors[0]).startswith("The video in 'Video' is")
+        assert result.errors[1] is own
+
+    def test_reports_nothing_for_a_node_that_passes(self) -> None:
+        assert run_pre_run_checks(self._OwnChecks()) == PreRunCheckResult(errors=[], unchecked_inputs=[])
+
+    @pytest.mark.usefixtures("slow_ffprobe")
+    def test_names_an_input_whose_probe_timed_out(self, tmp_path: Path) -> None:
+        node = self._OwnChecks()
+        node.set_parameter_value("video", _clip(tmp_path))
+        assert run_pre_run_checks(node).unchecked_inputs == ["The video in 'Video'"]
+
+    def test_names_nothing_when_every_input_was_read_in_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(
+            input_checks.subprocess,
+            "run",
+            lambda *_a, **_k: SimpleNamespace(stdout=json.dumps({"format": {"duration": "4.0"}})),
+        )
+        node = self._OwnChecks()
+        node.set_parameter_value("video", _clip(tmp_path))
+        assert run_pre_run_checks(node).unchecked_inputs == []
+
+    @pytest.mark.usefixtures("slow_ffprobe")
+    def test_names_a_file_the_nodes_own_check_could_not_read(self, tmp_path: Path) -> None:
+        node = self._OwnChecks(reads=_clip(tmp_path, "own.mp4"))
+        assert run_pre_run_checks(node).unchecked_inputs == ["'own.mp4'"]
+
+    @pytest.mark.usefixtures("slow_ffprobe")
+    def test_names_a_declared_input_once_when_the_node_also_reads_it(self, tmp_path: Path) -> None:
+        clip = _clip(tmp_path)
+        node = self._OwnChecks(reads=clip)
+        node.set_parameter_value("video", clip)
+        assert run_pre_run_checks(node).unchecked_inputs == ["The video in 'Video'"]
+
+    @pytest.mark.usefixtures("slow_ffprobe")
+    def test_reports_unchecked_inputs_alongside_errors(self, tmp_path: Path) -> None:
+        # The machine decides not to warn a node that failed; the result still carries both.
+        node = self._OwnChecks(own_errors=[ValueError("A prompt is required.")])
+        node.set_parameter_value("video", _clip(tmp_path))
+        result = run_pre_run_checks(node)
+        assert _messages(result.errors)[-1] == "A prompt is required."
+        assert result.unchecked_inputs == ["The video in 'Video'"]
+
+    def test_runs_the_nodes_own_checks_inside_the_budget_and_the_shared_readings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[str] = []
+
+        def counting_probe(location: str) -> VideoProbe:
+            reads.append(location)
+            return VideoProbe(info=ImageInfo(100, 100, None), seconds=4.0, fps=24.0, mime_type="video/mp4")
+
+        monkeypatch.setattr(input_checks, "_probe_video", counting_probe)
+        deadlines: list[float | None] = []
+        clip = _clip(tmp_path)
+
+        class Records(self._OwnChecks):
+            def validate_before_node_run(self) -> list[Exception] | None:
+                deadlines.append(probe_deadline())
+                return super().validate_before_node_run()
+
+        node = Records(reads=clip)
+        node.set_parameter_value("video", clip)
+        run_pre_run_checks(node)
+        assert deadlines[0] is not None
+        # The validators' probe and the node's own share one reading.
+        assert reads == [clip]
+        # Both are closed once the call returns.
+        assert probe_deadline() is None
+        local_video_probe(clip)
+        assert reads == [clip, clip]
 
 
 class TestUncheckedLocationsByName:

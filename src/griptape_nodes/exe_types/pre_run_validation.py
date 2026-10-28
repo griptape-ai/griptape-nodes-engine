@@ -1,18 +1,20 @@
-"""Running a node's declared pre-run validators at its turn, before it runs.
+"""Running a node's pre-run checks at its turn, before it runs.
 
-The resolution machine calls `run_pre_run_validators` just before the node's
-`validate_before_node_run`, inside one `input_check_budget` and one `input_check_readings`, and
-reports both methods' errors together. It also names each input whose video or audio took too long to
+The resolution machine calls `run_pre_run_checks`, which runs the node's declared validators and then
+its `validate_before_node_run`, inside one `input_check_budget` and one `input_check_readings`. It
+returns both methods' errors together, and names each input whose video or audio took too long to
 read, so the machine can tell the user it wasn't checked.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import PureWindowsPath
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterList
-from griptape_nodes.exe_types.input_checks import input_subject, read_media
+from griptape_nodes.exe_types.input_check_budget import input_check_budget
+from griptape_nodes.exe_types.input_checks import input_check_readings, input_subject, read_media, timed_out_locations
 from griptape_nodes.exe_types.validators.base import MediaInfo, holds_list, media_kind_of, needs_for_kind
 from griptape_nodes.files.path_utils import is_url
 
@@ -25,7 +27,14 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.validators.base import PreRunValidator
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["UncheckedInput", "run_pre_run_validators", "unchecked_inputs_message", "unchecked_locations_by_name"]
+__all__ = [
+    "PreRunCheckResult",
+    "UncheckedInput",
+    "run_pre_run_checks",
+    "run_pre_run_validators",
+    "unchecked_inputs_message",
+    "unchecked_locations_by_name",
+]
 
 # What an input is called in a message, by the kind of media its parameter holds.
 _NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
@@ -39,6 +48,37 @@ class UncheckedInput(NamedTuple):
     """Where the input was read from."""
     subject: str
     """How a message names it, such as "The video in 'Video'"."""
+
+
+@dataclass(frozen=True)
+class PreRunCheckResult:
+    """What a node's pre-run checks found."""
+
+    errors: list[Exception]
+    """Every error, the declared validators' first and then `validate_before_node_run`'s, in order."""
+    unchecked_inputs: list[str]
+    """Each input whose video or audio took too long to read, such as "The video in 'Video'", or a
+    file the node read itself, such as "'clip.mp4'". Empty when every input was read in time."""
+
+
+def run_pre_run_checks(node: BaseNode) -> PreRunCheckResult:
+    """Run a node's declared validators, then its `validate_before_node_run`, and collect what they found.
+
+    Both run inside one `input_check_budget`, which stops their video and audio probes (they block
+    the engine's event loop) after a few seconds, and one `input_check_readings`, so each input is
+    read once for the validators and the node's own checks together.
+    """
+    unchecked: list[UncheckedInput] = []
+    with input_check_budget(), input_check_readings():
+        errors: list[Exception] = [*run_pre_run_validators(node, unchecked=unchecked)]
+        errors.extend(node.validate_before_node_run() or [])
+        # The node's own checks can probe files directly; name any of those that timed out too.
+        named = {entry.location for entry in unchecked}
+        unchecked_inputs = [
+            *(entry.subject for entry in unchecked),
+            *unchecked_locations_by_name(timed_out_locations(), named),
+        ]
+    return PreRunCheckResult(errors=errors, unchecked_inputs=unchecked_inputs)
 
 
 def run_pre_run_validators(node: BaseNode, *, unchecked: list[UncheckedInput] | None = None) -> list[NodeError]:
@@ -95,7 +135,7 @@ def unchecked_inputs_message(inputs: Sequence[str]) -> str:
     """One sentence telling the user these inputs weren't checked before the run, and why.
 
     Args:
-        inputs: Each input's subject, as `run_pre_run_validators` gives them, such as
+        inputs: Each input's subject, as `PreRunCheckResult.unchecked_inputs` gives them, such as
             "The video in 'Video'".
     """
     if len(inputs) == 1:
