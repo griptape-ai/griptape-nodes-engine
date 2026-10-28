@@ -41,7 +41,11 @@ def register_stable_module_name(dynamic_module_name: str, stable_module_name: st
 
 
 def forget_stable_module_name(dynamic_module_name: str) -> None:
-    """Undo ``register_stable_module_name``, as when a library unloads."""
+    """Undo ``register_stable_module_name``.
+
+    A library unloading keeps its names: the open workflow can still hold values whose classes
+    came from its modules, and saving them needs those names.
+    """
     _stable_module_names.pop(dynamic_module_name, None)
 
 

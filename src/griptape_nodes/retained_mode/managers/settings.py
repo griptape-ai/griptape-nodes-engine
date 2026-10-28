@@ -696,6 +696,11 @@ class Settings(BaseModel):
         default=5,
         description="Maximum number of nodes executing at a time for parallel execution.",
     )
+    max_loop_iterations_in_parallel: int | None = Field(
+        category=EXECUTION,
+        default=0,
+        description="Maximum number of loop iterations running at a time when a loop runs all items at once. 0 means no limit.",
+    )
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,

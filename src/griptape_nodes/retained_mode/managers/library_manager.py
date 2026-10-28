@@ -15,7 +15,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     AppSessionStartedEvent,
     EngineInitializationProgress,
-    EngineReadyEvent,
     InitializationPhase,
     InitializationStatus,
     LibraryLoadStatus,
@@ -138,10 +137,6 @@ class LibraryManager(EngineScoped):
         self._library_event_handler_mappings: dict[type[Payload], dict[str, RegisteredEventHandler[Any]]] = {}
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
-        # True for the duration of the engine's initialization sequence (library + workflow
-        # loading) driven by on_app_initialization_complete. Reported on the engine heartbeat so
-        # a client connecting mid-startup can render a loading state instead of an empty list.
-        self._is_initializing: bool = False
         self._pre_reload_callbacks: list[Callable[[], Awaitable[None]]] = []
         # True when this process is a dedicated worker
         self._is_worker: bool = False
@@ -166,10 +161,6 @@ class LibraryManager(EngineScoped):
         event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
-            AppInitializationComplete,
-            self.on_app_initialization_complete,
-        )
-        event_manager.add_listener_to_app_event(
             AppSessionStartedEvent,
             self.workers.on_session_started,
         )
@@ -177,12 +168,8 @@ class LibraryManager(EngineScoped):
         self._pre_reload_callbacks.append(worker_manager.reset_workers)
 
     def is_initializing(self) -> bool:
-        """Return True while the engine is running its initialization sequence.
-
-        Covers the full on_app_initialization_complete / reload flow (library and workflow
-        loading), not just the library phase. Reported on the engine heartbeat.
-        """
-        return self._is_initializing
+        # Delegates to the engine lifecycle; griptape-nodes-app's engine registry still calls this.
+        return self.engine.lifecycle.is_initializing()
 
     def register_pre_reload_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Register a callback invoked immediately before all libraries are reloaded.
@@ -351,24 +338,11 @@ class LibraryManager(EngineScoped):
         finally:
             self._libraries_loading_complete.set()
 
-    async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
-        # Bracket the whole init sequence so the heartbeat can report is_initializing to clients
-        # that connect mid-startup. finally guarantees the flag clears even if init raises.
-        self._is_initializing = True
-        try:
-            await self._run_app_initialization(payload)
-        finally:
-            self._is_initializing = False
-
     @handles(ReloadAllLibrariesRequest)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
-        # Bracket the reload like on_app_initialization_complete so the heartbeat reports
-        # is_initializing during a mid-session reload too. finally clears it even on failure.
-        self._is_initializing = True
-        try:
+        # The heartbeat reports is_initializing during a mid-session reload too.
+        with self.engine.lifecycle.reloading():
             return await self._run_reload_libraries(request)
-        finally:
-            self._is_initializing = False
 
     def register_library_load_reporter(
         self,
@@ -381,7 +355,7 @@ class LibraryManager(EngineScoped):
         """Kept for node libraries that call it. See `LibraryCatalog.get_all_info_for_all_libraries_request`."""
         return await self.catalog.get_all_info_for_all_libraries_request(request)
 
-    def _collect_library_load_statuses(self) -> list[LibraryLoadStatus]:
+    def collect_library_load_statuses(self) -> list[LibraryLoadStatus]:
         """Gather the load outcome for every attempted library as serializable data.
 
         Presentation (icons, colors, table layout) is owned by the application
@@ -484,18 +458,8 @@ class LibraryManager(EngineScoped):
             return
         self._libraries_loading_complete = asyncio.Event()
 
-    async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
-        if payload.skip_library_loading:
-            # Register all secrets even in headless mode
-            self.engine.secrets_manager.register_all_secrets()
-
-            # Still need to tell WorkflowManager to register workflows
-            # Pass the specific workflows if provided, otherwise it will scan workspace
-            await self.engine.workflow_manager.refresh_workflow_registry(
-                workflows_to_register=payload.workflows_to_register
-            )
-            return
-
+    async def load_libraries_for_startup(self, payload: AppInitializationComplete) -> None:
+        """Run the library half of engine startup. See `EngineLifecycle` for the rest."""
         # Automatically migrate old XDG library paths from config
         # TODO: Remove https://github.com/griptape-ai/griptape-nodes/issues/3348
         self.discovery.migrate_old_xdg_library_paths()
@@ -527,33 +491,6 @@ class LibraryManager(EngineScoped):
                 "Library reconcile reported %d problem(s) at startup; continuing so the engine can start:\n%s",
                 len(reconcile_failures),
                 "\n".join(reconcile_failures),
-            )
-
-        # When the orchestrator restarts into an already-active session, the GUI will not
-        # send AppStartSessionRequest again, so workers must be started here.
-        await self.workers.maybe_start_workers_for_existing_session()
-
-        # Register all secrets now that libraries are loaded and settings are merged
-        self.engine.secrets_manager.register_all_secrets()
-
-        # We have to load all libraries before we attempt to load workflows. The refresh registers
-        # library-declared workflows first, then user workflows.
-        await self.engine.workflow_manager.refresh_workflow_registry()
-
-        # Signal readiness so the application layer can render its library status
-        # table and "engine ready" banner, and other consumers (the GUI, the
-        # desktop app) can react to the same event. Only the orchestrator
-        # announces readiness; dedicated library workers do not. Presentation is
-        # owned by the app, not the engine. The statuses are the orchestrator's own
-        # verdicts, derived from loading each library's real node modules here.
-        if not self._is_worker:
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineReadyEvent(
-                        libraries=self._collect_library_load_statuses(),
-                        is_initial_start=True,
-                    )
-                )
             )
 
     async def collect_library_workflow_files(self) -> list[str]:
@@ -660,16 +597,8 @@ class LibraryManager(EngineScoped):
 
         # Signal readiness again so the app re-renders the library status table against the
         # reloaded set. is_initial_start=False so the app refreshes the table without
-        # re-showing the startup banner. Orchestrator only.
-        if not self._is_worker:
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineReadyEvent(
-                        libraries=self._collect_library_load_statuses(),
-                        is_initial_start=False,
-                    )
-                )
-            )
+        # re-showing the startup banner.
+        self.engine.lifecycle.announce_ready(is_initial_start=False)
 
         # Hard activation: a reload is interactive (project switch / explicit reload), so a
         # reconcile failure (bad engine_version gate or a sourced library that could not be

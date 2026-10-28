@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
+    GraphAccessMixin,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
@@ -20,7 +22,7 @@ from griptape_nodes.serialization.values import DisplayValue, Value
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeRequest(RequestPayload):
+class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
     """Resolve (execute) a specific node.
 
     Use when: Running individual nodes, testing node execution, debugging workflows,
@@ -57,7 +59,7 @@ class ResolveNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowRequest(RequestPayload):
+class StartFlowRequest(RequestPayload, GraphAccessMixin):
     """Start executing a flow.
 
     Use when: Running workflows, beginning automated execution, testing complete flows.
@@ -102,7 +104,7 @@ class StartFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowRequest(RequestPayload):
+class StartLocalSubflowRequest(RequestPayload, GraphAccessMixin):
     """Start an independent local subflow that runs concurrently with the main flow.
 
     Use when: Running loop iterations or other independent subflows that need their own
@@ -137,7 +139,7 @@ class StartLocalSubflowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeRequest(RequestPayload):
+class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin):
     """Start executing a flow from a specific node.
 
     Use when: Resuming execution from a particular node, debugging specific parts of a flow,
@@ -178,7 +180,7 @@ class StartFlowFromNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelFlowRequest(RequestPayload):
+class CancelFlowRequest(RequestPayload, GraphAccessMixin):
     """Cancel a running flow execution.
 
     Use when: Stopping long-running workflows, handling user cancellation,
@@ -209,7 +211,7 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelRunRequest(RequestPayload):
+class CancelRunRequest(RequestPayload, GraphAccessMixin):
     """Cancel one run: a waiting run leaves the line without starting, and the run in progress stops.
 
     Use when: withdrawing a run queued behind another, or stopping a particular run. Run ids come
@@ -255,7 +257,7 @@ class RunInfo:
 
 @dataclass
 @PayloadRegistry.register
-class ListRunsRequest(RequestPayload):
+class ListRunsRequest(RequestPayload, GraphAccessMixin):
     """List the run in progress and the runs waiting behind it.
 
     Use when: finding a queued run to cancel, or showing what is waiting.
@@ -284,7 +286,7 @@ class ListRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveFlowRequest(RequestPayload):
+class UnresolveFlowRequest(RequestPayload, GraphAccessMixin):
     """Reset every node in a flow back to unresolved.
 
     Use when: Clearing cached results so the next run re-executes every node.
@@ -319,7 +321,7 @@ class UnresolveFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 # Step In: Execute one resolving step at a time (per parameter)
 @dataclass
 @PayloadRegistry.register
-class SingleExecutionStepRequest(RequestPayload):
+class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -338,7 +340,7 @@ class SingleExecutionStepResultFailure(ResultPayloadFailure):
 # Step Over: Execute one node at a time (execute whole node and move on) IS THIS CONTROL NODE OR ANY NODE?
 @dataclass
 @PayloadRegistry.register
-class SingleNodeStepRequest(RequestPayload):
+class SingleNodeStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -358,7 +360,7 @@ class SingleNodeStepResultFailure(ResolveNodeResultFailure):
 # Continue
 @dataclass
 @PayloadRegistry.register
-class ContinueExecutionStepRequest(RequestPayload):
+class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
     flow_name: str | None = None
 
@@ -377,7 +379,7 @@ class ContinueExecutionStepResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowStateRequest(RequestPayload):
+class GetFlowStateRequest(RequestPayload, GraphAccessMixin):
     """Get the current execution state of a flow.
 
     Use when: Monitoring execution progress, debugging workflow state,
@@ -413,7 +415,7 @@ class GetFlowStateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetIsFlowRunningRequest(RequestPayload):
+class GetIsFlowRunningRequest(RequestPayload, GraphAccessMixin):
     """Check if a flow is currently running.
 
     Use when: Monitoring execution status, preventing concurrent execution,
@@ -554,16 +556,89 @@ class NodeUnresolvedEvent(ExecutionPayload):
     node_name: str
 
 
+class NodeProcessOutcome(StrEnum):
+    """How a node's run ended, as reported on `NodeFinishProcessEvent`.
+
+    SUCCEEDED: the node finished its work.
+    FAILED: the node ran into an error, described by the event's `error_message` and `error`. A
+        node that runs into an error after the user asked it to stop still counts as failed.
+    CANCELLED: the run was stopped, for example because the user cancelled the workflow, or the
+        node stopped early because it was asked to.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 @dataclass
 @PayloadRegistry.register
 class NodeStartProcessEvent(ExecutionPayload):
+    """A node is about to run. Sent before the node does any work.
+
+    Sent once for every node the engine runs: regular nodes, nodes that run in a worker, group and
+    loop nodes, and the nodes inside them. A loop runs its body once per iteration, so a body node
+    sends one of these for each iteration.
+
+    Nodes that never start send neither this nor `NodeFinishProcessEvent`: locked nodes, which keep
+    their values without running; Start Loop nodes, since the loop is reported by its End Loop
+    node; and nodes that fail before they start, such as when an input can't be read or the node
+    fails validation, which send a `NodeErrorEvent` instead.
+
+    A group set to Isolated Execution, or to run in a library's environment, can run its nodes in a
+    separate Griptape Nodes process. Libraries load there too, so their listeners hear those nodes
+    there, and the main process hears only the group node itself.
+
+    Args:
+        node_name: The node on the canvas. A loop body node is named as it is on the canvas on
+            every iteration.
+        node_type: The node's class name.
+        specific_library_name: The library the node type came from.
+        flow_name: The flow the node is in.
+        execution_id: Identifies this run of the node. The `NodeFinishProcessEvent` for the same run
+            carries the same value. Opaque: compare it, but don't parse it. Match a finish to its
+            start by this rather than by `node_name`: a loop set to Run Group Items All at Once runs
+            the nodes inside it at the same time, so the same node can have several runs going.
+        parent_execution_id: The `execution_id` of the nearest run this one is part of, such as the
+            group or loop node whose body this node is in, or None at the top of a run.
+    """
+
     node_name: str
+    node_type: str | None = None
+    specific_library_name: str | None = None
+    flow_name: str | None = None
+    execution_id: str | None = None
+    parent_execution_id: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class NodeFinishProcessEvent(ExecutionPayload):
+    """A node stopped running, whether it succeeded, failed, or was cancelled.
+
+    Sent for every run that sent a `NodeStartProcessEvent`, after the node's work is over.
+
+    Args:
+        node_name: The node on the canvas, as on the matching `NodeStartProcessEvent`.
+        node_type: The node's class name.
+        specific_library_name: The library the node type came from.
+        flow_name: The flow the node is in.
+        execution_id: The same value as on the matching `NodeStartProcessEvent`.
+        parent_execution_id: The same value as on the matching `NodeStartProcessEvent`.
+        outcome: How the run ended. Optional so events from older engines still parse.
+        error_message: When the run failed, the failure as one flattened string.
+        error: When the run failed, the same failure in parts, as on `NodeErrorEvent`.
+    """
+
     node_name: str
+    node_type: str | None = None
+    specific_library_name: str | None = None
+    flow_name: str | None = None
+    execution_id: str | None = None
+    parent_execution_id: str | None = None
+    outcome: NodeProcessOutcome | None = None
+    error_message: str | None = None
+    error: NodeErrorDetails | None = None
 
 
 @dataclass
@@ -630,17 +705,24 @@ class ExecuteNodeRequest(RequestPayload):
       not, the request fails; node_metadata is ignored on this path. The
       orchestrator is the sole source of truth for node identity and parameter
       values.
-    - **Worker**: a fresh transient node is constructed from node_metadata on
-      every call via LibraryRegistry.create_node, hydrated, run, and discarded.
-      The worker never persists nodes across requests. node_metadata is
-      therefore required on this path.
+    - **Worker**: a copy of the node is loaded into the worker's own graph the way a saved
+      workflow loads it -- created from node_metadata, given element_modification_commands,
+      then parameter_values with initial_setup -- run, and discarded. The worker never persists
+      nodes across requests, and nothing in the load reaches the orchestrator.
 
     Args:
         node_name: Name of the node to execute.
-        parameter_values: Input parameter values to set before execution.
+        parameter_values: On the orchestrator path, values to set on the node before execution. On
+            the worker path, the node's own stored values, which the orchestrator fills in when it
+            forwards the request: a list's rows by row name, and a list fed whole by a connection
+            under the list's name.
         node_metadata: Full node metadata from the orchestrator. Required when
-            the target library spawns a worker (used to construct the transient
-            worker-side node). Ignored on the orchestrator path.
+            the target library spawns a worker (used to create the worker's copy).
+            Ignored on the orchestrator path.
+        element_modification_commands: The groups and parameters the orchestrator's node has beyond
+            its ``__init__`` shape, as a saved workflow records them, list rows included. The
+            orchestrator fills them in when it forwards the request. Only the element request types a
+            save writes are accepted. Ignored on the orchestrator path.
         local_object_source: The orchestrator's identity for this node in the process-local object
             cache. The worker's transient node adopts it so the objects it caches land in the same slots
             across runs, and survive the node being renamed. Carried as its own field rather than inside
@@ -677,6 +759,7 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_name: str | None = None
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
+    element_modification_commands: list[RequestPayload] = field(default_factory=list)
 
 
 @dataclass

@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
+from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 
 if TYPE_CHECKING:
@@ -80,15 +82,17 @@ class _EngineRootMeta(type):
         return current_engine()
 
 
-def _forbid_manager_during_worker_execution(manager_name: str, request_hint: str) -> None:
-    """Raise when node code reaches for a manager while executing in a worker process.
+def _check_manager_access_during_execution(manager_name: str, request_hint: str) -> None:
+    """Report node code reaching for a manager while a node runs, and refuse it in a worker process.
 
     A worker's copy of this state can diverge from the real one, so a read that looks local is
     answered by a process that is not the source of truth. Node code gets there with
     ``GriptapeNodes.handle_request(...)``, which routes to whichever process owns that state:
     the orchestrator for what it owns, this worker for the workspace it shares on disk. That is
     why the filesystem requests named below are answered locally and are still the right call --
-    the routing decision is the point, not the round trip.
+    the routing decision is the point, not the round trip. In-process the manager's answer is
+    right, so the access is reported (``state-read-bypassing-requests``) rather than refused, for
+    the author to fix before the node runs in a worker.
 
     Scoped to node execution deliberately: engine boot and library load run in the worker
     too, and they legitimately need their own managers.
@@ -106,9 +110,21 @@ def _forbid_manager_during_worker_execution(manager_name: str, request_hint: str
     no business touching mid-execution.
     """
     engine = current_engine()
-    if not engine.library_manager.is_worker:
-        return
     if not engine.event_manager.in_node_execution():
+        return
+    # A worker loading its copy of a node answers everything from its own graph, which its own managers
+    # hold. Decided per chain, as the load is: the execution count is for the whole process, so it is
+    # also set while another node runs.
+    if engine.event_manager.rebuilding_node_name() is not None:
+        return
+    scope = STRICT_MODE.current_scope()
+    if scope is not None and scope.kind is StrictModeScopeKind.RUNTIME_EXECUTE:
+        rule = RULES["state-read-bypassing-requests"]
+        STRICT_MODE.report(
+            rule_id=rule.rule_id,
+            message=rule.render(node_name=scope.subject, manager_name=manager_name, request_hint=request_hint),
+        )
+    if not engine.library_manager.is_worker:
         return
     msg = (
         f"Attempted to use {manager_name} while running in an isolated library process, whose "
@@ -157,7 +173,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def EventManager(cls) -> EventManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "EventManager",
             "your node's own APIs (append_value_to_parameter, publish_update_to_parameter), whose events forward on their own",
         )
@@ -165,64 +181,62 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def LibraryManager(cls) -> LibraryManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "LibraryManager", "ListRegisteredLibrariesRequest(...) / GetNodeMetadataFromLibraryRequest(...)"
         )
         return current_engine().library_manager
 
     @classmethod
     def ModelManager(cls) -> ModelManager:
-        _forbid_manager_during_worker_execution("ModelManager", "ListModelDownloadsRequest(...)")
+        _check_manager_access_during_execution("ModelManager", "ListModelDownloadsRequest(...)")
         return current_engine().model_manager
 
     @classmethod
     def AccessManager(cls) -> AccessManager:
-        _forbid_manager_during_worker_execution("AccessManager", "QueryModelAccessForNodeRequest(...)")
+        _check_manager_access_during_execution("AccessManager", "QueryModelAccessForNodeRequest(...)")
         return current_engine().access_manager
 
     @classmethod
     def ObjectManager(cls) -> ObjectManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "ObjectManager", "a request against the orchestrator's graph (e.g., RenameObjectRequest(...))"
         )
         return current_engine().object_manager
 
     @classmethod
     def FlowManager(cls) -> FlowManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "FlowManager", "flow requests (e.g., ListNodesInFlowRequest(...), ListConnectionsForNodeRequest(...))"
         )
         return current_engine().flow_manager
 
     @classmethod
     def NodeManager(cls) -> NodeManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "NodeManager", "node requests (e.g., GetNodeResolutionStateRequest(...), AddParameterToNodeRequest(...))"
         )
         return current_engine().node_manager
 
     @classmethod
     def ContextManager(cls) -> ContextManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "ContextManager", "GetCurrentProjectRequest(...) for the project; flow context belongs to the orchestrator"
         )
         return current_engine().context_manager
 
     @classmethod
     def WorkflowManager(cls) -> WorkflowManager:
-        _forbid_manager_during_worker_execution(
-            "WorkflowManager", "workflow requests (e.g., ListWorkflowsRequest(...))"
-        )
+        _check_manager_access_during_execution("WorkflowManager", "workflow requests (e.g., ListWorkflowsRequest(...))")
         return current_engine().workflow_manager
 
     @classmethod
     def ArbitraryCodeExecManager(cls) -> ArbitraryCodeExecManager:
-        _forbid_manager_during_worker_execution("ArbitraryCodeExecManager", "RunArbitraryPythonStringRequest(...)")
+        _check_manager_access_during_execution("ArbitraryCodeExecManager", "RunArbitraryPythonStringRequest(...)")
         return current_engine().arbitrary_code_exec_manager
 
     @classmethod
     def ConfigManager(cls) -> ConfigManager:
-        _forbid_manager_during_worker_execution("ConfigManager", "GetConfigValueRequest(...)")
+        _check_manager_access_during_execution("ConfigManager", "GetConfigValueRequest(...)")
         return current_engine().config_manager
 
     @classmethod
@@ -232,7 +246,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
         # answered locally rather than forwarded. Going through the request still matters --
         # paths get canonicalized and the OS boundary's policies apply -- so the guard stays,
         # but it must not claim the orchestrator is what makes the value correct.
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "OSManager",
             "ReadFileRequest(...) / WriteFileRequest(...), which canonicalize the path and apply the write policy",
         )
@@ -240,12 +254,12 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def SecretsManager(cls) -> SecretsManager:
-        _forbid_manager_during_worker_execution("SecretsManager", "GetSecretValueRequest(...)")
+        _check_manager_access_during_execution("SecretsManager", "GetSecretValueRequest(...)")
         return current_engine().secrets_manager
 
     @classmethod
     def OperationDepthManager(cls) -> OperationDepthManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "OperationDepthManager", "nothing: operation depth is orchestrator bookkeeping with no node-facing request"
         )
         return current_engine().operation_depth_manager
@@ -258,48 +272,46 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def AgentManager(cls) -> AgentManager:
-        _forbid_manager_during_worker_execution("AgentManager", "agent requests (e.g., RunAgentRequest(...))")
+        _check_manager_access_during_execution("AgentManager", "agent requests (e.g., RunAgentRequest(...))")
         return current_engine().agent_manager
 
     @classmethod
     def VersionCompatibilityManager(cls) -> VersionCompatibilityManager:
-        _forbid_manager_during_worker_execution("VersionCompatibilityManager", "GetEngineVersionRequest(...)")
+        _check_manager_access_during_execution("VersionCompatibilityManager", "GetEngineVersionRequest(...)")
         return current_engine().version_compatibility_manager
 
     @classmethod
     def SessionManager(cls) -> SessionManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "SessionManager", "session state belongs to the orchestrator; there is no node-facing request"
         )
         return current_engine().session_manager
 
     @classmethod
     def MCPManager(cls) -> MCPManager:
-        _forbid_manager_during_worker_execution("MCPManager", "MCP requests (e.g., ListMCPServersRequest(...))")
+        _check_manager_access_during_execution("MCPManager", "MCP requests (e.g., ListMCPServersRequest(...))")
         return current_engine().mcp_manager
 
     @classmethod
     def EngineIdentityManager(cls) -> EngineIdentityManager:
-        _forbid_manager_during_worker_execution("EngineIdentityManager", "GetEngineNameRequest(...)")
+        _check_manager_access_during_execution("EngineIdentityManager", "GetEngineNameRequest(...)")
         return current_engine().engine_identity_manager
 
     @classmethod
     def ResourceManager(cls) -> ResourceManager:
-        _forbid_manager_during_worker_execution(
-            "ResourceManager", "resource requests (e.g., ListResourcesRequest(...))"
-        )
+        _check_manager_access_during_execution("ResourceManager", "resource requests (e.g., ListResourcesRequest(...))")
         return current_engine().resource_manager
 
     @classmethod
     def SyncManager(cls) -> SyncManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "SyncManager", "sync state belongs to the orchestrator; there is no node-facing request"
         )
         return current_engine().sync_manager
 
     @classmethod
     def VariablesManager(cls) -> VariablesManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "VariablesManager",
             "variable requests (e.g., GetVariableRequest(...)); {VAR} macros resolve before process() runs",
         )
@@ -307,12 +319,12 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def UserManager(cls) -> UserManager:
-        _forbid_manager_during_worker_execution("UserManager", "user requests (e.g., GetUserRequest(...))")
+        _check_manager_access_during_execution("UserManager", "user requests (e.g., GetUserRequest(...))")
         return current_engine().user_manager
 
     @classmethod
     def ProjectManager(cls) -> ProjectManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "ProjectManager",
             "project requests (e.g., GetCurrentProjectRequest(...)), which answer locally and correctly",
         )
@@ -320,24 +332,22 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def ArtifactManager(cls) -> ArtifactManager:
-        _forbid_manager_during_worker_execution(
+        _check_manager_access_during_execution(
             "ArtifactManager", "artifact requests (e.g., ExtractArtifactMetadataRequest(...)), which answer locally"
         )
         return current_engine().artifact_manager
 
     @classmethod
     def ManifestManager(cls) -> ManifestManager:
-        _forbid_manager_during_worker_execution("ManifestManager", "manifest requests, answered by the orchestrator")
+        _check_manager_access_during_execution("ManifestManager", "manifest requests, answered by the orchestrator")
         return current_engine().manifest_manager
 
     @classmethod
     def BudgetManager(cls) -> BudgetManager:
-        _forbid_manager_during_worker_execution("BudgetManager", "GetAttributionContextRequest(...)")
+        _check_manager_access_during_execution("BudgetManager", "GetAttributionContextRequest(...)")
         return current_engine().budget_manager
 
     @classmethod
     def WorkerManager(cls) -> WorkerManager:
-        _forbid_manager_during_worker_execution(
-            "WorkerManager", "nothing: worker lifecycle belongs to the orchestrator"
-        )
+        _check_manager_access_during_execution("WorkerManager", "nothing: worker lifecycle belongs to the orchestrator")
         return current_engine().worker_manager

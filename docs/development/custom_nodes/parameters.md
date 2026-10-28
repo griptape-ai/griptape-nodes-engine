@@ -101,6 +101,8 @@ Add functionality via `add_trait()`:
     soft limit: it sizes the slider track, but values typed outside it are accepted rather than rejected.
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
+- **DatePicker**: `DatePicker(include_time: bool = False, min: str | None = None, max: str | None = None)` — the value is
+    an ISO 8601 local date (`2026-10-14`), or date and time (`2026-10-14T09:30`) with `include_time=True`.
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).

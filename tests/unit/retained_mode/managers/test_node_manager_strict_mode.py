@@ -25,6 +25,9 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
 
 
@@ -65,6 +68,15 @@ class TestExecuteNodeStrictMode:
         node.aprocess = AsyncMock(side_effect=_aprocess)
         return node
 
+    @staticmethod
+    def _running_copy(node_manager: NodeManager, node: MagicMock) -> AbstractContextManager[object]:
+        """Have the worker run `node` as the copy it loaded, leaving the escalation policy as the thing tested."""
+
+        async def run_copy(request: ExecuteNodeRequest) -> ResultPayload:
+            return await node_manager._hydrate_and_run_node(node, request)
+
+        return patch.object(node_manager, "_run_worker_copy", side_effect=run_copy)
+
     def _make_mock_obj_mgr(self, existing_node: MagicMock) -> MagicMock:
         m = MagicMock()
         m.attempt_get_object_by_name_as_type.return_value = existing_node
@@ -98,7 +110,7 @@ class TestExecuteNodeStrictMode:
         lib_mgr = self._make_mock_library_manager(is_worker=True)
         node_manager = self._make_node_manager(library_manager=lib_mgr)
 
-        with patch.object(node_manager, "_materialize_transient_node_from_metadata", return_value=node):
+        with self._running_copy(node_manager, node):
             request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
             result = await node_manager.on_execute_node_request(request)
 
@@ -114,7 +126,7 @@ class TestExecuteNodeStrictMode:
         lib_mgr = self._make_mock_library_manager(is_worker=True)
         node_manager = self._make_node_manager(library_manager=lib_mgr)
 
-        with patch.object(node_manager, "_materialize_transient_node_from_metadata", return_value=node):
+        with self._running_copy(node_manager, node):
             request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
             result = await node_manager.on_execute_node_request(request)
 

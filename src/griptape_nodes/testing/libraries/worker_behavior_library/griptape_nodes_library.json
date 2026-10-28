@@ -177,6 +177,105 @@
         "description": "Reports whether its hook and process ran while the node was being rebuilt",
         "display_name": "ReportsHydrationNode"
       }
+    },
+    {
+      "class_name": "EditsTheGraphWhileLoadingNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Edits other nodes and connections while loading",
+        "display_name": "EditsTheGraphWhileLoadingNode"
+      }
+    },
+    {
+      "class_name": "ReadsConnectionsWhileLoadingNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Asks about its connections while loading",
+        "display_name": "ReadsConnectionsWhileLoadingNode"
+      }
+    },
+    {
+      "class_name": "WaitsUntilReleasedNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Runs until a test releases it",
+        "display_name": "WaitsUntilReleasedNode"
+      }
+    },
+    {
+      "class_name": "FailsInProcessNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Raises while running",
+        "display_name": "FailsInProcessNode"
+      }
+    },
+    {
+      "class_name": "RefusesToRunNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Refused before it runs",
+        "display_name": "RefusesToRunNode"
+      }
+    },
+    {
+      "class_name": "RecordsDeletionNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Records after_node_deleted calls",
+        "display_name": "RecordsDeletionNode"
+      }
+    },
+    {
+      "class_name": "ListSourceNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Outputs a list of three strings",
+        "display_name": "ListSourceNode"
+      }
+    },
+    {
+      "class_name": "ReadsABoundedListNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Echoes a list that holds at most two rows",
+        "display_name": "ReadsABoundedListNode"
+      }
+    },
+    {
+      "class_name": "ReadsAManagerNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reads config through a manager while running",
+        "display_name": "ReadsAManagerNode"
+      }
+    },
+    {
+      "class_name": "SetsAnAttributeInItsHookNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Sets attributes from its value hook",
+        "display_name": "SetsAnAttributeInItsHookNode"
+      }
+    },
+    {
+      "class_name": "PlainGroupNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "A node group with no subflow",
+        "display_name": "PlainGroupNode"
+      }
     }
   ]
 }

@@ -5,8 +5,9 @@ import importlib.machinery
 import importlib.util
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import (
@@ -29,9 +30,12 @@ from griptape_nodes.node_library.library_registry import (
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import AppPayload, ExecutionPayload
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AfterLibraryCallbackProblem,
+    AppEventListenerRegistrationProblem,
     BeforeLibraryCallbackProblem,
+    ExecutionEventListenerRegistrationProblem,
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
@@ -66,6 +70,41 @@ logger = logging.getLogger("griptape_nodes")
 # importable under. Anything under this prefix is a dynamically loaded library module
 # whose import path only exists in-process once its library has been registered.
 STABLE_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
+
+
+@dataclass(frozen=True)
+class _ListenerFamily:
+    """What differs between registering a library's execution and app event listeners.
+
+    Args:
+        name: The family as it reads in messages: "execution" or "app".
+        getter_name: The AdvancedNodeLibrary method that returns the family's listeners.
+        payload_base_type: The base class every event type in the family extends.
+        example_event_type_name: An event type named in the error for a wrong entry.
+        problem_type: The library problem recorded when registration fails.
+    """
+
+    name: str
+    getter_name: str
+    payload_base_type: type
+    example_event_type_name: str
+    problem_type: type[ExecutionEventListenerRegistrationProblem | AppEventListenerRegistrationProblem]
+
+
+_EXECUTION_LISTENERS = _ListenerFamily(
+    name="execution",
+    getter_name="get_execution_event_listeners",
+    payload_base_type=ExecutionPayload,
+    example_event_type_name="NodeFinishProcessEvent",
+    problem_type=ExecutionEventListenerRegistrationProblem,
+)
+_APP_LISTENERS = _ListenerFamily(
+    name="app",
+    getter_name="get_app_event_listeners",
+    payload_base_type=AppPayload,
+    example_event_type_name="ConfigChanged",
+    problem_type=AppEventListenerRegistrationProblem,
+)
 
 
 class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -215,11 +254,12 @@ class LibraryModuleLoading(EngineScoped):
             if stable_namespace in sys.modules:
                 del sys.modules[stable_namespace]
 
-            # Find and remove from dynamic mapping
+            # The stable module name stays registered: the open workflow can still hold values
+            # whose classes came from this module, and saving them needs that name. The name
+            # depends only on the file's path and library, so a reload registers the same one.
             dynamic_module_name = self._stable_to_dynamic_module_mapping.get(stable_namespace)
             if dynamic_module_name:
                 self._dynamic_to_stable_module_mapping.pop(dynamic_module_name, None)
-                forget_stable_module_name(dynamic_module_name)
             self._stable_to_dynamic_module_mapping.pop(stable_namespace, None)
 
         # Clear the library's module set
@@ -595,6 +635,24 @@ class LibraryModuleLoading(EngineScoped):
                     err,
                 )
 
+        if advanced_library:
+            self._register_event_listeners(
+                _EXECUTION_LISTENERS,
+                advanced_library=advanced_library,
+                add_listener=self.engine.event_manager.add_listener_to_execution_event,
+                registered_listeners=library._registered_execution_event_listeners,
+                library_name=library_data.name,
+                library_info=library_info,
+            )
+            self._register_event_listeners(
+                _APP_LISTENERS,
+                advanced_library=advanced_library,
+                add_listener=self.engine.event_manager.add_listener_to_app_event,
+                registered_listeners=library._registered_app_event_listeners,
+                library_name=library_data.name,
+                library_info=library_info,
+            )
+
         # Update library_info fitness based on load successes and problem count
         if not any_nodes_loaded_successfully:
             library_info.fitness = LibraryFitness.UNUSABLE
@@ -641,6 +699,65 @@ class LibraryModuleLoading(EngineScoped):
             )
 
         return node_class
+
+    def _register_event_listeners(  # noqa: PLR0913
+        self,
+        family: _ListenerFamily,
+        *,
+        advanced_library: AdvancedNodeLibrary,
+        add_listener: Callable[[Any, Any], None],
+        registered_listeners: list[tuple[type, Callable]],
+        library_name: str,
+        library_info: LibraryInfo,
+    ) -> None:
+        """Register the execution or app event listeners a library declares, tracking each for unload.
+
+        A bad entry is recorded as a problem and skips the rest of the list; the listeners
+        registered before it stay registered and tracked, so unloading still removes them.
+        """
+        event_family = family.name
+        getter_name = family.getter_name
+        try:
+            # Looked up on the instance so a library's override of the getter is the one called.
+            listeners: Sequence[tuple[type, Callable]] = getattr(advanced_library, getter_name)()
+            for event_type, callback in listeners:
+                # Listeners match on the exact payload type, so a key from the wrong event family
+                # would register cleanly and then never fire. Fail loudly instead.
+                if not isinstance(event_type, type) or not issubclass(event_type, family.payload_base_type):
+                    msg = (
+                        f"Attempted to register an {event_family} event listener from library "
+                        f"'{library_name}'. Failed because '{event_type}' is not an {event_family} event "
+                        f"type. Each entry from {getter_name}() must pair an {event_family} event type, "
+                        f"such as {family.example_event_type_name}, with a function to run."
+                    )
+                    raise TypeError(msg)  # noqa: TRY301
+                if not callable(callback):
+                    msg = (
+                        f"Attempted to register an {event_family} event listener for '{event_type.__name__}' "
+                        f"from library '{library_name}'. Failed because the listener is not something that "
+                        f"can be called. Each entry from {getter_name}() must pair an {event_family} event "
+                        f"type with a function to run."
+                    )
+                    raise TypeError(msg)  # noqa: TRY301
+                # add_listener_to_execution_event rejects an async callback with a TypeError that
+                # already explains why.
+                add_listener(event_type, callback)
+                registered_listeners.append((event_type, callback))
+            if listeners:
+                logger.debug(
+                    "Registered %d %s event listener(s) for library '%s'",
+                    len(listeners),
+                    event_family,
+                    library_name,
+                )
+        except Exception as err:
+            library_info.problems.append(family.problem_type(error_message=str(err)))
+            logger.error(
+                "Failed to register %s event listeners for library '%s': %s",
+                event_family,
+                library_name,
+                err,
+            )
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.
