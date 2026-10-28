@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
 
-__all__ = ["DependsOn", "MaxCount"]
+__all__ = ["IfParameter", "MaxCount"]
 
 
 @dataclass(frozen=True)
@@ -45,23 +45,23 @@ class MaxCount(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class DependsOn(PreRunValidator):
+class IfParameter(PreRunValidator):
     """Limits that depend on another parameter's value, such as the selected model.
 
     At the node's turn, the validators listed for the other parameter's current value apply, or
-    `default` for a value not listed. A list can hold another `DependsOn`, for limits that depend
+    `default` for a value not listed. A list can hold another `IfParameter`, for limits that depend
     on two settings; it picks in turn. This is how a limit depends on a setting; a limit that
     depends on the file itself uses `PreRunValidator.when` or `unless`.
 
     ```python
-    DependsOn(
+    IfParameter(
         "model",
         {"pro": [SideRange(min=300), MaxFileSize(10 * MB)]},
         default=[SideRange(min=512)],
     )
     # A switch, and whether a list has items:
-    DependsOn("upscale", {True: []}, default=[SideRange(min=512)])
-    DependsOn("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
+    IfParameter("upscale", {True: []}, default=[SideRange(min=512)])
+    IfParameter("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
     ```
 
     Args:
@@ -115,7 +115,7 @@ class DependsOn(PreRunValidator):
         return picked
 
     def candidates(self) -> Sequence[PreRunValidator]:
-        """Every validator this can pick, from every list, through any `DependsOn` inside it."""
+        """Every validator this can pick, from every list, through any `IfParameter` inside it."""
         everything: list[PreRunValidator] = []
         lists = [validators for _, validators in self.choices]
         lists.append(self.default)

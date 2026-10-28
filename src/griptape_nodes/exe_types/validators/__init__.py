@@ -3,14 +3,14 @@
 Import them from here:
 
 ```python
-from griptape_nodes.exe_types.validators import AllowedFormats, DependsOn, MaxFileSize
+from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, MaxFileSize
 ```
 
 - `base`: what a validator is (`PreRunValidator`) and what the engine reads for it (`MediaNeed`,
   `MediaInfo`, and `EMPTY_MEDIA` when it read nothing), and `reads` to mark what a `Condition`
   for `PreRunValidator.when` or `unless` reads.
 - `media`: limits on an image, video or audio file, such as `MaxFileSize` or `Duration`.
-- `common`: `MaxCount` for a list's length, and `DependsOn` for limits that depend on another
+- `common`: `MaxCount` for a list's length, and `IfParameter` for limits that depend on another
   parameter's value.
 """
 
@@ -25,7 +25,7 @@ from griptape_nodes.exe_types.validators.base import (
     PreRunValidator,
     reads,
 )
-from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
+from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -47,11 +47,11 @@ __all__ = [
     "AspectRatioRange",
     "AudioCodecs",
     "Condition",
-    "DependsOn",
     "Duration",
     "ExactAspectRatios",
     "FrameCount",
     "FrameRate",
+    "IfParameter",
     "MaxCount",
     "MaxFileSize",
     "MediaInfo",

@@ -118,7 +118,7 @@ class Condition(Protocol):
 
     Pass one to `PreRunValidator.when` or `unless`. Write it as a function, and mark it with `reads`
     for the readings it uses, so the engine reads them along with the validator's. A limit that
-    depends on another parameter's value is a `DependsOn`.
+    depends on another parameter's value is an `IfParameter`.
     """
 
     def __call__(self, media: MediaInfo, /) -> bool:
@@ -189,7 +189,7 @@ class PreRunValidator(ABC):
         """
 
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:  # noqa: ARG002
-        """The validators that apply on `node` now. A validator is itself; `DependsOn` picks a list."""
+        """The validators that apply on `node` now. A validator is itself; `IfParameter` picks a list."""
         return (self,)
 
     def candidates(self) -> Sequence[PreRunValidator]:
@@ -223,7 +223,7 @@ class _Wrapped(PreRunValidator):
         object.__setattr__(self, "needs", self.inner.needs)
         object.__setattr__(self, "checks_whole_list", self.inner.checks_whole_list)
 
-    # A wrapped `DependsOn` picks, and each validator it picks or can pick is wrapped the same way.
+    # A wrapped `IfParameter` picks, and each validator it picks or can pick is wrapped the same way.
     @override
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:
         return [replace(self, inner=validator) for validator in self.inner.selected(node)]

@@ -52,7 +52,7 @@ from griptape_nodes.exe_types.pre_run_validation import (
     validate_node,
 )
 from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator, reads
-from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
+from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -363,7 +363,7 @@ class TestPlainListParameters:
         assert _Records.seen == []
 
 
-class TestDependsOn:
+class TestIfParameter:
     @staticmethod
     def _node() -> MockNode:
         return _node_with(
@@ -372,7 +372,7 @@ class TestDependsOn:
                 name="image",
                 pre_run_validators=[
                     AllowedFormats("image/png"),
-                    DependsOn(
+                    IfParameter(
                         "model",
                         {"pro": [SideRange(min=300)], "lite": [SideRange(min=100), MaxFileSize(1)]},
                         default=[SideRange(min=1000)],
@@ -400,11 +400,13 @@ class TestDependsOn:
         for message, fragment in zip(messages, expected, strict=True):
             assert fragment in message
 
-    def test_refuses_a_validator_the_parameter_cannot_hold_inside_a_nested_depends_on(self) -> None:
+    def test_refuses_a_validator_the_parameter_cannot_hold_inside_a_nested_if_parameter(self) -> None:
         with pytest.raises(TypeError, match="checks audio, and the parameter holds image"):
             ParameterImage(
                 name="image",
-                pre_run_validators=[DependsOn("model", {"pro": [DependsOn("size", {"large": [AudioCodecs("mp3")]})]})],
+                pre_run_validators=[
+                    IfParameter("model", {"pro": [IfParameter("size", {"large": [AudioCodecs("mp3")]})]})
+                ],
             )
 
     def test_checks_nothing_when_the_pick_lists_no_validators(
@@ -413,7 +415,7 @@ class TestDependsOn:
         # A model that doesn't send the input lists no limits for it, and the input isn't read.
         node = _node_with(
             ParameterString(name="model", default_value="fast"),
-            ParameterImage(name="last_frame", pre_run_validators=[DependsOn("model", {"pro": [SideRange(min=300)]})]),
+            ParameterImage(name="last_frame", pre_run_validators=[IfParameter("model", {"pro": [SideRange(min=300)]})]),
         )
         node.set_parameter_value("last_frame", str(image_file(tmp_path, 10, 10)))
         reads: list[str] = []
@@ -424,10 +426,10 @@ class TestDependsOn:
 
     def test_refuses_a_picked_validator_the_parameter_cannot_hold(self) -> None:
         with pytest.raises(TypeError, match="checks audio, and the parameter holds image"):
-            ParameterImage(name="image", pre_run_validators=[DependsOn("model", {"pro": [AudioCodecs("mp3")]})])
+            ParameterImage(name="image", pre_run_validators=[IfParameter("model", {"pro": [AudioCodecs("mp3")]})])
 
     def test_survives_a_parameter_copy(self) -> None:
-        parameter = ParameterImage(name="image", pre_run_validators=[DependsOn("model", {"pro": [SideRange(min=1)]})])
+        parameter = ParameterImage(name="image", pre_run_validators=[IfParameter("model", {"pro": [SideRange(min=1)]})])
         assert parameter.copy().pre_run_validators == parameter.pre_run_validators
 
 
@@ -505,16 +507,16 @@ class TestConditions:
     def test_a_condition_without_declared_needs_reads_only_the_validators(self) -> None:
         assert SideRange(min=1).when(_always).needs == SideRange.needs
 
-    def test_wraps_each_pick_of_a_depends_on(self, tmp_path: Path) -> None:
-        by_model = DependsOn("model", {"pro": [SideRange(min=300)]}, default=[SideRange(min=1000)])
+    def test_wraps_each_pick_of_a_if_parameter(self, tmp_path: Path) -> None:
+        by_model = IfParameter("model", {"pro": [SideRange(min=300)]}, default=[SideRange(min=1000)])
         node = self._image_node(by_model.unless(_no_image_read), model="pro")
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
         assert _messages(validate_inputs(node)) == [
             "The image in 'image' is 200x200 and each side must be at least 300 pixels. Use a larger one."
         ]
 
-    def test_a_depends_on_can_hold_a_conditional_validator(self, tmp_path: Path) -> None:
-        node = self._image_node(DependsOn("model", {"pro": [SideRange(min=300).when(_is_png)]}), model="pro")
+    def test_an_if_parameter_can_hold_a_conditional_validator(self, tmp_path: Path) -> None:
+        node = self._image_node(IfParameter("model", {"pro": [SideRange(min=300).when(_is_png)]}), model="pro")
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200, "JPEG")))
         assert validate_inputs(node) == []
         node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
@@ -548,7 +550,7 @@ class TestConditions:
             (lambda: ParameterImage(name="p", pre_run_validators=[Duration(max=1).when(_always)]), "Duration"),
             (
                 lambda: ParameterImage(
-                    name="p", pre_run_validators=[DependsOn("m", {"x": [AudioCodecs("mp3")]}).first(1)]
+                    name="p", pre_run_validators=[IfParameter("m", {"x": [AudioCodecs("mp3")]}).first(1)]
                 ),
                 "AudioCodecs",
             ),
@@ -558,7 +560,7 @@ class TestConditions:
                 "checks image, and the parameter holds video",
             ),
         ],
-        ids=["conditional", "first-of-depends-on", "whole-list-on-single", "condition-reads"],
+        ids=["conditional", "first-of-if-parameter", "whole-list-on-single", "condition-reads"],
     )
     def test_the_build_time_fit_check_sees_through_wrappers(self, build: Any, match: str) -> None:
         with pytest.raises(TypeError, match=match):

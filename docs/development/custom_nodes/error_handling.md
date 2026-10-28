@@ -383,21 +383,21 @@ at least 300 pixels. Use a larger one." and a "Provider limits" link to `input_l
 
 Import the validators from `griptape_nodes.exe_types.validators`:
 
-| Validator                                     | Checks                                                                               |
-| --------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `AllowedFormats("image/png", ...)`            | The format, read from the file: an image's, a video's container, an audio container. |
-| `MaxFileSize(maximum_bytes, strict=False)`    | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
-| `SideRange(min=..., max=...)`                 | Each side of an image or video frame, in pixels.                                     |
-| `PixelArea(min_megapixels=..., ...)`          | The pixels in an image or video frame, in millions.                                  |
-| `AspectRatioRange(tallest, widest)`           | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
-| `ExactAspectRatios("16:9", "9:16")`           | The aspect ratio, for a provider that takes only certain shapes.                     |
-| `Duration(min=..., max=..., fix=...)`         | A video's or audio clip's length, in seconds.                                        |
-| `FrameRate(min=..., max=...)`                 | A video's frame rate.                                                                |
-| `FrameCount(min=..., max=...)`                | A video's frame count.                                                               |
-| `VideoCodecs("h264", ...)`                    | A video's codec.                                                                     |
-| `AudioCodecs("mp3", ...)`                     | An audio clip's codec.                                                               |
-| `MaxCount(maximum, noun="images")`            | How many items a list parameter holds.                                               |
-| `DependsOn(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.               |
+| Validator                                       | Checks                                                                               |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `AllowedFormats("image/png", ...)`              | The format, read from the file: an image's, a video's container, an audio container. |
+| `MaxFileSize(maximum_bytes, strict=False)`      | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
+| `SideRange(min=..., max=...)`                   | Each side of an image or video frame, in pixels.                                     |
+| `PixelArea(min_megapixels=..., ...)`            | The pixels in an image or video frame, in millions.                                  |
+| `AspectRatioRange(tallest, widest)`             | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
+| `ExactAspectRatios("16:9", "9:16")`             | The aspect ratio, for a provider that takes only certain shapes.                     |
+| `Duration(min=..., max=..., fix=...)`           | A video's or audio clip's length, in seconds.                                        |
+| `FrameRate(min=..., max=...)`                   | A video's frame rate.                                                                |
+| `FrameCount(min=..., max=...)`                  | A video's frame count.                                                               |
+| `VideoCodecs("h264", ...)`                      | A video's codec.                                                                     |
+| `AudioCodecs("mp3", ...)`                       | An audio clip's codec.                                                               |
+| `MaxCount(maximum, noun="images")`              | How many items a list parameter holds.                                               |
+| `IfParameter(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.               |
 
 A validator that fits more than one kind of media, such as `SideRange`, checks the kind its
 parameter holds: a `ParameterImage`'s image, a `ParameterVideo`'s video, a `ParameterAudio`'s
@@ -418,20 +418,20 @@ On a `ParameterList`, each item is checked on its own and named by its position,
 'reference images'", while `MaxCount` checks the list's length.
 
 **Limits that depend on a setting.** When the limits change with the selected model, wrap them in
-`DependsOn`. At the node's turn it picks the list for the other parameter's current value, or
-`default` for any other value. A list can hold another `DependsOn`, for limits that depend on two
+`IfParameter`. At the node's turn it picks the list for the other parameter's current value, or
+`default` for any other value. A list can hold another `IfParameter`, for limits that depend on two
 settings. Override `input_limits_url()` to return the page for the current model too.
 
 The values it looks up can be anything a parameter holds, such as `True` for a switch. `key=` turns
 the value into what's looked up first: `key=bool` asks whether a list has any items.
 
 ```python
-DependsOn("upscale", {True: []}, default=[SideRange(min=512)])
-DependsOn("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
+IfParameter("upscale", {True: []}, default=[SideRange(min=512)])
+IfParameter("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
 ```
 
 ```python
-from griptape_nodes.exe_types.validators import DependsOn, MaxCount
+from griptape_nodes.exe_types.validators import IfParameter, MaxCount
 
 ParameterList(
     name="reference_images",
@@ -441,7 +441,7 @@ ParameterList(
     display_name="reference images",
     pre_run_validators=[
         AllowedFormats("image/jpeg", "image/png"),
-        DependsOn(
+        IfParameter(
             "model",
             {"pro": [MaxCount(4, noun="images"), SideRange(min=300)]},
             default=[MaxCount(1, noun="images"), SideRange(min=512)],
@@ -451,15 +451,15 @@ ParameterList(
 ```
 
 **Limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap any
-validator, `DependsOn` included, so it applies only to a value whose file the condition holds, or
+validator, `IfParameter` included, so it applies only to a value whose file the condition holds, or
 doesn't hold, for. A condition is a function given the value's `MediaInfo`, returning True or
 False; it marks what it reads with `@reads(...)`, so the engine reads that along with the
 validator's own readings. A condition sees only the file: a limit that depends on a setting is a
-`DependsOn`. On a list, `.first(n)` checks only the first `n` items, for a provider that reads only
+`IfParameter`. On a list, `.first(n)` checks only the first `n` items, for a provider that reads only
 that many.
 
 ```python
-from griptape_nodes.exe_types.validators import DependsOn, MaxFileSize, MediaNeed, SideRange, reads
+from griptape_nodes.exe_types.validators import IfParameter, MaxFileSize, MediaNeed, SideRange, reads
 
 
 @reads(MediaNeed.IMAGE)
@@ -471,7 +471,7 @@ ParameterImage(
     name="image",
     pre_run_validators=[
         MaxFileSize(5 * MB).when(is_png),
-        DependsOn("upscale", {True: []}, default=[SideRange(min=512)]),
+        IfParameter("upscale", {True: []}, default=[SideRange(min=512)]),
     ],
 )
 ```
@@ -504,7 +504,7 @@ class ReferenceToVideo(SuccessFailureNode):
 ```
 
 **Your own validator.** Most limits are a built-in validator, narrowed where needed with
-`.when()`, `.unless()`, `DependsOn` or `.first(n)`. For one none of them covers, subclass
+`.when()`, `.unless()`, `IfParameter` or `.first(n)`. For one none of them covers, subclass
 `PreRunValidator`, set `needs` to the readings it uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or
 `AUDIO`), and return a `NodeError` from `check`, or None. The engine reads the input once for all
 the validators on a parameter and hands each the same `MediaInfo`. For a reading `MediaInfo` doesn't

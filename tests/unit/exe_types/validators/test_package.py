@@ -39,7 +39,7 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
 @pytest.mark.parametrize(
     "first_import",
     [
-        "from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize, DependsOn",
+        "from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize, IfParameter",
         "from griptape_nodes.exe_types.validators import *",
         "import griptape_nodes.exe_types.core_types",
         "import griptape_nodes.exe_types.input_checks",
@@ -49,6 +49,6 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
 def test_imports_without_a_cycle_in_a_fresh_process(first_import: str) -> None:
     """The short imports work whichever module a process imports first."""
     # A circular import only shows when nothing else has been imported yet, so this needs its own process.
-    code = f"{first_import}\nfrom griptape_nodes.exe_types.validators import AllowedFormats, DependsOn, MaxFileSize"
+    code = f"{first_import}\nfrom griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, MaxFileSize"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, timeout=60)  # noqa: S603
     assert result.returncode == 0, result.stderr
