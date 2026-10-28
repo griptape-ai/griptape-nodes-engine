@@ -1770,6 +1770,7 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 include_existing_subflow_in_group=True,
+                values_supplied_by_connections=self._package_parameters_fed_by_connections(node),
             )
             serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request)
 
@@ -1829,6 +1830,23 @@ class FlowManager(EngineScoped):
         internal_connections.extend(connections_result)
         serialized_node_commands.extend(serialized_node_group_commands)
         return serialized_node_commands
+
+    def _package_parameters_fed_by_connections(self, node: BaseNode) -> set[str]:
+        """Names of the node's parameters whose values the packaged flow's connections will supply.
+
+        A connected input gets its value inside the rebuilt flow before its node runs: from the Start
+        node when the connection comes from outside the package, from the upstream node's output when
+        it is internal. The value the canvas node holds is overwritten either way, so the package
+        leaves it out rather than replaying it, where it would be validated against the parameter's
+        current rules and could abort the whole rebuild (issue #5889).
+
+        A locked node is the exception: its copy never runs (the paths that rebuild the package from
+        a workflow file lock it too), so nothing would feed its inputs, and a downstream node reading
+        a passthrough parameter would see the default instead of the frozen value. It keeps them all.
+        """
+        if node.lock:
+            return set()
+        return set(self.get_connections().incoming_index.get(node.name, {}))
 
     def _get_internal_connections_for_package(
         self,
@@ -4509,7 +4527,10 @@ class FlowManager(EngineScoped):
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
         if set_parameter_value_result.failed():
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}'."
+            msg = (
+                f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
+                f"{set_parameter_value_result.result_details}"
+            )
             raise FlowDeserializationError(msg)
 
     async def start_flow(

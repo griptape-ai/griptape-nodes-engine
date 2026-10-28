@@ -4400,6 +4400,7 @@ class NodeManager(EngineScoped):
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
+                    value_supplied_by_connection=parameter.name in request.values_supplied_by_connections,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -5300,6 +5301,7 @@ class NodeManager(EngineScoped):
         create_node_request: CreateNodeRequest,
         *,
         serialize_all_parameter_values: bool = False,
+        value_supplied_by_connection: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5318,6 +5320,7 @@ class NodeManager(EngineScoped):
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
+            value_supplied_by_connection (bool): If True, leave out the set value: a connection in the destination flow supplies it. The output value is still saved.
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5337,7 +5340,11 @@ class NodeManager(EngineScoped):
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
         # If serialize_all_parameter_values is True, save all parameter values regardless.
-        if (
+        # A value a connection will supply is not saved at all: replaying it would only have it
+        # validated against the parameter's current rules, and then overwritten by the connection.
+        if value_supplied_by_connection:
+            internal_value = None
+        elif (
             serialize_all_parameter_values
             or parameter.name in node.parameter_values
             or (parameter.default_value is not None and effective_value == parameter.default_value)

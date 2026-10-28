@@ -571,6 +571,8 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
+        values_supplied_by_connections: Names of parameters whose set values are left out, because a
+            connection in the flow the commands are replayed into supplies them. Output values are kept.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -587,6 +589,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
     serialize_all_parameter_values: bool = False
     # If True, keep subflow_name in group metadata for workflow file generation (defaults to False for copy/paste)
     include_existing_subflow_in_group: bool = False
+    values_supplied_by_connections: set[str] = field(default_factory=set)
 
 
 @dataclass
