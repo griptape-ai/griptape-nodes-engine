@@ -1,10 +1,16 @@
-"""A data node outside a loop runs once, however many passes the loop makes.
+"""A data node outside a loop runs once across the passes of a sequential loop, and once for a group.
 
 Legacy Start/End loops package unresolved upstream data dependencies into the loop body, outside
-nodes included (``NodeExecutor._collect_loop_body_nodes``), and reuse that one flow instance for
-every sequential pass. Nothing upstream of the outside node re-runs between passes, so it must stay
-resolved and feed every pass the same value: an Agent or image generator outside the loop should
-make one call, not one per pass.
+nodes included (``NodeExecutor._collect_loop_body_nodes``). With ``run_in_order`` set, that one flow
+instance is reused for every pass, so the packaged copy runs once: an Agent or image generator
+outside the loop makes one call, not one per pass. The legacy tests here set ``run_in_order``
+explicitly, because the fixture defaults it to False.
+
+Not pinned: the legacy loop in "all at once" mode, which deserializes a fresh copy of the body per
+pass and so runs the packaged outside node once per pass. That is a limitation of the two-node
+Start/End pair, which is being deprecated in favor of the group nodes (griptape-nodes-engine#6016).
+The outside counter is an instance attribute that restarts at zero in every deserialized copy, so a
+test of that mode would also need a counter that survives packaging.
 
 The iterative group path never packages outside nodes; its outside values arrive already resolved
 through ``get_resolved_upstream_values``. It is covered here so both loop shapes are pinned.
@@ -122,6 +128,8 @@ async def _run_legacy_loop_with_outside_dependency(
         _connect(engine, start_name, "exec_out", body_name, "exec_in")
         _connect(engine, body_name, "exec_out", end_node.name, "add_item")
         _connect(engine, "Outside", "value", body_name, "text")
+        # One reused body flow per run is what makes "runs once" hold; see the module docstring.
+        engine.handle_request(SetParameterValueRequest(parameter_name="run_in_order", node_name=start_name, value=True))
 
         if with_downstream_sink:
             downstream_name = _create(engine, "AnySinkDataNode", "Downstream Sink")
@@ -208,7 +216,7 @@ async def _run_group_loop_with_outside_dependency(
 async def test_outside_dependency_resolved_from_end_directly(
     tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
 ) -> None:
-    """A legacy loop whose End is reached by its own control chain runs the outside node once."""
+    """A sequential legacy loop whose End is reached by its own control chain runs the outside node once."""
     run_count = await _run_legacy_loop_with_outside_dependency(
         tmp_path, engine, materialize_library, with_downstream_sink=False
     )
