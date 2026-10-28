@@ -68,6 +68,13 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
 
+# Workflow ids in the form the registry mints.
+_IDLE_WORKFLOW_ID = "361f2196d4584af88fa4b3600657c25f"
+_BUSY_WORKFLOW_ID = "2287671f711164a037bd38f349ccfd4c"
+_CLOSED_WORKFLOW_ID = "d8aa87c26072342180185408ae0f4c1c"
+_OPEN_WORKFLOW_ID = "a933aec213adcc9ec281ca7604260fa4"
+
+
 @dataclass(kw_only=True)
 class _ProbeRequest(RequestPayload):
     """Minimal request used to exercise RemoteHandler's scope gate."""
@@ -353,6 +360,47 @@ class TestDropAllLocalObjectsHandler:
         assert isinstance(result, DropAllLocalObjectsResultSuccess)
         assert release_threads
         assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_closes_the_runtimes_kept_for_the_orchestrators_workflows_except_one_a_node_runs_in(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator tore its workflow down, so a later node of it gets a fresh runtime."""
+        engine.context_manager.adopt_orchestrator_workflow(_IDLE_WORKFLOW_ID, None, None, None)
+        busy = engine.context_manager.adopt_orchestrator_workflow(_BUSY_WORKFLOW_ID, None, None, None)
+
+        with engine.run_in_worker_workflow(busy):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_IDLE_WORKFLOW_ID)
+        assert engine.workflow_registry.find_by_id(_IDLE_WORKFLOW_ID) is None
+        assert engine.worker_workflows.find(_BUSY_WORKFLOW_ID) is busy
+
+    @pytest.mark.asyncio
+    async def test_naming_a_workflow_closes_only_its_runtime_and_releases_only_its_objects(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator closed one workflow while another stays open, so the other's runtime and objects stay."""
+        closed = engine.context_manager.adopt_orchestrator_workflow(_CLOSED_WORKFLOW_ID, None, None, None)
+        still_open = engine.context_manager.adopt_orchestrator_workflow(_OPEN_WORKFLOW_ID, None, None, None)
+        manager = engine.resource_manager
+        with engine.run_in_worker_workflow(closed):
+            closed_key = manager.put_local_object(object(), owner="Lib A", source="N", key="closed")
+        with engine.run_in_worker_workflow(still_open):
+            open_key = manager.put_local_object(object(), owner="Lib A", source="N", key="open")
+
+        result = await _handle_drop_all_local_objects(
+            DropAllLocalObjectsRequest(workflow_id=_CLOSED_WORKFLOW_ID), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_CLOSED_WORKFLOW_ID)
+        assert engine.worker_workflows.find(_OPEN_WORKFLOW_ID) is still_open
+        assert manager.entry_for(closed_key) is None
+        assert manager.entry_for(open_key) is not None
 
     @pytest.mark.asyncio
     async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:

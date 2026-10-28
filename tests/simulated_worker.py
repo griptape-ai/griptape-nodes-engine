@@ -130,6 +130,16 @@ def simulated_worker_engine(orchestrator: Engine) -> Iterator[SimulatedWorker]:
         forwarding_loop.close()
 
 
+def sent_from_open_workflow(request: ExecuteNodeRequest, orchestrator: Engine) -> ExecuteNodeRequest:
+    """`request` carrying `orchestrator`'s open workflow, as its node executor sends it. A worker refuses one without."""
+    snapshot = orchestrator.project_manager.workflow_context_for_dispatch()
+    request.orchestrator_workflow_id = snapshot.workflow_id
+    request.workflow_name = snapshot.name
+    request.workflow_file_path = snapshot.file_path
+    request.workflow_working_directory = snapshot.working_directory
+    return request
+
+
 async def _handled_by(engine: Engine, request: RequestPayload) -> ResultPayload:
     with engine_scope(engine):
         return await engine.ahandle_request(request)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -13,18 +14,21 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.common.project_templates import ProjectValidationInfo
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
     from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath, ResolvedProjectPath
-    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+    from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, _WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -47,7 +51,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
@@ -717,15 +720,25 @@ class TestProjectManagerBuiltinVariables:
         assert "project_name not yet implemented" in str(result.result_details)
 
     @staticmethod
-    def _mirroring_context_manager(workspace: Path) -> ContextManager:
-        """A real ContextManager and registry with an empty stack: exactly a worker before adopting."""
-        engine = MagicMock()
+    def _worker_context_manager(workspace: Path) -> ContextManager:
+        """A worker engine's ContextManager, with nothing open and no orchestrator workflow adopted."""
+        engine = Engine()
         engine.config_manager.workspace_path = workspace
-        context_manager = ContextManager(event_manager=MagicMock(), engine=engine)
-        engine.workflow_registry = _WorkflowRegistry(
-            engine.config_manager, is_workflow_open=context_manager.is_workflow_in_context
-        )
-        return context_manager
+        return engine.context_manager
+
+    @staticmethod
+    @contextmanager
+    def _running_in(
+        context_manager: ContextManager,
+        workflow_id: str | None,
+        name: str | None,
+        file_path: str | None,
+        working_directory: str | None,
+    ) -> Iterator[None]:
+        """Adopt the orchestrator's workflow and run in it for the block, as a worker's node does."""
+        workflow = context_manager.adopt_orchestrator_workflow(workflow_id, name, file_path, working_directory)
+        with context_manager.engine.run_in_worker_workflow(workflow):
+            yield
 
     @staticmethod
     def _workflow_file(path: Path) -> Path:
@@ -733,14 +746,14 @@ class TestProjectManagerBuiltinVariables:
         path.write_text("# stub")
         return path
 
-    def test_mirrored_workflow_context_resolves_the_lenders_folder(
+    def test_the_orchestrators_workflow_resolves_its_folder_on_the_worker(
         self,
         project_manager_with_template: ProjectManager,
         tmp_path: Path,
     ) -> None:
-        """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
+        """While a worker runs the orchestrator's node, workflow builtins resolve through the NORMAL path.
 
-        Unadopted, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
+        Outside it, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
         `{outputs}` template swallows it, and the path degrades to workspace-relative -- so the
         worker writes where the orchestrator does not read, with no error at the divergence.
         """
@@ -748,23 +761,22 @@ class TestProjectManagerBuiltinVariables:
 
         show_folder = tmp_path / "orchestrator" / "shows" / "my_show"
         workflow_file = self._workflow_file(show_folder / "my_show.py")
-        context_manager = self._mirroring_context_manager(show_folder)
+        context_manager = self._worker_context_manager(show_folder)
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = context_manager
 
         dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
         name_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_name}.txt"), variables={})
 
-        # Unadopted: the folder is unresolvable, which is what silently degrades the path.
+        # Outside the node: the folder is unresolvable, which is what silently degrades the path.
         assert not isinstance(
             project_manager_with_template.on_get_path_for_macro_request(dir_request),
             GetPathForMacroResultSuccess,
         )
 
-        context_manager.mirror_workflow_context("show-id", "my_show", str(workflow_file), None)
-
-        resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
-        resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
+        with self._running_in(context_manager, "show-id", "my_show", str(workflow_file), None):
+            resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
+            resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
 
         assert isinstance(resolved_dir, GetPathForMacroResultSuccess)
         assert resolved_dir.resolved_path == show_folder / "output.txt"
@@ -772,44 +784,42 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(resolved_name, GetPathForMacroResultSuccess)
         assert resolved_name.resolved_path.name == "my_show.txt"
 
-    def test_mirroring_registers_the_peers_workflow_unlisted_under_its_id(self, tmp_path: Path) -> None:
+    def test_adopting_registers_the_orchestrators_workflow_unlisted_under_its_id(self, tmp_path: Path) -> None:
         """The worker's entry carries the orchestrator's id and stays out of the worker's workflow list."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+        context_manager = self._worker_context_manager(tmp_path)
         workflow_file = self._workflow_file(tmp_path / "w.py")
 
-        context_manager.mirror_workflow_context("peer-id", "w", str(workflow_file), None)
+        with self._running_in(context_manager, "peer-id", "w", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == "peer-id"
 
         registry = context_manager.engine.workflow_registry
-        assert context_manager.get_current_workflow_id() == "peer-id"
         assert registry.get("peer-id").listed is False
         assert registry.list_workflows() == {}
 
-    def test_mirroring_an_unsaved_workflow_answers_its_working_directory(self, tmp_path: Path) -> None:
-        context_manager = self._mirroring_context_manager(tmp_path)
+    def test_adopting_an_unsaved_workflow_answers_its_working_directory(self, tmp_path: Path) -> None:
+        context_manager = self._worker_context_manager(tmp_path)
 
-        context_manager.mirror_workflow_context(
-            _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, str(tmp_path / "shots")
-        )
+        with self._running_in(
+            context_manager, _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, str(tmp_path / "shots")
+        ):
+            assert context_manager.get_current_workflow_name() == f"unsaved:{_PEER_WORKFLOW_ID}"
+            assert context_manager.get_current_workflow_file_path() is None
+            assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
 
-        assert context_manager.get_current_workflow_name() == f"unsaved:{_PEER_WORKFLOW_ID}"
-        assert context_manager.get_current_workflow_file_path() is None
-        assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
-
-    def test_mirroring_follows_the_peer_saving_its_workflow(self, tmp_path: Path) -> None:
-        """A peer that first saved the workflow since the last mirror moves this engine's entry, same id."""
-        context_manager = self._mirroring_context_manager(tmp_path)
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+    def test_adopting_follows_the_orchestrator_saving_its_workflow(self, tmp_path: Path) -> None:
+        """An orchestrator that first saved the workflow since the last node moves this engine's entry, same id."""
+        context_manager = self._worker_context_manager(tmp_path)
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
         workflow_file = self._workflow_file(tmp_path / "saved.py")
 
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "saved", str(workflow_file), None)
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "saved", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert context_manager.get_current_workflow_name() == "saved"
+            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-        assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
-        assert context_manager.get_current_workflow_name() == "saved"
-        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
-
-    def test_mirroring_takes_the_peers_id_for_a_file_known_here_under_another(self, tmp_path: Path) -> None:
-        """The peer's id is the authority: this engine's stale entry for the file is replaced, not used."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+    def test_adopting_takes_the_orchestrators_id_for_a_file_known_here_under_another(self, tmp_path: Path) -> None:
+        """The orchestrator's id is the authority: this engine's stale entry for the file is replaced, not used."""
+        context_manager = self._worker_context_manager(tmp_path)
         registry = context_manager.engine.workflow_registry
         workflow_file = self._workflow_file(tmp_path / "w.py")
         local = registry.register_file(
@@ -822,19 +832,19 @@ class TestProjectManagerBuiltinVariables:
             ),
         )
 
-        context_manager.mirror_workflow_context("orchestrator-id", "w", str(workflow_file), None)
+        with self._running_in(context_manager, "orchestrator-id", "w", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == "orchestrator-id"
 
-        assert context_manager.get_current_workflow_id() == "orchestrator-id"
         assert registry.find_by_id(local.workflow_id) is None
         assert registry.find_by_path(workflow_file) is registry.get("orchestrator-id")
 
-    def test_mirroring_moves_the_peers_unsaved_entry_onto_a_file_known_here_under_another_id(
+    def test_adopting_moves_the_orchestrators_unsaved_entry_onto_a_file_known_here_under_another_id(
         self, tmp_path: Path
     ) -> None:
-        """The peer first saved its unsaved workflow onto a file this engine scanned under another id."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+        """The orchestrator first saved its unsaved workflow onto a file this engine scanned under another id."""
+        context_manager = self._worker_context_manager(tmp_path)
         registry = context_manager.engine.workflow_registry
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
         workflow_file = self._workflow_file(tmp_path / "b.py")
         local = registry.register_file(
             workflow_file,
@@ -846,43 +856,54 @@ class TestProjectManagerBuiltinVariables:
             ),
         )
 
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "b", str(workflow_file), None)
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "b", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-        assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
         assert registry.find_by_id(local.workflow_id) is None
-        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-    def test_mirroring_a_file_that_is_gone_resolves_paths_in_its_folder(self, tmp_path: Path) -> None:
-        """The peer still has the workflow open at that path, so it resolves paths in that folder."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+    def test_adopting_a_file_that_is_gone_resolves_paths_in_its_folder(self, tmp_path: Path) -> None:
+        """The orchestrator still has the workflow open at that path, so it resolves paths in that folder."""
+        context_manager = self._worker_context_manager(tmp_path)
         missing = tmp_path / "shots" / "moved_away.py"
 
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "moved_away", str(missing), None)
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "moved_away", str(missing), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert context_manager.get_current_workflow_file_path() is None
+            assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
 
-        assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
-        assert context_manager.get_current_workflow_file_path() is None
-        assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
-
-    def test_replacing_the_mirror_drops_the_entry_it_registered(self, tmp_path: Path) -> None:
-        """A long-lived worker does not keep an entry for every peer workflow it ever ran a node for."""
-        context_manager = self._mirroring_context_manager(tmp_path)
-        registry = context_manager.engine.workflow_registry
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
-
-        context_manager.mirror_workflow_context(
+    def test_a_sweep_closes_the_runtimes_and_drops_the_entries_made_for_them(self, tmp_path: Path) -> None:
+        """A long-lived worker does not keep an entry for every orchestrator workflow it ever ran a node for."""
+        context_manager = self._worker_context_manager(tmp_path)
+        engine = context_manager.engine
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        context_manager.adopt_orchestrator_workflow(
             _OTHER_PEER_WORKFLOW_ID, f"unsaved:{_OTHER_PEER_WORKFLOW_ID}", None, None
         )
 
-        assert registry.find_by_id(_PEER_WORKFLOW_ID) is None
-        assert registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is not None
+        assert engine.sweep_worker_workflows() == 2  # noqa: PLR2004
 
-        context_manager.mirror_workflow_context(None, None, None, None)
+        assert not engine.worker_workflows.holds(_PEER_WORKFLOW_ID)
+        assert not engine.worker_workflows.holds(_OTHER_PEER_WORKFLOW_ID)
+        assert engine.workflow_registry.find_by_id(_PEER_WORKFLOW_ID) is None
+        assert engine.workflow_registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is None
 
-        assert registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is None
+    def test_a_sweep_keeps_the_runtime_a_node_is_running_in(self, tmp_path: Path) -> None:
+        context_manager = self._worker_context_manager(tmp_path)
+        engine = context_manager.engine
+        busy = context_manager.adopt_orchestrator_workflow(
+            _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None
+        )
 
-    def test_replacing_the_mirror_keeps_an_entry_from_this_engines_scan(self, tmp_path: Path) -> None:
-        """The scanned entry goes to the peer's id, and stays listed, so dropping the mirror keeps it."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+        with engine.run_in_worker_workflow(busy):
+            assert engine.sweep_worker_workflows() == 0
+
+        assert engine.worker_workflows.find(_PEER_WORKFLOW_ID) is busy
+        assert engine.workflow_registry.find_by_id(_PEER_WORKFLOW_ID) is not None
+
+    def test_a_sweep_keeps_an_entry_from_this_engines_scan(self, tmp_path: Path) -> None:
+        """The scanned entry goes to the orchestrator's id, and stays listed, so the sweep keeps it."""
+        context_manager = self._worker_context_manager(tmp_path)
         registry = context_manager.engine.workflow_registry
         workflow_file = self._workflow_file(tmp_path / "scanned.py")
         registry.register_file(
@@ -894,60 +915,56 @@ class TestProjectManagerBuiltinVariables:
                 node_libraries_referenced=[],
             ),
         )
-        context_manager.mirror_workflow_context(_PEER_WORKFLOW_ID, "scanned", str(workflow_file), None)
+        context_manager.adopt_orchestrator_workflow("peer-id", "scanned", str(workflow_file), None)
 
-        context_manager.mirror_workflow_context(
-            _OTHER_PEER_WORKFLOW_ID, f"unsaved:{_OTHER_PEER_WORKFLOW_ID}", None, None
-        )
+        context_manager.engine.sweep_worker_workflows()
 
-        kept = registry.find_by_id(_PEER_WORKFLOW_ID)
+        kept = registry.find_by_id("peer-id")
         assert kept is not None
         assert kept.listed
         assert registry.find_by_path(workflow_file) is kept
 
-    def test_mirroring_keeps_the_stack_indexable(self, tmp_path: Path) -> None:
-        """Adoption installs a REAL entry, so stack-indexing readers stay safe.
-
-        `has_current_workflow()` also means "there is an entry to index", so answering it True
-        without one raises IndexError in has_current_flow, push_flow, pop_flow and the setters.
-        """
-        context_manager = self._mirroring_context_manager(tmp_path)
+    def test_the_adopted_workflow_has_an_indexable_stack(self, tmp_path: Path) -> None:
+        """The runtime gives the worker a context stack of its own, so readers that index it stay safe."""
+        context_manager = self._worker_context_manager(tmp_path)
         workflow_file = self._workflow_file(tmp_path / "w.py")
-        context_manager.mirror_workflow_context("w-id", "w", str(workflow_file), None)
 
-        assert context_manager.has_current_workflow() is True
-        assert context_manager.has_current_flow() is False
-        assert context_manager.get_current_workflow_name() == "w"
-        assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+        with self._running_in(context_manager, "w-id", "w", str(workflow_file), None):
+            assert context_manager.has_current_workflow() is True
+            assert context_manager.has_current_flow() is False
+            assert context_manager.get_current_workflow_name() == "w"
+            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
 
-    def test_mirroring_replaces_rather_than_stacks(self, tmp_path: Path) -> None:
-        """A mirror tracks ONE peer context; stacking would leave a stale workflow to be read."""
-        context_manager = self._mirroring_context_manager(tmp_path)
+    def test_each_orchestrator_workflow_keeps_one_runtime(self, tmp_path: Path) -> None:
+        """Adopting the same workflow again returns its runtime; another workflow gets its own."""
+        context_manager = self._worker_context_manager(tmp_path)
         first = self._workflow_file(tmp_path / "first.py")
         second = self._workflow_file(tmp_path / "second.py")
-        context_manager.mirror_workflow_context("first-id", "first", str(first), None)
-        context_manager.mirror_workflow_context("second-id", "second", str(second), None)
-        # Re-adopting the same context must not grow the stack either.
-        context_manager.mirror_workflow_context("second-id", "second", str(second), None)
+        first_runtime = context_manager.adopt_orchestrator_workflow("first-id", "first", str(first), None)
+        second_runtime = context_manager.adopt_orchestrator_workflow("second-id", "second", str(second), None)
 
-        assert len(context_manager._workflow_stack) == 1
-        assert context_manager.get_current_workflow_name() == "second"
+        again = context_manager.adopt_orchestrator_workflow("second-id", "second", str(second), None)
 
-    def test_mirroring_an_empty_context_drops_the_previous_one(self, tmp_path: Path) -> None:
-        """A peer with no workflow must leave this engine with none either.
+        assert again is second_runtime
+        assert first_runtime is not second_runtime
+        with self._running_in(context_manager, "second-id", "second", str(second), None):
+            assert context_manager.get_current_workflow_id() == "second-id"
+            assert context_manager.get_current_workflow_name() == "second"
 
-        The mirror is replaced in place and never popped, so skipping the empty case left the
-        previous execution's workflow installed: the worker resolved `{workflow_dir}` to that
-        folder while the orchestrator degraded to workspace-relative, and wrote a real file
+    def test_a_node_from_an_orchestrator_with_no_workflow_is_refused(self, tmp_path: Path) -> None:
+        """An orchestrator with no workflow gives the worker no workflow to build the node's copy in.
+
+        An earlier node's workflow must not be used either: the worker would resolve `{workflow_dir}` to
+        that folder while the orchestrator degraded to workspace-relative, and write a real file
         where the orchestrator does not read.
         """
-        context_manager = self._mirroring_context_manager(tmp_path)
+        context_manager = self._worker_context_manager(tmp_path)
         workflow_file = self._workflow_file(tmp_path / "showA.py")
-        context_manager.mirror_workflow_context("show-a", "showA", str(workflow_file), None)
+        with self._running_in(context_manager, "show-a", "showA", str(workflow_file), None):
+            pass
 
-        context_manager.mirror_workflow_context(None, None, None, None)
-
-        assert context_manager.has_current_workflow() is False
+        with pytest.raises(context_manager.OrchestratorWorkflowError, match="no workflow was open"):
+            context_manager.adopt_orchestrator_workflow(None, None, None, None)
 
     def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
         self,

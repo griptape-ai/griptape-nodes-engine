@@ -95,7 +95,7 @@ class TestExecuteDispatchContract:
 
     @pytest.mark.asyncio
     async def test_dispatches_the_open_workflows_context_and_id(self) -> None:
-        """A worker mirrors the orchestrator's workflow under the id the request carries."""
+        """A worker runs the node in the runtime it keeps for the orchestrator's workflow, under the id the request carries."""
         node = _make_node()
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)

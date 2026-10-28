@@ -774,7 +774,7 @@ class ExecuteNodeRequest(RequestPayload):
             lookup that would otherwise resolve the flow.
         orchestrator_workflow_id: id of the orchestrator's open workflow the node runs for. Not
             `workflow_id`, which names the saved workflow a request acts on. The worker registers
-            the workflow under this id (unlisted) and puts it in its own context.
+            the workflow under this id (unlisted) and runs the node in the runtime it keeps for it.
         workflow_name / workflow_file_path / workflow_working_directory: the orchestrator's workflow
             CONTEXT, which the worker adopts as its own before running the node. Sent for the same
             reason as `variables` -- it lives in in-process state only the orchestrator has -- and
@@ -783,9 +783,9 @@ class ExecuteNodeRequest(RequestPayload):
             later) is answered by the worker's normal code paths. A worker without it answers "no
             current workflow" to all of them, which silently degrades `{outputs}` from the
             workflow's own folder to a workspace-relative path. With the id, these are what the
-            worker's registry entry for the workflow answers; orchestrator_workflow_id None means
-            the orchestrator had no workflow either, so there is nothing to adopt. A workflow_name
-            without an orchestrator_workflow_id fails, rather than running without the workflow.
+            worker's registry entry for the workflow answers. The worker builds its copy of the
+            node in that workflow, so a request with no orchestrator_workflow_id fails rather than
+            running without one.
         lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
             another engine runs asks that engine whether the lease holds it before running the node,
             and refuses a node sent under none. None for a worker on this machine.

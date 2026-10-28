@@ -52,7 +52,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
-from tests.simulated_worker import SimulatedWorker, simulated_worker
+from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -114,13 +114,13 @@ def _make_in_flow(node_type: str, name: str) -> BaseNode:
 
 
 async def _execute(node_type: str, name: str, **parameter_values: object) -> ExecuteNodeResultSuccess:
-    result = await current_engine().ahandle_request(
-        ExecuteNodeRequest(
-            node_name=name,
-            parameter_values=dict(parameter_values),
-            node_metadata={"node_type": node_type, "library": WORKER_BEHAVIOR_LIBRARY_NAME},
-        )
+    engine = current_engine()
+    request = ExecuteNodeRequest(
+        node_name=name,
+        parameter_values=dict(parameter_values),
+        node_metadata={"node_type": node_type, "library": WORKER_BEHAVIOR_LIBRARY_NAME},
     )
+    result = await engine.ahandle_request(sent_from_open_workflow(request, engine))
     assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
     return result
 

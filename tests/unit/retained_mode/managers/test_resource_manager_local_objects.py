@@ -5,6 +5,7 @@ and the lock -- rather than the dict.
 """
 
 import asyncio
+import contextvars
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
 
@@ -321,6 +323,56 @@ class TestDropForLibrary:
 
         assert dropped == entries_put
         assert released == ["good"]
+
+
+class TestDropForWorkflow:
+    def test_an_entry_records_the_workflow_it_was_held_for(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        host_key = manager.put_local_object(Held("host"), owner="Lib A", source="N", key="host")
+        engine.context_manager.push_workflow("wf")
+        workflow_id = engine.context_manager.get_current_workflow_id()
+
+        with engine.bind_workflow(engine.current_workflow()):
+            key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf")
+
+        entry = manager.entry_for(key)
+        host_entry = manager.entry_for(host_key)
+        assert entry is not None
+        assert host_entry is not None
+        assert entry.workflow_id == workflow_id
+        assert host_entry.workflow_id is None
+
+    def test_parking_for_a_closed_workflow_is_refused_and_records_nothing(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+
+        with engine.bind_workflow(workflow):
+            # Closed by other work, as a node task started before the close sees it.
+            contextvars.copy_context().run(engine.context_manager.pop_workflow)
+            with pytest.raises(WorkflowNotOpenError, match="was closed"):
+                manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late")
+
+        assert manager.drop_all_local_objects() == 0
+
+    def test_drops_only_that_workflows_objects(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        released: list[str] = []
+        for workflow_id, label in (("a", "a"), ("b", "b"), (None, "host")):
+            entry_value = Held(label)
+            key = manager.put_local_object(
+                entry_value, owner="Lib A", source="N", key=label, on_drop=lambda value: released.append(value.label)
+            )
+            entry = manager.entry_for(key)
+            assert entry is not None
+            entry.workflow_id = workflow_id
+
+        dropped = manager.drop_objects_for_workflow("a")
+
+        assert dropped == 1
+        assert released == ["a"]
+        assert manager.get_local_object(manager.local_object_key("b", owner="Lib A"), owner="Lib A") is not None
+        assert manager.get_local_object(manager.local_object_key("host", owner="Lib A"), owner="Lib A") is not None
 
 
 class TestPresence:
