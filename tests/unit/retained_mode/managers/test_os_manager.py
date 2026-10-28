@@ -350,6 +350,7 @@ class TestReadFileRequestImagePreview:
 
         with (
             patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
+            patch("mimetypes.guess_type", return_value=("image/aces", None)),
             patch(
                 "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
                 return_value=None,
