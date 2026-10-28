@@ -443,7 +443,7 @@ ParameterList(
 ```
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a total
-length across several clips, write a `NodeValidator` and list it in the node's `node_validators`.
+length across several clips, write a `NodeValidator` and put it in the node's `node_validators` tuple.
 It runs after every parameter's validators. Its `media` holds what they read, by parameter name,
 but only the readings some validator on that parameter asked for: a parameter with no validator
 that reads its video has `info.video` set to None. To be sure of a reading, call the reader
@@ -467,7 +467,7 @@ class TotalLength(NodeValidator):
 
 
 class ReferenceToVideo(SuccessFailureNode):
-    node_validators: ClassVar[list[NodeValidator]] = [TotalLength()]
+    node_validators: ClassVar[tuple[NodeValidator, ...]] = (TotalLength(),)
 ```
 
 **Your own validator.** Subclass `PreRunValidator`, set `needs` to the readings it uses

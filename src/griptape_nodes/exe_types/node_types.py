@@ -347,7 +347,7 @@ class BaseNode(ABC):
     _engine: Engine | None
     # Rules across several inputs, checked at the node's turn after each parameter's
     # `pre_run_validators`. See `griptape_nodes.exe_types.validators`.
-    node_validators: ClassVar[list[NodeValidator]] = []
+    node_validators: ClassVar[tuple[NodeValidator, ...]] = ()
 
     @property
     def parameters(self) -> list[Parameter]:

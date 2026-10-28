@@ -232,7 +232,7 @@ class TestReadOnce:
                 return []
 
         class ReadingNode(MockNode):
-            node_validators: ClassVar[list[NodeValidator]] = [Reads()]
+            node_validators: ClassVar[tuple[NodeValidator, ...]] = (Reads(),)
 
         node = ReadingNode(name="node")
         node.add_parameter(ParameterVideo(name="video", pre_run_validators=[Duration(max=30)]))
@@ -467,7 +467,7 @@ class TestNodeValidators:
                 return [NodeError("'first' and 'second' must be the same size.", links=None)]
 
         class PairNode(_LimitedNode):
-            node_validators: ClassVar[list[NodeValidator]] = [SameSize()]
+            node_validators: ClassVar[tuple[NodeValidator, ...]] = (SameSize(),)
 
         node = PairNode(name="node")
         node.add_parameter(ParameterImage(name="first", pre_run_validators=[SideRange(min=300)]))
@@ -492,7 +492,7 @@ class TestNodeValidators:
                 return [NodeError(f"{node.name} refused: {docs_url}", links=None)]
 
         class RuleNode(_LimitedNode):
-            node_validators: ClassVar[list[NodeValidator]] = [Always()]
+            node_validators: ClassVar[tuple[NodeValidator, ...]] = (Always(),)
 
         assert _messages(run_pre_run_validators(RuleNode(name="rule"))) == [f"rule refused: {DOCS}"]
 
