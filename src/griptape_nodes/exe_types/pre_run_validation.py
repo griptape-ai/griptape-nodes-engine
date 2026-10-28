@@ -197,7 +197,7 @@ def _check_parameter(
 
 
 def _selected_validators(node: BaseNode, parameter: Parameter) -> list[PreRunValidator]:
-    """The validators that apply to a parameter now, with each `ByParameter` replaced by its pick."""
+    """The validators that apply to a parameter now, with each `DependsOn` replaced by its pick."""
     validators: list[PreRunValidator] = []
     for declared in parameter.pre_run_validators:
         validators.extend(declared.selected(node))

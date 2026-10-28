@@ -121,7 +121,7 @@ class PreRunValidator(ABC):
         """
 
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:  # noqa: ARG002
-        """The validators that apply on `node` now. A validator is itself; `ByParameter` picks a list."""
+        """The validators that apply on `node` now. A validator is itself; `DependsOn` picks a list."""
         return (self,)
 
     def candidates(self) -> Sequence[PreRunValidator]:

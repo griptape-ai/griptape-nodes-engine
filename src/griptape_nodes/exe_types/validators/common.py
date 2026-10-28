@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
 
-__all__ = ["ByParameter", "MaxCount"]
+__all__ = ["DependsOn", "MaxCount"]
 
 
 @dataclass(frozen=True)
@@ -36,15 +36,15 @@ class MaxCount(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class ByParameter(PreRunValidator):
+class DependsOn(PreRunValidator):
     """Limits that depend on another parameter's value, such as the selected model.
 
     At the node's turn, the validators listed for the other parameter's current value apply, or
-    `default` for a value not listed. The lists hold plain validators: one `ByParameter` can't pick
-    another.
+    `default` for a value not listed. A list can hold another `DependsOn`, for limits that depend
+    on two settings; it picks in turn.
 
     ```python
-    ByParameter(
+    DependsOn(
         "model",
         {"pro": [SideRange(min=300), MaxFileSize(10 * MB)]},
         default=[SideRange(min=512)],
@@ -55,9 +55,6 @@ class ByParameter(PreRunValidator):
         parameter: The name of the parameter whose value picks the limits.
         choices: The validators for each value of that parameter.
         default: The validators for any other value.
-
-    Raises:
-        TypeError: If a list holds another `ByParameter`.
     """
 
     parameter: str
@@ -72,36 +69,34 @@ class ByParameter(PreRunValidator):
         *,
         default: Sequence[PreRunValidator] = (),
     ) -> None:
-        frozen_choices = tuple((value, tuple(validators)) for value, validators in choices.items())
-        frozen_default = tuple(default)
-        for _, validators in (*frozen_choices, ("", frozen_default)):
-            for validator in validators:
-                if isinstance(validator, ByParameter):
-                    msg = (
-                        f"Attempted to pick validators by parameter '{parameter}'. Failed because one of its "
-                        f"lists holds another ByParameter, on '{validator.parameter}'; list plain validators."
-                    )
-                    raise TypeError(msg)
         object.__setattr__(self, "parameter", parameter)
-        object.__setattr__(self, "choices", frozen_choices)
-        object.__setattr__(self, "default", frozen_default)
+        object.__setattr__(self, "choices", tuple((value, tuple(validators)) for value, validators in choices.items()))
+        object.__setattr__(self, "default", tuple(default))
 
     def check(self, value: Any, *, subject: str, media: MediaInfo, docs_url: str | None) -> NodeError | None:  # noqa: ARG002
         # The engine runs the validators `selected` picks; this one has nothing of its own to check.
         return None
 
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:
-        """The validators listed for the other parameter's current value, or `default`."""
-        current = node.get_parameter_value(self.parameter)
+        """The validators listed for the other parameter's current value, or `default`, each picking in turn."""
+        picked: list[PreRunValidator] = []
+        for validator in self._listed_for(node.get_parameter_value(self.parameter)):
+            picked.extend(validator.selected(node))
+        return picked
+
+    def candidates(self) -> Sequence[PreRunValidator]:
+        """Every validator this can pick, from every list, through any `DependsOn` inside it."""
+        everything: list[PreRunValidator] = []
+        lists = [validators for _, validators in self.choices]
+        lists.append(self.default)
+        for validators in lists:
+            for validator in validators:
+                everything.extend(validator.candidates())
+        return everything
+
+    def _listed_for(self, current: Any) -> tuple[PreRunValidator, ...]:
+        """The list for the other parameter's value, or `default`."""
         for value, validators in self.choices:
             if current == value:
                 return validators
         return self.default
-
-    def candidates(self) -> Sequence[PreRunValidator]:
-        """Every validator this can pick, from every list."""
-        everything: list[PreRunValidator] = []
-        for _, validators in self.choices:
-            everything.extend(validators)
-        everything.extend(self.default)
-        return everything

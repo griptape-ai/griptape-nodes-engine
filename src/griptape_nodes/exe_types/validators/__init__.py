@@ -3,13 +3,13 @@
 Import them from here:
 
 ```python
-from griptape_nodes.exe_types.validators import AllowedFormats, ByParameter, MaxFileSize
+from griptape_nodes.exe_types.validators import AllowedFormats, DependsOn, MaxFileSize
 ```
 
 - `base`: what a validator is (`PreRunValidator`, `NodeValidator`) and what the engine reads for it
   (`MediaNeed`, `MediaInfo`).
 - `media`: limits on an image, video or audio file, such as `MaxFileSize` or `Duration`.
-- `common`: `MaxCount` for a list's length, and `ByParameter` for limits that depend on another
+- `common`: `MaxCount` for a list's length, and `DependsOn` for limits that depend on another
   parameter's value.
 """
 
@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
 
 if TYPE_CHECKING:
-    from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
+    from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
     from griptape_nodes.exe_types.validators.media import (
         AllowedFormats,
         AspectRatioRange,
@@ -40,7 +40,7 @@ __all__ = [
     "AllowedFormats",
     "AspectRatioRange",
     "AudioCodecs",
-    "ByParameter",
+    "DependsOn",
     "Duration",
     "ExactAspectRatios",
     "FrameCount",
@@ -71,7 +71,7 @@ _LAZY_MODULES: dict[str, str] = {
     "PixelArea": "media",
     "SideRange": "media",
     "VideoCodecs": "media",
-    "ByParameter": "common",
+    "DependsOn": "common",
     "MaxCount": "common",
 }
 

@@ -51,7 +51,7 @@ from griptape_nodes.exe_types.pre_run_validation import (
     validate_node,
 )
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed, NodeValidator, PreRunValidator
-from griptape_nodes.exe_types.validators.common import ByParameter, MaxCount
+from griptape_nodes.exe_types.validators.common import DependsOn, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -388,7 +388,7 @@ class TestPlainListParameters:
         assert _Records.seen == []
 
 
-class TestByParameter:
+class TestDependsOn:
     @staticmethod
     def _node() -> MockNode:
         return _node_with(
@@ -397,7 +397,7 @@ class TestByParameter:
                 name="image",
                 pre_run_validators=[
                     AllowedFormats("image/png"),
-                    ByParameter(
+                    DependsOn(
                         "model",
                         {"pro": [SideRange(min=300)], "lite": [SideRange(min=100), MaxFileSize(1)]},
                         default=[SideRange(min=1000)],
@@ -425,9 +425,12 @@ class TestByParameter:
         for message, fragment in zip(messages, expected, strict=True):
             assert fragment in message
 
-    def test_refuses_a_nested_by_parameter(self) -> None:
-        with pytest.raises(TypeError, match="holds another ByParameter"):
-            ByParameter("model", {"pro": [ByParameter("size", {})]})
+    def test_refuses_a_validator_the_parameter_cannot_hold_inside_a_nested_depends_on(self) -> None:
+        with pytest.raises(TypeError, match="checks audio, and the parameter holds image"):
+            ParameterImage(
+                name="image",
+                pre_run_validators=[DependsOn("model", {"pro": [DependsOn("size", {"large": [AudioCodecs("mp3")]})]})],
+            )
 
     def test_checks_nothing_when_the_pick_lists_no_validators(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -435,7 +438,7 @@ class TestByParameter:
         # A model that doesn't send the input lists no limits for it, and the input isn't read.
         node = _node_with(
             ParameterString(name="model", default_value="fast"),
-            ParameterImage(name="last_frame", pre_run_validators=[ByParameter("model", {"pro": [SideRange(min=300)]})]),
+            ParameterImage(name="last_frame", pre_run_validators=[DependsOn("model", {"pro": [SideRange(min=300)]})]),
         )
         node.set_parameter_value("last_frame", str(image_file(tmp_path, 10, 10)))
         reads: list[str] = []
@@ -446,10 +449,10 @@ class TestByParameter:
 
     def test_refuses_a_picked_validator_the_parameter_cannot_hold(self) -> None:
         with pytest.raises(TypeError, match="checks audio, and the parameter holds image"):
-            ParameterImage(name="image", pre_run_validators=[ByParameter("model", {"pro": [AudioCodecs("mp3")]})])
+            ParameterImage(name="image", pre_run_validators=[DependsOn("model", {"pro": [AudioCodecs("mp3")]})])
 
     def test_survives_a_parameter_copy(self) -> None:
-        parameter = ParameterImage(name="image", pre_run_validators=[ByParameter("model", {"pro": [SideRange(min=1)]})])
+        parameter = ParameterImage(name="image", pre_run_validators=[DependsOn("model", {"pro": [SideRange(min=1)]})])
         assert parameter.copy().pre_run_validators == parameter.pre_run_validators
 
 

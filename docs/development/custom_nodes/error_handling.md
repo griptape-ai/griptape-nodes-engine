@@ -397,7 +397,7 @@ Import the validators from `griptape_nodes.exe_types.validators`:
 | `VideoCodecs("h264", ...)`                 | A video's codec.                                                                     |
 | `AudioCodecs("mp3", ...)`                  | An audio clip's codec.                                                               |
 | `MaxCount(maximum, noun="images")`         | How many items a list parameter holds.                                               |
-| `ByParameter(parameter, {...}, default=)`  | Picks one of several lists of validators by another parameter's value.               |
+| `DependsOn(parameter, {...}, default=)`    | Picks one of several lists of validators by another parameter's value.               |
 
 A validator that fits more than one kind of media, such as `SideRange`, checks the kind its
 parameter holds: a `ParameterImage`'s image, a `ParameterVideo`'s video, a `ParameterAudio`'s
@@ -418,12 +418,12 @@ On a `ParameterList`, each item is checked on its own and named by its position,
 'reference images'", while `MaxCount` checks the list's length.
 
 **Limits that depend on a setting.** When the limits change with the selected model, wrap them in
-`ByParameter`. At the node's turn it picks the list for the other parameter's current value, or
-`default` for any other value. Override `input_limits_url()` to return the page for the current
-model too.
+`DependsOn`. At the node's turn it picks the list for the other parameter's current value, or
+`default` for any other value. A list can hold another `DependsOn`, for limits that depend on two
+settings. Override `input_limits_url()` to return the page for the current model too.
 
 ```python
-from griptape_nodes.exe_types.validators import ByParameter, MaxCount
+from griptape_nodes.exe_types.validators import DependsOn, MaxCount
 
 ParameterList(
     name="reference_images",
@@ -433,7 +433,7 @@ ParameterList(
     display_name="reference images",
     pre_run_validators=[
         AllowedFormats("image/jpeg", "image/png"),
-        ByParameter(
+        DependsOn(
             "model",
             {"pro": [MaxCount(4, noun="images"), SideRange(min=300)]},
             default=[MaxCount(1, noun="images"), SideRange(min=512)],
