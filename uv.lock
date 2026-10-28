@@ -851,7 +851,7 @@ docs = [
     { name = "pymdown-extensions", specifier = ">=10.17" },
 ]
 test = [
-    { name = "coverage", specifier = ">=7.0.0" },
+    { name = "coverage", specifier = ">=7.9.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-cov", specifier = ">=6.0.0" },
