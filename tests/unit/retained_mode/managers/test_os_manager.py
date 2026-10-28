@@ -1,4 +1,3 @@
-import base64
 import os
 import platform
 import subprocess
@@ -15,12 +14,6 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.artifact_events import (
-    GetPreviewForArtifactResultFailure,
-    GetPreviewForArtifactResultSuccess,
-    RegisterArtifactProviderRequest,
-    RegisterArtifactProviderResultSuccess,
-)
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
@@ -71,8 +64,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
-from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
 
@@ -308,11 +299,12 @@ class TestReadFileRequest:
 
 
 class TestReadFileRequestImagePreview:
-    """Test ReadFileRequest's image thumbnail generation: Pillow first, then a registered provider.
+    """Test ReadFileRequest's image thumbnail generation: Pillow always runs first.
 
-    Files over the size cap must never reach either decode path -- base64-encoding a
-    multi-hundred-MB file whole is what hung the engine on large/multi-part images. See
-    os_manager.py's _generate_thumbnail_from_image_content and _preview_via_registered_provider.
+    Size only matters once Pillow has already failed to decode the file -- base64-encoding a
+    multi-hundred-MB file whole is what hung the engine on large/multi-part images it can't open
+    (EXR sequences, for one). A large file Pillow *can* decode must still get a thumbnail. See
+    os_manager.py's _generate_thumbnail_from_image_content.
     """
 
     # Minimal valid 1x1 red PNG, built by hand so the test has no binary fixture dependency.
@@ -337,134 +329,80 @@ class TestReadFileRequestImagePreview:
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    @pytest.fixture(autouse=True)
-    def isolated_provider_registry(self, engine: Engine) -> Generator[None, None, None]:
-        """Swap in a fresh ProviderRegistry so tests don't depend on or pollute app-init registration.
-
-        Providers normally register on the AppInitializationComplete broadcast, which the
-        `engine` fixture never sends, so the shared engine's registry starts empty. Each test
-        registers exactly the providers it needs onto a throwaway registry instead.
-        """
-        original_registry = engine.artifact_manager._registry
-        engine.artifact_manager._registry = ProviderRegistry(engine=engine)
-        yield
-        engine.artifact_manager._registry = original_registry
-
-    @staticmethod
-    def _register_image_provider(engine: Engine) -> None:
-        result = engine.artifact_manager.on_handle_register_artifact_provider_request(
-            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
-        )
-        assert isinstance(result, RegisterArtifactProviderResultSuccess)
-
-    def test_oversized_file_skips_decode_entirely(self, engine: Engine, temp_dir: Path) -> None:
-        """A file over the size cap must not be handed to Pillow, a provider, or base64."""
+    def test_large_pillow_decodable_file_is_still_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+        """A file over the size cap that Pillow can decode (e.g. a big JPEG) still gets a thumbnail."""
         file_path = temp_dir / "huge.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
+        with patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(self._ONE_PIXEL_PNG) - 1):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/webp;base64,")
+
+    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, temp_dir: Path) -> None:
+        """A file over the size cap that Pillow can't decode must never be base64-encoded whole."""
+        file_path = temp_dir / "huge.exr"
+        content = b"not a real exr, just needs to fail a Pillow decode"
+        file_path.write_bytes(content)
+
         with (
-            patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(self._ONE_PIXEL_PNG) - 1),
+            patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
             patch(
-                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
+                return_value=None,
             ) as mock_create_preview,
-            patch.object(engine, "ahandle_request", AsyncMock()) as mock_ahandle,
         ):
             request = ReadFileRequest(file_path=str(file_path))
             result = engine.handle_request(request)
 
-        mock_create_preview.assert_not_called()
-        mock_ahandle.assert_not_awaited()
+        mock_create_preview.assert_called_once()
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == OSManager._NO_PREVIEW_DATA_URL
 
-    def test_pillow_decodable_format_is_thumbnailed_without_consulting_the_registry(
-        self, engine: Engine, temp_dir: Path
-    ) -> None:
-        """A format Pillow can decode (PNG) never reaches the provider registry at all."""
+    def test_pillow_decodable_format_is_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+        """A format Pillow can decode (PNG) gets its 200px WEBP thumbnail."""
         file_path = temp_dir / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
-        with patch.object(engine, "ahandle_request", AsyncMock()) as mock_ahandle:
-            request = ReadFileRequest(file_path=str(file_path))
-            result = engine.handle_request(request)
+        request = ReadFileRequest(file_path=str(file_path))
+        result = engine.handle_request(request)
 
-        mock_ahandle.assert_not_awaited()
         assert isinstance(result, ReadFileResultSuccess)
         assert isinstance(result.content, str)
         assert result.content.startswith("data:image/webp;base64,")
 
-    def test_pillow_undecodable_format_with_provider_uses_provider_preview(
-        self, engine: Engine, temp_dir: Path
-    ) -> None:
-        """A file Pillow can't decode, but whose extension a registered provider claims (PNG), falls to it."""
-        self._register_image_provider(engine)
-        file_path = temp_dir / "test.png"
-        file_path.write_bytes(b"not a real png, just needs to fail a Pillow decode")
-
-        preview_path = temp_dir / "test.png.webp"
-        preview_path.write_bytes(b"fake webp preview bytes")
-
-        mock_result = GetPreviewForArtifactResultSuccess(paths_to_preview=str(preview_path), result_details="ok")
-
-        with patch.object(engine, "ahandle_request", AsyncMock(return_value=mock_result)) as mock_ahandle:
-            request = ReadFileRequest(file_path=str(file_path))
-            result = engine.handle_request(request)
-
-        mock_ahandle.assert_awaited_once()
-        assert isinstance(result, ReadFileResultSuccess)
-        assert isinstance(result.content, str)
-        assert result.content.startswith("data:image/webp;base64,")
-
-    def test_pillow_and_provider_both_fail_returns_original_bytes(self, engine: Engine, temp_dir: Path) -> None:
-        """If neither Pillow nor the registered provider can produce a preview, fall back to the raw bytes."""
-        self._register_image_provider(engine)
-        file_path = temp_dir / "test.png"
-        content = b"not a real png, just needs to fail a Pillow decode"
-        file_path.write_bytes(content)
-
-        mock_result = GetPreviewForArtifactResultFailure(result_details="no preview generator configured")
-
-        with patch.object(engine, "ahandle_request", AsyncMock(return_value=mock_result)) as mock_ahandle:
-            request = ReadFileRequest(file_path=str(file_path))
-            result = engine.handle_request(request)
-
-        mock_ahandle.assert_awaited_once()
-        assert isinstance(result, ReadFileResultSuccess)
-        assert result.content == f"data:image/png;base64,{base64.b64encode(content).decode('utf-8')}"
-
-    def test_pillow_undecodable_format_with_no_provider_returns_original_bytes(
-        self, engine: Engine, temp_dir: Path
-    ) -> None:
-        """A format Pillow can't open and no provider claims returns the raw bytes, never a hang."""
+    def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, temp_dir: Path) -> None:
+        """A format Pillow can't open, under the size cap, returns the raw bytes, never a hang."""
         file_path = temp_dir / "test.exr"
         content = b"not a real exr, just needs to never be decoded"
         file_path.write_bytes(content)
 
         # Windows' mimetypes table has no .exr entry; pin the image/aces guess Linux and macOS make.
-        with (
-            patch("mimetypes.guess_type", return_value=("image/aces", None)),
-            patch.object(engine, "ahandle_request", AsyncMock()) as mock_ahandle,
-        ):
+        with patch("mimetypes.guess_type", return_value=("image/aces", None)):
             request = ReadFileRequest(file_path=str(file_path))
             result = engine.handle_request(request)
 
-        mock_ahandle.assert_not_awaited()
         assert isinstance(result, ReadFileResultSuccess)
         assert isinstance(result.content, str)
         assert result.content.startswith("data:image/aces;base64,")
 
-    def test_should_transform_image_content_to_thumbnail_false_skips_provider_lookup(
+    def test_should_transform_image_content_to_thumbnail_false_skips_decoding(
         self, engine: Engine, temp_dir: Path
     ) -> None:
-        """Opting out of thumbnailing bypasses Pillow and provider lookup alike."""
+        """Opting out of thumbnailing returns the raw bytes without ever calling Pillow."""
         file_path = temp_dir / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
-        with patch.object(engine, "ahandle_request", AsyncMock()) as mock_ahandle:
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+        ) as mock_create_preview:
             request = ReadFileRequest(file_path=str(file_path), should_transform_image_content_to_thumbnail=False)
             result = engine.handle_request(request)
 
-        mock_ahandle.assert_not_awaited()
+        mock_create_preview.assert_not_called()
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == self._ONE_PIXEL_PNG
 

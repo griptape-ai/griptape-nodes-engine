@@ -69,11 +69,6 @@ from griptape_nodes.files.path_utils import (
     strip_surrounding_quotes,
 )
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
-from griptape_nodes.retained_mode.events.artifact_events import (
-    GetPreviewForArtifactRequest,
-    GetPreviewForArtifactResultSuccess,
-    PreviewGenerationPolicy,
-)
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
     CopyFileRequest,
@@ -154,7 +149,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     RegisterResourceTypeResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
-from griptape_nodes.retained_mode.managers.artifact_providers import BaseArtifactProvider, WriteVettingPolicy
+from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
@@ -2349,12 +2344,12 @@ class OSManager(EngineScoped):
         """Handle image content by creating previews or returning static URLs.
 
         The workspace check reads engine state, so it runs on the loop; only the image encode
-        runs on a worker thread. Files over ``_MAX_PREVIEWABLE_IMAGE_BYTES`` skip preview
-        generation entirely -- base64-encoding a multi-hundred-MB file whole is what has hung the
-        engine on large or multi-part images (EXR sequences, for one). Under that cap, Pillow is
-        tried first since it safely decodes most image formats; a registered artifact provider is
-        tried next for formats Pillow cannot open; the original bytes are only returned undecoded
-        if neither produces a preview.
+        runs on a worker thread. Pillow is tried first regardless of file size, since decoding a
+        large-but-valid image (a big JPEG or TIFF, say) is cheap and still worth a thumbnail. Only
+        when Pillow can't decode the file does size matter: under ``_MAX_PREVIEWABLE_IMAGE_BYTES``
+        the original bytes are returned undecoded; over it, a no-preview sentinel is returned
+        instead, since base64-encoding a multi-hundred-MB file whole is what has hung the engine
+        on large or multi-part images Pillow can't open (EXR sequences, for one).
 
         Args:
             content: Image bytes
@@ -2396,69 +2391,27 @@ class OSManager(EngineScoped):
 
         path_obj = Path(file_path) if isinstance(file_path, str) else file_path
 
+        pillow_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
+        if pillow_preview is not None:
+            return pillow_preview
+
         if len(original_image_bytes) > self._MAX_PREVIEWABLE_IMAGE_BYTES:
-            # Base64-encoding the whole file is the actual cost that has hung the engine on
-            # large/multi-part images -- not which decoder runs. A 200+ MB EXR sequence frame
-            # reaches this unconditionally via the sequence-frame loader, which bypasses the File
-            # Browser dialog's own 10MB client-side preview cutoff. Skip decoding and encoding
-            # entirely rather than ever holding the full file as base64.
+            # Pillow couldn't decode this file, and it's large enough that base64-encoding it
+            # whole is the actual cost that has hung the engine on large/multi-part images it
+            # can't open (EXR sequences, for one). A 200+ MB EXR sequence frame reaches this
+            # unconditionally via the sequence-frame loader, which bypasses the File Browser
+            # dialog's own 10MB client-side preview cutoff. Skip encoding it entirely.
             logger.debug(
-                "%s exceeds the %d byte preview cap; skipping thumbnail generation.",
+                "%s exceeds the %d byte preview cap and Pillow could not decode it; skipping preview.",
                 path_obj,
                 self._MAX_PREVIEWABLE_IMAGE_BYTES,
             )
             return self._NO_PREVIEW_DATA_URL
 
-        pillow_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
-        if pillow_preview is not None:
-            return pillow_preview
-
-        extension = path_obj.suffix.lstrip(".").lower()
-        provider_classes = self.engine.artifact_manager._registry.get_provider_classes_by_format(extension)
-        if provider_classes:
-            registered_preview = await self._preview_via_registered_provider(path_obj, provider_classes[0])
-            if registered_preview is not None:
-                return registered_preview
-
-        # Neither Pillow nor a registered provider could produce a preview. Safe to hand back the
-        # original bytes undecoded: the size cap above already bounds how much that can cost.
+        # Pillow couldn't decode this file, but it's small enough that returning it undecoded
+        # costs nothing worth guarding against.
         logger.debug("No preview could be generated for %s; returning the original bytes.", path_obj)
         return f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
-
-    async def _preview_via_registered_provider(
-        self, path_obj: Path, provider_class: type[BaseArtifactProvider]
-    ) -> str | None:
-        """Generate a preview through the ArtifactProvider registered for this format.
-
-        Returns:
-            A data URL built from the provider's preview output, or None if the provider could
-            not produce one (the caller falls back to the original bytes; Pillow already failed
-            to decode this file, or it would not have reached this call).
-        """
-        provider_name = provider_class.get_friendly_name()
-        macro_path = MacroPath(ParsedMacro(str(path_obj)), {})
-
-        result = await self.engine.ahandle_request(
-            GetPreviewForArtifactRequest(
-                macro_path=macro_path,
-                artifact_provider_name=provider_name,
-                preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
-            )
-        )
-
-        if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
-            logger.debug(
-                "Registered provider could not produce a preview for %s; falling back to legacy preview path. "
-                "Reason: %s",
-                path_obj,
-                str(result.result_details),
-            )
-            return None
-
-        preview_path = Path(result.paths_to_preview)
-        preview_bytes = await to_thread(preview_path.read_bytes)
-        preview_mime_type = mimetypes.guess_type(str(preview_path))[0] or "image/webp"
-        return f"data:{preview_mime_type};base64,{base64.b64encode(preview_bytes).decode('utf-8')}"
 
     @staticmethod
     def _image_bytes_to_preview_data_url(image_bytes: bytes) -> str | None:
