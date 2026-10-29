@@ -121,11 +121,10 @@ class ObjectManager(EngineScoped):
         # Best-effort: a node that refuses to cancel must not block the teardown.
         # A driver still parked holds its FSM claim until it wakes and abandons the
         # run; harmless here because deleting the flows drops the machine it holds.
-        if self.engine.flow_manager.check_for_existing_running_flow():
-            try:
-                await self.engine.flow_manager.cancel_flow_run()
-            except Exception as e:
-                logger.warning("Could not cancel the running workflow before clearing it. Continuing anyway: %s", e)
+        try:
+            await self.engine.flow_manager.cancel_all_runs()
+        except Exception as e:
+            logger.warning("Could not cancel the running workflow before clearing it. Continuing anyway: %s", e)
 
         try:
             # Eliminate all execution references before deletion
