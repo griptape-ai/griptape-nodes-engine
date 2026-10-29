@@ -446,6 +446,7 @@ class WorkerManager(EngineScoped):
         wid = request.worker_engine_id
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
+        self._forget_if_remote(wid, registration)
         worker_key = registration.worker_key if registration else None
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.unsubscribe_from_topic(response_topic)
@@ -803,6 +804,8 @@ class WorkerManager(EngineScoped):
                 except Exception as e:
                     logger.debug("Failed to unsubscribe from '%s' while stopping workers: %s", response_topic, e)
         self._forget_remote_starts(library_names=library_names)
+        for wid in worker_ids:
+            self._forget_if_remote(wid, self._workers.get(wid))
         if library_names is None:
             self._managed_worker_processes.clear()
             self._workers.clear()
@@ -834,6 +837,12 @@ class WorkerManager(EngineScoped):
         for wid, start in list(self._remote_starts.items()):
             if library_names is None or start.library_name in library_names:
                 del self._remote_starts[wid]
+                self.engine.forget_worker(wid)
+
+    def _forget_if_remote(self, worker_engine_id: str, registration: WorkerRegistration | None) -> None:
+        """Tell the app to stop carrying a removed worker's traffic, if `registration` shows it ran on another engine."""
+        if registration is not None and registration.host_engine_id is not None:
+            self.engine.forget_worker(worker_engine_id)
 
     def _withdraw_spawn_requests(self, *, library_names: set[str | None] | None, action: str) -> None:
         """Forget the named libraries' spawn requests (every library's when None), so a later one is honored.
@@ -1220,6 +1229,9 @@ class WorkerManager(EngineScoped):
             return None
         worker_engine_id = str(uuid.uuid4())
         self._remote_starts[worker_engine_id] = _RemoteStart(host_engine_id=host_engine_id, library_name=library_name)
+        # The worker can register before this start's answer arrives, so the app has to know where to
+        # carry its traffic before the request below is even sent.
+        self.engine.route_worker(worker_engine_id, host_engine_id)
         logger.info("Asking %s to start worker %s for library '%s'.", host_engine_id, worker_engine_id, library_name)
         request = worker_events.StartWorkerForEngineRequest(
             library_name=library_name, worker_engine_id=worker_engine_id
@@ -1238,11 +1250,13 @@ class WorkerManager(EngineScoped):
             raise
         if not isinstance(result, worker_events.StartWorkerForEngineResultSuccess):
             self._remote_starts.pop(worker_engine_id, None)
+            self.engine.forget_worker(worker_engine_id)
         return result
 
     def _schedule_remote_stop(self, worker_engine_id: str, host_engine_id: str) -> None:
         """Forget a start withdrawn while `host_engine_id` was answering it, and tell that engine to stop that worker."""
         self._remote_starts.pop(worker_engine_id, None)
+        self.engine.forget_worker(worker_engine_id)
         task = asyncio.get_running_loop().create_task(self._stop_remote_worker(worker_engine_id, host_engine_id))
         self._stop_requests.add(task)
         task.add_done_callback(self._stop_requests.discard)
@@ -1382,6 +1396,7 @@ class WorkerManager(EngineScoped):
                 result_details=f"This engine was not waiting on worker {wid}, so there was nothing to record."
             )
         self._remote_starts.pop(wid, None)
+        self.engine.forget_worker(wid)
         registered = start is None
         if request.reason == "stopped":
             reason = f"{host_engine_id} stopped the worker process that runs it."
@@ -1658,6 +1673,7 @@ class WorkerManager(EngineScoped):
             if start.host_engine_id != engine_id:
                 continue
             del self._remote_starts[wid]
+            self.engine.forget_worker(wid)
             self.note_worker_unavailable(
                 start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
             )

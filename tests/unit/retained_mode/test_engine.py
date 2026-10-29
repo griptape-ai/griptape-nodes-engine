@@ -340,10 +340,17 @@ class _Links:
     def __init__(self) -> None:
         self.asked: list[tuple[str, object, float | None]] = []
         self.link_lost: object = None
+        self.routes: dict[str, str] = {}
 
     async def request(self, engine_id: str, request: object, *, timeout_s: float | None) -> object:
         self.asked.append((engine_id, request, timeout_s))
         return ResultPayloadFailure(result_details="answered")
+
+    def route_worker(self, worker_engine_id: str, host_engine_id: str) -> None:
+        self.routes[worker_engine_id] = host_engine_id
+
+    def forget_worker(self, worker_engine_id: str) -> None:
+        self.routes.pop(worker_engine_id, None)
 
     def on_engine_lost(self, callback: object) -> None:
         self.link_lost = callback
@@ -388,3 +395,27 @@ class TestRequestingAnotherEngine:
             await asyncio.to_thread(asyncio.run, links.link_lost("artist"))  # type: ignore[operator]
 
         assert settled_on == [asyncio.get_running_loop()]
+
+
+class TestRoutingAWorker:
+    def test_without_links_routing_a_worker_fails_saying_so(self) -> None:
+        engine = Engine()
+
+        with pytest.raises(EngineNotFoundError, match="no connections to other engines"):
+            engine.route_worker("w1", "gpu-01")
+
+    def test_without_links_forgetting_a_worker_does_nothing(self) -> None:
+        engine = Engine()
+
+        engine.forget_worker("w1")
+
+    def test_a_route_and_a_forget_go_through_the_attached_links(self) -> None:
+        engine = Engine()
+        links = _Links()
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
+
+        engine.route_worker("w1", "gpu-01")
+        assert links.routes == {"w1": "gpu-01"}
+
+        engine.forget_worker("w1")
+        assert links.routes == {}
