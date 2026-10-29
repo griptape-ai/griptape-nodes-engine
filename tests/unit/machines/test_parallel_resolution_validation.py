@@ -17,12 +17,14 @@ from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
 from tests.unit.machines.scheduler_stubs import machine_running_one_node, node_stub
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.exe_types.node_types import BaseNode
 
 
-async def _until(condition: object, message: str) -> None:
+async def _until(condition: Callable[[], object], message: str) -> None:
     for _ in range(200):
-        if callable(condition) and condition():
+        if condition():
             return
         await asyncio.sleep(0.005)
     pytest.fail(message)
