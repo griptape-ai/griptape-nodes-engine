@@ -16,7 +16,13 @@ from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, Max
 
 from __future__ import annotations
 
-from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, Condition, PreRunValidator, reads
+from griptape_nodes.exe_types.validators.base import (
+    LIMITS_LINK_LABEL,
+    Condition,
+    MediaValidator,
+    PreRunValidator,
+    reads,
+)
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -49,6 +55,7 @@ __all__ = [
     "MaxFileSize",
     "MediaInfo",
     "MediaNeed",
+    "MediaValidator",
     "PixelArea",
     "PreRunValidator",
     "SideRange",

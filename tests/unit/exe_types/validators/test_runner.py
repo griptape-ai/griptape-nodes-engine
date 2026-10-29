@@ -55,7 +55,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.utils import media_probe
 from griptape_nodes.utils.media_probe import (
-    EMPTY_MEDIA,
     ImageInfo,
     MediaInfo,
     MediaNeed,
@@ -154,13 +153,7 @@ class TestSingleInputs:
         class NotEmpty(PreRunValidator):
             @override
             def check(
-                self,
-                value: Any,
-                *,
-                subject: str,
-                docs_url: str | None,
-                media: MediaInfo = EMPTY_MEDIA,
-                position: int | None = None,
+                self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None
             ) -> NodeError | None:
                 if value.strip():
                     return None
@@ -503,12 +496,20 @@ class TestConditions:
     def test_a_condition_without_declared_needs_reads_only_the_validators(self) -> None:
         assert SideRange(min=1).when(_always).needs == SideRange.needs
 
-    def test_wraps_each_pick_of_a_if_parameter(self, tmp_path: Path) -> None:
+    def test_conditions_on_the_file_are_for_media_validators_only(self) -> None:
+        # A condition reads the file; a validator that reads none puts its conditions on what it picks.
+        assert not hasattr(IfParameter("model", {}), "unless")
+        assert not hasattr(MaxCount(2), "when")
+        assert hasattr(SideRange(min=1), "when")
+
+    def test_first_wraps_each_pick_of_an_if_parameter(self, tmp_path: Path) -> None:
         by_model = IfParameter("model", {"pro": [SideRange(min=300)]}, default=[SideRange(min=1000)])
-        node = self._image_node(by_model.unless(_no_image_read), model="pro")
-        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
-        assert _messages(validate_inputs(node)) == [
-            "The image in 'image' is 200x200 and each side must be at least 300 pixels. Use a larger one."
+        node = TestLists._list_node(by_model.first(1))
+        node.add_parameter(ParameterString(name="model", default_value="pro"))
+        node.set_parameter_value("model", "pro")
+        node.set_parameter_value("reference_images", [str(image_file(tmp_path, 200 + i, 200)) for i in range(2)])
+        assert [message.split(" is ")[0] for message in _messages(validate_inputs(node))] == [
+            "Image 1 in 'reference images'"
         ]
 
     def test_an_if_parameter_can_hold_a_conditional_validator(self, tmp_path: Path) -> None:
@@ -550,7 +551,7 @@ class TestConditions:
                 ),
                 "AudioCodecs",
             ),
-            (lambda: ParameterImage(name="p", pre_run_validators=[MaxCount(2).unless(_always)]), "a list"),
+            (lambda: ParameterImage(name="p", pre_run_validators=[MaxCount(2).first(1)]), "a list"),
             (
                 lambda: ParameterVideo(name="p", pre_run_validators=[MaxFileSize(1).when(_no_image_read)]),
                 "checks image, and the parameter holds video",
@@ -790,15 +791,7 @@ class _Records(PreRunValidator):
     seen: ClassVar[list[Any]] = []
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
-    ) -> NodeError | None:
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         _Records.seen.append(value)
         return None
 

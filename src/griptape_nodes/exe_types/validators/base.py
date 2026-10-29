@@ -1,9 +1,10 @@
-"""What a pre-run validator is, and what the engine reads for it.
+"""What a pre-run validator is.
 
 A parameter declares `pre_run_validators=`; the engine runs them at the node's turn, just before
-`validate_before_node_run`. Each validator says which readings it needs (`needs`). The engine reads
-the union of those once per value and hands the same `MediaInfo` to every validator on the
-parameter, so a validator never opens the file itself.
+`validate_before_node_run`. `PreRunValidator` is a limit on any kind of value. `MediaValidator` is
+the family for image, video and audio files: each says which readings it needs (`needs`), and the
+engine reads the union of those once per value and hands the same `MediaInfo` to every media
+validator on the parameter, so a validator never opens the file itself.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 __all__ = [
     "LIMITS_LINK_LABEL",
     "Condition",
+    "MediaValidator",
     "PreRunValidator",
     "media_kind_of",
     "reads",
@@ -50,7 +52,7 @@ _KIND_FOR_TYPE: dict[str, MediaKind] = {
 class Condition(Protocol):
     """Whether a validator applies, from what was read from the value's file.
 
-    Pass one to `PreRunValidator.when` or `unless`. Write it as a function, and mark it with `reads`
+    Pass one to `MediaValidator.when` or `unless`. Write it as a function, and mark it with `reads`
     for the readings it uses, so the engine reads them along with the validator's. A limit that
     depends on another parameter's value is an `IfParameter`.
     """
@@ -82,42 +84,28 @@ def reads(*needs: MediaNeed) -> Callable[[Callable[[MediaInfo], bool]], Conditio
 class PreRunValidator(ABC):
     """A limit on one input, checked at the node's turn, before it runs.
 
-    Subclasses declare `needs`, the readings `check` uses. A validator on a list parameter checks
-    each item, unless it sets `checks_whole_list`, in which case it gets the whole list.
-
-    `when`, `unless` and `first` wrap any validator to narrow where it applies:
+    A validator on a list parameter checks each item, unless it sets `checks_whole_list`, in which
+    case it gets the whole list. `first` narrows it to a list's first items:
 
     ```python
-    MaxFileSize(10 * MB).when(is_png)  # is_png: a condition on the file, marked with `reads`
     SideRange(min=300).first(2)
     ```
+
+    A limit on an image, video or audio file subclasses `MediaValidator`, which reads the file once.
     """
 
-    # The readings `check` uses. A media reading (image, video or audio) is read for the kind the
-    # parameter holds; a validator that names none the parameter's kind matches can't go on it.
-    needs: ClassVar[frozenset[MediaNeed]] = frozenset()
     # True for a validator that judges a list parameter as a whole, such as how many items it holds.
     checks_whole_list: ClassVar[bool] = False
 
     @abstractmethod
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
-    ) -> NodeError | None:
-        """An error when `value` breaks this limit, or None when it is within it or couldn't be read.
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+        """An error when `value` breaks this limit, or None when it is within it.
 
         Args:
             value: The parameter's value; for a list, one item, or the whole list with `checks_whole_list`.
             subject: The start of the message naming the input, such as "Image 2 in 'reference images'".
                 With `checks_whole_list`, the parameter's name as the UI shows it.
             docs_url: The node's page documenting its input limits, from `BaseNode.input_limits_url`.
-            media: The readings `needs` asked for, read once for this value. Empty for a validator
-                that needs none.
             position: An item's 1-based position in a list parameter, or None for a single input or
                 the whole list.
         """
@@ -130,14 +118,6 @@ class PreRunValidator(ABC):
         """Every validator `selected` can return, so a parameter can refuse one that can't go on it."""
         return (self,)
 
-    def when(self, condition: Condition) -> PreRunValidator:
-        """This validator, applied only to a value whose file `condition` holds for."""
-        return _Conditional(self, condition, applies_when=True)
-
-    def unless(self, condition: Condition) -> PreRunValidator:
-        """This validator, applied only to a value whose file `condition` doesn't hold for."""
-        return _Conditional(self, condition, applies_when=False)
-
     def first(self, count: int) -> PreRunValidator:
         """This validator, applied only to the first `count` items of a list parameter.
 
@@ -146,18 +126,121 @@ class PreRunValidator(ABC):
         return _FirstItems(self, count)
 
 
+class MediaValidator(PreRunValidator):
+    """A limit on an image, video or audio file, judged on readings the engine takes once.
+
+    Subclasses declare `needs`, the readings `check_media` uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO`
+    or `AUDIO`), and implement `check_media`. A media reading is taken for the kind the parameter
+    holds; a validator that names none the parameter's kind matches can't go on it. `when` and
+    `unless` narrow it by what was read from the file:
+
+    ```python
+    MaxFileSize(10 * MB).when(is_png)  # is_png: a condition on the file, marked with `reads`
+    ```
+    """
+
+    # The readings `check_media` uses.
+    needs: ClassVar[frozenset[MediaNeed]] = frozenset()
+
+    @abstractmethod
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
+    ) -> NodeError | None:
+        """An error when `value` breaks this limit, or None when it is within it or couldn't be read.
+
+        Args:
+            value: The parameter's value, or one item of a list parameter.
+            media: The readings `needs` asked for, read once for this value. A reading that couldn't
+                be taken here (a remote URL, an unreadable file) is None, and the check skips it.
+            subject: The start of the message naming the input.
+            docs_url: The node's page documenting its input limits.
+            position: An item's 1-based position in a list parameter, or None for a single input.
+        """
+
+    @override
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+        """`check_media` with nothing read, so every reading is skipped: the engine reads the file first."""
+        return self.check_media(value, EMPTY_MEDIA, subject=subject, docs_url=docs_url, position=position)
+
+    def when(self, condition: Condition) -> MediaValidator:
+        """This validator, applied only to a value whose file `condition` holds for."""
+        return _Conditional(self, condition, applies_when=True)
+
+    def unless(self, condition: Condition) -> MediaValidator:
+        """This validator, applied only to a value whose file `condition` doesn't hold for."""
+        return _Conditional(self, condition, applies_when=False)
+
+    @override
+    def first(self, count: int) -> MediaValidator:
+        return _FirstMediaItems(self, count)
+
+
+def needs_of(validator: PreRunValidator) -> frozenset[MediaNeed]:
+    """The readings a validator needs: a media validator's `needs`, or none."""
+    if isinstance(validator, MediaValidator):
+        return validator.needs
+    return frozenset()
+
+
+def run_check(  # noqa: PLR0913
+    validator: PreRunValidator,
+    value: Any,
+    media: MediaInfo,
+    *,
+    subject: str,
+    docs_url: str | None,
+    position: int | None = None,
+) -> NodeError | None:
+    """Run one validator on one value, handing a media validator what was read for it."""
+    if isinstance(validator, MediaValidator):
+        return validator.check_media(value, media, subject=subject, docs_url=docs_url, position=position)
+    return validator.check(value, subject=subject, docs_url=docs_url, position=position)
+
+
 @dataclass(frozen=True)
-class _Wrapped(PreRunValidator):
-    """A validator that runs `inner` in some cases. It reads what `inner` reads and checks what it checks."""
+class _FirstItems(PreRunValidator):
+    """`inner`, run only on a list's first `count` items."""
 
     inner: PreRunValidator
+    count: int
+
+    def __post_init__(self) -> None:
+        # Per instance, since it follows `inner`; the engine and the fit check read it from here.
+        object.__setattr__(self, "checks_whole_list", self.inner.checks_whole_list)
+        if self.count < 1:
+            msg = (
+                f"Attempted to apply {_shown_name(self)} to the first {self.count} items. "
+                "Failed because the count must be at least 1."
+            )
+            raise ValueError(msg)
+
+    # A wrapped `IfParameter` picks, and each validator it picks or can pick is wrapped the same way.
+    @override
+    def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:
+        return [validator.first(self.count) for validator in self.inner.selected(node)]
+
+    @override
+    def candidates(self) -> Sequence[PreRunValidator]:
+        return [validator.first(self.count) for validator in self.inner.candidates()]
+
+    @override
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+        if position is not None and position > self.count:
+            return None
+        return self.inner.check(value, subject=subject, docs_url=docs_url, position=position)
+
+
+@dataclass(frozen=True)
+class _MediaWrapped(MediaValidator):
+    """A media validator that runs `inner` in some cases. It reads what `inner` reads."""
+
+    inner: MediaValidator
 
     def __post_init__(self) -> None:
         # Per instance, since they follow `inner`; the engine and the fit check read them from here.
         object.__setattr__(self, "needs", self.inner.needs)
         object.__setattr__(self, "checks_whole_list", self.inner.checks_whole_list)
 
-    # A wrapped `IfParameter` picks, and each validator it picks or can pick is wrapped the same way.
     @override
     def selected(self, node: BaseNode) -> Sequence[PreRunValidator]:
         return [replace(self, inner=validator) for validator in self.inner.selected(node)]
@@ -168,38 +251,34 @@ class _Wrapped(PreRunValidator):
 
 
 @dataclass(frozen=True)
-class _Conditional(_Wrapped):
-    """`inner`, run only when `condition` holds (or, with `applies_when=False`, doesn't)."""
+class _Conditional(_MediaWrapped):
+    """`inner`, run only when `condition` holds for the file (or, with `applies_when=False`, doesn't)."""
 
     condition: Condition
     applies_when: bool
 
+    @override
     def __post_init__(self) -> None:
         super().__post_init__()
         condition_needs: frozenset[MediaNeed] = getattr(self.condition, "needs", frozenset())
         object.__setattr__(self, "needs", self.inner.needs | condition_needs)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if self.condition(media) != self.applies_when:
             return None
-        return self.inner.check(value, subject=subject, docs_url=docs_url, media=media, position=position)
+        return self.inner.check_media(value, media, subject=subject, docs_url=docs_url, position=position)
 
 
 @dataclass(frozen=True)
-class _FirstItems(_Wrapped):
-    """`inner`, run only on a list's first `count` items."""
+class _FirstMediaItems(_MediaWrapped):
+    """A media validator run only on a list's first `count` items."""
 
     count: int
 
+    @override
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.count < 1:
@@ -210,18 +289,12 @@ class _FirstItems(_Wrapped):
             raise ValueError(msg)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if position is not None and position > self.count:
             return None
-        return self.inner.check(value, subject=subject, docs_url=docs_url, media=media, position=position)
+        return self.inner.check_media(value, media, subject=subject, docs_url=docs_url, position=position)
 
 
 def media_kind_of(parameter: Parameter) -> MediaKind | None:
@@ -241,10 +314,11 @@ def needs_for_kind(validators: Iterable[PreRunValidator], kind: MediaKind | None
     """The readings to take of one value for these validators, on a parameter holding `kind`."""
     needs: set[MediaNeed] = set()
     for validator in validators:
-        if MediaNeed.SIZE in validator.needs:
+        validator_needs = needs_of(validator)
+        if MediaNeed.SIZE in validator_needs:
             needs.add(MediaNeed.SIZE)
         # A media kind's own reading shares its name, such as MediaNeed("video").
-        if kind is not None and MediaNeed(kind) in validator.needs:
+        if kind is not None and MediaNeed(kind) in validator_needs:
             needs.add(MediaNeed(kind))
     return frozenset(needs)
 
@@ -267,7 +341,8 @@ def require_validators_fit(parameter: Parameter) -> None:
                     "Failed because it checks a list, and the parameter holds a single value."
                 )
                 raise TypeError(msg)
-            if not validator.needs:
+            validator_needs = needs_of(validator)
+            if not validator_needs:
                 continue
             if kind is None:
                 msg = (
@@ -275,7 +350,7 @@ def require_validators_fit(parameter: Parameter) -> None:
                     f"and the parameter's type, {parameter.type}, isn't an image, video or audio artifact."
                 )
                 raise TypeError(msg)
-            media_needs = validator.needs - {MediaNeed.SIZE}
+            media_needs = validator_needs - {MediaNeed.SIZE}
             if media_needs and MediaNeed(kind) not in media_needs:
                 readable = " or ".join(sorted(need.value for need in media_needs))
                 msg = (
@@ -287,6 +362,6 @@ def require_validators_fit(parameter: Parameter) -> None:
 
 def _shown_name(validator: PreRunValidator) -> str:
     """The validator's class name for an error, naming the validator a `when`, `unless` or `first` wraps."""
-    while isinstance(validator, _Wrapped):
+    while isinstance(validator, (_FirstItems, _MediaWrapped)):
         validator = validator.inner
     return type(validator).__name__

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.validators._checks import input_subject
-from griptape_nodes.exe_types.validators.base import holds_list, media_kind_of, needs_for_kind
+from griptape_nodes.exe_types.validators.base import holds_list, media_kind_of, needs_for_kind, run_check
 from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, read_media, reading_once
 
 if TYPE_CHECKING:
@@ -125,7 +125,7 @@ def _collect(  # noqa: PLR0913
     """Each error these validators report for one value."""
     errors: list[NodeError] = []
     for validator in validators:
-        error = validator.check(value, subject=subject, docs_url=docs_url, media=media, position=position)
+        error = run_check(validator, value, media, subject=subject, docs_url=docs_url, position=position)
         if error is not None:
             errors.append(error)
     return errors

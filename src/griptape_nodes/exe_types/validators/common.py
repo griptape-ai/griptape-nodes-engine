@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, override
 
 from griptape_nodes.exe_types.validators._checks import check_count
 from griptape_nodes.exe_types.validators.base import PreRunValidator
-from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -33,15 +32,7 @@ class MaxCount(PreRunValidator):
     noun: str = "items"
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
-    ) -> NodeError | None:
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         return check_count(len(value), maximum=self.maximum, parameter=subject, noun=self.noun, docs_url=docs_url)
 
 
@@ -93,15 +84,7 @@ class IfParameter(PreRunValidator):
         object.__setattr__(self, "key", key)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
-    ) -> NodeError | None:
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         # The engine runs the validators `selected` picks; this one has nothing of its own to check.
         return None
 

@@ -12,6 +12,7 @@ import griptape_nodes.exe_types.validators as validators_package
 import griptape_nodes.exe_types.validators.base as validators_base
 import griptape_nodes.exe_types.validators.common as validators_common
 import griptape_nodes.exe_types.validators.media as validators_media
+from griptape_nodes.utils import media_probe
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -21,16 +22,10 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
     """Every `media` and `common` validator, and the base types, are the same objects from the package."""
     source: dict[str, ModuleType] = dict.fromkeys(validators_media.__all__, validators_media)
     source.update(dict.fromkeys(validators_common.__all__, validators_common))
-    base_exports = (
-        "EMPTY_MEDIA",
-        "LIMITS_LINK_LABEL",
-        "Condition",
-        "MediaInfo",
-        "MediaNeed",
-        "PreRunValidator",
-        "reads",
-    )
+    base_exports = ("LIMITS_LINK_LABEL", "Condition", "MediaValidator", "PreRunValidator", "reads")
     source.update(dict.fromkeys(base_exports, validators_base))
+    # What a media validator reads comes from the probe, below the validators.
+    source.update(dict.fromkeys(("EMPTY_MEDIA", "MediaInfo", "MediaNeed"), media_probe))
     assert set(validators_package.__all__) == set(source)
     for name, module in source.items():
         assert getattr(validators_package, name) is getattr(module, name)

@@ -45,7 +45,7 @@ from tests.unit.exe_types.validators.media_files import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from griptape_nodes.exe_types.validators.base import PreRunValidator
+    from griptape_nodes.exe_types.validators.base import MediaValidator
 
 SUBJECT = "Image 2 in 'reference images'"
 DOCS = "https://example.com/limits"
@@ -53,9 +53,9 @@ DOCS = "https://example.com/limits"
 needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg and ffprobe are needed to make and read a clip")
 
 
-def _messages(validators: list[PreRunValidator], media: MediaInfo, value: Any = None) -> list[str]:
+def _messages(validators: list[MediaValidator], media: MediaInfo, value: Any = None) -> list[str]:
     """What each validator reports for one input, in order, leaving out those it passes."""
-    errors = [validator.check(value, subject=SUBJECT, media=media, docs_url=None) for validator in validators]
+    errors = [validator.check_media(value, media, subject=SUBJECT, docs_url=None) for validator in validators]
     return [str(error) for error in errors if error is not None]
 
 
@@ -150,7 +150,7 @@ class TestOnRealImages:
 
     def test_links_the_docs_page(self, tmp_path: Path) -> None:
         media = _image(str(image_file(tmp_path, 100, 100)))
-        error = SideRange(min=300).check(None, subject=SUBJECT, media=media, docs_url=DOCS)
+        error = SideRange(min=300).check_media(None, media, subject=SUBJECT, docs_url=DOCS)
         assert error is not None
         assert error.links
         assert error.links[0].url == DOCS
@@ -216,7 +216,7 @@ class TestOnRealVideos:
         media = _video(str(video_file(tmp_path, width=320, height=240, fps=24, seconds=2)))
         assert media.video is not None
         assert media.video.mime_type == "video/mp4"
-        validators: list[PreRunValidator] = [
+        validators: list[MediaValidator] = [
             AllowedFormats("video/mp4"),
             VideoCodecs("h264"),
             SideRange(min=200, max=1920),
@@ -230,7 +230,7 @@ class TestOnRealVideos:
 
     def test_reports_every_limit_a_real_clip_breaks(self, tmp_path: Path) -> None:
         media = _video(str(video_file(tmp_path, width=320, height=240, fps=24, seconds=2)))
-        validators: list[PreRunValidator] = [
+        validators: list[MediaValidator] = [
             AllowedFormats("video/quicktime"),
             VideoCodecs("hevc"),
             SideRange(min=480),
@@ -262,12 +262,12 @@ class TestOnRealAudio:
     def test_reads_and_checks_a_real_mp3(self, tmp_path: Path) -> None:
         media = _audio(str(audio_file(tmp_path, seconds=3)))
         assert media.audio is not None
-        validators: list[PreRunValidator] = [AllowedFormats("audio/mpeg"), AudioCodecs("mp3"), Duration(min=2, max=5)]
+        validators: list[MediaValidator] = [AllowedFormats("audio/mpeg"), AudioCodecs("mp3"), Duration(min=2, max=5)]
         assert _messages(validators, media) == []
 
     def test_reports_every_limit_a_real_mp3_breaks(self, tmp_path: Path) -> None:
         media = _audio(str(audio_file(tmp_path, seconds=3)))
-        validators: list[PreRunValidator] = [
+        validators: list[MediaValidator] = [
             AllowedFormats("audio/wav"),
             AudioCodecs("pcm_s16le"),
             Duration(max=1),
@@ -376,7 +376,7 @@ class TestVideoReadings:
         ],
     )
     def test_reports_a_maximum_without_checking_an_unset_minimum(
-        self, validator: PreRunValidator, expected: str
+        self, validator: MediaValidator, expected: str
     ) -> None:
         media = MediaInfo(video=VideoProbe(info=None, seconds=5.0, fps=60.0, frames=300))
         assert _messages([validator], media) == [expected]
@@ -386,7 +386,7 @@ class TestVideoReadings:
         assert _messages([FrameRate(max=30), FrameCount(max=150)], media) == []
 
     def test_skips_every_check_for_a_video_it_could_not_read(self) -> None:
-        validators: list[PreRunValidator] = [
+        validators: list[MediaValidator] = [
             AllowedFormats("video/mp4"),
             VideoCodecs("h264"),
             SideRange(min=1),

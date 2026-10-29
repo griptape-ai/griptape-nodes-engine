@@ -41,8 +41,8 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_size,
     check_video_codec,
 )
-from griptape_nodes.exe_types.validators.base import PreRunValidator
-from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed
+from griptape_nodes.exe_types.validators.base import MediaValidator
+from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,7 +75,7 @@ _NO_SUBJECT = ""
 
 
 @dataclass(frozen=True)
-class MaxFileSize(PreRunValidator):
+class MaxFileSize(MediaValidator):
     """The largest file the provider accepts, in bytes.
 
     Args:
@@ -92,14 +92,8 @@ class MaxFileSize(PreRunValidator):
     fix: str | None = None
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         return check_size(
             media.size_bytes,
@@ -112,7 +106,7 @@ class MaxFileSize(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class AllowedFormats(PreRunValidator):
+class AllowedFormats(MediaValidator):
     """The formats the provider accepts, as MIME types, such as `AllowedFormats("image/jpeg", "image/png")`.
 
     The format is read from the file, not its name, so a MOV renamed to .mp4 is still a MOV. On an
@@ -132,14 +126,8 @@ class AllowedFormats(PreRunValidator):
         object.__setattr__(self, "mime_types", mime_types)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if media.audio is not None:
             return check_mime_type(
@@ -149,7 +137,7 @@ class AllowedFormats(PreRunValidator):
 
 
 @dataclass(frozen=True, kw_only=True)
-class SideRange(PreRunValidator):
+class SideRange(MediaValidator):
     """The fewest and most pixels accepted for an image's or video frame's width and height.
 
     A video frame is measured as stored, turned upright for a rotated clip.
@@ -161,20 +149,14 @@ class SideRange(PreRunValidator):
     max: int | None = None
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         return check_dimensions(media.frame, subject=subject, min_side=self.min, max_side=self.max, docs_url=docs_url)
 
 
 @dataclass(frozen=True, kw_only=True)
-class PixelArea(PreRunValidator):
+class PixelArea(MediaValidator):
     """The fewest and most pixels accepted in an image or video frame, in millions."""
 
     needs = _FRAME_NEEDS
@@ -183,14 +165,8 @@ class PixelArea(PreRunValidator):
     max_megapixels: float | None = None
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         return check_dimensions(
             media.frame,
@@ -202,7 +178,7 @@ class PixelArea(PreRunValidator):
 
 
 @dataclass(frozen=True)
-class AspectRatioRange(PreRunValidator):
+class AspectRatioRange(MediaValidator):
     """The tallest and widest aspect ratios accepted, as the provider writes them, such as ("1:3", "3:1").
 
     A video whose pixels aren't square passes when either its stored or its displayed shape fits.
@@ -221,14 +197,8 @@ class AspectRatioRange(PreRunValidator):
         check_aspect_ratio_range(None, subject=_NO_SUBJECT, widest=self.widest, tallest=self.tallest)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         return _easier_shape(
             media,
@@ -239,7 +209,7 @@ class AspectRatioRange(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class ExactAspectRatios(PreRunValidator):
+class ExactAspectRatios(MediaValidator):
     """The only aspect ratios accepted, such as `ExactAspectRatios("16:9", "9:16")`.
 
     A frame matches when a side is within a pixel of the ratio. A video whose pixels aren't square
@@ -260,14 +230,8 @@ class ExactAspectRatios(PreRunValidator):
         object.__setattr__(self, "ratios", ratios)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         return _easier_shape(
             media,
@@ -276,7 +240,7 @@ class ExactAspectRatios(PreRunValidator):
 
 
 @dataclass(frozen=True, kw_only=True)
-class Duration(PreRunValidator):
+class Duration(MediaValidator):
     """The shortest and longest video or audio input accepted, in seconds.
 
     Providers don't say whether they measure the stream or the whole file, so a maximum is checked
@@ -296,14 +260,8 @@ class Duration(PreRunValidator):
     fix: str | None = None
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         probe = media.video
         too_long_fix = self.fix
@@ -325,7 +283,7 @@ class Duration(PreRunValidator):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FrameRate(PreRunValidator):
+class FrameRate(MediaValidator):
     """The lowest and highest frame rates accepted for a video.
 
     A variable-frame-rate clip's average and declared rates differ, so each bound is checked against
@@ -339,14 +297,8 @@ class FrameRate(PreRunValidator):
     tolerance: float = FRAME_RATE_TOLERANCE
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -369,7 +321,7 @@ class FrameRate(PreRunValidator):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FrameCount(PreRunValidator):
+class FrameCount(MediaValidator):
     """The fewest and most frames accepted for a video.
 
     A file that records no count, such as an MKV, is estimated from its durations and frame rates,
@@ -382,14 +334,8 @@ class FrameCount(PreRunValidator):
     max: int | None = None
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -403,7 +349,7 @@ class FrameCount(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class VideoCodecs(PreRunValidator):
+class VideoCodecs(MediaValidator):
     """The video codecs accepted, as ffprobe names them, such as `VideoCodecs("h264", "hevc")`.
 
     The names messages show ("H.264", "H.265") and "AVC" work too.
@@ -423,14 +369,8 @@ class VideoCodecs(PreRunValidator):
         object.__setattr__(self, "codecs", codecs)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if media.video is None:
             return None
@@ -438,7 +378,7 @@ class VideoCodecs(PreRunValidator):
 
 
 @dataclass(frozen=True, init=False)
-class AudioCodecs(PreRunValidator):
+class AudioCodecs(MediaValidator):
     """The audio codecs accepted, as ffprobe names them, such as `AudioCodecs("mp3", "pcm_s16le")`.
 
     A WAV's codec is a PCM one, such as "pcm_s16le". The names messages show ("MP3", "AC-3") work too.
@@ -458,14 +398,8 @@ class AudioCodecs(PreRunValidator):
         object.__setattr__(self, "codecs", codecs)
 
     @override
-    def check(
-        self,
-        value: Any,
-        *,
-        subject: str,
-        docs_url: str | None,
-        media: MediaInfo = EMPTY_MEDIA,
-        position: int | None = None,
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
         if media.audio is None:
             return None
