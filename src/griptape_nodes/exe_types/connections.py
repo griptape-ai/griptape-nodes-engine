@@ -204,6 +204,16 @@ class Connections:
             return ConnectionData(connection.source_node, connection.source_parameter)
         return None
 
+    def find_connection(
+        self, source_node: str, source_parameter: str, target_node: str, target_parameter: str
+    ) -> Connection | None:
+        """The connection between these node and parameter names, or None."""
+        for connection_id in self.outgoing_index.get(source_node, {}).get(source_parameter, []):
+            connection = self.connections[connection_id]
+            if connection.target_node.name == target_node and connection.target_parameter.name == target_parameter:
+                return connection
+        return None
+
     def remove_connection_by_object(self, conn: Connection) -> bool:
         """Remove a connection from the manager by Connection object.
 
