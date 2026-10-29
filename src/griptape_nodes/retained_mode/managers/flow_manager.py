@@ -5013,9 +5013,16 @@ class FlowManager(EngineScoped):
         self._finish_run(run)
 
     def _finish_run_if_over(self) -> None:
-        """End the run in progress if its flow has stopped, on the paths that can stop a paused run."""
+        """End the run in progress if its flow has stopped, on the paths that can stop a paused run.
+
+        Wait while anything still holds the machines. For example, in debug mode the user steps a
+        node, presses Cancel while its check is still running, then presses Run: without this wait,
+        the new run starts before the old step has finished. `_driving` only covers a normal Run;
+        `execution_is_advancing()` also covers a step or continue. Each of those calls this again
+        when it finishes, so the run still ends.
+        """
         run = self._run_in_progress
-        if run is None or self._driving or self.check_for_existing_running_flow():
+        if run is None or self._driving or self.execution_is_advancing() or self.check_for_existing_running_flow():
             return
         if run.state is RunState.PAUSED:
             run.state = RunState.FINISHED

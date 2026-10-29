@@ -52,6 +52,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowMetadataRequest,
     GetWorkflowMetadataResultFailure,
     GetWorkflowMetadataResultSuccess,
+    GetWorkflowShapeRequest,
+    GetWorkflowShapeResultFailure,
+    GetWorkflowShapeResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
@@ -6260,3 +6263,37 @@ class TestNodeLibraryDelegates:
         ) as extract_mock:
             assert workflow_manager.extract_workflow_shape("wf", flow_name="f") == {"x": 1}
         extract_mock.assert_called_once_with(engine.flow_manager, "wf", "f")
+
+
+class TestGetWorkflowShapeRequest:
+    """`GetWorkflowShapeRequest` answers with the shape `extract_workflow_shape` reads, so a node can ask for it."""
+
+    def test_returns_the_shape_of_the_named_flow(self, engine: Engine) -> None:
+        param = {"type": "str"}
+        with patch(
+            "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape",
+            return_value={"input": {"Start Flow_1": {"text": param}}, "output": {"End Flow_1": {"text": param}}},
+        ) as extract_mock:
+            result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="sub"))
+
+        assert isinstance(result, GetWorkflowShapeResultSuccess)
+        assert result.workflow_shape.inputs == {"Start Flow_1": {"text": param}}
+        assert result.workflow_shape.outputs == {"End Flow_1": {"text": param}}
+        extract_mock.assert_called_once_with(engine.flow_manager, "child", "sub")
+
+    def test_fails_naming_the_workflow_when_the_flow_has_no_start_node(self, engine: Engine) -> None:
+        with patch(
+            "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape",
+            side_effect=ValueError("Workflow 'child' does not have a StartNode."),
+        ):
+            result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="sub"))
+
+        assert isinstance(result, GetWorkflowShapeResultFailure)
+        assert "workflow 'child'" in str(result.result_details)
+        assert "does not have a StartNode" in str(result.result_details)
+
+    def test_fails_when_the_flow_does_not_exist(self, engine: Engine) -> None:
+        result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="No Such Flow"))
+
+        assert isinstance(result, GetWorkflowShapeResultFailure)
+        assert "No Such Flow" in str(result.result_details)

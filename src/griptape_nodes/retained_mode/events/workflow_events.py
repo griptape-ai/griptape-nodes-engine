@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -278,6 +279,43 @@ class ListCallableWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @PayloadRegistry.register
 class ListCallableWorkflowsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Callable workflow listing failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeRequest(RequestPayload, GraphAccessMixin):
+    """Get the inputs and outputs of a workflow's flow, read from its Start and End nodes as they are now.
+
+    Use when: Running a workflow imported as a subflow, whose Start and End nodes may have been
+    renamed on import, so the shape saved with the workflow no longer names them.
+
+    Args:
+        workflow_name: Registry key of the workflow, used in error messages
+        flow_name: Flow to read the shape from (None for the top-level flow)
+
+    Results: GetWorkflowShapeResultSuccess (with the shape) | GetWorkflowShapeResultFailure (flow not found, no Start or End node)
+    """
+
+    workflow_name: str
+    flow_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workflow shape read successfully.
+
+    Args:
+        workflow_shape: Parameters of each Start node (inputs) and End node (outputs), by node name
+    """
+
+    workflow_shape: WorkflowShape
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Workflow shape read failed. Common causes: flow not found, flow has no Start or End node."""
 
 
 @dataclass
