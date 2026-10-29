@@ -28,5 +28,5 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
     The one failure for every request whose envelope `open_workflow_id` names no open workflow,
     whatever the request, so a client can tell it apart and reopen the workflow or refresh what is
-    open.
+    open. HOST requests (`RequestScope`) ignore the id, so they never fail with it.
     """
