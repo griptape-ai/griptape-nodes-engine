@@ -1026,13 +1026,13 @@ class WorkerManager(EngineScoped):
         """Tell the engine asked to admit a node that the node ended, so its run can let that engine go."""
         if admission is None or self._admissions.pop(admission.admission_id, None) is None:
             return
-        request = worker_events.NodeExecutionEndedRequest(admission_id=admission.admission_id)
+        request = worker_events.ReportNodeExecutionEndedRequest(admission_id=admission.admission_id)
         try:
             result = await self.engine.request(admission.host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             logger.warning("Could not tell engine %s that a node it admitted ended: %s", admission.host_engine_id, e)
             return
-        if not isinstance(result, worker_events.NodeExecutionEndedResultSuccess):
+        if not isinstance(result, worker_events.ReportNodeExecutionEndedResultSuccess):
             logger.warning(
                 "Engine %s did not record that a node it admitted ended: %s",
                 admission.host_engine_id,
@@ -1834,44 +1834,48 @@ class WorkerManager(EngineScoped):
         return worker_events.AdmitNodeResultSuccess(result_details=f"Admitted node '{request.node_name}'.")
 
     @handles(
-        worker_events.NodeExecutionEndedRequest,
+        worker_events.ReportNodeExecutionEndedRequest,
         sender=RequiredSender.SESSION,
         owner=lambda manager, request, _sender: manager._engine_admitted(request.admission_id),
     )
-    async def handle_node_execution_ended_request(
-        self, request: worker_events.NodeExecutionEndedRequest
-    ) -> worker_events.NodeExecutionEndedResultSuccess:
+    async def handle_report_node_execution_ended_request(
+        self, request: worker_events.ReportNodeExecutionEndedRequest
+    ) -> worker_events.ReportNodeExecutionEndedResultSuccess:
         """Record that a node another engine ran here ended, ending its run if it was the run's only node."""
         engine_run = self._engine_run_admitting(request.admission_id)
         if engine_run is None:
-            return worker_events.NodeExecutionEndedResultSuccess(
+            return worker_events.ReportNodeExecutionEndedResultSuccess(
                 result_details="This engine was not running that node, so there was nothing to record."
             )
         # A node sent without a run is its run's only node, admitted or still in line.
         if engine_run.run_id is None:
             await self._end_engine_run(engine_run, "its node ended before it was admitted.")
-            return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
+            return worker_events.ReportNodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
         if request.admission_id in engine_run.waiting:
             engine_run.abandoned.add(request.admission_id)
         engine_run.running.discard(request.admission_id)
         self._let_go_if_idle(engine_run)
-        return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
+        return worker_events.ReportNodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
 
     @handles(
-        worker_events.EndRunRequest,
+        worker_events.ReportRunEndedRequest,
         sender=RequiredSender.SESSION,
         owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
     )
-    async def handle_end_run_request(self, request: worker_events.EndRunRequest) -> worker_events.EndRunResultSuccess:
+    async def handle_report_run_ended_request(
+        self, request: worker_events.ReportRunEndedRequest
+    ) -> worker_events.ReportRunEndedResultSuccess:
         """Let another engine's run go, now that it ended, so the next run in line gets this engine."""
         engine_id = require_request_sender().engine_id
         engine_run = self._engine_runs.get((engine_id, request.run_id))
         if engine_run is None:
-            return worker_events.EndRunResultSuccess(
+            return worker_events.ReportRunEndedResultSuccess(
                 result_details=f"This engine was not holding run {request.run_id}."
             )
         await self._end_engine_run(engine_run, "its run ended.")
-        return worker_events.EndRunResultSuccess(result_details=f"Let run {request.run_id} of engine {engine_id} go.")
+        return worker_events.ReportRunEndedResultSuccess(
+            result_details=f"Let run {request.run_id} of engine {engine_id} go."
+        )
 
     @handles(
         worker_events.ReportPlaceInLineRequest,
@@ -1912,7 +1916,7 @@ class WorkerManager(EngineScoped):
         finally:
             self._cancel_idle_timer(engine_run)
             self._forget_engine_run(engine_run)
-        return worker_events.EndRunResultSuccess(
+        return worker_events.ReportRunEndedResultSuccess(
             result_details=f"Engine {engine_run.engine_id}'s run let this engine go."
         )
 
@@ -2100,16 +2104,16 @@ class WorkerManager(EngineScoped):
     def _on_run_ended(self, run_id: str) -> None:
         """Tell every engine the ended run sent a node to that it ended, so they serve the next run."""
         for engine_id in self._run_engines.pop(run_id, set()):
-            self._send_notice(self._send_end_run(engine_id, run_id))
+            self._send_notice(self._send_run_ended(engine_id, run_id))
 
-    async def _send_end_run(self, engine_id: str, run_id: str) -> None:
-        request = worker_events.EndRunRequest(run_id=run_id)
+    async def _send_run_ended(self, engine_id: str, run_id: str) -> None:
+        request = worker_events.ReportRunEndedRequest(run_id=run_id)
         try:
             result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             logger.warning("Could not tell engine %s that run %s ended: %s", engine_id, run_id, e)
             return
-        if not isinstance(result, worker_events.EndRunResultSuccess):
+        if not isinstance(result, worker_events.ReportRunEndedResultSuccess):
             logger.warning("Engine %s did not end run %s: %s", engine_id, run_id, result.result_details)
 
     def _send_notice(self, notice: Coroutine[Any, Any, None]) -> None:

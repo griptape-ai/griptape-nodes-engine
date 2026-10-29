@@ -645,7 +645,7 @@ class TestEvictionCountsUnansweredChallenges:
     ) -> None:
         payload = {
             "event_type": "EventResultSuccess",
-            "result_type": worker_events.EndRunResultSuccess.__name__,
+            "result_type": worker_events.ReportRunEndedResultSuccess.__name__,
             "result": {"result_details": "late"},
             "request_id": "gave-up-on-it",
             "response_topic": f"engines/{_ENGINE}/response",
@@ -3564,8 +3564,10 @@ class TestSharingThisEngineBetweenRuns:
 
         assert isinstance(second, worker_events.AdmitNodeResultSuccess)
         assert len(line.runs) == 1
-        await _sent_by(_ARTIST, worker_manager.handle_end_run_request, worker_events.EndRunRequest(run_id="run-1"))
-        assert isinstance(await hold, worker_events.EndRunResultSuccess)
+        await _sent_by(
+            _ARTIST, worker_manager.handle_report_run_ended_request, worker_events.ReportRunEndedRequest(run_id="run-1")
+        )
+        assert isinstance(await hold, worker_events.ReportRunEndedResultSuccess)
         assert worker_manager._engine_runs == {}
 
     @pytest.mark.asyncio
@@ -3640,9 +3642,9 @@ class TestSharingThisEngineBetweenRuns:
         await _settle()
         hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
         await admitting
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.NodeExecutionEndedRequest(admission_id="a1"))
+        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
 
-        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.EndRunResultSuccess)
+        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
 
     @pytest.mark.asyncio
     async def test_a_node_sent_without_a_run_that_ends_while_waiting_leaves_the_line(
@@ -3657,7 +3659,7 @@ class TestSharingThisEngineBetweenRuns:
             _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1", run_id=None))
         )
         await _settle()
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.NodeExecutionEndedRequest(admission_id="a1"))
+        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
 
         assert isinstance(await asyncio.wait_for(admitting, timeout=1.0), worker_events.AdmitNodeResultFailure)
         assert worker_manager._engine_runs == {}
@@ -3682,10 +3684,14 @@ class TestSharingThisEngineBetweenRuns:
             await _settle()
             hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
             await _settle()
-            await _sent_by(_ARTIST, worker_manager.handle_end_run_request, worker_events.EndRunRequest(run_id="run-1"))
+            await _sent_by(
+                _ARTIST,
+                worker_manager.handle_report_run_ended_request,
+                worker_events.ReportRunEndedRequest(run_id="run-1"),
+            )
             freeing.set()
 
-            assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.EndRunResultSuccess)
+            assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
         assert isinstance(await admitting, worker_events.AdmitNodeResultFailure)
 
     @pytest.mark.asyncio
@@ -3702,9 +3708,9 @@ class TestSharingThisEngineBetweenRuns:
         await _settle()
         hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
         await admitting
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.NodeExecutionEndedRequest(admission_id="a1"))
+        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
 
-        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.EndRunResultSuccess)
+        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
 
     @pytest.mark.asyncio
     async def test_passing_to_another_engine_s_run_frees_workers_first(self, worker_manager: WorkerManager) -> None:
@@ -3866,7 +3872,7 @@ class TestSharingThisEngineBetweenRuns:
 
         intruder = RequestSender(engine_id="another-artist-engine", session_id="another-sess")
         result = await _dispatched_by(
-            worker_manager, intruder, worker_events.NodeExecutionEndedRequest(admission_id="a1")
+            worker_manager, intruder, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1")
         )
 
         assert isinstance(result, EventResultFailure)
@@ -3922,7 +3928,7 @@ class TestAskingAnotherEngineToAdmitANode:
         (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
         assert cast("worker_events.AdmitNodeRequest", admit).run_id == "run-1"
         assert links.sent[0][2] is None, "an admission waits as long as the run ahead of it"
-        assert links.sent_types() == ["AdmitNodeRequest", "NodeExecutionEndedRequest", "EndRunRequest"]
+        assert links.sent_types() == ["AdmitNodeRequest", "ReportNodeExecutionEndedRequest", "ReportRunEndedRequest"]
         assert {engine_id for engine_id, _request, _timeout_s in links.sent} == {_HOST_ENGINE}
 
     @pytest.mark.asyncio

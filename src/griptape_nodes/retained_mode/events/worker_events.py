@@ -347,7 +347,7 @@ class AdmitNodeRequest(RequestPayload):
     `ReportPlaceInLineRequest`.
 
     Args:
-        admission_id: Names this admission, in `NodeExecutionEndedRequest` and `ReportPlaceInLineRequest`.
+        admission_id: Names this admission, in `ReportNodeExecutionEndedRequest` and `ReportPlaceInLineRequest`.
         run_id: The run the node belongs to, or None for a node run on its own.
         node_name: The node, named in that engine's log.
     """
@@ -401,7 +401,7 @@ class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 @PayloadRegistry.register
-class NodeExecutionEndedRequest(RequestPayload):
+class ReportNodeExecutionEndedRequest(RequestPayload):
     """Sent by the artist's engine when a node another engine admitted ends, however it ends.
 
     Args:
@@ -414,19 +414,19 @@ class NodeExecutionEndedRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class NodeExecutionEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+class ReportNodeExecutionEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The engine recorded the node as ended."""
 
 
 @dataclass
 @PayloadRegistry.register
-class NodeExecutionEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+class ReportNodeExecutionEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The engine could not record the node as ended."""
 
 
 @dataclass
 @PayloadRegistry.register
-class EndRunRequest(RequestPayload):
+class ReportRunEndedRequest(RequestPayload):
     """Sent by the artist's engine to every engine a run used, once the run ends, so they serve the next run.
 
     Args:
@@ -439,13 +439,13 @@ class EndRunRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class EndRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+class ReportRunEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The engine no longer holds itself for the run."""
 
 
 @dataclass
 @PayloadRegistry.register
-class EndRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+class ReportRunEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The engine could not end the run."""
 
 
