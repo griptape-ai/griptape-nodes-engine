@@ -262,6 +262,10 @@ class WorkerManager(EngineScoped):
         # This engine's registration with each engine it sends work to, by (host_engine_id, session).
         self._engine_registrations: dict[tuple[str, str], asyncio.Task[ResultPayload]] = {}
 
+        # Engines that accepted this engine's session, until it withdraws the offers or loses them. A
+        # registration that fails later leaves an earlier one accepted, so it is kept apart from the attempts.
+        self._accepted_session_hosts: set[str] = set()
+
         # Heartbeats unanswered by each engine there is a session with, and the one in flight to each.
         self._engine_challenges_unanswered: dict[str, int] = {}
         self._engine_challenges: dict[str, asyncio.Task[None]] = {}
@@ -1439,6 +1443,7 @@ class WorkerManager(EngineScoped):
         """
         host_engine_ids = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
         self._engine_registrations.clear()
+        self._accepted_session_hosts.clear()
         for host_engine_id in host_engine_ids:
             task = asyncio.get_running_loop().create_task(self._withdraw_session_offer(host_engine_id))
             self._stop_requests.add(task)
@@ -1484,7 +1489,10 @@ class WorkerManager(EngineScoped):
             and task.exception() is None
             and isinstance(task.result(), worker_events.OfferSessionForWorkersResultSuccess)
         )
-        if not accepted and self._engine_registrations.get(key) is task:
+        if accepted:
+            self._accepted_session_hosts.add(key[0])
+            return
+        if self._engine_registrations.get(key) is task:
             del self._engine_registrations[key]
 
     async def _send_registration(self, host_engine_id: str) -> ResultPayload:
@@ -1994,8 +2002,8 @@ class WorkerManager(EngineScoped):
         return worker_events.EngineSessionHeartbeatResultSuccess(result_details=f"Heartbeat {request.heartbeat_id}.")
 
     def _session_peers(self) -> set[str]:
-        """The engines there is a session with: those this engine registered with, and those that offered it one."""
-        peers = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
+        """The engines there is a session with: those that accepted this engine's, and those that offered it one."""
+        peers = set(self._accepted_session_hosts)
         peers.update(session.engine_id for session in self._sessions.values())
         peers.discard(self.engine.get_engine_id())
         return peers
@@ -2011,7 +2019,9 @@ class WorkerManager(EngineScoped):
             del self._engine_challenges_unanswered[engine_id]
         for engine_id in peers:
             if self._engine_challenges_unanswered.get(engine_id, 0) >= self.unanswered_challenges_allowed:
-                await self._lose_engine(engine_id, f"engine {engine_id} stopped answering heartbeats.")
+                await self._lose_engine(
+                    engine_id, f"engine {engine_id} stopped answering heartbeats, or has no session with this engine."
+                )
                 continue
             if engine_id in self._engine_challenges:
                 continue
@@ -2030,8 +2040,9 @@ class WorkerManager(EngineScoped):
         if isinstance(result, worker_events.EngineSessionHeartbeatResultSuccess):
             self._engine_challenges_unanswered[engine_id] = 0
             return
-        # It is there but forgot the session, as after it restarted, so nothing waiting on it will be answered.
-        await self._lose_engine(engine_id, f"engine {engine_id} no longer has a session with this engine.")
+        # It is there but has no session with this engine. Counted like silence rather than lost at once:
+        # it may not have recorded the session yet, while one that restarted keeps saying so.
+        logger.debug("Engine %s has no session with this engine: %s", engine_id, result.result_details)
 
     async def _lose_engine(self, engine_id: str, reason: str) -> None:
         """Settle what a session with `engine_id` left behind, as when the connection to it is lost."""
@@ -2045,6 +2056,7 @@ class WorkerManager(EngineScoped):
             admission.given_up = reason
             admission.request_task.cancel()
         # Registered again by the next start, as an engine that restarted needs.
+        self._accepted_session_hosts.discard(engine_id)
         for key in [key for key in self._engine_registrations if key[0] == engine_id]:
             del self._engine_registrations[key]
         await self.on_engine_lost(engine_id)

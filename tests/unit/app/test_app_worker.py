@@ -4100,18 +4100,50 @@ class TestEngineSessionHeartbeats:
         assert worker_manager._engine_challenges_unanswered == {_HOST_ENGINE: 0}
 
     @pytest.mark.asyncio
-    async def test_an_engine_that_forgot_the_session_is_lost_at_once(self, worker_manager: WorkerManager) -> None:
-        """As after it restarted: nothing this engine waits on there will be answered."""
+    async def test_an_engine_that_keeps_saying_it_has_no_session_is_lost(self, worker_manager: WorkerManager) -> None:
+        """As after it restarted. One such answer is not enough: it may not have recorded the session yet."""
         links = _host_engine(worker_manager, refuse={"EngineSessionHeartbeatRequest": "no session"})
         await _start_on_host_engine(worker_manager)
         links.blocked["AdmitNodeRequest"] = asyncio.Event()
         admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
         await _settle()
 
-        await _sweep_engines(worker_manager, 1)
+        with patch.object(WorkerManager, "unanswered_challenges_allowed", new_callable=PropertyMock, return_value=2):
+            await _sweep_engines(worker_manager, 1)
+            assert not admitting.done()
+            await _sweep_engines(worker_manager, 2)
 
-        with pytest.raises(RuntimeError, match="no longer has a session"):
+        with pytest.raises(RuntimeError, match="has no session with this engine"):
             await asyncio.wait_for(admitting, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_registration_still_under_way_is_not_a_session(self, worker_manager: WorkerManager) -> None:
+        """The other engine records the session only once it handles the offer, and would answer it has none."""
+        links = _host_engine(worker_manager)
+        links.blocked["OfferSessionForWorkersRequest"] = asyncio.Event()
+        starting = asyncio.create_task(_start_on_host_engine(worker_manager))
+        await _settle()
+
+        assert _HOST_ENGINE not in worker_manager._session_peers()
+        links.blocked["OfferSessionForWorkersRequest"].set()
+        await starting
+        assert _HOST_ENGINE in worker_manager._session_peers()
+
+    @pytest.mark.asyncio
+    async def test_a_registration_that_fails_later_keeps_the_session_already_accepted(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise the other engine, still holding it, would hear this one deny it and stop its workers."""
+        links = _host_engine(worker_manager)
+        await _start_on_host_engine(worker_manager)
+        links.unanswered.add("OfferSessionForWorkersRequest")
+
+        await worker_manager._register_with_engine(_HOST_ENGINE, _SESSION, _LIBRARY)
+        answer = await _dispatched_by(
+            worker_manager, _FROM_HOST_ENGINE, worker_events.EngineSessionHeartbeatRequest(heartbeat_id="hb")
+        )
+
+        assert isinstance(answer.result, worker_events.EngineSessionHeartbeatResultSuccess)
 
     @pytest.mark.asyncio
     async def test_an_artist_s_engine_that_stops_answering_is_forgotten(self, worker_manager: WorkerManager) -> None:

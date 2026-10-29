@@ -478,7 +478,8 @@ class EngineSessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Sent on an interval by each of two engines with a session between them, to tell the other is still there.
 
     The artist's engine sends it to each engine it registered a session with, and that engine to each engine
-    that offered it one. One that stops answering, or answers that it knows of no session, is lost.
+    that offered it one. One that leaves too many unanswered, or keeps answering that it has no session, is
+    lost.
 
     Args:
         heartbeat_id: Correlation token, named in the log.
