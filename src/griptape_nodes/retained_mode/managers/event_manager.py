@@ -77,6 +77,8 @@ _active_request_sender: ContextVar[RequestSender | None] = ContextVar(
     "_event_manager_active_request_sender", default=None
 )
 
+_active_request_id: ContextVar[str | None] = ContextVar("_event_manager_active_request_id", default=None)
+
 # The node the current logical chain is rebuilding as a worker's copy, if any. Per chain rather than
 # process-wide, unlike the node-execution refcount: another node's aprocess can run in this process at the
 # same time, and its requests still go to the orchestrator while this chain's are answered here.
@@ -180,6 +182,11 @@ def current_request_type() -> type[RequestPayload] | None:
 def current_request_sender() -> RequestSender | None:
     """Return the engine that sent the request being dispatched on this task, or None if no other engine did."""
     return _active_request_sender.get()
+
+
+def current_request_id() -> str | None:
+    """Return the id the client gave the request being dispatched on this task, or None if it gave none."""
+    return _active_request_id.get()
 
 
 def require_request_sender() -> RequestSender:
@@ -1315,6 +1322,7 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
+        request_id_token = _active_request_id.set(result_context.get("request_id"))
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
@@ -1333,6 +1341,7 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
 
@@ -1413,6 +1422,7 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
+        request_id_token = _active_request_id.set(result_context.get("request_id"))
         try:
             try:
                 result_payload = self._invoke_handler_from_sync(callback, request)
@@ -1430,6 +1440,7 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
 

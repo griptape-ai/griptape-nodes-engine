@@ -230,7 +230,7 @@ class CancelRunRequest(RequestPayload, GraphAccessMixin):
     Args:
         run_id: The run to cancel.
 
-    Results: CancelRunResultSuccess | CancelRunResultFailure (no such run, or its flow has not started yet)
+    Results: CancelRunResultSuccess | CancelRunResultFailure (no run with that id)
     """
 
     run_id: str
@@ -245,7 +245,7 @@ class CancelRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The run was not cancelled. Common causes: no run with that id, or its flow has not started yet."""
+    """The run was not cancelled because no run with that id is in progress or waiting."""
 
 
 @dataclass
@@ -280,12 +280,14 @@ class RunInfo:
         flow_name: The flow it executes.
         state: Its state: queued, running, or paused.
         position: Its place in line, 1 being next, or 0 for the run in progress.
+        request_id: The id the client gave the request that submitted the run, or None if it gave none.
     """
 
     run_id: str
     flow_name: str
     state: str
     position: int
+    request_id: str | None = None
 
 
 @dataclass
@@ -544,11 +546,13 @@ class RunQueuedEvent(ExecutionPayload):
         run_id: The waiting run.
         flow_name: The flow the run executes.
         position: Its place in line, 1 being next, or 0 once it is no longer waiting.
+        request_id: The id the client gave the request that submitted the run, or None if it gave none.
     """
 
     run_id: str
     flow_name: str
     position: int
+    request_id: str | None = None
 
 
 @dataclass

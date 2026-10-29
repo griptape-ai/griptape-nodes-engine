@@ -191,6 +191,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.retained_mode.managers.event_manager import current_request_id
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunState
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.managers.workflow.shape import (
@@ -218,6 +219,8 @@ logger = logging.getLogger("griptape_nodes")
 # The run the code executing now belongs to. Tasks copy it when they are created, so every node a
 # run executes sees it, and a request a node makes can tell it comes from inside the run.
 _current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
+
+_CANCELLED_BEFORE_STARTING = "The run did not start: it was cancelled."
 
 
 @dataclass(frozen=True)
@@ -403,12 +406,17 @@ class FlowManager(EngineScoped):
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder(self.engine)
         self._node_executor = NodeExecutor(self.engine)
+        # The run queue and the run in progress are read and written without a lock, so only the engine loop
+        # may touch them. A run request sent synchronously from another thread can reach them from that
+        # thread's loop, which is not supported yet (#6039).
         self._run_queue = RunQueue()
         self._run_in_progress: Run | None = None
         # True from when the run in progress starts until its request returns. Until then only `_drive` may
         # end the run: its flow may not have started yet (still validating) or may have just been cancelled,
         # and the paths that end a paused run must not mistake either for the run being over.
         self._driving = False
+        # True while cancel_all_runs awaits the run in progress, so a run submitted meanwhile waits to be turned away.
+        self._cancelling_all = False
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -3295,11 +3303,7 @@ class FlowManager(EngineScoped):
 
     @handles(CancelRunRequest)
     async def on_cancel_run_request(self, request: CancelRunRequest) -> ResultPayload:
-        try:
-            cancelled = await self.cancel_run(request.run_id)
-        except RuntimeError as e:
-            details = f"Attempted to cancel run '{request.run_id}'. Failed because its flow has not started yet: {e}"
-            return CancelRunResultFailure(result_details=details)
+        cancelled = await self.cancel_run(request.run_id)
         if not cancelled:
             details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
             return CancelRunResultFailure(result_details=details)
@@ -3321,11 +3325,23 @@ class FlowManager(EngineScoped):
         in_progress = self._run_in_progress
         if in_progress is not None:
             runs.append(
-                RunInfo(run_id=in_progress.run_id, flow_name=in_progress.flow_name, state=in_progress.state, position=0)
+                RunInfo(
+                    run_id=in_progress.run_id,
+                    flow_name=in_progress.flow_name,
+                    state=in_progress.state,
+                    position=0,
+                    request_id=in_progress.request_id,
+                )
             )
         for index, waiting in enumerate(self._run_queue.snapshot()):
             runs.append(
-                RunInfo(run_id=waiting.run_id, flow_name=waiting.flow_name, state=waiting.state, position=index + 1)
+                RunInfo(
+                    run_id=waiting.run_id,
+                    flow_name=waiting.flow_name,
+                    state=waiting.state,
+                    position=index + 1,
+                    request_id=waiting.request_id,
+                )
             )
         return ListRunsResultSuccess(runs=runs, result_details=f"Listed {len(runs)} run(s).")
 
@@ -4663,6 +4679,7 @@ class FlowManager(EngineScoped):
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
             raise RuntimeError(errormsg)
+        self._raise_if_run_cancelled()
 
         if start_node is None:
             if self._global_flow_queue.empty():
@@ -4849,6 +4866,7 @@ class FlowManager(EngineScoped):
             state=RunState.QUEUED,
             outcome=asyncio.get_running_loop().create_future(),
             context=copy_context(),
+            request_id=current_request_id(),
         )
         self._run_queue.enqueue(run)
         self._start_next_run_if_idle()
@@ -4856,11 +4874,7 @@ class FlowManager(EngineScoped):
         return run
 
     async def cancel_run(self, run_id: str) -> bool:
-        """Cancel a run, returning whether there was one: a waiting run leaves the line, the run in progress stops.
-
-        Raises:
-            RuntimeError: The run in progress has not started its flow yet, so there is nothing to stop.
-        """
+        """Cancel a run, returning whether there was one: a waiting run leaves the line, the run in progress stops."""
         waiting = [run for run in self._run_queue.snapshot() if run.run_id == run_id]
         if waiting:
             self._turn_away(waiting, "it was cancelled.")
@@ -4868,24 +4882,26 @@ class FlowManager(EngineScoped):
         run = self._run_in_progress
         if run is None or run.run_id != run_id:
             return False
-        previous_state = run.state
         run.state = RunState.CANCELLED
-        try:
+        # A run whose flow has not started stops itself before starting it.
+        if self.check_for_existing_running_flow():
             await self.cancel_flow_run()
-        except RuntimeError:
-            run.state = previous_state
-            raise
         return True
 
     async def cancel_all_runs(self) -> None:
         """Cancel every waiting run, then the run in progress, without starting another."""
         # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
         self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
-        if not self.check_for_existing_running_flow():
-            return
         if self._run_in_progress is not None:
             self._run_in_progress.state = RunState.CANCELLED
-        await self.cancel_flow_run()
+        self._cancelling_all = True
+        try:
+            if self.check_for_existing_running_flow():
+                await self.cancel_flow_run()
+        finally:
+            self._cancelling_all = False
+        # Runs submitted while the cancel awaited were held, so they go too.
+        self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
 
     def _turn_away(self, runs: list[Run], reason: str) -> None:
         """Take waiting runs out of the line without executing them; each one's request returns `reason`."""
@@ -4898,6 +4914,16 @@ class FlowManager(EngineScoped):
             self._on_run_loop(run, run.outcome.set_result, failure)
         self._report_places_in_line()
 
+    def _raise_if_run_cancelled(self) -> None:
+        """Stop a run cancelled before its flow started, just before it would start it.
+
+        Raises:
+            RuntimeError: The run in progress was cancelled.
+        """
+        run = self._run_in_progress
+        if run is not None and run.state is RunState.CANCELLED:
+            raise RuntimeError(_CANCELLED_BEFORE_STARTING)
+
     @staticmethod
     def _of_run(result: ResultPayload, run_id: str | None) -> ResultPayload:
         """`result`, naming the run its request started or joined."""
@@ -4906,7 +4932,7 @@ class FlowManager(EngineScoped):
         return result
 
     def _start_next_run_if_idle(self) -> None:
-        if self._run_in_progress is not None:
+        if self._run_in_progress is not None or self._cancelling_all:
             return
         run = self._run_queue.pop_next()
         if run is None:
@@ -4924,6 +4950,11 @@ class FlowManager(EngineScoped):
     async def _drive(self, run: Run) -> None:
         # run.context is the submitter's context copied, so this marks only the run's own tasks.
         _current_run_id.set(run.run_id)
+        if run.state is RunState.CANCELLED:
+            run.outcome.set_result(self._of_run(run.spec.failure(_CANCELLED_BEFORE_STARTING), run.run_id))
+            self._driving = False
+            self._finish_run(run)
+            return
         try:
             result = await run.spec.execute(self.engine)
         except asyncio.CancelledError:
@@ -5000,7 +5031,12 @@ class FlowManager(EngineScoped):
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(
-                    payload=RunQueuedEvent(run_id=run.run_id, flow_name=run.flow_name, position=run.position)
+                    payload=RunQueuedEvent(
+                        run_id=run.run_id,
+                        flow_name=run.flow_name,
+                        position=run.position,
+                        request_id=run.request_id,
+                    )
                 )
             )
         )
@@ -5227,6 +5263,7 @@ class FlowManager(EngineScoped):
                 )
             )
         else:
+            self._raise_if_run_cancelled()
             # Set that we are only working on one node right now!
             self._global_single_node_resolution = True
             # Get or create machine

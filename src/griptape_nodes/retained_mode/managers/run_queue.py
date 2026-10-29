@@ -60,6 +60,8 @@ class Run:
     context: contextvars.Context
     # The place in line it was last reported at, 0 while it is not waiting.
     position: int = 0
+    # The id the client gave the request that submitted it, so the client can tell its own run apart.
+    request_id: str | None = None
 
 
 class RunQueue:
