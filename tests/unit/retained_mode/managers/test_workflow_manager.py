@@ -1939,6 +1939,36 @@ class TestWorkflowManager:
         assert list_libraries_call_count == 1
 
     @pytest.mark.asyncio
+    async def test_registration_scan_does_not_broadcast_register_results(self, engine: Engine, tmp_path: Path) -> None:
+        """A scan must not queue one RegisterWorkflow result per workflow for the websocket.
+
+        A project switch scans every workflow in the project, and those results went out ahead of
+        the switch request's own result, delaying it by about a second for 500 workflows.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        file_count = 5
+        for index in range(file_count):
+            (tmp_path / f"workflow_{index}.py").write_text(
+                _valid_workflow_source(f"workflow_{index}"), encoding="utf-8"
+            )
+
+        broadcast_results: list[Any] = []
+
+        def record(event: Any) -> None:
+            wrapped = getattr(event, "wrapped_event", None)
+            if isinstance(getattr(wrapped, "result", None), RegisterWorkflowResultSuccess):
+                broadcast_results.append(wrapped)
+
+        with patch.object(engine.event_manager, "put_event", side_effect=record):
+            result = await workflow_manager._process_workflows_for_registration([str(tmp_path)])
+
+        assert len(result.succeeded) == file_count
+        assert broadcast_results == []
+
+    @pytest.mark.asyncio
     async def test_registration_scan_throttles_progress_but_keeps_failures_and_final(
         self, engine: Engine, tmp_path: Path
     ) -> None:

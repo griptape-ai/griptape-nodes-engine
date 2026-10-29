@@ -935,9 +935,11 @@ class WorkflowManager(EngineScoped):
         # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
 
-        # Register it as a success.
+        # Register it as a success. Not broadcast: a scan registers every workflow in the project, and
+        # one result per workflow queued ~500 messages ahead of the triggering request's own result.
+        # Clients get the scan's progress events instead, and the result details still go to the log.
         workflow_register_request = RegisterWorkflowRequest(
-            metadata=workflow_metadata, file_name=str(workflow_to_register)
+            metadata=workflow_metadata, file_name=str(workflow_to_register), broadcast_result=False
         )
         workflow_register_result = self.engine.handle_request(workflow_register_request)
         if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):

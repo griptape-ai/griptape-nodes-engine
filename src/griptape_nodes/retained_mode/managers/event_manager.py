@@ -5,10 +5,12 @@ import contextvars
 import inspect
 import logging
 import threading
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from asyncio_thread_runner import ThreadRunner
@@ -80,6 +82,38 @@ _hydrating_node_name: ContextVar[str | None] = ContextVar("_event_manager_hydrat
 _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], ...]] = ContextVar(
     "_event_manager_active_post_dispatch_hooks", default=()
 )
+
+# _____TEST____ temporary diagnostics: is the event loop blocked after a project switch returns?
+_test_probe_tasks: set[asyncio.Task] = set()
+
+
+def _test_start_loop_block_probe(duration_s: float = 2.5, tick_s: float = 0.01, report_ms: float = 50.0) -> None:
+    async def probe() -> None:
+        test_log = logging.getLogger("griptape_nodes")
+        start = time.perf_counter()
+        blocks: list[tuple[float, float]] = []
+        while time.perf_counter() - start < duration_s:
+            before = time.perf_counter()
+            await asyncio.sleep(tick_s)
+            lag_ms = (time.perf_counter() - before - tick_s) * 1000
+            if lag_ms >= report_ms:
+                blocks.append(((before - start) * 1000, lag_ms))
+        test_log.info(
+            "_____TEST____ [project-switch] event loop after result: %d blocks >=%.0fms in %.1fs, totalling %.0fms",
+            len(blocks),
+            report_ms,
+            duration_s,
+            sum(lag for _, lag in blocks),
+        )
+        for offset_ms, lag_ms in blocks:
+            test_log.info(
+                "_____TEST____ [project-switch]   loop blocked %.0fms starting +%.0fms after result", lag_ms, offset_ms
+            )
+
+    task = asyncio.get_running_loop().create_task(probe())
+    _test_probe_tasks.add(task)
+    task.add_done_callback(_test_probe_tasks.discard)
+
 
 # Result/payload types whose broadcast is suppressed for the *current logical chain* only.
 # EventSuppressionContext writes this; should_suppress_event reads it.
@@ -1198,11 +1232,20 @@ class EventManager(EngineScoped):
             except Exception as exc:
                 return self._result_for_handler_exception(request, exc, context=result_context)
 
-            return self._handle_request_core(
+            test_core_start = time.perf_counter()
+            test_result_event = self._handle_request_core(
                 request,
                 cast("ResultPayload", result_payload),
                 context=result_context,
             )
+            if request_type.__name__ == "SetCurrentProjectRequest":
+                logging.getLogger("griptape_nodes").info(
+                    "_____TEST____ [project-switch] result ready to send at %s (result build + post-dispatch hooks took %.0fms)",
+                    datetime.now(UTC).isoformat(timespec="milliseconds"),
+                    (time.perf_counter() - test_core_start) * 1000,
+                )
+                _test_start_loop_block_probe()
+            return test_result_event
         finally:
             _active_request_type.reset(token)
 
