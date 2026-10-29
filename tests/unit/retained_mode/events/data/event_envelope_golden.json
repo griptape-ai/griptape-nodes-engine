@@ -2,6 +2,7 @@
   "EventRequest": {
     "request_id": "r1",
     "response_topic": "t",
+    "sender": null,
     "event_type": "EventRequest",
     "request_type": "GetParameterValueRequest",
     "request": {
@@ -19,6 +20,7 @@
       {
         "request_id": "a",
         "response_topic": null,
+        "sender": null,
         "event_type": "EventRequest",
         "request_type": "GetParameterValueRequest",
         "request": {

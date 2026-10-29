@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.105.0"
+version = "0.106.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -100,7 +100,7 @@ test = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.2,<0.13"]
+requires = ["uv_build>=0.7.2,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -181,7 +181,10 @@ ignore = [
 # and the `__init__` built inside the class factory has to be named `__init__`.
 # TID251: node libraries are the intended audience for the GriptapeNodes facade, as the
 # ban message itself says.
+# ARG002: a hook override keeps the base class's signature even where the example doesn't
+# use every argument.
 "docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
+"docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",

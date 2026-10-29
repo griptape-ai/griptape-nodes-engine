@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -12,7 +13,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class CreateConnectionRequest(RequestPayload):
+class CreateConnectionRequest(RequestPayload, GraphAccessMixin):
     """Create a connection between two node parameters.
 
     Use when: Connecting node outputs to inputs, building data flow between nodes,
@@ -76,7 +77,7 @@ class CreateConnectionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DeleteConnectionRequest(RequestPayload):
+class DeleteConnectionRequest(RequestPayload, GraphAccessMixin):
     """Delete a connection between two node parameters.
 
     Use when: Removing unwanted connections, restructuring workflows, disconnecting nodes,
@@ -112,7 +113,7 @@ class DeleteConnectionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ListConnectionsForNodeRequest(RequestPayload):
+class ListConnectionsForNodeRequest(RequestPayload, GraphAccessMixin):
     """List all connections for a specific node.
 
     Use when: Inspecting node connectivity, building connection visualizations,

@@ -1,7 +1,7 @@
 """A node's list parameters and their rows.
 
-A list nothing is connected to holds its items in rows, one child parameter per item, and has no value of
-its own: reading it builds it from the rows. Only a list fed by a connection to the list itself stores the
+A list nothing is connected to holds its items in rows, child parameters that each hold one item or a list
+of items, and has no value of its own: reading it builds it from the rows. Only a list fed by a connection to the list itself stores the
 whole list it was handed.
 """
 
@@ -66,11 +66,16 @@ class ListRows:
 
         - while the node is running, since rows it adds then don't reach the orchestrator's copy. Its
           result is recorded instead.
-        - while loading, which sets the rows next.
         - from a value hook on the list or one of its rows, which runs while a row is being set.
           Replacing the rows there would remove the one being set. To convert items, a list uses
           `item_converters` instead.
+
+        While loading, a whole list is stored as any value is, without asking whether the list is
+        connected: the connection may not be made yet. A save writes a whole list only for a list a
+        connection fed, and the rows of any other list arrive as their own values.
         """
+        if initial_setup:
+            return False
         if not self.holds_no_value(parameter):
             return False
         name = parameter.name
@@ -81,38 +86,16 @@ class ListRows:
         if name in self._in_hooks:
             self._warn_hook_write(parameter, value)
             return True
-        if initial_setup or name in self._being_replaced:
+        if name in self._being_replaced:
             return True
         self.set_as_rows_if_unconnected(parameter, value)
-        return True
-
-    def fill_copy(self, parameter: Parameter, value: Any) -> bool:
-        """Build the rows of a worker's copy of the node from the list it was sent. Returns whether it did.
-
-        Unlike `set_as_rows_if_unconnected`, this doesn't ask the orchestrator whether the list is
-        connected: a fresh copy has no rows to protect, and rows built from the list give the node the
-        same items either way.
-
-        A list longer than `max_items` can only have come over a connection, and doesn't fit in rows.
-        It is stored whole instead, so the node runs with every item as it does on the orchestrator.
-        """
-        if not isinstance(parameter, ParameterList) or not isinstance(value, list):
-            return False
-        if not _accepts_whole_list(parameter):
-            return False
-        max_items = parameter.max_items
-        if max_items is not None and len(value) > max_items:
-            return False
-        if value != handle_container_parameter(self._node, parameter):
-            self._replace(parameter, value)
         return True
 
     def set_as_rows_if_unconnected(self, parameter: Parameter, value: Any) -> bool:
         """Write a whole list to the rows of an unconnected list. Returns whether it did.
 
-        The engine calls this where a value arrives from outside the node: a request, and a worker
-        copy receiving the list it runs with. An unconnected list is read from its rows, so a list
-        stored beside them would never be read.
+        The engine calls this where a value arrives from outside the node: a request. An unconnected
+        list is read from its rows, so a list stored beside them would never be read.
 
         Raises:
             TypeError: if `value` is not a list.
@@ -132,40 +115,65 @@ class ListRows:
         self._replace(parameter, value)
         return True
 
+    def convert_and_validate(self, parameter: Parameter, value: Any) -> Any:
+        """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds."""
+        convert_and_validate = self._node._convert_and_validate
+        container = self._container_of(parameter)
+        if not isinstance(container, ParameterList) or not container.row_value_is_items(value):
+            return convert_and_validate(parameter, value)
+        return [convert_and_validate(parameter, item) for item in value]
+
+    def check_row_within_max_items(self, row: Parameter, value: Any, *, initial_setup: bool) -> None:
+        if initial_setup:
+            return
+        node = self._node
+        container = self._container_of(row)
+        if not isinstance(container, ParameterList) or container.max_items is None:
+            return
+        held_count = 0
+        for child in container.get_child_parameters():
+            child_value = value if child.name == row.name else node._get_raw_parameter_value(child.name)
+            held_count += len(_items_of_row(container, child_value))
+        if held_count <= container.max_items:
+            return
+        # Workers rebuild one row per item, so values over `max_items` cannot be restored.
+        msg = f"Attempted to set an item of list '{node.name}.{container.name}'. Failed because the list would hold {held_count} items, counting the items of any list in a row, and holds at most {container.max_items} items."
+        raise ValueError(msg)
+
     def row_removed(self, parameter_list: ParameterList, row: BaseNodeElement) -> None:
         """Drop a removed row's value, and tell the node its list changed."""
         self._node.parameter_values.pop(row.name, None)
         self.rows_changed(parameter_list)
 
     def rows_changed(self, container: ParameterContainer, *, initial_setup: bool = False) -> None:
-        """Tell the node a container's rows changed: a row was set, removed or moved."""
-        if container.name in self._being_replaced:
+        """Tell the node a container's rows changed: a row was set, removed or moved.
+
+        Not while loading: whether the rows are what the list holds depends on a connection the load
+        may not have made yet, and the list was checked when it was saved.
+        """
+        if container.name in self._being_replaced or initial_setup:
             return
         if not self.holds_no_value(container):
             # A connected list holds the value its connection delivered, which the rows don't change.
             return
-        self._notify(container, initial_setup=initial_setup)
+        self._notify(container)
 
-    def values_for_dispatch(self) -> dict[str, Any]:
-        """`parameter_values`, with each list as the node reads it and without its rows, to send with `ExecuteNodeRequest`.
+    def has_connected_rows(self, parameter: Parameter) -> bool:
+        """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
 
-        A worker copy has no rows and builds its own, with new names, from the list.
+        Checked only when there are rows: on a worker the question goes to the orchestrator.
         """
-        node = self._node
-        values = dict(node.parameter_values)
-        for parameter in node.parameters:
-            if not isinstance(parameter, ParameterList):
-                continue
-            rows = parameter.get_child_parameters()
-            if parameter.name not in values and not rows:
-                continue
-            values[parameter.name] = node._get_raw_parameter_value(parameter.name)
-            for row in rows:
-                values.pop(row.name, None)
-        return values
+        if not isinstance(parameter, ParameterList):
+            return False
+        rows = parameter.get_child_parameters()
+        if not rows:
+            return False
+        return bool(self._connected_parameter_names({row.name for row in rows}))
 
     def _replace(self, parameter_list: ParameterList, items: Any) -> None:
-        """Replace the list's rows with one row per item, the way the editor fills a list.
+        """Replace the list's rows with one row per entry of `items`, the way the editor fills a list.
+
+        An entry that is itself a list of items fills one row, and counts as its items toward `max_items`.
 
         Each row is set through `set_parameter_value`, so the node's hooks fire for each one. If an item
         is rejected, the old rows are put back and the error is raised.
@@ -180,12 +188,12 @@ class ListRows:
             msg = f"Attempted to set list {list_label}. Failed because a list can only be set to a list, but got a value of type '{type(items).__name__}'."
             raise TypeError(msg)
         max_items = parameter_list.max_items
-        if max_items is not None and len(items) > max_items:
-            msg = f"Attempted to set list {list_label} to {len(items)} items. Failed because the list holds at most {max_items} items."
+        item_count = _item_count(parameter_list, items)
+        if max_items is not None and item_count > max_items:
+            msg = f"Attempted to set list {list_label} to {item_count} items, counting the items of any list in it. Failed because the list holds at most {max_items} items."
             raise ValueError(msg)
         old_rows = parameter_list.get_child_parameters()
-        # Checked only when there are rows: on a worker the question goes to the orchestrator.
-        if old_rows and self._connected_parameter_names({row.name for row in old_rows}):
+        if self.has_connected_rows(parameter_list):
             msg = f"Attempted to set list {list_label}. Failed because some of its items are connected to other nodes, and replacing the items would remove those connections. Disconnect them first."
             raise ValueError(msg)
 
@@ -200,13 +208,18 @@ class ListRows:
             for item in items:
                 row = parameter_list.add_child_parameter()
                 node.set_parameter_value(row.name, item)
-            self._notify(parameter_list, initial_setup=False)
+            self._notify(parameter_list)
         except Exception:
             # Converters, validators and hooks may raise anything. Undo, then let it propagate unchanged.
             self._restore(parameter_list, old_rows, old_values)
             raise
         finally:
             self._being_replaced.discard(parameter_list.name)
+
+    def _container_of(self, parameter: Parameter) -> BaseNodeElement | None:
+        if parameter.parent_container_name is None:
+            return None
+        return self._node.get_parameter_by_name(parameter.parent_container_name)
 
     def _restore(self, parameter_list: ParameterList, rows: list[Parameter], values: dict[str, Any]) -> None:
         """Put back the rows `_replace` removed, with their values, and remove the ones it added."""
@@ -219,7 +232,7 @@ class ListRows:
         # Restored without running hooks, which could raise again and hide the error being undone.
         node.parameter_values.update(values)
 
-    def _notify(self, container: ParameterContainer, *, initial_setup: bool) -> None:
+    def _notify(self, container: ParameterContainer) -> None:
         """Run the container's validators and hooks on the value its rows now build.
 
         Its converters don't run: each row ran them on its own item. The value isn't stored, since
@@ -230,11 +243,10 @@ class ListRows:
         for validator in container.validators:
             validator(container, value)
         node._also_record_as_result(container, value)
-        if initial_setup:
-            return
         with self.hooks_running(container.name):
             node.before_value_set(parameter=container, value=value)
-            node.after_value_set(parameter=container, value=value)
+            with node._reporting_state_set_by("after_value_set"):
+                node.after_value_set(parameter=container, value=value)
 
     def _warn_hook_write(self, parameter: ParameterList, value: Any) -> None:
         """Warn, once per list, that a hook's write to it was ignored. Silent when it wouldn't change anything."""
@@ -275,6 +287,18 @@ def handle_container_parameter(current_node: BaseNode, parameter: ParameterConta
         # would put a live object in it and send it to a worker as JSON. The node still sees objects:
         # its read resolves the whole list on the way out.
         value = current_node._get_raw_parameter_value(child.name)
-        if value is not None:
-            build_parameter_value.append(value)
+        build_parameter_value.extend(_items_of_row(parameter, value))
     return build_parameter_value
+
+
+def _item_count(parameter_list: ParameterList, entries: list[Any]) -> int:
+    """How many items the list holds with one row per entry."""
+    return sum(len(_items_of_row(parameter_list, entry)) for entry in entries)
+
+
+def _items_of_row(container: ParameterContainer, value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(container, ParameterList) and container.row_value_is_items(value):
+        return [item for item in value if item is not None]
+    return [value]

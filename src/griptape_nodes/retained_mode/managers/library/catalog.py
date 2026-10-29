@@ -283,10 +283,16 @@ class LibraryCatalog(EngineScoped):
         snapshot_list = library.get_registered_nodes()
         event_copy = snapshot_list.copy()
 
+        # Registered metadata only, so node modules that deferred registration has not imported stay unimported.
+        node_metadata = None
+        if request.include_metadata:
+            node_metadata = {node_type: library.get_node_metadata(node_type) for node_type in event_copy}
+
         details = f"Successfully retrieved the list of node types in the Library named '{request.library}'."
 
         result = ListNodeTypesInLibraryResultSuccess(
             node_types=event_copy,
+            node_metadata=node_metadata,
             result_details=details,
         )
         return result

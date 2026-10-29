@@ -6,7 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError
+from griptape_nodes.common.node_executor import ExecuteNodeFailedError, node_error_details_for
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
@@ -33,12 +33,13 @@ from griptape_nodes.retained_mode.events.execution_events import (
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
 )
-from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails, build_node_error_details
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
 from griptape_nodes.serialization.values import encode_for_display
+from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
@@ -51,13 +52,6 @@ logger = logging.getLogger("griptape_nodes")
 # How long a driver waits on the new-work flag when it has nothing running and nothing it
 # can dispatch. Short enough to stay responsive, long enough not to busy-loop.
 _IDLE_RECHECK_SECONDS = 0.05
-
-
-def _node_error_details(node_name: str, exc: BaseException) -> NodeErrorDetails:
-    """Use the details built where the node failed, or build them from an engine exception that never became a result."""
-    if isinstance(exc, ExecuteNodeFailedError):
-        return exc.details
-    return build_node_error_details(node_name, exc)
 
 
 class NodeStatesResult(NamedTuple):
@@ -703,7 +697,7 @@ class ExecuteDagState(State):
                             payload=NodeErrorEvent(
                                 node_name=error_node_name,
                                 error_message=str(e),
-                                error=_node_error_details(error_node_name, e),
+                                error=node_error_details_for(error_node_name, e),
                             )
                         )
                     )
@@ -722,7 +716,9 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            check_result = validate_node(node_reference.node_reference)
+            # In a thread, so a slow check (an ffprobe of a large or remote file) doesn't freeze the
+            # editor and other flows. This node still waits for its result before it runs.
+            check_result = await async_utils.to_thread(validate_node, node_reference.node_reference)
             exceptions = check_result.errors
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
@@ -877,7 +873,7 @@ class ExecuteDagState(State):
                                 payload=NodeErrorEvent(
                                     node_name=node_name,
                                     error_message=str(exc),
-                                    error=_node_error_details(node_name, exc),
+                                    error=node_error_details_for(node_name, exc),
                                     run_seconds=dag_node.run_seconds,
                                 )
                             )
@@ -1033,7 +1029,7 @@ class ErrorState(State):
                         payload=NodeErrorEvent(
                             node_name=node_name,
                             error_message=str(exc),
-                            error=_node_error_details(node_name, exc),
+                            error=node_error_details_for(node_name, exc),
                             run_seconds=dag_node.run_seconds,
                         )
                     )

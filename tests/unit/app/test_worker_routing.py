@@ -16,9 +16,10 @@ These tests pin down the two invariants that replaced the old
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -53,13 +54,18 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     GetPathForMacroRequest,
     GetSituationRequest,
+    SetCurrentProjectRequest,
+    SetCurrentProjectResultSuccess,
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
 
 @dataclass(kw_only=True)
@@ -460,3 +466,137 @@ class TestDropLocalObjectsHandler:
         assert isinstance(result, DropLocalObjectsResultSuccess)
         assert released == []
         assert engine.resource_manager.get_local_object(key, owner="Lib A") is not None
+
+
+@pytest.fixture
+def engine_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """A running loop on its own thread, standing in for the worker's engine loop beside the test's own."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="engine-loop", daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join()
+    loop.close()
+
+
+def _bind_queue_to(event_manager: EventManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Initialize the event queue on `loop`, which is what makes it the engine loop."""
+
+    async def initialize() -> None:
+        event_manager.initialize_queue()
+
+    asyncio.run_coroutine_threadsafe(initialize(), loop).result()
+
+
+def _route_probe_through_a_remote_handler(event_manager: EventManager) -> None:
+    """Install `_ProbeRequest` the way a worker installs every forwarded type: behind a RemoteHandler."""
+
+    async def original(request: _ProbeRequest) -> _ProbeResult:
+        return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
+
+    event_manager.assign_manager_to_request_type(
+        _ProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
+    )
+
+
+class _ProjectManagerThatRequestsSynchronously:
+    """Adopts by sending a request through sync `handle_request`, as workflow registration does."""
+
+    def __init__(self, event_manager: EventManager) -> None:
+        self._event_manager = event_manager
+        self.adopted_on_thread: str | None = None
+        self.probe_succeeded: bool | None = None
+
+    def is_stale_adoption(self, project_id: str, generation: int) -> bool:  # noqa: ARG002
+        return False
+
+    async def ensure_project_loaded(self, project_id: str) -> bool:  # noqa: ARG002
+        return True
+
+    async def on_set_current_project_request(self, request: SetCurrentProjectRequest) -> SetCurrentProjectResultSuccess:  # noqa: ARG002
+        self.adopted_on_thread = threading.current_thread().name
+        probe_result = self._event_manager.handle_request(_ProbeRequest(marker="sync", broadcast_result=False))
+        self.probe_succeeded = probe_result.succeeded()
+        return SetCurrentProjectResultSuccess(result_details="ok")
+
+    def record_adopted_generation(self, generation: int) -> None:
+        pass
+
+
+def _install_adoption(
+    event_manager: EventManager, project_manager: _ProjectManagerThatRequestsSynchronously
+) -> asyncio.Event:
+    return register_broadcast_handlers(
+        event_manager,
+        config_manager=MagicMock(),
+        secrets_manager=MagicMock(),
+        project_manager=cast("ProjectManager", project_manager),
+    )
+
+
+def _configure_forwarding_on_this_loop(event_manager: EventManager) -> None:
+    """Make the calling loop the worker's websocket loop, the one that receives ActivateProjectRequest."""
+    event_manager.configure_worker_forwarding(
+        request_client=MagicMock(),
+        orchestrator_request_topic="orchestrator",
+        worker_response_topic="worker",
+        websocket_event_loop=asyncio.get_running_loop(),
+    )
+
+
+class TestActivateProjectRunsOnTheEngineLoop:
+    """Adoption arrives on the websocket loop, which answers heartbeats, so it must not run there."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_an_adoption_that_requests_synchronously_completes(
+        self, engine: Engine, engine_loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Run on the websocket loop, this adoption blocked that loop waiting on itself (#5946)."""
+        event_manager = engine.event_manager
+        _bind_queue_to(event_manager, engine_loop)
+        _configure_forwarding_on_this_loop(event_manager)
+        _route_probe_through_a_remote_handler(event_manager)
+        project_manager = _ProjectManagerThatRequestsSynchronously(event_manager)
+        worker_settled = _install_adoption(event_manager, project_manager)
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+
+        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+
+        assert result.succeeded()
+        assert project_manager.adopted_on_thread == "engine-loop"
+        assert project_manager.probe_succeeded is True
+        assert worker_settled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_without_an_engine_loop_adoption_is_refused(self, engine: Engine) -> None:
+        event_manager = engine.event_manager
+        assert event_manager.event_loop is None
+        project_manager = _ProjectManagerThatRequestsSynchronously(event_manager)
+        worker_settled = _install_adoption(event_manager, project_manager)
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+
+        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+
+        assert result.failed()
+        assert project_manager.adopted_on_thread is None
+        assert not worker_settled.is_set()
+
+
+class TestSyncDispatchOnTheWebsocketLoop:
+    """Blocking on a RemoteHandler from the loop it is dispatched to can never return."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_it_fails_instead_of_hanging(self, engine: Engine) -> None:
+        event_manager = engine.event_manager
+        _configure_forwarding_on_this_loop(event_manager)
+        _route_probe_through_a_remote_handler(event_manager)
+
+        result_event = event_manager.handle_request(_ProbeRequest(marker="sync", broadcast_result=False))
+
+        assert not result_event.succeeded()
+        assert "synchronously on the websocket event loop" in str(result_event.result.result_details)

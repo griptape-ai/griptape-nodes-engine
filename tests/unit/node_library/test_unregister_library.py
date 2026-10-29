@@ -8,6 +8,9 @@ import pytest
 
 from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry, LibrarySchema
+from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+from griptape_nodes.retained_mode.events.execution_events import NodeFinishProcessEvent
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 
 def _make_schema(name: str = "TestLib") -> LibrarySchema:
@@ -80,6 +83,38 @@ class TestUnregisterLibraryEventManagerCleanup:
 
         event_manager.remove_listener_for_app_event.assert_called_once_with(str, listener)
 
+    def test_execution_event_listeners_are_deregistered(self) -> None:
+        listener = MagicMock()
+        library = _register_library()
+        library._registered_execution_event_listeners.append((str, listener))
+
+        event_manager = MagicMock()
+        LibraryRegistry.unregister_library("TestLib", event_manager=event_manager)
+
+        event_manager.remove_listener_for_execution_event.assert_called_once_with(str, listener)
+
+    def test_listeners_listed_twice_still_unregister_cleanly(self) -> None:
+        """A library may list the same listener twice: it is subscribed once but tracked twice.
+
+        The second removal finds nothing to remove. It must not raise, or unregistering stops
+        before the library leaves the registry.
+        """
+        event_manager = EventManager()
+
+        def listener(_payload: object) -> None:
+            return
+
+        library = _register_library()
+        for _ in range(2):
+            event_manager.add_listener_to_app_event(ConfigChanged, listener)
+            library._registered_app_event_listeners.append((ConfigChanged, listener))
+            event_manager.add_listener_to_execution_event(NodeFinishProcessEvent, listener)
+            library._registered_execution_event_listeners.append((NodeFinishProcessEvent, listener))
+
+        LibraryRegistry.unregister_library("TestLib", event_manager=event_manager)
+
+        assert "TestLib" not in LibraryRegistry()._libraries
+
     def test_pre_dispatch_hooks_are_deregistered(self) -> None:
         hook = MagicMock()
         library = _register_library()
@@ -123,6 +158,7 @@ class TestUnregisterLibraryEventManagerCleanup:
         library = _register_library()
         library._registered_request_handler_types.append(str)
         library._registered_app_event_listeners.append((str, MagicMock()))
+        library._registered_execution_event_listeners.append((str, MagicMock()))
         library._registered_pre_dispatch_hooks.append(MagicMock())
         library._registered_post_dispatch_hooks.append((str, MagicMock()))
 
@@ -132,6 +168,7 @@ class TestUnregisterLibraryEventManagerCleanup:
         # Library object still exists locally; check fields are cleared
         assert library._registered_request_handler_types == []
         assert library._registered_app_event_listeners == []
+        assert library._registered_execution_event_listeners == []
         assert library._registered_pre_dispatch_hooks == []
         assert library._registered_post_dispatch_hooks == []
 

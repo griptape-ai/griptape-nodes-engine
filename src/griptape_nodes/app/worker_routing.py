@@ -35,18 +35,11 @@ from typing import TYPE_CHECKING, Any, TypeGuard, cast
 from griptape_nodes.retained_mode.events import artifact_events, os_events
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
-    ResultDetails,
     ResultPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
     SkipTheLineMixin,
     WorkflowNotAlteredMixin,
-)
-from griptape_nodes.retained_mode.events.connection_events import (
-    CreateConnectionRequest,
-    CreateConnectionResultFailure,
-    DeleteConnectionRequest,
-    DeleteConnectionResultFailure,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
@@ -54,23 +47,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 )
 from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
-    AddParameterGroupToNodeRequest,
-    AddParameterGroupToNodeResultFailure,
-    AddParameterToNodeRequest,
-    AddParameterToNodeResultFailure,
-    AlterParameterDetailsRequest,
-    AlterParameterDetailsResultFailure,
-    AlterParameterGroupDetailsRequest,
-    AlterParameterGroupDetailsResultFailure,
     MigrateParameterRequest,
-    RemoveParameterFromNodeRequest,
-    RemoveParameterFromNodeResultFailure,
-    RenameParameterRequest,
-    RenameParameterResultFailure,
-    ReorderParameterListItemRequest,
-    ReorderParameterListItemResultFailure,
-    SetParameterValueRequest,
-    SetParameterValueResultFailure,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
@@ -102,7 +79,7 @@ from griptape_nodes.utils.async_utils import call_function, to_thread
 logger = logging.getLogger("griptape_nodes")
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Coroutine, Iterator
     from types import ModuleType
 
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
@@ -432,37 +409,6 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 )
 
 
-# Requests that change a node's parameters or connections, with the failure each is answered with when
-# refused. Some value hooks send these to edit their own node, and hydration replays every value through
-# those hooks, so on a worker the replay would repeat on the orchestrator's node an edit it already made.
-_NODE_EDIT_REQUESTS: dict[type[RequestPayload], type[ResultPayloadFailure]] = {
-    CreateConnectionRequest: CreateConnectionResultFailure,
-    DeleteConnectionRequest: DeleteConnectionResultFailure,
-    SetParameterValueRequest: SetParameterValueResultFailure,
-    AddParameterToNodeRequest: AddParameterToNodeResultFailure,
-    RemoveParameterFromNodeRequest: RemoveParameterFromNodeResultFailure,
-    AlterParameterDetailsRequest: AlterParameterDetailsResultFailure,
-    RenameParameterRequest: RenameParameterResultFailure,
-    ReorderParameterListItemRequest: ReorderParameterListItemResultFailure,
-    AddParameterGroupToNodeRequest: AddParameterGroupToNodeResultFailure,
-    AlterParameterGroupDetailsRequest: AlterParameterGroupDetailsResultFailure,
-}
-
-_NODE_NAME_FIELDS = ("node_name", "source_node_name", "target_node_name")
-
-
-def edits_node(request: RequestPayload, node_name: str) -> bool:
-    """Whether `request` changes the parameters or connections of `node_name`.
-
-    A name left as None means the current context's node, which on the orchestrator is not one this worker
-    holds, so it counts as the node being rebuilt.
-    """
-    if type(request) not in _NODE_EDIT_REQUESTS:
-        return False
-    named = [getattr(request, field) for field in _NODE_NAME_FIELDS if hasattr(request, field)]
-    return any(name is None or name == node_name for name in named)
-
-
 @dataclass
 class RemoteHandler:
     """Worker-side dispatch shim.
@@ -471,7 +417,8 @@ class RemoteHandler:
     LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
-    During hydration it refuses requests that edit the node being rebuilt (see ``edits_node``).
+    A worker rebuilding its copy of a node never reaches this shim: inside
+    ``EventManager.rebuild_scope`` the dispatcher calls ``original`` directly.
 
     ``original`` is the handler this shim replaced and MUST be retained so the
     out-of-scope fallback can still service requests that bootstrap code makes
@@ -484,22 +431,9 @@ class RemoteHandler:
 
     async def __call__(self, request: RequestPayload) -> ResultPayload:
         if self.event_manager.in_node_execution():
-            rebuilding = self.event_manager.hydrating_node_name()
-            if rebuilding is not None and edits_node(request, rebuilding):
-                return self._refuse(request, rebuilding)
             event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
             return cast("ResultPayload", event_result.result)
         return await call_function(self.original, request)
-
-    @staticmethod
-    def _refuse(request: RequestPayload, node_name: str) -> ResultPayload:
-        details = (
-            f"Attempted to send {type(request).__name__} for node '{node_name}' to the orchestrator while "
-            "setting up that node to run in this process. Failed because the orchestrator already made that "
-            "edit when the value was first set, so it was not sent again."
-        )
-        failure_type = _NODE_EDIT_REQUESTS[type(request)]
-        return failure_type(result_details=ResultDetails(message=details, level=logging.WARNING))
 
 
 def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:
@@ -606,6 +540,37 @@ async def _handle_drop_local_objects(
     return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
 
 
+async def _adopt_on_engine_loop(
+    request: ActivateProjectRequest,
+    adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
+    *,
+    event_manager: EventManager,
+    worker_settled: asyncio.Event,
+) -> ResultPayload:
+    """Run `adopt` on the engine loop, and settle the worker once it succeeds.
+
+    ActivateProjectRequest arrives on the transport loop, which also answers heartbeats. Adoption is a
+    whole project switch, with file I/O and synchronous requests that block the loop they run on, so it
+    runs on the engine loop and is only awaited here.
+    """
+    engine_loop = event_manager.event_loop
+    if engine_loop is None:
+        details = (
+            f"Attempted to adopt orchestrator project '{request.project_id}'. "
+            f"Failed because this worker's engine event loop is not running."
+        )
+        return ActivateProjectResultFailure(result_details=details)
+
+    adoption = asyncio.run_coroutine_threadsafe(adopt(request), engine_loop)
+    result = await asyncio.wrap_future(adoption)
+
+    # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
+    # safe to set from another thread.
+    if result.succeeded():
+        worker_settled.set()
+    return result
+
+
 def register_broadcast_handlers(
     event_manager: EventManager,
     *,
@@ -659,6 +624,11 @@ def register_broadcast_handlers(
     adoption_lock = asyncio.Lock()
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
+        return await _adopt_on_engine_loop(
+            request, _adopt_project, event_manager=event_manager, worker_settled=worker_settled
+        )
+
+    async def _adopt_project(request: ActivateProjectRequest) -> ResultPayload:
         # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
         # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
         # refreshes the user layer idempotently.
@@ -671,7 +641,6 @@ def register_broadcast_handlers(
             if project_manager.is_stale_adoption(request.project_id, request.generation):
                 # Settled, not adopted: a newer activation already landed, so whatever is waiting
                 # on this has the answer it needs.
-                worker_settled.set()
                 return ActivateProjectResultSuccess(
                     result_details=(
                         f"Skipped adopting project '{request.project_id}' (generation "
@@ -696,7 +665,6 @@ def register_broadcast_handlers(
                 )
                 return ActivateProjectResultFailure(result_details=details)
             project_manager.record_adopted_generation(request.generation)
-            worker_settled.set()
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)

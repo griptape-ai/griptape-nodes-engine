@@ -13,6 +13,7 @@ from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
 from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationProblem
 from .engine_version_error_problem import EngineVersionErrorProblem
+from .execution_event_listener_registration_problem import ExecutionEventListenerRegistrationProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
 from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
@@ -61,6 +62,7 @@ __all__ = [
     "DuplicateNodeRegistrationProblem",
     "DuplicateWidgetRegistrationProblem",
     "EngineVersionErrorProblem",
+    "ExecutionEventListenerRegistrationProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
     "InvalidBetaFeatureProblem",

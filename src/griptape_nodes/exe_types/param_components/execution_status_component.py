@@ -27,6 +27,7 @@ class ExecutionStatusComponent:
         parameter_group_initially_collapsed: bool = True,
         result_details_tooltip: str = "Details about the operation result",
         result_details_placeholder: str = "Details on the operation will be presented here.",
+        result_details_allow_variable_substitution: bool = True,
     ) -> None:
         """Initialize the ExecutionStatusComponent and create the parameters immediately.
 
@@ -37,6 +38,8 @@ class ExecutionStatusComponent:
             parameter_group_initially_collapsed: Whether the Status group should start collapsed
             result_details_tooltip: Custom tooltip for result_details parameter
             result_details_placeholder: Custom placeholder text for result_details parameter
+            result_details_allow_variable_substitution: Whether {VAR} tokens in result_details are substituted
+                at execution time
         """
         self._node = node
 
@@ -62,6 +65,7 @@ class ExecutionStatusComponent:
             default_value=None,
             allowed_modes=result_details_modes,
             settable=False,
+            allow_variable_substitution=result_details_allow_variable_substitution,
             ui_options={
                 "multiline": True,
                 "placeholder_text": result_details_placeholder,

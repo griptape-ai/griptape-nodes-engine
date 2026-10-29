@@ -145,15 +145,22 @@ class ListNodeTypesInLibraryRequest(RequestPayload):
     """List all node types available in a specific library.
 
     Use when: Discovering available nodes, building node creation UIs,
-    validating node types, exploring library contents.
+    validating node types, exploring library contents. Set include_metadata when choosing
+    which node types to create: it adds each type's category, display name, description,
+    and deprecation, read from the library's registered metadata, so no node code loads.
+    To survey every library in one round trip, send one request per library from
+    ListRegisteredLibrariesRequest in an EventRequestBatch. For a node type's parameters,
+    follow up with DescribeNodeTypeRequest.
 
     Args:
         library: Name of the library to list node types for
+        include_metadata: Also return each node type's metadata in node_metadata
 
     Results: ListNodeTypesInLibraryResultSuccess (with node types) | ListNodeTypesInLibraryResultFailure (library not found)
     """
 
     library: str
+    include_metadata: bool = False
 
 
 @dataclass
@@ -162,10 +169,13 @@ class ListNodeTypesInLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayload
     """Node types in library listed successfully.
 
     Args:
-        node_types: List of node type names available in the library
+        node_types: List of node type names available in the library, in registration order
+        node_metadata: Each node type's metadata, keyed by node type name, when the request
+            set include_metadata; otherwise None
     """
 
     node_types: list[str]
+    node_metadata: dict[str, NodeMetadata] | None = None
 
 
 @dataclass
@@ -442,7 +452,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                          sees in their config. None for libraries registered through other
                          channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
+                    Also None when the request set `include_git_info` to False.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+                 Also None when the request set `include_git_info` to False.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
         is_registered: Whether a library of this name is in the LibraryRegistry right now.
                        Metadata is derived from config while the registry holds what actually
@@ -525,7 +537,14 @@ class LoadMetadataForAllLibrariesRequest(RequestPayload):
 
     Provides a lightweight way to discover all available libraries and their schemas
     without the overhead of importing Python modules or registering them in the system.
+
+    Args:
+        include_git_info: Whether to look up each library's `git_remote` and `git_ref`. The lookup
+                          costs several git subprocesses per library, so callers that only need
+                          the schemas should pass False; both fields are then None.
     """
+
+    include_git_info: bool = True
 
 
 @dataclass

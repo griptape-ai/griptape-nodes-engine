@@ -11,6 +11,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.list_rows import ListRows
+from griptape_nodes.exe_types.node_loading import node_loading
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState, aprocess_scope
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -165,6 +166,34 @@ class TestWholeListSetOnAnUnconnectedList:
         assert isinstance(result, SetParameterValueResultFailure)
         assert node.get_parameter_value("items") == ["a"]
 
+    def test_a_nested_list_adds_its_items(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+
+        result = _set_items(engine, [["a", "b"], "c"])
+
+        assert isinstance(result, SetParameterValueResultSuccess)
+        assert node.get_parameter_value("items") == ["a", "b", "c"]
+        assert [node.get_parameter_value(row.name) for row in _rows(node)] == [["a", "b"], "c"]
+
+    def test_more_items_than_max_items_after_nested_lists_is_rejected_and_keeps_the_rows(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        node = _add(engine, _ListNode(name="Lister", max_items=2), flow_name)
+        _set_items(engine, ["a"])
+
+        result = _set_items(engine, [["x", "y"], "z"])
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert "Attempted to set list 'Lister.items' to 3 items" in str(result.result_details)
+        assert node.get_parameter_value("items") == ["a"]
+
+    def test_a_row_holding_a_list_validates_each_item(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+        row = _add_row(engine, "a")
+
+        with pytest.raises(ValueError, match="bad item"):
+            node.set_parameter_value(row, ["ok", "bad"])
+
     def test_clearing_a_resolved_node_unresolves_it(self, engine: Engine, flow_name: str) -> None:
         """No row is set when the list is cleared, so the row path cannot be what unresolves the node."""
         node = _add(engine, _ListNode(name="Lister"), flow_name)
@@ -215,6 +244,61 @@ class TestWholeListSetOnAnUnconnectedList:
 
         assert isinstance(result, SetParameterValueResultFailure)
         assert _rows(node) == [row]
+
+
+class TestMaxItemsWhenARowChanges:
+    def test_a_row_set_over_max_items_is_rejected_and_keeps_its_value(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister", max_items=4), flow_name)
+        _set_items(engine, ["a", "b"])
+        row = _rows(node)[0]
+
+        result = engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name=row.name, value=["w", "x", "y", "z"])
+        )
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert node.get_parameter_value("items") == ["a", "b"]
+
+    def test_a_row_set_up_to_max_items_is_accepted(self, engine: Engine, flow_name: str) -> None:
+        node = _add(engine, _ListNode(name="Lister", max_items=4), flow_name)
+        _set_items(engine, ["a", "b"])
+        row = _rows(node)[0]
+
+        result = engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name=row.name, value=["x", "y", "z"])
+        )
+
+        assert isinstance(result, SetParameterValueResultSuccess)
+        assert node.get_parameter_value("items") == ["x", "y", "z", "b"]
+
+    def test_a_value_over_a_connection_is_rejected_too(self, engine: Engine, flow_name: str) -> None:
+        _add(engine, _Source(name="Source"), flow_name)
+        node = _add(engine, _ListNode(name="Lister", max_items=2), flow_name)
+        _set_items(engine, ["a"])
+        row = _rows(node)[0]
+        engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="out",
+                target_node_name="Lister",
+                target_parameter_name=row.name,
+            )
+        )
+        before = node.get_parameter_value("items")
+
+        result = engine.handle_request(
+            SetParameterValueRequest(
+                node_name="Lister",
+                parameter_name=row.name,
+                value=["x", "y", "z"],
+                data_type="list[str]",
+                incoming_connection_source_node_name="Source",
+                incoming_connection_source_parameter_name="out",
+            )
+        )
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert node.get_parameter_value("items") == before
 
 
 class TestValuesThatAreNotLists:
@@ -303,7 +387,7 @@ def _get_items(engine: Engine) -> object:
     return result.value
 
 
-def _add_row(engine: Engine, value: str) -> str:
+def _add_row(engine: Engine, value: str | list[str]) -> str:
     added = engine.handle_request(AddParameterToNodeRequest(node_name="Lister", parent_container_name="items"))
     assert isinstance(added, AddParameterToNodeResultSuccess)
     engine.handle_request(
@@ -343,13 +427,6 @@ class TestTheListFollowsItsRows:
         _set_items(engine, ["a", "b"])
 
         assert _rows(node) == []
-
-    def test_a_worker_is_sent_the_list_its_node_reads(self, engine: Engine, flow_name: str) -> None:
-        """A workflow saved before the list followed its rows can hold items whose rows are gone."""
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        node.parameter_values["items"] = ["removed"]
-
-        assert node._list_rows.values_for_dispatch()["items"] == []
 
 
 class TestLoadingASavedWorkflow:
@@ -408,6 +485,20 @@ class TestItemConverters:
 
         assert [node.get_parameter_value(row.name) for row in _rows(node)] == ["A", "B"]
         assert _get_items(engine) == ["A", "B"]
+
+    def test_a_row_holding_a_list_converts_each_item(self, engine: Engine, flow_name: str) -> None:
+        _add(engine, _ConvertingListNode(name="Lister"), flow_name)
+
+        _add_row(engine, ["a", "b"])
+
+        assert _get_items(engine) == ["A", "B"]
+
+    def test_a_whole_list_with_a_nested_list_converts_each_item(self, engine: Engine, flow_name: str) -> None:
+        _add(engine, _ConvertingListNode(name="Lister"), flow_name)
+
+        _set_items(engine, [["a", "b"], "c"])
+
+        assert _get_items(engine) == ["A", "B", "C"]
 
     def test_a_row_set_by_the_editor_converts(self, engine: Engine, flow_name: str) -> None:
         _add(engine, _ConvertingListNode(name="Lister"), flow_name)
@@ -568,28 +659,6 @@ class TestItemConvertersRunOncePerItem:
         assert _get_items(engine) == ["[a]", "[b]"]
 
 
-class TestDispatch:
-    def test_a_list_is_sent_without_its_rows(self, engine: Engine, flow_name: str) -> None:
-        """A worker builds its own rows, with new names, from the list."""
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        rows = [_add_row(engine, value) for value in ("a", "b")]
-
-        values = node._list_rows.values_for_dispatch()
-
-        assert values["items"] == ["a", "b"]
-        assert not set(rows) & set(values)
-
-    def test_a_list_built_from_its_rows_is_sent(self, engine: Engine, flow_name: str) -> None:
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        row = _add_row(engine, "a")
-        assert "items" not in node.parameter_values
-
-        values = node._list_rows.values_for_dispatch()
-
-        assert values["items"] == ["a"]
-        assert row not in values
-
-
 class TestFillingRowsOnACopyWithNone:
     def test_it_does_not_ask_about_connections_to_rows_it_does_not_have(self, engine: Engine, flow_name: str) -> None:
         """On a worker that question goes to the orchestrator, so it costs a round trip."""
@@ -742,36 +811,76 @@ class TestAHookWritingItsList:
         assert "from a value hook" not in caplog.text
 
 
-class TestAWorkerFillingItsCopy:
-    @pytest.fixture
-    def worker(self, engine: Engine) -> object:
-        engine.library_manager._is_worker = True
-        yield
-        engine.library_manager._is_worker = False
+class TestLoadingAWholeList:
+    """A load (a workflow opening, a paste, a worker's copy) stores a whole list as it stores any value.
 
-    @pytest.mark.usefixtures("worker")
-    @pytest.mark.parametrize("items", [["a", "b", "c"], []])
-    def test_does_not_ask_the_orchestrator_about_connections(
-        self, engine: Engine, flow_name: str, items: list[str]
-    ) -> None:
+    The load may make the list's connection after its values, or never, as in a worker's copy, so whether
+    the list is connected is not asked while it loads. A save writes a whole list only for a list a
+    connection fed; any other list's rows arrive as values of their own.
+    """
+
+    def test_is_stored_without_asking_whether_the_list_is_connected(self, engine: Engine, flow_name: str) -> None:
         node = _add(engine, _ListNode(name="Lister"), flow_name)
 
         with patch.object(BaseNode, "_param_has_incoming_connection", return_value=False) as asked:
-            failure = engine.node_manager._apply_hydrated_values(node, "Lister", {"items": items})
+            result = engine.handle_request(
+                SetParameterValueRequest(
+                    node_name="Lister", parameter_name="items", value=["a", "b"], initial_setup=True
+                )
+            )
 
-        assert failure is None
+        assert isinstance(result, SetParameterValueResultSuccess), result
         asked.assert_not_called()
-        assert node.get_parameter_value("items") == items
+        assert node.parameter_values["items"] == ["a", "b"]
+        assert _rows(node) == []
 
-    @pytest.mark.usefixtures("worker")
-    def test_a_connected_list_over_max_items_runs_with_every_item(self, engine: Engine, flow_name: str) -> None:
-        """The orchestrator warns and runs with the whole list, so the worker must too."""
+    def test_more_items_than_max_items_are_kept(self, engine: Engine, flow_name: str) -> None:
+        """Only a connection delivers more items than fit, and the orchestrator runs with all of them."""
         node = _add(engine, _ListNode(name="Lister", max_items=2), flow_name)
 
-        with patch.object(BaseNode, "_param_has_incoming_connection", return_value=True):
-            failure = engine.node_manager._apply_hydrated_values(node, "Lister", {"items": ["a", "b", "c"]})
+        result = engine.handle_request(
+            SetParameterValueRequest(
+                node_name="Lister", parameter_name="items", value=["a", "b", "c"], initial_setup=True
+            )
+        )
+
+        assert isinstance(result, SetParameterValueResultSuccess), result
+        assert node.parameter_values["items"] == ["a", "b", "c"]
+        assert _rows(node) == []
+
+    def test_is_read_whole_while_its_node_loads(self, engine: Engine, flow_name: str) -> None:
+        """Code that runs as the node loads reads the value it was given, not rows it does not have yet."""
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+        node.parameter_values["items"] = ["a", "b"]
+
+        with (
+            patch.object(BaseNode, "_param_has_incoming_connection", return_value=False) as asked,
+            node_loading("Lister"),
+        ):
             value = node.get_parameter_value("items")
 
-        assert failure is None
-        assert value == ["a", "b", "c"]
-        assert _rows(node) == []
+        asked.assert_not_called()
+        assert value == ["a", "b"]
+
+    def test_an_unconnected_list_is_read_from_its_rows_once_loaded(self, engine: Engine, flow_name: str) -> None:
+        """A list stored beside rows that no longer hold it, as an older save can, is not what the node reads."""
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+
+        engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name="items", value=["removed"], initial_setup=True)
+        )
+
+        assert node.get_parameter_value("items") == []
+
+    def test_loading_its_rows_does_not_notify_the_list(self, engine: Engine, flow_name: str) -> None:
+        """Whether the rows are what the list holds depends on a connection the load may not have made yet."""
+        node = _add(engine, _ListHookNode(name="Lister"), flow_name)
+        row = _add_row(engine, "")
+        node.seen_lists.clear()
+
+        engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name=row, value="loaded", initial_setup=True)
+        )
+
+        assert node.seen_lists == []
+        assert _get_items(engine) == ["[loaded]"]

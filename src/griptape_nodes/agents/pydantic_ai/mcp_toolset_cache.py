@@ -20,7 +20,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
-from griptape_nodes.agents.pydantic_ai.mcp_servers import disconnect_transport, mcp_server_from_config
+from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    disconnect_transport,
+    mcp_server_from_config,
+    require_user_tool_approval,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -188,9 +192,10 @@ class MCPToolsetCache:
         built = mcp_server_from_config(name, config)
         if built is None:
             return None
+        # This cache feeds only the chat sidebar, so it is where user servers get their approval gate.
         entry = _Entry(
             name=name,
-            toolset=built.toolset,
+            toolset=require_user_tool_approval(built.toolset),
             transport=built.transport,
             connection_fingerprint=connection,
         )

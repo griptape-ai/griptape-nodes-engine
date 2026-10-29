@@ -146,10 +146,8 @@ Two practical implications:
 
 - **Pass data into nodes via parameters; don't fetch flow state
     during execution.** Reading connection or peer-node state from
-    inside `process` (or from `before_value_set` /
-    `after_value_set`, which run during input hydration on the same
-    scope) works, but each read is a round-trip to the orchestrator
-    and the answer is stale as soon as it arrives.
+    inside `process` works, but each read is a round-trip to the
+    orchestrator and the answer is stale as soon as it arrives.
 - **Requests are the sanctioned boundary**, for reads and writes
     alike. Emit the corresponding request
     (`SetParameterValueRequest`, `AddParameterToNodeRequest`,
@@ -172,20 +170,35 @@ restrictions on containers and cross-library wires.
 
 ## Lifecycle changes you need to know
 
-### Each `ExecuteNodeRequest` constructs a fresh node
+### Each `ExecuteNodeRequest` loads a fresh copy of your node
 
-The worker materializes a transient node from request metadata, runs
-`process`, and discards it. **Your node holds no in-memory state
-between calls.** This is the single most surprising thing an author
-hits, and it is true on every execute: the worker-side node that ran
-the previous execution no longer exists.
+Before `process` runs, the worker loads a copy of your node the same
+way a saved workflow reopens:
+
+1. It creates the node from its class, so everything `__init__`
+    declares is there.
+1. It applies the structure the orchestrator's node has beyond that:
+    parameters a user added in the editor, parameters your hooks or
+    requests added, list rows, and type or mode changes made with
+    `AlterParameterDetailsRequest`. These are the changes a saved
+    workflow records.
+1. It sets the node's values with `initial_setup=True`.
+    `before_value_set` runs and `after_value_set` does not, exactly as
+    when a workflow reopens. A `set_parameter_value` override runs,
+    with `initial_setup=True`.
+
+The copy has the orchestrator's parameters, types and values. It has no
+connections and no other nodes around it, and nothing your node's code
+sends while it loads reaches the orchestrator. Then `process` runs, and
+from then on requests go to the orchestrator as usual. Afterwards the
+copy is discarded. **Your node holds no in-memory state between calls**:
+the next execute gets a new copy.
 
 The supported patterns for moving values:
 
 - **Inputs** arrive in `self.parameter_values` at the start of each
-    execute, hydrated from the orchestrator's authoritative copy.
-    Read them inside `process`; do not assume the values from a prior
-    call are still present.
+    execute, from the orchestrator's node. Read them inside `process`;
+    do not assume the values from a prior call are still present.
 - **Outputs** go in `self.parameter_output_values`. The framework
     ships these back to the orchestrator after `process` returns. Set
     `self.parameter_output_values["my_param"] = value` inside
@@ -198,22 +211,45 @@ The supported patterns for moving values:
 - **Cross-call state that must persist** belongs in the
     orchestrator. Issue a `SetParameterValueRequest` from inside
     `process` to update an authoritative value; on the next execute
-    the new value will hydrate into `self.parameter_values`. Do not
-    rely on `self.parameter_values[k] = v` mid-execute as a way to
-    carry state forward — that mutation does not propagate. The same
-    goes for `self.set_parameter_value` on a parameter with no
-    OUTPUT: it writes the worker's own copy, which is discarded when
-    `process` returns.
+    the copy is loaded with it. Do not rely on
+    `self.parameter_values[k] = v` mid-execute as a way to carry state
+    forward — that mutation does not propagate. The same goes for
+    `self.set_parameter_value` on a parameter with no OUTPUT: it writes
+    the worker's own copy, which is discarded when `process` returns.
 
 What does **not** work: setting `self.foo = ...` and expecting it to
-survive. The next execute gets a fresh node instance.
+survive. The next execute gets a fresh copy.
+
+### The rules that keep a worker identical to running in-process
+
+A node that follows these three rules behaves the same in a worker as
+in-process. Each is also what a saved workflow needs to reopen
+correctly, and strict mode checks each one (see below).
+
+1. **Ask by request.** `process` reads engine and graph state only
+    through `GriptapeNodes.handle_request(...)`, never through a manager
+    (`GriptapeNodes.ConfigManager()` and the like). In a worker a
+    request is answered by the orchestrator; a manager answers from the
+    worker's own copy.
+1. **State lives in parameters.** `after_value_set` and the
+    connection hooks change only the node's parameters and structure,
+    not attributes on `self`. Those hooks don't run for a worker's copy,
+    so anything `process` needs must come from parameter values or from
+    what loading rebuilds. Keep such state in a parameter (hidden if it
+    isn't for the user), or derive it from values where it is needed.
+1. **Loading doesn't touch the graph.** While `initial_setup` is set,
+    and in `before_value_set`, change the node itself
+    (parameters, types, visibility) and leave connections and other
+    nodes alone. A load makes connections before values, a paste
+    after them, and a worker's copy has none, so asking about them
+    gives an answer that depends on how the node was loaded.
 
 ### Mutating the parameter list during execute does not propagate
 
 `self.add_parameter(...)` and `self.remove_parameter_element(...)`
 called from inside `process` (or `aprocess`) apply only to the
-transient worker-side node. The orchestrator's authoritative copy
-never sees the change.
+worker's copy. The orchestrator's authoritative node never sees the
+change.
 
 To mutate parameters during execution, route through the request
 bus:
@@ -234,53 +270,17 @@ consequence worth stating outright: you cannot read the parameter
 back during the execution that added it.
 `self.get_parameter_by_name("new_param")` returns `None` in the
 worker even though the request succeeded and the editor is already
-showing the parameter.
+showing the parameter. The next execute has it, because each copy is
+loaded from the orchestrator's node as it is then.
 
-It does not reappear on the next execute either. Each execution
-builds a fresh worker-side copy from the node class, so parameter
-*structure* never carries forward — only values do.
-
-This is the contract, stated once: **a node's parameter structure
-must be a deterministic function of its parameter values.** Create
-parameters in `__init__`, or create and remove them from a value
-hook based on the values being set — the pattern the diffusers VAE
-decoder uses, rebuilding its output parameters from the pipeline
-value whenever it is set. Structure written that way needs no
-syncing at all: the same derivation runs on the orchestrator's
-node at edit time and again on the fresh worker copy as its values
-hydrate, so every copy converges on the same shape. Structure that
-exists only because something added it once — by request, from
-`process`, in a previous session — is history, not derivation, and
-history does not carry.
-
-Hydration honors the contract from its side. Values are applied in
-passes until the structure settles, so a value for a derived
-parameter works even when it arrives before the value that derives
-it — including chains, where one derived parameter's hook creates
-the next. A value for a parameter
-that nothing on the copy derives — most commonly one a user added
-in the editor — is left unapplied for that run, with a warning
-naming the parameter; it does not fail the execution, and the
-authoritative value on the orchestrator is untouched.
-
-### Value hooks run in both processes
+### Value hooks run on the orchestrator only
 
 `before_value_set` / `after_value_set` fire on the orchestrator when a
 user edits a value, so hooks that adjust the parameter list in response
 to user input — showing or hiding fields when a dropdown changes,
-growing a list — work normally at edit time.
-
-Two things to know about those hooks at *execution* time:
-
-- They also run in the worker, as inputs are applied. The
-    orchestrator skips hooks for a value that has not changed, but
-    the worker's node is freshly built, so every value looks new and
-    every hook runs. Keep them cheap and idempotent.
-- Anything they do to the node object there is discarded with the
-    temporary node. A parameter-list change made from a hook during
-    execution follows the rule above: route it through the request
-    bus if it needs to persist, and do not expect to read it back in
-    that same execution.
+growing a list — work normally at edit time. The worker's copy gets the
+resulting parameters from the orchestrator instead of running the hooks
+again.
 
 ## Configuration, secrets, and the current project propagate automatically
 
@@ -304,8 +304,9 @@ are worth knowing:
 - A "shallow" switch (same workspace and library config, where only
     the environment, directories, or situations differ) does **not**
     restart the worker. The orchestrator broadcasts the switch and the
-    worker adopts the new project in place, ahead of any queued node
-    execution, so it never runs against a stale project.
+    worker adopts the new project in place. The switch completes only
+    after the worker has adopted it, so a node dispatched afterward never
+    runs against a stale project.
 
 You do not need to wire any of this up. A worker never persists the
 project choice back to the shared config; the orchestrator is the
@@ -338,6 +339,11 @@ logs a `WARNING` so the asymmetry is visible.
     `GriptapeNodes.handle_request(...)` instead
 - [ ] Cross-node / flow state passed in via parameters, not fetched
     from inside `process`
+- [ ] Engine state read in `process` through requests, never managers
+- [ ] No attributes set on `self` from `after_value_set` or connection
+    hooks that `process` relies on
+- [ ] Under `initial_setup`, no requests about connections or other
+    nodes from `set_parameter_value` or `before_value_set`
 
 ## Strict mode is your safety net
 
@@ -348,11 +354,15 @@ from, prefixed with `Worker-<engine-id>` so you can tell it apart
 from orchestrator output. Look for both **WARNING** and **ERROR**
 entries.
 
-One rule, checked while a node executes:
+Four rules. Each warns where the node runs in-process and fails the
+node's run in a worker:
 
-| Rule                                                   | Orchestrator | Worker | Notes                                                  |
-| ------------------------------------------------------ | ------------ | ------ | ------------------------------------------------------ |
-| [`parameter-mutation-during-aprocess`](strict_mode.md) | WARNING      | ERROR  | Promotes the node's result to a failure on the worker. |
+| Rule                                                   | Checked                                          | Orchestrator | Worker |
+| ------------------------------------------------------ | ------------------------------------------------ | ------------ | ------ |
+| [`parameter-mutation-during-aprocess`](strict_mode.md) | While `process` runs                             | WARNING      | ERROR  |
+| [`graph-access-while-loading`](strict_mode.md)         | While a node is created or loaded                | WARNING      | ERROR  |
+| [`state-read-bypassing-requests`](strict_mode.md)      | While `process` runs                             | WARNING      | ERROR  |
+| [`state-outside-parameters`](strict_mode.md)           | When `after_value_set` or a connection hook runs | WARNING      | ERROR  |
 
 If a strict-mode line fires, the rule's remediation message names
 exactly which guideline above was violated and how to fix it.

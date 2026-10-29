@@ -52,8 +52,19 @@ def _make_node(
     # None of these values are held, so the egress pass must not treat them as parkable. A MagicMock
     # parameter answers truthy to is_process_local, which would swap every value for a mock key.
     node.get_parameter_by_name.return_value = None
-    # No lists, so what is dispatched is the values themselves.
-    node._list_rows.values_for_dispatch.side_effect = lambda: dict(node.parameter_values)
+    return node
+
+
+def _make_spec_node(spec: type, name: str) -> MagicMock:
+    """A node of a specific type, for the routes that branch on it.
+
+    A spec'd mock has no attributes the class only sets in __init__, so the ones execute() reads
+    to describe the node in its events are set here.
+    """
+    node = MagicMock(spec=spec)
+    node.name = name
+    node.metadata = {}
+    node.is_cancellation_requested = False
     return node
 
 
@@ -82,7 +93,8 @@ class TestExecuteDispatchContract:
         assert request.node_name == "Greeter"
 
     @pytest.mark.asyncio
-    async def test_dispatches_current_parameter_values(self) -> None:
+    async def test_dispatches_no_values_since_the_node_already_holds_them(self) -> None:
+        """The handler reads the node's own values, and fills them in itself when it forwards to a worker."""
         node = _make_node(parameter_values={"in": "hi", "n": 3})
 
         executor = _make_executor()
@@ -91,26 +103,8 @@ class TestExecuteDispatchContract:
         await executor.execute(node)
 
         request = mock_engine.ahandle_request.call_args.args[0]
-        assert request.parameter_values == {"in": "hi", "n": 3}
-
-    @pytest.mark.asyncio
-    async def test_dispatched_parameter_values_are_independent_copy(self) -> None:
-        """Mutating node.parameter_values after dispatch must not leak into the request."""
-        node = _make_node(parameter_values={"in": "hi"})
-        captured: dict[str, Any] = {}
-
-        async def capture(req: Any) -> ExecuteNodeResultSuccess:
-            # Mutate the node's live dict; the request's snapshot must not change.
-            node.parameter_values["in"] = "MUTATED"
-            captured["params"] = req.parameter_values
-            return _success_result()
-
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=capture)
-        await executor.execute(node)
-
-        assert captured["params"] == {"in": "hi"}
+        assert request.parameter_values == {}
+        assert request.element_modification_commands == []
 
     @pytest.mark.asyncio
     async def test_dispatches_node_metadata(self) -> None:
@@ -246,8 +240,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_basewhilenodegroup_routes_to_handle_while_group_execution(self) -> None:
-        node = MagicMock(spec=BaseWhileNodeGroup)
-        node.name = "WhileGroup"
+        node = _make_spec_node(BaseWhileNodeGroup, "WhileGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -266,8 +259,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativenodegroup_routes_to_handle_iterative_group_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeNodeGroup)
-        node.name = "IterGroup"
+        node = _make_spec_node(BaseIterativeNodeGroup, "IterGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -286,8 +278,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativeendnode_routes_to_handle_loop_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeEndNode)
-        node.name = "EndLoop"
+        node = _make_spec_node(BaseIterativeEndNode, "EndLoop")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -301,8 +292,7 @@ class TestExecuteSpecialNodeRouting:
     @pytest.mark.asyncio
     async def test_subflownodegroup_local_execution_calls_aprocess(self) -> None:
         """When execution_environment is LOCAL_EXECUTION, run aprocess in-process and skip dispatch."""
-        node = MagicMock(spec=SubflowNodeGroup)
-        node.name = "Subflow"
+        node = _make_spec_node(SubflowNodeGroup, "Subflow")
         node.execution_environment = MagicMock()
         node.execution_environment.name = "execution_environment"
         node.get_parameter_value = MagicMock(return_value=LOCAL_EXECUTION)

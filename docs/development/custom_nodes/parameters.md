@@ -102,6 +102,8 @@ Add functionality via `add_trait()`:
     soft limit: it sizes the slider track, but values typed outside it are accepted rather than rejected.
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
+- **DatePicker**: `DatePicker(include_time: bool = False, min: str | None = None, max: str | None = None)` — the value is
+    an ISO 8601 local date (`2026-10-14`), or date and time (`2026-10-14T09:30`) with `include_time=True`.
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
@@ -597,9 +599,14 @@ ParameterList(
 )
 ```
 
-**Setting a whole list:** a list nothing is connected to holds its items in rows, one per item, and has no value of
-its own: reading it builds it from the rows. Setting a whole list, with `SetParameterValueRequest` or with
-`self.set_parameter_value("images", [...])`, replaces the rows with one row per item. Three writes leave the rows
+**Rows and whole lists:** a row accepts one item, a `list[...]` of the item type, or an untyped `list`. A row that
+receives a list adds its items to the list, so the list value is the concatenation of its rows, and `max_items` counts
+those items. A row value exceeding `max_items` is refused. Over a connection, it fails the run with an error naming
+the list. When the list's own items may be lists (`list`, `any` or `all`), a list in a row is one item.
+
+**Setting a whole list:** a list nothing is connected to holds its items in rows and has no value of its own: reading
+it builds it from the rows. Setting a whole list, with `SetParameterValueRequest` or with
+`self.set_parameter_value("images", [...])`, replaces the rows with one row per entry. Three writes leave the rows
 alone: one made while the node is running (it is recorded as the node's result), one made while a workflow loads,
 and one made from `before_value_set` or `after_value_set` on the list or one of its rows, which logs a warning.
 Don't rewrite a list from those hooks to convert its items: use `item_converters`. A list fed by a connection to the list itself holds the whole list it was

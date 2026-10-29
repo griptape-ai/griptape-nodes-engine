@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter import Parameter
-from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType
+from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType, ParameterTypeBuiltin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -291,24 +291,48 @@ class ParameterList(ParameterContainer):
             if isinstance(child, Parameter):
                 child.type = value
         super()._custom_setter_for_property_type(value)
+        # Without explicit input types, the item types fall back to the type.
+        self._widen_all_row_input_types()
 
     def _custom_setter_for_property_input_types(self, value: list[str] | None) -> None:
-        # If we are setting a type, we need to propagate this to our children as well.
-        for child in self._children:
-            if isinstance(child, Parameter):
-                child.input_types = value
-        return super()._custom_setter_for_property_input_types(value)
+        super()._custom_setter_for_property_input_types(value)
+        self._widen_all_row_input_types()
+
+    def row_value_is_items(self, value: Any) -> bool:
+        """Return whether a row's `value` contributes its items rather than one item.
+
+        False for every value when the list's items may themselves be lists (`any`, `all` or `list`).
+        """
+        if not isinstance(value, list):
+            return False
+        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
+        item_types = super()._custom_getter_for_property_input_types()
+        return all(
+            ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
+        )
+
+    def _widen_all_row_input_types(self) -> None:
+        rows = [child for child in self._children if isinstance(child, Parameter)]
+        if not rows:
+            # During construction there are no rows, and the other item types may not be set yet.
+            return
+        for row in rows:
+            self._widen_row_input_types(row)
+
+    def _widen_row_input_types(self, row: Parameter) -> None:
+        # `self.input_types` is the container's list-shaped set, not its item types.
+        row.input_types = self._with_list_variants(super()._custom_getter_for_property_input_types())
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
         for child in self._children:
             if isinstance(child, Parameter):
                 child.output_type = value
-        return super()._custom_setter_for_property_output_type(value)
+        super()._custom_setter_for_property_output_type(value)
+        # Without explicit input types or a type, the item types fall back to the output type.
+        self._widen_all_row_input_types()
 
     def _custom_getter_for_property_input_types(self) -> list[str]:
-        # For every valid input type, also accept a list variant of that for the CONTAINER Parameter only.
-        # Children still use the input types given to them.
         base_input_types = super()._custom_getter_for_property_input_types()
         result = []
         for base_input_type in base_input_types:
@@ -473,9 +497,10 @@ class ParameterList(ParameterContainer):
                 raise ValueError(msg)
 
         if isinstance(child, Parameter):
-            # Rows get the item converters here, including rows restored from a saved workflow.
+            # Saved rows also need the container's item converters and input types.
             missing = [converter for converter in self._item_converters if converter not in child._converters]
             child._converters = [*missing, *child._converters]
+            self._widen_row_input_types(child)
         super().add_child(child)
 
         # Mark the parent node as unresolved since the parameter structure changed
@@ -513,6 +538,11 @@ class ParameterList(ParameterContainer):
             self._node_context.make_node_unresolved(
                 current_states_to_trigger_change_event={NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
             )
+
+    @staticmethod
+    def _with_list_variants(item_types: list[str]) -> list[str]:
+        """Accept bare `list` because runtime-built lists cannot always declare one item type."""
+        return [*item_types, *(f"list[{item_type}]" for item_type in item_types), "list"]
 
 
 class ParameterKeyValuePair(Parameter):
