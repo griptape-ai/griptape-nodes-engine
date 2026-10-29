@@ -20,7 +20,7 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
-    WorkflowPathTakenError,
+    WorkflowMetadata,
     WorkflowShape,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -247,12 +247,23 @@ class WorkflowSaver(EngineScoped):
         return WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @handles(SaveWorkflowRequest)
-    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:
+        return await self.save_open_workflow(request)
+
+    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
+    ) -> ResultPayload:
+        """Save the open workflow as `request` describes.
+
+        Where the file lands decides which workflow it is. The open workflow's own file, and the
+        first save of an unsaved workflow, continue the open workflow under its id; anything else
+        is a copy with an id of its own. `keep_open_workflow_identity` makes the save move the open
+        workflow to the new file instead of copying it, which is what a rename is.
+        """
         # Determine save target (file path, name, metadata)
         context_manager = self.engine.context_manager
-        current_workflow_name = (
-            context_manager.get_current_workflow_name() if context_manager.has_current_workflow() else None
-        )
+        current_workflow = context_manager.get_current_workflow() if context_manager.has_current_workflow() else None
+        current_workflow_name = current_workflow.name if current_workflow is not None else None
 
         try:
             save_target = self._determine_save_target(
@@ -269,29 +280,6 @@ class WorkflowSaver(EngineScoped):
         creation_date = save_target.creation_date
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
-
-        unsaved_source_key: str | None = None
-        if (
-            current_workflow_name is not None
-            and current_workflow_name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX)
-            and self.engine.workflow_registry.has_workflow_with_name(current_workflow_name)
-        ):
-            unsaved_source_key = current_workflow_name
-
-        # A first save moves the unsaved workflow onto its new file, unless a workflow already
-        # has the file's name and takes the save instead. Ask the registry before writing
-        # whether it accepts the move, so a refusal leaves the disk untouched.
-        if (
-            unsaved_source_key is not None
-            and unsaved_source_key != registry_key
-            and self.engine.workflow_registry.find_by_name(registry_key) is None
-        ):
-            unsaved_workflow = self.engine.workflow_registry.get_workflow_by_name(unsaved_source_key)
-            try:
-                self.engine.workflow_registry.raise_if_path_taken(unsaved_workflow, relative_file_path)
-            except WorkflowPathTakenError as err:
-                details = f"Attempted to save workflow '{relative_file_path}'. Failed because workflow '{err.existing.name}' is already registered at that path or under its name."
-                return SaveWorkflowResultFailure(result_details=details)
 
         # Re-saving the workflow that's currently open is always allowed; writing over a
         # *different* workflow's file needs the caller's explicit say-so. Both sides are
@@ -387,6 +375,22 @@ class WorkflowSaver(EngineScoped):
         else:
             resolved_display_name = None
 
+        continues_open_workflow = self._save_continues_open_workflow(
+            scenario=save_target.scenario,
+            destination=destination,
+            current_workflow=current_workflow,
+            keep_open_workflow_identity=keep_open_workflow_identity,
+        )
+
+        # The write would replace an open workflow's file, whose entry cannot be removed while open.
+        open_at_destination = self._other_open_workflow_at(destination, current_workflow)
+        if open_at_destination is not None:
+            details = (
+                f"Attempted to save workflow '{relative_file_path}'. Failed because workflow "
+                f"'{open_at_destination.name}' is open and saved in that file. Save under another name."
+            )
+            return SaveWorkflowResultFailure(result_details=details)
+
         save_file_result = self._save_workflow_file_inline(
             destination=destination,
             serialized_flow_commands=commands,
@@ -417,84 +421,124 @@ class WorkflowSaver(EngineScoped):
                 failure_reason = save_file_result.failure_reason
             return SaveWorkflowResultFailure(result_details=details, failure_reason=failure_reason)
 
-        workflow_metadata = save_file_result.workflow_metadata
-
-        # Reconcile registry key / relative_file_path with the actual written path
-        # for macro-driven saves. CREATE_NEW + `{_index:03}` may produce
-        # `foo_v001.py` from a `foo.py` request; the registry must key by what
-        # ended up on disk, not what was asked for.
-        if save_target.destination is not None:
-            written_relative = self._workspace_relative_path(save_file_result.file_path, self.engine)
-            if written_relative != relative_file_path:
-                relative_file_path = written_relative
-                registry_key = derive_registry_key(relative_file_path)
-
-        # Handle the unsaved -> saved transition: if the current-context workflow is an
-        # unsaved entry, swap its registry key to the path-derived key and update its
-        # file_path. This preserves the workflow instance (so any external references
-        # remain valid) while transitioning it to the "saved" state. Also walks the
-        # ContextManager's workflow stack in-place so any active context referencing
-        # the old unsaved key is updated to the new registry key.
-        if unsaved_source_key is not None and unsaved_source_key != registry_key:
-            # Rekey the unsaved entry to the path-derived key if the new key is not already
-            # occupied by a separate entry. If the new key already exists (e.g. a saved
-            # workflow with the same target path is already registered), fall back to
-            # dropping the unsaved entry and updating the existing saved entry below.
-            if self.engine.workflow_registry.find_by_name(registry_key) is not None:
-                self.engine.workflow_registry.delete_workflow_by_name(unsaved_source_key)
-                self.engine.workflow_manager.variable_substitution.drop(unsaved_source_key)
-            else:
-                unsaved_workflow = self.engine.workflow_registry.get_workflow_by_name(unsaved_source_key)
-                self.engine.workflow_registry.set_file_path(unsaved_workflow, relative_file_path)
-                self.engine.workflow_manager.variable_substitution.rekey(unsaved_source_key, registry_key)
-            for workflow_context_state in self.engine.context_manager._workflow_stack:
-                if workflow_context_state._name == unsaved_source_key:
-                    workflow_context_state._name = registry_key
-                    # The context also retains the workflow's path, and `workflow_dir` prefers
-                    # it over a registry lookup. An unsaved context has no path; this save is
-                    # where it gets one, so record it here or the builtin keeps falling back to
-                    # the registry key -- the thing that goes stale on the next project switch.
-                    workflow_context_state._file_path = str(save_file_result.file_path)
-
-        if self.engine.workflow_registry.find_by_name(registry_key) is None:
-            self.engine.workflow_registry.generate_new_workflow(
-                registry_key=registry_key, metadata=workflow_metadata, file_path=relative_file_path
-            )
-
-        existing_workflow = self.engine.workflow_registry.get_workflow_by_name(registry_key)
-        existing_workflow.metadata = workflow_metadata
-
-        # Saving an open library workflow wrote a copy instead of the library's file. Move the
-        # current context onto the copy, so the next save lands in it rather than in yet another copy.
-        if current_workflow_name is not None and self._is_open_library_workflow(
-            save_target.scenario, current_workflow_name, registry_key
-        ):
-            # The library workflow stays registered, so its substitution flag is copied, not moved.
-            self.engine.workflow_manager.variable_substitution.copy(current_workflow_name, registry_key)
-            for workflow_context_state in self.engine.context_manager._workflow_stack:
-                if workflow_context_state._name == current_workflow_name:
-                    workflow_context_state._name = registry_key
-                    workflow_context_state._file_path = str(save_file_result.file_path)
+        saved_workflow = self._record_saved_file(
+            written_path=save_file_result.file_path,
+            workflow_metadata=save_file_result.workflow_metadata,
+            current_workflow=current_workflow,
+            continues_open_workflow=continues_open_workflow,
+            scenario=save_target.scenario,
+        )
 
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
-            workflow_name=registry_key,
+            workflow_name=saved_workflow.name,
+            workflow_id=saved_workflow.workflow_id,
             result_details=details,
         )
 
-    def _is_open_library_workflow(
-        self, scenario: SaveWorkflowScenario, current_workflow_name: str, saved_registry_key: str
+    def _save_continues_open_workflow(
+        self,
+        *,
+        scenario: SaveWorkflowScenario,
+        destination: ProjectFileDestination,
+        current_workflow: Workflow | None,
+        keep_open_workflow_identity: bool,
     ) -> bool:
-        """Whether this save copied the library-provided workflow open in the current context."""
-        if scenario != SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
+        """Whether the file a save writes continues the open workflow, rather than being a copy of it.
+
+        Decided before the write, while `destination` can still be compared with the workflow's
+        own file. The open workflow continues into its own file, into the first file an unsaved
+        workflow is saved to, and into the file a rename moves it to. Every other save is a copy
+        (Save As, a versioned save, saving a library workflow), which is a new workflow with an
+        id of its own.
+        """
+        if current_workflow is None:
             return False
-        if current_workflow_name == saved_registry_key:
+        if keep_open_workflow_identity or not current_workflow.is_saved:
+            return True
+        if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
             return False
-        if not self.engine.workflow_registry.has_workflow_with_name(current_workflow_name):
+        return self._destination_is_file_of(destination, current_workflow)
+
+    def _other_open_workflow_at(
+        self, destination: ProjectFileDestination, current_workflow: Workflow | None
+    ) -> Workflow | None:
+        """The open workflow, other than `current_workflow`, whose file a write to `destination` replaces."""
+        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+            return None
+        try:
+            resolved_path = destination.resolve()
+        except FileLoadError:
+            return None
+        registry = self.engine.workflow_registry
+        workflow = registry.find_by_path(resolved_path)
+        if workflow is None or workflow is current_workflow or not registry.is_open(workflow.workflow_id):
+            return None
+        return workflow
+
+    def _destination_is_file_of(self, destination: ProjectFileDestination, workflow: Workflow) -> bool:
+        """Whether a write to `destination` lands on `workflow`'s own file.
+
+        A CREATE_NEW destination never lands on an existing file, and one whose macro cannot
+        resolve yet is waiting for a free index slot, so neither does.
+        """
+        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
             return False
-        current_workflow = self.engine.workflow_registry.get_workflow_by_name(current_workflow_name)
-        return bool(current_workflow.metadata.is_griptape_provided)
+        try:
+            resolved_path = destination.resolve()
+        except FileLoadError:
+            return False
+        return self.engine.workflow_registry.find_by_path(resolved_path) is workflow
+
+    def _record_saved_file(
+        self,
+        *,
+        written_path: str,
+        workflow_metadata: WorkflowMetadata,
+        current_workflow: Workflow | None,
+        continues_open_workflow: bool,
+        scenario: SaveWorkflowScenario,
+    ) -> Workflow:
+        """Update the registry for a file a save just wrote, and return the workflow it holds.
+
+        A file that continues the open workflow is the open workflow's: its entry moves there if
+        it was not already. Any other file is a new workflow. Either way, a different workflow
+        registered at that path is removed, since the file that was its identity now holds
+        another workflow.
+        """
+        registry = self.engine.workflow_registry
+        variable_substitution = self.engine.workflow_manager.variable_substitution
+        displaced = registry.find_by_path(written_path)
+
+        if current_workflow is not None and continues_open_workflow:
+            if displaced is not None and displaced is not current_workflow:
+                registry.remove(displaced.workflow_id)
+                variable_substitution.drop(displaced.workflow_id)
+            if displaced is not current_workflow:
+                registry.set_file_path(current_workflow, written_path)
+            current_workflow.metadata = workflow_metadata
+            current_workflow.metadata_is_placeholder = False
+            # A file registered only because it was opened is listed once it is saved.
+            current_workflow.listed = True
+            return current_workflow
+
+        if displaced is not None:
+            registry.remove(displaced.workflow_id)
+            variable_substitution.drop(displaced.workflow_id)
+        saved_workflow = registry.register_file(written_path, workflow_metadata)
+
+        # Saving an open library workflow wrote a copy instead of the library's file. Move the
+        # current context onto the copy, so the next save lands in it rather than in yet another copy.
+        if (
+            current_workflow is not None
+            and scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE
+            and current_workflow.metadata.is_griptape_provided
+        ):
+            # The library workflow stays registered, so its substitution flag is copied, not moved.
+            variable_substitution.copy(current_workflow.workflow_id, saved_workflow.workflow_id)
+            self.engine.context_manager.move_current_workflow_onto(saved_workflow.workflow_id)
+        return saved_workflow
 
     def generate_unique_filename(self, base_name: str) -> str:
         """Generate a unique filename for a workflow, avoiding collisions.
@@ -745,6 +789,9 @@ class WorkflowSaver(EngineScoped):
             logger.debug("Preserving existing metadata failed for workflow '%s': %s", file_name, err)
             return _ExistingMetadata(None, None, None, None)
         else:
+            # Made up for a header that could not be read, so there is nothing to preserve.
+            if existing.metadata_is_placeholder:
+                return _ExistingMetadata(None, None, None, None)
             return _ExistingMetadata(
                 display_name=existing.metadata.name,
                 description=existing.metadata.description,

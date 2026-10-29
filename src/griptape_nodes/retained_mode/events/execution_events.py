@@ -771,6 +771,9 @@ class ExecuteNodeRequest(RequestPayload):
             Workers carry this field because they have no access to VariablesManager
             or the workflow context; in-process nodes use it to skip the NodeManager
             lookup that would otherwise resolve the flow.
+        orchestrator_workflow_id: id of the orchestrator's open workflow the node runs for. Not
+            `workflow_id`, which names the saved workflow a request acts on. The worker registers
+            the workflow under this id (unlisted) and puts it in its own context.
         workflow_name / workflow_file_path / workflow_working_directory: the orchestrator's workflow
             CONTEXT, which the worker adopts as its own before running the node. Sent for the same
             reason as `variables` -- it lives in in-process state only the orchestrator has -- and
@@ -778,9 +781,10 @@ class ExecuteNodeRequest(RequestPayload):
             (`workflow_dir`, `workflow_name`, variable-substitution enablement, anything added
             later) is answered by the worker's normal code paths. A worker without it answers "no
             current workflow" to all of them, which silently degrades `{outputs}` from the
-            workflow's own folder to a workspace-relative path. These three mirror
-            ContextManager.WorkflowContextState exactly; workflow_name None means the orchestrator
-            had no workflow either, so there is nothing to adopt.
+            workflow's own folder to a workspace-relative path. With the id, these are what the
+            worker's registry entry for the workflow answers; orchestrator_workflow_id None means
+            the orchestrator had no workflow either, so there is nothing to adopt. A workflow_name
+            without an orchestrator_workflow_id fails, rather than running without the workflow.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -793,6 +797,7 @@ class ExecuteNodeRequest(RequestPayload):
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
+    orchestrator_workflow_id: str | None = None
     workflow_name: str | None = None
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
