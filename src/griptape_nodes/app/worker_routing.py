@@ -467,6 +467,10 @@ def register_remote_handlers(event_manager: EventManager) -> None:
     Must be called after every manager has finished registering (i.e. after the engine is
     constructed) AND after ``configure_worker_forwarding`` has supplied the RequestClient,
     topic, and loop references. See ``_run_worker`` in app.py.
+
+    A swapped type keeps no declared scope (``RequestScope``): ``RemoteHandler`` passes the
+    original the request alone, so an OPTIONAL_WORKFLOW handler gets None here, and a WORKFLOW
+    handler, which has no default, must be local-only.
     """
     for request_type in event_manager.registered_request_types():
         if request_type in LOCAL_ONLY_REQUEST_TYPES:

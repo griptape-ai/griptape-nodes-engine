@@ -47,7 +47,15 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.runtime.binding import (
+    NO_WORKFLOW,
+    NoWorkflow,
+    WorkflowNotNamedError,
+    WorkflowNotOpenError,
+    bound_workflow,
+)
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -99,6 +107,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -183,6 +192,7 @@ class Engine:
     _worker_manager: WorkerManager
     _lifecycle: EngineLifecycle
     _workflow_registry: _WorkflowRegistry
+    _open_workflows: OpenWorkflowSet
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -231,6 +241,7 @@ class Engine:
         # Workflow ids live only as long as this engine, so clients compare this to notice a
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
+        self._open_workflows = OpenWorkflowSet()
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -407,6 +418,10 @@ class Engine:
     @property
     def workflow_registry(self) -> _WorkflowRegistry:
         return self._workflow_registry
+
+    @property
+    def open_workflows(self) -> OpenWorkflowSet:
+        return self._open_workflows
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -612,6 +627,71 @@ class Engine:
         """
         return self._worker_manager.worker_host(worker_engine_id)
 
+    @contextmanager
+    def bind_workflow(self, workflow: WorkflowRuntime | NoWorkflow) -> Iterator[None]:
+        """Act on `workflow`, or on no workflow, for the duration of the block and in tasks it spawns."""
+        token = bound_workflow.set(workflow)
+        try:
+            yield
+        finally:
+            bound_workflow.reset(token)
+
+    def leave_closed_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
+
+        Bound to NO_WORKFLOW rather than unbound, so the rest of the work never falls back to another
+        open workflow. Only the current context is rebound: tasks spawned earlier keep their
+        binding, so a run that wakes after the close never reaches the next workflow.
+        """
+        if bound_workflow.get() is workflow:
+            bound_workflow.set(NO_WORKFLOW)
+
+    def current_workflow(self) -> WorkflowRuntime:
+        """The open workflow the current work acts on, for writes and runs that need one.
+
+        The workflow the current work is bound to, else the engine's only open workflow.
+
+        Raises:
+            NoOpenWorkflowError: The work is bound to no workflow, or is unbound and none is open.
+            WorkflowNotOpenError: The work is bound to a workflow that has closed.
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        workflow = self.current_workflow_or_none()
+        if workflow is None:
+            msg = "Attempted to change the open workflow. Failed because no workflow is open. Open or create a workflow first."
+            raise NoOpenWorkflowError(msg)
+        return workflow
+
+    def current_workflow_or_none(self) -> WorkflowRuntime | None:
+        """Like `current_workflow`, but None when there is none, for reads that find nothing without one.
+
+        Raises:
+            WorkflowNotOpenError: The work is bound to a workflow that has closed.
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        bound = bound_workflow.get()
+        if bound is NO_WORKFLOW:
+            return None
+        if bound is not None and bound.closed:
+            msg = (
+                f"Attempted to act on workflow '{bound.workflow_id}'. Failed because the workflow was closed. "
+                "Reopen the workflow and try again."
+            )
+            raise WorkflowNotOpenError(msg)
+        if bound is not None:
+            return bound
+
+        open_workflows = self._open_workflows.all_open()
+        if len(open_workflows) > 1:
+            msg = (
+                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
+                "open and the request did not name one."
+            )
+            raise WorkflowNotNamedError(msg)
+        if not open_workflows:
+            return None
+        return open_workflows[0]
+
     def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
@@ -667,7 +747,7 @@ class Engine:
         if dropped:
             logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
-    @handles(GetEngineVersionRequest)
+    @handles(GetEngineVersionRequest, scope=RequestScope.HOST)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)
@@ -681,7 +761,7 @@ class Engine:
             details = f"Attempted to get engine version. Failed due to '{err}'."
             return GetEngineVersionResultFailure(result_details=details)
 
-    @handles(EngineHeartbeatRequest)
+    @handles(EngineHeartbeatRequest, scope=RequestScope.HOST)
     def handle_engine_heartbeat_request(self, request: EngineHeartbeatRequest) -> ResultPayload:
         """Handle engine heartbeat requests.
 
