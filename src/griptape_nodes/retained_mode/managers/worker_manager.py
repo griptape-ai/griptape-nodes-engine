@@ -1776,7 +1776,7 @@ class WorkerManager(EngineScoped):
     @handles(
         worker_events.StopWorkerForEngineRequest,
         sender=RequiredSender.ENGINE,
-        owner=lambda manager, request, _sender: manager._engine_served_by(request.worker_engine_id),
+        owner=lambda manager, request, _sender: manager.hosted_for(request.worker_engine_id),
     )
     async def handle_stop_worker_for_engine_request(
         self, request: worker_events.StopWorkerForEngineRequest
@@ -1950,13 +1950,6 @@ class WorkerManager(EngineScoped):
         if session is None:
             return None
         return session.engine_id
-
-    def _engine_served_by(self, worker_engine_id: str) -> str | None:
-        """The engine a worker this engine runs serves, or None if it runs no such worker."""
-        hosted = self._hosted_workers.get(worker_engine_id)
-        if hosted is None:
-            return None
-        return hosted.engine_id
 
     async def _recycle_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker for a handoff, returning once its engine has heard it stopped.
@@ -2337,6 +2330,13 @@ class WorkerManager(EngineScoped):
         if unavailable is None:
             return None
         return unavailable.reason
+
+    def hosted_for(self, worker_engine_id: str) -> str | None:
+        """The engine a worker this engine runs serves, or None if it runs no such worker."""
+        hosted = self._hosted_workers.get(worker_engine_id)
+        if hosted is None:
+            return None
+        return hosted.engine_id
 
     def worker_host(self, worker_engine_id: str) -> str | None:
         """The engine that runs a worker this engine asked another engine for, or None for any other worker.

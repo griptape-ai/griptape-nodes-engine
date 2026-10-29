@@ -3157,6 +3157,17 @@ class TestServingAnotherEnginesSession:
         assert isinstance(result, worker_events.OfferSessionForWorkersResultSuccess)
         assert "not installed" in result.refused_libraries[_LIBRARY]
 
+    def test_a_worker_run_for_another_engine_names_that_engine_and_any_other_names_none(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The transports reach such a worker the way they reach the engine it serves."""
+        worker_manager._hosted_workers["w1"] = _HostedWorker(
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+        )
+
+        assert worker_manager.hosted_for("w1") == _ARTIST_ENGINE
+        assert worker_manager.hosted_for("stranger") is None
+
     @pytest.mark.asyncio
     async def test_the_worker_joins_the_session_under_its_id_on_this_machines_credentials(
         self, worker_manager: WorkerManager
