@@ -326,8 +326,9 @@ class EventRequest[P: Payload](BaseEvent):
         request_id: Id the caller matches the result by. Echoed on the result.
         response_topic: Where the result is sent. Echoed on the result.
         open_workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
-            handler, and every task it starts, acts on that workflow. Whatever the request, an id
-            that names no open workflow fails it with `WorkflowNotOpenResultFailure`, unhandled.
+            handler, and every task it starts, acts on that workflow. An id that names no open
+            workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
+            handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
             Left out, the request acts on the engine's only open workflow, unless another engine
             sent it: then it acts on no workflow. A payload field named `workflow_id` is something
             else: the workflow the request is about.
