@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -97,7 +99,7 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -153,6 +155,11 @@ class WorkflowManager(EngineScoped):
         problems: list[WorkflowProblem] = field(default_factory=list)
 
     _workflow_file_path_to_info: dict[str, WorkflowInfo]
+    # FlowManager reads the top of this stack to tag each new flow with the workflow being imported.
+    # A ContextVar keeps concurrent imports apart (Workflow nodes in PARALLEL mode run as separate
+    # tasks), and it lives on the instance so each engine has its own. A balanced set/reset removes
+    # the entry from the Context that set it.
+    _referenced_workflow_stack: contextvars.ContextVar[tuple[str, ...]]
 
     # Track how many contexts we have that intend to squelch (set to False) altered_workflow_state event values.
     class WorkflowSquelchContext:
@@ -174,33 +181,11 @@ class WorkflowManager(EngineScoped):
 
     _squelch_workflow_altered_count: int = 0
 
-    # Track referenced workflow import context stack
-    class ReferencedWorkflowContext:
-        """Context manager for tracking workflow import operations."""
-
-        def __init__(self, manager: WorkflowManager, workflow_name: str):
-            self.manager = manager
-            self.workflow_name = workflow_name
-
-        def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            self.manager._referenced_workflow_stack.append(self.workflow_name)
-            return self
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            self.manager._referenced_workflow_stack.pop()
-
-    _referenced_workflow_stack: list[str] = field(default_factory=list)
-
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
+        self._referenced_workflow_stack = contextvars.ContextVar("referenced_workflow_stack", default=())
         self._squelch_workflow_altered_count = 0
-        self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -222,7 +207,7 @@ class WorkflowManager(EngineScoped):
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
-        return len(self._referenced_workflow_stack) > 0
+        return len(self._referenced_workflow_stack.get()) > 0
 
     def get_current_referenced_workflow(self) -> str:
         """Get the current workflow source path from the context stack.
@@ -230,7 +215,7 @@ class WorkflowManager(EngineScoped):
         Raises:
             IndexError: If no referenced workflow context is active.
         """
-        return self._referenced_workflow_stack[-1]
+        return self._referenced_workflow_stack.get()[-1]
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # Clear everything, library-provided workflows included, before re-registering. Workflows
@@ -412,9 +397,18 @@ class WorkflowManager(EngineScoped):
         """Wait until any registry refresh in progress has finished."""
         await self._workflows_loading_complete.wait()
 
-    def referenced_workflow(self, workflow_name: str) -> ReferencedWorkflowContext:
-        """Track `workflow_name` as the referenced workflow being imported for the `with` block."""
-        return self.ReferencedWorkflowContext(self, workflow_name)
+    @contextmanager
+    def referenced_workflow(self, workflow_name: str) -> Iterator[None]:
+        """Track `workflow_name` as the referenced workflow being imported for the `with` block.
+
+        Enter and exit must run in the same asyncio task, as a plain `with` inside one coroutine does,
+        because `ContextVar.reset` rejects a token from another Context.
+        """
+        token = self._referenced_workflow_stack.set((*self._referenced_workflow_stack.get(), workflow_name))
+        try:
+            yield
+        finally:
+            self._referenced_workflow_stack.reset(token)
 
     def squelch_workflow_altered(self) -> WorkflowSquelchContext:
         """Suppress workflow-altered events for the duration of the `with` block."""
