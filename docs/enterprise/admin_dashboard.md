@@ -198,11 +198,11 @@ Click **+ Create Budget**.
     - **Hard Limit:** a call that would go over the limit does not run.
     - **Soft Limit:** calls keep running past the limit, and the row shows that the limit was reached. Use it to watch spending without stopping anyone.
 - **Period:** **Daily**, **Weekly**, **Monthly**, **Yearly**, or **Lifetime**. Periods start at midnight UTC on calendar boundaries; weeks start on Monday. A lifetime budget never resets.
-- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the organization's owner is emailed (see below). Whatever threshold you choose, the bar in the **Spent** column has a marker at 75% and turns amber once spending passes 75%.
+- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the organization's owner is emailed, as well as at 100% (see below). Whatever threshold you choose, the bar in the **Spent** column has a marker at 75% and turns amber once spending passes 75%.
 
 ![A budget past 75%: the bar turns amber after the marker](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
 
-When a budget passes a threshold, the organization's owner gets an email. That includes a budget you edit so that it is already past one, for example by lowering its limit. There is one email per budget per period, for the highest threshold crossed, and a budget whose **Hard Limit** refuses a call sends one for 100%. Raising the limit back above a threshold resets it, so crossing it again sends a new email.
+When a budget passes a threshold, the organization's owner gets an email. That includes a budget you edit so that it is already past one, for example by lowering its limit. Every budget also emails at 100%, whatever threshold you chose and whether its limit is hard or soft, and a **Hard Limit** budget that refuses a call sends that 100% email if it hasn't gone out yet. Thresholds crossed at the same moment send one email, for the highest; one crossed later in the period sends another. Raising the limit back above a threshold resets it, so crossing it again sends a new email.
 
 !!! note "Who gets alert emails"
 
