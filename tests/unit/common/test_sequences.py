@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior
+from griptape_nodes.common.sequences.scan import scan_sequences_from_filenames
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.os_events import (
     FileIOFailureReason,
@@ -612,6 +613,76 @@ class TestPatternValidation:
             result = await _scan(engine, directory, "render.####.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert len(result.sequences) == 1
+
+
+# --- Hyphen delimiters -------------------------------------------------
+
+
+class TestHyphenDelimiter:
+    """A `-` between a name and its number is a delimiter, not a minus sign.
+
+    fileseq reads `shot-0001.png` as frame -1 and fails to parse
+    `PF0044-####.png` as a template; the scanner has to keep the `-` in the
+    basename for both.
+    """
+
+    @pytest.mark.parametrize(
+        ("pattern", "basename"),
+        [
+            ("PF0044-####.png", "PF0044"),
+            ("PF0044-%04d.png", "PF0044"),
+            ("shot-####.png", "shot"),
+            ("shot-@@@@.png", "shot"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_hyphen_before_number_matches(self, engine: Engine, pattern: str, basename: str) -> None:
+        """Frames named `<name>-0001.png` are found for every token form."""
+        directory = "/work/in"
+        filenames = [f"{basename}-{n:04d}.png" for n in [1, 2, 3]]
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, pattern, policy=MissingItemPolicy.SPLIT)
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.pattern == pattern
+        assert [e.number for e in seq.entries] == [1, 2, 3]
+        assert [e.path for e in seq.entries] == [f"{directory}/{name}" for name in filenames]
+        assert seq.dropped_negative_number_count == 0
+
+    @pytest.mark.asyncio
+    async def test_hyphen_after_separator_stays_negative(self, engine: Engine) -> None:
+        """A `-` after a `.` is still a minus sign, so the number is dropped as negative."""
+        directory = "/work/in"
+        filenames = ["render.-0005.png", "render.00005.png", "render.00006.png"]
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.#####.png", policy=MissingItemPolicy.SPLIT)
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert [e.number for s in result.sequences for e in s.entries] == [5, 6]
+        assert all(s.dropped_negative_number_count == 1 for s in result.sequences)
+
+    @pytest.mark.asyncio
+    async def test_hyphen_sequence_not_mixed_into_undelimited_pattern(self, engine: Engine) -> None:
+        """`shot-0002.png` shares the `shot` prefix but isn't a frame of `shot####.png`."""
+        directory = "/work/in"
+        filenames = ["shot0001.png", "shot0002.png", "shot0003.png", "shot-0002.png"]
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "shot####.png", policy=MissingItemPolicy.SPLIT)
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert [e.path for s in result.sequences for e in s.entries] == [
+            "/work/in/shot0001.png",
+            "/work/in/shot0002.png",
+            "/work/in/shot0003.png",
+        ]
+
+    def test_scan_from_filenames_groups_hyphen_sequence(self) -> None:
+        """Directory-listing grouping recognizes hyphen-delimited sequences."""
+        filenames = ["PF0044-0001.png", "PF0044-0002.png", "notes.txt"]
+        sequences, consumed = scan_sequences_from_filenames(filenames, "/work/in")
+        assert len(sequences) == 1
+        assert sequences[0].pattern == "PF0044-####.png"
+        assert [e.number for e in sequences[0].entries] == [1, 2]
+        assert consumed == {"PF0044-0001.png", "PF0044-0002.png"}
 
 
 # --- Path round-trip ---------------------------------------------------

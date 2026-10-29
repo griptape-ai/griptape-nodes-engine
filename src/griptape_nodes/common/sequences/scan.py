@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
-from fileseq.constants import PAD_STYLE_HASH1
+from fileseq.constants import DISK_RE, PAD_STYLE_HASH1
 from fileseq.filesequence import FileSequence
 
 from griptape_nodes.common.sequences.models import (
@@ -55,6 +55,17 @@ logger = logging.getLogger("griptape_nodes")
 # Mandatory pad style: each `#` = 1 zero, matching Nuke. fileseq's default
 # (HASH4) treats each `#` as 4 zeros, which would silently break templates.
 PAD_STYLE = PAD_STYLE_HASH1
+
+# fileseq reads a `-` directly before the number as a minus sign (in a
+# listing) or a range delimiter (in a template), so `shot-0001.png` becomes
+# frame -1 of `shot` and `PF0044-####.png` fails to parse. A `-` that follows
+# a letter or digit is a name delimiter, so it's swapped for a stand-in
+# fileseq treats as basename text, then restored on the parsed basename.
+# NUL can't appear in a filename, so it can't collide with a real name.
+_LISTING_HYPHEN_STAND_IN = "\x00"
+# fileseq's template grammar rejects NUL before printf / `$F` tokens, and the
+# template is the only name being parsed, so a plain `_` is safe there.
+_TEMPLATE_HYPHEN_STAND_IN = "_"
 
 
 class ScanOutcome(NamedTuple):
@@ -373,7 +384,55 @@ def _coerce_target_pattern(
                 raise InvalidTemplateError(msg)
             case NoTokenBehavior.EXPLORE_SEQUENCE:
                 pass  # fall through to FileSequence parse below
-    return FileSequence(pattern, pad_style=PAD_STYLE)
+    return _parse_template(pattern)
+
+
+def _parse_template(pattern: str) -> FileSequence:
+    """Parse `pattern` with fileseq, keeping a `-` delimiter before the token in the basename."""
+    token = _TOKEN_PATTERN.search(pattern)
+    if token is None:
+        return FileSequence(pattern, pad_style=PAD_STYLE)
+    hyphen_index = token.start() - 1
+    if pattern[hyphen_index : token.start()] != "-" or not _ends_in_name_character(pattern[:hyphen_index]):
+        return FileSequence(pattern, pad_style=PAD_STYLE)
+    protected = f"{pattern[:hyphen_index]}{_TEMPLATE_HYPHEN_STAND_IN}{pattern[token.start() :]}"
+    fseq = FileSequence(protected, pad_style=PAD_STYLE)
+    fseq.setBasename(f"{fseq.basename()[:-1]}-")
+    return fseq
+
+
+def _find_sequences_in_list(filenames: list[str]) -> list[FileSequence]:
+    """Run `findSequencesInList`, reading a `-` after a letter or digit as a delimiter, not a sign."""
+    protected = [_protect_listing_hyphen(name) for name in filenames]
+    sequences = FileSequence.findSequencesInList(protected, pad_style=PAD_STYLE)
+    for fseq in sequences:
+        fseq.setBasename(fseq.basename().replace(_LISTING_HYPHEN_STAND_IN, "-"))
+    return sequences
+
+
+def _protect_listing_hyphen(filename: str) -> str:
+    """Swap a delimiter `-` before the number for the stand-in; other names pass through."""
+    match = DISK_RE.match(filename)
+    if match is None:
+        return filename
+    dirname, basename, number, extension = match.groups()
+    if not number or not number.startswith("-"):
+        return filename
+    if not _ends_in_name_character(basename):
+        return filename
+    return f"{dirname}{basename}{_LISTING_HYPHEN_STAND_IN}{number[1:]}{extension or ''}"
+
+
+def _ends_in_name_character(text: str) -> bool:
+    """Return True if `text` ends in a letter or digit.
+
+    Decides whether a following `-` is a name delimiter. A `-` after a
+    separator (`render.-0005.png`) or at the start of the name is left alone,
+    so fileseq still reads it as a negative number.
+    """
+    if not text:
+        return False
+    return text[-1].isalnum()
 
 
 # Recognized sequence-token forms, in fileseq's HASH1 idiom:
@@ -429,8 +488,10 @@ def _collect_present_numbers(
     if target.zfill() == 0:
         return _collect_literal_single_file(mapping, target, relevant_filenames)
 
-    inferred = FileSequence.findSequencesInList(relevant_filenames, pad_style=PAD_STYLE)
-    matching = [s for s in inferred if s.zfill() == target.zfill()]
+    inferred = _find_sequences_in_list(relevant_filenames)
+    # Match basename too: the prefix filter lets `shot_0001.png` through for
+    # `shot####.png`, and fileseq groups it under basename `shot_`.
+    matching = [s for s in inferred if s.basename() == target.basename() and s.zfill() == target.zfill()]
     if not matching:
         return _PresentNumbers(by_number={}, dropped_negatives=0)
 
@@ -538,7 +599,7 @@ def scan_sequences_from_filenames(
 
     _validate_subset_bounds(options.start_number, options.end_number)
 
-    all_detected = FileSequence.findSequencesInList(filenames, pad_style=PAD_STYLE)
+    all_detected = _find_sequences_in_list(filenames)
 
     result_sequences: list[Sequence] = []
     consumed_filenames: set[str] = set()
