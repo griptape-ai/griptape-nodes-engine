@@ -203,9 +203,11 @@ Click **+ Create Budget**.
 
 ![A budget past its alert threshold: the bar turns amber after the 75% marker](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
 
-!!! note "Alert emails are not sent yet"
+When a budget passes a threshold, the organization's owner gets an email. That includes a budget you edit so that it is already past one, for example by lowering its limit. There is one email per budget per period, for the highest threshold crossed, and a budget whose **Hard Limit** refuses a call sends one for 100%. Raising the limit back above a threshold resets it, so crossing it again sends a new email.
 
-    The dialog's tooltip says an email is sent when spending reaches the threshold. Email alerts are not available yet during the beta. Watch the **Budgets Above 75%** card and the **Over 75%** filter instead.
+!!! note "Who gets alert emails"
+
+    During the beta, alert emails go only to the organization's owner, the account that created it. They cannot be sent to other people or set per budget yet.
 
 ### Freezing a budget
 
