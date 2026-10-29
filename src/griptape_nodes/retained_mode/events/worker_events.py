@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Literal
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -156,3 +157,177 @@ class StartWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker spawn could not be scheduled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class StartWorkerForEngineRequest(RequestPayload):
+    """Sent by the artist's engine to the engine its distribution settings assign a library to.
+
+    That engine starts the library's worker under `worker_engine_id` in the session of the engine
+    that sent the request, so the worker registers with the artist's engine and serves it.
+
+    Args:
+        library_name: The library the worker will serve.
+        worker_engine_id: The engine ID the worker takes, chosen by the artist's engine so it can
+            recognize the worker's registration, and stop it, before this request is answered.
+    """
+
+    library_name: str
+    worker_engine_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class StartWorkerForEngineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine started the worker."""
+
+
+@dataclass
+@PayloadRegistry.register
+class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine did not start the worker.
+
+    Args:
+        session_unknown: The session that asked has not registered with this engine, as after this
+            engine restarts, or registered without naming the library, as after its settings
+            changed. It may register and ask again.
+    """
+
+    session_unknown: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class OfferSessionForWorkersRequest(RequestPayload):
+    """Sent by the artist's engine to another engine before asking it to start any worker.
+
+    Sent once per session for each engine the distribution settings assign a library to. That
+    engine registers the session of the engine that sent it, which the workers it starts for it
+    join. It refuses a session whose engine version differs from its own, because the wire shape of
+    every event is tied to the engine build, and refuses each library whose version differs or
+    that it does not have.
+
+    Args:
+        schema_version: The version of the distributed execution contract the artist's engine speaks.
+        engine_version: The artist's engine version.
+        library_versions: The version of each library the artist's engine will send to that engine.
+        static_server_base_url: Where the artist's engine serves the shared workspace, so the asset
+            URLs its workers mint are ones the artist's editor can open.
+    """
+
+    schema_version: str
+    engine_version: str
+    library_versions: dict[str, str]
+    static_server_base_url: str | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class OfferSessionForWorkersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine accepted the artist's session.
+
+    Args:
+        engine_id: The ID of the engine that accepted it, so the artist's engine can tell it reached
+            the engine its distribution settings name.
+        refused_libraries: Each library it will not start workers for, with the reason.
+    """
+
+    engine_id: str = ""
+    refused_libraries: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class OfferSessionForWorkersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine refused the artist's session, and will start no workers for it."""
+
+
+@dataclass
+@PayloadRegistry.register
+class WithdrawSessionOfferRequest(RequestPayload):
+    """Sent by the artist's engine to each engine it offered its session to, once it is done with them.
+
+    Sent when the artist's engine resets its workers, as when its session ends or it shuts down. The
+    other engine forgets every session the sender offered and stops the
+    workers it runs for them, as it does when the connection to the sender is lost.
+    """
+
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class WithdrawSessionOfferResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine forgot the sender's sessions."""
+
+
+@dataclass
+@PayloadRegistry.register
+class WithdrawSessionOfferResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not forget the sender's sessions."""
+
+
+@dataclass
+@PayloadRegistry.register
+class StopWorkerForEngineRequest(RequestPayload):
+    """Sent by the artist's engine to the engine it asked to start a worker, to stop that worker.
+
+    Sent when the start is withdrawn after it was sent, as when the library is reset while the
+    other engine has not answered yet. That engine reports the exit with `ReportWorkerExitedRequest`.
+
+    Args:
+        worker_engine_id: The worker to stop, as named in the `StartWorkerForEngineRequest`. Only
+            the engine that started it may stop it.
+    """
+
+    worker_engine_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class StopWorkerForEngineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine stopped the worker, or was not running it."""
+
+
+@dataclass
+@PayloadRegistry.register
+class StopWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not stop the worker."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportWorkerExitedRequest(RequestPayload):
+    """Sent by an engine to the artist's engine whenever a worker it runs for that artist exits.
+
+    Sent for every exit, whatever ended the worker, so the artist's engine settles a start that
+    never registered and removes a registered worker at once rather than after heartbeat eviction.
+
+    Args:
+        worker_engine_id: The worker that exited, as named in the `StartWorkerForEngineRequest`.
+        exit_code: The worker process's exit code.
+        reason: "stopped" when the engine stopped the worker on purpose, as when it shuts down or a
+            new start replaces it, so the worker may be started again. "exited" when the worker
+            ended on its own, as when it crashes or fails to start.
+    """
+
+    worker_engine_id: str
+    exit_code: int
+    reason: Literal["stopped", "exited"]
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportWorkerExitedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine recorded the exit."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportWorkerExitedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The exit was reported by an engine other than the one running the worker."""

@@ -9,6 +9,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Iterator
+from unittest.mock import patch
 
 import pytest
 
@@ -20,6 +21,7 @@ from griptape_nodes.retained_mode.engine import (
     has_current_engine,
     reset_root_engine,
 )
+from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
 from griptape_nodes.retained_mode.events.secrets_events import SetSecretValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -330,3 +332,59 @@ class TestFailedRequestLogging:
         assert "req-42" in record.getMessage()
         assert record.exc_info is not None
         assert self.SECRET_VALUE not in caplog.text
+
+
+class _Links:
+    """Answers every request with a fixed result, and records the lost-link callback it is given."""
+
+    def __init__(self) -> None:
+        self.asked: list[tuple[str, object, float | None]] = []
+        self.link_lost: object = None
+
+    async def request(self, engine_id: str, request: object, *, timeout_s: float | None) -> object:
+        self.asked.append((engine_id, request, timeout_s))
+        return ResultPayloadFailure(result_details="answered")
+
+    def on_engine_lost(self, callback: object) -> None:
+        self.link_lost = callback
+
+
+class TestRequestingAnotherEngine:
+    @pytest.mark.asyncio
+    async def test_without_links_a_request_fails_saying_so(self) -> None:
+        engine = Engine()
+
+        with pytest.raises(EngineNotFoundError, match="no connections to other engines"):
+            await engine.request("gpu-01", SetSecretValueRequest(key="k", value="v"), timeout_s=1.0)
+
+        assert not engine.can_reach_other_engines
+
+    @pytest.mark.asyncio
+    async def test_a_request_goes_through_the_attached_links(self) -> None:
+        engine = Engine()
+        links = _Links()
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
+        request = SetSecretValueRequest(key="k", value="v")
+
+        result = await engine.request("gpu-01", request, timeout_s=1.0)
+
+        assert isinstance(result, ResultPayloadFailure)
+        assert links.asked == [("gpu-01", request, 1.0)]
+        assert links.link_lost is not None
+        assert engine.can_reach_other_engines
+
+    @pytest.mark.asyncio
+    async def test_a_link_lost_on_the_transports_loop_is_settled_on_the_engine_loop(self) -> None:
+        engine = Engine()
+        engine.event_manager.initialize_queue()
+        links = _Links()
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
+        settled_on: list[asyncio.AbstractEventLoop] = []
+
+        async def record_loop(_engine_id: str) -> None:
+            settled_on.append(asyncio.get_running_loop())
+
+        with patch.object(engine.worker_manager, "on_engine_lost", side_effect=record_loop):
+            await asyncio.to_thread(asyncio.run, links.link_lost("artist"))  # type: ignore[operator]
+
+        assert settled_on == [asyncio.get_running_loop()]
