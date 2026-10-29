@@ -136,6 +136,7 @@ To limit how many workers the remote computer runs at once, set `distributed_exe
 
 - **Only some libraries can run elsewhere.** A library can run on another computer only if its nodes run in a worker, which is up to the library's author. Libraries with heavy dependencies, such as machine learning models, usually do. If you list one that doesn't, nothing fails: its nodes keep running on your workstation.
 - **Secrets come from your workstation.** When a node asks for a secret by name, such as a provider API key, it gets your workstation's value.
+- **Only use a remote computer you trust.** Your nodes running there act for your workstation: they can read your secrets and your workspace files, and work as your engine does. So you're trusting the remote computer, anyone who can connect to its Griptape Nodes port, and anyone whose nodes run on it, such as other people sharing it. Keep it on a network only your team reaches.
 - **If the remote computer moves to a new address**, restart Griptape Nodes on your workstation so it looks the remote engine up again.
 - **You can share one config file between computers.** A library listed with an engine's own ID runs on that engine. So computers that share a workspace can share its `griptape_nodes_config.json`: the remote computer runs its libraries itself, and your workstation sends them there.
 
