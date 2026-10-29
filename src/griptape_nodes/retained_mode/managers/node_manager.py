@@ -254,6 +254,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.serialization.commands import (
@@ -382,7 +383,7 @@ class _NodeInstantiationDeniedError(Exception):
 
 
 @dataclass(frozen=True)
-class ResolveNodeSpec:
+class ResolveNodeSpec(RunSpec):
     """A run of one node, from a `ResolveNodeRequest`."""
 
     request: ResolveNodeRequest

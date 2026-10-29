@@ -126,6 +126,8 @@ def worker_manager() -> WorkerManager:
     gtn.library_manager.wait_for_execution_env = AsyncMock()
     # No transport to other engines until a test attaches one.
     gtn.can_reach_other_engines = False
+    # Outside any run until a test puts the code in one.
+    gtn.flow_manager.current_run.return_value = None
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         send_message=AsyncMock(),
@@ -3599,7 +3601,7 @@ class TestSharingThisEngineBetweenRuns:
         await _settle()
         run = line.runs[0]
         run.position = 0
-        worker_manager._on_place_in_line(run)
+        run.spec.on_place_in_line(run)
         await asyncio.gather(*worker_manager._engine_notices)
 
         reports = [
@@ -3638,12 +3640,30 @@ class TestSharingThisEngineBetweenRuns:
 
         admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
         await _settle()
-        line.runs[0].spec.failure("The run did not start: it was cancelled.")
+        line.runs[0].spec.on_turned_away("The run did not start: it was cancelled.")
         result = await admitting
 
         assert isinstance(result, worker_events.AdmitNodeResultFailure)
         assert "it was cancelled" in str(result.result_details)
         assert worker_manager._engine_runs == {}
+
+    @pytest.mark.asyncio
+    async def test_building_a_run_s_failure_leaves_its_waiting_nodes_waiting(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        await _settle()
+
+        failure = line.runs[0].spec.failure("The run did not start: it was cancelled.")
+        await _settle()
+
+        assert isinstance(failure, worker_events.AdmitNodeResultFailure)
+        assert not admitting.done()
+        assert (_ARTIST_ENGINE, "run-1") in worker_manager._engine_runs
+        admitting.cancel()
 
     @pytest.mark.asyncio
     async def test_a_node_sent_without_a_run_lets_the_engine_go_when_it_ends(
@@ -3947,6 +3967,15 @@ class TestSharingThisEngineBetweenRuns:
         assert worker_manager._capacity_refusal(f"{_ARTIST_SESSION}/{_LIBRARY}") is None
 
 
+def _in_run(worker_manager: WorkerManager, run_id: str = "run-1") -> MagicMock:
+    """Put the code under test inside a run of this engine, returning the run."""
+    run = MagicMock()
+    run.run_id = run_id
+    run.ended = asyncio.get_running_loop().create_future()
+    worker_manager.engine.flow_manager.current_run.return_value = run  # type: ignore[attr-defined]
+    return run
+
+
 class TestAskingAnotherEngineToAdmitANode:
     @pytest.mark.asyncio
     async def test_the_admission_names_the_run_and_the_run_s_end_reaches_that_engine(
@@ -3954,10 +3983,12 @@ class TestAskingAnotherEngineToAdmitANode:
     ) -> None:
         links = _host_engine(worker_manager)
 
-        with patch("griptape_nodes.retained_mode.managers.worker_manager.current_run_id", return_value="run-1"):
-            admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
+        run = _in_run(worker_manager)
+
+        admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
         await worker_manager.end_admission(admission)
-        worker_manager._on_run_ended("run-1")
+        run.ended.set_result(None)
+        await _settle()
         await asyncio.gather(*worker_manager._engine_notices)
 
         (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
@@ -3974,9 +4005,9 @@ class TestAskingAnotherEngineToAdmitANode:
         links = _host_engine(worker_manager)
         links.blocked["AdmitNodeRequest"] = asyncio.Event()
         report = worker_manager.engine.flow_manager.report_run_waiting_for_engine
-        with patch("griptape_nodes.retained_mode.managers.worker_manager.current_run_id", return_value="run-1"):
-            admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
-            await _settle()
+        _in_run(worker_manager)
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
         (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
         admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
         await _dispatched_by(
@@ -4019,9 +4050,9 @@ class TestAskingAnotherEngineToAdmitANode:
     ) -> None:
         links = _host_engine(worker_manager)
         links.blocked["AdmitNodeRequest"] = asyncio.Event()
-        with patch("griptape_nodes.retained_mode.managers.worker_manager.current_run_id", return_value="run-1"):
-            admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
-            await _settle()
+        _in_run(worker_manager)
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
         (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
         admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
 

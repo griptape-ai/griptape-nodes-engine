@@ -40,8 +40,8 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     resolve_worker_command,
     worker_requests_from_environment,
 )
-from griptape_nodes.retained_mode.managers.flow_manager import current_run_id
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
+from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.managers.settings import (
     DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY,
     DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
@@ -148,7 +148,7 @@ class _EngineRun:
 
 
 @dataclass
-class _EngineRunSpec:
+class _EngineRunSpec(RunSpec):
     """A run of another engine's nodes, which holds this engine from when it starts until that run lets it go."""
 
     manager: WorkerManager
@@ -159,8 +159,13 @@ class _EngineRunSpec:
         return await self.manager.hold_for_engine_run(self.engine_run)
 
     def failure(self, details: str) -> ResultPayload:
-        self.manager.refuse_engine_run(self.engine_run, details)
         return worker_events.AdmitNodeResultFailure(result_details=details)
+
+    def on_place_in_line(self, run: Run) -> None:
+        self.manager.report_place_in_line(self.engine_run, run.position)
+
+    def on_turned_away(self, details: str) -> None:
+        self.manager.refuse_engine_run(self.engine_run, details)
 
 
 @dataclass
@@ -360,10 +365,6 @@ class WorkerManager(EngineScoped):
 
         event_manager.register_request_handlers(self)
         event_manager.recognize_sessions(self.has_registered_session)
-        # A run's end reaches every engine it sent a node to, and another engine's run waiting here
-        # hears its place in line.
-        engine.flow_manager.add_run_ended_listener(self._on_run_ended)
-        engine.flow_manager.add_place_in_line_listener(self._on_place_in_line)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -1003,12 +1004,13 @@ class WorkerManager(EngineScoped):
         host_engine_id = self._engine_for_library(library_name)
         if host_engine_id is None:
             return None
-        admission = EngineAdmission(
-            admission_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=current_run_id()
-        )
+        run = self.engine.flow_manager.current_run()
+        run_id = None
+        if run is not None:
+            run_id = run.run_id
+            self._note_run_uses_engine(run, host_engine_id)
+        admission = EngineAdmission(admission_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=run_id)
         self._admissions[admission.admission_id] = admission
-        if admission.run_id is not None:
-            self._run_engines.setdefault(admission.run_id, set()).add(host_engine_id)
         request = worker_events.AdmitNodeRequest(
             admission_id=admission.admission_id, run_id=admission.run_id, node_name=node_name
         )
@@ -1029,6 +1031,15 @@ class WorkerManager(EngineScoped):
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
             raise RuntimeError(msg)
         return admission
+
+    def _note_run_uses_engine(self, run: Run, host_engine_id: str) -> None:
+        """Record that `run` sent a node to `host_engine_id`, so the run's end reaches that engine."""
+        engine_ids = self._run_engines.get(run.run_id)
+        if engine_ids is None:
+            engine_ids = set()
+            self._run_engines[run.run_id] = engine_ids
+            run.ended.add_done_callback(lambda _ended: self._on_run_ended(run.run_id))
+        engine_ids.add(host_engine_id)
 
     def _stop_reporting_wait(self, admission: EngineAdmission) -> None:
         if admission.run_id is not None:
@@ -1822,7 +1833,7 @@ class WorkerManager(EngineScoped):
                 sender.engine_id,
             )
         engine_run.waiting.add(request.admission_id)
-        self._report_place_in_line(engine_run, request.admission_id)
+        self._report_place_to_admission(engine_run, request.admission_id)
         try:
             refusal = await asyncio.shield(engine_run.admitted)
         finally:
@@ -1923,6 +1934,11 @@ class WorkerManager(EngineScoped):
         return worker_events.ReportRunEndedResultSuccess(
             result_details=f"Engine {engine_run.engine_id}'s run let this engine go."
         )
+
+    def report_place_in_line(self, engine_run: _EngineRun, position: int) -> None:
+        """Tell the engine whose run waits here its place in line, for each of its nodes waiting."""
+        for admission_id in list(engine_run.waiting):
+            self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, position))
 
     def refuse_engine_run(self, engine_run: _EngineRun, details: str) -> None:
         """Tell another engine's run waiting here that it will not get this engine, and why.
@@ -2085,15 +2101,7 @@ class WorkerManager(EngineScoped):
             return None
         return admission.host_engine_id
 
-    def _on_place_in_line(self, run: Run) -> None:
-        """Tell the engine whose run waits here its place in line, for each of its nodes waiting."""
-        if not isinstance(run.spec, _EngineRunSpec):
-            return
-        engine_run = run.spec.engine_run
-        for admission_id in list(engine_run.waiting):
-            self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, run.position))
-
-    def _report_place_in_line(self, engine_run: _EngineRun, admission_id: str) -> None:
+    def _report_place_to_admission(self, engine_run: _EngineRun, admission_id: str) -> None:
         """Tell a node that just asked to be admitted its run's place in line, if the run waits."""
         if engine_run.line_run is None or not engine_run.line_run.position:
             return

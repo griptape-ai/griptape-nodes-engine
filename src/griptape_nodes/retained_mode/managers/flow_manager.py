@@ -192,7 +192,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.event_manager import current_request_id
-from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunState
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunSpec, RunState
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.managers.workflow.shape import (
     build_workflow_shape_from_parameter_info,
@@ -210,7 +210,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.run_queue import RunSpec
     from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
@@ -229,7 +228,7 @@ def current_run_id() -> str | None:
 
 
 @dataclass(frozen=True)
-class StartFlowSpec:
+class StartFlowSpec(RunSpec):
     """A run of a whole flow, from a `StartFlowRequest`."""
 
     request: StartFlowRequest
@@ -249,7 +248,7 @@ class StartFlowSpec:
 
 
 @dataclass(frozen=True)
-class StartFlowFromNodeSpec:
+class StartFlowFromNodeSpec(RunSpec):
     """A run of a flow from one of its nodes, from a `StartFlowFromNodeRequest`."""
 
     request: StartFlowFromNodeRequest
@@ -422,9 +421,6 @@ class FlowManager(EngineScoped):
         self._driving = False
         # True while cancel_all_runs awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self._cancelling_all = False
-        # Called with each run's ID as it ends, and with each waiting run whose place in line changes.
-        self._run_ended_listeners: list[Callable[[str], None]] = []
-        self._place_in_line_listeners: list[Callable[[Run], None]] = []
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -4873,6 +4869,7 @@ class FlowManager(EngineScoped):
             queued_at=datetime.now(tz=UTC),
             state=RunState.QUEUED,
             outcome=asyncio.get_running_loop().create_future(),
+            ended=asyncio.get_running_loop().create_future(),
             context=copy_context(),
             request_id=current_request_id(),
         )
@@ -4911,13 +4908,11 @@ class FlowManager(EngineScoped):
         # Runs submitted while the cancel awaited were held, so they go too.
         self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
 
-    def add_run_ended_listener(self, listener: Callable[[str], None]) -> None:
-        """Call `listener` with each run's ID once the run ends, however it ends, on the loop the run was submitted on."""
-        self._run_ended_listeners.append(listener)
-
-    def add_place_in_line_listener(self, listener: Callable[[Run], None]) -> None:
-        """Call `listener`, on the run's loop, with each waiting run whose place in line changes, and at 0 once it stops."""
-        self._place_in_line_listeners.append(listener)
+    def current_run(self) -> Run | None:
+        """The run in progress, if the code executing now belongs to it, or None."""
+        if not self._is_inside_run_in_progress():
+            return None
+        return self._run_in_progress
 
     def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
         """Report that the run in progress waits at `position` for another engine, or no longer waits at 0.
@@ -4938,10 +4933,16 @@ class FlowManager(EngineScoped):
                 continue
             run.state = RunState.CANCELLED
             self._leave_line(run)
-            self._on_run_loop(run, self._fail_run_outcome, run, f"The run did not start: {reason}")
+            self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
         self._report_places_in_line()
 
-    def _fail_run_outcome(self, run: Run, details: str) -> None:
+    def _end_without_executing(self, run: Run, details: str) -> None:
+        """End a run that left the line without executing; its request returns `details`."""
+        self._fail_unexecuted(run, details)
+        run.ended.set_result(None)
+
+    def _fail_unexecuted(self, run: Run, details: str) -> None:
+        run.spec.on_turned_away(details)
         run.outcome.set_result(self._of_run(run.spec.failure(details), run.run_id))
 
     def _raise_if_run_cancelled(self) -> None:
@@ -4981,7 +4982,7 @@ class FlowManager(EngineScoped):
         # run.context is the submitter's context copied, so this marks only the run's own tasks.
         _current_run_id.set(run.run_id)
         if run.state is RunState.CANCELLED:
-            run.outcome.set_result(self._of_run(run.spec.failure(_CANCELLED_BEFORE_STARTING), run.run_id))
+            self._fail_unexecuted(run, _CANCELLED_BEFORE_STARTING)
             self._driving = False
             self._finish_run(run)
             return
@@ -5025,8 +5026,7 @@ class FlowManager(EngineScoped):
         if self._run_in_progress is not run:
             return
         self._run_in_progress = None
-        for listener in self._run_ended_listeners:
-            self._on_run_loop(run, listener, run.run_id)
+        self._on_run_loop(run, run.ended.set_result, None)
         self._start_next_run_if_idle()
         self._report_places_in_line()
 
@@ -5061,8 +5061,7 @@ class FlowManager(EngineScoped):
 
     def _report_place_in_line(self, run: Run) -> None:
         self._put_run_queued_event(run, run.position)
-        for listener in self._place_in_line_listeners:
-            self._on_run_loop(run, listener, run)
+        self._on_run_loop(run, run.spec.on_place_in_line, run)
 
     def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(

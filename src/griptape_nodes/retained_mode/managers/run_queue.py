@@ -31,12 +31,13 @@ class RunState(StrEnum):
 
 
 class RunSpec(Protocol):
-    """What a run executes: the request that started it, with the flow it runs."""
+    """What a run executes: the request that started it, with the flow it runs.
 
-    @property
-    def flow_name(self) -> str:
-        """The flow the run executes."""
-        raise NotImplementedError
+    Specs subclass it, so a spec that needs no hook inherits one that does nothing.
+    """
+
+    # The flow the run executes.
+    flow_name: str
 
     async def execute(self, engine: Engine) -> ResultPayload:
         """Execute the run, returning what its request returns."""
@@ -46,6 +47,12 @@ class RunSpec(Protocol):
         """The failure its request returns for a run that did not execute."""
         raise NotImplementedError
 
+    def on_place_in_line(self, run: Run) -> None:
+        """Called on the run's loop each time its place in line changes, and at 0 once it stops waiting."""
+
+    def on_turned_away(self, details: str) -> None:
+        """Called on the run's loop when the run ends without executing, with why, before its request returns `failure`."""
+
 
 @dataclass
 class Run:
@@ -54,8 +61,10 @@ class Run:
     flow_name: str
     queued_at: datetime
     state: RunState
-    # What the run's request returns, set once the request is done.
+    # What the run's request returns, set once the request is done. A debug run paused there goes on.
     outcome: asyncio.Future[ResultPayload]
+    # Set once the run ends, however it ends, on the loop it was submitted on.
+    ended: asyncio.Future[None]
     # The submitter's context, so the run executes as if the request had run it directly.
     context: contextvars.Context
     # The place in line it was last reported at, 0 while it is not waiting.

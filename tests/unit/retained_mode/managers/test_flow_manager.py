@@ -5,7 +5,7 @@ import itertools
 import json
 import tempfile
 from collections.abc import Awaitable, Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDe
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
 from griptape_nodes.serialization.commands import encode_commands
 
 
@@ -1062,7 +1063,7 @@ class TestReparentFlow:
 
 
 @dataclass
-class _Spec:
+class _Spec(RunSpec):
     """A run that executes `body`, standing in for a request's run."""
 
     flow_name: str
@@ -1339,17 +1340,15 @@ class TestRunsEndCleanly:
 
     @pytest.mark.asyncio
     async def test_a_run_ended_on_another_loop_is_reported_on_the_run_s_own_loop(self, engine: Engine) -> None:
-        """A listener that starts a task would otherwise start it on a loop that is about to close."""
+        """A callback that starts a task would otherwise start it on a loop that is about to close."""
         flow_manager = engine.flow_manager
         flow_running = {"value": False}
         reported = asyncio.Event()
         loops: list[asyncio.AbstractEventLoop] = []
 
-        def on_run_ended(_run_id: str) -> None:
+        def on_run_ended(_ended: asyncio.Future[None]) -> None:
             loops.append(asyncio.get_running_loop())
             reported.set()
-
-        flow_manager.add_run_ended_listener(on_run_ended)
 
         async def stop_the_flow() -> None:
             flow_running["value"] = False
@@ -1366,6 +1365,7 @@ class TestRunsEndCleanly:
             await flow_manager.start_run(_Spec("flow", first))
             first_run = flow_manager._run_in_progress
             assert first_run is not None
+            first_run.ended.add_done_callback(on_run_ended)
 
             with ThreadRunner() as runner:
                 runner.run(flow_manager.cancel_run(first_run.run_id))
@@ -1403,6 +1403,90 @@ class TestRunSpecs:
 
         assert isinstance(result, ResolveNodeResultFailure)
         assert "does not exist" in str(result.result_details)
+
+
+@dataclass
+class _HearingSpec(_Spec):
+    """A run that records what its hooks hear."""
+
+    places: list[int] = field(default_factory=list)
+    turned_away: list[str] = field(default_factory=list)
+
+    def on_place_in_line(self, run: Run) -> None:
+        self.places.append(run.position)
+
+    def on_turned_away(self, details: str) -> None:
+        self.turned_away.append(details)
+
+
+class TestRunSpecHooks:
+    """A run's spec hears its place in line and why it was turned away; the run says when it ended."""
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_run_s_spec_hears_its_place_and_when_it_stops_waiting(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        spec = _HearingSpec("second", second)
+        waiting = asyncio.ensure_future(flow_manager.start_run(spec))
+        await asyncio.sleep(0)
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, waiting), timeout=1.0)
+
+        assert spec.places == [1, 0]
+
+    @pytest.mark.asyncio
+    async def test_a_run_turned_away_tells_its_spec_why_and_ends(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def never() -> Any:
+            return _ran("never")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        spec = _HearingSpec("second", never)
+        waiting_run = flow_manager.submit_run(spec)
+
+        await flow_manager.cancel_run(waiting_run.run_id)
+        await asyncio.wait_for(waiting_run.ended, timeout=1.0)
+
+        assert spec.turned_away == ["The run did not start: it was cancelled."]
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_paused_run_ends_when_its_flow_stops_not_when_its_request_returns(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+
+        async def pauses() -> Any:
+            flow_running["value"] = True
+            return _ran("paused")
+
+        with patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]):
+            await flow_manager.start_run(_Spec("flow", pauses))
+            run = flow_manager._run_in_progress
+            assert run is not None
+            assert run.outcome.done()
+            assert not run.ended.done()
+
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over()
+            await asyncio.wait_for(run.ended, timeout=1.0)
 
 
 class TestRunRequests:
