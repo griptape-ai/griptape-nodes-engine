@@ -3993,7 +3993,7 @@ class NodeManager(EngineScoped):
                 )
 
             try:
-                with aprocess_scope(request.variables, node):
+                with aprocess_scope(request.variables, node, run_id=request.run_id):
                     await node.aprocess()
             except Exception as e:
                 return self._execution_failure(e, node_name)

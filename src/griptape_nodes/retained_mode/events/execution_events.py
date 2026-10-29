@@ -824,6 +824,9 @@ class ExecuteNodeRequest(RequestPayload):
             workflow's own folder to a workspace-relative path. These three mirror
             ContextManager.WorkflowContextState exactly; workflow_name None means the orchestrator
             had no workflow either, so there is nothing to adopt.
+        run_id: The workflow run this execution is part of, which the node holds as its `run_id`
+            while it runs. Sent so a worker's node can name its run on the budget requests it makes,
+            since the worker has no run of its own. None when no run is in progress.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -840,6 +843,7 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
+    run_id: str | None = None
 
 
 @dataclass

@@ -189,7 +189,7 @@ class BudgetManager(EngineScoped):
         """Ask Cloud whether a direct provider call fits its budgets; fail open unless Cloud says no."""
         correlation_id = uuid.uuid4().hex
         body: dict[str, Any] = {
-            "tags": self._build_tags(request.node_type, request.node_id),
+            "tags": self._build_tags(request.node_type, request.node_id, request.run_id),
             "model": request.model,
             "correlation_id": correlation_id,
         }
@@ -254,7 +254,7 @@ class BudgetManager(EngineScoped):
         idempotency_key = uuid.uuid4().hex
         body: dict[str, Any] = {
             "idempotency_key": idempotency_key,
-            "tags": self._build_tags(request.node_type, request.node_id),
+            "tags": self._build_tags(request.node_type, request.node_id, request.run_id),
             "occurred_at": datetime.now(UTC).isoformat(),
         }
         if request.declared_cost_micro_usd is None:
@@ -319,8 +319,12 @@ class BudgetManager(EngineScoped):
 
         return [entry.id for entry in chain if entry.id.strip() != SYSTEM_DEFAULTS_KEY]
 
-    def _build_tags(self, node_type: str | None, node_id: str | None) -> dict[str, Any]:
-        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown."""
+    def _build_tags(self, node_type: str | None, node_id: str | None, run_id: str | None) -> dict[str, Any]:
+        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown.
+
+        A call that names its run keeps it, since the run in progress when the request arrives may be
+        a later one. One that names none is counted toward the run in progress, if any.
+        """
         tags: dict[str, Any] = {}
         project_chain = self._resolve_project_chain()
         if project_chain:
@@ -328,12 +332,14 @@ class BudgetManager(EngineScoped):
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow():
             tags["workflow"] = context_manager.get_current_workflow_name()
+        if run_id is None:
+            run_id = self.engine.flow_manager.current_run_id
         candidates = {
             "node_type": node_type,
             "node_id": node_id,
             "engine_id": self.engine.get_engine_id(),
             "session_id": self.engine.get_session_id(),
-            "run_id": self.engine.flow_manager.current_run_id,
+            "run_id": run_id,
         }
         tags.update({key: value for key, value in candidates.items() if value is not None})
         return tags

@@ -1,12 +1,13 @@
 """Fixture node for the run-spend e2e tests.
 
 ``SpendingNode`` reports a fixed cost from inside its run, the way the standard library's
-``report_model_usage_sync`` does after a direct provider call. It passes only what the library
-passes -- the model, the cost and its own class name -- so every other tag on the report, the run
-id among them, is the engine's to add.
+``report_model_usage_sync`` does after a direct provider call. It passes what the library
+passes -- the model, the cost, its own class name, and the run it is executing for -- so every other
+tag on the report is the engine's to add.
 
-Given a ``gate_file``, it then waits for that file to appear before finishing, so a test can cancel
-the run while the node is still running.
+Given a ``gate_file``, it waits for that file to appear before finishing, so a test can act while the
+node is still running: by default it reports first and then waits, and with ``report_after_gate`` it
+waits first and reports once the gate opens, the way a slow provider call reports late.
 """
 
 from __future__ import annotations
@@ -40,8 +41,32 @@ class SpendingNode(ControlNode):
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
             )
         )
+        self.add_parameter(
+            Parameter(
+                name="report_after_gate",
+                tooltip="Wait for the gate before reporting, rather than after, as a slow call reports late.",
+                type="bool",
+                default_value=False,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
 
     async def aprocess(self) -> None:
+        # Read now, while the node holds its run: a report sent after the gate must still name this run.
+        run_id = self.run_id
+        if self.get_parameter_value("report_after_gate"):
+            # Shielded, as a provider call blocked in a worker thread outlives the cancelled task that
+            # started it and still reports when it returns.
+            await asyncio.shield(self._wait_then_report(run_id))
+            return
+        await self._report(run_id)
+        await self._wait_for_gate()
+
+    async def _wait_then_report(self, run_id: str | None) -> None:
+        await self._wait_for_gate()
+        await self._report(run_id)
+
+    async def _report(self, run_id: str | None) -> None:
         await GriptapeNodes.ahandle_request(
             ReportUsageRequest(
                 declared_cost_micro_usd=COST_MICRO_USD,
@@ -49,9 +74,9 @@ class SpendingNode(ControlNode):
                 model="gpt-5-nano",
                 activity_type="chat_completion",
                 node_type=type(self).__name__,
+                run_id=run_id,
             )
         )
-        await self._wait_for_gate()
 
     async def _wait_for_gate(self) -> None:
         gate_path = self.get_parameter_value("gate_file") or ""
