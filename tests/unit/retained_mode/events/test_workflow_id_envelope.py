@@ -3,7 +3,7 @@
 `data/workflow_id_envelope_golden.json` is shared: the editor and app suites copy it. The editor
 asserts it emits this shape, the app that it forwards the id, and this suite that the engine
 reads it and echoes it on the result as `open_workflow_id`, apart from any `workflow_id` the result
-payload carries. The engine does not route by the id yet.
+payload carries.
 """
 
 import dataclasses
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
@@ -31,6 +31,11 @@ GOLDEN_WORKFLOW_ID = "5b0f6c3e8d1a4f7e9c2b6a4d3e1f0b97"
 
 def _golden() -> dict:
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+
+
+def _open_golden_workflow(engine: Engine) -> None:
+    engine.workflow_registry.register_unsaved("Golden", workflow_id=GOLDEN_WORKFLOW_ID)
+    engine.context_manager.push_workflow(workflow_name=f"unsaved:{GOLDEN_WORKFLOW_ID}")
 
 
 def test_the_engine_reads_the_envelope_open_workflow_id() -> None:
@@ -61,8 +66,9 @@ def test_the_envelope_open_workflow_id_round_trips() -> None:
 
 @pytest.mark.asyncio
 async def test_the_result_echoes_the_envelope_open_workflow_id() -> None:
-    """No workflow is open, so the id names none in context. The request still runs."""
+    """The request runs in the workflow the id names, and its result carries the id back."""
     engine = current_engine()
+    _open_golden_workflow(engine)
     event = converters.engine.structure(_golden()["EventRequest"], EventRequest)
     result_context = ResultContext(
         request_id=event.request_id, response_topic=event.response_topic, open_workflow_id=event.open_workflow_id
@@ -78,7 +84,9 @@ async def test_the_result_echoes_the_envelope_open_workflow_id() -> None:
 
 def test_the_sync_path_echoes_the_envelope_open_workflow_id() -> None:
     """`handle_request` takes the envelope id the same way `ahandle_request` does."""
-    result_event = current_engine().event_manager.handle_request(
+    engine = current_engine()
+    _open_golden_workflow(engine)
+    result_event = engine.event_manager.handle_request(
         GetWorkflowContextRequest(), result_context=ResultContext(open_workflow_id=GOLDEN_WORKFLOW_ID)
     )
 
