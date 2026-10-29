@@ -35,6 +35,9 @@ class MinMax(Trait):
 
     def validators_for_trait(self) -> list[Callable[..., Any]]:
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001
+            # None means "no value", which has no position on the range to check.
+            if value is None:
+                return
             if value > self.max or value < self.min:
                 msg = "Value out of range"
                 raise ValueError(msg)

@@ -131,6 +131,7 @@ plugins:
           - guides/local_editor.md: Serving the editor from the engine at 127.0.0.1:8126 instead of using the hosted editor
           - guides/libraries.md: Installing and managing node libraries
           - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by, worker command prefix)
+          - guides/run_nodes_on_another_computer.md: Running a library's nodes on another computer's engine (distributed_execution.libraries, advertise_url, requirements, troubleshooting)
         Project system:
           - guides/projects/index.md: Project system overview
           - guides/projects/gui_guide.md: Managing projects from the GUI
@@ -317,6 +318,7 @@ nav:
           - Running the Editor Locally: guides/local_editor.md
           - Libraries: guides/libraries.md
           - Managed Environment: guides/managed_environment.md
+          - Running Nodes on Another Computer: guides/run_nodes_on_another_computer.md
       - Projects:
           - Overview: guides/projects/index.md
           - Managing Projects in the GUI: guides/projects/gui_guide.md
