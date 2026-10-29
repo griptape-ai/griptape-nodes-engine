@@ -543,12 +543,12 @@ The checks follow these rules:
 - **Declare the provider's limits and a docs link.** The validators know nothing about any provider.
     Your node declares the limits the provider documents, only on the inputs its request sends, and
     `input_limits_url()` returns the page that documents them, so the user can see the rule.
-- **No network calls.** The checks run before every run, in a worker thread, so a slow one holds up
-    only its own node, not the editor or other flows. They never download an input or a tool: they
-    measure files on this machine and data URIs, and use ffprobe only when it is already installed.
-    Each input is read once per run, however many validators it has. A local probe takes tens of
-    milliseconds; one that takes more than 10 seconds, such as a file on a stalled network drive, is
-    abandoned and its checks skipped. An image given as a file path costs
+- **No network calls.** The checks run before every run, in a worker thread, so a slow one doesn't
+    freeze the editor or other flows, but the run starts no other node until it finishes. They never
+    download an input or a tool: they measure files on this machine and data URIs, and use ffprobe
+    only when it is already installed. Each input is read once per run, however many validators it
+    has. A local probe takes tens of milliseconds; one that takes more than 3 seconds, such as a file
+    on a stalled network drive, is abandoned and its checks skipped. An image given as a file path costs
     only a header read, except a WebP or AVIF file, which Pillow reads in full without decoding its
     pixels. One given as a data URI or an in-memory artifact is decoded in full, so its check takes
     longer the larger it is; pass file paths where you can.

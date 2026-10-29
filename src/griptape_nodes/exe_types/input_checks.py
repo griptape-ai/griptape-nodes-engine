@@ -68,11 +68,12 @@ __all__ = [
 ]
 
 
-# A local probe takes tens of milliseconds. Validation runs in a worker thread, so a slow probe holds
-# up only its own node; this only stops a hung ffprobe (a stalled network drive, a damaged file). A
-# probe that takes longer is abandoned and the checks that need it (container, codec, frame size,
-# duration, frame rate) are skipped.
-FFPROBE_TIMEOUT_SECONDS = 10
+# A local probe takes tens of milliseconds; this stops a hung one (a stalled network drive, a damaged
+# file). Validation runs in a worker thread, so it doesn't freeze the editor, but the run starts no
+# other node until a node's checks return, so a node with several stuck inputs holds up its run for
+# this long per input. A probe that takes longer is abandoned and the checks that need it (container,
+# codec, frame size, duration, frame rate) are skipped.
+FFPROBE_TIMEOUT_SECONDS = 3
 
 # An ISO media file (MP4, MOV, HEIC, AVIF) opens with an `ftyp` box: a 4-byte size, "ftyp", then
 # the 4-byte major brand.

@@ -5,6 +5,6 @@
     and the limit, and links the page from the node's new `input_limits_url()`. It reads each input's
     format, codec, size, pixel size, length, frame rate and frame count locally, once; anything it
     can't read locally, such as a remote URL, is left for the provider; a video or audio input that
-    takes more than 10 seconds to read is skipped and logged as a warning. See
+    takes more than 3 seconds to read is skipped and logged as a warning. See
     [Checking inputs before a run](https://docs.griptapenodes.com/en/stable/development/custom_nodes/error_handling/#checking-inputs-before-a-run).
     [#5960](https://github.com/griptape-ai/griptape-nodes-engine/issues/5960)

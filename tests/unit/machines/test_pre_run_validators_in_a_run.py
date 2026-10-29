@@ -122,15 +122,19 @@ def slow_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("slow_ffprobe")
-async def test_runs_the_node_when_an_input_could_not_be_read_in_time(tmp_path: Path) -> None:
+async def test_runs_the_node_when_an_input_could_not_be_read_in_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A video that took too long to read is skipped, like any input that can't be read here."""
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"video")
     node = _VideoNode()
     node.set_parameter_value("video", str(clip))
     machine, _put_event = _machine_for(node)
+    execute = AsyncMock()
+    monkeypatch.setattr(ExecuteDagState, "execute_node", execute)
 
     await asyncio.wait_for(machine.resolve_node(), timeout=5)
 
-    # It got past its checks; any later error is from running it against this stub engine.
-    assert "encountered problems" not in (machine.get_error_message() or "")
+    # It got past its checks and was started.
+    execute.assert_awaited_once()
