@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import uuid
+from abc import abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
@@ -21,6 +24,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import BaseNodeElement
@@ -41,6 +45,7 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _task_local_flow_stack_state: ContextManager.TaskLocalFlowStackState
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -53,6 +58,25 @@ class ContextManager(EngineScoped):
 
     class EmptyStackError(WorkflowContextError):
         """Empty stack error."""
+
+    class FlowStackState(Protocol):
+        """The flow-stack operations shared by the workflow's shared stack and a task-local stack."""
+
+        @abstractmethod
+        def push_flow(self, flow: ControlFlow) -> ControlFlow:
+            """Push a flow onto this stack and return it."""
+
+        @abstractmethod
+        def pop_flow(self) -> ControlFlow:
+            """Pop the top flow from this stack and return it."""
+
+        @abstractmethod
+        def flow_states(self) -> Sequence[ContextManager.FlowContextState]:
+            """Return this stack's flow states, bottom first."""
+
+        @abstractmethod
+        def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:
+            """Push a flow for a `with` block and return the action that exits it."""
 
     class WorkflowContextState:
         """Internal class that represents a Workflow's state which owns a stack of flow names."""
@@ -93,18 +117,84 @@ class ContextManager(EngineScoped):
             flow_context = self._flow_stack.pop()
             return flow_context._flow
 
-        def has_current_flow(self) -> bool:
-            """Check if this workflow has an active flow."""
-            return len(self._flow_stack) > 0
+        def flow_states(self) -> Sequence[ContextManager.FlowContextState]:
+            """Return this workflow's flow stack, bottom first."""
+            return self._flow_stack
 
-        def get_current_flow(self) -> ControlFlow:
-            """Get the current flow in this workflow."""
-            if not self._flow_stack:
-                msg = f"No active Flow in Workflow '{self._name}'"
+        def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:
+            """Push a flow for a `with` block, returning the action that exits it."""
+            self.push_flow(flow)
+            return self._exit_flow
+
+        def _exit_flow(self) -> None:
+            self.pop_flow()
+
+    class TaskLocalFlowStackState:
+        """Flow-stack operations on the current task's task-local stack.
+
+        Opt-in task-local stacks protect stacks held across awaits (e.g., workflow
+        imports).
+
+        The stack lives in a ContextVar as an immutable tuple, and push and pop replace
+        it with `ContextVar.set` rather than mutating it.
+        """
+
+        _stack_var: contextvars.ContextVar[tuple[ContextManager.FlowContextState, ...] | None]
+        _get_workflow_name: Callable[[], str]
+
+        def __init__(self, get_workflow_name: Callable[[], str]):
+            self._stack_var = contextvars.ContextVar("task_local_flow_stack", default=None)
+            self._get_workflow_name = get_workflow_name
+
+        def is_active(self) -> bool:
+            """Check if the current task is inside `task_local_flow_stack()`."""
+            return self._stack_var.get() is not None
+
+        def enter_task_local_stack(self, flow_states: Sequence[ContextManager.FlowContextState]) -> Callable[[], None]:
+            """Give the current task its own stack, returning the action that ends it.
+
+            The stack starts as copies of `flow_states`, so node and element pushes inside the
+            block never reach the stack copied from.
+            """
+            token = self._stack_var.set(tuple(flow_state.copy() for flow_state in flow_states))
+
+            def exit_task_local_stack() -> None:
+                self._stack_var.reset(token)
+
+            return exit_task_local_stack
+
+        def push_flow(self, flow: ControlFlow) -> ControlFlow:
+            """Push a flow onto this task's flow stack."""
+            self._stack_var.set((*self.flow_states(), ContextManager.FlowContextState(flow)))
+            return flow
+
+        def pop_flow(self) -> ControlFlow:
+            """Pop the top flow from this task's flow stack."""
+            stack = self.flow_states()
+            if not stack:
+                msg = f"Cannot pop Flow: no active Flows in Workflow '{self._get_workflow_name()}'"
                 raise ContextManager.EmptyStackError(msg)
 
-            flow_context = self._flow_stack[-1]
-            return flow_context._flow
+            self._stack_var.set(stack[:-1])
+            return stack[-1]._flow
+
+        def flow_states(self) -> tuple[ContextManager.FlowContextState, ...]:
+            """Return this task's flow stack, bottom first."""
+            return self._stack_var.get() or ()
+
+        def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:
+            """Push a flow for a `with` block, returning the action that exits it.
+
+            Exiting restores exactly the stack from before the push, dropping any bare
+            pushes made since.
+            """
+            stack_on_enter = self.flow_states()
+            self.push_flow(flow)
+
+            def exit_flow() -> None:
+                self._stack_var.set(stack_on_enter)
+
+            return exit_flow
 
     class WorkflowContext:
         """A context manager for a Workflow."""
@@ -136,6 +226,12 @@ class ContextManager(EngineScoped):
         def __init__(self, flow: ControlFlow):
             self._flow = flow
             self._node_stack = []
+
+        def copy(self) -> ContextManager.FlowContextState:
+            """Copy this flow state with its own node and element stacks."""
+            flow_copy = ContextManager.FlowContextState(self._flow)
+            flow_copy._node_stack = [node_state.copy() for node_state in self._node_stack]
+            return flow_copy
 
         def push_node(self, node: BaseNode) -> BaseNode:
             """Push a node name onto this flow's node stack."""
@@ -175,6 +271,12 @@ class ContextManager(EngineScoped):
             self.node = node
             self._element_stack = []
 
+        def copy(self) -> ContextManager.NodeContextState:
+            """Copy this node state with its own element stack."""
+            node_copy = ContextManager.NodeContextState(self.node)
+            node_copy._element_stack = list(self._element_stack)
+            return node_copy
+
         def push_element(self, element: BaseNodeElement) -> BaseNodeElement:
             """Push an element name onto this node's element stack."""
             self._element_stack.append(element)
@@ -207,13 +309,21 @@ class ContextManager(EngineScoped):
 
         _manager: ContextManager
         _flow: ControlFlow
+        _exit_flow: Callable[[], None]
 
         def __init__(self, manager: ContextManager, flow: ControlFlow):
             self._manager = manager
             self._flow = flow
 
         def __enter__(self) -> ControlFlow:
-            return self._manager.push_flow(self._flow)
+            if not self._manager.has_current_workflow():
+                msg = f"Cannot enter a Flow context '{self._flow.name}' without an active Workflow context"
+                raise ContextManager.NoActiveWorkflowError(msg)
+
+            # Push to either global or task-local flow stack, depending on whether the
+            # current task is inside a `task_local_flow_stack()` context.
+            self._exit_flow = self._manager._active_flow_stack_state().enter_flow(self._flow)
+            return self._flow
 
         def __exit__(
             self,
@@ -221,7 +331,7 @@ class ContextManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self._manager.pop_flow()
+            self._exit_flow()
 
     class NodeContext:
         """A context manager for a Node within a Flow."""
@@ -265,7 +375,11 @@ class ContextManager(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
+        # Shared stack preserving the editor's current flow across request tasks.
         self._workflow_stack = []
+        # Opt-in task-local flow stacks isolating concurrent workflow imports across
+        # awaits.
+        self._task_local_flow_stack_state = self.TaskLocalFlowStackState(self.get_current_workflow_name)
         event_manager.register_request_handlers(self)
 
     @handles(SetWorkflowContextRequest)
@@ -436,6 +550,28 @@ class ContextManager(EngineScoped):
                 raise ValueError(msg) from e
         return self.FlowContext(self, flow)
 
+    @contextmanager
+    def task_local_flow_stack(self) -> Iterator[None]:
+        """Give the current task its own copy of the flow stack for the `with` block.
+
+        The copy starts as a snapshot of the current stack, so flows already entered
+        stay visible. Pushes and pops inside the block never touch the stack shared with
+        other tasks.
+
+        Node and element stacks are copied on entry, so pushes inside the block never
+        reach the parent stack. Tasks spawned inside the block share those copies,
+        though: a child task's node or element pushes are visible to this task, while
+        flow pushes and pops stay per task.
+        """
+        flow_states: Sequence[ContextManager.FlowContextState] = ()
+        if self.has_current_workflow():
+            flow_states = self._active_flow_stack_state().flow_states()
+        exit_task_local_stack = self._task_local_flow_stack_state.enter_task_local_stack(flow_states)
+        try:
+            yield
+        finally:
+            exit_task_local_stack()
+
     def node(self, node: str | BaseNode) -> ContextManager.NodeContext:
         """Create a context manager for a Node context.
 
@@ -507,6 +643,10 @@ class ContextManager(EngineScoped):
         # the previous workflow's entry to be read by whatever runs next.
         self._workflow_stack[-1] = state
 
+    def has_task_local_flow_stack(self) -> bool:
+        """Check if the current task is inside `task_local_flow_stack()`."""
+        return self._task_local_flow_stack_state.is_active()
+
     def has_current_workflow(self) -> bool:
         """Check if there is an active Workflow context."""
         return len(self._workflow_stack) > 0
@@ -516,16 +656,14 @@ class ContextManager(EngineScoped):
         if not self.has_current_workflow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.has_current_flow()
+        return len(self._active_flow_stack_state().flow_states()) > 0
 
     def has_current_node(self) -> bool:
         """Check if there is an active Node within the current Flow."""
         if not self.has_current_flow():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         return current_flow.has_current_node()
 
     def has_current_element(self) -> bool:
@@ -533,8 +671,7 @@ class ContextManager(EngineScoped):
         if not self.has_current_node():
             return False
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         current_node = current_flow._node_stack[-1]
         return current_node.has_current_element()
 
@@ -650,8 +787,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.get_current_flow()
+        return self._current_flow_state()._flow
 
     def get_current_node(self) -> BaseNode:
         """Get the name of the current Node within the current Flow.
@@ -667,8 +803,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         return current_flow.get_current_node()
 
     def get_current_element(self) -> BaseNodeElement:
@@ -685,8 +820,7 @@ class ContextManager(EngineScoped):
             msg = "No active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "No active Node context"
@@ -793,8 +927,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
             raise self.NoActiveWorkflowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.push_flow(flow)
+        return self._active_flow_stack_state().push_flow(flow)
 
     def pop_flow(self) -> ControlFlow:
         """Pop the current Flow context from the stack.
@@ -809,8 +942,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Flow: stack is empty"
             raise self.EmptyStackError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        return current_workflow.pop_flow()
+        return self._active_flow_stack_state().pop_flow()
 
     def push_node(self, node: BaseNode) -> BaseNode:
         """Push a new Node context onto the stack for the current Flow.
@@ -828,8 +960,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter a Node context '{node.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         result = current_flow.push_node(node)
         return result
 
@@ -847,8 +978,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Node: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
         result = current_flow.pop_node()
         return result
 
@@ -869,8 +999,7 @@ class ContextManager(EngineScoped):
             msg = f"Cannot enter an Element context '{element.name}' without an active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot enter an Element context without an active Node context"
@@ -893,8 +1022,7 @@ class ContextManager(EngineScoped):
             msg = "Cannot pop Element: no active Flow context"
             raise self.NoActiveFlowError(msg)
 
-        current_workflow = self._workflow_stack[-1]
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = self._current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot pop Element: no active Node context"
@@ -902,3 +1030,19 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _current_flow_state(self) -> ContextManager.FlowContextState:
+        """Return the top flow state of the active flow stack."""
+        return self._active_flow_stack_state().flow_states()[-1]
+
+    def _active_flow_stack_state(self) -> ContextManager.FlowStackState:
+        """Return the state that owns this task's flow stack.
+
+        Inside `task_local_flow_stack()`, the task's own stack lives in a ContextVar so
+        concurrent imports cannot push onto each other's flows; everything else uses the
+        workflow's shared stack, which is not safe to hold across an await.
+        """
+        if self.has_task_local_flow_stack():
+            return self._task_local_flow_stack_state
+
+        return self._workflow_stack[-1]

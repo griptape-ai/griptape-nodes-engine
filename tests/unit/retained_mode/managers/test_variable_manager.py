@@ -928,3 +928,17 @@ class TestProjectVariableSerialization:
         serialized = converter.unstructure(result)
         assert serialized["variable"]["name"] == "workspace_dir"
         assert serialized["variable"]["value"] == "/proj"
+
+
+class TestGetFlowHierarchy:
+    """`_get_flow_hierarchy` walks from a flow up to the root."""
+
+    def test_walks_up_to_the_root(self, engine: Engine, flow_name: str) -> None:
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        hierarchy = engine.variables_manager._get_flow_hierarchy(child.flow_name)
+
+        assert hierarchy == [child.flow_name, flow_name]
