@@ -219,9 +219,12 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 class ResultContext(TypedDict, total=False):
+    """Request envelope fields dispatch carries to the result. All but `sender` are echoed on the result envelope."""
+
     response_topic: str | None
     request_id: str | None
     sender: RequestSender | None
+    open_workflow_id: str | None
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1250,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
+                    open_workflow_id=context.get("open_workflow_id"),
                 )
             else:
                 result_event = EventResultFailure(
@@ -1255,6 +1259,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
+                    open_workflow_id=context.get("open_workflow_id"),
                 )
 
         # Fired here rather than in the two dispatch methods because every path that
@@ -1291,7 +1296,9 @@ class EventManager(EngineScoped):
 
         Args:
             request: The request to handle
-            result_context: The result context containing response_topic and request_id
+            result_context: The request envelope's fields: response_topic, request_id, sender, and
+                open_workflow_id, the open workflow the request runs in. Echoed on the result. Not
+                routed on.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
@@ -1391,7 +1398,9 @@ class EventManager(EngineScoped):
 
         Args:
             request: The request to handle
-            result_context: The result context containing response_topic and request_id
+            result_context: The request envelope's fields: response_topic, request_id, sender, and
+                open_workflow_id, the open workflow the request runs in. Echoed on the result. Not
+                routed on.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
