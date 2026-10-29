@@ -3602,6 +3602,50 @@ class TestSharingThisEngineBetweenRuns:
         assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.EndRunResultSuccess)
 
     @pytest.mark.asyncio
+    async def test_a_node_sent_without_a_run_that_ends_while_waiting_leaves_the_line(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise its run would hold this engine for the idle timeout once it reached the front."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+
+        admitting = asyncio.create_task(
+            _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1", run_id=None))
+        )
+        await _settle()
+        await _dispatched_by(worker_manager, _ARTIST, worker_events.NodeExecutionEndedRequest(admission_id="a1"))
+
+        assert isinstance(await asyncio.wait_for(admitting, timeout=1.0), worker_events.AdmitNodeResultFailure)
+        assert worker_manager._engine_runs == {}
+        worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(line.runs[0].run_id)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_ends_while_workers_are_freed_for_it_lets_the_engine_go(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise the run would hold this engine forever, and every run behind it would wait."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        worker_manager._last_engine_run_engine_id = "another-artist-engine"
+        freeing = asyncio.Event()
+
+        async def free_slowly(_engine_id: str) -> None:
+            await freeing.wait()
+
+        with patch.object(worker_manager, "_free_for_handoff", new=free_slowly):
+            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+            await _settle()
+            hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
+            await _settle()
+            await _sent_by(_ARTIST, worker_manager.handle_end_run_request, worker_events.EndRunRequest(run_id="run-1"))
+            freeing.set()
+
+            assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.EndRunResultSuccess)
+        assert isinstance(await admitting, worker_events.AdmitNodeResultFailure)
+
+    @pytest.mark.asyncio
     async def test_a_run_with_no_node_running_lets_go_after_the_idle_timeout(
         self, worker_manager: WorkerManager
     ) -> None:

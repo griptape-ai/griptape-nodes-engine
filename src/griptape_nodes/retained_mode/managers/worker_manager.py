@@ -1801,22 +1801,23 @@ class WorkerManager(EngineScoped):
         sender=RequiredSender.SESSION,
         owner=lambda manager, request, _sender: manager._engine_admitted(request.admission_id),
     )
-    def handle_node_execution_ended_request(
+    async def handle_node_execution_ended_request(
         self, request: worker_events.NodeExecutionEndedRequest
     ) -> worker_events.NodeExecutionEndedResultSuccess:
-        """Record that a node another engine ran here ended, letting its run go if it was the run's only node."""
+        """Record that a node another engine ran here ended, ending its run if it was the run's only node."""
         engine_run = self._engine_run_admitting(request.admission_id)
         if engine_run is None:
             return worker_events.NodeExecutionEndedResultSuccess(
                 result_details="This engine was not running that node, so there was nothing to record."
             )
+        # A node sent without a run is its run's only node, admitted or still in line.
+        if engine_run.run_id is None:
+            await self._end_engine_run(engine_run, "its node ended before it was admitted.")
+            return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
         if request.admission_id in engine_run.waiting:
             engine_run.abandoned.add(request.admission_id)
         engine_run.running.discard(request.admission_id)
-        if engine_run.run_id is None and not engine_run.running and not engine_run.waiting:
-            engine_run.released.set()
-        else:
-            self._let_go_if_idle(engine_run)
+        self._let_go_if_idle(engine_run)
         return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
 
     @handles(
@@ -1877,9 +1878,13 @@ class WorkerManager(EngineScoped):
         )
 
     def refuse_engine_run(self, engine_run: _EngineRun, details: str) -> None:
-        """Tell another engine's run waiting here that it will not get this engine, and why."""
+        """Tell another engine's run waiting here that it will not get this engine, and why.
+
+        Also releases it, so a run refused while `hold_for_engine_run` frees workers for it lets this engine go.
+        """
         if not engine_run.admitted.done():
             engine_run.admitted.set_result(details)
+        engine_run.released.set()
         self._forget_engine_run(engine_run)
 
     def _engine_that_offered(self, sender: RequestSender) -> str | None:

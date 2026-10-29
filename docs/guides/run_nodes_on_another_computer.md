@@ -110,6 +110,7 @@ Several people can send their libraries to the same remote computer. It runs one
 - **Runs take turns, in the order they asked.** When your run's first node arrives while someone else's run has the remote computer, your node waits. Meanwhile the run toolbar in your editor shows your run as queued, with its place in line.
 - **A run keeps the remote computer until it ends.** Once your run has it, your run's later nodes there start right away, even while someone else waits. It passes to the next run when yours ends, or when none of your run's nodes has run there for `distributed_execution.idle_timeout_s` (5 minutes unless the remote computer sets it otherwise).
 - **Runs started on the remote computer itself wait in the same line.**
+- **Don't send libraries both ways between two computers.** If computer A sends a library to B and B sends one to A, a run on each can wait for the other forever: each holds its own computer while it waits for the other's. Cancel one run to free both. The remote computer's log names the other engine when this happens.
 - **The previous person's models are freed first.** When the remote computer passes from one person's run to another's, it frees models the way its `distributed_execution.release` setting says:
 
 | Setting         | Value                      | What happens                                                                                                                    |
