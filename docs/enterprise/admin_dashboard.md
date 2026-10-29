@@ -137,8 +137,6 @@ Griptape Cloud checks the budgets that cover a call **before** the model runs. I
 
 ![The Admin Beta Features menu, with Spend & Budgets and Usage Audit listed under Admin](../assets/img/enterprise/admin_dashboard-beta_menu.png)
 
-**Spend & Budgets** and **Usage Audit** appear in the sidebar. The setting is saved in this browser only: it does not follow you to another browser or computer, and it does not affect anyone else in your organization. Budgets you set are enforced for everyone whether or not they have the pages turned on.
-
 ### The overview
 
 ![The Spend & Budgets overview cards](../assets/img/enterprise/admin_dashboard-spend_overview.png)
