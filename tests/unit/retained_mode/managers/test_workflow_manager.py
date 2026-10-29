@@ -5776,43 +5776,30 @@ class TestReferencedWorkflowTagging:
             other_flow = other_engine.flow_manager.get_flow_by_name(result.flow_name)
             assert other_engine.flow_manager.get_referenced_workflow_name(other_flow) is None
 
-    def test_entering_the_same_import_context_twice_is_refused(self, engine: Engine) -> None:
-        """Re-entering an import that is already running fails without disturbing it."""
+    def test_leaving_an_import_removes_the_variable_from_the_context(self, engine: Engine) -> None:
+        """Leaving an import clears the stack and drops the variable from the Context."""
         workflow_manager = engine.workflow_manager
-        context = workflow_manager.referenced_workflow("workflow_x")
 
-        with context:
-            with pytest.raises(RuntimeError, match="already active"):
-                context.__enter__()
-
+        with workflow_manager.referenced_workflow("workflow_x"):
             assert workflow_manager.get_current_referenced_workflow() == "workflow_x"
 
         assert not workflow_manager.has_current_referenced_workflow()
-        # Check reset() called in __exit__, which removes the variable from the Context
+        # Check reset() was called on leaving the block, which removes the variable from the Context
         # instead of leaving an empty tuple.
         assert workflow_manager._referenced_workflow_stack not in contextvars.copy_context()
 
-    def test_exiting_an_import_context_again_is_a_no_op(self, engine: Engine) -> None:
-        """A second exit after a finished import neither raises nor disturbs the surrounding state."""
+    def test_an_error_inside_an_import_still_restores_the_outer_workflow(self, engine: Engine) -> None:
+        """An exception raised inside a nested import leaves the outer import current."""
         workflow_manager = engine.workflow_manager
-        context = workflow_manager.referenced_workflow("workflow_x")
 
-        with context:
+        class ImportFailedError(Exception):
             pass
 
-        with workflow_manager.referenced_workflow("workflow_outer"):
-            context.__exit__(None, None, None)
+        with workflow_manager.referenced_workflow("outer"):
+            with pytest.raises(ImportFailedError), workflow_manager.referenced_workflow("inner"):
+                raise ImportFailedError
 
-            assert workflow_manager.get_current_referenced_workflow() == "workflow_outer"
-
-        assert not workflow_manager.has_current_referenced_workflow()
-
-    def test_exiting_an_import_context_that_was_never_entered_is_a_no_op(self, engine: Engine) -> None:
-        """Exiting a context that was never entered neither raises nor changes the state."""
-        workflow_manager = engine.workflow_manager
-        context = workflow_manager.referenced_workflow("workflow_x")
-
-        context.__exit__(None, None, None)
+            assert workflow_manager.get_current_referenced_workflow() == "outer"
 
         assert not workflow_manager.has_current_referenced_workflow()
 

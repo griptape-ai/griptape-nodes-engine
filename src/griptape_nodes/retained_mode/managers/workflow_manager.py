@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -98,7 +99,7 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -179,40 +180,6 @@ class WorkflowManager(EngineScoped):
             self.manager._squelch_workflow_altered_count -= 1
 
     _squelch_workflow_altered_count: int = 0
-
-    # Track referenced workflow import context stack
-    class ReferencedWorkflowContext:
-        """Context manager for tracking workflow import operations."""
-
-        def __init__(self, manager: WorkflowManager, workflow_name: str):
-            self._manager = manager
-            self._workflow_name = workflow_name
-            self._token: contextvars.Token[tuple[str, ...]] | None = None
-
-        def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            if self._token is not None:
-                msg = (
-                    f"Attempted to enter the referenced workflow context for '{self._workflow_name}'. "
-                    "Failed because this context is already active. Create a new context for each import."
-                )
-                raise RuntimeError(msg)
-
-            stack = self._manager._referenced_workflow_stack
-            self._token = stack.set((*stack.get(), self._workflow_name))
-            return self
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            if self._token is None:
-                return
-
-            token = self._token
-            self._token = None
-            self._manager._referenced_workflow_stack.reset(token)
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -430,9 +397,18 @@ class WorkflowManager(EngineScoped):
         """Wait until any registry refresh in progress has finished."""
         await self._workflows_loading_complete.wait()
 
-    def referenced_workflow(self, workflow_name: str) -> ReferencedWorkflowContext:
-        """Track `workflow_name` as the referenced workflow being imported for the `with` block."""
-        return self.ReferencedWorkflowContext(self, workflow_name)
+    @contextmanager
+    def referenced_workflow(self, workflow_name: str) -> Iterator[None]:
+        """Track `workflow_name` as the referenced workflow being imported for the `with` block.
+
+        Enter and exit must run in the same asyncio task, as a plain `with` inside one coroutine does,
+        because `ContextVar.reset` rejects a token from another Context.
+        """
+        token = self._referenced_workflow_stack.set((*self._referenced_workflow_stack.get(), workflow_name))
+        try:
+            yield
+        finally:
+            self._referenced_workflow_stack.reset(token)
 
     def squelch_workflow_altered(self) -> WorkflowSquelchContext:
         """Suppress workflow-altered events for the duration of the `with` block."""
