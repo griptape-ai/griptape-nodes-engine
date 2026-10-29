@@ -51,6 +51,7 @@ from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULT
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _STATIC_URL_SETTLE_TIMEOUT_S,
+    EngineAdmission,
     WorkerManager,
     WorkerRegistration,
     _HostedWorker,
@@ -3545,6 +3546,26 @@ class TestSharingThisEngineBetweenRuns:
             if isinstance(request, worker_events.ReportPlaceInLineRequest)
         ]
         assert reports == [(_ARTIST_ENGINE, 1), (_ARTIST_ENGINE, 0)]
+        admitting.cancel()
+
+    @pytest.mark.asyncio
+    async def test_two_engines_waiting_on_each_other_is_logged_as_an_error(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        _FakeLine(worker_manager)
+        worker_manager._admissions["mine"] = EngineAdmission(
+            admission_id="mine", host_engine_id=_ARTIST_ENGINE, run_id="run-here"
+        )
+
+        with caplog.at_level(logging.ERROR):
+            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+            await _settle()
+
+        assert any(
+            _ARTIST_ENGINE in record.getMessage() for record in caplog.records if record.levelno == logging.ERROR
+        )
         admitting.cancel()
 
     @pytest.mark.asyncio

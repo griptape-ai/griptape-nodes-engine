@@ -1771,6 +1771,15 @@ class WorkerManager(EngineScoped):
                 result_details="the session asking for it never registered with this engine."
             )
         engine_run = self._engine_run_for(sender.engine_id, request)
+        if not engine_run.admitted.done() and any(
+            admission.host_engine_id == sender.engine_id for admission in self._admissions.values()
+        ):
+            logger.error(
+                "A run from engine %s waits for this engine while a run here waits for engine %s. Neither "
+                "continues until one is cancelled. Engines that send nodes to each other can stop each other this way.",
+                sender.engine_id,
+                sender.engine_id,
+            )
         engine_run.waiting.add(request.admission_id)
         self._report_place_in_line(engine_run, request.admission_id)
         try:

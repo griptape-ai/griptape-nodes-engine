@@ -3755,8 +3755,11 @@ class NodeManager(EngineScoped):
             try:
                 if library_name:
                     await wm.wait_until_executable(library_name)
-                    admission = await wm.admit_on_engine(library_name, request.node_name)
-                    await wm.wait_until_executable(library_name)
+                    # A worker that could not be started there leaves nothing to admit the node, and an
+                    # engine that never answered the start would never answer the admission either.
+                    if wm.worker_unavailable_reason(library_name) is None:
+                        admission = await wm.admit_on_engine(library_name, request.node_name)
+                        await wm.wait_until_executable(library_name)
                 worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)

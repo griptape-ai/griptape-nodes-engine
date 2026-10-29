@@ -917,6 +917,7 @@ class TestExecuteNodeWorkerRoute:
         calls: list[str] = []
         admission = object()
         success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
+        wm.worker_unavailable_reason.return_value = None
         wm.wait_until_executable = AsyncMock(side_effect=lambda *_: calls.append("wait"))
         wm.admit_on_engine = AsyncMock(side_effect=lambda *_: calls.append("admit") or admission)
         lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
@@ -932,6 +933,29 @@ class TestExecuteNodeWorkerRoute:
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert calls == ["wait", "admit", "wait", "pick", "run", "end"]
         wm.end_admission.assert_awaited_once_with(admission)
+
+    @pytest.mark.asyncio
+    async def test_a_node_whose_worker_there_could_not_start_asks_that_engine_for_nothing(self) -> None:
+        """An engine that never answered the start would never answer the admission either."""
+        node = _make_routed_node()
+        obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        wm = MagicMock()
+        node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+        wm.wait_until_executable = AsyncMock()
+        wm.worker_unavailable_reason.return_value = "engine eng-2 did not answer."
+        wm.admit_on_engine = AsyncMock()
+        lib_mgr.workers.get_worker_for_library.return_value = None
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        await node_manager.on_execute_node_request(request)
+
+        wm.admit_on_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
