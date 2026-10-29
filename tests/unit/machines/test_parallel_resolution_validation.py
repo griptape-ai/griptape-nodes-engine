@@ -21,8 +21,6 @@ from tests.unit.machines.scheduler_stubs import machine_running_one_node, node_s
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from griptape_nodes.exe_types.node_types import BaseNode
-
 
 async def _until(condition: Callable[[], object], message: str) -> None:
     for _ in range(200):
@@ -111,7 +109,7 @@ class TestValidationRunsOffTheEventLoop:
         put_event = cast("AsyncMock", machine.context.engine.event_manager.aput_event)
         events = [call.args[0].wrapped_event.payload for call in put_event.call_args_list]
         errors = [event for event in events if isinstance(event, NodeErrorEvent)]
-        assert [cast("BaseNode", injected).name] == [event.node_name for event in errors]
+        assert [injected.name] == [event.node_name for event in errors]
 
         release.set()
         held_node_execution.set()
