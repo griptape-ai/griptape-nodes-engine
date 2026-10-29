@@ -279,7 +279,8 @@ class RunInfo:
         run_id: The run.
         flow_name: The flow it executes.
         state: Its state: queued, running, or paused.
-        position: Its place in line, 1 being next, or 0 for the run in progress.
+        position: Its place in line, 1 being next, or 0 for the run in progress. The run in progress has one
+            too, and is queued, while its node waits in another engine's line.
         request_id: The id the client gave the request that submitted the run, or None if it gave none.
     """
 

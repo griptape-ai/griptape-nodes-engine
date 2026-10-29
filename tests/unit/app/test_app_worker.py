@@ -3926,46 +3926,6 @@ class TestAskingAnotherEngineToAdmitANode:
         assert {engine_id for engine_id, _request, _timeout_s in links.sent} == {_HOST_ENGINE}
 
     @pytest.mark.asyncio
-    async def test_a_waiting_node_fails_once_every_worker_on_that_engine_stops_responding(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """Over Griptape Cloud nothing reports that engine lost, so the wait would never end."""
-        links = _host_engine(worker_manager)
-        links.blocked["AdmitNodeRequest"] = asyncio.Event()
-        worker_manager._workers["w1"] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-        )
-        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
-        await _settle()
-
-        await worker_manager.evict_worker("w1")
-
-        with pytest.raises(RuntimeError, match="stopped responding"):
-            await asyncio.wait_for(admitting, timeout=1.0)
-        assert worker_manager._admissions == {}
-        assert "NodeExecutionEndedRequest" not in links.sent_types()
-
-    @pytest.mark.asyncio
-    async def test_a_waiting_node_keeps_waiting_while_another_worker_there_answers(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        links = _host_engine(worker_manager)
-        links.blocked["AdmitNodeRequest"] = asyncio.Event()
-        for wid in ("w1", "w2"):
-            worker_manager._workers[wid] = WorkerRegistration(
-                request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-            )
-        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
-        await _settle()
-
-        await worker_manager.evict_worker("w1")
-        await _settle()
-
-        assert not admitting.done()
-        links.blocked["AdmitNodeRequest"].set()
-        await admitting
-
-    @pytest.mark.asyncio
     async def test_a_run_stops_waiting_when_its_admission_is_answered_even_without_a_last_report(
         self, worker_manager: WorkerManager
     ) -> None:

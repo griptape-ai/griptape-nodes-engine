@@ -162,10 +162,8 @@ class EngineAdmission:
     host_engine_id: str
     # The run on this engine the node belongs to, or None for a node run on its own.
     run_id: str | None
-    # The request asking for it while it waits, cancelled to give up on an engine that is gone.
+    # The request asking for it, done once that engine has answered.
     request_task: asyncio.Task[ResultPayload] | None = None
-    # Why it was given up, set before `request_task` is cancelled.
-    given_up: str | None = None
 
 
 @dataclass
@@ -1011,14 +1009,6 @@ class WorkerManager(EngineScoped):
             await self.end_admission(admission)
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
             raise RuntimeError(msg) from e
-        except asyncio.CancelledError:
-            if admission.given_up is None:
-                await self.end_admission(admission)
-                raise
-            # That engine stopped answering, so it is not told the node ended.
-            self._admissions.pop(admission.admission_id, None)
-            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {admission.given_up}"
-            raise RuntimeError(msg) from None
         except BaseException:
             await self.end_admission(admission)
             raise
@@ -1031,23 +1021,6 @@ class WorkerManager(EngineScoped):
     def _stop_reporting_wait(self, admission: EngineAdmission) -> None:
         if admission.run_id is not None:
             self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, 0)
-
-    def _give_up_on_engine_if_silent(self, host_engine_id: str) -> None:
-        """Give up the nodes waiting for `host_engine_id` to admit them once none of its workers answers.
-
-        Over Griptape Cloud nothing reports that engine lost, so its workers' heartbeats are what tell.
-        """
-        if any(registration.host_engine_id == host_engine_id for registration in self._workers.values()):
-            return
-        if any(start.host_engine_id == host_engine_id for start in self._remote_starts.values()):
-            return
-        for admission in self._admissions.values():
-            if admission.host_engine_id != host_engine_id or admission.request_task is None:
-                continue
-            if admission.request_task.done():
-                continue
-            admission.given_up = f"every worker {host_engine_id} runs for this engine stopped responding."
-            admission.request_task.cancel()
 
     async def end_admission(self, admission: EngineAdmission | None) -> None:
         """Tell the engine asked to admit a node that the node ended, so its run can let that engine go."""
@@ -1136,8 +1109,6 @@ class WorkerManager(EngineScoped):
             worker_engine_id,
             worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
         )
-        if registration is not None and registration.host_engine_id is not None:
-            self._give_up_on_engine_if_silent(registration.host_engine_id)
         # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
         # library would wait forever, and the next run would report a worker that "may still be
         # starting up" for the rest of the session.
@@ -1734,10 +1705,7 @@ class WorkerManager(EngineScoped):
             return "the session asking for it never registered with this engine."
         if library_name not in session.library_versions:
             return "the session did not name it when it registered with this engine, so its version was never checked."
-        version_refusal = self._library_version_refusal(library_name, session.library_versions[library_name])
-        if version_refusal is not None:
-            return version_refusal
-        return None
+        return self._library_version_refusal(library_name, session.library_versions[library_name])
 
     def _library_version_refusal(self, library_name: str, version: str) -> str | None:
         """Why this engine's copy of `library_name` cannot run a session's `version` of it, or None if it can."""
@@ -2167,8 +2135,12 @@ class WorkerManager(EngineScoped):
                 frees.append(self._recycle_hosted_worker(hosted))
             else:
                 frees.append(self._drop_library_named_objects(worker_engine_id, hosted))
-        # All at once, so a worker that never answers delays the handoff by one timeout, not one each.
-        await asyncio.gather(*frees)
+        # All at once, so a worker that never answers delays the handoff by one timeout, not one each. Each is
+        # waited out even if another fails, so none is still stopping once the next run is admitted.
+        outcomes = await asyncio.gather(*frees, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                logger.error("Could not free a worker for engine %s's run: %s", incoming_engine_id, outcome)
 
     async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
         """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
@@ -2414,9 +2386,9 @@ class WorkerManager(EngineScoped):
         """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
         if self._engine_for_library(library_name) is None:
             return
-        # A worker that ended on its own left a reason, which stays until the library is reset.
         if self.is_worker_running_or_starting(library_name):
             return
+        # A worker that ended on its own left a reason, which stays until the library is reset.
         if self.worker_unavailable_reason(library_name) is not None and library_name not in self._refused_for_capacity:
             return
         self._refused_for_capacity.discard(library_name)
