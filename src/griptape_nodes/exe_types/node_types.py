@@ -1162,7 +1162,7 @@ class BaseNode(ABC):
         # THESE MAY RAISE EXCEPTIONS. These can cause a running Flow to be canceled, or
         # cause a calling object to alter its assumptions/behavior. The value requested
         # to be assigned will NOT be set.
-        candidate_value = self._list_rows.convert_and_validate(parameter, value)
+        candidate_value = self._list_rows.convert_and_validate(parameter, value, initial_setup=initial_setup)
         self._list_rows.check_row_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
 
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.

@@ -115,15 +115,17 @@ class ListRows:
         self._replace(parameter, value)
         return True
 
-    def convert_and_validate(self, parameter: Parameter, value: Any) -> Any:
+    def convert_and_validate(self, parameter: Parameter, value: Any, *, initial_setup: bool) -> Any:
         """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds.
 
         A connected list's validators check the list the node will read: `value`, then its rows' items.
+        Not while loading, which doesn't ask whether the list is connected: the load may not have made
+        the connection yet, or its rows. The value is checked as it is.
         """
         node = self._node
         if isinstance(parameter, ParameterList):
             candidate_value = node._convert_value(parameter, value)
-            read_value = self.read_with_rows(parameter, candidate_value)
+            read_value = candidate_value if initial_setup else self.read_with_rows(parameter, candidate_value)
             for validator in parameter.validators:
                 validator(parameter, read_value)
             return candidate_value
