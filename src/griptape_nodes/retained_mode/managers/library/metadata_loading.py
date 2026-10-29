@@ -78,7 +78,7 @@ class LibraryMetadataLoading(EngineScoped):
     @handles(LoadMetadataForAllLibrariesRequest)
     async def load_metadata_for_all_libraries_request(
         self,
-        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
+        request: LoadMetadataForAllLibrariesRequest,
     ) -> ResultPayload:
         """Load metadata for all libraries from configuration without loading node modules.
 
@@ -96,7 +96,10 @@ class LibraryMetadataLoading(EngineScoped):
         # so their names/versions can be displayed in status output).
         metadata_results = await asyncio.gather(
             *(
-                self._aload_library_metadata(LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path))
+                self._aload_library_metadata(
+                    LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path),
+                    include_git_info=request.include_git_info,
+                )
                 for discovered in library_files
             )
         )
@@ -125,7 +128,8 @@ class LibraryMetadataLoading(EngineScoped):
             # Try to load existing JSON first - only scan if load fails
             sandbox_json_path = sandbox_library_dir / LIBRARY_CONFIG_FILENAME
             sandbox_result = await self._aload_library_metadata(
-                LoadLibraryMetadataFromFileRequest(file_path=str(sandbox_json_path))
+                LoadLibraryMetadataFromFileRequest(file_path=str(sandbox_json_path)),
+                include_git_info=request.include_git_info,
             )
 
             # If load failed, it either didn't exist or was malformed. Try scanning, which will generate a fresh one.
@@ -315,7 +319,7 @@ class LibraryMetadataLoading(EngineScoped):
         )
 
     async def _aload_library_metadata(
-        self, request: LoadLibraryMetadataFromFileRequest
+        self, request: LoadLibraryMetadataFromFileRequest, *, include_git_info: bool
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
         """Load one library's metadata, running its git lookup off the event loop.
 
@@ -324,7 +328,7 @@ class LibraryMetadataLoading(EngineScoped):
         lookups stall engine initialization for the length of the whole poll.
         """
         result = self.read_library_metadata(request)
-        if isinstance(result, LoadLibraryMetadataFromFileResultSuccess):
+        if include_git_info and isinstance(result, LoadLibraryMetadataFromFileResultSuccess):
             result.git_remote, result.git_ref = await asyncio.to_thread(get_git_info, _library_dir(result))
         return result
 
