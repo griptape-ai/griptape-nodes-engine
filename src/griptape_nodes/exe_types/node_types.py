@@ -191,7 +191,10 @@ def _differs(raw_value: Any, output_value: Any) -> bool:
 
 @contextmanager
 def aprocess_scope(
-    precomputed_variables: dict[str, str | int] | None = None, node: BaseNode | None = None
+    precomputed_variables: dict[str, str | int] | None = None,
+    node: BaseNode | None = None,
+    *,
+    run_id: str | None = None,
 ) -> Iterator[None]:
     """Mark the enclosed block as the actual aprocess() execution.
 
@@ -208,9 +211,13 @@ def aprocess_scope(
             performance shortcut for in-process nodes.
         node: The node whose body is about to run. A value it sets on itself is
             what this run produced; one it sets on another node is not.
+        run_id: The workflow run this execution is part of, which `node` holds as its `run_id`
+            until the block ends.
     """
     token = _in_aprocess.set(True)
     node_token = _running_node.set(node)
+    if node is not None:
+        node._run_id = run_id
     # Pre-seed with orchestrator-resolved variables when provided; otherwise
     # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
     cache_token = VariableResolver.seed_cache(precomputed_variables)
@@ -219,6 +226,8 @@ def aprocess_scope(
     finally:
         _in_aprocess.reset(token)
         _running_node.reset(node_token)
+        if node is not None:
+            node._run_id = None
         VariableResolver.reset_cache(cache_token)
 
 
@@ -441,6 +450,10 @@ class BaseNode(ABC):
         # ExecuteNodeRequest.local_object_source; it survives rename, so a renamed node keeps displacing
         # its own prior objects.
         self.local_object_source = f"{name}@{uuid.uuid4().hex[:8]}"
+        # The workflow run this node is executing for. Set by the engine for the length of one
+        # execution, so a model call the node makes is attributed to the run that made it, even when
+        # a later run is in progress by the time the call is reported.
+        self._run_id: str | None = None
         self.parameter_values = {}
         self._list_rows = ListRows(self)
         self.parameter_output_values = TrackedParameterOutputValues(self)
@@ -492,6 +505,16 @@ class BaseNode(ABC):
     @state.setter
     def state(self, new_state: NodeResolutionState) -> None:
         self._state = new_state
+
+    @property
+    def run_id(self) -> str | None:
+        """The workflow run this node is executing for, or None when it isn't executing for one.
+
+        Save it when a model call starts and pass the saved value on the budget requests for that
+        call (`BudgetAccessRequest`, `ReportUsageRequest`), so the call is attributed to this run. It
+        goes back to None when the execution ends, and a slow call can report after that.
+        """
+        return self._run_id
 
     @property
     def parent_group(self) -> BaseNode | None:

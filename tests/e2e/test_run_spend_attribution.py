@@ -413,3 +413,39 @@ async def test_a_run_that_waited_its_turn_keeps_the_id_it_waited_under(
     reports = await stub_cloud.wait_for_reports(2 * len(NODE_NAMES))
     run_ids = [report["tags"].get("run_id") for report in reports]
     assert run_ids.count(second_result.run_id) == len(NODE_NAMES), run_ids
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_reports_after_its_run_ended_still_counts_toward_it(
+    engine: Engine,
+    tmp_path: Path,
+    record_published: Callable[..., list[Any]],
+    stub_cloud: _StubSpendServer,
+    three_node_flow: str,
+) -> None:
+    """A slow call that outlives its run reports under that run, not the one started after it."""
+    gate = tmp_path / "gates" / "first.gate"
+    first = NODE_NAMES[0]
+    engine.handle_request(SetParameterValueRequest(parameter_name="gate_file", node_name=first, value=str(gate)))
+    engine.handle_request(SetParameterValueRequest(parameter_name="report_after_gate", node_name=first, value=True))
+    payloads = record_published(object)
+
+    slow_run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=three_node_flow)))
+    await wait_until_resolving(engine, first)
+    cancelled = await engine.ahandle_request(CancelFlowRequest(flow_name=three_node_flow))
+    assert cancelled.succeeded(), cancelled
+    engine.handle_request(SetParameterValueRequest(parameter_name="gate_file", node_name=first, value=""))
+    engine.handle_request(SetParameterValueRequest(parameter_name="report_after_gate", node_name=first, value=False))
+    next_run = await engine.ahandle_request(StartFlowRequest(flow_name=three_node_flow))
+    assert isinstance(next_run, StartFlowResultSuccess), next_run
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    gate.write_text("open")
+    with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(slow_run), timeout=RUN_TIMEOUT_SECONDS)
+    slow_run.cancel()
+
+    cancelled_run_id, next_run_id = _announced_run_ids(payloads)
+    reports = await stub_cloud.wait_for_reports(len(NODE_NAMES) + 1)
+    run_ids = [report["tags"].get("run_id") for report in reports]
+    assert run_ids.count(next_run_id) == len(NODE_NAMES), run_ids
+    assert run_ids.count(cancelled_run_id) == 1, f"The late report should name the run that made it: {run_ids}"

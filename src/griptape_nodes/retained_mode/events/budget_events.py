@@ -111,6 +111,8 @@ class BudgetAccessRequest(RequestPayload):
             only by budgets with no headroom left.
         node_type: Library class of the calling node, for attribution
         node_id: Opaque id of the calling node, for attribution. Never the node's label.
+        run_id: The workflow run the call is part of: the calling node's `run_id`, saved when the
+            call started. When omitted, the call is attributed to whatever run is in progress, if any.
 
     Results: BudgetAccessResultSuccess (cleared to proceed) |
         BudgetAccessResultFailure (a budget refused the call; the node should not make it)
@@ -120,6 +122,7 @@ class BudgetAccessRequest(RequestPayload):
     estimated_cost_micro_usd: int | None = None
     node_type: str | None = None
     node_id: str | None = None
+    run_id: str | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
@@ -190,6 +193,8 @@ class ReportUsageRequest(RequestPayload):
         activity_type: Kind of call, e.g. "chat_completion"
         node_type: Library class of the calling node, for attribution
         node_id: Opaque id of the calling node, for attribution. Never the node's label.
+        run_id: The workflow run the call is part of: the calling node's `run_id`, saved when the
+            call started. When omitted, the call is attributed to whatever run is in progress, if any.
         correlation_id: From the `BudgetAccessResultSuccess` of the check before this call, if any
 
     Results: ReportUsageResultSuccess (queued) | ReportUsageResultFailure (not sent)
@@ -207,6 +212,7 @@ class ReportUsageRequest(RequestPayload):
     activity_type: str | None = None
     node_type: str | None = None
     node_id: str | None = None
+    run_id: str | None = None
     correlation_id: str | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
