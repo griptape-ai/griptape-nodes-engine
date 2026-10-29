@@ -1482,3 +1482,14 @@ class TestRunResultsNameTheirRun:
         turned_away = await asyncio.wait_for(waiting, timeout=1.0)
         assert "did not start: it was cancelled" in str(turned_away.result_details)
         assert executed == []
+
+
+class TestCancelAllRunsWhenIdle:
+    @pytest.mark.asyncio
+    async def test_an_idle_engine_has_nothing_to_cancel(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+
+        with patch.object(flow_manager, "cancel_flow_run") as cancel_flow_run:
+            await flow_manager.cancel_all_runs()
+
+        cancel_flow_run.assert_not_called()
