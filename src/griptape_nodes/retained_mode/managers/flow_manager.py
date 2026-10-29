@@ -4982,9 +4982,15 @@ class FlowManager(EngineScoped):
         self._finish_run(run)
 
     def _finish_run_if_over(self) -> None:
-        """End the run in progress if its flow has stopped, on the paths that can stop a paused run."""
+        """End the run in progress if its flow has stopped, on the paths that can stop a paused run.
+
+        A cancel resets the machines at once, but a driver parked in one (a step request waiting
+        on a node's checks in a thread) keeps running until it unwinds. Ending the run then would
+        start the next run while the cancelled one's code is still running, so it ends when that
+        driver finishes instead: every path that drives the machines calls this again on its way out.
+        """
         run = self._run_in_progress
-        if run is None or self._driving or self.check_for_existing_running_flow():
+        if run is None or self._driving or self.execution_is_advancing() or self.check_for_existing_running_flow():
             return
         if run.state is RunState.PAUSED:
             run.state = RunState.FINISHED
