@@ -149,6 +149,7 @@ Griptape Cloud checks the budgets that cover a call **before** the model runs. I
 | **Oversubscribed Budgets** | Every budget's limit added together, and how far that total is above your balance. Nested budgets are counted on top of their parents and reset periods are ignored, so this is "how much have we allowed to be spent", not a forecast. Use it as a sanity check. |
 | **Budgets Above 75%**      | How many budgets have used more than 75% of their limit. Click the arrow to list them.                                                                                                                                                                            |
 | **Budget Exhausted**       | How many budgets have reached their limit. Click the arrow to list them.                                                                                                                                                                                          |
+| **Purchase History**       | Your organization's most recent credit purchase and when it was made.                                                                                                                                                                                             |
 
 ### The budget table
 
@@ -199,9 +200,9 @@ Click **+ Create Budget**.
     - **Hard Limit:** a call that would go over the limit does not run.
     - **Soft Limit:** calls keep running past the limit, and the row shows that the limit was reached. Use it to watch spending without stopping anyone.
 - **Period:** **Daily**, **Weekly**, **Monthly**, **Yearly**, or **Lifetime**. Periods start at midnight UTC on calendar boundaries; weeks start on Monday. A lifetime budget never resets.
-- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the budget is flagged. The bar in the **Spent** column has a marker at this point and turns amber when spending passes it.
+- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the organization's owner is emailed (see below). Whatever threshold you choose, the bar in the **Spent** column has a marker at 75% and turns amber once spending passes 75%.
 
-![A budget past its alert threshold: the bar turns amber after the 75% marker](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
+![A budget past 75%: the bar turns amber after the marker](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
 
 When a budget passes a threshold, the organization's owner gets an email. That includes a budget you edit so that it is already past one, for example by lowering its limit. There is one email per budget per period, for the highest threshold crossed, and a budget whose **Hard Limit** refuses a call sends one for 100%. Raising the limit back above a threshold resets it, so crossing it again sends a new email.
 
