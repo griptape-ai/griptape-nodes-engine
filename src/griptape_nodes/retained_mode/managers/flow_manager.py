@@ -223,6 +223,11 @@ _current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=N
 _CANCELLED_BEFORE_STARTING = "The run did not start: it was cancelled."
 
 
+def current_run_id() -> str | None:
+    """The run the code executing now belongs to, or None outside any run."""
+    return _current_run_id.get()
+
+
 @dataclass(frozen=True)
 class StartFlowSpec:
     """A run of a whole flow, from a `StartFlowRequest`."""
@@ -417,6 +422,9 @@ class FlowManager(EngineScoped):
         self._driving = False
         # True while cancel_all_runs awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self._cancelling_all = False
+        # Called with each run's ID as it ends, and with each waiting run whose place in line changes.
+        self._run_ended_listeners: list[Callable[[str], None]] = []
+        self._place_in_line_listeners: list[Callable[[Run], None]] = []
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -4901,6 +4909,25 @@ class FlowManager(EngineScoped):
         # Runs submitted while the cancel awaited were held, so they go too.
         self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
 
+    def add_run_ended_listener(self, listener: Callable[[str], None]) -> None:
+        """Call `listener` with each run's ID once the run ends, however it ends."""
+        self._run_ended_listeners.append(listener)
+
+    def add_place_in_line_listener(self, listener: Callable[[Run], None]) -> None:
+        """Call `listener` with each waiting run whose place in line changes, and at 0 once it stops waiting."""
+        self._place_in_line_listeners.append(listener)
+
+    def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
+        """Report that the run in progress waits at `position` for another engine, or no longer waits at 0.
+
+        Its node there waits while another run has that engine, so it is reported as a run waiting here
+        would be.
+        """
+        run = self._run_in_progress
+        if run is None or run.run_id != run_id:
+            return
+        self._put_run_queued_event(run, position)
+
     def _turn_away(self, runs: list[Run], reason: str) -> None:
         """Take waiting runs out of the line without executing them; each one's request returns `reason`."""
         for run in runs:
@@ -4993,6 +5020,8 @@ class FlowManager(EngineScoped):
         if self._run_in_progress is not run:
             return
         self._run_in_progress = None
+        for listener in self._run_ended_listeners:
+            listener(run.run_id)
         self._start_next_run_if_idle()
         self._report_places_in_line()
 
@@ -5026,13 +5055,18 @@ class FlowManager(EngineScoped):
                 self._report_place_in_line(run)
 
     def _report_place_in_line(self, run: Run) -> None:
+        self._put_run_queued_event(run, run.position)
+        for listener in self._place_in_line_listeners:
+            listener(run)
+
+    def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(
                     payload=RunQueuedEvent(
                         run_id=run.run_id,
                         flow_name=run.flow_name,
-                        position=run.position,
+                        position=position,
                         request_id=run.request_id,
                     )
                 )

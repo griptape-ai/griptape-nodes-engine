@@ -40,9 +40,14 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     resolve_worker_command,
     worker_requests_from_environment,
 )
+from griptape_nodes.retained_mode.managers.flow_manager import current_run_id
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.settings import (
+    DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY,
     DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
+    DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY,
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
@@ -53,12 +58,13 @@ from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_EN
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Coroutine
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.run_queue import Run
 
 logger = logging.getLogger("griptape_nodes_app")
 
@@ -104,6 +110,56 @@ class _HostedWorker:
     process: asyncio.subprocess.Process | None = None
     # Set once the start has spawned the process or given up, which a stop sent meanwhile waits for.
     started: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class _EngineRun:
+    """Another engine's run on this engine, waiting in this engine's line of runs or holding this engine."""
+
+    engine_id: str
+    # The run's ID on that engine, or None for a node sent without a run, which is a run of its own.
+    run_id: str | None
+    key: tuple[str, str]
+    # Resolved with None once the run has this engine, or with why it never will.
+    admitted: asyncio.Future[str | None]
+    # Set when the run lets this engine go.
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+    # This engine's own run that stands for it in the line, set once it is submitted.
+    line_run: Run | None = None
+    # Admissions of its nodes still waiting, which are told the run's place in line.
+    waiting: set[str] = field(default_factory=set)
+    # Admissions of its nodes running here.
+    running: set[str] = field(default_factory=set)
+    # Admissions whose node ended before it was admitted.
+    abandoned: set[str] = field(default_factory=set)
+    # Lets the run go once none of its nodes has run here for the idle timeout.
+    idle_timer: asyncio.TimerHandle | None = None
+
+
+@dataclass
+class _EngineRunSpec:
+    """A run of another engine's nodes, which holds this engine from when it starts until that run lets it go."""
+
+    manager: WorkerManager
+    engine_run: _EngineRun
+    flow_name: str
+
+    async def execute(self, engine: Engine) -> ResultPayload:  # noqa: ARG002
+        return await self.manager.hold_for_engine_run(self.engine_run)
+
+    def failure(self, details: str) -> ResultPayload:
+        self.manager.refuse_engine_run(self.engine_run, details)
+        return worker_events.AdmitNodeResultFailure(result_details=details)
+
+
+@dataclass
+class EngineAdmission:
+    """A node another engine was asked to admit, which that engine must be told has ended."""
+
+    admission_id: str
+    host_engine_id: str
+    # The run on this engine the node belongs to, or None for a node run on its own.
+    run_id: str | None
 
 
 @dataclass
@@ -208,6 +264,21 @@ class WorkerManager(EngineScoped):
         # not garbage-collected while they wait for the answer.
         self._stop_requests: set[asyncio.Task] = set()
 
+        # Other engines' runs on this engine, waiting in its line or holding it, by (engine, run).
+        self._engine_runs: dict[tuple[str, str], _EngineRun] = {}
+
+        # The engine whose run last held this engine, so the next run from another engine frees its workers.
+        self._last_engine_run_engine_id: str | None = None
+
+        # Nodes this engine asked other engines to admit, by admission ID, until each ends.
+        self._admissions: dict[str, EngineAdmission] = {}
+
+        # The engines each of this engine's runs sent a node to, so the run's end reaches each of them.
+        self._run_engines: dict[str, set[str]] = {}
+
+        # Reports and run ends sent to other engines from synchronous callbacks, held until answered.
+        self._engine_notices: set[asyncio.Task] = set()
+
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
 
@@ -275,6 +346,10 @@ class WorkerManager(EngineScoped):
         )
 
         event_manager.register_request_handlers(self)
+        # A run's end reaches every engine it sent a node to, and another engine's run waiting here
+        # hears its place in line.
+        engine.flow_manager.add_run_ended_listener(self._on_run_ended)
+        engine.flow_manager.add_place_in_line_listener(self._on_place_in_line)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -895,6 +970,61 @@ class WorkerManager(EngineScoped):
             # execution, each still carrying its worker's tag for fail_requests_by_tag to walk.
             self._tx.request_client.discard_request(request_id)
             raise
+
+    async def admit_on_engine(self, library_name: str, node_name: str) -> EngineAdmission | None:
+        """Wait until the engine that runs `library_name`'s worker admits the node, or None if it runs here.
+
+        Unbounded, like the node itself: another run can hold that engine for as long as it runs. That
+        engine may stop this engine's worker there to free itself for that run, so pick the worker only
+        after this returns, through `wait_until_executable`, which starts it again. Pass the admission
+        to `end_admission` once the node ends, however it ends.
+
+        Raises:
+            RuntimeError: That engine will not run the node, with why.
+        """
+        host_engine_id = self._engine_for_library(library_name)
+        if host_engine_id is None:
+            return None
+        admission = EngineAdmission(
+            admission_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=current_run_id()
+        )
+        self._admissions[admission.admission_id] = admission
+        if admission.run_id is not None:
+            self._run_engines.setdefault(admission.run_id, set()).add(host_engine_id)
+        request = worker_events.AdmitNodeRequest(
+            admission_id=admission.admission_id, run_id=admission.run_id, node_name=node_name
+        )
+        try:
+            result = await self.engine.request(host_engine_id, request, timeout_s=None)
+        except EngineNotFoundError as e:
+            await self.end_admission(admission)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
+            raise RuntimeError(msg) from e
+        except BaseException:
+            await self.end_admission(admission)
+            raise
+        if not result.succeeded():
+            await self.end_admission(admission)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+            raise RuntimeError(msg)
+        return admission
+
+    async def end_admission(self, admission: EngineAdmission | None) -> None:
+        """Tell the engine asked to admit a node that the node ended, so its run can let that engine go."""
+        if admission is None or self._admissions.pop(admission.admission_id, None) is None:
+            return
+        request = worker_events.NodeExecutionEndedRequest(admission_id=admission.admission_id)
+        try:
+            result = await self.engine.request(admission.host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            logger.warning("Could not tell engine %s that a node it admitted ended: %s", admission.host_engine_id, e)
+            return
+        if not isinstance(result, worker_events.NodeExecutionEndedResultSuccess):
+            logger.warning(
+                "Engine %s did not record that a node it admitted ended: %s",
+                admission.host_engine_id,
+                result.result_details,
+            )
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
@@ -1530,7 +1660,19 @@ class WorkerManager(EngineScoped):
             return "the session asking for it never registered with this engine."
         if library_name not in session.library_versions:
             return "the session did not name it when it registered with this engine, so its version was never checked."
-        return self._library_version_refusal(library_name, session.library_versions[library_name])
+        version_refusal = self._library_version_refusal(library_name, session.library_versions[library_name])
+        if version_refusal is not None:
+            return version_refusal
+        max_workers = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY, default=None)
+        # A worker this start replaces does not count against the limit.
+        worker_key = f"{session_id}/{library_name}"
+        running = len([key for key in self._managed_worker_processes if key != worker_key])
+        if max_workers is not None and running >= max_workers:
+            return (
+                f"this engine already runs {running} workers, the most its "
+                f"{DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY} setting allows."
+            )
+        return None
 
     def _library_version_refusal(self, library_name: str, version: str) -> str | None:
         """Why this engine's copy of `library_name` cannot run a session's `version` of it, or None if it can."""
@@ -1610,6 +1752,127 @@ class WorkerManager(EngineScoped):
             result_details=f"Forgot the sessions engine {engine_id} offered."
         )
 
+    @handles(
+        worker_events.AdmitNodeRequest,
+        sender=RequiredSender.SESSION,
+        owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
+    )
+    async def handle_admit_node_request(
+        self, request: worker_events.AdmitNodeRequest
+    ) -> worker_events.AdmitNodeResultSuccess | worker_events.AdmitNodeResultFailure:
+        """Answer once another engine's node may run here, which waits while another run has this engine.
+
+        Another engine's run waits in this engine's own line of runs, and holds this engine from when it
+        starts until it lets it go, so its later nodes are admitted at once.
+        """
+        sender = require_request_sender()
+        if self._engine_that_offered(sender) is None:
+            return worker_events.AdmitNodeResultFailure(
+                result_details="the session asking for it never registered with this engine."
+            )
+        engine_run = self._engine_run_for(sender.engine_id, request)
+        engine_run.waiting.add(request.admission_id)
+        self._report_place_in_line(engine_run, request.admission_id)
+        try:
+            refusal = await asyncio.shield(engine_run.admitted)
+        finally:
+            engine_run.waiting.discard(request.admission_id)
+        if refusal is not None:
+            return worker_events.AdmitNodeResultFailure(result_details=refusal)
+        if request.admission_id in engine_run.abandoned:
+            engine_run.abandoned.discard(request.admission_id)
+            self._let_go_if_idle(engine_run)
+            return worker_events.AdmitNodeResultFailure(result_details="the node ended before it was admitted.")
+        engine_run.running.add(request.admission_id)
+        self._cancel_idle_timer(engine_run)
+        return worker_events.AdmitNodeResultSuccess(result_details=f"Admitted node '{request.node_name}'.")
+
+    @handles(
+        worker_events.NodeExecutionEndedRequest,
+        sender=RequiredSender.SESSION,
+        owner=lambda manager, request, _sender: manager._engine_admitted(request.admission_id),
+    )
+    def handle_node_execution_ended_request(
+        self, request: worker_events.NodeExecutionEndedRequest
+    ) -> worker_events.NodeExecutionEndedResultSuccess:
+        """Record that a node another engine ran here ended, letting its run go if it was the run's only node."""
+        engine_run = self._engine_run_admitting(request.admission_id)
+        if engine_run is None:
+            return worker_events.NodeExecutionEndedResultSuccess(
+                result_details="This engine was not running that node, so there was nothing to record."
+            )
+        if request.admission_id in engine_run.waiting:
+            engine_run.abandoned.add(request.admission_id)
+        engine_run.running.discard(request.admission_id)
+        if engine_run.run_id is None and not engine_run.running and not engine_run.waiting:
+            engine_run.released.set()
+        else:
+            self._let_go_if_idle(engine_run)
+        return worker_events.NodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
+
+    @handles(
+        worker_events.EndRunRequest,
+        sender=RequiredSender.SESSION,
+        owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
+    )
+    async def handle_end_run_request(self, request: worker_events.EndRunRequest) -> worker_events.EndRunResultSuccess:
+        """Let another engine's run go, now that it ended, so the next run in line gets this engine."""
+        engine_id = require_request_sender().engine_id
+        engine_run = self._engine_runs.get((engine_id, request.run_id))
+        if engine_run is None:
+            return worker_events.EndRunResultSuccess(
+                result_details=f"This engine was not holding run {request.run_id}."
+            )
+        await self._end_engine_run(engine_run, "its run ended.")
+        return worker_events.EndRunResultSuccess(result_details=f"Let run {request.run_id} of engine {engine_id} go.")
+
+    @handles(
+        worker_events.ReportPlaceInLineRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager._engine_admitting(request.admission_id),
+    )
+    def handle_report_place_in_line_request(
+        self, request: worker_events.ReportPlaceInLineRequest
+    ) -> worker_events.ReportPlaceInLineResultSuccess:
+        """Report the place in line of a run here whose node waits on another engine, as if it waited here."""
+        admission = self._admissions.get(request.admission_id)
+        if admission is None or admission.run_id is None:
+            return worker_events.ReportPlaceInLineResultSuccess(
+                result_details="No run here waits on that admission, so there was nothing to report."
+            )
+        self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, request.position)
+        return worker_events.ReportPlaceInLineResultSuccess(result_details=f"Reported place {request.position}.")
+
+    async def hold_for_engine_run(self, engine_run: _EngineRun) -> ResultPayload:
+        """Hold this engine for another engine's run, from when it reaches the front of the line until it lets go.
+
+        Passing from one engine's run to another's first frees workers, as `distributed_execution.release`
+        says. Freeing is best effort: a failure there still hands this engine over.
+        """
+        if self._last_engine_run_engine_id not in (None, engine_run.engine_id):
+            try:
+                await self._free_for_handoff(engine_run.engine_id)
+            except Exception:
+                logger.exception("Could not free this engine's workers for engine %s's run.", engine_run.engine_id)
+        self._last_engine_run_engine_id = engine_run.engine_id
+        if not engine_run.admitted.done():
+            engine_run.admitted.set_result(None)
+        self._let_go_if_idle(engine_run)
+        try:
+            await engine_run.released.wait()
+        finally:
+            self._cancel_idle_timer(engine_run)
+            self._forget_engine_run(engine_run)
+        return worker_events.EndRunResultSuccess(
+            result_details=f"Engine {engine_run.engine_id}'s run let this engine go."
+        )
+
+    def refuse_engine_run(self, engine_run: _EngineRun, details: str) -> None:
+        """Tell another engine's run waiting here that it will not get this engine, and why."""
+        if not engine_run.admitted.done():
+            engine_run.admitted.set_result(details)
+        self._forget_engine_run(engine_run)
+
     def _engine_that_offered(self, sender: RequestSender) -> str | None:
         """The engine that offered the sender's session to this one, or None if none has."""
         session = self._sessions.get(cast("str", sender.session_id))
@@ -1654,7 +1917,8 @@ class WorkerManager(EngineScoped):
         await self._forget_engine(engine_id, why="lost its connection")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
-        """Forget the sessions `engine_id` offered this engine, and stop their workers."""
+        """Forget the sessions `engine_id` offered this engine, let its runs go, and stop their workers."""
+        await self._end_engine_runs_from(engine_id, f"engine {engine_id} {why}.")
         offered = [session_id for session_id, session in self._sessions.items() if session.engine_id == engine_id]
         for session_id in offered:
             del self._sessions[session_id]
@@ -1669,6 +1933,170 @@ class WorkerManager(EngineScoped):
             len(hosted),
         )
         await asyncio.gather(*(self._stop_hosted_worker(worker) for worker in hosted))
+
+    def _engine_run_for(self, engine_id: str, request: worker_events.AdmitNodeRequest) -> _EngineRun:
+        """The run here that stands for another engine's run, submitted to this engine's line if it is new."""
+        key = (engine_id, request.run_id or request.admission_id)
+        engine_run = self._engine_runs.get(key)
+        # A run that let this engine go is not joined: its next node waits in line again.
+        if engine_run is not None and not engine_run.released.is_set():
+            return engine_run
+        engine_run = _EngineRun(
+            engine_id=engine_id,
+            run_id=request.run_id,
+            key=key,
+            admitted=asyncio.get_running_loop().create_future(),
+        )
+        self._engine_runs[key] = engine_run
+        spec = _EngineRunSpec(manager=self, engine_run=engine_run, flow_name=f"a run from engine {engine_id}")
+        engine_run.line_run = self.engine.flow_manager.submit_run(spec)
+        return engine_run
+
+    async def _end_engine_runs_from(self, engine_id: str, reason: str) -> None:
+        """Let go of every run from `engine_id`, holding this engine or waiting for it."""
+        for engine_run in [run for run in self._engine_runs.values() if run.engine_id == engine_id]:
+            await self._end_engine_run(engine_run, reason)
+
+    async def _end_engine_run(self, engine_run: _EngineRun, reason: str) -> None:
+        """Let another engine's run go: one holding this engine releases it, and one still waiting leaves the line."""
+        if engine_run.admitted.done():
+            engine_run.released.set()
+            return
+        # Refused first, so its waiting nodes hear `reason` rather than the line's own cancellation.
+        self.refuse_engine_run(engine_run, reason)
+        if engine_run.line_run is not None:
+            await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id)
+
+    def _let_go_if_idle(self, engine_run: _EngineRun) -> None:
+        """Start the idle timeout of a run holding this engine whose nodes have all ended."""
+        if not engine_run.admitted.done() or engine_run.admitted.result() is not None:
+            return
+        if engine_run.running or engine_run.released.is_set():
+            return
+        self._cancel_idle_timer(engine_run)
+        idle_timeout_s = self.engine.config_manager.get_config_value(
+            DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY, default=300.0, cast_type=float
+        )
+        engine_run.idle_timer = asyncio.get_running_loop().call_later(idle_timeout_s, engine_run.released.set)
+
+    @staticmethod
+    def _cancel_idle_timer(engine_run: _EngineRun) -> None:
+        if engine_run.idle_timer is not None:
+            engine_run.idle_timer.cancel()
+            engine_run.idle_timer = None
+
+    def _forget_engine_run(self, engine_run: _EngineRun) -> None:
+        if self._engine_runs.get(engine_run.key) is engine_run:
+            del self._engine_runs[engine_run.key]
+
+    def _engine_run_admitting(self, admission_id: str) -> _EngineRun | None:
+        """The run here whose node holds the admission, waiting or running, or None."""
+        for engine_run in self._engine_runs.values():
+            if admission_id in engine_run.running or admission_id in engine_run.waiting:
+                return engine_run
+        return None
+
+    def _engine_admitted(self, admission_id: str) -> str | None:
+        """The engine whose node holds an admission on this engine, or None if none does."""
+        engine_run = self._engine_run_admitting(admission_id)
+        if engine_run is None:
+            return None
+        return engine_run.engine_id
+
+    def _engine_admitting(self, admission_id: str) -> str | None:
+        """The engine this engine asked to admit a node, or None if it asked for no such admission."""
+        admission = self._admissions.get(admission_id)
+        if admission is None:
+            return None
+        return admission.host_engine_id
+
+    def _on_place_in_line(self, run: Run) -> None:
+        """Tell the engine whose run waits here its place in line, for each of its nodes waiting."""
+        if not isinstance(run.spec, _EngineRunSpec):
+            return
+        engine_run = run.spec.engine_run
+        for admission_id in list(engine_run.waiting):
+            self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, run.position))
+
+    def _report_place_in_line(self, engine_run: _EngineRun, admission_id: str) -> None:
+        """Tell a node that just asked to be admitted its run's place in line, if the run waits."""
+        if engine_run.line_run is None or not engine_run.line_run.position:
+            return
+        self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, engine_run.line_run.position))
+
+    async def _send_place_in_line(self, engine_id: str, admission_id: str, position: int) -> None:
+        request = worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=position)
+        try:
+            result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            logger.warning("Could not tell engine %s its run's place in line: %s", engine_id, e)
+            return
+        if not isinstance(result, worker_events.ReportPlaceInLineResultSuccess):
+            logger.warning("Engine %s did not take its run's place in line: %s", engine_id, result.result_details)
+
+    def _on_run_ended(self, run_id: str) -> None:
+        """Tell every engine the ended run sent a node to that it ended, so they serve the next run."""
+        for engine_id in self._run_engines.pop(run_id, set()):
+            self._send_notice(self._send_end_run(engine_id, run_id))
+
+    async def _send_end_run(self, engine_id: str, run_id: str) -> None:
+        request = worker_events.EndRunRequest(run_id=run_id)
+        try:
+            result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            logger.warning("Could not tell engine %s that run %s ended: %s", engine_id, run_id, e)
+            return
+        if not isinstance(result, worker_events.EndRunResultSuccess):
+            logger.warning("Engine %s did not end run %s: %s", engine_id, run_id, result.result_details)
+
+    def _send_notice(self, notice: Coroutine[Any, Any, None]) -> None:
+        """Send a report to another engine without waiting, holding the task until it is answered."""
+        task = asyncio.get_running_loop().create_task(notice)
+        self._engine_notices.add(task)
+        task.add_done_callback(self._engine_notices.discard)
+
+    async def _free_for_handoff(self, incoming_engine_id: str) -> None:
+        """Free workers, as `distributed_execution.release` says, before this engine passes to `incoming_engine_id`'s run."""
+        config = self.engine.config_manager
+        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default="others")
+        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default="drop_cache")
+        if which == "none":
+            return
+        for worker_engine_id, hosted in list(self._hosted_workers.items()):
+            if which == "others" and hosted.engine_id == incoming_engine_id:
+                continue
+            if how == "recycle":
+                # Its exit is reported stopped, so its engine starts it again before that library's next node.
+                logger.info("Stopping worker %s to free this engine for another engine's run.", worker_engine_id)
+                await self._stop_hosted_worker(hosted)
+            else:
+                await self._drop_library_named_objects(worker_engine_id, hosted)
+
+    async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
+        """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
+        request_id = str(uuid.uuid4())
+        future = await self._tx.request_client.track_request(
+            request_id, tag=worker_engine_id, resolve_failures_as_payload=True
+        )
+        event = EventRequest(
+            request=worker_events.DropLibraryNamedLocalObjectsRequest(),
+            request_id=request_id,
+            response_topic=f"engines/{self.engine.get_engine_id()}/response",
+        )
+        request_topic = f"sessions/{hosted.session_id}/workers/{worker_engine_id}/request"
+        try:
+            await self._tx.send_message("EventRequest", converters.engine.dumps(event), request_topic)
+            result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=_ENGINE_REQUEST_TIMEOUT_S)
+        except TimeoutError:
+            self._tx.request_client.discard_request(request_id)
+            logger.warning(
+                "Worker %s did not free its models within %.0f seconds.", worker_engine_id, _ENGINE_REQUEST_TIMEOUT_S
+            )
+            return
+        except BaseException:
+            self._tx.request_client.discard_request(request_id)
+            raise
+        logger.info("Worker %s: %s", worker_engine_id, result.get("result", {}).get("result_details"))
 
     async def _wait_for_session(self, library_name: str) -> str | None:
         """Return the active session's id once there is one, or None, recorded, if none came."""
@@ -1851,7 +2279,12 @@ class WorkerManager(EngineScoped):
         worker evicted). Bounded anyway, because "every" is a claim about code that will keep
         changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
         timeout is a bug report; an unbounded wait is a mystery.
+
+        A library whose worker another engine stopped, to free itself for another engine's run, has that
+        worker started there again first.
         """
+        if library_name is not None:
+            await self._start_remote_worker_if_stopped(library_name)
         if self.has_settled(library_name):
             return
         if library_name is None:
@@ -1873,6 +2306,15 @@ class WorkerManager(EngineScoped):
                     f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
                 )
             raise RuntimeError(msg) from None
+
+    async def _start_remote_worker_if_stopped(self, library_name: str) -> None:
+        """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
+        if self._engine_for_library(library_name) is None:
+            return
+        # A worker that ended on its own left a reason, which stays until the library is reset.
+        if self.is_worker_running_or_starting(library_name) or self.worker_unavailable_reason(library_name) is not None:
+            return
+        await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

@@ -140,6 +140,7 @@ def _make_node_manager(
     # cannot be in. Routing awaits it, so it needs to be awaitable.
     worker_manager = worker_manager or MagicMock()
     worker_manager.wait_until_executable = AsyncMock()
+    worker_manager.admit_on_engine = AsyncMock(return_value=None)
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -902,6 +903,35 @@ class TestExecuteNodeWorkerRoute:
         wm.route_to_worker.assert_awaited_once()
         # The orchestrator stub must not have run aprocess; the worker did.
         node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_node_for_another_engine_picks_its_worker_once_admitted(self) -> None:
+        """That engine may stop the worker while the node waits, and the second wait starts it again."""
+        node = _make_routed_node()
+        obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        wm = MagicMock()
+        node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+        calls: list[str] = []
+        admission = object()
+        success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
+        wm.wait_until_executable = AsyncMock(side_effect=lambda *_: calls.append("wait"))
+        wm.admit_on_engine = AsyncMock(side_effect=lambda *_: calls.append("admit") or admission)
+        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
+        wm.route_to_worker = AsyncMock(side_effect=lambda *_: calls.append("run") or success)
+        wm.end_admission = AsyncMock(side_effect=lambda *_: calls.append("end"))
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert calls == ["wait", "admit", "wait", "pick", "run", "end"]
+        wm.end_admission.assert_awaited_once_with(admission)
 
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:

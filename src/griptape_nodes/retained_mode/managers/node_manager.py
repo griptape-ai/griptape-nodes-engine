@@ -3402,7 +3402,7 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(self, request: ExecuteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
+    async def on_execute_node_request(self, request: ExecuteNodeRequest) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
 
         On the orchestrator the node must already live in ObjectManager (created by
@@ -3452,18 +3452,10 @@ class NodeManager(EngineScoped):
             #
             # The wait comes first: a worker is routable the moment it registers but loads its
             # library after, and forwarding into that window fails node creation over there.
-            try:
-                if library_name:
-                    await self.engine.worker_manager.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
-            except RuntimeError as err:
-                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
             wm = self.engine.worker_manager
-            if wm is not None and worker is not None:
-                preparation_failure = self._prepare_for_worker(node, request)
-                if preparation_failure is not None:
-                    return preparation_failure
-                return await self._execute_node_via_worker(request, wm, worker)
+            in_library_worker = await self._execute_node_in_library_worker(request, node, wm, library_name)
+            if in_library_worker is not None:
+                return in_library_worker
             # A library's own worker comes first: that is where its dependencies are installed. Only a
             # node that would otherwise run here moves to the worker its Isolated Execution names.
             #
@@ -3748,6 +3740,35 @@ class NodeManager(EngineScoped):
         if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
             return None
         return library_manager.catalog.get_collated_problems_for_library(library_name)
+
+    async def _execute_node_in_library_worker(
+        self, request: ExecuteNodeRequest, node: BaseNode, wm: WorkerManager, library_name: str | None
+    ) -> ResultPayload | None:
+        """Run the node in its library's worker, here or on another engine, or None if the library has none.
+
+        A worker on another engine also waits for that engine to admit the node, and is picked only
+        after: that engine may stop the worker while the node waits, and the second wait starts it again.
+        """
+        library_manager = self.engine.library_manager
+        admission = None
+        try:
+            try:
+                if library_name:
+                    await wm.wait_until_executable(library_name)
+                    admission = await wm.admit_on_engine(library_name, request.node_name)
+                    await wm.wait_until_executable(library_name)
+                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+            except RuntimeError as err:
+                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
+            if wm is None or worker is None:
+                return None
+            preparation_failure = self._prepare_for_worker(node, request)
+            if preparation_failure is not None:
+                return preparation_failure
+            return await self._execute_node_via_worker(request, wm, worker)
+        finally:
+            if admission is not None:
+                await wm.end_admission(admission)
 
     async def _execute_node_in_isolated_execution_worker(
         self, request: ExecuteNodeRequest, wm: WorkerManager, scope: IsolatedExecutionScope

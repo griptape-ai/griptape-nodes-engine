@@ -25,6 +25,10 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
+DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
+DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
+DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY = "distributed_execution.idle_timeout_s"
+DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -444,6 +448,27 @@ class WorkerSettings(BaseModel):
             raise ValueError(msg) from e
 
 
+class ReleaseSettings(BaseModel):
+    which: Literal["none", "others", "all"] = Field(
+        default="others",
+        description=(
+            "On an engine that runs nodes for other engines: whose workers it frees when it passes from one "
+            "engine's run to another's. 'none' frees nothing, for an engine dedicated to one pipeline. 'others' "
+            "frees the workers of every engine but the incoming run's, so its own models stay loaded. 'all' "
+            "frees the incoming run's workers too."
+        ),
+    )
+    how: Literal["drop_cache", "recycle"] = Field(
+        default="drop_cache",
+        description=(
+            "How it frees them. 'drop_cache' has each worker drop what its libraries keep between runs, such as "
+            "a loaded model, and keeps values a later node of the same run still needs. 'recycle' stops the "
+            "worker, which starts again the next time one of its nodes runs; the only sure way to free "
+            "everything."
+        ),
+    )
+
+
 class DistributedExecutionSettings(BaseModel):
     library_engines: dict[str, str] = Field(
         default_factory=dict,
@@ -454,6 +479,22 @@ class DistributedExecutionSettings(BaseModel):
             "own ID, run on this computer. Set it in a config file, not an environment variable: library "
             "names are case-sensitive, and environment variable names are lowercased. See the guide "
             "Running Nodes on Another Computer."
+        ),
+    )
+    release: ReleaseSettings = Field(default_factory=ReleaseSettings)
+    idle_timeout_s: float = Field(
+        default=300.0,
+        description=(
+            "On an engine that runs nodes for other engines: seconds another engine's run keeps this engine "
+            "after its last node here finished, if that engine never says the run ended. Must be longer than "
+            "the longest stretch of a run between two of its nodes that run here."
+        ),
+    )
+    max_workers: int | None = Field(
+        default=None,
+        description=(
+            "On an engine that runs nodes for other engines: the most workers it runs at once. A start beyond "
+            "it is refused, and the node that needed it fails saying so. Empty (the default) sets no limit."
         ),
     )
 
