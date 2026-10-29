@@ -110,6 +110,8 @@ class _HostedWorker:
     process: asyncio.subprocess.Process | None = None
     # Set once the start has spawned the process or given up, which a stop sent meanwhile waits for.
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reports the process's exit to the artist's engine, done once that engine has answered.
+    exit_watcher: asyncio.Task | None = None
 
 
 @dataclass
@@ -160,6 +162,10 @@ class EngineAdmission:
     host_engine_id: str
     # The run on this engine the node belongs to, or None for a node run on its own.
     run_id: str | None
+    # The request asking for it while it waits, cancelled to give up on an engine that is gone.
+    request_task: asyncio.Task[ResultPayload] | None = None
+    # Why it was given up, set before `request_task` is cancelled.
+    given_up: str | None = None
 
 
 @dataclass
@@ -250,6 +256,8 @@ class WorkerManager(EngineScoped):
         # from sending the start until the worker registers, the start fails, or it is withdrawn.
         # Their worker registers here like a local one.
         self._remote_starts: dict[str, _RemoteStart] = {}
+        # Libraries whose last remote start was refused for capacity, which their next node asks for again.
+        self._refused_for_capacity: set[str] = set()
 
         # This engine's registration with each engine it sends work to, by (host_engine_id, session).
         self._engine_registrations: dict[tuple[str, str], asyncio.Task[ResultPayload]] = {}
@@ -994,12 +1002,21 @@ class WorkerManager(EngineScoped):
         request = worker_events.AdmitNodeRequest(
             admission_id=admission.admission_id, run_id=admission.run_id, node_name=node_name
         )
+        admission.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
         try:
-            result = await self.engine.request(host_engine_id, request, timeout_s=None)
+            result = await admission.request_task
         except EngineNotFoundError as e:
             await self.end_admission(admission)
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
             raise RuntimeError(msg) from e
+        except asyncio.CancelledError:
+            if admission.given_up is None:
+                await self.end_admission(admission)
+                raise
+            # That engine stopped answering, so it is not told the node ended.
+            self._admissions.pop(admission.admission_id, None)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {admission.given_up}"
+            raise RuntimeError(msg) from None
         except BaseException:
             await self.end_admission(admission)
             raise
@@ -1008,6 +1025,23 @@ class WorkerManager(EngineScoped):
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
             raise RuntimeError(msg)
         return admission
+
+    def _give_up_on_engine_if_silent(self, host_engine_id: str) -> None:
+        """Give up the nodes waiting for `host_engine_id` to admit them once none of its workers answers.
+
+        Over Griptape Cloud nothing reports that engine lost, so its workers' heartbeats are what tell.
+        """
+        if any(registration.host_engine_id == host_engine_id for registration in self._workers.values()):
+            return
+        if any(start.host_engine_id == host_engine_id for start in self._remote_starts.values()):
+            return
+        for admission in self._admissions.values():
+            if admission.host_engine_id != host_engine_id or admission.request_task is None:
+                continue
+            if admission.request_task.done():
+                continue
+            admission.given_up = f"every worker {host_engine_id} runs for this engine stopped responding."
+            admission.request_task.cancel()
 
     async def end_admission(self, admission: EngineAdmission | None) -> None:
         """Tell the engine asked to admit a node that the node ended, so its run can let that engine go."""
@@ -1096,6 +1130,8 @@ class WorkerManager(EngineScoped):
             worker_engine_id,
             worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
         )
+        if registration is not None and registration.host_engine_id is not None:
+            self._give_up_on_engine_if_silent(registration.host_engine_id)
         # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
         # library would wait forever, and the next run would report a worker that "may still be
         # starting up" for the rest of the session.
@@ -1333,6 +1369,9 @@ class WorkerManager(EngineScoped):
         reason = f"{host_engine_id} did not start its worker: {result.result_details}"
         logger.error("Not starting a worker for library '%s': %s", library_name, reason)
         self.note_worker_unavailable(library_name, reason)
+        if isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.at_capacity:
+            # The node waiting now fails with the reason; the library's next node asks again.
+            self._refused_for_capacity.add(library_name)
 
     async def _ask_engine_to_start_worker(
         self, library_name: str, host_engine_id: str, session_id: str
@@ -1592,11 +1631,9 @@ class WorkerManager(EngineScoped):
             return worker_events.StartWorkerForEngineResultFailure(
                 result_details=f"A worker for library '{library_name}' is already starting for that session."
             )
-        refusal = self._refusal_to_serve(library_name, session_id)
+        refusal = self._start_refusal(library_name, session_id, worker_key)
         if refusal is not None:
-            return worker_events.StartWorkerForEngineResultFailure(
-                result_details=refusal, session_unknown=self._session_must_register(library_name, session_id)
-            )
+            return refusal
         resolved = self._worker_command(library_name, session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
@@ -1645,10 +1682,41 @@ class WorkerManager(EngineScoped):
         # It registers with the artist's engine, not here, so its unregistration never reaches this
         # engine. Watching the process is what reports its exit and lets another start for the session.
         watcher = asyncio.get_running_loop().create_task(self._report_when_exited(worker_engine_id, hosted, proc))
+        hosted.exit_watcher = watcher
         self._exit_watchers.add(watcher)
         watcher.add_done_callback(self._exit_watchers.discard)
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
+        )
+
+    def _start_refusal(
+        self, library_name: str, session_id: str, worker_key: str
+    ) -> worker_events.StartWorkerForEngineResultFailure | None:
+        """The failure a start of `worker_key`'s worker for that session returns, or None if this engine will start it."""
+        refusal = self._refusal_to_serve(library_name, session_id)
+        if refusal is not None:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details=refusal, session_unknown=self._session_must_register(library_name, session_id)
+            )
+        capacity_refusal = self._capacity_refusal(worker_key)
+        if capacity_refusal is not None:
+            return worker_events.StartWorkerForEngineResultFailure(result_details=capacity_refusal, at_capacity=True)
+        return None
+
+    def _capacity_refusal(self, worker_key: str) -> str | None:
+        """Why this engine runs no more workers for other engines, or None if it may start `worker_key`'s."""
+        max_workers = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY, default=None)
+        if max_workers is None:
+            return None
+        # Starts still under way count, and a worker this start replaces does not.
+        running = len(
+            {hosted.worker_key for hosted in self._hosted_workers.values() if hosted.worker_key != worker_key}
+        )
+        if running < max_workers:
+            return None
+        return (
+            f"this engine already runs {running} workers for other engines, the most its "
+            f"{DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY} setting allows."
         )
 
     def _refusal_to_serve(self, library_name: str, session_id: str) -> str | None:
@@ -1663,15 +1731,6 @@ class WorkerManager(EngineScoped):
         version_refusal = self._library_version_refusal(library_name, session.library_versions[library_name])
         if version_refusal is not None:
             return version_refusal
-        max_workers = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY, default=None)
-        # A worker this start replaces does not count against the limit.
-        worker_key = f"{session_id}/{library_name}"
-        running = len([key for key in self._managed_worker_processes if key != worker_key])
-        if max_workers is not None and running >= max_workers:
-            return (
-                f"this engine already runs {running} workers, the most its "
-                f"{DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY} setting allows."
-            )
         return None
 
     def _library_version_refusal(self, library_name: str, version: str) -> str | None:
@@ -1905,6 +1964,16 @@ class WorkerManager(EngineScoped):
             return None
         return hosted.engine_id
 
+    async def _recycle_hosted_worker(self, hosted: _HostedWorker) -> None:
+        """Stop a worker for a handoff, returning once its engine has heard it stopped.
+
+        Its engine starts it again before that library's next node, so the next run's node must not be
+        admitted while that engine still counts the stopped worker as running.
+        """
+        await self._stop_hosted_worker(hosted)
+        if hosted.exit_watcher is not None:
+            await asyncio.shield(hosted.exit_watcher)
+
     async def _stop_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker this engine runs for another engine. Its exit watcher reports it stopped.
 
@@ -2087,7 +2156,7 @@ class WorkerManager(EngineScoped):
             if how == "recycle":
                 # Its exit is reported stopped, so its engine starts it again before that library's next node.
                 logger.info("Stopping worker %s to free this engine for another engine's run.", worker_engine_id)
-                frees.append(self._stop_hosted_worker(hosted))
+                frees.append(self._recycle_hosted_worker(hosted))
             else:
                 frees.append(self._drop_library_named_objects(worker_engine_id, hosted))
         # All at once, so a worker that never answers delays the handoff by one timeout, not one each.
@@ -2252,6 +2321,7 @@ class WorkerManager(EngineScoped):
         worker that "may still be starting up" for the rest of the session.
         """
         self._worker_unavailable[library_name] = reason
+        self._refused_for_capacity.discard(library_name)
         self.note_library_loaded(library_name)
 
     def forget_library(self, library_name: str) -> None:
@@ -2337,8 +2407,11 @@ class WorkerManager(EngineScoped):
         if self._engine_for_library(library_name) is None:
             return
         # A worker that ended on its own left a reason, which stays until the library is reset.
-        if self.is_worker_running_or_starting(library_name) or self.worker_unavailable_reason(library_name) is not None:
+        if self.is_worker_running_or_starting(library_name):
             return
+        if self.worker_unavailable_reason(library_name) is not None and library_name not in self._refused_for_capacity:
+            return
+        self._refused_for_capacity.discard(library_name)
         await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
@@ -2387,10 +2460,19 @@ class WorkerManager(EngineScoped):
         return [self._claim_worker_result]
 
     async def _claim_worker_result(self, message: dict[str, Any]) -> bool:
-        """Claim a result no pending request wanted, and relay it to the GUI."""
+        """Claim a result no pending request wanted, and relay it to the GUI.
+
+        One addressed to this engine's own response topic answers a request this engine sent and stopped
+        waiting for, because it timed out or its engine was lost, so it is dropped rather than shown.
+        """
         payload = message.get("payload", {})
         if payload.get("event_type") not in RESULT_EVENT_TYPES:
             return False
+        if payload.get("response_topic") == f"engines/{self.engine.get_engine_id()}/response":
+            logger.debug(
+                "Dropping a late reply to request %s, which this engine stopped waiting for.", payload.get("request_id")
+            )
+            return True
         try:
             await self.relay_worker_result(payload)
         except Exception:

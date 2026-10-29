@@ -640,6 +640,24 @@ class TestEvictionCountsUnansweredChallenges:
         assert _ENGINE not in worker_manager._workers
 
     @pytest.mark.asyncio
+    async def test_a_late_reply_to_this_engine_s_own_request_is_dropped_not_shown(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        payload = {
+            "event_type": "EventResultSuccess",
+            "result_type": worker_events.EndRunResultSuccess.__name__,
+            "result": {"result_details": "late"},
+            "request_id": "gave-up-on-it",
+            "response_topic": f"engines/{_ENGINE}/response",
+        }
+
+        with patch.object(worker_manager, "relay_worker_result", new=AsyncMock()) as relay:
+            claimed = await worker_manager._claim_worker_result({"payload": payload})
+
+        assert claimed is True
+        relay.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_heartbeat_reply_clears_the_count(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key=None, unanswered_challenges=2
@@ -2666,6 +2684,31 @@ class TestStartingAWorkerOnAnotherEngine:
         assert not worker_manager.is_worker_running_or_starting(_LIBRARY)
 
     @pytest.mark.asyncio
+    async def test_a_start_refused_for_capacity_is_asked_again_by_the_library_s_next_node(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The node waiting now fails with the reason, and a slot may be free by the next one."""
+        _host_engine(worker_manager)
+        full = worker_events.StartWorkerForEngineResultFailure(result_details="no room", at_capacity=True)
+
+        with patch.object(worker_manager, "_ask_engine_to_start_worker", new=AsyncMock(return_value=full)):
+            await _start_on_host_engine(worker_manager)
+        assert "no room" in str(worker_manager.worker_unavailable_reason(_LIBRARY))
+
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager._start_remote_worker_if_stopped(_LIBRARY)
+        start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_start_refused_for_another_reason_is_not_asked_again(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager, refuse={"StartWorkerForEngineRequest": "not installed"})
+        await _start_on_host_engine(worker_manager)
+
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager._start_remote_worker_if_stopped(_LIBRARY)
+        start.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_engine_that_cannot_be_found_makes_the_library_unavailable_and_is_asked_again(
         self, worker_manager: WorkerManager
     ) -> None:
@@ -3734,6 +3777,27 @@ class TestSharingThisEngineBetweenRuns:
         assert sorted(by_worker[id(call_args.args[0])] for call_args in stop.await_args_list) == stopped
 
     @pytest.mark.asyncio
+    async def test_a_recycled_worker_s_engine_hears_it_stopped_before_the_next_run_is_admitted(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise that engine could route the next node to the worker that just stopped."""
+        _configure(
+            worker_manager,
+            {"distributed_execution.release.which": "all", "distributed_execution.release.how": "recycle"},
+        )
+        answered = asyncio.Event()
+        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1")
+        hosted.exit_watcher = asyncio.create_task(answered.wait())
+        worker_manager._hosted_workers["w1"] = hosted
+
+        with patch.object(worker_manager, "_stop_hosted_worker", new=AsyncMock()):
+            freeing = asyncio.create_task(worker_manager._free_for_handoff(_ARTIST_ENGINE))
+            await _settle()
+            assert not freeing.done()
+            answered.set()
+            await asyncio.wait_for(freeing, timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_freeing_a_worker_that_exits_ends_when_it_exits(self, worker_manager: WorkerManager) -> None:
         """Otherwise the next run would wait out the whole timeout for a worker that is gone."""
         _host_engine(worker_manager)
@@ -3817,14 +3881,29 @@ class TestSharingThisEngineBetweenRuns:
         _host_engine(worker_manager)
         _configure(worker_manager, {"distributed_execution.max_workers": 1})
         _register_session(worker_manager)
-        worker_manager._managed_worker_processes["another-sess/lib"] = _worker_proc_mock()
+        # Still starting, which counts as much as a running one.
+        worker_manager._hosted_workers["w-other"] = _HostedWorker(
+            worker_key="another-sess/lib", engine_id="another-artist-engine", session_id="another-sess"
+        )
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert result.at_capacity
         assert "distributed_execution.max_workers" in str(result.result_details)
         spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_this_engine_s_own_workers_do_not_count_against_the_worker_limit(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _host_engine(worker_manager)
+        _configure(worker_manager, {"distributed_execution.max_workers": 1})
+        _register_session(worker_manager)
+        worker_manager._managed_worker_processes["Local Library"] = _worker_proc_mock()
+
+        assert worker_manager._capacity_refusal(f"{_ARTIST_SESSION}/{_LIBRARY}") is None
 
 
 class TestAskingAnotherEngineToAdmitANode:
@@ -3845,6 +3924,46 @@ class TestAskingAnotherEngineToAdmitANode:
         assert links.sent[0][2] is None, "an admission waits as long as the run ahead of it"
         assert links.sent_types() == ["AdmitNodeRequest", "NodeExecutionEndedRequest", "EndRunRequest"]
         assert {engine_id for engine_id, _request, _timeout_s in links.sent} == {_HOST_ENGINE}
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_node_fails_once_every_worker_on_that_engine_stops_responding(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Over Griptape Cloud nothing reports that engine lost, so the wait would never end."""
+        links = _host_engine(worker_manager)
+        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        worker_manager._workers["w1"] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
+        )
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
+
+        await worker_manager.evict_worker("w1")
+
+        with pytest.raises(RuntimeError, match="stopped responding"):
+            await asyncio.wait_for(admitting, timeout=1.0)
+        assert worker_manager._admissions == {}
+        assert "NodeExecutionEndedRequest" not in links.sent_types()
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_node_keeps_waiting_while_another_worker_there_answers(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        for wid in ("w1", "w2"):
+            worker_manager._workers[wid] = WorkerRegistration(
+                request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
+            )
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
+
+        await worker_manager.evict_worker("w1")
+        await _settle()
+
+        assert not admitting.done()
+        links.blocked["AdmitNodeRequest"].set()
+        await admitting
 
     @pytest.mark.asyncio
     async def test_a_library_that_runs_here_needs_no_admission(self, worker_manager: WorkerManager) -> None:

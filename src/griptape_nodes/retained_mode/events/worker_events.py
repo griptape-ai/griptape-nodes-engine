@@ -193,9 +193,12 @@ class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
         session_unknown: The session that asked has not registered with this engine, as after this
             engine restarts, or registered without naming the library, as after its settings
             changed. It may register and ask again.
+        at_capacity: This engine already runs as many workers for other engines as it allows. It may
+            ask again later.
     """
 
     session_unknown: bool = False
+    at_capacity: bool = False
 
 
 @dataclass
