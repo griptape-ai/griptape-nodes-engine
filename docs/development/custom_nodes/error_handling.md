@@ -450,13 +450,13 @@ ParameterList(
 )
 ```
 
-**Limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap any
-validator, `IfParameter` included, so it applies only to a value whose file the condition holds, or
-doesn't hold, for. A condition is a function given the value's `MediaInfo`, returning True or
-False; it marks what it reads with `@reads(...)`, so the engine reads that along with the
-validator's own readings. A condition sees only the file: a limit that depends on a setting is a
-`IfParameter`. On a list, `.first(n)` checks only the first `n` items, for a provider that reads only
-that many.
+**Limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap a media
+validator so it applies only to a value whose file the condition holds, or doesn't hold, for. A
+condition is a function given the value's `MediaInfo`, returning True or False; it marks what it
+reads with `@reads(...)`, so the engine reads that along with the validator's own readings. A
+condition sees only the file: a limit that depends on a setting is an `IfParameter`. On a list,
+`.first(n)` checks only the first `n` items, for a provider that reads only that many; it works on
+any validator.
 
 ```python
 from griptape_nodes.exe_types.validators import IfParameter, MaxFileSize, MediaNeed, SideRange, reads
@@ -479,11 +479,11 @@ ParameterImage(
 **Rules across several inputs.** For a limit that involves more than one input, such as a total
 length across several clips, check it in the node's `validate_before_node_run`. The engine runs it
 right after the declared validators, in the same pass, so a reader from
-`griptape_nodes.exe_types.input_checks` called there returns what the validators already read, and
-no file is read twice.
+`griptape_nodes.utils.media_probe` called there returns what the validators already read, and no
+file is read twice.
 
 ```python
-from griptape_nodes.exe_types.input_checks import local_video_probe
+from griptape_nodes.utils.media_probe import local_video_probe
 from griptape_nodes.exe_types.node_error import NodeError
 
 MAX_TOTAL_SECONDS = 30
@@ -504,28 +504,47 @@ class ReferenceToVideo(SuccessFailureNode):
 ```
 
 **Your own validator.** Most limits are a built-in validator, narrowed where needed with
-`.when()`, `.unless()`, `IfParameter` or `.first(n)`. For one none of them covers, subclass
-`PreRunValidator`, set `needs` to the readings it uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or
-`AUDIO`), and return a `NodeError` from `check`, or None. The engine reads the input once for all
-the validators on a parameter and hands each the same `MediaInfo`. For a reading `MediaInfo` doesn't
-carry, call a reader (`local_size_bytes`, `local_image_info`, `local_image_format`,
-`local_video_probe`, `local_audio_probe`) from `griptape_nodes.exe_types.input_checks`; during the
-node's checks it returns what was already read. `check` is also given a list item's `position`;
-take `**_` for any argument you don't use.
+`IfParameter`, `.first(n)`, or for a media validator `.when()` and `.unless()`. For one none of
+them covers, subclass `PreRunValidator` and return a `NodeError` from `check`, or None. `check` is
+also given a list item's `position`; take `**_` for any argument you don't use.
 
 ```python
 from typing import Any, override
 
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator
+from griptape_nodes.exe_types.validators import PreRunValidator
 
 
-class EvenSides(PreRunValidator):
+class NotBlank(PreRunValidator):
+    @override
+    def check(self, value: Any, *, subject: str, docs_url: str | None, **_: Any) -> NodeError | None:
+        if str(value or "").strip():
+            return None
+        return NodeError(f"{subject} is empty. Write a prompt.")
+```
+
+A limit on an image, video or audio file subclasses `MediaValidator` instead: set `needs` to the
+readings it uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or `AUDIO`) and implement `check_media`, which
+is handed them. The engine reads the input once for all the media validators on a parameter and
+hands each the same `MediaInfo`, and refuses one whose readings don't fit the parameter's kind
+when the node is built. For a reading `MediaInfo` doesn't carry, call a reader
+(`local_size_bytes`, `local_image_info`, `local_image_format`, `local_video_probe`,
+`local_audio_probe`) from `griptape_nodes.utils.media_probe`; during the node's checks it returns
+what was already read.
+
+```python
+from typing import Any, override
+
+from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.exe_types.validators import MediaInfo, MediaNeed, MediaValidator
+
+
+class EvenSides(MediaValidator):
     needs = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
 
     @override
-    def check(
-        self, value: Any, *, subject: str, docs_url: str | None, media: MediaInfo = EMPTY_MEDIA, **_: Any
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, **_: Any
     ) -> NodeError | None:
         frame = media.frame
         if frame is None or (frame.width % 2 == 0 and frame.height % 2 == 0):
