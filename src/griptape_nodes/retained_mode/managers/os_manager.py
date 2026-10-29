@@ -328,6 +328,16 @@ class OSManager(EngineScoped):
         "music": 0x000D,  # CSIDL_MYMUSIC
     }
 
+    # Matches the File Browser dialog's own client-side preview cutoff. The sequence-frame
+    # loader bypasses that client-side check, so this is what actually stops a 200+ MB frame
+    # from being base64-encoded whole -- the real cost behind the engine hang in #6043.
+    _MAX_PREVIEWABLE_IMAGE_BYTES: ClassVar[int] = 10 * 1024 * 1024
+
+    # Returned in place of a preview for files over the size cap. A syntactically valid, empty
+    # data URL: no image decoder can render it, so the editor shows its own "failed to load
+    # preview" state instead of the raw file content.
+    _NO_PREVIEW_DATA_URL: ClassVar[str] = "data:,"
+
     @staticmethod
     def normalize_path_parts_for_special_folder(path_str: str) -> list[str]:
         r"""Parse a path string into normalized parts for special folder detection.
@@ -2334,7 +2344,12 @@ class OSManager(EngineScoped):
         """Handle image content by creating previews or returning static URLs.
 
         The workspace check reads engine state, so it runs on the loop; only the image encode
-        runs on a worker thread.
+        runs on a worker thread. Pillow is tried first regardless of file size, since decoding a
+        large-but-valid image (a big JPEG or TIFF, say) is cheap and still worth a thumbnail. Only
+        when Pillow can't decode the file does size matter: under ``_MAX_PREVIEWABLE_IMAGE_BYTES``
+        the original bytes are returned undecoded; over it, a no-preview sentinel is returned
+        instead, since base64-encoding a multi-hundred-MB file whole is what has hung the engine
+        on large or multi-part images Pillow can't open (EXR sequences, for one).
 
         Args:
             content: Image bytes
@@ -2374,11 +2389,38 @@ class OSManager(EngineScoped):
             # Not a valid local path (might be URL or data URI), continue to preview
             pass
 
-        return await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes, mime_type)
+        path_obj = Path(file_path) if isinstance(file_path, str) else file_path
+
+        pillow_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
+        if pillow_preview is not None:
+            return pillow_preview
+
+        if len(original_image_bytes) > self._MAX_PREVIEWABLE_IMAGE_BYTES:
+            # Pillow couldn't decode this file, and it's large enough that base64-encoding it
+            # whole is the actual cost that has hung the engine on large/multi-part images it
+            # can't open (EXR sequences, for one). A 200+ MB EXR sequence frame reaches this
+            # unconditionally via the sequence-frame loader, which bypasses the File Browser
+            # dialog's own 10MB client-side preview cutoff. Skip encoding it entirely.
+            logger.debug(
+                "%s exceeds the %d byte preview cap and Pillow could not decode it; skipping preview.",
+                path_obj,
+                self._MAX_PREVIEWABLE_IMAGE_BYTES,
+            )
+            return self._NO_PREVIEW_DATA_URL
+
+        # Pillow couldn't decode this file, but it's small enough that returning it undecoded
+        # costs nothing worth guarding against.
+        logger.debug("No preview could be generated for %s; returning the original bytes.", path_obj)
+        return f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
 
     @staticmethod
-    def _image_bytes_to_preview_data_url(image_bytes: bytes, mime_type: str) -> str:
-        """Encode a small WEBP preview of the image as a data URL. CPU-bound and touches no engine state."""
+    def _image_bytes_to_preview_data_url(image_bytes: bytes) -> str | None:
+        """Encode a small WEBP preview of the image as a data URL. CPU-bound and touches no engine state.
+
+        Returns:
+            The preview data URL, or None if Pillow could not decode the image (the caller then
+            returns the original bytes under the size cap, or a no-preview sentinel over it).
+        """
         preview_data_url = create_image_preview_from_bytes(
             image_bytes,  # type: ignore[arg-type]
             max_width=200,
@@ -2391,10 +2433,7 @@ class OSManager(EngineScoped):
             logger.debug("Image preview created (file not moved)")
             return preview_data_url
 
-        # Fallback to data URL if preview creation fails
-        data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
-        logger.debug("Fallback to full image data URL")
-        return data_url
+        return None
 
     @handles(GetNextUnusedFilenameRequest)
     def on_get_next_unused_filename_request(self, request: GetNextUnusedFilenameRequest) -> ResultPayload:

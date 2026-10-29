@@ -228,9 +228,8 @@ class TestReadFileThumbnail:
         source = tmp_path / "source.png"
         source.write_bytes(_png_bytes())
         step = _SlowStep()
-        monkeypatch.setattr(
-            engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data, _mime: step.run("data:thumb")
-        )
+        # Pillow runs before any registry lookup, so this exercises the off-loop encode directly.
+        monkeypatch.setattr(engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data: step.run("data:thumb"))
 
         read = asyncio.create_task(engine.ahandle_request(ReadFileRequest(file_path=str(source), workspace_only=False)))
         try:
