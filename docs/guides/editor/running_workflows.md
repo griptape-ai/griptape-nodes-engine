@@ -127,12 +127,12 @@ A few things worth knowing:
     bar names every one of them, so your administrator can make room in all
     of them at once.
 
-To see how much a budget has spent and how much room it has left, open its
-page on Griptape Cloud. A budget marked *(frozen)* refuses every call no
-matter how many credits are left, until an administrator lifts the freeze.
+A budget marked *(frozen)* refuses every call no matter how many credits are
+left, until an administrator lifts the freeze.
 
-Budgets are set, raised and unfrozen on Griptape Cloud, not in the editor.
-Bring the budget names from the bar to your Griptape administrator.
+Your organization's administrators set, raise and unfreeze budgets in
+[Spend & Budgets](../../enterprise/admin_dashboard.md#spend-budgets) in the
+Admin Dashboard. Bring the budget names from the bar to them.
 
 ## Reading execution state on the canvas
 
