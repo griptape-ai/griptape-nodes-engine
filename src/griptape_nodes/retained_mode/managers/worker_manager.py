@@ -2449,19 +2449,10 @@ class WorkerManager(EngineScoped):
         return [self._claim_worker_result]
 
     async def _claim_worker_result(self, message: dict[str, Any]) -> bool:
-        """Claim a result no pending request wanted, and relay it to the GUI.
-
-        One addressed to this engine's own response topic answers a request this engine sent and stopped
-        waiting for, because it timed out or its engine was lost, so it is dropped rather than shown.
-        """
+        """Claim a result no pending request wanted, and relay it to the GUI."""
         payload = message.get("payload", {})
         if payload.get("event_type") not in RESULT_EVENT_TYPES:
             return False
-        if payload.get("response_topic") == f"engines/{self.engine.get_engine_id()}/response":
-            logger.debug(
-                "Dropping a late reply to request %s, which this engine stopped waiting for.", payload.get("request_id")
-            )
-            return True
         try:
             await self.relay_worker_result(payload)
         except Exception:

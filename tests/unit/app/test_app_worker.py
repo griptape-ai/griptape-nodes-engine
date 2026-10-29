@@ -640,24 +640,6 @@ class TestEvictionCountsUnansweredChallenges:
         assert _ENGINE not in worker_manager._workers
 
     @pytest.mark.asyncio
-    async def test_a_late_reply_to_this_engine_s_own_request_is_dropped_not_shown(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        payload = {
-            "event_type": "EventResultSuccess",
-            "result_type": worker_events.ReportRunEndedResultSuccess.__name__,
-            "result": {"result_details": "late"},
-            "request_id": "gave-up-on-it",
-            "response_topic": f"engines/{_ENGINE}/response",
-        }
-
-        with patch.object(worker_manager, "relay_worker_result", new=AsyncMock()) as relay:
-            claimed = await worker_manager._claim_worker_result({"payload": payload})
-
-        assert claimed is True
-        relay.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_a_heartbeat_reply_clears_the_count(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key=None, unanswered_challenges=2
