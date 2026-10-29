@@ -459,7 +459,7 @@ class TestAudioReadings:
         media = MediaInfo(audio=AudioProbe(mime_type=reading, codec="aac", profile="LC", seconds=3.0))
         assert _messages([AllowedFormats(listed)], media) == []
 
-    def test_suggests_an_audio_editor_for_audio_that_is_too_long(self) -> None:
+    def test_checks_both_duration_bounds_on_audio_with_generic_suggestions(self) -> None:
         media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
         assert _messages([MaxDuration(1), MinDuration(5)], media) == [
             f"{SUBJECT} is 3.00 seconds long and the limit is 1. Shorten it.",

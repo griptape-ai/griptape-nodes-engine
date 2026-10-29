@@ -101,8 +101,9 @@ class PreRunValidator(ABC):
     def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         """An error when `value` breaks this limit, or None when it is within it.
 
-        An input with no value is skipped before any validator runs, so `value` is never None; check
-        that a required input is set in the node's `validate_before_node_run`.
+        A single input with no value, and each empty row of a list, is skipped before any validator
+        runs, so `value` is never None; a validator with `checks_whole_list` still gets the list, even
+        an empty one. Check that a required input is set in the node's `validate_before_node_run`.
 
         Args:
             value: The parameter's value; for a list, one item, or the whole list with `checks_whole_list`.

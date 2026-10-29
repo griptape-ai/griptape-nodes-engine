@@ -391,8 +391,8 @@ Import the validators from `griptape_nodes.exe_types.validators`:
 | `PixelArea(min_megapixels=..., ...)`            | The pixels in an image or video frame, in millions.                                  |
 | `AspectRatioRange(tallest, widest)`             | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
 | `ExactAspectRatios("16:9", "9:16")`             | The aspect ratio, for a provider that takes only certain shapes.                     |
-| `MinDuration(seconds, fix=...)`                 | A video's or audio clip's shortest accepted length, in seconds.                      |
-| `MaxDuration(seconds, fix=...)`                 | A video's or audio clip's longest accepted length, in seconds.                       |
+| `MinDuration(minimum_seconds, fix=...)`         | A video's or audio clip's shortest accepted length, in seconds.                      |
+| `MaxDuration(maximum_seconds, fix=...)`         | A video's or audio clip's longest accepted length, in seconds.                       |
 | `FrameRate(min=..., max=...)`                   | A video's frame rate.                                                                |
 | `FrameCount(min=..., max=...)`                  | A video's frame count.                                                               |
 | `VideoCodecs("h264", ...)`                      | A video's codec.                                                                     |
@@ -507,9 +507,10 @@ class ReferenceToVideo(SuccessFailureNode):
 **Your own validator.** Most limits are a built-in validator, narrowed where needed with
 `IfParameter`, `.first(n)`, or for a media validator `.when()` and `.unless()`. For one none of
 them covers, subclass `PreRunValidator` and return a `NodeError` from `check`, or None. `check` is
-also given a list item's `position`; take `**_` for any argument you don't use. An input with no
-value is skipped before any validator runs, so check that a required input is set in the node's
-`validate_before_node_run`.
+also given a list item's `position`; take `**_` for any argument you don't use. A single input with
+no value, and each empty row of a list, is skipped before any validator runs; a validator with
+`checks_whole_list` still gets the list, even an empty one. Check that a required input is set in
+the node's `validate_before_node_run`.
 
 ```python
 from dataclasses import dataclass
