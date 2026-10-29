@@ -11,10 +11,11 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_aspect_ratio_range,
     check_audio_codec,
     check_dimensions,
-    check_duration,
     check_frame_count,
     check_frame_rate,
+    check_max_duration,
     check_mime_type,
+    check_min_duration,
     check_size,
     check_video_codec,
 )
@@ -470,43 +471,47 @@ class TestCodecNames:
 
 class TestCheckDuration:
     def test_allows_a_duration_in_range(self) -> None:
-        assert check_duration(5.0, subject="The video in 'Video'", minimum=1, maximum=8.7) is None
+        assert check_min_duration(5.0, subject="The video in 'Video'", minimum=1) is None
+        assert check_max_duration(5.0, subject="The video in 'Video'", maximum=8.7) is None
 
     def test_skips_an_unknown_duration(self) -> None:
-        assert check_duration(None, subject="The video in 'Video'", maximum=1) is None
+        assert check_min_duration(None, subject="The video in 'Video'", minimum=1) is None
+        assert check_max_duration(None, subject="The video in 'Video'", maximum=1) is None
 
     def test_rejects_a_long_video(self) -> None:
-        error = check_duration(12.345, subject="The video in 'Video'", maximum=8.7)
+        error = check_max_duration(12.345, subject="The video in 'Video'", maximum=8.7)
         assert str(error) == ("The video in 'Video' is 12.35 seconds long and the limit is 8.7. Shorten it.")
 
     def test_rejects_a_short_video(self) -> None:
-        error = check_duration(0.5, subject="The video in 'Video'", minimum=2)
+        error = check_min_duration(0.5, subject="The video in 'Video'", minimum=2)
         assert str(error) == "The video in 'Video' is 0.50 seconds long and the minimum is 2. Use a longer clip."
 
     def test_reports_a_duration_just_over_the_limit_as_over_it(self) -> None:
-        error = check_duration(8.701, subject="The video in 'Video'", maximum=8.7)
+        error = check_max_duration(8.701, subject="The video in 'Video'", maximum=8.7)
         assert str(error).startswith("The video in 'Video' is 8.701 seconds long and the limit is 8.7.")
 
     def test_reports_a_duration_under_a_non_round_minimum_as_under_it(self) -> None:
-        error = check_duration(1.9455, subject="The video in 'Video'", minimum=1.946)
+        error = check_min_duration(1.9455, subject="The video in 'Video'", minimum=1.946)
         assert str(error).startswith("The video in 'Video' is 1.9455 seconds long and the minimum is 1.946.")
 
     def test_reports_a_duration_under_a_long_minimum_as_under_it(self) -> None:
-        error = check_duration(2.046665, subject="The video in 'Video'", minimum=2.0466666666)
+        error = check_min_duration(2.046665, subject="The video in 'Video'", minimum=2.0466666666)
         assert str(error).startswith("The video in 'Video' is 2.04666 seconds long and the minimum is 2.04667.")
 
     def test_rounds_a_long_minimum_up_so_a_clip_under_it_reads_as_under_it(self) -> None:
         # Six significant figures would show 1234.56, under the minimum; it is shown rounded up.
-        error = check_duration(1234.5, subject="The video in 'Video'", minimum=1234.5649)
+        error = check_min_duration(1234.5, subject="The video in 'Video'", minimum=1234.5649)
         assert str(error).startswith("The video in 'Video' is 1234.50 seconds long and the minimum is 1234.57.")
 
     def test_prints_a_duration_in_full_when_no_rounding_reads_as_past_the_limit(self) -> None:
-        error = check_duration(1.000000000001, subject="The video in 'Video'", maximum=1.0000000000001)
+        error = check_max_duration(1.000000000001, subject="The video in 'Video'", maximum=1.0000000000001)
         assert str(error).startswith("The video in 'Video' is 1.000000000001 seconds long and the limit is 1.")
 
     def test_uses_the_given_fix(self) -> None:
-        error = check_duration(20, subject="The video in 'Video'", maximum=10, fix="Pick a shorter clip.")
+        error = check_max_duration(20, subject="The video in 'Video'", maximum=10, fix="Pick a shorter clip.")
         assert str(error).endswith("Pick a shorter clip.")
+        error = check_min_duration(1, subject="The video in 'Video'", minimum=3, fix="Pick a longer clip.")
+        assert str(error).endswith("Pick a longer clip.")
 
 
 class TestInputSubject:

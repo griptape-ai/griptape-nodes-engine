@@ -10,7 +10,7 @@ from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, Max
   family for image, video and audio files, judged on readings the engine takes once (`MediaNeed`
   names one, `MediaInfo` holds them, both from `griptape_nodes.utils.media_probe`). `reads` marks
   what a `Condition` for `MediaValidator.when` or `unless` reads.
-- `media`: limits on an image, video or audio file, such as `MaxFileSize` or `Duration`.
+- `media`: limits on an image, video or audio file, such as `MaxFileSize` or `MaxDuration`.
 - `common`: `MaxCount` for a list's length, and `IfParameter` for limits that depend on another
   parameter's value.
 """
@@ -29,34 +29,35 @@ from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
     AudioCodecs,
-    Duration,
     ExactAspectRatios,
     FrameCount,
     FrameRate,
+    MaxDuration,
     MaxFileSize,
+    MinDuration,
     PixelArea,
     SideRange,
     VideoCodecs,
 )
-from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed
+from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 __all__ = [
-    "EMPTY_MEDIA",
     "LIMITS_LINK_LABEL",
     "AllowedFormats",
     "AspectRatioRange",
     "AudioCodecs",
     "Condition",
-    "Duration",
     "ExactAspectRatios",
     "FrameCount",
     "FrameRate",
     "IfParameter",
     "MaxCount",
+    "MaxDuration",
     "MaxFileSize",
     "MediaInfo",
     "MediaNeed",
     "MediaValidator",
+    "MinDuration",
     "PixelArea",
     "PreRunValidator",
     "SideRange",

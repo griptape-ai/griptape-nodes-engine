@@ -48,7 +48,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 __all__ = [
-    "EMPTY_MEDIA",
     "AudioProbe",
     "ImageInfo",
     "MediaInfo",

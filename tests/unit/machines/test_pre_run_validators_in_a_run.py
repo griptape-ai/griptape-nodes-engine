@@ -13,7 +13,7 @@ from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
-from griptape_nodes.exe_types.validators.media import Duration, SideRange
+from griptape_nodes.exe_types.validators.media import MaxDuration, SideRange
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.fsm import WorkflowState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
@@ -106,7 +106,7 @@ async def test_a_validator_error_alone_fails_the_node(tmp_path: Path) -> None:
 class _VideoNode(MockNode):
     def __init__(self) -> None:
         super().__init__(name="edit")
-        self.add_parameter(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
+        self.add_parameter(ParameterVideo(name="video", display_name="Video", pre_run_validators=[MaxDuration(5)]))
 
 
 @pytest.fixture

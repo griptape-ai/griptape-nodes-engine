@@ -43,8 +43,8 @@ from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
     AudioCodecs,
-    Duration,
     FrameRate,
+    MaxDuration,
     MaxFileSize,
     SideRange,
 )
@@ -116,7 +116,7 @@ class TestSingleInputs:
         clip.write_bytes(b"audio")
         probe = media_probe.AudioProbe(mime_type="audio/mpeg", codec="mp3", profile=None, seconds=9.0)
         monkeypatch.setattr(media_probe, "_probe_audio", lambda _location: probe)
-        node = _node_with(ParameterAudio(name="voice", pre_run_validators=[Duration(max=5)]))
+        node = _node_with(ParameterAudio(name="voice", pre_run_validators=[MaxDuration(5)]))
         node.set_parameter_value("voice", str(clip))
         assert _messages(validate_inputs(node)) == [
             "The audio clip in 'voice' is 9.00 seconds long and the limit is 5. Shorten it."
@@ -188,7 +188,7 @@ class TestReadOnce:
                     AllowedFormats("video/mp4"),
                     SideRange(max=2048),
                     AspectRatioRange("1:3", "3:1"),
-                    Duration(max=30),
+                    MaxDuration(30),
                     FrameRate(max=60),
                     MaxFileSize(1024),
                 ],
@@ -544,7 +544,7 @@ class TestConditions:
     @pytest.mark.parametrize(
         ("build", "match"),
         [
-            (lambda: ParameterImage(name="p", pre_run_validators=[Duration(max=1).when(_always)]), "Duration"),
+            (lambda: ParameterImage(name="p", pre_run_validators=[MaxDuration(1).when(_always)]), "MaxDuration"),
             (
                 lambda: ParameterImage(
                     name="p", pre_run_validators=[IfParameter("m", {"x": [AudioCodecs("mp3")]}).first(1)]
@@ -616,7 +616,7 @@ class TestParameterTypes:
                 "isn't an image, video or audio",
             ),
             (lambda: ParameterAudio(name="p", pre_run_validators=[SideRange(min=1)]), "checks image or video"),
-            (lambda: ParameterImage(name="p", pre_run_validators=[Duration(max=1)]), "checks audio or video"),
+            (lambda: ParameterImage(name="p", pre_run_validators=[MaxDuration(1)]), "checks audio or video"),
             (lambda: ParameterImage(name="p", pre_run_validators=[MaxCount(2)]), "checks a list"),
             (lambda: Parameter(name="p", type="int", pre_run_validators=[MaxFileSize(1)]), "isn't an image"),
         ],
@@ -628,8 +628,8 @@ class TestParameterTypes:
 
     def test_accepts_media_validators_on_their_kinds(self) -> None:
         ParameterImage(name="i", pre_run_validators=[AllowedFormats("image/png"), SideRange(min=1), MaxFileSize(1)])
-        ParameterVideo(name="v", pre_run_validators=[AllowedFormats("video/mp4"), Duration(max=1), FrameRate(max=1)])
-        ParameterAudio(name="a", pre_run_validators=[AllowedFormats("audio/mpeg"), Duration(max=1)])
+        ParameterVideo(name="v", pre_run_validators=[AllowedFormats("video/mp4"), MaxDuration(1), FrameRate(max=1)])
+        ParameterAudio(name="a", pre_run_validators=[AllowedFormats("audio/mpeg"), MaxDuration(1)])
 
     @pytest.mark.parametrize(
         "parameter_class",
@@ -720,7 +720,7 @@ class TestValidateNode:
             self._own_errors = own_errors
             self._reads = reads
             self.add_parameter(
-                ParameterVideo(name="video", display_name="Video", pre_run_validators=[MaxFileSize(1), Duration(max=5)])
+                ParameterVideo(name="video", display_name="Video", pre_run_validators=[MaxFileSize(1), MaxDuration(5)])
             )
 
         def validate_before_node_run(self) -> list[Exception] | None:
@@ -767,7 +767,7 @@ class TestValuesHeldInAnotherProcess:
     _ELSEWHERE = make_reference(worker="some-other-worker", key="LoadVideo.video#deadbeef", source="LoadVideo@abc12345")
 
     def test_skips_a_single_input_held_elsewhere(self) -> None:
-        node = _node_with(ParameterVideo(name="video", pre_run_validators=[Duration(max=5)]))
+        node = _node_with(ParameterVideo(name="video", pre_run_validators=[MaxDuration(5)]))
         node.set_parameter_value("video", self._ELSEWHERE)
         assert validate_inputs(node) == []
 
@@ -779,7 +779,7 @@ class TestValuesHeldInAnotherProcess:
                 input_types=["VideoUrlArtifact"],
                 type="VideoUrlArtifact",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-                pre_run_validators=[MaxCount(1), Duration(max=5)],
+                pre_run_validators=[MaxCount(1), MaxDuration(5)],
             )
         )
         node.set_parameter_value("clips", [self._ELSEWHERE, self._ELSEWHERE])

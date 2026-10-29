@@ -25,7 +25,7 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
     base_exports = ("LIMITS_LINK_LABEL", "Condition", "MediaValidator", "PreRunValidator", "reads")
     source.update(dict.fromkeys(base_exports, validators_base))
     # What a media validator reads comes from the probe, below the validators.
-    source.update(dict.fromkeys(("EMPTY_MEDIA", "MediaInfo", "MediaNeed"), media_probe))
+    source.update(dict.fromkeys(("MediaInfo", "MediaNeed"), media_probe))
     assert set(validators_package.__all__) == set(source)
     for name, module in source.items():
         assert getattr(validators_package, name) is getattr(module, name)

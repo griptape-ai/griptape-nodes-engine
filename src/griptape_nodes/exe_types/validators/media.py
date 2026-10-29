@@ -34,10 +34,11 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_aspect_ratio_range,
     check_audio_codec,
     check_dimensions,
-    check_duration,
     check_frame_count,
     check_frame_rate,
+    check_max_duration,
     check_mime_type,
+    check_min_duration,
     check_size,
     check_video_codec,
 )
@@ -54,11 +55,12 @@ __all__ = [
     "AllowedFormats",
     "AspectRatioRange",
     "AudioCodecs",
-    "Duration",
     "ExactAspectRatios",
     "FrameCount",
     "FrameRate",
+    "MaxDuration",
     "MaxFileSize",
+    "MinDuration",
     "PixelArea",
     "SideRange",
     "VideoCodecs",
@@ -66,8 +68,6 @@ __all__ = [
 
 _FRAME_NEEDS = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
 _LENGTH_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
-
-# What `Duration` suggests for audio over its maximum; `check_duration`'s default suggests a video node.
 
 # A subject for checking a validator's own arguments when it is built, before there is an input.
 _NO_SUBJECT = ""
@@ -238,24 +238,21 @@ class ExactAspectRatios(MediaValidator):
         )
 
 
-@dataclass(frozen=True, kw_only=True)
-class Duration(MediaValidator):
-    """The shortest and longest video or audio input accepted, in seconds.
+@dataclass(frozen=True)
+class MinDuration(MediaValidator):
+    """The shortest video or audio input accepted, in seconds.
 
-    Providers don't say whether they measure the stream or the whole file, so a maximum is checked
-    against the shorter of the two and a minimum against the longer.
+    Providers don't say whether they measure the stream or the whole file, so the longer of the two
+    is checked.
 
     Args:
-        min: The shortest input accepted.
-        max: The longest input accepted.
-        fix: What the artist can do about an input of the wrong length, such as naming a library's
-            own trim node. Defaults to shortening it or using a longer clip.
+        minimum_seconds: The shortest input accepted.
+        fix: What the artist can do about a clip that is too short. Defaults to "Use a longer clip."
     """
 
     needs = _LENGTH_NEEDS
 
-    min: float | None = None
-    max: float | None = None
+    minimum_seconds: float
     fix: str | None = None
 
     @override
@@ -265,15 +262,38 @@ class Duration(MediaValidator):
         probe = media.video if media.video is not None else media.audio
         if probe is None:
             return None
-        if self.max is not None:
-            error = check_duration(
-                probe.shortest_seconds, subject=subject, maximum=self.max, fix=self.fix, docs_url=docs_url
-            )
-            if error is not None:
-                return error
-        if self.min is None:
+        return check_min_duration(
+            probe.longest_seconds, subject=subject, minimum=self.minimum_seconds, fix=self.fix, docs_url=docs_url
+        )
+
+
+@dataclass(frozen=True)
+class MaxDuration(MediaValidator):
+    """The longest video or audio input accepted, in seconds.
+
+    Providers don't say whether they measure the stream or the whole file, so the shorter of the two
+    is checked.
+
+    Args:
+        maximum_seconds: The longest input accepted.
+        fix: What the artist can do about a clip that is too long. Defaults to "Shorten it."
+    """
+
+    needs = _LENGTH_NEEDS
+
+    maximum_seconds: float
+    fix: str | None = None
+
+    @override
+    def check_media(
+        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
+    ) -> NodeError | None:
+        probe = media.video if media.video is not None else media.audio
+        if probe is None:
             return None
-        return check_duration(probe.longest_seconds, subject=subject, minimum=self.min, fix=self.fix, docs_url=docs_url)
+        return check_max_duration(
+            probe.shortest_seconds, subject=subject, maximum=self.maximum_seconds, fix=self.fix, docs_url=docs_url
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -324,8 +344,8 @@ class FrameCount(MediaValidator):
     Args:
         min: The fewest frames accepted.
         max: The most frames accepted.
-        fix: What the artist can do about too many frames, such as naming a library's own trim
-            node. Defaults to shortening the clip or lowering its frame rate.
+        fix: What the artist can do about too many frames. Defaults to "Shorten it, or lower its
+            frame rate."
     """
 
     needs = frozenset({MediaNeed.VIDEO})

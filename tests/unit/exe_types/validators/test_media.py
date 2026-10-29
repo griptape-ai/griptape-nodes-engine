@@ -13,11 +13,12 @@ from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
     AudioCodecs,
-    Duration,
     ExactAspectRatios,
     FrameCount,
     FrameRate,
+    MaxDuration,
     MaxFileSize,
+    MinDuration,
     PixelArea,
     SideRange,
     VideoCodecs,
@@ -221,7 +222,8 @@ class TestOnRealVideos:
             VideoCodecs("h264"),
             SideRange(min=200, max=1920),
             AspectRatioRange("1:2", "2:1"),
-            Duration(min=1, max=10),
+            MinDuration(1),
+            MaxDuration(10),
             FrameRate(min=24, max=60),
             FrameCount(min=24, max=100),
             MaxFileSize(10 * 1024 * 1024),
@@ -235,7 +237,7 @@ class TestOnRealVideos:
             VideoCodecs("hevc"),
             SideRange(min=480),
             ExactAspectRatios("16:9"),
-            Duration(min=3),
+            MinDuration(3),
             FrameRate(min=30),
             FrameCount(max=24),
         ]
@@ -262,7 +264,12 @@ class TestOnRealAudio:
     def test_reads_and_checks_a_real_mp3(self, tmp_path: Path) -> None:
         media = _audio(str(audio_file(tmp_path, seconds=3)))
         assert media.audio is not None
-        validators: list[MediaValidator] = [AllowedFormats("audio/mpeg"), AudioCodecs("mp3"), Duration(min=2, max=5)]
+        validators: list[MediaValidator] = [
+            AllowedFormats("audio/mpeg"),
+            AudioCodecs("mp3"),
+            MinDuration(2),
+            MaxDuration(5),
+        ]
         assert _messages(validators, media) == []
 
     def test_reports_every_limit_a_real_mp3_breaks(self, tmp_path: Path) -> None:
@@ -270,7 +277,7 @@ class TestOnRealAudio:
         validators: list[MediaValidator] = [
             AllowedFormats("audio/wav"),
             AudioCodecs("pcm_s16le"),
-            Duration(max=1),
+            MaxDuration(1),
         ]
         assert _messages(validators, media) == [
             f"{SUBJECT} is in MP3 format. Convert it to WAV.",
@@ -309,16 +316,16 @@ class TestVideoReadings:
         ("stream", "container", "validator", "expected"),
         [
             # A 10 s video with a 31 s audio track: the maximum is checked against the video.
-            (10.0, 31.0, Duration(max=30), None),
+            (10.0, 31.0, MaxDuration(30), None),
             # A 2.9 s video with 3.5 s of audio: the minimum is checked against the longer reading.
-            (2.9, 3.5, Duration(min=3), None),
-            (31.0, 32.0, Duration(max=30), "is 31.00 seconds long and the limit is 30."),
-            (2.0, 2.5, Duration(min=3), "is 2.50 seconds long and the minimum is 3."),
+            (2.9, 3.5, MinDuration(3), None),
+            (31.0, 32.0, MaxDuration(30), "is 31.00 seconds long and the limit is 30."),
+            (2.0, 2.5, MinDuration(3), "is 2.50 seconds long and the minimum is 3."),
         ],
         ids=["long-audio-under-max", "long-audio-over-min", "both-over-max", "both-under-min"],
     )
     def test_checks_each_duration_bound_against_the_easier_reading(
-        self, stream: float, container: float, validator: Duration, expected: str | None
+        self, stream: float, container: float, validator: MediaValidator, expected: str | None
     ) -> None:
         media = MediaInfo(video=VideoProbe(info=None, seconds=stream, container_seconds=container))
         messages = _messages([validator], media)
@@ -330,18 +337,33 @@ class TestVideoReadings:
 
     def test_uses_a_given_duration_fix(self) -> None:
         media = MediaInfo(video=VideoProbe(info=None, seconds=1.0))
-        assert _messages([Duration(min=3, fix="Pick a longer clip.")], media) == [
+        assert _messages([MinDuration(3, fix="Pick a longer clip.")], media) == [
             f"{SUBJECT} is 1.00 seconds long and the minimum is 3. Pick a longer clip."
         ]
 
-    def test_a_library_can_name_its_own_trim_node(self) -> None:
-        # The engine's own suggestions name no node; a library that ships one says so with `fix=`.
-        fix = "Use a Trim Video node to shorten it."
-        media = MediaInfo(video=VideoProbe(info=None, seconds=12.0, fps=24.0, frames=288))
-        assert _messages([Duration(max=10, fix=fix), FrameCount(max=240, fix=fix)], media) == [
-            f"{SUBJECT} is 12.00 seconds long and the limit is 10. {fix}",
-            f"{SUBJECT} has 288 frames and the limit is 240. {fix}",
+    def test_each_bound_has_its_own_fix(self) -> None:
+        # A fix for a clip that is too short never shows on one that is too long, and the reverse.
+        too_short = MinDuration(3, fix="Pick a clip of at least 3 seconds.")
+        too_long = MaxDuration(10, fix="Cut it to 10 seconds or less.")
+        long_clip = MediaInfo(video=VideoProbe(info=None, seconds=12.0))
+        assert _messages([too_short, too_long], long_clip) == [
+            f"{SUBJECT} is 12.00 seconds long and the limit is 10. Cut it to 10 seconds or less."
         ]
+        short_clip = MediaInfo(video=VideoProbe(info=None, seconds=1.0))
+        assert _messages([too_short, too_long], short_clip) == [
+            f"{SUBJECT} is 1.00 seconds long and the minimum is 3. Pick a clip of at least 3 seconds."
+        ]
+
+    def test_a_given_fix_replaces_the_frame_count_suggestion(self) -> None:
+        media = MediaInfo(video=VideoProbe(info=None, seconds=12.0, fps=24.0, frames=288))
+        assert _messages([FrameCount(max=240, fix="Use fewer frames.")], media) == [
+            f"{SUBJECT} has 288 frames and the limit is 240. Use fewer frames."
+        ]
+
+    def test_check_without_readings_refuses_rather_than_passing(self) -> None:
+        # Without readings every media check would pass, so the plain `check` refuses to run.
+        with pytest.raises(TypeError, match="call check_media"):
+            MaxFileSize(1).check("clip.mp4", subject=SUBJECT, docs_url=None)
 
     def test_checks_frames_against_the_reading_easier_to_meet(self) -> None:
         # No recorded count: 3 s at 24 fps average (72 frames) or 30 fps declared (90 frames).
@@ -398,7 +420,7 @@ class TestVideoReadings:
             SideRange(min=1),
             AspectRatioRange("1:1", "1:1"),
             ExactAspectRatios("1:1"),
-            Duration(min=100),
+            MinDuration(100),
             FrameRate(min=100),
             FrameCount(min=100),
             MaxFileSize(1),
@@ -439,14 +461,14 @@ class TestAudioReadings:
 
     def test_suggests_an_audio_editor_for_audio_that_is_too_long(self) -> None:
         media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
-        assert _messages([Duration(max=1), Duration(min=5)], media) == [
+        assert _messages([MaxDuration(1), MinDuration(5)], media) == [
             f"{SUBJECT} is 3.00 seconds long and the limit is 1. Shorten it.",
             f"{SUBJECT} is 3.00 seconds long and the minimum is 5. Use a longer clip.",
         ]
 
     def test_uses_a_given_fix_for_audio_that_is_too_long(self) -> None:
         media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
-        assert _messages([Duration(max=1, fix="Pick a shorter take.")], media) == [
+        assert _messages([MaxDuration(1, fix="Pick a shorter take.")], media) == [
             f"{SUBJECT} is 3.00 seconds long and the limit is 1. Pick a shorter take."
         ]
 

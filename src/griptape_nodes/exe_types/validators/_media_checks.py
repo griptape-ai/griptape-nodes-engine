@@ -278,42 +278,48 @@ def check_audio_codec(
     return _codec_error(codec, subject=subject, allowed=allowed, docs_url=docs_url)
 
 
-def check_duration(  # noqa: PLR0913
-    seconds: float | None,
-    *,
-    subject: str,
-    minimum: float | None = None,
-    maximum: float | None = None,
-    fix: str | None = None,
-    docs_url: str | None = None,
+def check_min_duration(
+    seconds: float | None, *, subject: str, minimum: float, fix: str | None = None, docs_url: str | None = None
 ) -> NodeError | None:
-    """An error when an audio or video input is shorter or longer than the provider accepts.
+    """An error when an audio or video input is shorter than the provider accepts.
 
     Args:
         seconds: The input's duration. For a video, pass a `local_video_probe` result's
-            `shortest_seconds` for a maximum or `longest_seconds` for a minimum, the readings
-            the `Duration` validator uses. None skips the check.
+            `longest_seconds`, the reading `MinDuration` uses. None skips the check.
         subject: The input, from `input_subject`.
         minimum: The shortest input accepted, in seconds.
-        maximum: The longest input accepted, in seconds.
-        fix: What the artist can do about it. Defaults to shortening it or using a longer clip.
+        fix: What the artist can do about it. Defaults to "Use a longer clip."
         docs_url: The provider's page documenting the limit.
     """
-    if seconds is None:
+    if seconds is None or seconds >= minimum:
         return None
-    if maximum is not None and seconds > maximum:
-        next_step = fix or "Shorten it."
-        return limit_error(
-            f"{subject} is {_format_past(seconds, maximum, 2)} seconds long and the limit is {_format_limit(maximum)}. {next_step}",
-            docs_url,
-        )
-    if minimum is not None and seconds < minimum:
-        next_step = fix or "Use a longer clip."
-        return limit_error(
-            f"{subject} is {_format_past(seconds, minimum, 2)} seconds long and the minimum is {_format_limit(minimum, round_up=True)}. {next_step}",
-            docs_url,
-        )
-    return None
+    return limit_error(
+        f"{subject} is {_format_past(seconds, minimum, 2)} seconds long and the minimum is "
+        f"{_format_limit(minimum, round_up=True)}. {fix or 'Use a longer clip.'}",
+        docs_url,
+    )
+
+
+def check_max_duration(
+    seconds: float | None, *, subject: str, maximum: float, fix: str | None = None, docs_url: str | None = None
+) -> NodeError | None:
+    """An error when an audio or video input is longer than the provider accepts.
+
+    Args:
+        seconds: The input's duration. For a video, pass a `local_video_probe` result's
+            `shortest_seconds`, the reading `MaxDuration` uses. None skips the check.
+        subject: The input, from `input_subject`.
+        maximum: The longest input accepted, in seconds.
+        fix: What the artist can do about it. Defaults to "Shorten it."
+        docs_url: The provider's page documenting the limit.
+    """
+    if seconds is None or seconds <= maximum:
+        return None
+    return limit_error(
+        f"{subject} is {_format_past(seconds, maximum, 2)} seconds long and the limit is "
+        f"{_format_limit(maximum)}. {fix or 'Shorten it.'}",
+        docs_url,
+    )
 
 
 def check_frame_rate(  # noqa: PLR0913

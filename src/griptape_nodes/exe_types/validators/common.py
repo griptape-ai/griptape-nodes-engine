@@ -43,7 +43,7 @@ class IfParameter(PreRunValidator):
     At the node's turn, the validators listed for the other parameter's current value apply, or
     `default` for a value not listed. A list can hold another `IfParameter`, for limits that depend
     on two settings; it picks in turn. This is how a limit depends on a setting; a limit that
-    depends on the file itself uses `PreRunValidator.when` or `unless`.
+    depends on the file itself uses `MediaValidator.when` or `unless`.
 
     ```python
     IfParameter(

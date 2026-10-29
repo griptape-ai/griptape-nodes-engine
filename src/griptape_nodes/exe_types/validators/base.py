@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, override
 
-from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed
+from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -101,6 +101,9 @@ class PreRunValidator(ABC):
     def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         """An error when `value` breaks this limit, or None when it is within it.
 
+        An input with no value is skipped before any validator runs, so `value` is never None; check
+        that a required input is set in the node's `validate_before_node_run`.
+
         Args:
             value: The parameter's value; for a list, one item, or the whole list with `checks_whole_list`.
             subject: The start of the message naming the input, such as "Image 2 in 'reference images'".
@@ -159,8 +162,16 @@ class MediaValidator(PreRunValidator):
 
     @override
     def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
-        """`check_media` with nothing read, so every reading is skipped: the engine reads the file first."""
-        return self.check_media(value, EMPTY_MEDIA, subject=subject, docs_url=docs_url, position=position)
+        """Refuse to judge a file without reading it: call `check_media` with what was read.
+
+        Raises:
+            TypeError: Always. Without readings every media check would pass.
+        """
+        msg = (
+            f"Attempted to check {type(self).__name__} without reading the file. "
+            "Failed because a media validator judges what was read from it; call check_media with a MediaInfo."
+        )
+        raise TypeError(msg)
 
     def when(self, condition: Condition) -> MediaValidator:
         """This validator, applied only to a value whose file `condition` holds for."""
