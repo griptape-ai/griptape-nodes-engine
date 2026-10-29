@@ -22,6 +22,11 @@ When developing, follow this iteration loop:
 1. **Fix issues**: resolve all issues from previous step
 1. **Continue working**: continue to the next change
 
+## Reviewing
+
+When reviewing a PR, follow `REVIEW.md`. It sets what blocks a merge, what to skip, and how to
+format comments.
+
 ## Code Style Preferences
 
 **Avoid Tuples For Return Values** - Tuples should be a last resort. When unavoidable, use NamedTuples for clarity. Prefer separate variables, class instances, or other data structures.
