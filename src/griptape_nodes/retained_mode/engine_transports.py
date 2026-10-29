@@ -50,17 +50,6 @@ class EngineTransports(Protocol):
         """
         ...
 
-    def route_worker(self, worker_engine_id: str, host_engine_id: str) -> None:
-        """Carry this engine's traffic for the worker `worker_engine_id` over the transport to `host_engine_id`.
-
-        `host_engine_id` is the engine that runs that worker.
-        """
-        ...
-
-    def forget_worker(self, worker_engine_id: str) -> None:
-        """Stop carrying traffic for that worker; forgetting a worker that isn't routed does nothing."""
-        ...
-
     def on_engine_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
         """Call `callback` with an engine's ID once the connection to it is lost.
 

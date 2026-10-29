@@ -597,22 +597,12 @@ class Engine:
             raise EngineNotFoundError(msg)
         return self._engine_transports.hosted_worker_environment(engine_id)
 
-    def route_worker(self, worker_engine_id: str, host_engine_id: str) -> None:
-        """Tell the app which engine runs the worker `worker_engine_id`, so it knows where to carry its traffic.
+    def worker_host(self, worker_engine_id: str) -> str | None:
+        """The engine that runs the worker `worker_engine_id` for this one, or None for a local or unknown worker.
 
-        Raises:
-            EngineNotFoundError: This engine has no way to reach other engines.
+        The transports ask this to carry a worker's traffic to the engine that runs it.
         """
-        if self._engine_transports is None:
-            msg = f"Attempted to route worker {worker_engine_id} to engine {host_engine_id}. Failed because this engine has no connections to other engines."
-            raise EngineNotFoundError(msg)
-        self._engine_transports.route_worker(worker_engine_id, host_engine_id)
-
-    def forget_worker(self, worker_engine_id: str) -> None:
-        """Tell the app to stop carrying traffic for the worker `worker_engine_id`. Does nothing if none is attached."""
-        if self._engine_transports is None:
-            return
-        self._engine_transports.forget_worker(worker_engine_id)
+        return self._worker_manager.worker_host(worker_engine_id)
 
     def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.

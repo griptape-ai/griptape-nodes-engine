@@ -446,7 +446,6 @@ class WorkerManager(EngineScoped):
         wid = request.worker_engine_id
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
-        self._forget_if_remote(wid, registration)
         worker_key = registration.worker_key if registration else None
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.unsubscribe_from_topic(response_topic)
@@ -804,8 +803,6 @@ class WorkerManager(EngineScoped):
                 except Exception as e:
                     logger.debug("Failed to unsubscribe from '%s' while stopping workers: %s", response_topic, e)
         self._forget_remote_starts(library_names=library_names)
-        for wid in worker_ids:
-            self._forget_if_remote(wid, self._workers.get(wid))
         if library_names is None:
             self._managed_worker_processes.clear()
             self._workers.clear()
@@ -837,12 +834,6 @@ class WorkerManager(EngineScoped):
         for wid, start in list(self._remote_starts.items()):
             if library_names is None or start.library_name in library_names:
                 del self._remote_starts[wid]
-                self.engine.forget_worker(wid)
-
-    def _forget_if_remote(self, worker_engine_id: str, registration: WorkerRegistration | None) -> None:
-        """Tell the app to stop carrying a removed worker's traffic, if `registration` shows it ran on another engine."""
-        if registration is not None and registration.host_engine_id is not None:
-            self.engine.forget_worker(worker_engine_id)
 
     def _withdraw_spawn_requests(self, *, library_names: set[str | None] | None, action: str) -> None:
         """Forget the named libraries' spawn requests (every library's when None), so a later one is honored.
@@ -1229,9 +1220,6 @@ class WorkerManager(EngineScoped):
             return None
         worker_engine_id = str(uuid.uuid4())
         self._remote_starts[worker_engine_id] = _RemoteStart(host_engine_id=host_engine_id, library_name=library_name)
-        # The worker can register before this start's answer arrives, so the app has to know where to
-        # carry its traffic before the request below is even sent.
-        self.engine.route_worker(worker_engine_id, host_engine_id)
         logger.info("Asking %s to start worker %s for library '%s'.", host_engine_id, worker_engine_id, library_name)
         request = worker_events.StartWorkerForEngineRequest(
             library_name=library_name, worker_engine_id=worker_engine_id
@@ -1250,13 +1238,11 @@ class WorkerManager(EngineScoped):
             raise
         if not isinstance(result, worker_events.StartWorkerForEngineResultSuccess):
             self._remote_starts.pop(worker_engine_id, None)
-            self.engine.forget_worker(worker_engine_id)
         return result
 
     def _schedule_remote_stop(self, worker_engine_id: str, host_engine_id: str) -> None:
         """Forget a start withdrawn while `host_engine_id` was answering it, and tell that engine to stop that worker."""
         self._remote_starts.pop(worker_engine_id, None)
-        self.engine.forget_worker(worker_engine_id)
         task = asyncio.get_running_loop().create_task(self._stop_remote_worker(worker_engine_id, host_engine_id))
         self._stop_requests.add(task)
         task.add_done_callback(self._stop_requests.discard)
@@ -1369,7 +1355,7 @@ class WorkerManager(EngineScoped):
     @handles(
         worker_events.ReportWorkerExitedRequest,
         sender=RequiredSender.ENGINE,
-        owner=lambda manager, request, _sender: manager._engine_running(request.worker_engine_id),
+        owner=lambda manager, request, _sender: manager.worker_host(request.worker_engine_id),
     )
     async def handle_report_worker_exited_request(
         self, request: worker_events.ReportWorkerExitedRequest
@@ -1396,7 +1382,6 @@ class WorkerManager(EngineScoped):
                 result_details=f"This engine was not waiting on worker {wid}, so there was nothing to record."
             )
         self._remote_starts.pop(wid, None)
-        self.engine.forget_worker(wid)
         registered = start is None
         if request.reason == "stopped":
             reason = f"{host_engine_id} stopped the worker process that runs it."
@@ -1639,16 +1624,6 @@ class WorkerManager(EngineScoped):
             return None
         return hosted.engine_id
 
-    def _engine_running(self, worker_engine_id: str) -> str | None:
-        """The engine that runs a worker this engine asked for, or None if it asked for no such worker."""
-        start = self._remote_starts.get(worker_engine_id)
-        if start is not None:
-            return start.host_engine_id
-        registration = self._workers.get(worker_engine_id)
-        if registration is None:
-            return None
-        return registration.host_engine_id
-
     async def _stop_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker this engine runs for another engine. Its exit watcher reports it stopped.
 
@@ -1673,7 +1648,6 @@ class WorkerManager(EngineScoped):
             if start.host_engine_id != engine_id:
                 continue
             del self._remote_starts[wid]
-            self.engine.forget_worker(wid)
             self.note_worker_unavailable(
                 start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
             )
@@ -1841,6 +1815,20 @@ class WorkerManager(EngineScoped):
     def worker_unavailable_reason(self, library_name: str | None) -> str | None:
         """Why no worker is available to run `library_name`, or None if that is not the problem."""
         return self._worker_unavailable.get(library_name)
+
+    def worker_host(self, worker_engine_id: str) -> str | None:
+        """The engine that runs a worker this engine asked another engine for, or None for any other worker.
+
+        Known from the moment the start is recorded, before it is sent, so traffic for a worker that registers
+        before the start's answer arrives can already be carried to its engine.
+        """
+        start = self._remote_starts.get(worker_engine_id)
+        if start is not None:
+            return start.host_engine_id
+        registration = self._workers.get(worker_engine_id)
+        if registration is None:
+            return None
+        return registration.host_engine_id
 
     def has_settled(self, library_name: str | None) -> bool:
         """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending.
