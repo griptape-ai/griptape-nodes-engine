@@ -452,7 +452,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                          sees in their config. None for libraries registered through other
                          channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
+                    Also None when the request set `include_git_info` to False.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+                 Also None when the request set `include_git_info` to False.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
         is_registered: Whether a library of this name is in the LibraryRegistry right now.
                        Metadata is derived from config while the registry holds what actually
@@ -535,7 +537,14 @@ class LoadMetadataForAllLibrariesRequest(RequestPayload):
 
     Provides a lightweight way to discover all available libraries and their schemas
     without the overhead of importing Python modules or registering them in the system.
+
+    Args:
+        include_git_info: Whether to look up each library's `git_remote` and `git_ref`. The lookup
+                          costs several git subprocesses per library, so callers that only need
+                          the schemas should pass False; both fields are then None.
     """
+
+    include_git_info: bool = True
 
 
 @dataclass

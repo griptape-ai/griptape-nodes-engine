@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
     ProgressEvent,
     RequestPayload,
+    RequestSender,
     ResultDetail,
     ResultDetails,
     ResultPayload,
@@ -45,8 +46,11 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     EventManager,
     EventTranslationContext,
     ResultContext,
+    current_request_sender,
     current_request_type,
+    require_request_sender,
 )
+from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 
 
 class TestEventsWhileRebuildingACopy:
@@ -1778,6 +1782,112 @@ class TestPostDispatchHookContextIsolation:
 
         assert seen_request_types == [None]
         assert scope.violations == []
+
+
+class TestTheRequestSender:
+    """A handler reads which engine, and which of its sessions, sent the request from its envelope."""
+
+    @staticmethod
+    def _manager_recording_senders(
+        seen: list[RequestSender | None], sender: RequiredSender | None = RequiredSender.ENGINE
+    ) -> EventManager:
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            seen.append(current_request_sender())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=sender)
+        return event_manager
+
+    @pytest.mark.asyncio
+    async def test_another_engine_may_send_only_requests_whose_handler_admits_it(self) -> None:
+        handled: list[_ProbeRequest] = []
+        event_manager = EventManager()
+
+        async def handler(request: _ProbeRequest) -> _ProbeResult:
+            handled.append(request)
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        refused = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist")}
+        )
+        local = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert not refused.succeeded()
+        assert local.succeeded()
+        assert len(handled) == 1
+
+    @pytest.mark.parametrize(("sender", "runs"), [("artist", True), ("impostor", False)])
+    @pytest.mark.asyncio
+    async def test_a_request_naming_what_another_engine_owns_runs_only_for_that_engine(
+        self, sender: str, *, runs: bool
+    ) -> None:
+        class _Owner:
+            @handles(_ProbeRequest, sender=RequiredSender.ENGINE, owner=lambda _manager, _request, _sender: "artist")
+            async def handle(self, _request: _ProbeRequest) -> _ProbeResult:
+                return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.register_request_handlers(_Owner())
+
+        result = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id=sender)}
+        )
+
+        assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_request_another_engine_sent_names_its_engine_and_session(self) -> None:
+        seen: list[RequestSender | None] = []
+        event_manager = self._manager_recording_senders(seen)
+
+        await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist", session_id="s1")}
+        )
+
+        assert seen == [RequestSender(engine_id="artist", session_id="s1")]
+        assert current_request_sender() is None
+
+    @pytest.mark.parametrize(
+        ("required", "context", "runs"),
+        [
+            (RequiredSender.ENGINE, {}, False),
+            (RequiredSender.ENGINE, {"sender": RequestSender(engine_id="artist")}, True),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist")}, False),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_handler_marked_with_a_sender_runs_only_for_requests_from_it(
+        self, required: RequiredSender, context: ResultContext, *, runs: bool
+    ) -> None:
+        handled: list[RequestSender] = []
+
+        class _Owner:
+            @handles(_ProbeRequest, sender=required)
+            async def handle(self, _request: _ProbeRequest) -> _ProbeResult:
+                handled.append(require_request_sender())
+                return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.register_request_handlers(_Owner())
+
+        result = await event_manager.ahandle_request(_ProbeRequest(), result_context=context)
+
+        assert bool(handled) == runs
+        assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_request_no_engine_sent_has_no_sender(self) -> None:
+        seen: list[RequestSender | None] = []
+        event_manager = self._manager_recording_senders(seen, sender=None)
+
+        await event_manager.ahandle_request(_ProbeRequest(), result_context=ResultContext(request_id="r1"))
+
+        assert seen == [None]
 
 
 class TestAuthorizationCheckpointHooks:

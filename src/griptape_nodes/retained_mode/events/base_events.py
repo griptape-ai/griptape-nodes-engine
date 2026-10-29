@@ -8,6 +8,14 @@ from typing import Any, NoReturn, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 
+@dataclass(frozen=True)
+class RequestSender:
+    """The engine, and its session, that sent a request, when another engine sent it."""
+
+    engine_id: str
+    session_id: str | None = None
+
+
 @dataclass
 class ResultDetail:
     """A single detail about an operation result, including logging level and human readable message."""
@@ -316,6 +324,9 @@ class EventRequest[P: Payload](BaseEvent):
     request: P
     request_id: str | None = None
     response_topic: str | None = None
+    # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
+    # `require_request_sender()`.
+    sender: RequestSender | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
