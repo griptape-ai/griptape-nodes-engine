@@ -1437,6 +1437,35 @@ class TestRunRequests:
         await asyncio.wait_for(asyncio.gather(running, *waiting), timeout=1.0)
 
     @pytest.mark.asyncio
+    async def test_a_run_waiting_for_another_engine_is_listed_as_a_run_waiting_here_would_be(
+        self, engine: Engine
+    ) -> None:
+        """Its place is the one that engine last reported, until it stops waiting."""
+        flow_manager = engine.flow_manager
+        may_end = asyncio.Event()
+
+        async def waits_there() -> Any:
+            await may_end.wait()
+            return _ran("first")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", waits_there)))
+        await asyncio.sleep(0)
+        run = flow_manager._run_in_progress
+        assert run is not None
+
+        flow_manager.report_run_waiting_for_engine(run.run_id, 2)
+        waiting = flow_manager.on_list_runs_request(ListRunsRequest())
+        flow_manager.report_run_waiting_for_engine(run.run_id, 0)
+        admitted = flow_manager.on_list_runs_request(ListRunsRequest())
+
+        assert isinstance(waiting, ListRunsResultSuccess)
+        assert isinstance(admitted, ListRunsResultSuccess)
+        assert [(r.state, r.position) for r in waiting.runs] == [("queued", 2)]
+        assert [(r.state, r.position) for r in admitted.runs] == [("running", 0)]
+        may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_cancelling_a_waiting_run_by_request_withdraws_it(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
         first_may_end = asyncio.Event()

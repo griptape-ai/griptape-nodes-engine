@@ -3330,12 +3330,14 @@ class FlowManager(EngineScoped):
         runs: list[RunInfo] = []
         in_progress = self._run_in_progress
         if in_progress is not None:
+            # Waiting for another engine, which reported its place in that engine's line.
+            state = RunState.QUEUED if in_progress.position else in_progress.state
             runs.append(
                 RunInfo(
                     run_id=in_progress.run_id,
                     flow_name=in_progress.flow_name,
-                    state=in_progress.state,
-                    position=0,
+                    state=state,
+                    position=in_progress.position,
                     request_id=in_progress.request_id,
                 )
             )
@@ -4920,12 +4922,13 @@ class FlowManager(EngineScoped):
     def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
         """Report that the run in progress waits at `position` for another engine, or no longer waits at 0.
 
-        Its node there waits while another run has that engine, so it is reported as a run waiting here
-        would be.
+        Its node there waits while another run has that engine, so it is reported, and listed, as a run
+        waiting here would be.
         """
         run = self._run_in_progress
-        if run is None or run.run_id != run_id:
+        if run is None or run.run_id != run_id or run.position == position:
             return
+        run.position = position
         self._put_run_queued_event(run, position)
 
     def _turn_away(self, runs: list[Run], reason: str) -> None:

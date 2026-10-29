@@ -3966,6 +3966,37 @@ class TestAskingAnotherEngineToAdmitANode:
         await admitting
 
     @pytest.mark.asyncio
+    async def test_a_run_stops_waiting_when_its_admission_is_answered_even_without_a_last_report(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Otherwise a lost last report would leave the run listed as waiting while its node runs."""
+        links = _host_engine(worker_manager)
+        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        report = worker_manager.engine.flow_manager.report_run_waiting_for_engine
+        with patch("griptape_nodes.retained_mode.managers.worker_manager.current_run_id", return_value="run-1"):
+            admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+            await _settle()
+        (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
+        admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
+        await _dispatched_by(
+            worker_manager,
+            _FROM_HOST_ENGINE,
+            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=2),
+        )
+
+        links.blocked["AdmitNodeRequest"].set()
+        await admitting
+        await _settle()
+        late = await _dispatched_by(
+            worker_manager,
+            _FROM_HOST_ENGINE,
+            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=1),
+        )
+
+        assert isinstance(late, EventResultSuccess)
+        assert [c.args for c in report.call_args_list] == [("run-1", 2), ("run-1", 0)]  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_a_library_that_runs_here_needs_no_admission(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
 

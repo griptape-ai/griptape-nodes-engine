@@ -1003,6 +1003,8 @@ class WorkerManager(EngineScoped):
             admission_id=admission.admission_id, run_id=admission.run_id, node_name=node_name
         )
         admission.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
+        # However the admission is answered, the run no longer waits, even if that engine's last report was lost.
+        admission.request_task.add_done_callback(lambda _task: self._stop_reporting_wait(admission))
         try:
             result = await admission.request_task
         except EngineNotFoundError as e:
@@ -1025,6 +1027,10 @@ class WorkerManager(EngineScoped):
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
             raise RuntimeError(msg)
         return admission
+
+    def _stop_reporting_wait(self, admission: EngineAdmission) -> None:
+        if admission.run_id is not None:
+            self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, 0)
 
     def _give_up_on_engine_if_silent(self, host_engine_id: str) -> None:
         """Give up the nodes waiting for `host_engine_id` to admit them once none of its workers answers.
@@ -1909,7 +1915,9 @@ class WorkerManager(EngineScoped):
     ) -> worker_events.ReportPlaceInLineResultSuccess:
         """Report the place in line of a run here whose node waits on another engine, as if it waited here."""
         admission = self._admissions.get(request.admission_id)
-        if admission is None or admission.run_id is None:
+        # A report that arrives after the admission was answered is out of date.
+        waiting = admission is not None and admission.request_task is not None and not admission.request_task.done()
+        if admission is None or admission.run_id is None or not waiting:
             return worker_events.ReportPlaceInLineResultSuccess(
                 result_details="No run here waits on that admission, so there was nothing to report."
             )
