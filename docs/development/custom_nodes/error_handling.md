@@ -480,7 +480,7 @@ ParameterImage(
 length across several clips, check it in the node's `validate_before_node_run`. The engine runs it
 right after the declared validators, in the same pass, so a reader from
 `griptape_nodes.exe_types.input_checks` called there returns what the validators already read, and
-no file is read twice. A video it reads itself counts toward the same 5-second limit on probing.
+no file is read twice.
 
 ```python
 from griptape_nodes.exe_types.input_checks import local_video_probe
@@ -537,22 +537,18 @@ The checks follow these rules:
 
 - **Skip what can't be read locally, don't fail it.** A remote URL, a format Pillow can't open, an
     image over Pillow's decompression-bomb limit (about 179 megapixels), a video or audio input when
-    ffprobe isn't installed, or a probe that runs out of time (see "No network calls, and a cap on blocking"
-    below) is left for the provider to judge. A validator refuses only an input it has read and
-    found outside the limit. When a probe runs out of time, the engine logs a warning, and if the
-    node passes its other checks it runs and the engine sends a `NodeInputsNotCheckedEvent` naming
-    the node and each input it couldn't check. A node that fails a check gets only that error.
+    ffprobe isn't installed, or a probe that runs out of time (see "No network calls" below) is left
+    for the provider to judge. A validator refuses only an input it has read and found outside the
+    limit. A probe that runs out of time is also logged as a warning naming the file.
 - **Declare the provider's limits and a docs link.** The validators know nothing about any provider.
     Your node declares the limits the provider documents, only on the inputs its request sends, and
     `input_limits_url()` returns the page that documents them, so the user can see the rule.
-- **No network calls, and a cap on blocking.** The checks run before every run, on the engine's
-    event loop. They never download an input or a tool: they measure files on this machine and data
-    URIs, and use ffprobe only when it is already installed. Each input is read once per run, however
-    many validators it has. A local probe takes tens of milliseconds. Each one is given at most 2
-    seconds, and no probe starts more than 5 seconds after the node's checks began, so its video and
-    audio probes together block for at most that long; an input left when the time runs out is
-    skipped. The 5 seconds count `validate_before_node_run` too, and apply per node: when the engine
-    starts several nodes at once, each can block for that long. An image given as a file path costs
+- **No network calls.** The checks run before every run, in a worker thread, so a slow one holds up
+    only its own node, not the editor or other flows. They never download an input or a tool: they
+    measure files on this machine and data URIs, and use ffprobe only when it is already installed.
+    Each input is read once per run, however many validators it has. A local probe takes tens of
+    milliseconds; one that takes more than 10 seconds, such as a file on a stalled network drive, is
+    abandoned and its checks skipped. An image given as a file path costs
     only a header read, except a WebP or AVIF file, which Pillow reads in full without decoding its
     pixels. One given as a data URI or an in-memory artifact is decoded in full, so its check takes
     longer the larger it is; pass file paths where you can.

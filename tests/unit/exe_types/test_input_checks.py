@@ -24,7 +24,6 @@ from griptape_nodes.exe_types.input_checks import (
     AudioProbe,
     ImageInfo,
     VideoProbe,
-    input_check_budget,
     input_check_readings,
     input_subject,
     local_audio_probe,
@@ -329,56 +328,6 @@ class TestLocalVideoDuration:
         _probed_seconds(str(clip))
         assert ffprobe_runs[0]["encoding"] == "utf-8"
 
-    def test_gives_each_probe_the_probe_timeout_outside_a_budget(
-        self, clip: Path, ffprobe_runs: list[dict[str, Any]]
-    ) -> None:
-        _probed_seconds(str(clip))
-        assert ffprobe_runs[0]["timeout"] == input_checks.FFPROBE_TIMEOUT_SECONDS
-
-    def test_gives_a_probe_only_what_is_left_of_the_budget(
-        self, clip: Path, ffprobe_runs: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        now = [100.0]
-        monkeypatch.setattr(input_checks.time, "monotonic", lambda: now[0])
-        with input_check_budget(seconds=3):
-            _probed_seconds(str(clip))
-            now[0] += 2.5
-            _probed_seconds(str(clip))
-        assert [run["timeout"] for run in ffprobe_runs] == [input_checks.FFPROBE_TIMEOUT_SECONDS, 0.5]
-
-    def test_skips_a_probe_once_the_budget_is_spent(
-        self, clip: Path, ffprobe_runs: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        now = [100.0]
-        monkeypatch.setattr(input_checks.time, "monotonic", lambda: now[0])
-        with input_check_budget(seconds=3):
-            now[0] += 3
-            assert _probed_seconds(str(clip)) is None
-        assert ffprobe_runs == []
-
-    def test_lets_a_nested_budget_shorten_but_not_extend_the_outer_one(
-        self, clip: Path, ffprobe_runs: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        now = [100.0]
-        monkeypatch.setattr(input_checks.time, "monotonic", lambda: now[0])
-        with input_check_budget(seconds=3):
-            with input_check_budget(seconds=60):
-                now[0] += 2.5
-                _probed_seconds(str(clip))
-            with input_check_budget(seconds=0.2):
-                _probed_seconds(str(clip))
-        assert [run["timeout"] for run in ffprobe_runs] == [0.5, pytest.approx(0.2)]
-
-    def test_ends_the_budget_with_its_block(
-        self, clip: Path, ffprobe_runs: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        now = [100.0]
-        monkeypatch.setattr(input_checks.time, "monotonic", lambda: now[0])
-        with input_check_budget(seconds=1):
-            now[0] += 5
-        assert _probed_seconds(str(clip)) == 9.5
-        assert ffprobe_runs[0]["timeout"] == input_checks.FFPROBE_TIMEOUT_SECONDS
-
     def test_skips_when_ffprobe_times_out(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         def slow_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
@@ -431,7 +380,7 @@ class TestLocalVideoDuration:
 
 
 class TestProbeTimeouts:
-    """A probe that runs out of time is noted, so the engine can say the input wasn't checked."""
+    """A probe that runs out of time is skipped and logged, like any input that can't be read here."""
 
     @pytest.fixture
     def clip(self, tmp_path: Path) -> Path:
@@ -448,84 +397,15 @@ class TestProbeTimeouts:
         monkeypatch.setattr(input_checks.subprocess, "run", slow_run)
 
     @pytest.mark.usefixtures("slow_ffprobe")
-    def test_notes_a_probe_that_times_out(self, clip: Path, caplog: pytest.LogCaptureFixture) -> None:
+    def test_skips_and_logs_a_probe_that_times_out(self, clip: Path, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"), input_check_readings():
             info = read_media(str(clip), {MediaNeed.VIDEO}, kind="video")
         assert info.video is None
-        assert info.timed_out
         assert any(
-            "ffprobe took longer than 2 seconds" in record.getMessage() and str(clip) in record.getMessage()
+            f"ffprobe took longer than {input_checks.FFPROBE_TIMEOUT_SECONDS:g} seconds" in record.getMessage()
+            and str(clip) in record.getMessage()
             for record in caplog.records
         )
-
-    def test_notes_a_probe_the_budget_leaves_no_time_for(
-        self, clip: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        now = [100.0]
-        monkeypatch.setattr(input_checks.time, "monotonic", lambda: now[0])
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: pytest.fail("ffprobe must not run"))
-        with (
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-            input_check_budget(seconds=3),
-            input_check_readings(),
-        ):
-            now[0] += 3
-            info = read_media(str(clip), {MediaNeed.AUDIO}, kind="audio")
-        assert info.timed_out
-        assert any("had already used their time" in record.getMessage() for record in caplog.records)
-
-    @pytest.mark.usefixtures("slow_ffprobe")
-    def test_notes_only_the_input_that_timed_out(self, clip: Path, tmp_path: Path) -> None:
-        other = tmp_path / "other.mp4"
-        other.write_bytes(b"video")
-        with input_check_readings():
-            read_media(str(clip), {MediaNeed.VIDEO}, kind="video")
-            assert not read_media(str(other), {MediaNeed.SIZE}, kind="video").timed_out
-            # Read again from the block's readings, it still says the probe timed out.
-            assert read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
-
-    def test_does_not_mark_the_audio_when_only_the_same_files_video_timed_out(
-        self, clip: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
-            if "v:0" in cmd:
-                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-            return SimpleNamespace(
-                stdout=json.dumps(
-                    {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac", "duration": "1.0"}]}
-                )
-            )
-
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", run)
-        with input_check_readings():
-            assert read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
-            audio = read_media(str(clip), {MediaNeed.AUDIO}, kind="audio")
-        assert audio.audio is not None
-        assert audio.timed_out is False
-
-    @pytest.mark.usefixtures("slow_ffprobe")
-    def test_forgets_timeouts_when_the_block_ends(self, clip: Path) -> None:
-        with input_check_readings():
-            read_media(str(clip), {MediaNeed.VIDEO}, kind="video")
-        with input_check_readings():
-            assert read_media(str(clip), {MediaNeed.SIZE}, kind="video").timed_out is False
-        assert read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out is False
-
-    def test_does_not_note_a_probe_that_fails(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        def failing_run(cmd: list[str], **_kwargs: Any) -> None:
-            raise subprocess.CalledProcessError(1, cmd, stderr="Invalid data found")
-
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", failing_run)
-        with input_check_readings():
-            assert not read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
-
-    def test_does_not_note_a_missing_ffprobe(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: None)
-        with input_check_readings():
-            assert not read_media(str(clip), {MediaNeed.VIDEO}, kind="video").timed_out
 
 
 class TestLocalVideoProbe:

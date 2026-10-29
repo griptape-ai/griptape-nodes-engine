@@ -14,9 +14,8 @@ runs. This module reads what they check, and a custom validator or a node's own
   installed. They return None when the value is a remote URL, can't be found or parsed, or when the
   tool to read it is missing or too slow. Inside `input_check_readings`, which the engine opens
   around each node's checks, each reader reads a location once and returns the same result after.
-  A probe that runs out of time is logged as a warning and noted, so the engine can tell the user
-  that input wasn't checked, whether a declared validator or the node's own check asked for it;
-  `timed_out_locations` lists them.
+  A probe that runs out of time is logged as a warning and skipped, like any other input that
+  can't be read here.
 - **`read_media`** takes the readings a set of validators needs from one value, in one call.
 
 The validators in `griptape_nodes.exe_types.validators` compare these readings with a provider's
@@ -35,7 +34,6 @@ import math
 import shutil
 import subprocess
 import sys
-import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from io import BytesIO
@@ -45,7 +43,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from PIL import Image, UnidentifiedImageError
 from static_ffmpeg import run as static_ffmpeg_run
 
-from griptape_nodes.exe_types.input_check_budget import input_check_budget, probe_deadline
 from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed
 from griptape_nodes.files.file import File, FileLoadError
 from griptape_nodes.files.path_utils import is_url
@@ -60,7 +57,6 @@ __all__ = [
     "AudioProbe",
     "ImageInfo",
     "VideoProbe",
-    "input_check_budget",
     "input_check_readings",
     "input_subject",
     "local_audio_probe",
@@ -69,14 +65,14 @@ __all__ = [
     "local_size_bytes",
     "local_video_probe",
     "read_media",
-    "timed_out_locations",
 ]
 
 
-# Validation runs on the engine's event loop, so every probe blocks it. A local probe takes tens of
-# milliseconds; one that takes longer than this is abandoned and the checks that need it (container,
-# codec, frame size, duration, frame rate) are skipped.
-FFPROBE_TIMEOUT_SECONDS = 2
+# A local probe takes tens of milliseconds. Validation runs in a worker thread, so a slow probe holds
+# up only its own node; this only stops a hung ffprobe (a stalled network drive, a damaged file). A
+# probe that takes longer is abandoned and the checks that need it (container, codec, frame size,
+# duration, frame rate) are skipped.
+FFPROBE_TIMEOUT_SECONDS = 10
 
 # An ISO media file (MP4, MOV, HEIC, AVIF) opens with an `ftyp` box: a 4-byte size, "ftyp", then
 # the 4-byte major brand.
@@ -95,11 +91,6 @@ _HALF_TURN_DEGREES = 180
 # What the readers have read in the current `input_check_readings` block, by reader and location, or
 # None outside one. A reading that came back None is kept too, so an unreadable input isn't retried.
 _readings: ContextVar[dict[tuple[MediaNeed, str], Any] | None] = ContextVar("input_check_readings", default=None)
-
-# The probes that ran out of time in the current `input_check_readings` block, by the reading they
-# were for and location, or None outside one. A file's video and audio are probed separately, and
-# only one of them may time out.
-_timed_out: ContextVar[set[tuple[MediaNeed, str]] | None] = ContextVar("input_check_timed_out", default=None)
 
 
 class ImageInfo(NamedTuple):
@@ -130,32 +121,16 @@ def input_check_readings() -> Iterator[None]:
     The engine opens one around each node's pre-run checks, so the validators on a parameter and
     the node's own `validate_before_node_run` share one read of each input. What
     was read is dropped when the block ends, so nothing carries over to the next run or another node.
-    It also notes which locations' probes ran out of time, for `MediaInfo.timed_out`.
     Opened inside another one, it shares the outer block's readings.
     """
     if _readings.get() is not None:
         yield
         return
     token = _readings.set({})
-    timed_out_token = _timed_out.set(set())
     try:
         yield
     finally:
-        _timed_out.reset(timed_out_token)
         _readings.reset(token)
-
-
-# The readings that run ffprobe, and so can run out of time.
-_PROBE_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
-
-
-def timed_out_locations() -> frozenset[str]:
-    """Every location whose video or audio probe ran out of time in the current `input_check_readings` block.
-
-    Includes probes a node's own checks ran by calling the readers directly, not only those its
-    declared validators asked for. Empty outside a block.
-    """
-    return frozenset(location for _need, location in _timed_out.get() or ())
 
 
 def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> MediaInfo:
@@ -166,10 +141,6 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
     `local_audio_probe` for `AUDIO`. A reading not asked for, or that couldn't be taken, is None.
     An image Pillow can't open, such as a HEIC photo, still has its format read from its file
     signature where that names one, so a format check can judge it while the size checks skip.
-    Inside `input_check_readings`, `timed_out` says whether a video or audio reading this call asked
-    for was skipped because its probe ran out of time, in this call or an earlier one in the block. A
-    reading it didn't ask for doesn't count, so an audio input isn't marked because the same file's
-    video probe timed out, and a call that asked only for size or an image isn't marked at all.
 
     Args:
         value: The media input: an artifact, a path, a URL or a data URI.
@@ -200,8 +171,6 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
         image_format=image_format,
         video=video,
         audio=audio,
-        location=location,
-        timed_out=any((need, location) in (_timed_out.get() or ()) for need in _PROBE_NEEDS.intersection(needs)),
     )
 
 
@@ -449,8 +418,7 @@ def local_video_probe(value: Any) -> VideoProbe | None:
     """A video input's container, codec, frame size, duration and frame rate, or None if unreadable here.
 
     One ffprobe run reads them all, so a node checking several on the same clip waits on at most
-    one `FFPROBE_TIMEOUT_SECONDS`, and the values come from the same read of the file. Inside an
-    `input_check_budget`, the probe also stops when the budget does.
+    one `FFPROBE_TIMEOUT_SECONDS`, and the values come from the same read of the file.
     Probes only a file on this machine, with an ffprobe that is already installed; see
     `_run_ffprobe`.
     """
@@ -565,10 +533,8 @@ def _run_ffprobe(value: Any, args: list[str], *, kind: MediaKind) -> dict[str, A
 
     Only a file on this machine is probed: a remote URL would make ffprobe download it, and a data
     URI is too large to pass on its command line. ffprobe is used only if it is already installed
-    (see `_installed_ffprobe`), never fetched, and is given `FFPROBE_TIMEOUT_SECONDS` to answer, or
-    what's left of the current `input_check_budget` if that's less. A probe that runs out of time, or
-    that the budget leaves no time to start, is logged as a warning and noted in the current
-    `input_check_readings` block.
+    (see `_installed_ffprobe`), never fetched, and is given `FFPROBE_TIMEOUT_SECONDS` to answer. A
+    probe that runs out of time is logged as a warning.
     """
     location = coerce_media_url_or_data_uri(value, kind=kind)
     if not location or location.startswith("data:"):
@@ -580,10 +546,6 @@ def _run_ffprobe(value: Any, args: list[str], *, kind: MediaKind) -> dict[str, A
     if ffprobe is None:
         logger.debug("ffprobe is not installed, skipping a pre-run %s check", kind)
         return None
-    timeout = _probe_timeout()
-    if timeout is None:
-        _note_timed_out(location, kind, "the node's checks had already used their time")
-        return None
     cmd = [ffprobe, "-v", "error", "-print_format", "json", *args, str(path)]
     try:
         result = subprocess.run(  # noqa: S603
@@ -594,10 +556,15 @@ def _run_ffprobe(value: Any, args: list[str], *, kind: MediaKind) -> dict[str, A
             encoding="utf-8",
             errors="replace",
             check=True,
-            timeout=timeout,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        _note_timed_out(location, kind, f"ffprobe took longer than {timeout:g} seconds")
+        logger.warning(
+            "Skipped checking %s before the run because ffprobe took longer than %g seconds: %s",
+            _INPUT_NOUN[kind],
+            FFPROBE_TIMEOUT_SECONDS,
+            location,
+        )
         return None
     except (subprocess.SubprocessError, OSError, ValueError) as e:
         logger.debug("Could not probe a %s for a pre-run input check, skipping it: %s", kind, e)
@@ -615,14 +582,6 @@ def _run_ffprobe(value: Any, args: list[str], *, kind: MediaKind) -> dict[str, A
 
 # How the warning for a probe that ran out of time names the input, by its kind.
 _INPUT_NOUN: dict[MediaKind, str] = {"image": "an image", "video": "a video", "audio": "an audio clip"}
-
-
-def _note_timed_out(location: str, kind: MediaKind, reason: str) -> None:
-    """Log that a probe ran out of time, and note it in the current `input_check_readings` block."""
-    logger.warning("Skipped checking %s before the run because %s: %s", _INPUT_NOUN[kind], reason, location)
-    timed_out = _timed_out.get()
-    if timed_out is not None:
-        timed_out.add((MediaNeed(kind), location))
 
 
 def _record_matroska_doctype(data: dict[str, Any], path: Path) -> None:
@@ -657,17 +616,6 @@ def _matroska_doctype(header: bytes) -> str | None:
     if end > len(header):
         return None
     return header[start + len(_EBML_DOCTYPE_ID) + 1 : end].decode("ascii", errors="replace")
-
-
-def _probe_timeout() -> float | None:
-    """How long the next probe may take, or None when the current budget leaves no time for one."""
-    deadline = probe_deadline()
-    if deadline is None:
-        return FFPROBE_TIMEOUT_SECONDS
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return None
-    return min(FFPROBE_TIMEOUT_SECONDS, remaining)
 
 
 def _installed_ffprobe() -> str | None:

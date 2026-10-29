@@ -67,8 +67,6 @@ class MediaInfo:
     nothing here opens, ffprobe missing or out of time). A validator skips a reading that is None.
     `image_format` is an image's format read from its file signature when `image` couldn't be read,
     such as "image/heif" for a HEIC photo Pillow can't open, so a format check still judges it.
-    `location` is where the value was read from, and `timed_out` is True when a video or audio
-    reading was skipped because its probe ran out of time.
     """
 
     size_bytes: int | None = None
@@ -76,8 +74,6 @@ class MediaInfo:
     image_format: str | None = None
     video: VideoProbe | None = None
     audio: AudioProbe | None = None
-    location: str | None = None
-    timed_out: bool = False
 
     @property
     def frame(self) -> ImageInfo | None:

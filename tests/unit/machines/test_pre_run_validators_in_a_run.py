@@ -18,7 +18,7 @@ from griptape_nodes.exe_types.validators.media import Duration, SideRange
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.fsm import WorkflowState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
-from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent, NodeInputsNotCheckedEvent
+from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
 from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import image_file
 
@@ -103,22 +103,10 @@ async def test_a_validator_error_alone_fails_the_node(tmp_path: Path) -> None:
     assert len(_node_error_events(put_event)) == 1
 
 
-def _unchecked_events(put_event: AsyncMock) -> list[NodeInputsNotCheckedEvent]:
-    return [
-        call.args[0].wrapped_event.payload
-        for call in put_event.await_args_list
-        if isinstance(call.args[0].wrapped_event.payload, NodeInputsNotCheckedEvent)
-    ]
-
-
 class _VideoNode(MockNode):
-    def __init__(self, own_errors: list[Exception] | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__(name="edit")
-        self._own_errors = own_errors
         self.add_parameter(ParameterVideo(name="video", display_name="Video", pre_run_validators=[Duration(max=5)]))
-
-    def validate_before_node_run(self) -> list[Exception] | None:
-        return self._own_errors
 
 
 @pytest.fixture
@@ -134,51 +122,15 @@ def slow_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("slow_ffprobe")
-async def test_tells_the_user_an_input_was_not_checked_and_runs_the_node(tmp_path: Path) -> None:
-    """A video that took too long to read is reported, and the node goes on to run."""
+async def test_runs_the_node_when_an_input_could_not_be_read_in_time(tmp_path: Path) -> None:
+    """A video that took too long to read is skipped, like any input that can't be read here."""
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"video")
     node = _VideoNode()
     node.set_parameter_value("video", str(clip))
-    machine, put_event = _machine_for(node)
+    machine, _put_event = _machine_for(node)
 
     await asyncio.wait_for(machine.resolve_node(), timeout=5)
 
-    # It got past its checks: nothing about its inputs failed it.
+    # It got past its checks; any later error is from running it against this stub engine.
     assert "encountered problems" not in (machine.get_error_message() or "")
-    (event,) = _unchecked_events(put_event)
-    assert event.node_name == "edit"
-    assert event.inputs == ["The video in 'Video'"]
-    assert event.message == (
-        "The video in 'Video' wasn't checked before the run because reading it took too long. "
-        "The provider may still reject it."
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("slow_ffprobe")
-async def test_says_nothing_about_unchecked_inputs_when_the_node_fails_a_check(tmp_path: Path) -> None:
-    """A node that fails a check doesn't run, so it gets only its error, not the not-checked warning."""
-    clip = tmp_path / "clip.mp4"
-    clip.write_bytes(b"video")
-    node = _VideoNode(own_errors=[ValueError("A prompt is required.")])
-    node.set_parameter_value("video", str(clip))
-    machine, put_event = _machine_for(node)
-
-    await asyncio.wait_for(machine.resolve_node(), timeout=5)
-
-    assert "A prompt is required." in (machine.get_error_message() or "")
-    assert _unchecked_events(put_event) == []
-    assert len(_node_error_events(put_event)) == 1
-
-
-@pytest.mark.asyncio
-async def test_says_nothing_when_every_input_was_checked(tmp_path: Path) -> None:
-    """No report when every input was read in time."""
-    node = _Checked(own_errors=None)
-    node.set_parameter_value("image", str(image_file(tmp_path, 400, 400)))
-    machine, put_event = _machine_for(node)
-
-    await asyncio.wait_for(machine.resolve_node(), timeout=5)
-
-    assert _unchecked_events(put_event) == []

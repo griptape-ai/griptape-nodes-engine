@@ -14,7 +14,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
-from griptape_nodes.exe_types.pre_run_validation import unchecked_inputs_message, validate_node
+from griptape_nodes.exe_types.pre_run_validation import validate_node
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
@@ -29,7 +29,6 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentDataNodeEvent,
     InvolvedNodesEvent,
     NodeErrorEvent,
-    NodeInputsNotCheckedEvent,
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
 )
@@ -718,8 +717,7 @@ class ExecuteDagState(State):
             node_reference.node_reference.parameter_output_values.silent_clear()
             # In a thread, so a slow check (an ffprobe of a large or remote file) doesn't freeze the
             # editor and other flows. This node still waits for its result before it runs.
-            check_result = await async_utils.to_thread(validate_node, node_reference.node_reference)
-            exceptions = check_result.errors
+            exceptions = await async_utils.to_thread(validate_node, node_reference.node_reference)
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
@@ -742,13 +740,6 @@ class ExecuteDagState(State):
                 context.error_message = msg
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
-
-            # Only a node that goes on to run is told its unchecked inputs may still be rejected; a node
-            # that failed a check shows just that error, and the timeout is still in the log.
-            if check_result.unchecked_inputs:
-                await ExecuteDagState._report_unchecked_inputs(
-                    context, node_reference.node_reference.name, check_result.unchecked_inputs
-                )
 
             # We've set up the node for success completely. Now we check and handle accordingly if it's a for-each-start node
             # if False:
@@ -910,19 +901,6 @@ class ExecuteDagState(State):
         if context.paused:
             return None
         return ExecuteDagState
-
-    @staticmethod
-    async def _report_unchecked_inputs(context: ParallelResolutionContext, node_name: str, inputs: list[str]) -> None:
-        """Tell the user which of a node's inputs weren't checked before it ran, and log it."""
-        message = unchecked_inputs_message(inputs)
-        logger.warning("Node '%s': %s", node_name, message)
-        await context.engine.event_manager.aput_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(
-                    payload=NodeInputsNotCheckedEvent(node_name=node_name, inputs=inputs, message=message)
-                )
-            )
-        )
 
     @staticmethod
     def _log_abandoned(context: ParallelResolutionContext) -> None:
