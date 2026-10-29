@@ -715,7 +715,9 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            # Off the loop so a slow check doesn't stall the engine; the run can be reset while this awaits.
+            # The check runs in a thread so a slow one doesn't freeze the editor. While it runs, the user
+            # can press Cancel. If they did, stop here: otherwise the node runs anyway (a provider node
+            # would submit its job) even though the run was cancelled.
             exceptions = await async_utils.to_thread(validate_node, node_reference.node_reference)
             if context.was_reset_since(generation):
                 ExecuteDagState._log_abandoned(context)
