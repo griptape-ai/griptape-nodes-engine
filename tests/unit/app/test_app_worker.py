@@ -3734,6 +3734,29 @@ class TestSharingThisEngineBetweenRuns:
         assert sorted(by_worker[id(call_args.args[0])] for call_args in stop.await_args_list) == stopped
 
     @pytest.mark.asyncio
+    async def test_freeing_a_worker_that_exits_ends_when_it_exits(self, worker_manager: WorkerManager) -> None:
+        """Otherwise the next run would wait out the whole timeout for a worker that is gone."""
+        _host_engine(worker_manager)
+        hosted = _HostedWorker(worker_key="s1/lib", engine_id="another-artist-engine", session_id="s1")
+        worker_manager._hosted_workers["w1"] = hosted
+        exited = asyncio.Event()
+
+        async def wait() -> int:
+            await exited.wait()
+            return 0
+
+        proc = MagicMock()
+        proc.wait = wait
+
+        freeing = asyncio.create_task(worker_manager._free_for_handoff(_ARTIST_ENGINE))
+        await _settle()
+        watcher = asyncio.create_task(worker_manager._report_when_exited("w1", hosted, proc))
+        exited.set()
+
+        await asyncio.wait_for(freeing, timeout=1.0)
+        await watcher
+
+    @pytest.mark.asyncio
     async def test_an_engine_that_is_lost_lets_its_runs_go(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)

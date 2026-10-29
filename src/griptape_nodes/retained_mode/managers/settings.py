@@ -484,6 +484,7 @@ class DistributedExecutionSettings(BaseModel):
     release: ReleaseSettings = Field(default_factory=ReleaseSettings)
     idle_timeout_s: float = Field(
         default=300.0,
+        gt=0,
         description=(
             "On an engine that runs nodes for other engines: seconds another engine's run keeps this engine "
             "after its last node here finished, if that engine never says the run ended. Must be longer than "

@@ -1706,6 +1706,10 @@ class WorkerManager(EngineScoped):
             reason = "exited"
         logger.debug("Worker %s for key '%s' %s (exit code %s)", worker_engine_id, hosted.worker_key, reason, exit_code)
         self._hosted_workers.pop(worker_engine_id, None)
+        # A request this engine sent it, such as freeing its models at a handoff, will never be answered.
+        await self._tx.request_client.fail_requests_by_tag(
+            worker_engine_id, worker_events.WorkerGoneError(f"worker '{worker_engine_id}' {reason}")
+        )
         request = worker_events.ReportWorkerExitedRequest(
             worker_engine_id=worker_engine_id, exit_code=exit_code, reason=reason
         )
@@ -1865,10 +1869,10 @@ class WorkerManager(EngineScoped):
             except Exception:
                 logger.exception("Could not free this engine's workers for engine %s's run.", engine_run.engine_id)
         self._last_engine_run_engine_id = engine_run.engine_id
-        if not engine_run.admitted.done():
-            engine_run.admitted.set_result(None)
-        self._let_go_if_idle(engine_run)
         try:
+            if not engine_run.admitted.done():
+                engine_run.admitted.set_result(None)
+            self._let_go_if_idle(engine_run)
             await engine_run.released.wait()
         finally:
             self._cancel_idle_timer(engine_run)
@@ -2076,15 +2080,18 @@ class WorkerManager(EngineScoped):
         how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default="drop_cache")
         if which == "none":
             return
+        frees = []
         for worker_engine_id, hosted in list(self._hosted_workers.items()):
             if which == "others" and hosted.engine_id == incoming_engine_id:
                 continue
             if how == "recycle":
                 # Its exit is reported stopped, so its engine starts it again before that library's next node.
                 logger.info("Stopping worker %s to free this engine for another engine's run.", worker_engine_id)
-                await self._stop_hosted_worker(hosted)
+                frees.append(self._stop_hosted_worker(hosted))
             else:
-                await self._drop_library_named_objects(worker_engine_id, hosted)
+                frees.append(self._drop_library_named_objects(worker_engine_id, hosted))
+        # All at once, so a worker that never answers delays the handoff by one timeout, not one each.
+        await asyncio.gather(*frees)
 
     async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
         """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
@@ -2106,6 +2113,10 @@ class WorkerManager(EngineScoped):
             logger.warning(
                 "Worker %s did not free its models within %.0f seconds.", worker_engine_id, _ENGINE_REQUEST_TIMEOUT_S
             )
+            return
+        except worker_events.WorkerGoneError:
+            # Gone, so nothing of it is left to free.
+            logger.info("Worker %s exited before it freed its models.", worker_engine_id)
             return
         except BaseException:
             self._tx.request_client.discard_request(request_id)

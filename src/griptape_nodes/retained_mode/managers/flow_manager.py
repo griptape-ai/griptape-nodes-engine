@@ -4910,11 +4910,11 @@ class FlowManager(EngineScoped):
         self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
 
     def add_run_ended_listener(self, listener: Callable[[str], None]) -> None:
-        """Call `listener` with each run's ID once the run ends, however it ends."""
+        """Call `listener` with each run's ID once the run ends, however it ends, on the loop the run was submitted on."""
         self._run_ended_listeners.append(listener)
 
     def add_place_in_line_listener(self, listener: Callable[[Run], None]) -> None:
-        """Call `listener` with each waiting run whose place in line changes, and at 0 once it stops waiting."""
+        """Call `listener`, on the run's loop, with each waiting run whose place in line changes, and at 0 once it stops."""
         self._place_in_line_listeners.append(listener)
 
     def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
@@ -4935,9 +4935,11 @@ class FlowManager(EngineScoped):
                 continue
             run.state = RunState.CANCELLED
             self._leave_line(run)
-            failure = self._of_run(run.spec.failure(f"The run did not start: {reason}"), run.run_id)
-            self._on_run_loop(run, run.outcome.set_result, failure)
+            self._on_run_loop(run, self._fail_run_outcome, run, f"The run did not start: {reason}")
         self._report_places_in_line()
+
+    def _fail_run_outcome(self, run: Run, details: str) -> None:
+        run.outcome.set_result(self._of_run(run.spec.failure(details), run.run_id))
 
     def _raise_if_run_cancelled(self) -> None:
         """Stop a run cancelled before its flow started, just before it would start it.
@@ -5021,7 +5023,7 @@ class FlowManager(EngineScoped):
             return
         self._run_in_progress = None
         for listener in self._run_ended_listeners:
-            listener(run.run_id)
+            self._on_run_loop(run, listener, run.run_id)
         self._start_next_run_if_idle()
         self._report_places_in_line()
 
@@ -5057,7 +5059,7 @@ class FlowManager(EngineScoped):
     def _report_place_in_line(self, run: Run) -> None:
         self._put_run_queued_event(run, run.position)
         for listener in self._place_in_line_listeners:
-            listener(run)
+            self._on_run_loop(run, listener, run)
 
     def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(

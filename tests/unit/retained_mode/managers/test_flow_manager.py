@@ -1337,6 +1337,42 @@ class TestRunsEndCleanly:
             result = await asyncio.wait_for(waiting, timeout=1.0)
         assert str(result.result_details) == "second ran"
 
+    @pytest.mark.asyncio
+    async def test_a_run_ended_on_another_loop_is_reported_on_the_run_s_own_loop(self, engine: Engine) -> None:
+        """A listener that starts a task would otherwise start it on a loop that is about to close."""
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+        reported = asyncio.Event()
+        loops: list[asyncio.AbstractEventLoop] = []
+
+        def on_run_ended(_run_id: str) -> None:
+            loops.append(asyncio.get_running_loop())
+            reported.set()
+
+        flow_manager.add_run_ended_listener(on_run_ended)
+
+        async def stop_the_flow() -> None:
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over()
+
+        async def first() -> Any:
+            flow_running["value"] = True
+            return _ran("first")
+
+        with (
+            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]),
+            patch.object(flow_manager, "cancel_flow_run", side_effect=stop_the_flow),
+        ):
+            await flow_manager.start_run(_Spec("flow", first))
+            first_run = flow_manager._run_in_progress
+            assert first_run is not None
+
+            with ThreadRunner() as runner:
+                runner.run(flow_manager.cancel_run(first_run.run_id))
+
+            await asyncio.wait_for(reported.wait(), timeout=1.0)
+        assert loops == [asyncio.get_running_loop()]
+
 
 class TestRunSpecs:
     """A queued run looks up what it runs when it starts, so something deleted while it waited fails cleanly."""
