@@ -493,6 +493,7 @@ class DistributedExecutionSettings(BaseModel):
     )
     max_workers: int | None = Field(
         default=None,
+        ge=1,
         description=(
             "On an engine that runs nodes for other engines: the most workers it runs for them at once. A start "
             "beyond it is refused, and the node that needed it fails saying so; that library's next node asks "
