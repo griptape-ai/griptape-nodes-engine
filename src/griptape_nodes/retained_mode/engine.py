@@ -47,7 +47,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
     NoWorkflow,
@@ -747,7 +747,7 @@ class Engine:
         if dropped:
             logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
-    @handles(GetEngineVersionRequest)
+    @handles(GetEngineVersionRequest, scope=RequestScope.HOST)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)
@@ -761,7 +761,7 @@ class Engine:
             details = f"Attempted to get engine version. Failed due to '{err}'."
             return GetEngineVersionResultFailure(result_details=details)
 
-    @handles(EngineHeartbeatRequest)
+    @handles(EngineHeartbeatRequest, scope=RequestScope.HOST)
     def handle_engine_heartbeat_request(self, request: EngineHeartbeatRequest) -> ResultPayload:
         """Handle engine heartbeat requests.
 

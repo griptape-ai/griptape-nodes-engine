@@ -7,14 +7,33 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineHeartbeatRequest,
+    EngineHeartbeatResultSuccess,
+    GetEngineVersionRequest,
+)
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigCategoryRequest,
+    GetWorkspaceRequest,
+    ListBetaFeaturesRequest,
+)
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
+from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
+from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
+from griptape_nodes.retained_mode.events.workflow_events import (
+    ListAllWorkflowInfoRequest,
+    ListAllWorkflowsRequest,
+    ListCallableWorkflowsRequest,
+)
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -283,3 +302,47 @@ class TestHostScope:
 
         assert result_event.succeeded()
         assert calls.workflows == [None]
+
+
+# Reads about the engine, not a workflow: each works with no workflow open, so a stale id cannot fail it.
+_HOST_READS: list[Callable[[], RequestPayload]] = [
+    lambda: EngineHeartbeatRequest(heartbeat_id="hb"),
+    GetEngineVersionRequest,
+    ListRegisteredLibrariesRequest,
+    ListAllWorkflowsRequest,
+    ListAllWorkflowInfoRequest,
+    ListCallableWorkflowsRequest,
+    GetConfigCategoryRequest,
+    GetWorkspaceRequest,
+    ListBetaFeaturesRequest,
+    GetCurrentProjectRequest,
+    ListProjectTemplatesRequest,
+]
+
+
+class TestHostReads:
+    @pytest.mark.parametrize("make_request", _HOST_READS)
+    @pytest.mark.asyncio
+    async def test_a_stale_envelope_id_does_not_fail_it(
+        self, engine: Engine, make_request: Callable[[], RequestPayload]
+    ) -> None:
+        _open_workflow(engine)
+        request = make_request()
+
+        result_event = await engine.event_manager.ahandle_request(
+            request, result_context=ResultContext(open_workflow_id=NOT_OPEN_ID)
+        )
+
+        assert engine.event_manager.get_scope_for_request_type(type(request)) is RequestScope.HOST
+        assert not isinstance(result_event.result, WorkflowNotOpenResultFailure)
+        assert result_event.succeeded(), result_event.result.result_details
+
+    def test_the_heartbeat_still_reports_the_open_workflow(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        result = engine.event_manager.handle_request(
+            EngineHeartbeatRequest(heartbeat_id="hb"), result_context=ResultContext(open_workflow_id=NOT_OPEN_ID)
+        ).result
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.current_workflow_id == workflow.workflow_id

@@ -88,7 +88,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LogLevel,
     Settings,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
 from griptape_nodes.utils.engine_dirs import engine_config_dir
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
@@ -1489,7 +1489,7 @@ class ConfigManager(EngineScoped):
 
         return write_succeeded
 
-    @handles(GetConfigCategoryRequest)
+    @handles(GetConfigCategoryRequest, scope=RequestScope.HOST)
     def on_handle_get_config_category_request(self, request: GetConfigCategoryRequest) -> ResultPayload:
         if request.category is None or request.category == "":
             # Return the whole shebang. Start with the defaults and then layer on the user config.
@@ -1609,12 +1609,12 @@ class ConfigManager(EngineScoped):
         result_details = "Successfully returned the config layer stack."
         return GetConfigLayersResultSuccess(layers=self.config_layers(), result_details=result_details)
 
-    @handles(GetWorkspaceRequest)
+    @handles(GetWorkspaceRequest, scope=RequestScope.HOST)
     def on_handle_get_workspace_request(self, request: GetWorkspaceRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the absolute workspace path."
         return GetWorkspaceResultSuccess(workspace_path=str(self.workspace_path), result_details=result_details)
 
-    @handles(ListBetaFeaturesRequest)
+    @handles(ListBetaFeaturesRequest, scope=RequestScope.HOST)
     def on_handle_list_beta_features_request(self, request: ListBetaFeaturesRequest) -> ResultPayload:  # noqa: ARG002
         all_features = list(list_beta_features())
         for library_name in LibraryRegistry.list_libraries():

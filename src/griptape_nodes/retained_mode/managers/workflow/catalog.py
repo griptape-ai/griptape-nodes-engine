@@ -43,7 +43,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -68,7 +68,7 @@ class WorkflowCatalog(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    @handles(ListAllWorkflowsRequest)
+    @handles(ListAllWorkflowsRequest, scope=RequestScope.HOST)
     async def on_list_all_workflows_request(self, _request: ListAllWorkflowsRequest) -> ResultPayload:
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -81,7 +81,7 @@ class WorkflowCatalog(EngineScoped):
             workflows=workflows, result_details=f"Successfully retrieved {len(workflows)} workflows."
         )
 
-    @handles(ListCallableWorkflowsRequest)
+    @handles(ListCallableWorkflowsRequest, scope=RequestScope.HOST)
     async def on_list_callable_workflows_request(self, _request: ListCallableWorkflowsRequest) -> ResultPayload:
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -141,7 +141,7 @@ class WorkflowCatalog(EngineScoped):
             result_details=f"Successfully retrieved workflow info for '{workflow_file_path}'.",
         )
 
-    @handles(ListAllWorkflowInfoRequest)
+    @handles(ListAllWorkflowInfoRequest, scope=RequestScope.HOST)
     def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
