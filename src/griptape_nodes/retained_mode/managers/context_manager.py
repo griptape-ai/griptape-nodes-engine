@@ -933,7 +933,9 @@ class ContextManager(EngineScoped):
         open_workflows = self.engine.open_workflows
         # Not open when the entry is a worker's mirror, which opens nothing.
         if not self._workflow_stack and open_workflows.is_open(popped.workflow_id):
-            open_workflows.close(open_workflows.get(popped.workflow_id))
+            closed = open_workflows.get(popped.workflow_id)
+            open_workflows.close(closed)
+            self.engine.leave_closed_workflow(closed)
         return name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:

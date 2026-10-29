@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -76,6 +77,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -262,6 +264,29 @@ class TestWritePathsKeepOrMintAnId:
         assert _id_at(project_engine, library_saved.file_path) == library_id
         # As on main, the open workflow moves onto the copy so the next save lands in it.
         assert project_engine.context_manager.get_current_workflow_id() == copy.workflow_id
+
+    def test_after_saving_a_library_workflow_requests_reach_it_by_the_id_of_the_copy(
+        self, project_engine: Engine
+    ) -> None:
+        """The editor learns the copy's id from the context, so the open workflow's runtime answers to it."""
+        library_id = _open_new_workflow(project_engine, "library_workflow")
+        library_saved = _save(project_engine)
+        project_engine.workflow_registry.get(library_id).metadata.is_griptape_provided = True
+        workflow = project_engine.open_workflows.get(library_id)
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name=library_saved.workflow_name))
+
+        assert copy.workflow_id is not None
+        assert project_engine.open_workflows.get(copy.workflow_id) is workflow
+        by_copy = project_engine.event_manager.handle_request(
+            GetWorkflowContextRequest(), result_context=ResultContext(open_workflow_id=copy.workflow_id)
+        )
+        assert isinstance(by_copy.result, GetWorkflowContextSuccess)
+        assert by_copy.result.workflow_id == copy.workflow_id
+        by_library = project_engine.event_manager.handle_request(
+            GetWorkflowContextRequest(), result_context=ResultContext(open_workflow_id=library_id)
+        )
+        assert isinstance(by_library.result, WorkflowNotOpenResultFailure)
 
     def test_branch_merge_and_reset(self, project_engine: Engine) -> None:
         source = _saved_workflow(project_engine, "source")
