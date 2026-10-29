@@ -12,6 +12,7 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
 )
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import StartNode
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
@@ -285,6 +286,41 @@ class TestLocalWorkflowExecutorCli:
 
         assert "pickle_control_flow_result" not in kwargs
         LocalWorkflowExecutor(pickle_control_flow_result=True)
+
+
+class TestParentRun:
+    """A workflow run for another engine's run, such as a node group in a remote environment, counts toward it."""
+
+    def test_the_parent_run_comes_from_the_command_line(self) -> None:
+        parser = ArgumentParser()
+        LocalWorkflowExecutor.add_cli_arguments(parser)
+
+        kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(parser.parse_args(["--parent-run-id", "parent-run"]))
+
+        assert kwargs["parent_run_id"] == "parent-run"
+
+    def test_no_parent_run_on_the_command_line_means_none(self) -> None:
+        parser = ArgumentParser()
+        LocalWorkflowExecutor.add_cli_arguments(parser)
+
+        kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(parser.parse_args([]))
+
+        assert kwargs["parent_run_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_parent_run_holds_while_the_executor_is_open(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the parent run is under test, not app startup.
+        monkeypatch.setattr(engine.event_manager, "abroadcast_app_event", AsyncMock())
+        parser = ArgumentParser()
+        LocalWorkflowExecutor.add_cli_arguments(parser)
+        executor = LocalWorkflowExecutor.from_cli_args(parser.parse_args(["--parent-run-id", "parent-run"]))
+
+        async with executor:
+            assert engine.flow_manager.parent_run_id == "parent-run"
+
+        assert engine.flow_manager.parent_run_id is None
 
 
 class TestSetInputForFlow:

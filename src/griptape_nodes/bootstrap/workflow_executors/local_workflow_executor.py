@@ -68,6 +68,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         workflows_to_register: list[str] | None = None,
         save_on_failure_path: str | None = None,
         pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
+        parent_run_id: str | None = None,
     ):
         super().__init__()
         self._set_storage_backend(storage_backend=storage_backend)
@@ -75,6 +76,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         self._skip_library_loading = skip_library_loading
         self._workflows_to_register = workflows_to_register or []
         self._save_on_failure_path = save_on_failure_path
+        # The run of the engine that started this one, which this workflow's spend counts toward.
+        self._parent_run_id = parent_run_id
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -94,6 +97,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                 defer_pending_library_resets=True,
             )
         )
+        # Last, so a failure above cannot leave later runs in this process counted toward the parent:
+        # __aexit__, which clears it, does not run when __aenter__ raises.
+        self._join_parent_run()
         return self
 
     async def __aexit__(
@@ -103,11 +109,20 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
+        # First, so a failure below cannot leave later runs in this process counted toward the parent.
+        self._leave_parent_run()
         # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
         # The process usually exits next, which would drop usage reports still queued.
         await asyncio.to_thread(GriptapeNodes.BudgetManager().flush_reports)
+
+    def _join_parent_run(self) -> None:
+        """Count this process's runs toward the run of the engine that started it, if one did."""
+        GriptapeNodes.FlowManager().parent_run_id = self._parent_run_id
+
+    def _leave_parent_run(self) -> None:
+        GriptapeNodes.FlowManager().parent_run_id = None
 
     def _get_workflow_name(self) -> str:
         try:
@@ -455,6 +470,11 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     ) -> None:
         super().add_cli_arguments(parser, pickle_control_flow_result_default=pickle_control_flow_result_default)
         cls._add_save_on_failure_argument(parser)
+        parser.add_argument(
+            "--parent-run-id",
+            default=None,
+            help="Run id of the engine that started this workflow; its spend counts toward that run",
+        )
 
     @classmethod
     def _add_save_on_failure_argument(cls, parser: ArgumentParser) -> None:
@@ -474,4 +494,5 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     def _cli_constructor_kwargs(cls, args: Namespace) -> dict[str, Any]:
         kwargs = super()._cli_constructor_kwargs(args)
         kwargs["save_on_failure_path"] = args.save_on_failure
+        kwargs["parent_run_id"] = args.parent_run_id
         return kwargs

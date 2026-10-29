@@ -54,11 +54,10 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             storage_backend=storage_backend,
             project_file_path=project_file_path,
             save_on_failure_path=save_on_failure_path,
+            parent_run_id=parent_run_id,
         )
         self._init_websocket_sender(session_id)
         self._on_start_flow_result = on_start_flow_result
-        # The run of the engine that started this one, which this workflow's spend counts toward.
-        self._parent_run_id = parent_run_id
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -73,7 +72,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         await self._start_websocket_connection()
         # Last, so a failure above cannot leave later runs in this process counted toward the parent:
         # __aexit__, which clears it, does not run when __aenter__ raises.
-        GriptapeNodes.FlowManager().parent_run_id = self._parent_run_id
+        self._join_parent_run()
 
         return self
 
@@ -85,7 +84,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     ) -> None:
         """Async context manager exit."""
         # First, so a failure below cannot leave later runs in this process counted toward the parent.
-        GriptapeNodes.FlowManager().parent_run_id = None
+        self._leave_parent_run()
         # The process exits next, which would drop usage reports still queued.
         await asyncio.to_thread(GriptapeNodes.BudgetManager().flush_reports)
         await self._stop_websocket_connection()
@@ -277,15 +276,9 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
             default=None,
             help="ID of the session to use",
         )
-        parser.add_argument(
-            "--parent-run-id",
-            default=None,
-            help="Run id of the engine that started this workflow; its spend counts toward that run",
-        )
 
     @classmethod
     def _cli_constructor_kwargs(cls, args: Namespace) -> dict[str, Any]:
         kwargs = super()._cli_constructor_kwargs(args)
         kwargs["session_id"] = args.session_id
-        kwargs["parent_run_id"] = args.parent_run_id
         return kwargs
