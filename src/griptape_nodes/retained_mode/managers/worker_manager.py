@@ -90,6 +90,15 @@ class _SessionRegistration:
     library_versions: dict[str, str]
 
 
+@dataclass(frozen=True)
+class _WorkerUnavailable:
+    """Why no worker will run a library."""
+
+    reason: str
+    # The library's next node asks for its worker again, as after another engine refused it for capacity.
+    retryable: bool = False
+
+
 @dataclass
 class _RemoteStart:
     """A worker the artist's engine asked another engine to start, until it registers, fails, or is withdrawn."""
@@ -254,8 +263,6 @@ class WorkerManager(EngineScoped):
         # from sending the start until the worker registers, the start fails, or it is withdrawn.
         # Their worker registers here like a local one.
         self._remote_starts: dict[str, _RemoteStart] = {}
-        # Libraries whose last remote start was refused for capacity, which their next node asks for again.
-        self._refused_for_capacity: set[str] = set()
 
         # This engine's registration with each engine it sends work to, by (host_engine_id, session).
         self._engine_registrations: dict[tuple[str, str], asyncio.Task[ResultPayload]] = {}
@@ -327,7 +334,7 @@ class WorkerManager(EngineScoped):
         # answer questions about a PROCESS: is one coming, has it loaded the library, did it die.
         # One owner, so one writer.
         self._execution_ready: dict[str | None, asyncio.Event] = {}
-        self._worker_unavailable: dict[str | None, str] = {}
+        self._worker_unavailable: dict[str | None, _WorkerUnavailable] = {}
 
         config = engine.config_manager
         configured_interval_s: float = config.get_config_value(
@@ -1345,10 +1352,9 @@ class WorkerManager(EngineScoped):
             return
         reason = f"{host_engine_id} did not start its worker: {result.result_details}"
         logger.error("Not starting a worker for library '%s': %s", library_name, reason)
-        self.note_worker_unavailable(library_name, reason)
-        if isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.at_capacity:
-            # The node waiting now fails with the reason; the library's next node asks again.
-            self._refused_for_capacity.add(library_name)
+        # The node waiting now fails with the reason; after a capacity refusal, the library's next node asks again.
+        at_capacity = isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.at_capacity
+        self.note_worker_unavailable(library_name, reason, retryable=at_capacity)
 
     async def _ask_engine_to_start_worker(
         self, library_name: str, host_engine_id: str, session_id: str
@@ -2297,15 +2303,15 @@ class WorkerManager(EngineScoped):
         if ready is not None:
             ready.set()
 
-    def note_worker_unavailable(self, library_name: str | None, reason: str) -> None:
+    def note_worker_unavailable(self, library_name: str | None, reason: str, *, retryable: bool = False) -> None:
         """Record why no worker will run `library_name`, and release anything waiting on one.
 
         Recording without releasing leaves the next run waiting out the whole startup grace before
         blaming a library load that never began; releasing without recording leaves it blaming a
-        worker that "may still be starting up" for the rest of the session.
+        worker that "may still be starting up" for the rest of the session. A `retryable` reason has
+        the library's next node ask for its worker again.
         """
-        self._worker_unavailable[library_name] = reason
-        self._refused_for_capacity.discard(library_name)
+        self._worker_unavailable[library_name] = _WorkerUnavailable(reason=reason, retryable=retryable)
         self.note_library_loaded(library_name)
 
     def forget_library(self, library_name: str) -> None:
@@ -2321,7 +2327,10 @@ class WorkerManager(EngineScoped):
 
     def worker_unavailable_reason(self, library_name: str | None) -> str | None:
         """Why no worker is available to run `library_name`, or None if that is not the problem."""
-        return self._worker_unavailable.get(library_name)
+        unavailable = self._worker_unavailable.get(library_name)
+        if unavailable is None:
+            return None
+        return unavailable.reason
 
     def worker_host(self, worker_engine_id: str) -> str | None:
         """The engine that runs a worker this engine asked another engine for, or None for any other worker.
@@ -2393,9 +2402,9 @@ class WorkerManager(EngineScoped):
         if self.is_worker_running_or_starting(library_name):
             return
         # A worker that ended on its own left a reason, which stays until the library is reset.
-        if self.worker_unavailable_reason(library_name) is not None and library_name not in self._refused_for_capacity:
+        unavailable = self._worker_unavailable.get(library_name)
+        if unavailable is not None and not unavailable.retryable:
             return
-        self._refused_for_capacity.discard(library_name)
         await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:

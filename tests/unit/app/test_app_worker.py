@@ -2700,6 +2700,22 @@ class TestStartingAWorkerOnAnotherEngine:
         start.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_a_capacity_refusal_followed_by_another_reason_is_not_asked_again(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _host_engine(worker_manager)
+        full = worker_events.StartWorkerForEngineResultFailure(result_details="no room", at_capacity=True)
+        with patch.object(worker_manager, "_ask_engine_to_start_worker", new=AsyncMock(return_value=full)):
+            await _start_on_host_engine(worker_manager)
+
+        worker_manager.note_worker_unavailable(_LIBRARY, "the connection to gpu-01 was lost.")
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager._start_remote_worker_if_stopped(_LIBRARY)
+
+        start.assert_not_awaited()
+        assert worker_manager.worker_unavailable_reason(_LIBRARY) == "the connection to gpu-01 was lost."
+
+    @pytest.mark.asyncio
     async def test_a_start_refused_for_another_reason_is_not_asked_again(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager, refuse={"StartWorkerForEngineRequest": "not installed"})
         await _start_on_host_engine(worker_manager)
