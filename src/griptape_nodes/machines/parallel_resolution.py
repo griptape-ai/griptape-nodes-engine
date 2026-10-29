@@ -714,9 +714,11 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            # In a thread, so a slow check (an ffprobe of a large or remote file) doesn't freeze the
-            # editor and other flows. This node still waits for its result before it runs.
+            # Off the loop so a slow check doesn't stall the engine; the run can be reset while this awaits.
             exceptions = await async_utils.to_thread(node_reference.node_reference.validate_before_node_run)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name

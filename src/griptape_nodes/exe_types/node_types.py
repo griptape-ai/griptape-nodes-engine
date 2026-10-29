@@ -1453,7 +1453,8 @@ class BaseNode(ABC):
 
         It runs in a worker thread, not on the engine's event loop, so a slow check doesn't freeze the
         editor or other flows; the node waits for it before running. Setting parameter values and
-        sending events from here is safe, but don't touch asyncio objects or await anything.
+        sending events from here is safe. Engine requests run on this thread too, so keep them to quick
+        lookups, and don't touch asyncio objects or await anything.
 
         For anything that needs the real thing -- a loaded model, a tensor an upstream node produced --
         use `validate_in_execution_environment`, which runs where the node runs.
