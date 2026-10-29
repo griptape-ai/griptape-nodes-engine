@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeModuleImportProblem,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -183,7 +183,7 @@ class LibraryCatalog(EngineScoped):
             result_details=f"Successfully listed {len(handler_mappings)} capable library event handlers",
         )
 
-    @handles(ListRegisteredLibrariesRequest)
+    @handles(ListRegisteredLibrariesRequest, scope=RequestScope.HOST)
     async def on_list_registered_libraries_request(self, _request: ListRegisteredLibrariesRequest) -> ResultPayload:
         await self.engine.library_manager._libraries_loading_complete.wait()
         # Make a COPY of the list
