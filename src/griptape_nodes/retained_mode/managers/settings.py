@@ -27,7 +27,6 @@ WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
 DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
-DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY = "distributed_execution.idle_timeout_s"
 DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
@@ -482,15 +481,6 @@ class DistributedExecutionSettings(BaseModel):
         ),
     )
     release: ReleaseSettings = Field(default_factory=ReleaseSettings)
-    idle_timeout_s: float = Field(
-        default=300.0,
-        gt=0,
-        description=(
-            "On an engine that runs nodes for other engines: seconds another engine's run keeps this engine "
-            "after its last node here finished, if that engine never says the run ended. Must be longer than "
-            "the longest stretch of a run between two of its nodes that run here."
-        ),
-    )
     max_workers: int | None = Field(
         default=None,
         ge=1,

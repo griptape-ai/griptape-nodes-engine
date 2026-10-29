@@ -108,7 +108,7 @@ A change to `distributed_execution.library_engines` takes effect the next time t
 Several people can send their libraries to the same remote computer. It runs one person's run at a time, so two people's nodes never share its GPU at once.
 
 - **Runs take turns, in the order they asked.** When your run's first node arrives while someone else's run has the remote computer, your node waits. Meanwhile the run toolbar in your editor shows your run as queued, with its place in line.
-- **A run keeps the remote computer until it ends.** Once your run has it, your run's later nodes there start right away, even while someone else waits. It passes to the next run when yours ends, or when none of your run's nodes has run there for `distributed_execution.idle_timeout_s` (5 minutes unless the remote computer sets it otherwise).
+- **A run keeps the remote computer until it ends.** Once your run has it, your run's later nodes there start right away, even while someone else waits. It passes to the next run when yours ends, including when you cancel it. A paused run keeps the remote computer until you continue it to the end or cancel it. If your engine stops or loses its connection to the remote computer, the remote computer passes to the next run.
 - **Don't send libraries both ways between two computers.** If computer A sends a library to B and B sends one to A, a run on each can wait for the other forever: each holds its own computer while it waits for the other's. Cancel one run to free both. The remote computer's log names the other engine when this happens.
 - **The previous person's models are freed first.** When the remote computer passes from one person's run to another's, it frees models the way its `distributed_execution.release` setting says:
 
@@ -125,7 +125,6 @@ To limit how many workers the remote computer runs at once, set `distributed_exe
 ```json
 {
   "distributed_execution": {
-    "idle_timeout_s": 300,
     "max_workers": 4,
     "release": { "which": "others", "how": "drop_cache" }
   }

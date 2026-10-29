@@ -43,7 +43,6 @@ from griptape_nodes.retained_mode.managers.external_environment import (
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.managers.settings import (
-    DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY,
     DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
     DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
     DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
@@ -77,6 +76,11 @@ _STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 # How long an engine waits for another engine to answer a request. Starting a worker
 # answers once its process exists, so this bounds an engine that is down or unreachable.
 _ENGINE_REQUEST_TIMEOUT_S = 60.0
+
+# How many times an engine tries to tell another engine that a run ended, and how long it pauses between
+# tries. That engine holds itself for the run until it hears, or until it loses its connection to this one.
+_RUN_ENDED_ATTEMPTS = 5
+_RUN_ENDED_RETRY_PAUSE_S = 10.0
 
 
 @dataclass
@@ -143,8 +147,6 @@ class _EngineRun:
     running: set[str] = field(default_factory=set)
     # Admissions whose node ended before it was admitted.
     abandoned: set[str] = field(default_factory=set)
-    # Lets the run go once none of its nodes has run here for the idle timeout.
-    idle_timer: asyncio.TimerHandle | None = None
 
 
 @dataclass
@@ -1842,10 +1844,8 @@ class WorkerManager(EngineScoped):
             return worker_events.AdmitNodeResultFailure(result_details=refusal)
         if request.admission_id in engine_run.abandoned:
             engine_run.abandoned.discard(request.admission_id)
-            self._let_go_if_idle(engine_run)
             return worker_events.AdmitNodeResultFailure(result_details="the node ended before it was admitted.")
         engine_run.running.add(request.admission_id)
-        self._cancel_idle_timer(engine_run)
         return worker_events.AdmitNodeResultSuccess(result_details=f"Admitted node '{request.node_name}'.")
 
     @handles(
@@ -1869,7 +1869,6 @@ class WorkerManager(EngineScoped):
         if request.admission_id in engine_run.waiting:
             engine_run.abandoned.add(request.admission_id)
         engine_run.running.discard(request.admission_id)
-        self._let_go_if_idle(engine_run)
         return worker_events.ReportNodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
 
     @handles(
@@ -1926,10 +1925,8 @@ class WorkerManager(EngineScoped):
         try:
             if not engine_run.admitted.done():
                 engine_run.admitted.set_result(None)
-            self._let_go_if_idle(engine_run)
             await engine_run.released.wait()
         finally:
-            self._cancel_idle_timer(engine_run)
             self._forget_engine_run(engine_run)
         return worker_events.ReportRunEndedResultSuccess(
             result_details=f"Engine {engine_run.engine_id}'s run let this engine go."
@@ -2005,6 +2002,9 @@ class WorkerManager(EngineScoped):
             self.note_worker_unavailable(
                 start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
             )
+        # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
+        for key in [key for key in self._engine_registrations if key[0] == engine_id]:
+            del self._engine_registrations[key]
         await self._forget_engine(engine_id, why="lost its connection")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
@@ -2058,24 +2058,6 @@ class WorkerManager(EngineScoped):
         if engine_run.line_run is not None:
             await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id)
 
-    def _let_go_if_idle(self, engine_run: _EngineRun) -> None:
-        """Start the idle timeout of a run holding this engine whose nodes have all ended."""
-        if not engine_run.admitted.done() or engine_run.admitted.result() is not None:
-            return
-        if engine_run.running or engine_run.released.is_set():
-            return
-        self._cancel_idle_timer(engine_run)
-        idle_timeout_s = self.engine.config_manager.get_config_value(
-            DISTRIBUTED_EXECUTION_IDLE_TIMEOUT_KEY, default=300.0, cast_type=float
-        )
-        engine_run.idle_timer = asyncio.get_running_loop().call_later(idle_timeout_s, engine_run.released.set)
-
-    @staticmethod
-    def _cancel_idle_timer(engine_run: _EngineRun) -> None:
-        if engine_run.idle_timer is not None:
-            engine_run.idle_timer.cancel()
-            engine_run.idle_timer = None
-
     def _forget_engine_run(self, engine_run: _EngineRun) -> None:
         if self._engine_runs.get(engine_run.key) is engine_run:
             del self._engine_runs[engine_run.key]
@@ -2123,14 +2105,45 @@ class WorkerManager(EngineScoped):
             self._send_notice(self._send_run_ended(engine_id, run_id))
 
     async def _send_run_ended(self, engine_id: str, run_id: str) -> None:
+        """Tell `engine_id` that a run ended, trying again until it answers or this engine has no session with it.
+
+        Nothing else lets that engine go while the run had a node there, so a lost notice would hold it
+        from every other run.
+        """
         request = worker_events.ReportRunEndedRequest(run_id=run_id)
-        try:
-            result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
-        except EngineNotFoundError as e:
-            logger.warning("Could not tell engine %s that run %s ended: %s", engine_id, run_id, e)
+        for attempt in range(1, _RUN_ENDED_ATTEMPTS + 1):
+            if attempt > 1:
+                await asyncio.sleep(_RUN_ENDED_RETRY_PAUSE_S)
+            if not self._has_session_with(engine_id):
+                logger.info(
+                    "Not telling engine %s that run %s ended: this engine no longer uses it.", engine_id, run_id
+                )
+                return
+            try:
+                result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            except EngineNotFoundError as e:
+                logger.warning(
+                    "Could not tell engine %s that run %s ended (attempt %d of %d): %s",
+                    engine_id,
+                    run_id,
+                    attempt,
+                    _RUN_ENDED_ATTEMPTS,
+                    e,
+                )
+                continue
+            if not isinstance(result, worker_events.ReportRunEndedResultSuccess):
+                logger.warning("Engine %s did not end run %s: %s", engine_id, run_id, result.result_details)
             return
-        if not isinstance(result, worker_events.ReportRunEndedResultSuccess):
-            logger.warning("Engine %s did not end run %s: %s", engine_id, run_id, result.result_details)
+        logger.error(
+            "Gave up telling engine %s that run %s ended. It runs no one else's nodes until it loses its "
+            "connection to this engine or this engine stops its workers.",
+            engine_id,
+            run_id,
+        )
+
+    def _has_session_with(self, engine_id: str) -> bool:
+        """Whether this engine offered its session to `engine_id` and has not withdrawn it or lost that engine."""
+        return any(host_engine_id == engine_id for host_engine_id, _session_id in self._engine_registrations)
 
     def _send_notice(self, notice: Coroutine[Any, Any, None]) -> None:
         """Send a report to another engine without waiting, holding the task until it is answered."""

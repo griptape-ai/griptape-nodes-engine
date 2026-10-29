@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycl
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
+    _RUN_ENDED_ATTEMPTS,
     _STATIC_URL_SETTLE_TIMEOUT_S,
     EngineAdmission,
     WorkerManager,
@@ -3732,12 +3733,11 @@ class TestSharingThisEngineBetweenRuns:
         assert isinstance(await admitting, worker_events.AdmitNodeResultFailure)
 
     @pytest.mark.asyncio
-    async def test_a_run_with_no_node_running_lets_go_after_the_idle_timeout(
+    async def test_a_run_whose_nodes_all_ended_keeps_the_engine_until_it_ends(
         self, worker_manager: WorkerManager
     ) -> None:
-        """Otherwise an engine that never says its run ended would hold this one forever."""
+        """Its next node may come at any time, such as after a long node on the artist's own engine."""
         _host_engine(worker_manager)
-        _configure(worker_manager, {"distributed_execution.idle_timeout_s": 0.01})
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
@@ -3746,7 +3746,12 @@ class TestSharingThisEngineBetweenRuns:
         hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
         await admitting
         await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
+        await asyncio.sleep(0.05)
 
+        assert not hold.done()
+        await _sent_by(
+            _ARTIST, worker_manager.handle_report_run_ended_request, worker_events.ReportRunEndedRequest(run_id="run-1")
+        )
         assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
 
     @pytest.mark.asyncio
@@ -3976,6 +3981,100 @@ def _in_run(worker_manager: WorkerManager, run_id: str = "run-1") -> MagicMock:
     return run
 
 
+def _offer_session_to(worker_manager: WorkerManager, engine_id: str) -> None:
+    """Record that this engine's session registered with `engine_id`."""
+    accepted = asyncio.get_running_loop().create_future()
+    accepted.set_result(worker_events.OfferSessionForWorkersResultSuccess(result_details="ok", engine_id=engine_id))
+    worker_manager._engine_registrations[(engine_id, _SESSION)] = accepted  # type: ignore[assignment]
+
+
+class TestTellingAnotherEngineARunEnded:
+    """That engine holds itself for the run until it hears, so the notice is sent again until it is answered."""
+
+    @pytest.mark.asyncio
+    async def test_a_notice_that_does_not_arrive_is_sent_again_until_it_is_answered(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        links = _host_engine(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        answer = links.request
+        lost = 2
+        tries = {"count": 0}
+
+        async def lost_twice(engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+            tries["count"] += 1
+            if tries["count"] <= lost:
+                links.sent.append((engine_id, request, timeout_s))
+                msg = "gpu-01 did not answer."
+                raise EngineNotFoundError(msg)
+            return await answer(engine_id, request, timeout_s=timeout_s)
+
+        worker_manager.engine.request = lost_twice  # type: ignore[method-assign]
+        with (
+            patch("griptape_nodes.retained_mode.managers.worker_manager._RUN_ENDED_RETRY_PAUSE_S", new=0),
+            caplog.at_level(logging.WARNING),
+        ):
+            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+
+        assert links.sent_types() == ["ReportRunEndedRequest"] * (lost + 1)
+        assert sum("attempt" in record.getMessage() for record in caplog.records) == lost
+
+    @pytest.mark.asyncio
+    async def test_a_notice_that_never_arrives_is_given_up_after_the_last_attempt(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        links = _host_engine(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        links.not_found = "gpu-01 did not answer."
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.worker_manager._RUN_ENDED_RETRY_PAUSE_S", new=0),
+            caplog.at_level(logging.WARNING),
+        ):
+            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+
+        assert len(links.sent) == _RUN_ENDED_ATTEMPTS
+        assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_notice_is_sent_to_an_engine_this_engine_has_no_session_with(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Such as one it withdrew its session from, or lost: that engine already let the run go."""
+        links = _host_engine(worker_manager)
+
+        await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+
+        assert links.sent == []
+
+    @pytest.mark.asyncio
+    async def test_retrying_stops_once_this_engine_has_no_session_with_that_engine(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        links.not_found = "gpu-01 did not answer."
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+
+        async def withdraw_meanwhile(_pause: float) -> None:
+            worker_manager._engine_registrations.clear()
+
+        with patch("griptape_nodes.retained_mode.managers.worker_manager.asyncio.sleep", new=withdraw_meanwhile):
+            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+
+        assert len(links.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_losing_that_engine_forgets_the_session_offered_to_it(self, worker_manager: WorkerManager) -> None:
+        links = _host_engine(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        _offer_session_to(worker_manager, "another-engine")
+
+        assert links.link_lost is not None
+        await links.link_lost(_HOST_ENGINE)
+
+        assert list(worker_manager._engine_registrations) == [("another-engine", _SESSION)]
+
+
 class TestAskingAnotherEngineToAdmitANode:
     @pytest.mark.asyncio
     async def test_the_admission_names_the_run_and_the_run_s_end_reaches_that_engine(
@@ -3984,6 +4083,7 @@ class TestAskingAnotherEngineToAdmitANode:
         links = _host_engine(worker_manager)
 
         run = _in_run(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
 
         admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
         await worker_manager.end_admission(admission)
