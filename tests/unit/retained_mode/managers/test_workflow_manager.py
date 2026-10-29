@@ -5788,6 +5788,8 @@ class TestReferencedWorkflowTagging:
             assert workflow_manager.get_current_referenced_workflow() == "workflow_x"
 
         assert not workflow_manager.has_current_referenced_workflow()
+        # Check reset() called in __exit__, which removes the variable from the Context
+        # instead of leaving an empty tuple.
         assert workflow_manager._referenced_workflow_stack not in contextvars.copy_context()
 
     def test_exiting_an_import_context_again_is_a_no_op(self, engine: Engine) -> None:
