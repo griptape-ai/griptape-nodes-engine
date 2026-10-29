@@ -4,6 +4,8 @@ The node still waits for its own result: it runs only when validation passes, an
 stops the run exactly as before.
 """
 
+from __future__ import annotations
+
 import asyncio
 import threading
 from typing import TYPE_CHECKING, cast
