@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from griptape_nodes.machines.dag_builder import NodeState
+from griptape_nodes.machines.dag_builder import DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ErrorState, ExecuteDagState
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
 from tests.unit.machines.scheduler_stubs import machine_running_one_node, node_stub
@@ -112,3 +112,37 @@ class TestValidationRunsOffTheEventLoop:
         release.set()
         held_node_execution.set()
         await asyncio.wait_for(driver, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_a_run_reset_while_a_node_validates_does_not_run_it(
+        self, held_node_execution: asyncio.Event, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        executed: list[str] = []
+
+        async def record(_engine: object, dag_node: DagNode) -> None:
+            executed.append(dag_node.node_reference.name)
+
+        monkeypatch.setattr(ExecuteDagState, "execute_node", record)
+        machine, release, _dag_builder = machine_running_one_node(max_nodes_in_parallel=2)
+        validating = threading.Event()
+        finish_validation = threading.Event()
+
+        def slow_validate() -> None:
+            validating.set()
+            finish_validation.wait(timeout=5)
+
+        injected = node_stub("injected")
+        injected.validate_before_node_run = MagicMock(side_effect=slow_validate)
+        driver = asyncio.create_task(machine.resolve_node())
+        machine.inject_node(injected)
+        await asyncio.to_thread(validating.wait, 5)
+
+        # What cancelling the flow does while the node is still being checked.
+        release.set()
+        machine.reset_machine(cancel=True)
+        finish_validation.set()
+        await asyncio.wait_for(driver, timeout=2)
+        held_node_execution.set()
+
+        assert executed == [], "a node whose run was cancelled during its checks must not run"
+        assert not machine.context.task_to_node, "no task may be left behind for the next run"
