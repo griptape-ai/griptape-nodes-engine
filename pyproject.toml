@@ -27,7 +27,6 @@ dependencies = [
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
-  "typer>=0.15.0",
   # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library
   # installs floor at the engine's version, so 2.x here fails them and marks them FLAWED (issue 5752).
   "huggingface-hub>=1.9.0,<2",
@@ -198,7 +197,7 @@ ignore = [
 # surface that separately-versioned callers bind to, so they have no Engine to be handed.
 "src/griptape_nodes/retained_mode/griptape_nodes.py" = ["TID251"]
 "src/griptape_nodes/retained_mode/retained_mode.py" = ["TID251"]
-"src/griptape_nodes/cli/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/managers/model_download_process.py" = ["TID251"]
 "src/griptape_nodes/api_client/**" = ["TID251"]
 "src/griptape_nodes/servers/**" = ["TID251"]
 "src/griptape_nodes/bootstrap/**" = ["TID251"]

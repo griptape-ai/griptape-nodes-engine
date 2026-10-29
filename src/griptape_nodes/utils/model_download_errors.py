@@ -1,6 +1,6 @@
 """Classification, wording, and subprocess wire format for model download failures.
 
-A download runs in a child process (`griptape_nodes.cli.commands.models download`),
+A download runs in a child process (`model_download_process`),
 so the exception is raised in one process and the message is shown by another. The
 child classifies the exception it caught and reports the verdict; the parent turns
 that verdict into the sentence the user reads. Both halves live here so the editor
