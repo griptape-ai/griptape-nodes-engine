@@ -162,8 +162,10 @@ class EngineAdmission:
     host_engine_id: str
     # The run on this engine the node belongs to, or None for a node run on its own.
     run_id: str | None
-    # The request asking for it, done once that engine has answered.
+    # The request asking for it, done once that engine has answered, or cancelled to give up on it.
     request_task: asyncio.Task[ResultPayload] | None = None
+    # Why it was given up, set before `request_task` is cancelled.
+    given_up: str | None = None
 
 
 @dataclass
@@ -259,6 +261,10 @@ class WorkerManager(EngineScoped):
 
         # This engine's registration with each engine it sends work to, by (host_engine_id, session).
         self._engine_registrations: dict[tuple[str, str], asyncio.Task[ResultPayload]] = {}
+
+        # Heartbeats unanswered by each engine there is a session with, and the one in flight to each.
+        self._engine_challenges_unanswered: dict[str, int] = {}
+        self._engine_challenges: dict[str, asyncio.Task[None]] = {}
 
         # Artists' sessions on other engines registered here, by session id.
         self._sessions: dict[str, _SessionRegistration] = {}
@@ -546,9 +552,13 @@ class WorkerManager(EngineScoped):
         return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
 
     async def orchestrator_heartbeat_loop(self) -> None:
-        """Challenge each registered worker on an interval; evict those that stop answering."""
+        """Challenge each registered worker, and each engine there is a session with, on an interval.
+
+        Evicts the workers, and loses the engines, that stop answering.
+        """
         while True:
             await asyncio.sleep(self.heartbeat_interval_s)
+            await self._challenge_engines()
             if not self._workers:
                 continue
 
@@ -1009,6 +1019,14 @@ class WorkerManager(EngineScoped):
             await self.end_admission(admission)
             msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
             raise RuntimeError(msg) from e
+        except asyncio.CancelledError:
+            if admission.given_up is None:
+                await self.end_admission(admission)
+                raise
+            # That engine is lost, so it is not told the node ended.
+            self._admissions.pop(admission.admission_id, None)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {admission.given_up}"
+            raise RuntimeError(msg) from None
         except BaseException:
             await self.end_admission(admission)
             raise
@@ -1962,6 +1980,74 @@ class WorkerManager(EngineScoped):
             return
         del self._managed_worker_processes[hosted.worker_key]
         await self._terminate_via_spawn_loop(hosted.worker_key, proc)
+
+    @handles(worker_events.EngineSessionHeartbeatRequest, sender=RequiredSender.ENGINE)
+    def handle_engine_session_heartbeat_request(
+        self, request: worker_events.EngineSessionHeartbeatRequest
+    ) -> worker_events.EngineSessionHeartbeatResultSuccess | worker_events.EngineSessionHeartbeatResultFailure:
+        """Answer another engine's heartbeat, saying whether a session between the two still exists."""
+        engine_id = require_request_sender().engine_id
+        if engine_id not in self._session_peers():
+            return worker_events.EngineSessionHeartbeatResultFailure(
+                result_details=f"This engine has no session with engine {engine_id}."
+            )
+        return worker_events.EngineSessionHeartbeatResultSuccess(result_details=f"Heartbeat {request.heartbeat_id}.")
+
+    def _session_peers(self) -> set[str]:
+        """The engines there is a session with: those this engine registered with, and those that offered it one."""
+        peers = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
+        peers.update(session.engine_id for session in self._sessions.values())
+        peers.discard(self.engine.get_engine_id())
+        return peers
+
+    async def _challenge_engines(self) -> None:
+        """Lose each engine there is a session with that left too many heartbeats unanswered, and challenge the rest.
+
+        Over Griptape Cloud nothing else reports another engine gone, and a node waiting for it to admit
+        the node would wait forever.
+        """
+        peers = self._session_peers()
+        for engine_id in [engine_id for engine_id in self._engine_challenges_unanswered if engine_id not in peers]:
+            del self._engine_challenges_unanswered[engine_id]
+        for engine_id in peers:
+            if self._engine_challenges_unanswered.get(engine_id, 0) >= self.unanswered_challenges_allowed:
+                await self._lose_engine(engine_id, f"engine {engine_id} stopped answering heartbeats.")
+                continue
+            if engine_id in self._engine_challenges:
+                continue
+            task = asyncio.get_running_loop().create_task(self._challenge_engine(engine_id))
+            self._engine_challenges[engine_id] = task
+            task.add_done_callback(lambda _task, engine_id=engine_id: self._engine_challenges.pop(engine_id, None))
+
+    async def _challenge_engine(self, engine_id: str) -> None:
+        self._engine_challenges_unanswered[engine_id] = self._engine_challenges_unanswered.get(engine_id, 0) + 1
+        request = worker_events.EngineSessionHeartbeatRequest(heartbeat_id=str(uuid.uuid4()))
+        try:
+            result = await self.engine.request(engine_id, request, timeout_s=self.heartbeat_interval_s)
+        except EngineNotFoundError as e:
+            logger.debug("Engine %s did not answer a heartbeat: %s", engine_id, e)
+            return
+        if isinstance(result, worker_events.EngineSessionHeartbeatResultSuccess):
+            self._engine_challenges_unanswered[engine_id] = 0
+            return
+        # It is there but forgot the session, as after it restarted, so nothing waiting on it will be answered.
+        await self._lose_engine(engine_id, f"engine {engine_id} no longer has a session with this engine.")
+
+    async def _lose_engine(self, engine_id: str, reason: str) -> None:
+        """Settle what a session with `engine_id` left behind, as when the connection to it is lost."""
+        logger.warning("Lost engine %s: %s", engine_id, reason)
+        self._engine_challenges_unanswered.pop(engine_id, None)
+        for admission in self._admissions.values():
+            if admission.host_engine_id != engine_id or admission.request_task is None:
+                continue
+            if admission.request_task.done():
+                continue
+            admission.given_up = reason
+            admission.request_task.cancel()
+        # Registered again by the next start, as an engine that restarted needs.
+        for key in [key for key in self._engine_registrations if key[0] == engine_id]:
+            del self._engine_registrations[key]
+        await self.on_engine_lost(engine_id)
 
     async def on_engine_lost(self, engine_id: str) -> None:
         """Settle the starts sent to an engine whose connection was lost, or forget an artist's engine whose connection was.

@@ -470,3 +470,31 @@ class DropLibraryNamedLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultP
 @PayloadRegistry.register
 class DropLibraryNamedLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The worker failed while releasing what its libraries kept between runs."""
+
+
+@dataclass
+@PayloadRegistry.register
+class EngineSessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
+    """Sent on an interval by each of two engines with a session between them, to tell the other is still there.
+
+    The artist's engine sends it to each engine it registered a session with, and that engine to each engine
+    that offered it one. One that stops answering, or answers that it knows of no session, is lost.
+
+    Args:
+        heartbeat_id: Correlation token, named in the log.
+    """
+
+    heartbeat_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class EngineSessionHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine is there, and a session between the two engines is too."""
+
+
+@dataclass
+@PayloadRegistry.register
+class EngineSessionHeartbeatResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine is there but has no session with the engine that asked, as after it restarted."""

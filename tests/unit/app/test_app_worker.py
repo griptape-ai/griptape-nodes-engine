@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
-from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 
@@ -2453,6 +2453,8 @@ class _FakeEngineTransports:
         self.refuse = refuse or {}
         self.answers: dict[str, list[dict]] = {}
         self.not_found: str | None = None
+        # Request types the other engine never answers, which fail as a request that timed out.
+        self.unanswered: set[str] = set()
         self.blocked: dict[str, asyncio.Event] = {}
         self.arrived: dict[str, asyncio.Event] = {}
         self.link_lost: Callable[[str], Awaitable[None]] | None = None
@@ -2471,6 +2473,9 @@ class _FakeEngineTransports:
         if self.not_found is not None:
             raise EngineNotFoundError(self.not_found)
         request_type = type(request).__name__
+        if request_type in self.unanswered:
+            msg = f"engine {engine_id} did not answer within {timeout_s} seconds."
+            raise EngineNotFoundError(msg)
         self.arrived.setdefault(request_type, asyncio.Event()).set()
         if request_type in self.blocked:
             await self.blocked[request_type].wait()
@@ -4037,3 +4042,85 @@ class TestAskingAnotherEngineToAdmitANode:
             await worker_manager.wait_until_executable(_LIBRARY)
 
         start.assert_not_awaited()
+
+
+async def _sweep_engines(worker_manager: WorkerManager, times: int) -> None:
+    """Run the engine half of the heartbeat sweep `times` times, letting each challenge finish."""
+    for _ in range(times):
+        await worker_manager._challenge_engines()
+        await asyncio.gather(*worker_manager._engine_challenges.values())
+        await _settle()
+
+
+class TestEngineSessionHeartbeats:
+    @pytest.mark.asyncio
+    async def test_an_engine_with_a_session_is_answered_and_a_stranger_is_not(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        heartbeat = worker_events.EngineSessionHeartbeatRequest(heartbeat_id="hb")
+
+        known = await _dispatched_by(worker_manager, _ARTIST, heartbeat)
+        stranger = await _dispatched_by(worker_manager, RequestSender(engine_id="stranger", session_id=None), heartbeat)
+
+        assert isinstance(known.result, worker_events.EngineSessionHeartbeatResultSuccess)
+        assert isinstance(stranger.result, worker_events.EngineSessionHeartbeatResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_an_engine_that_stops_answering_is_lost_and_the_node_waiting_on_it_fails(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Over Griptape Cloud nothing else reports it gone, and the node would wait forever."""
+        links = _host_engine(worker_manager)
+        await _start_on_host_engine(worker_manager)
+        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
+        links.unanswered.add("EngineSessionHeartbeatRequest")
+
+        with patch.object(WorkerManager, "unanswered_challenges_allowed", new_callable=PropertyMock, return_value=2):
+            await _sweep_engines(worker_manager, 3)
+
+        with pytest.raises(RuntimeError, match="stopped answering heartbeats"):
+            await asyncio.wait_for(admitting, timeout=1.0)
+        assert worker_manager._admissions == {}
+        assert worker_manager._engine_registrations == {}
+        assert "NodeExecutionEndedRequest" not in links.sent_types()
+
+    @pytest.mark.asyncio
+    async def test_an_engine_that_answers_is_kept(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        await _start_on_host_engine(worker_manager)
+
+        with patch.object(WorkerManager, "unanswered_challenges_allowed", new_callable=PropertyMock, return_value=2):
+            await _sweep_engines(worker_manager, 4)
+
+        assert worker_manager._engine_registrations != {}
+        assert worker_manager._engine_challenges_unanswered == {_HOST_ENGINE: 0}
+
+    @pytest.mark.asyncio
+    async def test_an_engine_that_forgot_the_session_is_lost_at_once(self, worker_manager: WorkerManager) -> None:
+        """As after it restarted: nothing this engine waits on there will be answered."""
+        links = _host_engine(worker_manager, refuse={"EngineSessionHeartbeatRequest": "no session"})
+        await _start_on_host_engine(worker_manager)
+        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        await _settle()
+
+        await _sweep_engines(worker_manager, 1)
+
+        with pytest.raises(RuntimeError, match="no longer has a session"):
+            await asyncio.wait_for(admitting, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_an_artist_s_engine_that_stops_answering_is_forgotten(self, worker_manager: WorkerManager) -> None:
+        """Its runs here let this engine go and its workers stop, as when its connection is lost."""
+        links = _host_engine(worker_manager)
+        _register_session(worker_manager)
+        links.unanswered.add("EngineSessionHeartbeatRequest")
+
+        with patch.object(WorkerManager, "unanswered_challenges_allowed", new_callable=PropertyMock, return_value=2):
+            await _sweep_engines(worker_manager, 3)
+
+        assert worker_manager._sessions == {}
