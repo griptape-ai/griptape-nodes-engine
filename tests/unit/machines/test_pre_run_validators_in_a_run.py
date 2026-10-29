@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
-from griptape_nodes.exe_types import input_checks
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
@@ -19,6 +18,7 @@ from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.fsm import WorkflowState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
+from griptape_nodes.utils import media_probe
 from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import image_file
 
@@ -116,8 +116,8 @@ def slow_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
     def run(cmd: list[str], **kwargs: Any) -> None:
         raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
-    monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-    monkeypatch.setattr(input_checks.subprocess, "run", run)
+    monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+    monkeypatch.setattr(media_probe.subprocess, "run", run)
 
 
 @pytest.mark.asyncio

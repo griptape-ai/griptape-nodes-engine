@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from griptape_nodes.exe_types.input_checks import ImageInfo
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators._checks import check_count
+from griptape_nodes.exe_types.validators._checks import check_count, input_subject
 from griptape_nodes.exe_types.validators._media_checks import (
     check_aspect_ratio_exact,
     check_aspect_ratio_range,
@@ -19,6 +18,7 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_size,
     check_video_codec,
 )
+from griptape_nodes.utils.media_probe import ImageInfo
 
 SUBJECT = "Image 2 in 'reference images'"
 DOCS = "https://example.com/limits"
@@ -510,3 +510,15 @@ class TestCheckDuration:
     def test_uses_the_given_fix(self) -> None:
         error = check_duration(20, subject="The video in 'Video'", maximum=10, fix="Pick a shorter clip.")
         assert str(error).endswith("Pick a shorter clip.")
+
+
+class TestInputSubject:
+    def test_names_a_position_in_a_list(self) -> None:
+        assert input_subject("reference images", noun="image", position=2) == SUBJECT
+
+    def test_names_a_single_input(self) -> None:
+        assert input_subject("start frame", noun="image") == "The image in 'start frame'"
+
+    def test_keeps_a_nouns_own_capitals_at_a_position(self) -> None:
+        assert input_subject("icons", noun="SVG icon", position=2) == "SVG icon 2 in 'icons'"
+        assert input_subject("loras", noun="LoRA file", position=1) == "LoRA file 1 in 'loras'"

@@ -1,7 +1,7 @@
 """Running a node's pre-run checks at its turn, before it runs.
 
 The resolution machine calls `validate_node`, in a worker thread, which runs the node's declared
-validators and then its `validate_before_node_run` inside one `input_check_readings`, and returns
+validators and then its `validate_before_node_run` inside one `reading_once`, and returns
 both methods' errors together.
 """
 
@@ -10,8 +10,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import ParameterList
-from griptape_nodes.exe_types.input_checks import input_check_readings, input_subject, read_media
-from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, holds_list, media_kind_of, needs_for_kind
+from griptape_nodes.exe_types.validators._checks import input_subject
+from griptape_nodes.exe_types.validators.base import holds_list, media_kind_of, needs_for_kind
+from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, read_media, reading_once
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -32,10 +33,10 @@ _DEFAULT_NOUN = "input"
 def validate_node(node: BaseNode) -> list[Exception]:
     """Run a node's declared validators, then its `validate_before_node_run`, and return their errors.
 
-    Both run inside one `input_check_readings`, so each input is read once for the validators and
+    Both run inside one `reading_once`, so each input is read once for the validators and
     the node's own checks together.
     """
-    with input_check_readings():
+    with reading_once():
         errors: list[Exception] = [*validate_inputs(node)]
         errors.extend(node.validate_before_node_run() or [])
     return errors

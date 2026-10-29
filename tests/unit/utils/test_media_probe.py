@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import sys
+import typing
 from io import BytesIO
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -19,21 +20,21 @@ from griptape.artifacts import ImageArtifact, ImageUrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 from PIL import Image, PngImagePlugin, features
 
-from griptape_nodes.exe_types import input_checks
-from griptape_nodes.exe_types.input_checks import (
+from griptape_nodes.utils import media_probe
+from griptape_nodes.utils.media_probe import (
     AudioProbe,
     ImageInfo,
+    MediaInfo,
+    MediaNeed,
     VideoProbe,
-    input_check_readings,
-    input_subject,
     local_audio_probe,
     local_image_format,
     local_image_info,
     local_size_bytes,
     local_video_probe,
     read_media,
+    reading_once,
 )
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed
 from tests.unit.exe_types.validators.media_files import HEIC_PHOTO
 
 if TYPE_CHECKING:
@@ -78,18 +79,6 @@ def _data_uri(data: bytes, mime_type: str = "image/png") -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode()}"
 
 
-class TestInputSubject:
-    def test_names_a_position_in_a_list(self) -> None:
-        assert input_subject("reference images", noun="image", position=2) == SUBJECT
-
-    def test_names_a_single_input(self) -> None:
-        assert input_subject("start frame", noun="image") == "The image in 'start frame'"
-
-    def test_keeps_a_nouns_own_capitals_at_a_position(self) -> None:
-        assert input_subject("icons", noun="SVG icon", position=2) == "SVG icon 2 in 'icons'"
-        assert input_subject("loras", noun="LoRA file", position=1) == "LoRA file 1 in 'loras'"
-
-
 class TestLocalSizeBytes:
     @pytest.mark.parametrize("length", [1, 2, 3, 100, 1001])
     def test_measures_a_data_uri_exactly(self, length: int) -> None:
@@ -122,7 +111,7 @@ class TestLocalSizeBytes:
     def test_skips_a_file_it_cannot_stat(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         path = tmp_path / "image.png"
         path.write_bytes(b"x" * 10)
-        monkeypatch.setattr(input_checks, "_local_path", lambda _location: tmp_path / "deleted-since.png")
+        monkeypatch.setattr(media_probe, "_local_path", lambda _location: tmp_path / "deleted-since.png")
         assert local_size_bytes(str(path), kind="image") is None
 
     def test_skips_an_empty_value(self) -> None:
@@ -192,7 +181,7 @@ class TestLocalImageInfo:
             msg = "Unimplemented DXGI format 10"
             raise NotImplementedError(msg)
 
-        monkeypatch.setattr(input_checks.Image, "open", unimplemented)
+        monkeypatch.setattr(media_probe.Image, "open", unimplemented)
         assert local_image_info(_data_uri(_png_bytes(8, 8))) is None
 
     def test_skips_bytes_that_are_not_an_image(self) -> None:
@@ -205,7 +194,7 @@ class TestLocalImageInfo:
             msg = "EXIF IFD runs past the end of the file"
             raise SyntaxError(msg)
 
-        monkeypatch.setattr(input_checks.Image.Image, "getexif", broken_exif)
+        monkeypatch.setattr(media_probe.Image.Image, "getexif", broken_exif)
         assert local_image_info(image) == ImageInfo(400, 300, "image/jpeg")
 
     def test_skips_a_data_uri_whose_payload_is_not_base64(self) -> None:
@@ -296,7 +285,7 @@ class TestLocalVideoDuration:
         def fetch(*_args: Any, **_kwargs: Any) -> None:
             pytest.fail("a pre-run input check must never fetch ffmpeg")
 
-        monkeypatch.setattr(input_checks.static_ffmpeg_run, "get_or_fetch_platform_executables_else_raise", fetch)
+        monkeypatch.setattr(media_probe.static_ffmpeg_run, "get_or_fetch_platform_executables_else_raise", fetch)
 
     @pytest.fixture
     def clip(self, tmp_path: Path) -> Path:
@@ -313,15 +302,15 @@ class TestLocalVideoDuration:
             runs.append({"cmd": cmd, **kwargs})
             return SimpleNamespace(stdout=json.dumps({"format": {"duration": "9.5"}}))
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", fake_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", fake_run)
         return runs
 
     def test_probes_a_local_file_with_a_short_timeout(self, clip: Path, ffprobe_runs: list[dict[str, Any]]) -> None:
         assert _probed_seconds(VideoUrlArtifact(value=str(clip))) == 9.5
         assert ffprobe_runs[0]["cmd"][0] == "/usr/bin/ffprobe"
         assert ffprobe_runs[0]["cmd"][-1] == str(clip)
-        assert ffprobe_runs[0]["timeout"] == input_checks.FFPROBE_TIMEOUT_SECONDS
+        assert ffprobe_runs[0]["timeout"] == media_probe.FFPROBE_TIMEOUT_SECONDS
 
     def test_decodes_ffprobe_output_as_utf8(self, clip: Path, ffprobe_runs: list[dict[str, Any]]) -> None:
         # ffprobe echoes the file name in UTF-8; decoding with Windows' code page fails on a non-Latin one.
@@ -332,8 +321,8 @@ class TestLocalVideoDuration:
         def slow_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", slow_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", slow_run)
 
         assert _probed_seconds(str(clip)) is None
 
@@ -341,14 +330,14 @@ class TestLocalVideoDuration:
         def failing_run(cmd: list[str], **_kwargs: Any) -> SimpleNamespace:
             raise subprocess.CalledProcessError(1, cmd, stderr="Invalid data found")
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", failing_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", failing_run)
 
         assert _probed_seconds(str(clip)) is None
 
     def test_skips_when_ffprobe_is_not_installed(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: None)
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: pytest.fail("ffprobe must not run"))
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: None)
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: pytest.fail("ffprobe must not run"))
 
         assert _probed_seconds(str(clip)) is None
 
@@ -361,16 +350,16 @@ class TestLocalVideoDuration:
     def test_skips_when_ffprobe_prints_no_json_object(
         self, clip: Path, monkeypatch: pytest.MonkeyPatch, stdout: str
     ) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=stdout))
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=stdout))
         assert _probed_seconds(str(clip)) is None
 
     def test_skips_a_probe_that_times_out(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         def slow_run(cmd: list[str], **kwargs: Any) -> None:
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", slow_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", slow_run)
         assert _probed_seconds(str(clip)) is None
 
     def test_skips_a_path_it_cannot_resolve(self, ffprobe_runs: list[dict[str, Any]]) -> None:
@@ -393,16 +382,16 @@ class TestProbeTimeouts:
         def slow_run(cmd: list[str], **kwargs: Any) -> None:
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", slow_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", slow_run)
 
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_skips_and_logs_a_probe_that_times_out(self, clip: Path, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"), input_check_readings():
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"), reading_once():
             info = read_media(str(clip), {MediaNeed.VIDEO}, kind="video")
         assert info.video is None
         assert any(
-            f"ffprobe took longer than {input_checks.FFPROBE_TIMEOUT_SECONDS:g} seconds" in record.getMessage()
+            f"ffprobe took longer than {media_probe.FFPROBE_TIMEOUT_SECONDS:g} seconds" in record.getMessage()
             and str(clip) in record.getMessage()
             for record in caplog.records
         )
@@ -453,8 +442,8 @@ class TestLocalVideoProbe:
             runs.append(cmd)
             return SimpleNamespace(stdout=json.dumps(output))
 
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", fake_run)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", fake_run)
         return runs
 
     def test_reads_the_frame_count_a_file_records(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -535,7 +524,7 @@ class TestLocalVideoProbe:
         assert local_video_probe(str(clip)) == VideoProbe(info=None, seconds=4.0, fps=None, container_seconds=4.0)
 
     def test_skips_when_ffprobe_is_not_installed(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: None)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: None)
         assert local_video_probe(str(clip)) is None
 
     def test_skips_a_remote_video(self) -> None:
@@ -562,9 +551,9 @@ class TestLocalVideoInfo:
         return path
 
     def _answer(self, monkeypatch: pytest.MonkeyPatch, stream: dict[str, Any]) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
         monkeypatch.setattr(
-            input_checks.subprocess,
+            media_probe.subprocess,
             "run",
             lambda *_a, **_k: SimpleNamespace(stdout=json.dumps({"streams": [stream]})),
         )
@@ -598,7 +587,7 @@ class TestLocalVideoInfo:
         assert _probed_frame(str(clip)) == ImageInfo(1080, 1920, None)
 
     def test_skips_when_ffprobe_is_not_installed(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: None)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: None)
         assert _probed_frame(str(clip)) is None
 
     def test_skips_a_remote_video(self) -> None:
@@ -611,10 +600,10 @@ class TestInstalledFfprobe:
         def fetch(*_args: Any, **_kwargs: Any) -> None:
             pytest.fail("a pre-run input check must never fetch ffmpeg")
 
-        monkeypatch.setattr(input_checks.static_ffmpeg_run, "get_or_fetch_platform_executables_else_raise", fetch)
+        monkeypatch.setattr(media_probe.static_ffmpeg_run, "get_or_fetch_platform_executables_else_raise", fetch)
 
     def _platform_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exe_name: str = "ffprobe") -> Path:
-        monkeypatch.setattr(input_checks.static_ffmpeg_run, "get_platform_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(media_probe.static_ffmpeg_run, "get_platform_dir", lambda: str(tmp_path))
         (tmp_path / exe_name).write_bytes(b"")
         return tmp_path
 
@@ -622,37 +611,37 @@ class TestInstalledFfprobe:
     def test_uses_a_finished_static_ffmpeg_install(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, exe_name: str
     ) -> None:
-        monkeypatch.setattr(input_checks.sys, "platform", platform)
+        monkeypatch.setattr(media_probe.sys, "platform", platform)
         platform_dir = self._platform_dir(tmp_path, monkeypatch, exe_name)
         (platform_dir / "installed.crumb").write_text("installed")
-        assert input_checks._installed_ffprobe() == str(platform_dir / exe_name)
+        assert media_probe._installed_ffprobe() == str(platform_dir / exe_name)
 
     def test_ignores_an_unfinished_static_ffmpeg_install(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._platform_dir(tmp_path, monkeypatch)
-        monkeypatch.setattr(input_checks.shutil, "which", lambda _name: None)
-        assert input_checks._installed_ffprobe() is None
+        monkeypatch.setattr(media_probe.shutil, "which", lambda _name: None)
+        assert media_probe._installed_ffprobe() is None
 
     def test_falls_back_to_ffprobe_on_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._platform_dir(tmp_path, monkeypatch)
-        monkeypatch.setattr(input_checks.shutil, "which", lambda _name: "/opt/bin/ffprobe")
-        assert input_checks._installed_ffprobe() == "/opt/bin/ffprobe"
+        monkeypatch.setattr(media_probe.shutil, "which", lambda _name: "/opt/bin/ffprobe")
+        assert media_probe._installed_ffprobe() == "/opt/bin/ffprobe"
 
     def test_falls_back_to_path_when_static_ffmpeg_has_no_directory(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def no_dir() -> str:
             msg = "Read-only file system"
             raise OSError(msg)
 
-        monkeypatch.setattr(input_checks.static_ffmpeg_run, "get_platform_dir", no_dir)
-        monkeypatch.setattr(input_checks.shutil, "which", lambda _name: "/opt/bin/ffprobe")
-        assert input_checks._installed_ffprobe() == "/opt/bin/ffprobe"
+        monkeypatch.setattr(media_probe.static_ffmpeg_run, "get_platform_dir", no_dir)
+        monkeypatch.setattr(media_probe.shutil, "which", lambda _name: "/opt/bin/ffprobe")
+        assert media_probe._installed_ffprobe() == "/opt/bin/ffprobe"
 
     def test_falls_back_to_path_when_a_finished_install_lacks_ffprobe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(input_checks.static_ffmpeg_run, "get_platform_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(media_probe.static_ffmpeg_run, "get_platform_dir", lambda: str(tmp_path))
         (tmp_path / "installed.crumb").write_text("installed")
-        monkeypatch.setattr(input_checks.shutil, "which", lambda _name: "/opt/bin/ffprobe")
-        assert input_checks._installed_ffprobe() == "/opt/bin/ffprobe"
+        monkeypatch.setattr(media_probe.shutil, "which", lambda _name: "/opt/bin/ffprobe")
+        assert media_probe._installed_ffprobe() == "/opt/bin/ffprobe"
 
 
 class TestVideoEncoding:
@@ -682,7 +671,7 @@ class TestVideoEncoding:
     ) -> None:
         tags = {} if brand is None else {"major_brand": brand}
         data = {"format": {"format_name": demuxer, "tags": tags}, "streams": [{"codec_name": codec}]}
-        assert input_checks._video_mime_type(data) == expected
+        assert media_probe._video_mime_type(data) == expected
 
     @pytest.mark.parametrize(
         ("header", "codec", "expected"),
@@ -699,12 +688,12 @@ class TestVideoEncoding:
         path = tmp_path / "clip.mkv"
         path.write_bytes(header + b"\x00" * 32)
         data: dict[str, Any] = {"format": {"format_name": "matroska,webm"}, "streams": [{"codec_name": codec}]}
-        input_checks._record_matroska_doctype(data, path)
-        assert input_checks._video_mime_type(data) == expected
+        media_probe._record_matroska_doctype(data, path)
+        assert media_probe._video_mime_type(data) == expected
 
     def test_falls_back_to_the_codec_when_the_doctype_is_unread(self) -> None:
         data = {"format": {"format_name": "matroska,webm"}, "streams": [{"codec_name": "vp9"}]}
-        assert input_checks._video_mime_type(data) == "video/webm"
+        assert media_probe._video_mime_type(data) == "video/webm"
 
     @pytest.mark.parametrize(
         "header",
@@ -716,24 +705,24 @@ class TestVideoEncoding:
         ids=["no-size", "long-size", "truncated"],
     )
     def test_reads_no_doctype_from_a_header_it_cannot_parse(self, header: bytes) -> None:
-        assert input_checks._matroska_doctype(header) is None
+        assert media_probe._matroska_doctype(header) is None
 
     def test_leaves_the_doctype_unread_when_the_file_is_gone(self, tmp_path: Path) -> None:
         data: dict[str, Any] = {"format": {"format_name": "matroska,webm"}, "streams": [{"codec_name": "vp9"}]}
-        input_checks._record_matroska_doctype(data, tmp_path / "deleted-since.mkv")
-        assert input_checks._DOCTYPE_KEY not in data["format"]
-        assert input_checks._video_mime_type(data) == "video/webm"
+        media_probe._record_matroska_doctype(data, tmp_path / "deleted-since.mkv")
+        assert media_probe._DOCTYPE_KEY not in data["format"]
+        assert media_probe._video_mime_type(data) == "video/webm"
 
     def test_reads_a_3g2_brand_as_3gpp2(self) -> None:
         data = {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "tags": {"major_brand": "3g2a"}}}
-        assert input_checks._video_mime_type(data) == "video/3gpp2"
+        assert media_probe._video_mime_type(data) == "video/3gpp2"
 
     @pytest.mark.parametrize(
         ("demuxer", "expected"), [("mxf", "application/mxf"), ("dv", "video/dv"), ("ogg", "video/ogg")]
     )
     def test_names_more_video_containers(self, demuxer: str, expected: str) -> None:
         data = {"format": {"format_name": demuxer}, "streams": [{"codec_name": "mpeg2video"}]}
-        assert input_checks._video_mime_type(data) == expected
+        assert media_probe._video_mime_type(data) == expected
 
     def test_reads_a_matroska_streams_duration_from_its_tag(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -748,19 +737,19 @@ class TestVideoEncoding:
                 "format": {"format_name": "matroska,webm", "duration": "10.0"},
             }
         )
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
         probe = local_video_probe(str(clip))
         assert probe is not None
         assert probe.seconds == pytest.approx(3.023)
         assert probe.container_seconds == 10.0
 
     def test_reads_a_duration_tag_named_for_its_language(self) -> None:
-        assert input_checks._stream_seconds({"tags": {"DURATION-eng": "00:00:03.500000000"}}) == pytest.approx(3.5)
+        assert media_probe._stream_seconds({"tags": {"DURATION-eng": "00:00:03.500000000"}}) == pytest.approx(3.5)
 
     @pytest.mark.parametrize("tag", ["N/A", "", "1:2", "bad", "-00:00:01.0", "00:00:inf", "00:00:nan"])
     def test_ignores_a_duration_tag_that_isnt_a_clock_time(self, tag: str) -> None:
-        assert input_checks._stream_seconds({"tags": {"DURATION": tag}}) is None
+        assert media_probe._stream_seconds({"tags": {"DURATION": tag}}) is None
 
     @pytest.mark.parametrize(
         ("width", "height", "sar", "displayed"),
@@ -770,17 +759,17 @@ class TestVideoEncoding:
         self, width: int, height: int, sar: str, displayed: tuple[int, int]
     ) -> None:
         data = {"streams": [{"width": width, "height": height, "sample_aspect_ratio": sar}]}
-        assert input_checks._display_frame_size(data) == ImageInfo(*displayed, None)
+        assert media_probe._display_frame_size(data) == ImageInfo(*displayed, None)
 
     @pytest.mark.parametrize("sar", ["1:1", "0:1", "N/A", None])
     def test_has_no_displayed_shape_for_square_or_unknown_pixels(self, sar: str | None) -> None:
         data = {"streams": [{"width": 1920, "height": 1080, "sample_aspect_ratio": sar}]}
-        assert input_checks._display_frame_size(data) is None
+        assert media_probe._display_frame_size(data) is None
 
     def test_scales_the_upright_height_of_a_rotated_anamorphic_frame(self) -> None:
         # Turned upright, 1440x1080 is 1080x1440, and its 4:3 pixels stretch the 1440 side.
         data = {"streams": [{"width": 1440, "height": 1080, "sample_aspect_ratio": "4:3", "tags": {"rotate": "90"}}]}
-        assert input_checks._display_frame_size(data) == ImageInfo(1080, 1920, None)
+        assert media_probe._display_frame_size(data) == ImageInfo(1080, 1920, None)
 
 
 class TestAudio:
@@ -792,9 +781,9 @@ class TestAudio:
 
     def _answer(self, monkeypatch: pytest.MonkeyPatch, stream: dict[str, Any], format_info: dict[str, Any]) -> None:
         """Pretend ffprobe is installed and answers with one audio stream and this container."""
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
         answer = json.dumps({"streams": [stream], "format": format_info})
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
 
     @pytest.mark.parametrize(
         ("demuxer", "brand", "expected"),
@@ -841,27 +830,27 @@ class TestAudio:
         assert probe.profile is None
 
     def test_reads_nothing_from_a_file_with_no_audio(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
         answer = json.dumps({"streams": [], "format": {"format_name": "mp4"}})
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
         assert local_audio_probe(str(clip)) is None
 
     @pytest.mark.parametrize("format_info", [None, {}, {"format_name": 3}], ids=["no-format", "no-name", "not-text"])
     def test_reads_no_container_when_ffprobe_names_none(
         self, clip: Path, monkeypatch: pytest.MonkeyPatch, format_info: Any
     ) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
         output: dict[str, Any] = {"streams": [{"codec_name": "mp3", "duration": "3.0"}]}
         if format_info is not None:
             output["format"] = format_info
         answer = json.dumps(output)
-        monkeypatch.setattr(input_checks.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
+        monkeypatch.setattr(media_probe.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=answer))
         probe = local_audio_probe(str(clip))
         assert probe is not None
         assert (probe.mime_type, probe.codec, probe.seconds) == (None, "mp3", 3.0)
 
     def test_skips_audio_when_ffprobe_is_not_installed(self, clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: None)
+        monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: None)
         assert local_audio_probe(str(clip)) is None
 
     @pytest.mark.parametrize(("brand", "expected"), [("3gp5", "audio/3gpp"), ("3g2a", "audio/3gpp2")])
@@ -927,3 +916,22 @@ class TestAudio:
         probe = local_audio_probe(str(clip))
         assert probe is not None
         assert probe.mime_type == expected
+
+
+class TestLayering:
+    """The probe sits below the validators: they read with it, and it imports nothing of theirs."""
+
+    def test_resolves_mediainfos_type_hints_at_runtime(self) -> None:
+        hints = typing.get_type_hints(media_probe.MediaInfo)
+        assert hints["image"] == media_probe.ImageInfo | None
+        assert hints["video"] == media_probe.VideoProbe | None
+
+    def test_imports_without_the_validators(self) -> None:
+        code = (
+            "import sys\n"
+            "import griptape_nodes.utils.media_probe\n"
+            "assert not any(name.startswith('griptape_nodes.exe_types.validators') for name in sys.modules), "
+            "sorted(name for name in sys.modules if 'validators' in name)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)  # noqa: S603
+        assert result.returncode == 0, result.stderr

@@ -1,10 +1,7 @@
-"""Reading a media input's properties locally, for the pre-run validators and a node's own checks.
+"""Reading an image, video or audio input's properties on this machine, without changing it.
 
-A request a provider is certain to reject still costs the artist an upload and a wait, and sometimes
-credits. A node declares the limits on its parameters with `pre_run_validators=` (see
-`griptape_nodes.exe_types.validators`), and the engine checks them at the node's turn, before it
-runs. This module reads what they check, and a custom validator or a node's own
-`validate_before_node_run` can read with it too:
+The pre-run validators in `griptape_nodes.exe_types.validators` judge what this module reads, and a
+node's own `validate_before_node_run` can read with it too, for a rule across several inputs:
 
 - **Readers** (`local_size_bytes`, `local_image_info`, `local_image_format`, `local_video_probe`,
   `local_audio_probe`) read a media input's properties from data already on this machine. `local_video_probe` reads a
@@ -12,16 +9,13 @@ runs. This module reads what they check, and a custom validator or a node's own
   `local_audio_probe` an audio input's container, codec and durations. None of them makes a network
   call or downloads a tool: the video and audio readers use ffprobe only if it is already
   installed. They return None when the value is a remote URL, can't be found or parsed, or when the
-  tool to read it is missing or too slow. Inside `input_check_readings`, which the engine opens
-  around each node's checks, each reader reads a location once and returns the same result after.
-  A probe that runs out of time is logged as a warning and skipped, like any other input that
-  can't be read here.
-- **`read_media`** takes the readings a set of validators needs from one value, in one call.
+  tool to read it is missing or too slow. During a node's checks, each reader reads a location once
+  and returns the same result after. A probe that runs out of time is logged as a warning and
+  skipped, like any other input that can't be read here.
+- **`MediaInfo`** holds what was read of one value, and **`MediaNeed`** names one reading.
 
-The validators in `griptape_nodes.exe_types.validators` compare these readings with a provider's
-limits and write the messages.
-
-A limit is enforced only where it can be read cheaply; anything else is left for the provider.
+`reading_once` and `read_media` are for the engine's validation runner, which opens one around each
+node's checks; they are not in `__all__`. Nothing here depends on the validators.
 """
 
 from __future__ import annotations
@@ -36,6 +30,8 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -43,8 +39,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from PIL import Image, UnidentifiedImageError
 from static_ffmpeg import run as static_ffmpeg_run
 
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed
-from griptape_nodes.files.file import File, FileLoadError
 from griptape_nodes.files.path_utils import is_url
 from griptape_nodes.utils.media_values import MediaKind, coerce_media_url_or_data_uri
 
@@ -54,17 +48,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 __all__ = [
+    "EMPTY_MEDIA",
     "AudioProbe",
     "ImageInfo",
+    "MediaInfo",
+    "MediaNeed",
     "VideoProbe",
-    "input_check_readings",
-    "input_subject",
     "local_audio_probe",
     "local_image_format",
     "local_image_info",
     "local_size_bytes",
     "local_video_probe",
-    "read_media",
 ]
 
 
@@ -89,9 +83,19 @@ _QUARTER_TURN_ORIENTATIONS = frozenset({5, 6, 7, 8})
 _QUARTER_TURN_DEGREES = 90
 _HALF_TURN_DEGREES = 180
 
-# What the readers have read in the current `input_check_readings` block, by reader and location, or
+
+class MediaNeed(StrEnum):
+    """One reading of a media value: its size, or its image, video or audio properties."""
+
+    SIZE = "size"
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+
+
+# What the readers have read in the current `reading_once` block, by reader and location, or
 # None outside one. A reading that came back None is kept too, so an unreadable input isn't retried.
-_readings: ContextVar[dict[tuple[MediaNeed, str], Any] | None] = ContextVar("input_check_readings", default=None)
+_readings: ContextVar[dict[tuple[MediaNeed, str], Any] | None] = ContextVar("media_probe_readings", default=None)
 
 
 class ImageInfo(NamedTuple):
@@ -102,21 +106,8 @@ class ImageInfo(NamedTuple):
     mime_type: str | None
 
 
-def input_subject(parameter: str, *, noun: str, position: int | None = None) -> str:
-    """The start of a message naming one input, such as "Image 2 in 'reference images'".
-
-    Args:
-        parameter: The parameter's name as the UI shows it.
-        noun: What the input is, such as "image" or "video".
-        position: The input's 1-based position in a list parameter, or None for a single input.
-    """
-    if position is None:
-        return f"The {noun} in '{parameter}'"
-    return f"{noun[:1].upper()}{noun[1:]} {position} in '{parameter}'"
-
-
 @contextmanager
-def input_check_readings() -> Iterator[None]:
+def reading_once() -> Iterator[None]:
     """Read each media location at most once per reader inside this block.
 
     The engine opens one around each node's pre-run checks, so the validators on a parameter and
@@ -150,7 +141,7 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
     """
     location = coerce_media_url_or_data_uri(value, kind=kind)
     if not location:
-        return MediaInfo()
+        return EMPTY_MEDIA
     size_bytes = None
     image = None
     image_format = None
@@ -172,11 +163,12 @@ def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> 
         image_format=image_format,
         video=video,
         audio=audio,
+        location=location,
     )
 
 
 def _read_once(reader: MediaNeed, location: str, read: Callable[[str], Any]) -> Any:
-    """`read(location)`, or what it returned before in the current `input_check_readings` block."""
+    """`read(location)`, or what it returned before in the current `reading_once` block."""
     readings = _readings.get()
     if readings is None:
         return read(location)
@@ -482,6 +474,58 @@ class AudioProbe(NamedTuple):
         return [s for s in (self.seconds, self.container_seconds) if s is not None]
 
 
+@dataclass(frozen=True)
+class MediaInfo:
+    """What the engine read from one media value: only the readings its validators asked for.
+
+    Each part is None when it wasn't asked for, or couldn't be read locally (a remote URL, a format
+    nothing here opens, ffprobe missing or out of time). A validator skips a reading that is None.
+    `image_format` is an image's format read from its file signature when `image` couldn't be read,
+    such as "image/heif" for a HEIC photo Pillow can't open, so a format check still judges it.
+    `location` is where the value was read from, such as a file path, so a check on its name reads it.
+    """
+
+    size_bytes: int | None = None
+    image: ImageInfo | None = None
+    image_format: str | None = None
+    video: VideoProbe | None = None
+    audio: AudioProbe | None = None
+    location: str | None = None
+
+    @property
+    def frame(self) -> ImageInfo | None:
+        """The image's pixel size, or the video's frame as stored (turned upright)."""
+        if self.image is not None:
+            return self.image
+        if self.video is not None:
+            return self.video.info
+        return None
+
+    @property
+    def display_frame(self) -> ImageInfo | None:
+        """A video frame's shape as it plays when its pixels aren't square, or None."""
+        if self.video is None:
+            return None
+        return self.video.display_info
+
+    @property
+    def mime_type(self) -> str | None:
+        """The format read from the file: the image's, the video's container or the audio's container."""
+        if self.image is not None:
+            return self.image.mime_type
+        if self.image_format is not None:
+            return self.image_format
+        if self.video is not None:
+            return self.video.mime_type
+        if self.audio is not None:
+            return self.audio.mime_type
+        return None
+
+
+# What a validator gets when nothing was read: the value holds no media, or no validator asked.
+EMPTY_MEDIA = MediaInfo()
+
+
 def local_audio_probe(value: Any) -> AudioProbe | None:
     """The container, codec and duration of an audio input, or None if it can't be read locally.
 
@@ -647,6 +691,9 @@ def _installed_ffprobe() -> str | None:
 
 def _local_path(location: str) -> Path | None:
     """The file on this machine a location names, or None for a remote URL or an unresolvable path."""
+    # avoid circular import: File resolves paths through the engine, which imports Parameter and so the validators.
+    from griptape_nodes.files.file import File, FileLoadError
+
     try:
         resolved = File(location).resolve()
     except (FileLoadError, OSError, ValueError):

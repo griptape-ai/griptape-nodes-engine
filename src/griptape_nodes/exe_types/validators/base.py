@@ -10,24 +10,21 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, override
+
+from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     from griptape_nodes.exe_types.core_types import Parameter
-    from griptape_nodes.exe_types.input_checks import AudioProbe, ImageInfo, VideoProbe
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = [
-    "EMPTY_MEDIA",
     "LIMITS_LINK_LABEL",
     "Condition",
-    "MediaInfo",
-    "MediaNeed",
     "PreRunValidator",
     "media_kind_of",
     "reads",
@@ -39,15 +36,6 @@ __all__ = [
 LIMITS_LINK_LABEL = "Provider limits"
 
 
-class MediaNeed(StrEnum):
-    """A reading of a media value that a validator needs."""
-
-    SIZE = "size"
-    IMAGE = "image"
-    VIDEO = "video"
-    AUDIO = "audio"
-
-
 # The artifact type names a parameter declares for each kind of media.
 _KIND_FOR_TYPE: dict[str, MediaKind] = {
     "imageurlartifact": "image",
@@ -57,56 +45,6 @@ _KIND_FOR_TYPE: dict[str, MediaKind] = {
     "audiourlartifact": "audio",
     "audioartifact": "audio",
 }
-
-
-@dataclass(frozen=True)
-class MediaInfo:
-    """What the engine read from one media value: only the readings its validators asked for.
-
-    Each part is None when it wasn't asked for, or couldn't be read locally (a remote URL, a format
-    nothing here opens, ffprobe missing or out of time). A validator skips a reading that is None.
-    `image_format` is an image's format read from its file signature when `image` couldn't be read,
-    such as "image/heif" for a HEIC photo Pillow can't open, so a format check still judges it.
-    """
-
-    size_bytes: int | None = None
-    image: ImageInfo | None = None
-    image_format: str | None = None
-    video: VideoProbe | None = None
-    audio: AudioProbe | None = None
-
-    @property
-    def frame(self) -> ImageInfo | None:
-        """The image's pixel size, or the video's frame as stored (turned upright)."""
-        if self.image is not None:
-            return self.image
-        if self.video is not None:
-            return self.video.info
-        return None
-
-    @property
-    def display_frame(self) -> ImageInfo | None:
-        """A video frame's shape as it plays when its pixels aren't square, or None."""
-        if self.video is None:
-            return None
-        return self.video.display_info
-
-    @property
-    def mime_type(self) -> str | None:
-        """The format read from the file: the image's, the video's container or the audio's container."""
-        if self.image is not None:
-            return self.image.mime_type
-        if self.image_format is not None:
-            return self.image_format
-        if self.video is not None:
-            return self.video.mime_type
-        if self.audio is not None:
-            return self.audio.mime_type
-        return None
-
-
-# What a validator gets when nothing was read: the value holds no media, or no validator asked.
-EMPTY_MEDIA = MediaInfo()
 
 
 class Condition(Protocol):

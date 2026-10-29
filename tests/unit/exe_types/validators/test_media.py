@@ -9,9 +9,6 @@ import pytest
 from griptape.artifacts import ImageArtifact
 from PIL import Image
 
-from griptape_nodes.exe_types import input_checks
-from griptape_nodes.exe_types.input_checks import AudioProbe, ImageInfo, VideoProbe, local_size_bytes, read_media
-from griptape_nodes.exe_types.validators.base import MediaInfo, MediaNeed
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -24,6 +21,16 @@ from griptape_nodes.exe_types.validators.media import (
     PixelArea,
     SideRange,
     VideoCodecs,
+)
+from griptape_nodes.utils import media_probe
+from griptape_nodes.utils.media_probe import (
+    AudioProbe,
+    ImageInfo,
+    MediaInfo,
+    MediaNeed,
+    VideoProbe,
+    local_size_bytes,
+    read_media,
 )
 from tests.unit.exe_types.validators.media_files import (
     HAS_FFMPEG,
@@ -150,18 +157,18 @@ class TestOnRealImages:
 
     def test_skips_a_remote_image(self) -> None:
         media = _image("https://example.com/image.gif")
-        assert media == MediaInfo()
+        assert media == MediaInfo(location="https://example.com/image.gif")
         assert _messages(list(self.KLING), media) == []
 
     def test_reduces_an_in_memory_image_to_a_string_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[Any] = []
-        coerce = input_checks.coerce_media_url_or_data_uri
+        coerce = media_probe.coerce_media_url_or_data_uri
 
         def counting(value: Any, *, kind: Any) -> str | None:
             calls.append(value)
             return coerce(value, kind=kind)
 
-        monkeypatch.setattr(input_checks, "coerce_media_url_or_data_uri", counting)
+        monkeypatch.setattr(media_probe, "coerce_media_url_or_data_uri", counting)
         artifact = ImageArtifact(png_bytes(400, 300), format="png", width=400, height=300)
         media = _image(artifact)
         assert media.image == ImageInfo(400, 300, "image/png")
@@ -244,7 +251,7 @@ class TestOnRealVideos:
 
     def test_reads_a_real_clips_size_without_probing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         path = video_file(tmp_path)
-        monkeypatch.setattr(input_checks, "local_video_probe", lambda _v: pytest.fail("a size limit needs no probe"))
+        monkeypatch.setattr(media_probe, "local_video_probe", lambda _v: pytest.fail("a size limit needs no probe"))
         media = read_media(str(path), {MediaNeed.SIZE}, kind="video")
         assert media.size_bytes == path.stat().st_size
         assert len(_messages([MaxFileSize(1)], media)) == 1
@@ -394,9 +401,9 @@ class TestVideoReadings:
 
     def test_skips_a_remote_video_without_probing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            input_checks.subprocess, "run", lambda *_a, **_k: pytest.fail("a remote video must not be probed")
+            media_probe.subprocess, "run", lambda *_a, **_k: pytest.fail("a remote video must not be probed")
         )
-        assert _video("https://example.com/clip.mp4") == MediaInfo()
+        assert _video("https://example.com/clip.mp4") == MediaInfo(location="https://example.com/clip.mp4")
 
 
 class TestAspectRatioRangeBounds:
@@ -485,6 +492,6 @@ class TestArguments:
 
 
 def test_local_size_bytes_still_reads_outside_a_pass(tmp_path: Path) -> None:
-    """A reader called outside `input_check_readings` reads the file, as before."""
+    """A reader called outside `reading_once` reads the file, as before."""
     path = image_file(tmp_path, 10, 10)
     assert local_size_bytes(str(path), kind="image") == path.stat().st_size

@@ -42,7 +42,7 @@ def test_exports_every_public_validator_and_the_types_they_use() -> None:
         "from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize, IfParameter",
         "from griptape_nodes.exe_types.validators import *",
         "import griptape_nodes.exe_types.core_types",
-        "import griptape_nodes.exe_types.input_checks",
+        "import griptape_nodes.utils.media_probe",
     ],
     ids=["named", "star", "core-types-first", "input-checks-first"],
 )

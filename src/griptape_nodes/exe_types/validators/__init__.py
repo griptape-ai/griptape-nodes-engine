@@ -16,15 +16,7 @@ from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, Max
 
 from __future__ import annotations
 
-from griptape_nodes.exe_types.validators.base import (
-    EMPTY_MEDIA,
-    LIMITS_LINK_LABEL,
-    Condition,
-    MediaInfo,
-    MediaNeed,
-    PreRunValidator,
-    reads,
-)
+from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, Condition, PreRunValidator, reads
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -39,6 +31,7 @@ from griptape_nodes.exe_types.validators.media import (
     SideRange,
     VideoCodecs,
 )
+from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed
 
 __all__ = [
     "EMPTY_MEDIA",

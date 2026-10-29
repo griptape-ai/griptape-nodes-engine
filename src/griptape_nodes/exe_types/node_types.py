@@ -1466,7 +1466,7 @@ class BaseNode(ABC):
         for WebP and AVIF), and each video or audio probe is time-limited; an image passed as a data URI
         or in memory is decoded in full, so its cost grows with its size. A limit across several media
         inputs, such as their total length, belongs here: the readers in
-        `griptape_nodes.exe_types.input_checks` (`local_video_probe` and the rest) return what the
+        `griptape_nodes.utils.media_probe` (`local_video_probe` and the rest) return what the
         validators already read, so no file is read twice.
 
         It runs in a worker thread, not on the engine's event loop, so a slow check doesn't freeze the

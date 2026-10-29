@@ -1,7 +1,7 @@
 """The checks behind the validators in `media`: each compares one reading of a file with a limit and writes the message.
 
 A check skips a reading that is None, which is what the readers in
-`griptape_nodes.exe_types.input_checks` return for anything they couldn't read locally.
+`griptape_nodes.utils.media_probe` return for anything they couldn't read locally.
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from griptape_nodes.exe_types.validators._checks import limit_error
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from griptape_nodes.exe_types.input_checks import ImageInfo
     from griptape_nodes.exe_types.node_error import NodeError
+    from griptape_nodes.utils.media_probe import ImageInfo
 
 
 _BYTES_PER_MB = 1024 * 1024

@@ -14,15 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, override
 
 import pytest
 
-from griptape_nodes.exe_types import input_checks
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.input_checks import (
-    ImageInfo,
-    VideoProbe,
-    input_check_readings,
-    local_image_info,
-    local_video_probe,
-)
 from griptape_nodes.exe_types.local_objects import make_reference
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
@@ -41,11 +33,11 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
-from griptape_nodes.exe_types.pre_run_validation import (
+from griptape_nodes.exe_types.validators._runner import (
     validate_inputs,
     validate_node,
 )
-from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, MediaNeed, PreRunValidator, reads
+from griptape_nodes.exe_types.validators.base import PreRunValidator, reads
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -60,6 +52,17 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
+)
+from griptape_nodes.utils import media_probe
+from griptape_nodes.utils.media_probe import (
+    EMPTY_MEDIA,
+    ImageInfo,
+    MediaInfo,
+    MediaNeed,
+    VideoProbe,
+    local_image_info,
+    local_video_probe,
+    reading_once,
 )
 from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import image_file
@@ -112,8 +115,8 @@ class TestSingleInputs:
     def test_names_audio_as_an_audio_clip(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         clip = tmp_path / "clip.mp3"
         clip.write_bytes(b"audio")
-        probe = input_checks.AudioProbe(mime_type="audio/mpeg", codec="mp3", profile=None, seconds=9.0)
-        monkeypatch.setattr(input_checks, "_probe_audio", lambda _location: probe)
+        probe = media_probe.AudioProbe(mime_type="audio/mpeg", codec="mp3", profile=None, seconds=9.0)
+        monkeypatch.setattr(media_probe, "_probe_audio", lambda _location: probe)
         node = _node_with(ParameterAudio(name="voice", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("voice", str(clip))
         assert _messages(validate_inputs(node)) == [
@@ -179,7 +182,7 @@ class TestReadOnce:
             reads.append(location)
             return VideoProbe(info=ImageInfo(4000, 1000, None), seconds=40.0, fps=24.0, mime_type="video/mp4")
 
-        monkeypatch.setattr(input_checks, "_probe_video", counting_probe)
+        monkeypatch.setattr(media_probe, "_probe_video", counting_probe)
         return reads
 
     def test_probes_a_video_once_for_every_validator_on_it(self, tmp_path: Path, video_reads: list[str]) -> None:
@@ -199,7 +202,7 @@ class TestReadOnce:
             )
         )
         node.set_parameter_value("video", str(clip))
-        with input_check_readings():
+        with reading_once():
             messages = _messages(validate_inputs(node))
         assert messages == [
             "The video in 'video' is 4000x1000 and each side must be at most 2048 pixels. Resize it smaller.",
@@ -219,10 +222,10 @@ class TestReadOnce:
     def test_reads_again_in_the_next_pass(self, tmp_path: Path, video_reads: list[str]) -> None:
         clip = tmp_path / "clip.mp4"
         clip.write_bytes(b"video")
-        with input_check_readings():
+        with reading_once():
             local_video_probe(str(clip))
             local_video_probe(str(clip))
-        with input_check_readings():
+        with reading_once():
             local_video_probe(str(clip))
         assert video_reads == [str(clip), str(clip)]
 
@@ -239,9 +242,9 @@ class TestReadOnce:
         def unreadable(location: str) -> None:
             reads.append(location)
 
-        monkeypatch.setattr(input_checks, "_read_image_info", unreadable)
+        monkeypatch.setattr(media_probe, "_read_image_info", unreadable)
         path = str(tmp_path / "broken.png")
-        with input_check_readings():
+        with reading_once():
             assert local_image_info(path) is None
             assert local_image_info(path) is None
         assert reads == [path]
@@ -249,9 +252,9 @@ class TestReadOnce:
     def test_a_nested_pass_shares_the_outer_readings(self, tmp_path: Path, video_reads: list[str]) -> None:
         clip = tmp_path / "clip.mp4"
         clip.write_bytes(b"video")
-        with input_check_readings():
+        with reading_once():
             local_video_probe(str(clip))
-            with input_check_readings():
+            with reading_once():
                 local_video_probe(str(clip))
             local_video_probe(str(clip))
         assert video_reads == [str(clip)]
@@ -308,11 +311,11 @@ class TestLists:
             reads.append(location)
             return ImageInfo(100, 100, "image/png")
 
-        monkeypatch.setattr(input_checks, "_read_image_info", counting)
+        monkeypatch.setattr(media_probe, "_read_image_info", counting)
         node = self._list_node(SideRange(min=300), AllowedFormats("image/png"), AspectRatioRange("1:2", "2:1"))
         images = [str(tmp_path / "a.png"), str(tmp_path / "b.png")]
         node.set_parameter_value("reference_images", images)
-        with input_check_readings():
+        with reading_once():
             assert len(validate_inputs(node)) == 2
         assert reads == images
 
@@ -412,8 +415,8 @@ class TestIfParameter:
         )
         node.set_parameter_value("last_frame", str(image_file(tmp_path, 10, 10)))
         reads: list[str] = []
-        monkeypatch.setattr(input_checks, "_read_image_info", reads.append)
-        with input_check_readings():
+        monkeypatch.setattr(media_probe, "_read_image_info", reads.append)
+        with reading_once():
             assert validate_inputs(node) == []
         assert reads == []
 
@@ -486,13 +489,13 @@ class TestConditions:
             reads_seen.append(location)
             return ImageInfo(10, 10, "image/png")
 
-        monkeypatch.setattr(input_checks, "_read_image_info", counting)
+        monkeypatch.setattr(media_probe, "_read_image_info", counting)
         wrapped = MaxFileSize(1).when(_no_image_read)
         assert wrapped.needs == {MediaNeed.SIZE, MediaNeed.IMAGE}
         node = self._image_node(wrapped)
         image = str(image_file(tmp_path, 10, 10))
         node.set_parameter_value("image", image)
-        with input_check_readings():
+        with reading_once():
             # The image was read for the condition, which then held false, so the size limit was skipped.
             assert validate_inputs(node) == []
         assert reads_seen == [image]
@@ -591,7 +594,7 @@ class TestRulesAcrossInputs:
             side = sizes[Path(location).name]
             return ImageInfo(side, side, "image/png")
 
-        monkeypatch.setattr(input_checks, "_read_image_info", counting)
+        monkeypatch.setattr(media_probe, "_read_image_info", counting)
         node = self._PairNode()
         first, second = str(tmp_path / "a.png"), str(tmp_path / "b.png")
         node.set_parameter_value("first", first)
@@ -694,8 +697,8 @@ def no_ffprobe_reading(monkeypatch: pytest.MonkeyPatch) -> None:
     def run(cmd: list[str], **kwargs: Any) -> None:
         raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
-    monkeypatch.setattr(input_checks, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
-    monkeypatch.setattr(input_checks.subprocess, "run", run)
+    monkeypatch.setattr(media_probe, "_installed_ffprobe", lambda: "/usr/bin/ffprobe")
+    monkeypatch.setattr(media_probe.subprocess, "run", run)
 
 
 def _clip(tmp_path: Path, name: str = "clip.mp4") -> str:
@@ -745,7 +748,7 @@ class TestValidateNode:
             reads.append(location)
             return VideoProbe(info=ImageInfo(100, 100, None), seconds=4.0, fps=24.0, mime_type="video/mp4")
 
-        monkeypatch.setattr(input_checks, "_probe_video", counting_probe)
+        monkeypatch.setattr(media_probe, "_probe_video", counting_probe)
         clip = _clip(tmp_path)
         node = self._OwnChecks(reads=clip)
         node.set_parameter_value("video", clip)

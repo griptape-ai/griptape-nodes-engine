@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
 from griptape_nodes.exe_types.validators._checks import check_count
-from griptape_nodes.exe_types.validators.base import EMPTY_MEDIA, MediaInfo, PreRunValidator
+from griptape_nodes.exe_types.validators.base import PreRunValidator
+from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence

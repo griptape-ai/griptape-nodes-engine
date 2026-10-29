@@ -1,8 +1,8 @@
 """Checks shared by validators of any kind of value, and the error every check returns.
 
 `check_count` backs `MaxCount`; `limit_error` builds the `NodeError`, with its link to the provider's
-limits page, that every check in this package returns. The checks on media files are in
-`_media_checks`.
+limits page, that every check in this package returns; `input_subject` starts the message naming the
+input. The checks on media files are in `_media_checks`.
 """
 
 from __future__ import annotations
@@ -35,3 +35,16 @@ def limit_error(message: str, docs_url: str | None) -> NodeError:
     if not docs_url:
         return NodeError(message, links=None)
     return NodeError(message, links=[NodeErrorLink(label=LIMITS_LINK_LABEL, url=docs_url)])
+
+
+def input_subject(parameter: str, *, noun: str, position: int | None = None) -> str:
+    """The start of a message naming one input, such as "Image 2 in 'reference images'".
+
+    Args:
+        parameter: The parameter's name as the UI shows it.
+        noun: What the input is, such as "image" or "video".
+        position: The input's 1-based position in a list parameter, or None for a single input.
+    """
+    if position is None:
+        return f"The {noun} in '{parameter}'"
+    return f"{noun[:1].upper()}{noun[1:]} {position} in '{parameter}'"
