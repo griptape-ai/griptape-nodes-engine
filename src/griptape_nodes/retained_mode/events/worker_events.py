@@ -190,9 +190,9 @@ class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
     """The engine did not start the worker.
 
     Args:
-        session_unknown: The session that asked has not registered with this engine, as after this
-            engine restarts, or registered without naming the library, as after its settings
-            changed. It may register and ask again.
+        session_unknown: The session that asked registered without naming the library, as after its
+            settings changed. It may register and ask again. A session that never registered is
+            refused before the request is handled.
         at_capacity: This engine already runs as many workers for other engines as it allows. It may
             ask again later.
     """

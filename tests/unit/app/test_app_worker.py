@@ -3069,6 +3069,7 @@ async def _dispatched_by(
     """Dispatch `request` to `worker_manager`'s handlers through an EventManager, as though `sender` sent it."""
     event_manager = EventManager()
     event_manager.register_request_handlers(worker_manager)
+    event_manager.recognize_sessions(worker_manager.has_registered_session)
     return await event_manager.ahandle_request(request, result_context={"sender": sender})
 
 
@@ -3212,15 +3213,33 @@ class TestServingAnotherEnginesSession:
         spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_start_for_an_unregistered_session_fails(self, worker_manager: WorkerManager) -> None:
+    async def test_a_start_for_an_unregistered_session_is_refused(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+            result = await _dispatched_by(worker_manager, _ARTIST, _start_for_artist())
 
-        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
-        assert result.session_unknown
+        assert not result.succeeded()
+        assert "has not registered with this engine" in str(result.result.result_details)
         spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_start_for_a_registered_session_is_handled(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        offer = worker_events.OfferSessionForWorkersRequest(
+            schema_version=DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
+            engine_version=engine_version,
+            library_versions={_LIBRARY: "1.0.0"},
+        )
+
+        offered = await _dispatched_by(worker_manager, _ARTIST, offer)
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()):
+            started = await _dispatched_by(worker_manager, _ARTIST, _start_for_artist())
+
+        assert isinstance(offered.result, worker_events.OfferSessionForWorkersResultSuccess)
+        # Its handler answered it, rather than the sender check refusing it first.
+        assert isinstance(started.result, worker_events.StartWorkerForEngineResultFailure)
+        assert "already starting" in str(started.result.result_details)
 
     @pytest.mark.asyncio
     async def test_a_start_from_another_engine_than_registered_the_session_fails(
@@ -3872,7 +3891,8 @@ class TestSharingThisEngineBetweenRuns:
 
         result = await _dispatched_by(worker_manager, _ARTIST, _admit("a1"))
 
-        assert isinstance(result.result, worker_events.AdmitNodeResultFailure)
+        assert not result.succeeded()
+        assert "has not registered with this engine" in str(result.result.result_details)
         assert line.runs == []
 
     @pytest.mark.asyncio

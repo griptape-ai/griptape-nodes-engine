@@ -359,6 +359,7 @@ class WorkerManager(EngineScoped):
         )
 
         event_manager.register_request_handlers(self)
+        event_manager.recognize_sessions(self.has_registered_session)
         # A run's end reaches every engine it sent a node to, and another engine's run waiting here
         # hears its place in line.
         engine.flow_manager.add_run_ended_listener(self._on_run_ended)
@@ -1350,7 +1351,7 @@ class WorkerManager(EngineScoped):
             return
         result = await self._ask_engine_to_start_worker(library_name, host_engine_id, session_id)
         if isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.session_unknown:
-            # That engine restarted since this engine registered with it, so register again, once.
+            # That engine's record of the session does not name the library, so register again, once.
             result = await self._ask_engine_to_start_worker(library_name, host_engine_id, session_id)
         if result is None or isinstance(result, worker_events.StartWorkerForEngineResultSuccess):
             return
@@ -1566,7 +1567,7 @@ class WorkerManager(EngineScoped):
 
     @handles(
         worker_events.OfferSessionForWorkersRequest,
-        sender=RequiredSender.SESSION,
+        sender=RequiredSender.ANY_SESSION,
         owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
     )
     def handle_offer_session_for_workers_request(
@@ -1710,9 +1711,7 @@ class WorkerManager(EngineScoped):
         """Why this engine will not start `library_name`'s worker for that session, or None if it will."""
         if not self.engine.can_reach_other_engines:
             return "this engine has no connections to other engines."
-        session = self._sessions.get(session_id)
-        if session is None:
-            return "the session asking for it never registered with this engine."
+        session = self._sessions[session_id]
         if library_name not in session.library_versions:
             return "the session did not name it when it registered with this engine, so its version was never checked."
         return self._library_version_refusal(library_name, session.library_versions[library_name])
@@ -1734,8 +1733,7 @@ class WorkerManager(EngineScoped):
 
     def _session_must_register(self, library_name: str, session_id: str) -> bool:
         """Whether the artist's engine should register the session again before this library can start."""
-        session = self._sessions.get(session_id)
-        return session is None or library_name not in session.library_versions
+        return library_name not in self._sessions[session_id].library_versions
 
     async def _report_when_exited(
         self, worker_engine_id: str, hosted: _HostedWorker, proc: asyncio.subprocess.Process
@@ -1813,10 +1811,6 @@ class WorkerManager(EngineScoped):
         starts until it lets it go, so its later nodes are admitted at once.
         """
         sender = require_request_sender()
-        if self._engine_that_offered(sender) is None:
-            return worker_events.AdmitNodeResultFailure(
-                result_details="the session asking for it never registered with this engine."
-            )
         engine_run = self._engine_run_for(sender.engine_id, request)
         if not engine_run.admitted.done() and any(
             admission.host_engine_id == sender.engine_id for admission in self._admissions.values()
@@ -1939,6 +1933,10 @@ class WorkerManager(EngineScoped):
             engine_run.admitted.set_result(details)
         engine_run.released.set()
         self._forget_engine_run(engine_run)
+
+    def has_registered_session(self, sender: RequestSender) -> bool:
+        """Whether the sender's session registered with this engine, offering it to run that engine's work."""
+        return sender.session_id in self._sessions
 
     def _engine_that_offered(self, sender: RequestSender) -> str | None:
         """The engine that offered the sender's session to this one, or None if none has."""
