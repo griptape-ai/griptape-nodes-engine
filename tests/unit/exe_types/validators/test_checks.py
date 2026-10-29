@@ -202,8 +202,7 @@ class TestCheckFrameCount:
     def test_refuses_too_many_frames(self) -> None:
         error = check_frame_count(9001, subject=SUBJECT, maximum=9000, docs_url=DOCS)
         assert str(error) == (
-            f"{SUBJECT} has 9,001 frames and the limit is 9,000. Use a Trim Video node to shorten it, or lower its "
-            "frame rate."
+            f"{SUBJECT} has 9,001 frames and the limit is 9,000. Shorten it, or lower its frame rate."
         )
         assert error is not None
         assert error.links
@@ -478,9 +477,7 @@ class TestCheckDuration:
 
     def test_rejects_a_long_video(self) -> None:
         error = check_duration(12.345, subject="The video in 'Video'", maximum=8.7)
-        assert str(error) == (
-            "The video in 'Video' is 12.35 seconds long and the limit is 8.7. Use a Trim Video node to shorten it."
-        )
+        assert str(error) == ("The video in 'Video' is 12.35 seconds long and the limit is 8.7. Shorten it.")
 
     def test_rejects_a_short_video(self) -> None:
         error = check_duration(0.5, subject="The video in 'Video'", minimum=2)

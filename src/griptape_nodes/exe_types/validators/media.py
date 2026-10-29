@@ -68,7 +68,6 @@ _FRAME_NEEDS = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
 _LENGTH_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
 
 # What `Duration` suggests for audio over its maximum; `check_duration`'s default suggests a video node.
-_AUDIO_TOO_LONG_FIX = "Trim it in an audio editor."
 
 # A subject for checking a validator's own arguments when it is built, before there is an input.
 _NO_SUBJECT = ""
@@ -249,8 +248,8 @@ class Duration(MediaValidator):
     Args:
         min: The shortest input accepted.
         max: The longest input accepted.
-        fix: What the artist can do about an input of the wrong length. Defaults to trimming it (in
-            a Trim Video node for a video, an audio editor for audio) or using a longer clip.
+        fix: What the artist can do about an input of the wrong length, such as naming a library's
+            own trim node. Defaults to shortening it or using a longer clip.
     """
 
     needs = _LENGTH_NEEDS
@@ -263,17 +262,12 @@ class Duration(MediaValidator):
     def check_media(
         self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
     ) -> NodeError | None:
-        probe = media.video
-        too_long_fix = self.fix
-        if probe is None:
-            probe = media.audio
-            if too_long_fix is None:
-                too_long_fix = _AUDIO_TOO_LONG_FIX
+        probe = media.video if media.video is not None else media.audio
         if probe is None:
             return None
         if self.max is not None:
             error = check_duration(
-                probe.shortest_seconds, subject=subject, maximum=self.max, fix=too_long_fix, docs_url=docs_url
+                probe.shortest_seconds, subject=subject, maximum=self.max, fix=self.fix, docs_url=docs_url
             )
             if error is not None:
                 return error
@@ -326,12 +320,19 @@ class FrameCount(MediaValidator):
 
     A file that records no count, such as an MKV, is estimated from its durations and frame rates,
     each bound against the estimate easier to meet.
+
+    Args:
+        min: The fewest frames accepted.
+        max: The most frames accepted.
+        fix: What the artist can do about too many frames, such as naming a library's own trim
+            node. Defaults to shortening the clip or lowering its frame rate.
     """
 
     needs = frozenset({MediaNeed.VIDEO})
 
     min: int | None = None
     max: int | None = None
+    fix: str | None = None
 
     @override
     def check_media(
@@ -340,7 +341,9 @@ class FrameCount(MediaValidator):
         if media.video is None:
             return None
         if self.max is not None:
-            error = check_frame_count(media.video.fewest_frames, subject=subject, maximum=self.max, docs_url=docs_url)
+            error = check_frame_count(
+                media.video.fewest_frames, subject=subject, maximum=self.max, fix=self.fix, docs_url=docs_url
+            )
             if error is not None:
                 return error
         if self.min is None:

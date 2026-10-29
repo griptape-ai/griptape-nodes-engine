@@ -246,7 +246,7 @@ class TestOnRealVideos:
             f"{SUBJECT} is 320x240, and its aspect ratio must be 16:9. Crop it.",
             f"{SUBJECT} is 2.00 seconds long and the minimum is 3. Use a longer clip.",
             f"{SUBJECT} is 24 fps and the minimum is 30 fps. Re-export it at a higher frame rate.",
-            f"{SUBJECT} has 48 frames and the limit is 24. Use a Trim Video node to shorten it, or lower its frame rate.",
+            f"{SUBJECT} has 48 frames and the limit is 24. Shorten it, or lower its frame rate.",
         ]
 
     def test_reads_a_real_clips_size_without_probing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,7 +275,7 @@ class TestOnRealAudio:
         assert _messages(validators, media) == [
             f"{SUBJECT} is in MP3 format. Convert it to WAV.",
             f"{SUBJECT} is encoded as MP3. Re-encode it as 16-bit PCM (little-endian).",
-            f"{SUBJECT} is 3.00 seconds long and the limit is 1. Trim it in an audio editor.",
+            f"{SUBJECT} is 3.00 seconds long and the limit is 1. Shorten it.",
         ]
 
 
@@ -334,12 +334,21 @@ class TestVideoReadings:
             f"{SUBJECT} is 1.00 seconds long and the minimum is 3. Pick a longer clip."
         ]
 
+    def test_a_library_can_name_its_own_trim_node(self) -> None:
+        # The engine's own suggestions name no node; a library that ships one says so with `fix=`.
+        fix = "Use a Trim Video node to shorten it."
+        media = MediaInfo(video=VideoProbe(info=None, seconds=12.0, fps=24.0, frames=288))
+        assert _messages([Duration(max=10, fix=fix), FrameCount(max=240, fix=fix)], media) == [
+            f"{SUBJECT} is 12.00 seconds long and the limit is 10. {fix}",
+            f"{SUBJECT} has 288 frames and the limit is 240. {fix}",
+        ]
+
     def test_checks_frames_against_the_reading_easier_to_meet(self) -> None:
         # No recorded count: 3 s at 24 fps average (72 frames) or 30 fps declared (90 frames).
         media = MediaInfo(video=VideoProbe(info=None, seconds=3.0, fps=24.0, nominal_fps=30.0))
         assert _messages([FrameCount(min=80, max=80)], media) == []
         assert _messages([FrameCount(max=60)], media) == [
-            f"{SUBJECT} has 72 frames and the limit is 60. Use a Trim Video node to shorten it, or lower its frame rate."
+            f"{SUBJECT} has 72 frames and the limit is 60. Shorten it, or lower its frame rate."
         ]
         assert _messages([FrameCount(min=100)], media) == [
             f"{SUBJECT} has 90 frames and the minimum is 100. Use a longer clip."
@@ -368,10 +377,7 @@ class TestVideoReadings:
             (FrameRate(max=30), f"{SUBJECT} is 60 fps and the maximum is 30 fps. Re-export it at a lower frame rate."),
             (
                 FrameCount(max=100),
-                (
-                    f"{SUBJECT} has 300 frames and the limit is 100. "
-                    "Use a Trim Video node to shorten it, or lower its frame rate."
-                ),
+                (f"{SUBJECT} has 300 frames and the limit is 100. Shorten it, or lower its frame rate."),
             ),
         ],
     )
@@ -434,7 +440,7 @@ class TestAudioReadings:
     def test_suggests_an_audio_editor_for_audio_that_is_too_long(self) -> None:
         media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
         assert _messages([Duration(max=1), Duration(min=5)], media) == [
-            f"{SUBJECT} is 3.00 seconds long and the limit is 1. Trim it in an audio editor.",
+            f"{SUBJECT} is 3.00 seconds long and the limit is 1. Shorten it.",
             f"{SUBJECT} is 3.00 seconds long and the minimum is 5. Use a longer clip.",
         ]
 

@@ -119,7 +119,7 @@ class TestSingleInputs:
         node = _node_with(ParameterAudio(name="voice", pre_run_validators=[Duration(max=5)]))
         node.set_parameter_value("voice", str(clip))
         assert _messages(validate_inputs(node)) == [
-            "The audio clip in 'voice' is 9.00 seconds long and the limit is 5. Trim it in an audio editor."
+            "The audio clip in 'voice' is 9.00 seconds long and the limit is 5. Shorten it."
         ]
 
     def test_links_the_nodes_input_limits_page(self, tmp_path: Path) -> None:
@@ -200,7 +200,7 @@ class TestReadOnce:
         assert messages == [
             "The video in 'video' is 4000x1000 and each side must be at most 2048 pixels. Resize it smaller.",
             "The video in 'video' is 4000x1000, which is too wide. The aspect ratio must be between 1:3 and 3:1. Crop it.",
-            "The video in 'video' is 40.00 seconds long and the limit is 30. Use a Trim Video node to shorten it.",
+            "The video in 'video' is 40.00 seconds long and the limit is 30. Shorten it.",
         ]
         assert video_reads == [str(clip)]
 

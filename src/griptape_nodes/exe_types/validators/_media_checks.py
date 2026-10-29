@@ -296,13 +296,13 @@ def check_duration(  # noqa: PLR0913
         subject: The input, from `input_subject`.
         minimum: The shortest input accepted, in seconds.
         maximum: The longest input accepted, in seconds.
-        fix: What the artist can do about it. Defaults to trimming or using a longer clip.
+        fix: What the artist can do about it. Defaults to shortening it or using a longer clip.
         docs_url: The provider's page documenting the limit.
     """
     if seconds is None:
         return None
     if maximum is not None and seconds > maximum:
-        next_step = fix or "Use a Trim Video node to shorten it."
+        next_step = fix or "Shorten it."
         return limit_error(
             f"{subject} is {_format_past(seconds, maximum, 2)} seconds long and the limit is {_format_limit(maximum)}. {next_step}",
             docs_url,
@@ -353,12 +353,13 @@ def check_frame_rate(  # noqa: PLR0913
     return None
 
 
-def check_frame_count(
+def check_frame_count(  # noqa: PLR0913
     frames: int | None,
     *,
     subject: str,
     minimum: int | None = None,
     maximum: int | None = None,
+    fix: str | None = None,
     docs_url: str | None = None,
 ) -> NodeError | None:
     """An error when a video has fewer or more frames than the provider accepts.
@@ -370,6 +371,8 @@ def check_frame_count(
         subject: The input, from `input_subject`.
         minimum: The fewest frames accepted.
         maximum: The most frames accepted.
+        fix: What the artist can do about too many frames. Defaults to shortening the clip or
+            lowering its frame rate.
         docs_url: The provider's page documenting the limit.
     """
     if frames is None:
@@ -377,7 +380,7 @@ def check_frame_count(
     if maximum is not None and frames > maximum:
         return limit_error(
             f"{subject} has {frames:,} frames and the limit is {maximum:,}. "
-            "Use a Trim Video node to shorten it, or lower its frame rate.",
+            f"{fix or 'Shorten it, or lower its frame rate.'}",
             docs_url,
         )
     if minimum is not None and frames < minimum:
