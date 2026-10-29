@@ -50,7 +50,7 @@ from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycl
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
-    _RUN_ENDED_ATTEMPTS,
+    _REPORT_ATTEMPTS,
     _STATIC_URL_SETTLE_TIMEOUT_S,
     EngineAdmission,
     WorkerManager,
@@ -3992,6 +3992,34 @@ class TestTellingAnotherEngineARunEnded:
     """That engine holds itself for the run until it hears, so the notice is sent again until it is answered."""
 
     @pytest.mark.asyncio
+    async def test_a_node_sent_without_a_run_reports_its_end_until_it_is_answered(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Nothing else lets that engine go from a node sent without a run."""
+        links = _host_engine(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        answer = links.request
+        tries = {"count": 0}
+
+        async def lost_once(engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+            if isinstance(request, worker_events.ReportNodeExecutionEndedRequest):
+                tries["count"] += 1
+                if tries["count"] == 1:
+                    links.sent.append((engine_id, request, timeout_s))
+                    msg = "gpu-01 did not answer."
+                    raise EngineNotFoundError(msg)
+            return await answer(engine_id, request, timeout_s=timeout_s)
+
+        worker_manager.engine.request = lost_once  # type: ignore[method-assign]
+        with patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0):
+            admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
+            await worker_manager.end_admission(admission)
+            await asyncio.gather(*worker_manager._engine_notices)
+
+        lost_then_answered = ["ReportNodeExecutionEndedRequest"] * 2
+        assert [t for t in links.sent_types() if t == "ReportNodeExecutionEndedRequest"] == lost_then_answered
+
+    @pytest.mark.asyncio
     async def test_a_notice_that_does_not_arrive_is_sent_again_until_it_is_answered(
         self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -4011,10 +4039,12 @@ class TestTellingAnotherEngineARunEnded:
 
         worker_manager.engine.request = lost_twice  # type: ignore[method-assign]
         with (
-            patch("griptape_nodes.retained_mode.managers.worker_manager._RUN_ENDED_RETRY_PAUSE_S", new=0),
+            patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0),
             caplog.at_level(logging.WARNING),
         ):
-            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+            await worker_manager._report_until_answered(
+                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+            )
 
         assert links.sent_types() == ["ReportRunEndedRequest"] * (lost + 1)
         assert sum("attempt" in record.getMessage() for record in caplog.records) == lost
@@ -4028,12 +4058,14 @@ class TestTellingAnotherEngineARunEnded:
         links.not_found = "gpu-01 did not answer."
 
         with (
-            patch("griptape_nodes.retained_mode.managers.worker_manager._RUN_ENDED_RETRY_PAUSE_S", new=0),
+            patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0),
             caplog.at_level(logging.WARNING),
         ):
-            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+            await worker_manager._report_until_answered(
+                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+            )
 
-        assert len(links.sent) == _RUN_ENDED_ATTEMPTS
+        assert len(links.sent) == _REPORT_ATTEMPTS
         assert any(record.levelno == logging.ERROR for record in caplog.records)
 
     @pytest.mark.asyncio
@@ -4043,7 +4075,9 @@ class TestTellingAnotherEngineARunEnded:
         """Such as one it withdrew its session from, or lost: that engine already let the run go."""
         links = _host_engine(worker_manager)
 
-        await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+        await worker_manager._report_until_answered(
+            _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+        )
 
         assert links.sent == []
 
@@ -4059,7 +4093,9 @@ class TestTellingAnotherEngineARunEnded:
             worker_manager._engine_registrations.clear()
 
         with patch("griptape_nodes.retained_mode.managers.worker_manager.asyncio.sleep", new=withdraw_meanwhile):
-            await worker_manager._send_run_ended(_HOST_ENGINE, "run-1")
+            await worker_manager._report_until_answered(
+                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+            )
 
         assert len(links.sent) == 1
 

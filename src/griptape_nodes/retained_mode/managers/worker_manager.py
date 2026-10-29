@@ -79,8 +79,8 @@ _ENGINE_REQUEST_TIMEOUT_S = 60.0
 
 # How many times an engine tries to tell another engine that a run ended, and how long it pauses between
 # tries. That engine holds itself for the run until it hears, or until it loses its connection to this one.
-_RUN_ENDED_ATTEMPTS = 5
-_RUN_ENDED_RETRY_PAUSE_S = 10.0
+_REPORT_ATTEMPTS = 5
+_REPORT_RETRY_PAUSE_S = 10.0
 
 
 @dataclass
@@ -1048,21 +1048,14 @@ class WorkerManager(EngineScoped):
             self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, 0)
 
     async def end_admission(self, admission: EngineAdmission | None) -> None:
-        """Tell the engine asked to admit a node that the node ended, so its run can let that engine go."""
+        """Tell the engine asked to admit a node that the node ended, so its run can let that engine go.
+
+        Sent without waiting and retried: for a node sent without a run, nothing else lets that engine go.
+        """
         if admission is None or self._admissions.pop(admission.admission_id, None) is None:
             return
         request = worker_events.ReportNodeExecutionEndedRequest(admission_id=admission.admission_id)
-        try:
-            result = await self.engine.request(admission.host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
-        except EngineNotFoundError as e:
-            logger.warning("Could not tell engine %s that a node it admitted ended: %s", admission.host_engine_id, e)
-            return
-        if not isinstance(result, worker_events.ReportNodeExecutionEndedResultSuccess):
-            logger.warning(
-                "Engine %s did not record that a node it admitted ended: %s",
-                admission.host_engine_id,
-                result.result_details,
-            )
+        self._send_notice(self._report_until_answered(admission.host_engine_id, request, "a node it admitted ended"))
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
@@ -2101,44 +2094,42 @@ class WorkerManager(EngineScoped):
 
     def _on_run_ended(self, run_id: str) -> None:
         """Tell every engine the ended run sent a node to that it ended, so they serve the next run."""
-        for engine_id in self._run_engines.pop(run_id, set()):
-            self._send_notice(self._send_run_ended(engine_id, run_id))
-
-    async def _send_run_ended(self, engine_id: str, run_id: str) -> None:
-        """Tell `engine_id` that a run ended, trying again until it answers or this engine has no session with it.
-
-        Nothing else lets that engine go while the run had a node there, so a lost notice would hold it
-        from every other run.
-        """
         request = worker_events.ReportRunEndedRequest(run_id=run_id)
-        for attempt in range(1, _RUN_ENDED_ATTEMPTS + 1):
+        for engine_id in self._run_engines.pop(run_id, set()):
+            self._send_notice(self._report_until_answered(engine_id, request, f"run {run_id} ended"))
+
+    async def _report_until_answered(self, engine_id: str, request: RequestPayload, what: str) -> None:
+        """Tell `engine_id` `what`, trying again until it answers or this engine has no session with it.
+
+        Used for the reports that let that engine go, which nothing else does while it is connected, so a
+        lost one would hold it from every other run.
+        """
+        for attempt in range(1, _REPORT_ATTEMPTS + 1):
             if attempt > 1:
-                await asyncio.sleep(_RUN_ENDED_RETRY_PAUSE_S)
+                await asyncio.sleep(_REPORT_RETRY_PAUSE_S)
             if not self._has_session_with(engine_id):
-                logger.info(
-                    "Not telling engine %s that run %s ended: this engine no longer uses it.", engine_id, run_id
-                )
+                logger.info("Not telling engine %s that %s: this engine no longer uses it.", engine_id, what)
                 return
             try:
                 result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
             except EngineNotFoundError as e:
                 logger.warning(
-                    "Could not tell engine %s that run %s ended (attempt %d of %d): %s",
+                    "Could not tell engine %s that %s (attempt %d of %d): %s",
                     engine_id,
-                    run_id,
+                    what,
                     attempt,
-                    _RUN_ENDED_ATTEMPTS,
+                    _REPORT_ATTEMPTS,
                     e,
                 )
                 continue
-            if not isinstance(result, worker_events.ReportRunEndedResultSuccess):
-                logger.warning("Engine %s did not end run %s: %s", engine_id, run_id, result.result_details)
+            if not result.succeeded():
+                logger.warning("Engine %s did not take the report that %s: %s", engine_id, what, result.result_details)
             return
         logger.error(
-            "Gave up telling engine %s that run %s ended. It runs no one else's nodes until it loses its "
-            "connection to this engine or this engine stops its workers.",
+            "Gave up telling engine %s that %s. It runs no one else's nodes until it loses its connection to "
+            "this engine or this engine stops its workers.",
             engine_id,
-            run_id,
+            what,
         )
 
     def _has_session_with(self, engine_id: str) -> bool:
