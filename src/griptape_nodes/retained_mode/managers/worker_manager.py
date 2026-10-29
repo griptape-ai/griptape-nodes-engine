@@ -944,12 +944,15 @@ class WorkerManager(EngineScoped):
         event_request: EventRequest,
         worker_engine_id: str,
         worker_request_topic: str,
+        *,
+        response_topic: str | None = None,
     ) -> dict:
         """Forward event_request to the named worker and await the raw result payload.
 
         Registers a Future via RequestClient keyed by request_id and resolves it when
         the worker response arrives. The caller is responsible for deserializing the
-        returned dict into the appropriate result type.
+        returned dict into the appropriate result type. `response_topic` is where the worker
+        answers, by default the worker's response topic in this engine's session.
         """
         request_id = event_request.request_id or str(uuid.uuid4())
         # Opt into structured-failure delivery so a worker-side
@@ -973,6 +976,7 @@ class WorkerManager(EngineScoped):
                 event_request.model_copy(update={"request_id": request_id}),
                 worker_engine_id=worker_engine_id,
                 worker_request_topic=worker_request_topic,
+                response_topic=response_topic,
             )
             return await asyncio.wrap_future(future)
         except BaseException:
@@ -2154,21 +2158,16 @@ class WorkerManager(EngineScoped):
 
     async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
         """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
-        request_id = str(uuid.uuid4())
-        future = await self._tx.request_client.track_request(
-            request_id, tag=worker_engine_id, resolve_failures_as_payload=True
-        )
-        event = EventRequest(
-            request=worker_events.DropLibraryNamedLocalObjectsRequest(),
-            request_id=request_id,
-            response_topic=f"engines/{self.engine.get_engine_id()}/response",
-        )
+        event = EventRequest(request=worker_events.DropLibraryNamedLocalObjectsRequest())
         request_topic = f"sessions/{hosted.session_id}/workers/{worker_engine_id}/request"
+        # The worker is in the session of the engine it serves, not this engine's, so it answers on this engine's own topic.
+        response_topic = f"engines/{self.engine.get_engine_id()}/response"
         try:
-            await self._tx.send_message("EventRequest", converters.engine.dumps(event), request_topic)
-            result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=_ENGINE_REQUEST_TIMEOUT_S)
+            result = await asyncio.wait_for(
+                self.route_to_worker(event, worker_engine_id, request_topic, response_topic=response_topic),
+                timeout=_ENGINE_REQUEST_TIMEOUT_S,
+            )
         except TimeoutError:
-            self._tx.request_client.discard_request(request_id)
             logger.warning(
                 "Worker %s did not free its models within %.0f seconds.", worker_engine_id, _ENGINE_REQUEST_TIMEOUT_S
             )
@@ -2177,9 +2176,6 @@ class WorkerManager(EngineScoped):
             # Gone, so nothing of it is left to free.
             logger.info("Worker %s exited before it freed its models.", worker_engine_id)
             return
-        except BaseException:
-            self._tx.request_client.discard_request(request_id)
-            raise
         logger.info("Worker %s: %s", worker_engine_id, result.get("result", {}).get("result_details"))
 
     async def _wait_for_session(self, library_name: str) -> str | None:
@@ -2495,6 +2491,7 @@ class WorkerManager(EngineScoped):
         *,
         worker_engine_id: str,
         worker_request_topic: str,
+        response_topic: str | None = None,
     ) -> None:
         """Route an event to the appropriate worker's dedicated request topic.
 
@@ -2502,8 +2499,10 @@ class WorkerManager(EngineScoped):
         Future: consult a WorkerRegistry to select the correct worker based on event type
         or target library.
         """
-        session_id = self.engine.get_session_id()
-        worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
+        worker_response_topic = response_topic
+        if worker_response_topic is None:
+            session_id = self.engine.get_session_id()
+            worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
         await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)

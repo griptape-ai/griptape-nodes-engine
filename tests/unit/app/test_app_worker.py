@@ -3843,6 +3843,23 @@ class TestSharingThisEngineBetweenRuns:
         await watcher
 
     @pytest.mark.asyncio
+    async def test_freeing_a_worker_asks_it_in_its_session_and_hears_back_on_this_engine_s_topic(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The worker is in the session of the engine it serves, which is not this engine's."""
+        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1")
+
+        with patch("griptape_nodes.retained_mode.managers.worker_manager._ENGINE_REQUEST_TIMEOUT_S", new=0.01):
+            await worker_manager._drop_library_named_objects("w1", hosted)
+
+        message_type, body, topic = worker_manager._tx.send_message.call_args.args  # type: ignore[union-attr]
+        sent = json.loads(body)
+        assert message_type == "EventRequest"
+        assert topic == "sessions/s1/workers/w1/request"
+        assert sent["response_topic"] == f"engines/{_ENGINE}/response"
+        assert worker_manager._tx.request_client._pending_requests == {}  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_an_engine_that_is_lost_lets_its_runs_go(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
