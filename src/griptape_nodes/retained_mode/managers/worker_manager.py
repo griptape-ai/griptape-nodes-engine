@@ -1355,7 +1355,7 @@ class WorkerManager(EngineScoped):
     @handles(
         worker_events.ReportWorkerExitedRequest,
         sender=RequiredSender.ENGINE,
-        owner=lambda manager, request, _sender: manager._engine_running(request.worker_engine_id),
+        owner=lambda manager, request, _sender: manager.worker_host(request.worker_engine_id),
     )
     async def handle_report_worker_exited_request(
         self, request: worker_events.ReportWorkerExitedRequest
@@ -1624,16 +1624,6 @@ class WorkerManager(EngineScoped):
             return None
         return hosted.engine_id
 
-    def _engine_running(self, worker_engine_id: str) -> str | None:
-        """The engine that runs a worker this engine asked for, or None if it asked for no such worker."""
-        start = self._remote_starts.get(worker_engine_id)
-        if start is not None:
-            return start.host_engine_id
-        registration = self._workers.get(worker_engine_id)
-        if registration is None:
-            return None
-        return registration.host_engine_id
-
     async def _stop_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker this engine runs for another engine. Its exit watcher reports it stopped.
 
@@ -1825,6 +1815,20 @@ class WorkerManager(EngineScoped):
     def worker_unavailable_reason(self, library_name: str | None) -> str | None:
         """Why no worker is available to run `library_name`, or None if that is not the problem."""
         return self._worker_unavailable.get(library_name)
+
+    def worker_host(self, worker_engine_id: str) -> str | None:
+        """The engine that runs a worker this engine asked another engine for, or None for any other worker.
+
+        Known from the moment the start is recorded, before it is sent, so traffic for a worker that registers
+        before the start's answer arrives can already be carried to its engine.
+        """
+        start = self._remote_starts.get(worker_engine_id)
+        if start is not None:
+            return start.host_engine_id
+        registration = self._workers.get(worker_engine_id)
+        if registration is None:
+            return None
+        return registration.host_engine_id
 
     def has_settled(self, library_name: str | None) -> bool:
         """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending.
