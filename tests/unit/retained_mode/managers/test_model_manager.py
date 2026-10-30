@@ -8,8 +8,12 @@ Covers:
   download reports a written message rather than whatever landed in the subprocess pipe
 - `on_handle_download_model_request` — a missing Hugging Face token does not block the attempt
 - `_load_status_file` — status file reads survive a concurrent status file write
+- `on_handle_pause_model_download_request` / `on_handle_resume_model_download_request` — a paused
+  download keeps its status until resumed with the parameters it started with
+- `on_handle_delete_model_request` — deleting a model clears its download record
 """
 
+import asyncio
 import importlib.util
 import io
 import json
@@ -31,13 +35,22 @@ from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
+    DeleteModelRequest,
+    DeleteModelResultSuccess,
     DownloadModelRequest,
+    DownloadModelResultFailure,
     DownloadModelResultSuccess,
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
     ListModelDownloadsRequest,
     ListModelDownloadsResultSuccess,
+    PauseModelDownloadRequest,
+    PauseModelDownloadResultFailure,
+    PauseModelDownloadResultSuccess,
+    ResumeModelDownloadRequest,
+    ResumeModelDownloadResultFailure,
+    ResumeModelDownloadResultSuccess,
     SearchModelsRequest,
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
@@ -981,6 +994,7 @@ class TestAppInitializationCompleteWorkerGuard:
         with (
             patch.object(type(model_manager), "engine", property(lambda _self: engine)),
             patch.object(model_manager, "_find_unfinished_downloads", return_value=["org/model"]) as find_unfinished,
+            patch.object(model_manager, "_find_paused_downloads", return_value=set()),
             patch.object(model_manager, "on_handle_download_model_request", new_callable=AsyncMock) as handle_download,
         ):
             await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=False))
@@ -1035,3 +1049,228 @@ class TestFindUnfinishedDownloads:
         self._write(status_dir, "org/done", status="completed")
 
         assert model_manager._find_unfinished_downloads() == []
+
+    def test_a_paused_download_stays_paused(self, model_manager: ModelManager, status_dir: Path) -> None:
+        """The user stopped it on purpose; an engine start must not restart the transfer."""
+        self._write(status_dir, "org/paused", status="paused")
+
+        assert model_manager._find_unfinished_downloads() == []
+
+
+# ---------------------------------------------------------------------------
+# Pause and resume
+# ---------------------------------------------------------------------------
+
+
+class _BlockingProcess:
+    """Download subprocess that runs until terminated, or until `finish` is called."""
+
+    def __init__(self) -> None:
+        self.stdout = None
+        self.stderr = None
+        self.returncode: int | None = None
+        self._exited = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.returncode = -15
+        self._exited.set()
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def finish(self) -> None:
+        self.returncode = 0
+        self._exited.set()
+
+    async def wait(self) -> int | None:
+        await self._exited.wait()
+        return self.returncode
+
+
+class TestPauseAndResume:
+    @pytest.fixture
+    def status_dir(self, model_manager: ModelManager, tmp_path: Path) -> Iterator[Path]:
+        def write(status_file: Path, data: dict) -> None:
+            status_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=tmp_path),
+            patch.object(model_manager, "_write_download_status", side_effect=write),
+        ):
+            yield tmp_path
+
+    async def _start_download(
+        self, model_manager: ModelManager, process: _BlockingProcess, **request_fields: Any
+    ) -> asyncio.Task:
+        spawned = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.set()
+            return process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            download = asyncio.create_task(
+                model_manager.on_handle_download_model_request(
+                    DownloadModelRequest(model_id="org/model", **request_fields)
+                )
+            )
+            # The task registers the process before its next await, which is the earliest this wakes.
+            await spawned.wait()
+        assert "org/model" in model_manager._download_processes
+        return download
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_pausing_keeps_the_download_paused(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultSuccess)
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "paused"
+        # The request that started the download ends without claiming the model downloaded.
+        assert isinstance(await download, DownloadModelResultFailure)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_download_that_finishes_first_is_not_paused(self, model_manager: ModelManager) -> None:
+        process = _BlockingProcess()
+        download = await self._start_download(model_manager, process)
+        process.finish()
+        await download
+
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultFailure)
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_resume_downloads_what_was_paused(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(
+            model_manager, _BlockingProcess(), local_dir="/models/here", revision="refs/pr/1"
+        )
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+
+        resumed_process = _BlockingProcess()
+        resumed_process.finish()
+        spawned: list[str] = []
+
+        async def fake_create_subprocess_exec(*cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.extend(cmd)
+            return resumed_process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            result = await model_manager.on_handle_resume_model_download_request(
+                ResumeModelDownloadRequest(model_id="org/model")
+            )
+
+        assert isinstance(result, ResumeModelDownloadResultSuccess)
+        assert spawned[spawned.index("--local-dir") + 1] == "/models/here"
+        assert spawned[spawned.index("--revision") + 1] == "refs/pr/1"
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_second_resume_does_not_start_a_second_download(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+
+        resumed_process = _BlockingProcess()
+        first_resume = await self._start_resume(model_manager, resumed_process)
+
+        second = await model_manager.on_handle_resume_model_download_request(
+            ResumeModelDownloadRequest(model_id="org/model")
+        )
+        resumed_process.finish()
+
+        assert isinstance(second, ResumeModelDownloadResultFailure)
+        assert isinstance(await first_resume, ResumeModelDownloadResultSuccess)
+
+    async def _start_resume(self, model_manager: ModelManager, process: _BlockingProcess) -> asyncio.Task:
+        spawned = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.set()
+            return process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            resume = asyncio.create_task(
+                model_manager.on_handle_resume_model_download_request(ResumeModelDownloadRequest(model_id="org/model"))
+            )
+            await spawned.wait()
+        return resume
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_paused_configured_model_is_not_downloaded_at_startup(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+        engine = SimpleNamespace(
+            config_manager=SimpleNamespace(get_config_value=lambda *_args, **_kwargs: ["org/model"])
+        )
+
+        with (
+            patch.object(type(model_manager), "engine", property(lambda _self: engine)),
+            patch.object(model_manager, "on_handle_download_model_request", new_callable=AsyncMock) as handle_download,
+        ):
+            await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=False))
+
+        handle_download.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_nothing_to_pause(self, model_manager: ModelManager) -> None:
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_only_a_paused_download_resumes(self, model_manager: ModelManager, status_dir: Path) -> None:
+        record = {"model_id": "org/model", "status": "completed", "started_at": "s", "updated_at": "u"}
+        (status_dir / "org--model.json").write_text(json.dumps(record), encoding="utf-8")
+
+        result = await model_manager.on_handle_resume_model_download_request(
+            ResumeModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, ResumeModelDownloadResultFailure)
+
+
+# ---------------------------------------------------------------------------
+# on_handle_delete_model_request
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteModelClearsDownloadRecord:
+    """A paused or failed record left behind would mark a later copy of the model incomplete."""
+
+    @pytest.mark.asyncio
+    async def test_the_download_record_goes_with_the_files(self, model_manager: ModelManager, tmp_path: Path) -> None:
+        record = {"model_id": "org/model", "status": "paused", "started_at": "s", "updated_at": "u"}
+        status_file = tmp_path / "org--model.json"
+        status_file.write_text(json.dumps(record), encoding="utf-8")
+
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=tmp_path),
+            patch.object(model_manager, "_delete_model", return_value="/cache/org--model"),
+        ):
+            result = await model_manager.on_handle_delete_model_request(DeleteModelRequest(model_id="org/model"))
+
+        assert isinstance(result, DeleteModelResultSuccess)
+        assert not status_file.exists()
