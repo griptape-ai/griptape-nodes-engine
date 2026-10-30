@@ -3746,7 +3746,7 @@ class NodeManager(EngineScoped):
             return
         for node in list(flow.nodes.values()):
             self._forget_node(node, flow)
-        self.engine.flow_manager.forget_empty_flow(flow)
+        self.engine.flow_manager.forget_empty_flow(self.engine.current_workflow(), flow)
 
     def _local_library_load_failure(self, library_name: str | None) -> str | None:
         """What THIS process recorded about failing to load ``library_name``, if anything.

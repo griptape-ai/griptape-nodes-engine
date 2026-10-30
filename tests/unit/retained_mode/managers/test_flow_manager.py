@@ -197,6 +197,17 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
+    def test_deserializing_needs_a_workflow_to_load_into(self, engine: Engine, image_with_flow_commands: str) -> None:
+        engine.context_manager.pop_workflow()
+        request = ExtractFlowCommandsFromImageMetadataRequest(
+            file_url_or_path=image_with_flow_commands, deserialize=True
+        )
+
+        result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert "Failed to deserialize" in str(result.result_details)
+
     def test_returns_commands_when_flow_commands_key_present(
         self, engine: Engine, image_with_flow_commands: str, empty_flow_commands: SerializedFlowCommands
     ) -> None:
@@ -268,9 +279,10 @@ class TestStartFlowRequestDefaultsToCurrentContext:
             ).ClearAllObjectStateRequest(i_know_what_im_doing=True)
         )
 
+        engine.context_manager.push_workflow("no_flow_wf")
         assert not engine.context_manager.has_current_flow()
 
-        result = await flow_manager.on_start_flow_request(StartFlowRequest())
+        result = await flow_manager.on_start_flow_request(StartFlowRequest(), engine.current_workflow())
 
         assert isinstance(result, StartFlowResultFailure)
         # Message should now name a concrete remediation, not the old generic one.
@@ -297,15 +309,16 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         )
         assert isinstance(create_flow_result, CreateFlowResultSuccess)
 
-        # Short-circuit get_flow_by_name so we can assert on the resolved name without
+        # Short-circuit get_flow_by_name_in so we can assert on the resolved name without
         # actually running a control flow.
-        with patch.object(flow_manager, "get_flow_by_name", side_effect=KeyError("stop here")) as get_flow:
-            result = await flow_manager.on_start_flow_request(StartFlowRequest())
+        workflow = engine.current_workflow()
+        with patch.object(flow_manager, "get_flow_by_name_in", side_effect=KeyError("stop here")) as get_flow:
+            result = await flow_manager.on_start_flow_request(StartFlowRequest(), workflow)
 
         # The handler should have looked up the current-context flow name, not bailed with
         # the "must provide flow name" error.
         assert isinstance(result, StartFlowResultFailure)
-        get_flow.assert_called_once_with("flow_in_ctx")
+        get_flow.assert_called_once_with(workflow, "flow_in_ctx")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -320,9 +333,12 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         flow_manager = engine.flow_manager
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
+        engine.context_manager.push_workflow("no_node_wf")
         assert not engine.context_manager.has_current_node()
 
-        result = await flow_manager.on_start_flow_from_node_request(StartFlowFromNodeRequest())
+        result = await flow_manager.on_start_flow_from_node_request(
+            StartFlowFromNodeRequest(), engine.current_workflow()
+        )
 
         assert isinstance(result, StartFlowFromNodeResultFailure)
         assert "Current Context" in str(result.result_details)
@@ -347,29 +363,26 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         # needs to expose `.name`; we short-circuit object lookup below.
         fake_node = MagicMock(spec=BaseNode)
         fake_node.name = "node_in_ctx"
-        ctx = engine.context_manager
+        workflow = engine.current_workflow()
+        ctx = workflow.context
         with (
             patch.object(ctx, "has_current_node", return_value=True),
             patch.object(ctx, "get_current_node", return_value=fake_node),
-            patch.object(
-                engine.object_manager,
-                "attempt_get_object_by_name_as_type",
-                return_value=fake_node,
-            ),
+            patch.object(workflow.objects, "get_as_type", return_value=fake_node),
             patch.object(
                 engine.node_manager,
                 "get_node_parent_flow_by_name",
                 return_value="derived_parent_flow",
             ) as get_parent_flow,
-            patch.object(flow_manager, "get_flow_by_name", side_effect=KeyError("stop here")) as get_flow,
+            patch.object(flow_manager, "get_flow_by_name_in", side_effect=KeyError("stop here")) as get_flow,
         ):
-            result = await flow_manager.on_start_flow_from_node_request(StartFlowFromNodeRequest())
+            result = await flow_manager.on_start_flow_from_node_request(StartFlowFromNodeRequest(), workflow)
 
         # The handler should have used the current-context node and derived its parent flow,
         # not bailed with the "must provide node name" error.
         assert isinstance(result, StartFlowFromNodeResultFailure)
         get_parent_flow.assert_called_once_with("node_in_ctx")
-        get_flow.assert_called_once_with("derived_parent_flow")
+        get_flow.assert_called_once_with(workflow, "derived_parent_flow")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -383,17 +396,19 @@ class TestStartFlowFailureMessage:
         flow_manager = engine.flow_manager
         validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
         with (
-            patch.object(flow_manager, "get_flow_by_name", return_value=MagicMock()),
-            patch.object(flow_manager, "check_for_existing_running_flow", return_value=False),
-            patch.object(flow_manager, "get_start_node_queue"),
+            patch.object(flow_manager, "get_flow_by_name_in", return_value=MagicMock()),
+            patch.object(flow_manager, "_flow_is_running", return_value=False),
+            patch.object(flow_manager, "get_start_node_queue_in"),
             patch.object(flow_manager, "on_validate_flow_dependencies_request", return_value=validated),
         ):
             yield flow_manager
 
     @pytest.mark.asyncio
-    async def test_start_flow_reports_exception(self, ready_flow_manager: Any) -> None:
+    async def test_start_flow_reports_exception(self, ready_flow_manager: Any, engine: Engine) -> None:
         with patch.object(ready_flow_manager, "start_flow", side_effect=RuntimeError("boom")):
-            result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
+            result = await ready_flow_manager.on_start_flow_request(
+                StartFlowRequest(flow_name="f"), engine.current_workflow()
+            )
 
         assert isinstance(result, StartFlowResultFailure)
         assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
@@ -405,7 +420,9 @@ class TestStartFlowFailureMessage:
         machine.resolution_machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
         ready_flow_manager._global_control_flow_machine = machine
         with patch.object(ready_flow_manager, "start_flow"):
-            result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
+            result = await ready_flow_manager.on_start_flow_request(
+                StartFlowRequest(flow_name="f"), ready_flow_manager.engine.current_workflow()
+            )
 
         assert isinstance(result, StartFlowResultFailure)
         assert (
@@ -415,12 +432,13 @@ class TestStartFlowFailureMessage:
 
     @pytest.mark.asyncio
     async def test_start_flow_from_node_reports_exception(self, ready_flow_manager: Any, engine: Engine) -> None:
+        workflow = engine.current_workflow()
         with (
-            patch.object(engine.object_manager, "attempt_get_object_by_name_as_type", return_value=MagicMock()),
+            patch.object(workflow.objects, "get_as_type", return_value=MagicMock()),
             patch.object(ready_flow_manager, "start_flow", side_effect=RuntimeError("boom")),
         ):
             result = await ready_flow_manager.on_start_flow_from_node_request(
-                StartFlowFromNodeRequest(node_name="n", flow_name="f")
+                StartFlowFromNodeRequest(node_name="n", flow_name="f"), workflow
             )
 
         assert isinstance(result, StartFlowFromNodeResultFailure)
@@ -444,12 +462,14 @@ class TestListNodesInFlowRequest:
         from griptape_nodes.retained_mode.managers.flow_manager import ControlFlow
 
         flow_manager = engine.flow_manager
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
         with patch.object(
-            engine.object_manager,
-            "attempt_get_object_by_name_as_type",
+            workflow.objects,
+            "get_as_type",
             side_effect=lambda _name, typ: flow if typ is ControlFlow else None,
         ):
-            return flow_manager.on_list_nodes_in_flow_request(request)  # type: ignore[arg-type]
+            return flow_manager.on_list_nodes_in_flow_request_in_workflow(request, workflow)  # type: ignore[arg-type]
 
     def test_no_filter_returns_all_nodes(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
@@ -587,9 +607,10 @@ class TestAutoLayoutFlowRequest:
         )
 
         self._cleanup(engine)
+        engine.context_manager.push_workflow("no_flow_wf")
         flow_manager = engine.flow_manager
 
-        result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest())
+        result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest(), engine.current_workflow())
 
         assert isinstance(result, AutoLayoutFlowResultFailure)
 
@@ -610,7 +631,8 @@ class TestAutoLayoutFlowRequest:
                 origin_y=20.0,
                 layer_spacing=100.0,
                 row_spacing=50.0,
-            )
+            ),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, AutoLayoutFlowResultSuccess)
@@ -638,7 +660,9 @@ class TestAutoLayoutFlowRequest:
         self._bootstrap_workflow_and_flow(engine, workflow="empty_wf", flow="empty_flow")
 
         flow_manager = engine.flow_manager
-        result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest(flow_name="empty_flow"))
+        result = await flow_manager.on_auto_layout_flow_request(
+            AutoLayoutFlowRequest(flow_name="empty_flow"), engine.current_workflow()
+        )
 
         assert isinstance(result, AutoLayoutFlowResultSuccess)
         assert result.positioned_nodes == []
@@ -759,16 +783,17 @@ class TestClassifyNodesForDag:
     control-entry / data-sink roles based purely on the connection graph. It backs both the
     top-level queue and isolated subflow seeding, so these tests lock in each branch. Real node
     subclasses and a real Connections object are used so the Parameter/Connection semantics match
-    production; only get_connections is patched to hand the classifier the crafted graph.
+    production; only the workflow's connections are swapped for the crafted graph.
     """
 
     @staticmethod
     def _classify(engine: Engine, nodes: list, connections: Connections) -> DagNodeCategories:
         from unittest.mock import patch
 
-        flow_manager = engine.flow_manager
-        with patch.object(flow_manager, "get_connections", return_value=connections):
-            return flow_manager.classify_nodes_for_dag(nodes)
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+        with patch.object(workflow.flows, "connections", connections):
+            return engine.flow_manager.classify_nodes_for_dag_in(workflow, nodes)
 
     def test_start_node_is_a_start_node(self, engine: Engine) -> None:
         start = _ClassifyStartNode("Start")
@@ -890,7 +915,8 @@ class TestSerializeFlowSkipsTransientChildFlows:
         flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
         result = flow_manager.on_serialize_flow_to_commands(
-            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
+            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True),
+            engine.current_workflow(),
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess)
 
@@ -942,7 +968,8 @@ class TestSerializeFlowSkipsTransientChildFlows:
         # Serialization must succeed (not fail on the transient flow's internal connection) and
         # must not include the transient flow.
         result = flow_manager.on_serialize_flow_to_commands(
-            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
+            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True),
+            engine.current_workflow(),
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
 
@@ -1213,7 +1240,7 @@ class TestRunsEndCleanly:
         async def first() -> Any:
             await may_start.wait()
             try:
-                await flow_manager.start_flow(MagicMock())
+                await flow_manager.start_flow(engine.current_workflow(), MagicMock())
             except RuntimeError as e:
                 return StartFlowResultFailure(validation_exceptions=[e], result_details=str(e))
             return _ran("first")
@@ -1358,15 +1385,24 @@ class TestRunSpecs:
 
     @pytest.mark.asyncio
     async def test_a_flow_run_whose_flow_is_gone_fails(self, engine: Engine) -> None:
-        result = await StartFlowSpec(request=StartFlowRequest(flow_name="gone"), flow_name="gone").execute(engine)
+        engine.context_manager.push_workflow("wf")
+        spec = StartFlowSpec(
+            request=StartFlowRequest(flow_name="gone"), workflow=engine.current_workflow(), flow_name="gone"
+        )
+
+        result = await spec.execute(engine)
 
         assert isinstance(result, StartFlowResultFailure)
         assert "Cannot start flow" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_a_run_from_a_node_that_is_gone_fails(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("wf")
         spec = StartFlowFromNodeSpec(
-            request=StartFlowFromNodeRequest(node_name="gone"), flow_name="flow", node_name="gone"
+            request=StartFlowFromNodeRequest(node_name="gone"),
+            workflow=engine.current_workflow(),
+            flow_name="flow",
+            node_name="gone",
         )
 
         result = await spec.execute(engine)

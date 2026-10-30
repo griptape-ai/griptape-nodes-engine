@@ -2841,6 +2841,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="declared_var", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2870,6 +2871,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references=set(),
@@ -2888,6 +2890,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="ghost", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2920,6 +2923,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="shared_name", scope=VariableScope.GLOBAL_ONLY)},
@@ -2968,6 +2972,7 @@ class TestWorkflowVariablePersistence:
         # Child flow should not claim the parent-owned variable.
         child_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         child_commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=child_flow_name,
             unique_parameter_uuid_to_values=child_unique_values,
             variable_references={ref},
@@ -2977,6 +2982,7 @@ class TestWorkflowVariablePersistence:
         # Parent flow should claim it.
         parent_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         parent_commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=parent_flow_name,
             unique_parameter_uuid_to_values=parent_unique_values,
             variable_references={ref},
@@ -3174,6 +3180,7 @@ class TestVariableReferenceAccess:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={
