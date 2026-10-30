@@ -27,7 +27,7 @@ class TestClearAllObjectStateCancelsFirst:
         calls: list[str] = []
 
         engine = MagicMock()
-        engine.flow_manager.cancel_all_runs = AsyncMock(side_effect=lambda: calls.append("cancel"))
+        engine.flow_manager.cancel_all_runs = AsyncMock(side_effect=lambda **_: calls.append("cancel"))
         engine.flow_manager.reset_global_execution_state = MagicMock(side_effect=lambda: calls.append("reset"))
         # Awaited by the handler to release objects libraries parked in workers.
         engine.worker_manager.broadcast_local_object_teardown = AsyncMock()
