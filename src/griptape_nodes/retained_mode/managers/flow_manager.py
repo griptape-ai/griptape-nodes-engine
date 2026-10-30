@@ -60,6 +60,8 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ContinueExecutionStepResultFailure,
     ContinueExecutionStepResultSuccess,
     ControlFlowCancelledEvent,
+    FlowRunEndedEvent,
+    FlowRunStartedEvent,
     GetFlowStateRequest,
     GetFlowStateResultFailure,
     GetFlowStateResultSuccess,
@@ -256,6 +258,8 @@ class FlowManager(EngineScoped):
         self._driving = False
         # True while cancel_all_runs awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self._cancelling_all = False
+        # Set when this engine runs a node group for another engine's run, which owns the run and its id.
+        self.parent_run_id: str | None = None
 
         self.packaging = FlowPackaging(event_manager, engine=engine)
         self.serialization = FlowSerialization(event_manager, engine=engine)
@@ -263,6 +267,22 @@ class FlowManager(EngineScoped):
     @property
     def global_single_node_resolution(self) -> bool:
         return self._global_single_node_resolution
+
+    @property
+    def current_run_id(self) -> str | None:
+        """The id of the run in progress, or None when nothing is running.
+
+        Spend attribution reads this, so a model call made while a run is in progress counts toward
+        that run. A node in a library worker sends its budget requests to this engine, which is why
+        the id is read here rather than from the running task's context. When this engine runs a node
+        group for another engine, its runs count toward that engine's run.
+        """
+        run = self._run_in_progress
+        if run is None:
+            return None
+        if self.parent_run_id is not None:
+            return self.parent_run_id
+        return run.run_id
 
     @property
     def global_flow_queue(self) -> Queue[QueueItem]:
@@ -2268,6 +2288,7 @@ class FlowManager(EngineScoped):
         run.state = RunState.RUNNING
         self._run_in_progress = run
         self._driving = True
+        self._announce_run_started(run)
         # The run that just ended may have ended on a short-lived loop, such as a synchronous request's.
         self._on_run_loop(run, self._create_driver, run)
 
@@ -2309,6 +2330,28 @@ class FlowManager(EngineScoped):
                 run.state = RunState.FAILED
         self._finish_run(run)
 
+    def _announce_run_started(self, run: Run) -> None:
+        """Tell clients the run has the machine and its id, unless another engine's run owns it."""
+        if self.parent_run_id is not None:
+            return
+        self.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(payload=FlowRunStartedEvent(run_id=run.run_id, flow_name=run.flow_name))
+            )
+        )
+
+    def _announce_run_ended(self, run: Run) -> None:
+        """Tell clients the run has ended and how, unless another engine's run owns it."""
+        if self.parent_run_id is not None:
+            return
+        self.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(
+                    payload=FlowRunEndedEvent(run_id=run.run_id, flow_name=run.flow_name, state=run.state.value)
+                )
+            )
+        )
+
     def _finish_run_if_over(self) -> None:
         """End the run in progress if its flow has stopped, on the paths that can stop a paused run.
 
@@ -2343,6 +2386,7 @@ class FlowManager(EngineScoped):
         if self._run_in_progress is not run:
             return
         self._run_in_progress = None
+        self._announce_run_ended(run)
         self._start_next_run_if_idle()
         self._report_places_in_line()
 

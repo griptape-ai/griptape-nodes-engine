@@ -104,6 +104,23 @@ class TestLocalSessionWorkflowExecutorCli:
 
         assert kwargs["session_id"] == "abc-123"
 
+    def test_cli_constructor_kwargs_includes_parent_run_id(self) -> None:
+        parser = ArgumentParser()
+        LocalSessionWorkflowExecutor.add_cli_arguments(parser)
+        args = parser.parse_args(["--parent-run-id", "parent-run"])
+
+        kwargs = LocalSessionWorkflowExecutor._cli_constructor_kwargs(args)
+
+        assert kwargs["parent_run_id"] == "parent-run"
+
+    def test_cli_constructor_kwargs_parent_run_id_defaults_to_none(self) -> None:
+        parser = ArgumentParser()
+        LocalSessionWorkflowExecutor.add_cli_arguments(parser)
+
+        kwargs = LocalSessionWorkflowExecutor._cli_constructor_kwargs(parser.parse_args([]))
+
+        assert kwargs["parent_run_id"] is None
+
     def test_cli_constructor_kwargs_project_file_path_converted_to_path(self) -> None:
         parser = ArgumentParser()
         LocalSessionWorkflowExecutor.add_cli_arguments(parser)
@@ -283,6 +300,25 @@ class TestExecutionEventsAreSentOnce:
             if sent.args[0] == "execution_event"
         ]
         assert sent_execution_events == ["NodeStartProcessEvent", "ControlFlowResolvedEvent"]
+
+
+class TestParentRun:
+    """A node group run in this process for another engine's run counts toward that run."""
+
+    @pytest.mark.asyncio
+    async def test_the_parent_run_holds_for_the_session_only(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the parent run is under test; app startup and the websocket are not.
+        monkeypatch.setattr(engine.event_manager, "abroadcast_app_event", AsyncMock())
+        executor = LocalSessionWorkflowExecutor(session_id="session", parent_run_id="parent-run")
+        executor._start_websocket_connection = AsyncMock()  # type: ignore[method-assign]
+        executor._stop_websocket_connection = AsyncMock()  # type: ignore[method-assign]
+
+        async with executor:
+            assert engine.flow_manager.parent_run_id == "parent-run"
+
+        assert engine.flow_manager.parent_run_id is None
 
 
 class TestUsageReportsOnExit:

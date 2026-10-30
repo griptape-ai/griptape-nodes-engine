@@ -5,7 +5,7 @@ Griptape Cloud enforces spending budgets on every call that goes through the Gri
 - `BudgetAccessRequest`, sent **before** the call, asks Cloud whether the call fits the budgets of the open project.
 - `ReportUsageRequest`, sent **after** the call, tells Cloud what the call cost, so it counts against those budgets and shows in usage auditing.
 
-The engine adds the project, workflow, engine and session to both requests for you. Send the provider's own name for the model, such as `gpt-5-nano`, in both requests, so a refusal and the spend it would have been are grouped under the same model in usage audits. Pass the node's class name as `node_type`. `node_id` is for an opaque id; never pass the node's name, which the user types and may not want shared.
+The engine adds the project, workflow, workflow run, engine and session to both requests for you. Send the provider's own name for the model, such as `gpt-5-nano`, in both requests, so a refusal and the spend it would have been are grouped under the same model in usage audits. Pass the node's class name as `node_type`. `node_id` is for an opaque id; never pass the node's name, which the user types and may not want shared.
 
 ## Before the call: `BudgetAccessRequest`
 
@@ -78,3 +78,11 @@ await GriptapeNodes.ahandle_request(
 - **Never fail a node over its report.** Ignore the result. A report with neither token counts nor a declared cost, or with both, comes back as a failure with the reason. Griptape Cloud checks everything else, such as the model or the cache counts, and a report it rejects is logged and dropped. Either way the node carries on.
 
 - Pass the `correlation_id` from the check's success so Cloud can pair the check with the report.
+
+## What one run cost
+
+Every `BudgetAccessRequest` and `ReportUsageRequest` sent while a workflow runs carries that run's id as the `run_id` tag, so Griptape Cloud can total what one run cost, apart from earlier runs of the same workflow. A loop's iterations, a node run while a flow is already running, and a node group set to run in a separate process on the same machine all count toward the run in progress. A group sent to a remote execution environment reports under that environment's own run ids. A request sent while no run is in progress carries no `run_id`.
+
+The id is the run's own: the one its request's result names in `run_id`, and the one `RunQueuedEvent`, `ListRunsRequest` and `CancelRunRequest` use. A run started while another is in progress waits its turn and keeps that id. The engine announces it on `FlowRunStartedEvent` when the run starts, so a client can learn the id as the run starts rather than when its request returns, and on `FlowRunEndedEvent` when the run ends, with how it ended: finished, failed, or cancelled. Every run that sends a start event sends exactly one end event, including a run whose flow fails before it starts.
+
+A client that keeps the id can ask Griptape Cloud what that run cost with `POST /api/spend/search` and the filter `tag_filters: [{"key": "run_id", "value": ["<run id>"]}]`. The response's `totals` add up every matching row, not just the page returned. Calls made through the Griptape Cloud proxy do not carry `run_id` yet, so this total covers direct provider calls only.
