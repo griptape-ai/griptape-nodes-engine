@@ -252,75 +252,80 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         explicit.assert_called_once_with(engine.current_workflow(), *args)
         assert returned is explicit.return_value
 
-    @pytest.mark.parametrize(
-        ("edge_name", "handler_name", "request_payload"),
-        [
-            (
-                "create_connection",
-                "on_create_connection_request",
-                CreateConnectionRequest(
-                    source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
-                ),
-            ),
-            (
-                "delete_connection",
-                "on_delete_connection_request",
-                DeleteConnectionRequest(
-                    source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
-                ),
-            ),
-        ],
-    )
-    def test_a_connection_edge_method_hands_the_open_workflow_to_the_handler(
-        self, engine: Engine, edge_name: str, handler_name: str, request_payload: Any
-    ) -> None:
-        _open_workflow(engine)
-        flow_manager = engine.flow_manager
-
-        with patch.object(flow_manager, handler_name, return_value=MagicMock()) as handler:
-            returned = getattr(flow_manager, edge_name)(request_payload)
-
-        handler.assert_called_once_with(request_payload, engine.current_workflow())
-        assert returned is handler.return_value
-
-    @pytest.mark.asyncio
-    async def test_start_local_subflow_hands_the_open_workflow_to_the_handler(self, engine: Engine) -> None:
-        _open_workflow(engine)
-        flow_manager = engine.flow_manager
-        request = StartLocalSubflowRequest(flow_name="subflow")
-
-        with patch.object(flow_manager, "on_start_local_subflow_request", return_value=MagicMock()) as handler:
-            await flow_manager.start_local_subflow(request)
-
-        handler.assert_awaited_once_with(request, engine.current_workflow())
-
     @pytest.mark.asyncio
     async def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
 
-        created = flow_manager.create_connection(
-            CreateConnectionRequest(
-                source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
-            )
-        )
-        deleted = flow_manager.delete_connection(
-            DeleteConnectionRequest(
-                source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
-            )
-        )
-        started = await flow_manager.start_local_subflow(StartLocalSubflowRequest(flow_name="subflow"))
-
-        assert isinstance(created, CreateConnectionResultFailure)
-        assert isinstance(deleted, DeleteConnectionResultFailure)
-        assert isinstance(started, StartLocalSubflowResultFailure)
         assert not flow_manager.check_for_existing_running_flow()
         assert flow_manager.flow_state(MagicMock()) == ([], [], [])
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
 
-class TestHandlersNodeLibrariesCallDirectly:
-    """Shipped node libraries call these by name with only a request, so those calls keep working."""
+def _connection_request(request_type: type) -> Any:
+    return request_type(
+        source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
+    )
+
+
+class TestHandlersCalledDirectly:
+    """Engine, `exe_types` and node library code call these by name with only a request, so those calls keep working."""
+
+    @pytest.mark.parametrize(
+        ("handler_name", "request_type"),
+        [
+            ("on_create_connection_request", CreateConnectionRequest),
+            ("on_delete_connection_request", DeleteConnectionRequest),
+        ],
+    )
+    def test_a_connection_handler_called_with_only_a_request_acts_on_the_open_workflow(
+        self, engine: Engine, handler_name: str, request_type: type
+    ) -> None:
+        _open_workflow(engine)
+        flow_manager = engine.flow_manager
+        request = _connection_request(request_type)
+
+        with patch.object(flow_manager, f"{handler_name}_in_workflow", return_value=MagicMock()) as handler:
+            returned = getattr(flow_manager, handler_name)(request)
+
+        handler.assert_called_once_with(request, engine.current_workflow())
+        assert returned is handler.return_value
+
+    def test_deleting_a_connection_with_only_a_request_runs_the_handler(self, engine: Engine) -> None:
+        _open_workflow(engine)
+
+        result = engine.flow_manager.on_delete_connection_request(_connection_request(DeleteConnectionRequest))
+
+        assert isinstance(result, DeleteConnectionResultFailure)
+        assert "'a'" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_start_local_subflow_called_with_only_a_request_acts_on_the_open_workflow(
+        self, engine: Engine
+    ) -> None:
+        _open_workflow(engine)
+        flow_manager = engine.flow_manager
+        request = StartLocalSubflowRequest(flow_name="subflow")
+
+        with patch.object(
+            flow_manager, "on_start_local_subflow_request_in_workflow", return_value=MagicMock()
+        ) as handler:
+            returned = await flow_manager.on_start_local_subflow_request(request)
+
+        handler.assert_awaited_once_with(request, engine.current_workflow())
+        assert returned is handler.return_value
+
+    @pytest.mark.asyncio
+    async def test_handlers_called_with_only_a_request_fail_with_no_workflow_open(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+
+        created = flow_manager.on_create_connection_request(_connection_request(CreateConnectionRequest))
+        deleted = flow_manager.on_delete_connection_request(_connection_request(DeleteConnectionRequest))
+        started = await flow_manager.on_start_local_subflow_request(StartLocalSubflowRequest(flow_name="subflow"))
+
+        assert isinstance(created, CreateConnectionResultFailure)
+        assert isinstance(deleted, DeleteConnectionResultFailure)
+        assert isinstance(started, StartLocalSubflowResultFailure)
 
     def test_get_top_level_flow_takes_only_a_request(self, engine: Engine) -> None:
         _open_workflow(engine)

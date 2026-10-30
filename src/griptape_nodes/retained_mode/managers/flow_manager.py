@@ -1110,19 +1110,20 @@ class FlowManager(EngineScoped):
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
 
-    def create_connection(self, request: CreateConnectionRequest) -> ResultPayload:
+    def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code not handed a workflow; code holding one calls the handler with it.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_create_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             details = f'Connection "{request.source_node_name}.{request.source_parameter_name}" to "{request.target_node_name}.{request.target_parameter_name}" failed because no workflow is open.'
             return CreateConnectionResultFailure(result_details=details)
-        return self.on_create_connection_request(request, workflow)
+        return self.on_create_connection_request_in_workflow(request, workflow)
 
     @handles(CreateConnectionRequest, scope=RequestScope.WORKFLOW)
-    def on_create_connection_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
+    def on_create_connection_request_in_workflow(  # noqa: PLR0911, PLR0912, PLR0915, C901
         self, request: CreateConnectionRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         # Vet the two nodes first.
@@ -1471,19 +1472,20 @@ class FlowManager(EngineScoped):
 
         return result
 
-    def delete_connection(self, request: DeleteConnectionRequest) -> ResultPayload:
+    def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:
         """Disconnect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code not handed a workflow; code holding one calls the handler with it.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_delete_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             details = f'Connection not deleted "{request.source_node_name}.{request.source_parameter_name}" to "{request.target_node_name}.{request.target_parameter_name}" because no workflow is open.'
             return DeleteConnectionResultFailure(result_details=details)
-        return self.on_delete_connection_request(request, workflow)
+        return self.on_delete_connection_request_in_workflow(request, workflow)
 
     @handles(DeleteConnectionRequest, scope=RequestScope.WORKFLOW)
-    def on_delete_connection_request(  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
+    def on_delete_connection_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
         self, request: DeleteConnectionRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         # Vet the two nodes first.
@@ -3326,19 +3328,20 @@ class FlowManager(EngineScoped):
             details = f"Cannot start subflow '{flow_name}'. Start node '{start_node_name}' not found: {err}"
             return StartLocalSubflowResultFailure(result_details=details)
 
-    async def start_local_subflow(self, request: StartLocalSubflowRequest) -> ResultPayload:
+    async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:
         """Run a subflow of the open workflow, outside dispatch.
 
-        Edge method for code not handed a workflow; code holding one calls `on_start_local_subflow_request`.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             details = f"Attempted to run subflow '{request.flow_name}'. Failed because no workflow is open."
             return StartLocalSubflowResultFailure(result_details=details)
-        return await self.on_start_local_subflow_request(request, workflow)
+        return await self.on_start_local_subflow_request_in_workflow(request, workflow)
 
     @handles(StartLocalSubflowRequest, scope=RequestScope.WORKFLOW)
-    async def on_start_local_subflow_request(  # noqa: C901, PLR0911
+    async def on_start_local_subflow_request_in_workflow(  # noqa: C901, PLR0911
         self, request: StartLocalSubflowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         flow_name = request.flow_name
