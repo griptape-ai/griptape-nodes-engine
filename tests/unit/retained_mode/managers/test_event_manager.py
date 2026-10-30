@@ -2307,17 +2307,17 @@ class _RecordingWorkerRequestClient:
         self.answer = answer
         self.sent: list[dict] = []
 
-    async def request_to_orchestrator(
+    async def request_from_worker(
         self,
         event_request: EventRequest,
-        orchestrator_request_topic: str,
+        request_topic: str,
         worker_response_topic: str,
         timeout_ms: int | None = None,
     ) -> dict:
         self.sent.append(
             {
                 "request": event_request.request,
-                "request_topic": orchestrator_request_topic,
+                "request_topic": request_topic,
                 "response_topic": worker_response_topic,
                 "timeout_ms": timeout_ms,
             }

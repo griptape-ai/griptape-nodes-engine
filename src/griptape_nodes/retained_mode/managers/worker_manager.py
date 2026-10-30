@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
+    ReleaseSettings,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.serialization.values import untag
@@ -1497,6 +1498,7 @@ class WorkerManager(EngineScoped):
         host_engine_ids = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
         self._engine_registrations.clear()
         for host_engine_id in host_engine_ids:
+            self._forget_leases_on(host_engine_id)
             task = asyncio.get_running_loop().create_task(self._withdraw_session_offer(host_engine_id))
             self._stop_requests.add(task)
             task.add_done_callback(self._stop_requests.discard)
@@ -2046,13 +2048,19 @@ class WorkerManager(EngineScoped):
         # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
         for key in [key for key in self._engine_registrations if key[0] == engine_id]:
             del self._engine_registrations[key]
-        # It forgets the leases too, so a run's next node there asks for a new one. An acquire still waiting
-        # fails on its own, with the connection's loss as the reason.
+        self._forget_leases_on(engine_id)
+        await self._forget_engine(engine_id, why="lost its connection")
+
+    def _forget_leases_on(self, engine_id: str) -> None:
+        """Forget this engine's leases on `engine_id`, which forgets them with the session, so a run's next node asks again.
+
+        Neither released nor cancelled: that engine has no session to release them in, and an acquire still
+        waiting fails on its own, with the reason.
+        """
         for lease in [lease for lease in self._leases.values() if lease.host_engine_id == engine_id]:
             del self._leases[lease.lease_id]
             if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
                 del self._run_leases[(lease.run_id, lease.host_engine_id)]
-        await self._forget_engine(engine_id, why="lost its connection")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
         """Forget the sessions `engine_id` offered this engine, let its runs go, and stop their workers."""
@@ -2191,8 +2199,9 @@ class WorkerManager(EngineScoped):
     async def _free_for_handoff(self, incoming_engine_id: str) -> None:
         """Free workers, as `distributed_execution.release` says, before this engine passes to `incoming_engine_id`'s run."""
         config = self.engine.config_manager
-        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default="others")
-        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default="drop_cache")
+        defaults = ReleaseSettings()
+        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default=defaults.which)
+        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default=defaults.how)
         if which == "none":
             return
         frees = []
@@ -2414,7 +2423,7 @@ class WorkerManager(EngineScoped):
         ready = self._execution_ready.get(library_name)
         return ready is None or ready.is_set()
 
-    async def wait_until_executable(self, library_name: str | None) -> None:
+    async def wait_until_executable(self, library_name: str | None, *, start_stopped: bool = True) -> None:
         """Block until `library_name` can be executed, or until it is settled that it cannot.
 
         A worker registers BEFORE it loads libraries -- registration is what carries the
@@ -2428,10 +2437,14 @@ class WorkerManager(EngineScoped):
         timeout is a bug report; an unbounded wait is a mystery.
 
         A library whose worker another engine stopped, to free itself for another engine's run, has that
-        worker started there again first.
+        worker started there again first, unless `start_stopped` is False: then such a library returns at
+        once, as before a lease, which must not load the library there while another run holds that engine.
         """
         if library_name is not None:
-            await self._start_remote_worker_if_stopped(library_name)
+            if start_stopped:
+                await self._start_remote_worker_if_stopped(library_name)
+            elif self._remote_worker_stopped(library_name):
+                return
         if self.has_settled(library_name):
             return
         if library_name is None:
@@ -2456,15 +2469,19 @@ class WorkerManager(EngineScoped):
 
     async def _start_remote_worker_if_stopped(self, library_name: str) -> None:
         """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
-        if self._engine_for_library(library_name) is None:
-            return
-        if self.is_worker_running_or_starting(library_name):
-            return
-        # A worker that ended on its own left a reason, which stays until the library is reset.
-        unavailable = self._worker_unavailable.get(library_name)
-        if unavailable is not None and not unavailable.retryable:
+        if not self._remote_worker_stopped(library_name):
             return
         await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
+
+    def _remote_worker_stopped(self, library_name: str) -> bool:
+        """Whether `library_name`'s worker on another engine is stopped and may be started again there."""
+        if self._engine_for_library(library_name) is None:
+            return False
+        if self.is_worker_running_or_starting(library_name):
+            return False
+        # A worker that ended on its own left a reason, which stays until the library is reset.
+        unavailable = self._worker_unavailable.get(library_name)
+        return unavailable is None or unavailable.retryable
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

@@ -3760,7 +3760,8 @@ class NodeManager(EngineScoped):
         try:
             try:
                 if library_name:
-                    await wm.wait_until_executable(library_name)
+                    # A worker that engine stopped starts again only once the lease holds it.
+                    await wm.wait_until_executable(library_name, start_stopped=False)
                     # A worker that could not be started there leaves nothing to lease, and an engine
                     # that never answered the start would never answer the lease either.
                     if wm.worker_unavailable_reason(library_name) is None:
@@ -3769,7 +3770,7 @@ class NodeManager(EngineScoped):
                 worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if wm is None or worker is None:
+            if worker is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:

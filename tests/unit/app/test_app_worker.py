@@ -3031,6 +3031,27 @@ class TestARemoteWorkerExits:
         assert not worker_manager.is_worker_running_or_starting(_LIBRARY)
 
     @pytest.mark.asyncio
+    async def test_a_worker_the_engine_stopped_is_started_again_only_when_asked_to(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Before a lease, starting it would load the library there while another run holds that engine."""
+        _host_engine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
+        )
+        await _sent_by(
+            _FROM_HOST_ENGINE,
+            worker_manager.handle_report_worker_exited_request,
+            _exited(_ENGINE, "stopped", exit_code=0),
+        )
+
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await asyncio.wait_for(worker_manager.wait_until_executable(_LIBRARY, start_stopped=False), timeout=1.0)
+            start.assert_not_awaited()
+            await worker_manager.wait_until_executable(_LIBRARY)
+        start.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_an_exit_reported_twice_is_recorded_once(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
         await _start_on_host_engine(worker_manager)
@@ -4337,6 +4358,26 @@ class TestAskingAnotherEngineForALease:
         assert after.lease_id != before.lease_id
         assert links.sent_types().count("AcquireLeaseRequest") == len([before, after])
         assert "ReleaseLeaseRequest" not in links.sent_types(), "a lost engine is not told to release"
+
+    @pytest.mark.asyncio
+    async def test_a_run_s_next_node_asks_for_a_new_lease_after_withdrawing_its_offers(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """That engine forgets the leases with the offer, so the old one would be refused."""
+        links = _host_engine(worker_manager)
+        _in_run(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        before = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        worker_manager.release_after_node(before)
+
+        worker_manager._withdraw_session_offers()
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        after = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+
+        assert before is not None
+        assert after is not None
+        assert after.lease_id != before.lease_id
+        assert links.sent_types().count("AcquireLeaseRequest") == len([before, after])
 
     @pytest.mark.asyncio
     async def test_a_node_outside_any_run_has_a_lease_of_its_own_released_when_it_ends(

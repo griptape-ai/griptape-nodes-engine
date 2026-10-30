@@ -1003,7 +1003,7 @@ class TestExecuteNodeWorkerRoute:
             return success
 
         wm.worker_unavailable_reason.return_value = None
-        wm.wait_until_executable = AsyncMock(side_effect=lambda *_: calls.append("wait"))
+        wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
         wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
         lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
         wm.route_to_worker = AsyncMock(side_effect=run)
@@ -1214,7 +1214,7 @@ class TestExecuteNodePrivateExecutionRoute:
 
         # Set after the node manager is built, which installs its own mock. The library's own wait
         # comes first and passes; only the Isolated Execution worker's wait can fail here.
-        async def wait_until_executable(key: str | None) -> None:
+        async def wait_until_executable(key: str | None, *, start_stopped: bool = True) -> None:  # noqa: ARG001
             if key is None and load_failure is not None:
                 raise RuntimeError(load_failure)
 

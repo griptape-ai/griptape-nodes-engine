@@ -1140,9 +1140,9 @@ class EventManager(EngineScoped):
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
         response_future = asyncio.run_coroutine_threadsafe(
-            self._worker_request_client.request_to_orchestrator(
+            self._worker_request_client.request_from_worker(
                 event_request=EventRequest(request=request),
-                orchestrator_request_topic=request_topic,
+                request_topic=request_topic,
                 worker_response_topic=response_topic,
                 timeout_ms=self._forward_timeout_ms,
             ),

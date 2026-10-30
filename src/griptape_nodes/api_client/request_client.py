@@ -39,7 +39,7 @@ class _PendingRequest:
     # the full payload dict instead of rejecting it with
     # ``Exception(error_msg)``. The default (False) preserves the
     # original "failure -> raised exception" contract that
-    # ``request``/``request_to_orchestrator``/``request_batch`` already
+    # ``request``/``request_from_worker``/``request_batch`` already
     # rely on. The worker fan-out path opts in so the orchestrator can
     # cattrs-structure the failure dict back into a real
     # ``ResultPayloadFailure`` (preserving exception fidelity over the
@@ -185,23 +185,23 @@ class RequestClient:
             logger.debug("Request %s completed successfully", request_id)
             return result
 
-    async def request_to_orchestrator(
+    async def request_from_worker(
         self,
         event_request: EventRequest,
-        orchestrator_request_topic: str,
+        request_topic: str,
         worker_response_topic: str,
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Publish an EventRequest to the orchestrator and await its matching EventResult.
+        """Publish a worker's EventRequest to another engine, its orchestrator or its host, and await the EventResult.
 
-        Sets event_request.response_topic to worker_response_topic so the orchestrator
+        Sets event_request.response_topic to worker_response_topic so that engine
         replies on a topic this RequestClient is subscribed to. Tracks the future by
         event_request.request_id (generated if missing), publishes the serialized
-        EventRequest to orchestrator_request_topic, and awaits the matching response.
+        EventRequest to request_topic, and awaits the matching response.
 
         Args:
             event_request: EventRequest wrapping the RequestPayload to forward.
-            orchestrator_request_topic: Topic the orchestrator listens on.
+            request_topic: Topic the engine asked listens on.
             worker_response_topic: Topic this worker listens on for the reply.
             timeout_ms: Optional timeout in milliseconds.
 
@@ -224,10 +224,10 @@ class RequestClient:
             await self.client.subscribe(worker_response_topic)
             self._subscribed_response_topics.add(worker_response_topic)
 
-        logger.debug("Forwarding request %s on %s", request_id, orchestrator_request_topic)
+        logger.debug("Forwarding request %s on %s", request_id, request_topic)
 
         try:
-            await self.client.publish("EventRequest", payload_dict, orchestrator_request_topic)
+            await self.client.publish("EventRequest", payload_dict, request_topic)
 
             if timeout_ms:
                 timeout_sec = timeout_ms / 1000
