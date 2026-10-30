@@ -425,8 +425,6 @@ class NodeManager(EngineScoped):
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Each node's parent flow and the nodes routed to a worker belong to the open workflow and
-        # live on its runtime.
 
         # Worker-side: request_id → (asyncio.Task, BaseNode) for the aprocess
         # task currently handling an ExecuteNodeRequest. Populated in
