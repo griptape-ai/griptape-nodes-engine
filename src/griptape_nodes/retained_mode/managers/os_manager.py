@@ -4594,8 +4594,8 @@ class OSManager(EngineScoped):
         re-entrancy the full request path would add while the engine is still constructing.
         """
         request_type = type(request)
-        callback = self._event_manager._request_type_to_manager.get(request_type)
-        if not callback:
+        callback = self._event_manager.get_manager_for_request_type(request_type)
+        if callback is None:
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
         return callback(request)
