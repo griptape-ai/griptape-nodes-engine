@@ -291,6 +291,8 @@ class LibraryRegistry:
     _collision_node_names_to_library_names: ClassVar[dict[str, list[str]]] = {}
     # Track registered widgets per library: {library_name: set(widget_names)}
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
+    # Bumped on every change to which libraries and node types are registered. See `get_generation`.
+    _generation: ClassVar[int] = 0
 
     @classmethod
     def _clear(cls) -> None:
@@ -305,6 +307,22 @@ class LibraryRegistry:
         cls._node_aliases.clear()
         cls._collision_node_names_to_library_names.clear()
         cls._registered_widgets.clear()
+        cls._bump_generation()
+
+    @classmethod
+    def get_generation(cls) -> int:
+        """A counter that changes whenever a library or node type is registered or unregistered.
+
+        Anything derived from registered node classes (such as cached node type descriptions) is
+        current only while this value is unchanged. Every registration change in the process bumps
+        it: loading, reloading and unloading libraries, and adding or replacing a single node type
+        (the sandbox library re-registering a node from edited source).
+        """
+        return cls._generation
+
+    @classmethod
+    def _bump_generation(cls) -> None:
+        cls._generation += 1
 
     @classmethod
     def generate_new_library(
@@ -321,6 +339,7 @@ class LibraryRegistry:
             library_data=library_data, is_default_library=mark_as_default_library, advanced_library=advanced_library
         )
         cls._libraries[library_data.name] = library
+        cls._bump_generation()
         return library
 
     @classmethod
@@ -351,6 +370,7 @@ class LibraryRegistry:
 
         # Now delete the library from the registry.
         del cls._libraries[library_name]
+        cls._bump_generation()
 
     @classmethod
     def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:  # noqa: C901
@@ -697,6 +717,7 @@ class Library:
 
         self._node_types[node_class_as_str] = NodeTypeEntry(node_class_as_str, node_class=node_class)
         self._node_metadata[node_class_as_str] = metadata
+        LibraryRegistry._bump_generation()
         return library_problem
 
     def register_lazy_node_type(
@@ -716,6 +737,7 @@ class Library:
 
         self._node_types[node_class_name] = NodeTypeEntry(class_name=node_class_name, loader=loader)
         self._node_metadata[node_class_name] = metadata
+        LibraryRegistry._bump_generation()
         return library_problem
 
     def unregister_node_type(self, node_class_name: str) -> None:
@@ -734,6 +756,7 @@ class Library:
             raise LibraryRegistryError(msg)
         del self._node_types[node_class_name]
         self._node_metadata.pop(node_class_name, None)
+        LibraryRegistry._bump_generation()
 
     def get_library_data(self) -> LibrarySchema:
         return self._library_data

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -60,11 +62,14 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeModuleImportProblem,
 )
+from griptape_nodes.retained_mode.managers.library.node_type_specs import NodeTypeSpecCache, trim_parameters
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.node_library.library_registry import Library, NodeMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -76,6 +81,7 @@ logger = logging.getLogger("griptape_nodes")
 class LibraryCatalog(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
+        self._node_type_specs = NodeTypeSpecCache()
         event_manager.register_request_handlers(self)
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
@@ -343,104 +349,41 @@ class LibraryCatalog(EngineScoped):
 
     @handles(DescribeNodeTypeRequest)
     def describe_node_type_request(self, request: DescribeNodeTypeRequest) -> ResultPayload:
-        # Resolve the library for this node type. When no library is supplied, we rely on
-        # LibraryRegistry to pick the unique library that provides it.
-        try:
-            library = LibraryRegistry.get_library_for_node_type(
-                node_type=request.node_type, specific_library_name=request.library
-            )
-        except KeyError as err:
-            details = f"Attempted to describe node type '{request.node_type}'. Failed when looking up its library because: {err}"
-            return DescribeNodeTypeResultFailure(result_details=details)
+        resolved = self._resolve_node_type(request.node_type, request.library)
+        if isinstance(resolved, _NodeTypeLookupFailure):
+            return DescribeNodeTypeResultFailure(result_details=resolved.details)
 
-        library_name = library.get_library_data().name
+        # A request that leaves something out is for planning, so it is served from the cache. One
+        # with everything included is read fresh, for dropdowns built from the machine it runs on.
+        includes_everything = (
+            request.include_metadata
+            and request.include_tooltips
+            and request.include_ui_options
+            and request.include_exec_pins
+        )
+        if includes_everything:
+            parameters = self._fresh_parameters(resolved)
+        else:
+            parameters = self._cached_parameters(resolved)
+        if isinstance(parameters, _ParameterProbeFailure):
+            return self._described_without_parameters(resolved, parameters, include_metadata=request.include_metadata)
 
-        # Make sure the node type really is registered in this library before we go further.
-        try:
-            node_metadata = library.get_node_metadata(node_type=request.node_type)
-        except KeyError:
-            details = f"Attempted to describe node type '{request.node_type}' in Library '{library_name}'. Failed because the Library has no node type with that name."
-            return DescribeNodeTypeResultFailure(result_details=details)
-
-        # Instantiate a throwaway node so we can read the parameters its __init__ declares.
-        # The node is never added to a flow or the ObjectManager, so it is garbage-collected
-        # when this method returns.
-        #
-        # Nodes whose __init__ performs I/O (network calls, auth checks, disk reads) can raise.
-        # In that case we still return a success payload with the library-level metadata and a
-        # WARNING entry in result_details, so callers can present the node at all instead of
-        # getting an opaque failure for every such node type.
-        # Resolving the class imports the node's module, which deferred registration put off until
-        # first use, so a broken module raises here rather than at load.
-        try:
-            node_class = library.get_node_class(request.node_type)
-        except (ImportError, AttributeError, TypeError) as err:
-            import_error = f"{type(err).__name__}: {err}"
-            return DescribeNodeTypeResultSuccess(
-                library=library_name,
-                node_type=request.node_type,
-                metadata=node_metadata,
-                parameters=[],
-                result_details=ResultDetails(
-                    ResultDetail(
-                        level=logging.INFO,
-                        message=(
-                            f"Described node type '{request.node_type}' in Library '{library_name}' "
-                            "with library metadata only."
-                        ),
-                    ),
-                    ResultDetail(
-                        level=logging.WARNING,
-                        message=f"Node module failed to import: {import_error}",
-                    ),
-                ),
-            )
-        probe_name = f"__describe_node_type_probe__{request.node_type}"
-        try:
-            # Wrap in ``LibraryRegistry.constructing_node()`` so the
-            # parameter-mutation detector skips this ephemeral probe's
-            # declarative ``add_parameter`` calls (this construction
-            # bypasses ``LibraryRegistry.create_node``).
-            #
-            # Pass the node's library and type so declarative ``__init__`` logic
-            # that resolves against the library -- e.g. ``get_declared_models``
-            # populating a model dropdown from the ``model_catalog`` -- works
-            # during the probe just as it does under ``create_node``.
-            with LibraryRegistry.constructing_node(throwaway=True):
-                probe_node = node_class(
-                    name=probe_name,
-                    metadata={"library": library_name, "node_type": request.node_type},
-                )
-        except Exception as err:
-            probe_error = f"{type(err).__name__}: {err}"
-            return DescribeNodeTypeResultSuccess(
-                library=library_name,
-                node_type=request.node_type,
-                metadata=node_metadata,
-                parameters=[],
-                result_details=ResultDetails(
-                    ResultDetail(
-                        level=logging.INFO,
-                        message=(
-                            f"Described node type '{request.node_type}' in Library '{library_name}' "
-                            "with library metadata only."
-                        ),
-                    ),
-                    ResultDetail(
-                        level=logging.WARNING,
-                        message=f"Parameter probe failed because: {probe_error}",
-                    ),
-                ),
-            )
-
-        parameters = [ParameterDescription.from_parameter(param) for param in probe_node.parameters]
-
-        details = f"Successfully described node type '{request.node_type}' in Library '{library_name}'."
+        metadata = None
+        if request.include_metadata:
+            metadata = resolved.metadata
+        trimmed = trim_parameters(
+            parameters,
+            include_tooltips=request.include_tooltips,
+            include_ui_options=request.include_ui_options,
+            include_exec_pins=request.include_exec_pins,
+        )
+        details = f"Successfully described node type '{request.node_type}' in Library '{resolved.library_name}'."
         return DescribeNodeTypeResultSuccess(
-            library=library_name,
+            library=resolved.library_name,
             node_type=request.node_type,
-            metadata=node_metadata,
-            parameters=parameters,
+            metadata=metadata,
+            parameters=trimmed.parameters,
+            exec_pins=trimmed.exec_pins,
             result_details=details,
         )
 
@@ -590,6 +533,152 @@ class LibraryCatalog(EngineScoped):
         )
         return result
 
+    def _described_without_parameters(
+        self, resolved: _ResolvedNodeType, failure: _ParameterProbeFailure, *, include_metadata: bool
+    ) -> DescribeNodeTypeResultSuccess:
+        """A description without parameters, for a node type whose parameters could not be read.
+
+        Still a success: the WARNING entry tells callers why the parameters are missing, and the
+        library metadata is there when the request asked for it.
+        """
+        metadata = None
+        summary = "without its parameters"
+        if include_metadata:
+            metadata = resolved.metadata
+            summary = "with library metadata only"
+        return DescribeNodeTypeResultSuccess(
+            library=resolved.library_name,
+            node_type=resolved.node_type,
+            metadata=metadata,
+            parameters=[],
+            result_details=ResultDetails(
+                ResultDetail(
+                    level=logging.INFO,
+                    message=f"Described node type '{resolved.node_type}' in Library '{resolved.library_name}' {summary}.",
+                ),
+                ResultDetail(level=logging.WARNING, message=failure.describe_warning),
+            ),
+        )
+
+    def _fresh_parameters(self, resolved: _ResolvedNodeType) -> list[ParameterDescription] | _ParameterProbeFailure:
+        """A node type's parameter descriptions, read from a new probe instance."""
+        probe = self._probe_parameters(resolved)
+        if isinstance(probe, _ParameterProbeFailure):
+            return probe
+        return [ParameterDescription.from_parameter(param) for param in probe]
+
+    def _cached_parameters(self, resolved: _ResolvedNodeType) -> list[ParameterDescription] | _ParameterProbeFailure:
+        """A node type's parameter descriptions, from the cache when it holds them.
+
+        Returns a copy, so a caller changing a description (a default value, say) cannot change
+        what later requests receive.
+        """
+        parameters = self._node_type_specs.get(resolved.library_name, resolved.node_type)
+        if parameters is None:
+            built = self._build_cached_parameters(resolved)
+            if isinstance(built, _ParameterProbeFailure):
+                return built
+            parameters = built
+        return copy.deepcopy(parameters)
+
+    def _build_cached_parameters(
+        self, resolved: _ResolvedNodeType
+    ) -> list[ParameterDescription] | _ParameterProbeFailure:
+        """Probe a node type, describe its parameters, and keep the descriptions in the cache.
+
+        Failures are not cached: the cause (a missing dependency, a failed network call, a missing
+        API key) may be fixed without any library reloading.
+        """
+        # Read before probing: descriptions built across a registration change are not kept.
+        generation = LibraryRegistry.get_generation()
+        probe = self._probe_parameters(resolved)
+        if isinstance(probe, _ParameterProbeFailure):
+            return probe
+
+        # Reading a parameter runs library code (trait ui_options, for one), and cached descriptions
+        # are copied out on every request, so a default that cannot be copied has to fail here, as a warning.
+        try:
+            parameters = copy.deepcopy([ParameterDescription.from_parameter(param) for param in probe])
+        except Exception as err:
+            read_error = f"{type(err).__name__}: {err}"
+            return _ParameterProbeFailure(describe_warning=f"Parameter read failed because: {read_error}")
+
+        self._node_type_specs.put(resolved.library_name, resolved.node_type, parameters, generation=generation)
+        return parameters
+
+    def _resolve_node_type(
+        self, node_type: str, library_name: str | None
+    ) -> _ResolvedNodeType | _NodeTypeLookupFailure:
+        """Find the library and metadata for a node type.
+
+        Args:
+            node_type: Name of the node type
+            library_name: Library to look in. When None, the one library that registers the node type.
+        """
+        # When no library is supplied, rely on LibraryRegistry to pick the unique library that provides it.
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type=node_type, specific_library_name=library_name)
+        except KeyError as err:
+            details = (
+                f"Attempted to describe node type '{node_type}'. Failed when looking up its library because: {err}"
+            )
+            return _NodeTypeLookupFailure(details=details)
+
+        resolved_library_name = library.get_library_data().name
+
+        # Make sure the node type really is registered in this library before going further.
+        try:
+            node_metadata = library.get_node_metadata(node_type=node_type)
+        except KeyError:
+            details = f"Attempted to describe node type '{node_type}' in Library '{resolved_library_name}'. Failed because the Library has no node type with that name."
+            return _NodeTypeLookupFailure(details=details)
+
+        return _ResolvedNodeType(
+            library=library,
+            library_name=resolved_library_name,
+            node_type=node_type,
+            metadata=node_metadata,
+        )
+
+    def _probe_parameters(self, resolved: _ResolvedNodeType) -> list[Parameter] | _ParameterProbeFailure:
+        """The parameters a node type's __init__ declares, read from a throwaway instance.
+
+        The node is never added to a flow or the ObjectManager, so it is garbage-collected once its
+        parameters are no longer referenced.
+
+        Nodes whose __init__ performs I/O (network calls, auth checks, disk reads) can raise, and
+        resolving the class imports the node's module, which deferred registration put off until
+        first use, so a broken module raises here rather than at load. Either is returned as a
+        failure so callers can still present the node type's library metadata.
+        """
+        try:
+            node_class = resolved.library.get_node_class(resolved.node_type)
+        except (ImportError, AttributeError, TypeError) as err:
+            import_error = f"{type(err).__name__}: {err}"
+            return _ParameterProbeFailure(describe_warning=f"Node module failed to import: {import_error}")
+
+        probe_name = f"__describe_node_type_probe__{resolved.node_type}"
+        try:
+            # Wrap in ``LibraryRegistry.constructing_node()`` so the
+            # parameter-mutation detector skips this ephemeral probe's
+            # declarative ``add_parameter`` calls (this construction
+            # bypasses ``LibraryRegistry.create_node``).
+            #
+            # Pass the node's library and type so declarative ``__init__`` logic
+            # that resolves against the library -- e.g. ``get_declared_models``
+            # populating a model dropdown from the ``model_catalog`` -- works
+            # during the probe just as it does under ``create_node``.
+            with LibraryRegistry.constructing_node(throwaway=True):
+                probe_node = node_class(
+                    name=probe_name,
+                    metadata={"library": resolved.library_name, "node_type": resolved.node_type},
+                )
+        except Exception as err:
+            probe_error = f"{type(err).__name__}: {err}"
+            return _ParameterProbeFailure(describe_warning=f"Parameter probe failed because: {probe_error}")
+
+        return probe_node.parameters
+
     def _library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
         """The library that recorded an import failure for a node type, or None when none did.
 
@@ -661,3 +750,31 @@ class LibraryCatalog(EngineScoped):
                 )
             )
         return widgets_info
+
+
+@dataclass
+class _ResolvedNodeType:
+    """A node type found in a registered library."""
+
+    library: Library
+    library_name: str
+    node_type: str
+    metadata: NodeMetadata
+
+
+@dataclass
+class _NodeTypeLookupFailure:
+    """A node type no registered library could be pinned down as providing."""
+
+    details: str
+
+
+@dataclass
+class _ParameterProbeFailure:
+    """A node type whose parameters could not be read, because its module or __init__ raised.
+
+    Args:
+        describe_warning: The WARNING DescribeNodeTypeRequest reports
+    """
+
+    describe_warning: str
