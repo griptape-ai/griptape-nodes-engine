@@ -27,8 +27,7 @@ class TestClearAllObjectStateCancelsFirst:
         calls: list[str] = []
 
         engine = MagicMock()
-        engine.flow_manager.check_for_existing_running_flow.return_value = True
-        engine.flow_manager.cancel_flow_run = AsyncMock(side_effect=lambda: calls.append("cancel"))
+        engine.flow_manager.cancel_all_runs = AsyncMock(side_effect=lambda: calls.append("cancel"))
         engine.flow_manager.reset_global_execution_state = MagicMock(side_effect=lambda: calls.append("reset"))
         # Awaited by the handler to release objects libraries parked in workers.
         engine.worker_manager.broadcast_local_object_teardown = AsyncMock()
@@ -43,10 +42,10 @@ class TestClearAllObjectStateCancelsFirst:
         assert calls == ["cancel", "reset"], "the reset must not run ahead of the cancel"
 
     @pytest.mark.asyncio
-    async def test_idle_engine_is_not_cancelled(self) -> None:
+    async def test_a_cancel_that_fails_does_not_stop_the_clear(self) -> None:
+        """A node that refuses to cancel must not leave the workflow half torn down."""
         engine = MagicMock()
-        engine.flow_manager.check_for_existing_running_flow.return_value = False
-        engine.flow_manager.cancel_flow_run = AsyncMock()
+        engine.flow_manager.cancel_all_runs = AsyncMock(side_effect=RuntimeError("a node would not stop"))
         engine.worker_manager.broadcast_local_object_teardown = AsyncMock()
         engine.context_manager.has_current_workflow.return_value = False
 
@@ -56,5 +55,4 @@ class TestClearAllObjectStateCancelsFirst:
         )
 
         assert isinstance(result, ClearAllObjectStateResultSuccess)
-        engine.flow_manager.cancel_flow_run.assert_not_awaited()
         engine.flow_manager.reset_global_execution_state.assert_called_once()

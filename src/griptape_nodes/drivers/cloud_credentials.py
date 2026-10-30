@@ -1,4 +1,4 @@
-"""Resolve the credential used to authenticate against Griptape Cloud.
+"""Resolve the credential and deployment URL used to reach Griptape Cloud.
 
 Griptape Cloud accepts two kinds of bearer credential: a Griptape Cloud API key
 (``GT_CLOUD_API_KEY``, a ``gt-`` prefixed key) and a Griptape Nodes License
@@ -21,9 +21,10 @@ Two endpoints must keep using the API key and must NOT be routed through here:
   HTTP 401. Were one added, an unassigned license authenticates as the org's
   synthetic service principal, so "who is the current user" would answer with a
   service account rather than the human.
-- ``wss://api.nodes.griptape.ai/ws/engines/events`` is served by a different
-  service that accepts only ``gt-`` keys or Auth0-signed JWTs. A License is
-  signed by the license key, so it fails signing-key lookup there.
+- ``wss://api.nodes.griptape.ai/ws/engines/events`` (the relay) is served by a
+  different service, which authenticates ``gt-`` keys and Auth0-signed JWTs.
+  License support there is not implemented yet, so the relay's credential comes
+  from :func:`resolve_relay_credential`, the one place to add it.
 
 Authenticating with a License is necessary but not always sufficient: the
 control plane also evaluates an entitlement policy per request, so a License
@@ -125,8 +126,20 @@ def resolve_cloud_credential(
     return secrets_manager.get_secret(secret_name, should_error_on_not_found=False)
 
 
+def resolve_relay_credential(secrets_manager: SecretsManager) -> str | None:
+    """Return the credential this engine connects to the Griptape Cloud relay with, or None if there is none.
+
+    The relay authenticates the Griptape Cloud API key. When it accepts the License too, this
+    returns the License the same way :func:`resolve_cloud_credential` does.
+    """
+    return secrets_manager.get_secret(API_KEY_SECRET_NAME, should_error_on_not_found=False)
+
+
 def resolve_cloud_base_url(secrets_manager: SecretsManager | None = None) -> str:
     """Return the base URL of the Griptape Cloud deployment in use.
+
+    The URL may carry a path (``https://example.com/prefix``). Build request URLs
+    from it with :func:`join_cloud_url`.
 
     Args:
         secrets_manager: Reads the override from the workspace and global
@@ -134,7 +147,8 @@ def resolve_cloud_base_url(secrets_manager: SecretsManager | None = None) -> str
             available; without it a workspace ``.env`` override is missed.
 
     Returns:
-        The configured base URL, or :data:`DEFAULT_CLOUD_BASE_URL`.
+        The configured base URL, or :data:`DEFAULT_CLOUD_BASE_URL` when it is
+        unset or empty.
     """
     if secrets_manager is None:
         base_url = os.getenv(BASE_URL_SETTING_NAME)
@@ -142,6 +156,21 @@ def resolve_cloud_base_url(secrets_manager: SecretsManager | None = None) -> str
         base_url = secrets_manager.get_secret(BASE_URL_SETTING_NAME, should_error_on_not_found=False)
 
     return base_url or DEFAULT_CLOUD_BASE_URL
+
+
+def join_cloud_url(base_url: str, path: str) -> str:
+    """Append a path to a Griptape Cloud base URL, keeping any path the base URL has.
+
+    ``urljoin`` is not used because an absolute path replaces the base URL's path.
+
+    Args:
+        base_url: Griptape Cloud base URL, optionally with a path.
+        path: Path to append (e.g. ``/api/buckets``).
+
+    Returns:
+        The joined URL.
+    """
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 def resolve_cloud_host(secrets_manager: SecretsManager | None = None) -> str:

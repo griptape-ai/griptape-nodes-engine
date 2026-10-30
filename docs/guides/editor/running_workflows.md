@@ -76,6 +76,20 @@ Two cases are worth knowing about:
 **Run Workflow** and **Run From Selected** still require an idle
 workflow; they stay disabled until the current run ends.
 
+## Starting a run while another is running
+
+A run started some other way while one is in progress, such as from a
+script or another tool that drives the engine, waits for the run in
+progress to finish and then starts. Several waiting runs start one at a
+time, in the order they were started. **Cancel Run** stops only the run in
+progress; the next waiting run then starts.
+
+A script can see the run in progress and the runs waiting behind it with
+`ListRunsRequest`, withdraw a waiting run with `CancelRunRequest`, which
+takes the run's id from that list, and cancel everything with
+`CancelAllRunsRequest`. The result of a run request also names its run, in
+`run_id`.
+
 ## Stopping a run
 
 While a workflow is running, the same button area shows **Cancel Run** in
@@ -113,12 +127,12 @@ A few things worth knowing:
     bar names every one of them, so your administrator can make room in all
     of them at once.
 
-To see how much a budget has spent and how much room it has left, open its
-page on Griptape Cloud. A budget marked *(frozen)* refuses every call no
-matter how many credits are left, until an administrator lifts the freeze.
+A budget marked *(frozen)* refuses every call no matter how many credits are
+left, until an administrator lifts the freeze.
 
-Budgets are set, raised and unfrozen on Griptape Cloud, not in the editor.
-Bring the budget names from the bar to your Griptape administrator.
+Your organization's administrators set, raise and unfreeze budgets in
+[Spend & Budgets](../../enterprise/admin_dashboard.md#spend-budgets) in the
+Admin Dashboard. Bring the budget names from the bar to them.
 
 ## Reading execution state on the canvas
 

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -16,7 +17,7 @@ from griptape_nodes.serialization.values import DisplayValue
 # Variable Events
 @dataclass
 @PayloadRegistry.register
-class CreateVariableRequest(RequestPayload):
+class CreateVariableRequest(RequestPayload, GraphAccessMixin):
     """Create a new variable.
 
     Args:
@@ -52,7 +53,7 @@ class CreateVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Get Variable Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableRequest(RequestPayload):
+class GetVariableRequest(RequestPayload, GraphAccessMixin):
     """Get a complete variable by name.
 
     Args:
@@ -86,7 +87,7 @@ class GetVariableResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # Get Variable Value Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableValueRequest(RequestPayload):
+class GetVariableValueRequest(RequestPayload, GraphAccessMixin):
     """Get the value of a variable by name.
 
     Args:
@@ -120,7 +121,7 @@ class GetVariableValueResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 # Set Variable Value Events
 @dataclass
 @PayloadRegistry.register
-class SetVariableValueRequest(RequestPayload):
+class SetVariableValueRequest(RequestPayload, GraphAccessMixin):
     """Set the value of a variable by name.
 
     Args:
@@ -154,7 +155,7 @@ class SetVariableValueResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Get Variable Type Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableTypeRequest(RequestPayload):
+class GetVariableTypeRequest(RequestPayload, GraphAccessMixin):
     """Get the type of a variable by name.
 
     Args:
@@ -188,7 +189,7 @@ class GetVariableTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 # Set Variable Type Events
 @dataclass
 @PayloadRegistry.register
-class SetVariableTypeRequest(RequestPayload):
+class SetVariableTypeRequest(RequestPayload, GraphAccessMixin):
     """Set the type of a variable by name.
 
     Args:
@@ -222,7 +223,7 @@ class SetVariableTypeResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Delete Variable Events
 @dataclass
 @PayloadRegistry.register
-class DeleteVariableRequest(RequestPayload):
+class DeleteVariableRequest(RequestPayload, GraphAccessMixin):
     """Delete a variable by name.
 
     Args:
@@ -254,7 +255,7 @@ class DeleteVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Rename Variable Events
 @dataclass
 @PayloadRegistry.register
-class RenameVariableRequest(RequestPayload):
+class RenameVariableRequest(RequestPayload, GraphAccessMixin):
     """Rename a variable by name.
 
     Args:
@@ -288,7 +289,7 @@ class RenameVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Has Variable Events
 @dataclass
 @PayloadRegistry.register
-class HasVariableRequest(RequestPayload):
+class HasVariableRequest(RequestPayload, GraphAccessMixin):
     """Check if a variable exists by name.
 
     Args:
@@ -323,7 +324,7 @@ class HasVariableResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # List Variables Events
 @dataclass
 @PayloadRegistry.register
-class ListVariablesRequest(RequestPayload):
+class ListVariablesRequest(RequestPayload, GraphAccessMixin):
     """List all variables in the specified scope.
 
     Args:
@@ -362,7 +363,7 @@ class ListVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # Get Variable Details Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableDetailsRequest(RequestPayload):
+class GetVariableDetailsRequest(RequestPayload, GraphAccessMixin):
     """Get variable details (metadata only, no heavy values).
 
     Args:
@@ -433,7 +434,7 @@ class Substitutable:
 
 @dataclass
 @PayloadRegistry.register
-class ListSubstitutablesRequest(RequestPayload):
+class ListSubstitutablesRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: use ListVariablesRequest instead.
 
     ListVariablesResultSuccess carries per-entry layer provenance (``layers``),
@@ -499,7 +500,7 @@ class ListSubstitutablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class ResolveSubstitutionRequest(RequestPayload):
+class ResolveSubstitutionRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: use ListVariablesRequest instead.
 
     Same layered walk; build a name→value dict from the result's variables.
@@ -548,7 +549,7 @@ class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class GetVariablesRequest(RequestPayload):
+class GetVariablesRequest(RequestPayload, GraphAccessMixin):
     """Probe specific variable names in scope and report which resolved.
 
     The named companion to ListVariablesRequest: List enumerates everything
@@ -595,7 +596,7 @@ class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SetVariablesRequest(RequestPayload):
+class SetVariablesRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: no known senders (engine, standard library, and GUI all confirmed clean).
 
     Batch write of multiple variable values atomically (all-or-nothing). Use

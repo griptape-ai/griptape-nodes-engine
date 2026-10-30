@@ -462,13 +462,13 @@ class TestTheRealRunPathReleases:
     def test_a_fresh_node_instance_reparking_the_same_slot_displaces(self, engine: Engine) -> None:  # noqa: ARG002 (the store the fixture builds is the subject)
         """Worker semantics: the previous run's object is displaced by slot, wherever it lives.
 
-        The transient node is rebuilt every execution, but the store is process-level.
+        A worker loads a new copy of the node for every execution, but the store is process-level.
         """
         first_run = _Producer(name="Producer")
         first_run.parameter_output_values["latent"] = Held("first")
         _egress(first_run)
 
-        # ExecuteNodeRequest carries local_object_source, and the worker's transient node adopts it. That
+        # ExecuteNodeRequest carries local_object_source, and the worker's copy of the node adopts it. That
         # is what makes the identity stable across instances; a node that mints its own is a different node.
         second_run = _Producer(name="Producer")
         second_run.local_object_source = first_run.local_object_source
