@@ -1033,15 +1033,13 @@ class FlowSerialization(EngineScoped):
         Returns:
             The saved name, or None if the command carries no name to map from
         """
-        match flow_initialization_command:
-            case CreateFlowRequest():
-                return flow_initialization_command.flow_name
-            case ImportWorkflowAsReferencedSubFlowRequest():
-                # An imported workflow is referenced by workflow name, not by a flow name a group
-                # could have recorded, so there is nothing to map.
-                return None
-            case _:
-                return None
+        if isinstance(flow_initialization_command, CreateFlowRequest):
+            return flow_initialization_command.flow_name
+        if isinstance(flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest):
+            # An imported workflow is referenced by workflow name, not by a flow name a group
+            # could have recorded, so there is nothing to map.
+            return None
+        return None
 
     def _create_flow_for_deserialization(
         self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
