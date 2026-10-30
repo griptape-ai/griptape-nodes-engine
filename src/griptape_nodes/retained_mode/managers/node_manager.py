@@ -2554,7 +2554,7 @@ class NodeManager(EngineScoped):
                 source_node = self.get_node_by_name(conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.delete_connection(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2572,7 +2572,7 @@ class NodeManager(EngineScoped):
                 target_node = self.get_node_by_name(conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.delete_connection(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -3746,7 +3746,7 @@ class NodeManager(EngineScoped):
             return
         for node in list(flow.nodes.values()):
             self._forget_node(node, flow)
-        self.engine.flow_manager.forget_empty_flow(flow)
+        self.engine.flow_manager.forget_empty_flow(self.engine.current_workflow(), flow)
 
     def _local_library_load_failure(self, library_name: str | None) -> str | None:
         """What THIS process recorded about failing to load ``library_name``, if anything.
@@ -6271,7 +6271,7 @@ class NodeManager(EngineScoped):
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.create_connection(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -6282,7 +6282,7 @@ class NodeManager(EngineScoped):
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.create_connection(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 

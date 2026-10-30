@@ -426,12 +426,11 @@ class TestNodesAndFlowsOnTheRuntime:
         assert reopened.nodes.name_to_parent_flow_name == {}
         assert reopened.flows.name_to_parent_name == {}
         assert not engine.flow_manager.global_single_node_resolution
-        assert not engine.flow_manager.does_canvas_exist()
+        assert not engine.flow_manager.does_canvas_exist(reopened)
 
     def test_lookups_find_no_node_or_run_with_no_workflow_open(self, engine: Engine) -> None:
         with pytest.raises(KeyError, match="could not be found"):
             engine.node_manager.get_node_parent_flow_by_name("node")
-        assert not engine.flow_manager.does_canvas_exist()
         assert not engine.flow_manager.check_for_existing_running_flow()
         assert not engine.flow_manager.execution_is_advancing()
 
@@ -443,8 +442,6 @@ class TestNodesAndFlowsOnTheRuntime:
 
     @pytest.mark.asyncio
     async def test_runs_and_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
-        with pytest.raises(NoOpenWorkflowError):
-            await engine.flow_manager.start_flow(MagicMock())
         with pytest.raises(NoOpenWorkflowError):
             await engine.flow_manager.cancel_flow_run()
         with pytest.raises(NoOpenWorkflowError):
@@ -466,7 +463,7 @@ class TestNodesAndFlowsOnTheRuntime:
 
         parked_run.start_flow = AsyncMock(side_effect=park_then_fail)
         monkeypatch.setattr(flow_manager_module, "ControlFlowMachine", MagicMock(return_value=parked_run))
-        run = asyncio.create_task(engine.flow_manager.start_flow(MagicMock(), MagicMock()))
+        run = asyncio.create_task(engine.flow_manager.start_flow(first, MagicMock(), MagicMock()))
         await asyncio.sleep(0)
         assert first.flows.global_control_flow_machine is parked_run
 

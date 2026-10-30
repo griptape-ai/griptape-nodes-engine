@@ -82,7 +82,7 @@ class TestStartFlowCleansUpAfterAFailedRun:
         flow_manager, _ = _doomed_run(monkeypatch)
 
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.start_flow(MagicMock(), MagicMock())
+            await flow_manager.start_flow(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         _assert_engine_is_restartable(flow_manager)
 
@@ -95,7 +95,7 @@ class TestStartFlowCleansUpAfterAFailedRun:
         # The error worth reporting is the one that ended the run, not the one raised while
         # clearing up after it.
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.start_flow(MagicMock(), MagicMock())
+            await flow_manager.start_flow(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         machine.cancel_flow.assert_awaited_once()
         _assert_engine_is_restartable(flow_manager)

@@ -492,7 +492,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # get old connections first, since this will delete the proxy
                 remap_connections = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.delete_connection(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -506,7 +506,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections from the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.create_connection(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -527,7 +527,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Get the incoming connections to the proxy parameter
                 remap_connections = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.delete_connection(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -541,7 +541,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections to the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.create_connection(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -610,7 +610,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from this node to proxy
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.delete_connection(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -624,7 +624,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from this node to target nodes
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.create_connection(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -639,7 +639,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete outgoing connections from proxy and clean up if no other incoming connections exist
                 if not other_incoming_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.delete_connection(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=connection.target_parameter.name,
@@ -675,7 +675,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from proxy to this node
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.delete_connection(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -689,7 +689,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from source nodes to this node
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.create_connection(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -704,7 +704,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete incoming connections to proxy and clean up if no other outgoing connections exist
                 if not other_outgoing_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.delete_connection(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=proxy_parameter.name,
@@ -1335,9 +1335,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
-            result = await self.engine.flow_manager.on_start_local_subflow_request(
-                StartLocalSubflowRequest(flow_name=subflow)
-            )
+            result = await self.engine.flow_manager.start_local_subflow(StartLocalSubflowRequest(flow_name=subflow))
 
             if isinstance(result, StartLocalSubflowResultFailure):
                 # Clear partial outputs to prevent inconsistent state
