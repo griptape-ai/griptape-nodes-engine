@@ -424,8 +424,6 @@ class NodeManager(EngineScoped):
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Each node's parent flow and the nodes routed to a worker belong to the open workflow and
-        # live on its runtime.
 
         # Worker-side: request_id → (asyncio.Task, BaseNode) for the aprocess
         # task currently handling an ExecuteNodeRequest. Populated in
@@ -3514,8 +3512,8 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values. A worker opens no workflow, so it is handed none: it runs
-        in the orchestrator's workflow context, mirrored from the request.
+        parameter values. A worker opens no workflow, so it is handed none: it loads
+        the copy into the runtime it keeps for the orchestrator's workflow.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
