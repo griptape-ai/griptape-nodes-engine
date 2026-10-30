@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import list_models, scan_cache_dir, snapshot_download
 from huggingface_hub import model_info as hf_model_info
+from huggingface_hub.utils._paths import filter_repo_objects
 from huggingface_hub.utils.tqdm import tqdm
 
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -22,6 +24,7 @@ from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.node_library.library_registry import get_declared_models
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
@@ -46,7 +49,13 @@ from griptape_nodes.retained_mode.events.model_events import (
     ListModelsResultSuccess,
     ModelDownloadStatus,
     ModelInfo,
+    PauseModelDownloadRequest,
+    PauseModelDownloadResultFailure,
+    PauseModelDownloadResultSuccess,
     QueryInfo,
+    ResumeModelDownloadRequest,
+    ResumeModelDownloadResultFailure,
+    ResumeModelDownloadResultSuccess,
     SearchModelsRequest,
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
@@ -102,6 +111,10 @@ class DownloadParams:
     ignore_patterns: list[str] | None = None
 
 
+class DownloadPausedError(Exception):
+    """Raised by a download task whose subprocess was stopped by a pause request."""
+
+
 _DOWNLOAD_PROGRESS_EMIT_INTERVAL = 1.0  # seconds between stdout progress events
 _PROGRESS_PIPE_ENV_VAR = "GRIPTAPE_NODES_PROGRESS_PIPE"  # set by parent to enable JSON stdout emission
 _STATUS_READ_LOCK_ATTEMPTS = 5  # tries before giving up on a status file a writer is holding
@@ -109,11 +122,70 @@ _STATUS_READ_TORN_ATTEMPTS = 2  # a torn read clears on the next try; a file mal
 _STATUS_READ_RETRY_DELAY = 0.05  # seconds to wait out that writer between tries
 
 
-def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
+def _bytes_already_downloaded(params: DownloadParams) -> int:
+    """Sum the sizes of the files a download will skip because they finished on an earlier attempt.
+
+    `snapshot_download` gives a finished file no progress bar, so it counts toward neither the
+    bytes downloaded nor the total. Without this, a restarted download reads as starting over.
+
+    Args:
+        params: Download parameters, resolved against the same cache `snapshot_download` uses.
+
+    Returns:
+        int: Bytes of finished files, or 0 if none are found or the files can't be read.
+            The count only drives progress, so it never fails the download.
+    """
+    try:
+        root = _finished_files_root(params)
+        if not root.is_dir():
+            return 0
+        # Snapshot entries are symlinks into blobs/, so is_file() and stat() follow them to the
+        # finished file. A local_dir keeps its partial downloads and metadata under .cache/.
+        files = {
+            path.relative_to(root).as_posix(): path
+            for path in root.rglob("*")
+            if path.is_file() and path.relative_to(root).parts[0] != ".cache"
+        }
+        wanted = filter_repo_objects(
+            items=files,
+            allow_patterns=params.allow_patterns,
+            ignore_patterns=params.ignore_patterns,
+        )
+        return sum(files[relative_path].stat().st_size for relative_path in wanted)
+    except (OSError, ValueError) as e:
+        # ValueError covers a refs file that isn't UTF-8 and a null byte in the ID or revision.
+        logger.debug("Could not size the finished files of '%s': %s", params.model_id, e)
+        return 0
+
+
+def _finished_files_root(params: DownloadParams) -> Path:
+    """Return the directory holding the files a download has already finished.
+
+    Args:
+        params: Download parameters.
+
+    Returns:
+        Path: The local_dir if one is set, otherwise the revision's snapshot in the HF cache.
+    """
+    if params.local_dir:
+        return Path(params.local_dir)
+    repo_dir = Path(hf_constants.HF_HUB_CACHE) / f"models--{params.model_id.replace('/', '--')}"
+    revision = params.revision or "main"
+    # A branch or tag resolves through refs/; a commit hash names the snapshot directly.
+    try:
+        commit_hash = (repo_dir / "refs" / revision).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        commit_hash = revision
+    return repo_dir / "snapshots" / commit_hash
+
+
+def _create_progress_tracker(model_id: str, already_downloaded: int = 0) -> type[tqdm]:  # noqa: C901
     """Create a tqdm class with model_id pre-configured.
 
     Args:
         model_id: The model ID to track progress for
+        already_downloaded: Bytes of files finished on an earlier attempt, counted as done
+            and added to the total of every byte-level bar
 
     Returns:
         A tqdm class that will track progress for the given model
@@ -147,6 +219,11 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
                     desc,
                 )
                 return
+
+            # snapshot_download adds each file's size to this total as that file starts.
+            self.total = (self.total or 0) + already_downloaded
+            self.n += already_downloaded
+            self._cumulative_bytes = already_downloaded
 
             logger.debug(
                 "ModelDownloadTracker instantiated for tracking - model_id: %s, total: %s, unit: %s, desc: '%s'",
@@ -379,6 +456,7 @@ class ModelManager(EngineScoped):
         super().__init__(engine)
         self._download_tasks = {}
         self._download_processes = {}
+        self._pausing_downloads: set[str] = set()
 
         if event_manager is not None:
             event_manager.register_request_handlers(self)
@@ -412,12 +490,22 @@ class ModelManager(EngineScoped):
         Raises:
             Exception: If download fails
         """
+        already_downloaded = _bytes_already_downloaded(
+            DownloadParams(
+                model_id=model_id,
+                local_dir=local_dir,
+                revision=revision,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+            )
+        )
+
         # Build download kwargs with progress tracking
         download_kwargs = {
             "repo_id": model_id,
             "repo_type": "model",
             "revision": revision,
-            "tqdm_class": _create_progress_tracker(model_id),
+            "tqdm_class": _create_progress_tracker(model_id, already_downloaded),
         }
 
         # Add optional parameters
@@ -493,6 +581,13 @@ class ModelManager(EngineScoped):
             self._download_tasks[parsed_model_id] = task
 
             await task
+        except DownloadPausedError:
+            return DownloadModelResultFailure(
+                result_details=ResultDetails(
+                    message=f"Download of model '{parsed_model_id}' was paused before it finished.",
+                    level=logging.INFO,
+                ),
+            )
         except asyncio.CancelledError:
             # Handle task cancellation gracefully
             logger.info("Download request cancelled for model '%s'", parsed_model_id)
@@ -619,6 +714,9 @@ class ModelManager(EngineScoped):
             "total_bytes": 0,
             "downloaded_bytes": 0,
             "progress_percent": 0.0,
+            # Recorded so a resume downloads the same thing. Not part of ModelDownloadStatus.
+            "local_dir": download_params.local_dir,
+            "revision": download_params.revision,
         }
         await asyncio.to_thread(self._write_download_status, status_file, initial_data)
 
@@ -668,6 +766,19 @@ class ModelManager(EngineScoped):
                     "progress_percent": 100.0,
                 }
                 await asyncio.to_thread(self._write_download_status, status_file, final_data)
+            elif model_id in self._pausing_downloads:
+                # Finished files stay in the cache and the next download skips them. Hugging Face
+                # restarts the file that was in progress under a new temp name.
+                logger.info("Paused download of model '%s'", model_id)
+                paused_data = {
+                    **last_known,
+                    "status": "paused",
+                    "updated_at": current_time,
+                    "paused_at": current_time,
+                }
+                await asyncio.to_thread(self._write_download_status, status_file, paused_data)
+                msg = f"Download of model '{model_id}' was paused"
+                raise DownloadPausedError(msg)
             else:
                 # The child's structured event is the only thing here that describes the
                 # failure. Its stderr also carries progress frames and library warnings, so
@@ -697,8 +808,86 @@ class ModelManager(EngineScoped):
                 raise ValueError(error_msg)
 
         finally:
+            self._pausing_downloads.discard(model_id)
             if model_id in self._download_processes:
                 del self._download_processes[model_id]
+
+    @handles(PauseModelDownloadRequest)
+    async def on_handle_pause_model_download_request(self, request: PauseModelDownloadRequest) -> ResultPayload:
+        """Stop an in-progress download, keeping its finished files so a resume skips them.
+
+        The download task, not this handler, writes the "paused" status: it does so after the
+        subprocess's last progress event, which would otherwise overwrite it with "downloading".
+
+        Args:
+            request: The pause request containing model_id
+
+        Returns:
+            ResultPayload: Success once the download is paused, or failure if there was nothing to pause
+        """
+        model_id = request.model_id
+        process = self._download_processes.get(model_id)
+        task = self._download_tasks.get(model_id)
+        if process is None or task is None:
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because it is not downloading."
+            )
+
+        self._pausing_downloads.add(model_id)
+        await cancel_subprocess(process, f"download process for model '{model_id}'")
+        # Wait for the task to record the outcome. Its exception belongs to the download request awaiting it.
+        await asyncio.wait({task})
+
+        if task.cancelled():
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because the download was cancelled."
+            )
+        if not isinstance(task.exception(), DownloadPausedError):
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because the download finished first."
+            )
+
+        return PauseModelDownloadResultSuccess(
+            model_id=model_id,
+            result_details=f"Paused the download of model '{model_id}'",
+        )
+
+    @handles(ResumeModelDownloadRequest)
+    async def on_handle_resume_model_download_request(self, request: ResumeModelDownloadRequest) -> ResultPayload:
+        """Resume a paused download with the parameters it was started with.
+
+        Args:
+            request: The resume request containing model_id
+
+        Returns:
+            ResultPayload: Success once the download completes, or failure with error details
+        """
+        model_id = request.model_id
+        data = await asyncio.to_thread(_load_status_file, self._get_status_file_path(model_id))
+        if data is None or data.get("status") != "paused":
+            return ResumeModelDownloadResultFailure(
+                result_details=f"Attempted to resume the download of model '{model_id}'. Failed because it is not paused."
+            )
+        # Checked with no await before the download registers its task, so a second resume sees it.
+        if model_id in self._download_tasks:
+            return ResumeModelDownloadResultFailure(
+                result_details=f"Attempted to resume the download of model '{model_id}'. Failed because it is already downloading."
+            )
+
+        result = await self.on_handle_download_model_request(
+            DownloadModelRequest(
+                model_id=model_id,
+                local_dir=data.get("local_dir"),
+                revision=data.get("revision") or "main",
+            )
+        )
+        if isinstance(result, DownloadModelResultFailure):
+            return ResumeModelDownloadResultFailure(result_details=result.result_details, exception=result.exception)
+
+        return ResumeModelDownloadResultSuccess(
+            model_id=model_id,
+            result_details=f"Resumed and finished the download of model '{model_id}'",
+        )
 
     @handles(ListModelsRequest)
     async def on_handle_list_models_request(self, request: ListModelsRequest) -> ResultPayload:  # noqa: ARG002
@@ -762,6 +951,14 @@ class ModelManager(EngineScoped):
                 result_details=error_msg,
                 exception=e,
             )
+
+        # A leftover paused or failed record would keep nodes treating a later copy of the model as
+        # incomplete, so it goes with the files.
+        try:
+            await asyncio.to_thread(self._delete_model_download_status, model_id)
+            deleted_items.append("download record")
+        except FileNotFoundError:
+            logger.debug("No download record found for '%s'", model_id)
 
         if not deleted_items:
             error_msg = f"Model '{model_id}' not found (no cached files or download records)"
@@ -1043,6 +1240,12 @@ class ModelManager(EngineScoped):
         # Find unfinished downloads to resume
         unfinished_models = await asyncio.to_thread(self._find_unfinished_downloads)
 
+        # A configured model the user paused waits for them to resume it
+        paused_models = await asyncio.to_thread(self._find_paused_downloads)
+        models_to_download = [
+            model_id for model_id in models_to_download if self._parse_model_id(model_id) not in paused_models
+        ]
+
         # Combine new downloads and unfinished ones, avoiding duplicates
         all_models = list(
             dict.fromkeys(
@@ -1179,6 +1382,10 @@ class ModelManager(EngineScoped):
                 unfinished_models.append(model_id)
 
         return unfinished_models
+
+    def _find_paused_downloads(self) -> set[str]:
+        """Find model IDs whose download the user paused."""
+        return {status.model_id for status in self._list_all_download_statuses() if status.status == "paused"}
 
     @staticmethod
     def _failure_is_worth_retrying(data: dict) -> bool:

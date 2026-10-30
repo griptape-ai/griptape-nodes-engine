@@ -20,6 +20,7 @@ Streaming tokens come straight off Pydantic AI's text deltas via the runner's
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import textwrap
@@ -153,6 +154,17 @@ from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextRequest,
     GetAttributionContextResultSuccess,
 )
+from griptape_nodes.retained_mode.events.flow_events import (
+    FlowSummaryNode,
+    GetFlowSummaryRequest,
+    GetFlowSummaryResultSuccess,
+)
+from griptape_nodes.retained_mode.events.library_events import (
+    ListNodeTypesInLibraryRequest,
+    ListNodeTypesInLibraryResultSuccess,
+    ListRegisteredLibrariesRequest,
+    ListRegisteredLibrariesResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
@@ -174,6 +186,7 @@ if TYPE_CHECKING:
     from pydantic_ai.messages import ModelMessage, ToolCallPart, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
+    from griptape_nodes.node_library.library_registry import NodeMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
@@ -203,18 +216,30 @@ _AGENT_INSTRUCTIONS_BASE = (
     "connections, save and run workflows.\n"
     "{image_tool_line}"
     "  - Additional MCP tools may be available, each prefixed with its server name.\n\n"
-    "Behavior rules (these are non-negotiable):\n"
-    "  1. NEVER respond with only a plan or a description of what you intend to do. If a "
-    "     task requires tool work, call the relevant tools in the SAME turn as your "
-    "     acknowledgment. A response of the form 'I'll do X' with no tool calls is wrong.\n"
-    "  2. When the user asks you to build, create, modify, inspect, or run something, "
-    "     start with discovery tool calls (e.g. GriptapeNodes_ListRegisteredLibrariesRequest, "
-    "     GriptapeNodes_ListNodeTypesInLibraryRequest) before doing anything that "
-    "     mutates state.\n"
-    "  3. Make multiple tool calls in parallel when they don't depend on each other.\n"
-    "  4. Only after you have actually completed the user's task should you produce a final "
-    "     text response. That final response should be a short summary of what you did, "
-    "     including the names of any nodes you created or changed.\n"
+    "Behavior rules:\n"
+    "  1. When a task needs tool work, call the tools in the same turn you acknowledge it, and keep "
+    "calling them until the task is done. Describe a plan only alongside the calls that carry it out.\n"
+    "  2. Work from the node types and the current flow given below; they are complete. Look up only the "
+    "parameters of the node types you will use: put one GriptapeNodes_DescribeNodeTypeRequest per type "
+    "in a single GriptapeNodes_EventRequestBatch call, covering every type in your plan, including list "
+    "and helper nodes.\n"
+    "  3. Plan the whole change, then apply it as one GriptapeNodes_EventRequestBatch call that creates the "
+    "nodes, sets their values, and connects them, in that order. The engine keeps each requested node "
+    "name unless another node already has it, and the results give every created node's name. Then send "
+    "one more batch with only the calls that failed, using the returned names, and delete any "
+    "placeholder node a failed create left.\n"
+    "  4. An input that takes a list (its type is list or list[...], such as MergeImages.Images or "
+    "Agent.rulesets) takes either a whole list or one item per slot. To connect single items, add a slot "
+    "for each with GriptapeNodes_AddParameterToNodeRequest, setting parent_container_name to the input, "
+    "then connect each item to a slot name those calls return.\n"
+    "  5. A model sees an image only through an input whose input types include an image type. To have a "
+    "model look at, describe, or critique an image, use a node with such an input, such as DescribeImage, "
+    "which answers a prompt about the images it is given, even when the user calls it an agent. Text "
+    "inputs, such as an Agent's prompt or additional_context, receive an image only as text.\n"
+    "  6. Build and edit workflows; run, resolve, or save them when the user asks for that.\n"
+    "  7. Make independent tool calls in parallel when they cannot go in one batch.\n"
+    "  8. When the task is done, reply with a short summary of what you did, including the names of any "
+    "nodes you created or changed.\n"
 )
 
 _IMAGE_TOOL_INSTRUCTION = (
@@ -222,6 +247,19 @@ _IMAGE_TOOL_INSTRUCTION = (
     "displays the generated image inline automatically, so briefly describe what you made and "
     "do NOT paste the returned URL or markdown image syntax into your reply.\n"
 )
+
+
+_NO_FLOW_INSTRUCTION = "No flow is open yet. Call GriptapeNodes_EnsureWorkflowAndFlowRequest before creating nodes."
+
+_NODE_TYPES_NOT_LISTED_INSTRUCTION = (
+    "The node types are not listed here. To get them, call GriptapeNodes_ListRegisteredLibrariesRequest, then "
+    "put one GriptapeNodes_ListNodeTypesInLibraryRequest per library, with include_metadata set, in a single "
+    "GriptapeNodes_EventRequestBatch call. GriptapeNodes_ListRegisteredLibrariesRequest answers once libraries "
+    "finish loading."
+)
+
+# Long enough for a node's one-line purpose, short enough that the node type list stays a few tokens per node.
+_MAX_NODE_DESCRIPTION_LENGTH = 160
 
 
 _TOOL_APPROVAL_INSTRUCTIONS = (
@@ -256,10 +294,84 @@ def _compose_server_rules(configs: Sequence[Mapping[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-def _compose_run_instructions(server_rules: str) -> str:
-    """Join the instructions that apply to one run: MCP server rules, then approval rules."""
-    parts = [server_rules, _TOOL_APPROVAL_INSTRUCTIONS]
+@dataclass(frozen=True)
+class _WorkflowContext:
+    """The parts of a run's instructions that describe the engine's current state."""
+
+    node_types: str
+    flow: str
+
+
+def _compose_run_instructions(workflow_context: _WorkflowContext, server_rules: str) -> str:
+    """Join the instructions that apply to one run.
+
+    The text that changes least comes first, and the flow, which changes with almost every
+    message, comes last.
+    """
+    parts = [workflow_context.node_types, server_rules, _TOOL_APPROVAL_INSTRUCTIONS, workflow_context.flow]
     return "\n\n".join(part for part in parts if part)
+
+
+def _render_node_types(libraries: Mapping[str, Mapping[str, NodeMetadata]]) -> str:
+    """The available node types as compact text: one line per type, grouped by library and category.
+
+    Categories keep the order their first node type was registered in.
+    """
+    lines = ["Node types. These are all the node types you can create; use these exact type and library names."]
+    for library_name, node_metadata in libraries.items():
+        lines.append(f"Library '{library_name}':")
+        by_category: dict[str, list[str]] = {}
+        for node_type, metadata in node_metadata.items():
+            by_category.setdefault(metadata.category, []).append(_render_node_type(node_type, metadata))
+        for category, node_lines in by_category.items():
+            lines.append(f"  {category}:")
+            lines.extend(f"    - {line}" for line in node_lines)
+    return "\n".join(lines)
+
+
+def _render_node_type(node_type: str, metadata: NodeMetadata) -> str:
+    label = node_type
+    if metadata.deprecation is not None:
+        label = f"{label} (deprecated, do not use for new work)"
+    description = " ".join(metadata.description.split())
+    if len(description) > _MAX_NODE_DESCRIPTION_LENGTH:
+        description = f"{description[: _MAX_NODE_DESCRIPTION_LENGTH - 3]}..."
+    if not description:
+        return label
+    return f"{label}: {description}"
+
+
+def _render_flow(summary: GetFlowSummaryResultSuccess) -> str:
+    """The flow summary as compact text: one line per node, then one per connection."""
+    lines = [
+        (
+            f"Current flow: '{summary.flow_name}', read when this run started (a new message or "
+            "an answered approval). Changes you make after that are not shown. Values not listed are the defaults. "
+            "New nodes go into this flow."
+        )
+    ]
+    if not summary.nodes:
+        lines.append("The flow is empty.")
+        return "\n".join(lines)
+    lines.append("Nodes:")
+    lines.extend(f"  - {_render_flow_node(node)}" for node in summary.nodes)
+    if summary.connections:
+        lines.append("Connections:")
+        lines.extend(f"  - {connection.source} -> {connection.target}" for connection in summary.connections)
+    return "\n".join(lines)
+
+
+def _render_flow_node(node: FlowSummaryNode) -> str:
+    parts = [f"{node.name} ({node.type} from '{node.library}')"]
+    if node.group is not None:
+        parts.append(f"in group '{node.group}'")
+    if node.position is not None:
+        parts.append(f"at ({node.position['x']}, {node.position['y']})")
+    if node.values:
+        parts.append(f"values {json.dumps(node.values, default=str)}")
+    if node.multi_inputs:
+        parts.append(f"list inputs {', '.join(node.multi_inputs)}")
+    return " ".join(parts)
 
 
 def _plan_tool_approvals(
@@ -774,6 +886,7 @@ class AgentManager(EngineScoped):
             model_name=model_name,
         )
         attribution_headers = await self._attribution_headers(provider_name)
+        workflow_context = await self._workflow_context()
 
         event_manager = self.engine.event_manager
 
@@ -799,11 +912,74 @@ class AgentManager(EngineScoped):
                 persist_prompt=persist_prompt,
                 history_rehydrator=_rehydrate_history,
                 extra_toolsets=mcp.lease.toolsets,
-                extra_instructions=_compose_run_instructions(mcp.instructions),
+                extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
                 extra_headers=attribution_headers,
                 approval=approval,
                 deferred_tool_results=deferred_tool_results,
             )
+
+    async def _workflow_context(self) -> _WorkflowContext:
+        """The available node types and the current flow, rendered for one run's instructions.
+
+        Read fresh every run rather than cached, so a library loaded or a node added
+        between messages shows up on the next one. Only this run reads them, so they
+        are not broadcast, and a failure costs the run some context rather than
+        showing the user an error.
+        """
+        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context())
+        return _WorkflowContext(node_types=node_types, flow=flow)
+
+    async def _node_types_context(self) -> str:
+        # Never wait for libraries that are still loading: no timeout fits both a normal startup and a
+        # library installing its dependencies. The instruction says how to get the node types, and
+        # ListRegisteredLibrariesRequest itself waits for loading to finish, so the agent's own call
+        # returns once they are ready.
+        if not self.engine.library_manager._libraries_loading_complete.is_set():
+            logger.info("Left the node types out of the chat's instructions because libraries are still loading.")
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        registered = await self.engine.ahandle_request(
+            ListRegisteredLibrariesRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
+        )
+        if not isinstance(registered, ListRegisteredLibrariesResultSuccess):
+            logger.info("Left the node types out of the chat's instructions: %s", registered.result_details)
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        listed = await asyncio.gather(
+            *(
+                self.engine.ahandle_request(
+                    ListNodeTypesInLibraryRequest(
+                        library=library_name,
+                        include_metadata=True,
+                        broadcast_result=False,
+                        failure_log_level=logging.DEBUG,
+                    )
+                )
+                for library_name in registered.libraries
+            )
+        )
+        libraries: dict[str, dict[str, NodeMetadata]] = {}
+        for library_name, result in zip(registered.libraries, listed, strict=True):
+            if not isinstance(result, ListNodeTypesInLibraryResultSuccess) or result.node_metadata is None:
+                logger.info("Left library '%s' out of the chat's node types: %s", library_name, result.result_details)
+                continue
+            libraries[library_name] = result.node_metadata
+        return _render_node_types(libraries)
+
+    async def _flow_context(self) -> str:
+        if not self.engine.context_manager.has_current_flow():
+            return _NO_FLOW_INSTRUCTION
+        summary = await self.engine.ahandle_request(
+            GetFlowSummaryRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
+        )
+        if not isinstance(summary, GetFlowSummaryResultSuccess):
+            logger.info("Left the flow out of the chat's instructions: %s", summary.result_details)
+            return ""
+        try:
+            return _render_flow(summary)
+        except (TypeError, ValueError):
+            # A node's values or metadata can hold anything a workflow file or request put
+            # there; one that won't render must not stop every message on this flow.
+            logger.exception("Left the flow out of the chat's instructions because it could not be rendered.")
+            return ""
 
     def _claim_thread(self, thread_id: str) -> _ActiveRun | None:
         """Mark ``thread_id`` as running a turn, or return ``None`` when it already is.

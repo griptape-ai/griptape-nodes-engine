@@ -20,6 +20,20 @@ logger = logging.getLogger("griptape_nodes")
 
 NO_MODELS_PLACEHOLDER = "No models downloaded — visit Model Manager"
 
+# Dropdown row decoration and button label for each download status other than "completed".
+# An unrecognized status gets the failed treatment, since the files are still not known to be complete.
+_FAILED_DOWNLOAD_ROW = {"icon": "alert-circle", "subtitle": "Download failed"}
+_INCOMPLETE_DOWNLOAD_ROWS = {
+    "downloading": {"icon": "loader", "subtitle": "Downloading…"},
+    "paused": {"icon": "pause-circle", "subtitle": "Paused"},
+    "failed": _FAILED_DOWNLOAD_ROW,
+}
+_DOWNLOAD_BUTTON_LABELS = {
+    "downloading": "View Download Progress",
+    "paused": "Open Model Manager to Resume",
+    "failed": "Open Model Manager to Retry",
+}
+
 
 class HuggingFaceModelParameter(ABC):
     """Mixin component that adds an inline model-selection dropdown to a node.
@@ -78,7 +92,8 @@ class HuggingFaceModelParameter(ABC):
         self._deprecated_repos: list[str] = deprecated_repos or []
         # Cached at refresh time only — never fetched from inside a callback to
         # avoid nested handle_request() calls that cause recursion.
-        self._downloading_model_ids: set[str] = set()
+        # Maps model id to the status of every download that has not completed.
+        self._incomplete_downloads: dict[str, str] = {}
 
         # License-policy state, and the only two pieces of it: `_gate_mode` is the caller's
         # configuration and never changes; `_policy` is the query result, replaced as a whole by
@@ -137,7 +152,7 @@ class HuggingFaceModelParameter(ABC):
 
         # Snapshot active downloads before rebuilding choices so the dropdown
         # subtitles and button visibility reflect the current download state.
-        self._refresh_downloading_model_ids()
+        self._refresh_incomplete_downloads()
         # Re-query policy alongside the cache scan so a license change since the last refresh
         # is reflected in both the row decoration and the badge. Guard on the configured mode,
         # not on the resolved flag: under auto-detect the flag is the *result* of the query, so
@@ -397,19 +412,33 @@ class HuggingFaceModelParameter(ABC):
             value = str(self._node.get_parameter_value(self._parameter_name) or "")
         apply_denial_badge(parameter, value, self.query_for_denial(value), decoration=self._policy.decoration)
 
-    def _refresh_downloading_model_ids(self) -> None:
+    def _refresh_incomplete_downloads(self) -> None:
         # Only called from refresh_parameters() — never from inside a button
         # callback — to avoid nested handle_request() calls that cause recursion.
         result = self._node.engine.handle_request(ListModelDownloadsRequest())
         if not isinstance(result, ListModelDownloadsResultSuccess):
-            self._downloading_model_ids = set()
+            self._incomplete_downloads = {}
             return
-        self._downloading_model_ids = {s.model_id for s in result.downloads if s.status == "downloading"}
+        self._incomplete_downloads = {s.model_id: s.status for s in result.downloads if s.status != "completed"}
+
+    def _incomplete_download_status(self, choice: str) -> str | None:
+        """Status of the unfinished download behind ``choice``, or ``None`` when there is none.
+
+        HuggingFace creates the cache entry as soon as a download starts, so a paused or failed
+        model still appears in ``fetch_repo_revisions()``. This is what tells it apart from a
+        complete one.
+        """
+        repo_id, _ = self._key_to_repo_revision(choice)
+        search_term = self._get_model_search_term(choice)
+        for key in (choice, repo_id, search_term):
+            status = self._incomplete_downloads.get(key)
+            if status is not None:
+                return status
+        return None
 
     def _build_data_choices(self, choices: list[str]) -> list[dict]:
         downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
         not_downloaded = set(self.get_not_downloaded_choices())
-        downloading = self._downloading_model_ids
 
         decoration = self._policy.decoration
 
@@ -423,12 +452,10 @@ class HuggingFaceModelParameter(ABC):
             # refresh cannot silently erase the other's rows.
             if self._gated and self.query_for_denial(choice) is not None:
                 data.append({"name": choice, "icon": decoration.icon, "subtitle": decoration.row_subtitle})
-            # Downloading check must come before downloaded: HuggingFace creates
-            # cache entries as soon as a download starts, so a partially-downloaded
-            # model appears in fetch_repo_revisions() and would otherwise show
-            # as "Downloaded" while still in progress.
-            elif repo_id in downloading or choice in downloading:
-                data.append({"name": choice, "icon": "loader", "subtitle": "Downloading…"})
+            # Incomplete downloads must come before downloaded: a partially-downloaded
+            # model appears in fetch_repo_revisions() and would otherwise show as "Downloaded".
+            elif (status := self._incomplete_download_status(choice)) is not None:
+                data.append({"name": choice, **_INCOMPLETE_DOWNLOAD_ROWS.get(status, _FAILED_DOWNLOAD_ROW)})
             elif repo_id in downloaded_keys or choice in downloaded_keys:
                 data.append({"name": choice, "icon": "check-circle", "subtitle": "Downloaded"})
             elif choice in not_downloaded or repo_id in not_downloaded:
@@ -468,17 +495,16 @@ class HuggingFaceModelParameter(ABC):
             value = str(self._node.get_parameter_value(self._parameter_name) or "")
 
         not_downloaded = set(self.get_not_downloaded_choices())
-        search_term = self._get_model_search_term(value)
-        is_downloading = search_term in self._downloading_model_ids
-        should_show = value in not_downloaded or is_downloading
+        status = self._incomplete_download_status(value)
+        should_show = value in not_downloaded or status is not None
 
         if should_show:
             self._node.show_parameter_by_name(self._download_param_name)
             # Update the button label to match context so the call-to-action
-            # makes sense whether the model is queued to download or already downloading.
+            # makes sense whether the model is not downloaded, downloading, paused, or failed.
             download_param = self._node.get_parameter_by_name(self._download_param_name)
             if isinstance(download_param, ParameterButton):
-                download_param.label = "View Download Progress" if is_downloading else "Open Model Manager to Download"
+                download_param.label = _DOWNLOAD_BUTTON_LABELS.get(status or "", "Open Model Manager to Download")
         else:
             self._node.hide_parameter_by_name(self._download_param_name)
 
@@ -501,6 +527,17 @@ class HuggingFaceModelParameter(ABC):
             self.get_repo_revision()
         except Exception as e:
             return [e]
+
+        if isinstance(selection, str):
+            status = self._incomplete_download_status(selection)
+            if status is not None:
+                return [
+                    RuntimeError(
+                        f"Attempted to use model '{selection}' on node '{self._node.name}'. "
+                        f"Failed because its download has not completed (status: {status}). "
+                        "Finish the download in the Model Manager first."
+                    )
+                ]
 
         return None
 
@@ -536,10 +573,10 @@ class HuggingFaceModelParameter(ABC):
     ) -> NodeMessageResult | None:
         value = self._node.get_parameter_value(self._parameter_name)
         search_term = self._get_model_search_term(str(value))
-        # Use the cached downloading state — calling handle_request() here would
+        # Use the cached download state — calling handle_request() here would
         # create a nested request inside the button-click handler and cause recursion.
-        if search_term in self._downloading_model_ids:
-            # Already downloading: open the downloads view pre-filtered to this model.
+        if self._incomplete_download_status(str(value)) is not None:
+            # Downloading, paused, or failed: open the downloads view pre-filtered to this model.
             href = f"#model-management?filter={search_term}"
         else:
             # Not yet downloaded: open model search so the user can start the download.
