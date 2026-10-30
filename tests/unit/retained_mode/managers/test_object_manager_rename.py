@@ -17,7 +17,8 @@ class TestRenameToTakenName:
         object_manager.add_object_by_name("Taken", MagicMock(spec=ControlFlow))
 
         result = object_manager.on_rename_object_request(
-            RenameObjectRequest(object_name="Flow_1", requested_name="Taken", allow_next_closest_name_available=True)
+            RenameObjectRequest(object_name="Flow_1", requested_name="Taken", allow_next_closest_name_available=True),
+            workflow=workflow,
         )
 
         assert isinstance(result, RenameObjectResultSuccess)

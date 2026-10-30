@@ -220,6 +220,7 @@ class TestListSubstitutablesRequest:
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert result.substitutables == []
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
@@ -270,6 +271,7 @@ class TestGetVariablesRequest:
         assert isinstance(result, GetVariablesResultFailure)
         assert "ListVariablesRequest" in str(result.result_details)
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         result = engine.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
         assert isinstance(result, GetVariablesResultFailure)
@@ -328,6 +330,7 @@ class TestResolveSubstitutionRequest:
         assert result.unresolved == ["MISSING"]
         assert result.resolved == {"SHOT": "sc001", "workspace_dir": "/workspace"}
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))

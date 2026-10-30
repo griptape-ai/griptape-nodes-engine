@@ -6,19 +6,18 @@ from typing import TYPE_CHECKING
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.workflow_events import (
     GetVariableSubstitutionEnabledRequest,
-    GetVariableSubstitutionEnabledResultFailure,
     GetVariableSubstitutionEnabledResultSuccess,
     SetVariableSubstitutionEnabledRequest,
-    SetVariableSubstitutionEnabledResultFailure,
     SetVariableSubstitutionEnabledResultNotAlteredSuccess,
     SetVariableSubstitutionEnabledResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -46,40 +45,30 @@ class VariableSubstitution(EngineScoped):
             return True
         return workflow.variables.substitution_enabled
 
-    @handles(GetVariableSubstitutionEnabledRequest)
+    @handles(GetVariableSubstitutionEnabledRequest, scope=RequestScope.WORKFLOW)
     def on_get_variable_substitution_enabled_request(
         self,
         request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
+        workflow: WorkflowRuntime,
     ) -> ResultPayload:
-        """Return whether variable substitution is enabled for the current workflow."""
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
-            return GetVariableSubstitutionEnabledResultFailure(
-                result_details="Attempted to get variable substitution enabled. Failed because no workflow is active."
-            )
-        enabled = self.is_enabled()
+        """Return whether variable substitution is enabled for the workflow."""
+        enabled = workflow.variables.substitution_enabled
         return GetVariableSubstitutionEnabledResultSuccess(
-            result_details=f"Variable substitution is {'enabled' if enabled else 'disabled'} for the current workflow.",
+            result_details=f"Variable substitution is {'enabled' if enabled else 'disabled'} for the workflow.",
             enabled=enabled,
         )
 
-    @handles(SetVariableSubstitutionEnabledRequest)
+    @handles(SetVariableSubstitutionEnabledRequest, scope=RequestScope.WORKFLOW)
     def on_set_variable_substitution_enabled_request(
-        self, request: SetVariableSubstitutionEnabledRequest
+        self, request: SetVariableSubstitutionEnabledRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
-        """Enable or disable variable substitution for the current workflow.
+        """Enable or disable variable substitution for the workflow.
 
         Stores the flag on the open workflow's runtime. When the workflow is saved, the code
         generator bakes a SetVariableSubstitutionEnabledRequest call into build_workflow() so the
         flag is restored on every subsequent load, including direct script execution.
         """
-        context_manager = self.engine.context_manager
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return SetVariableSubstitutionEnabledResultFailure(
-                result_details="Attempted to set variable substitution enabled. Failed because no workflow is active."
-            )
-        workflow_name = context_manager.get_current_workflow_name()
+        workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
         workflow.variables.substitution_enabled = request.enabled
         details = (
             f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
