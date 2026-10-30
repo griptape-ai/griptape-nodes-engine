@@ -214,7 +214,7 @@ class FlowSummaryConnection:
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowSummaryRequest(RequestPayload):
+class GetFlowSummaryRequest(RequestPayload, GraphAccessMixin):
     """Summarize a flow's nodes, the values set on them, and their connections, in one call.
 
     Use when: planning an edit to a workflow the user already has open, or checking what is in
