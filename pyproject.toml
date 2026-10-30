@@ -96,7 +96,7 @@ test = [
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
   "pytest-timeout>=2.4.0",
-  "coverage>=7.0.0",
+  "coverage>=7.9.0",
 ]
 
 [build-system]
@@ -108,6 +108,11 @@ module-name = "griptape_nodes"
 
 [tool.uv.sources]
 griptape-cloud-client = { git = "https://github.com/griptape-ai/griptape-cloud-python-client", rev = "main" }
+
+[tool.coverage.run]
+# sys.monitoring stops tracing a line once it has run, unlike the default tracer on 3.12 that
+# traces every line every time. It does not support branch coverage on 3.12.
+core = "sysmon"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
