@@ -1092,45 +1092,19 @@ class EventManager(EngineScoped):
         sync handle_request path does, since it blocks its own thread on the result and can
         only do so when the coroutine runs on another thread's loop.
         """
-        if (
-            self._worker_request_client is None
-            or self._orchestrator_request_topic is None
-            or self._worker_response_topic is None
-            or self._websocket_event_loop is None
-        ):
+        if self._orchestrator_request_topic is None or self._worker_response_topic is None:
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
 
-        event_request: EventRequest = EventRequest(request=request)
-
-        response_future = asyncio.run_coroutine_threadsafe(
-            self._worker_request_client.request_to_orchestrator(
-                event_request=event_request,
-                orchestrator_request_topic=self._orchestrator_request_topic,
-                worker_response_topic=self._worker_response_topic,
-                timeout_ms=self._forward_timeout_ms,
-            ),
-            self._websocket_event_loop,
+        response_payload = await self._send_from_worker(
+            request, request_topic=self._orchestrator_request_topic, response_topic=self._worker_response_topic
         )
-        response_payload = await asyncio.wrap_future(response_future)
-
-        event_type = response_payload.get("event_type", "")
-        result_type_name = response_payload.get("result_type")
-        result_data = response_payload.get("result", {})
-
-        if not result_type_name:
-            msg = f"Forwarded response for {type(request).__name__} missing 'result_type'."
-            raise RuntimeError(msg)
-
-        resolved_result_type = PayloadRegistry.get_type(result_type_name)
-        if resolved_result_type is None:
-            msg = f"Forwarded response 'result_type' is not registered: {result_type_name}"
-            raise RuntimeError(msg)
-
-        result_payload = cast("ResultPayload", converters.engine.structure(result_data, resolved_result_type))
+        result_payload = _read_forwarded_result(request, response_payload)
 
         event_cls: type[EventResultSuccess | EventResultFailure]
-        event_cls = EventResultSuccess if event_type == "EventResultSuccess" else EventResultFailure
+        event_cls = (
+            EventResultSuccess if response_payload.get("event_type", "") == "EventResultSuccess" else EventResultFailure
+        )
 
         return event_cls(
             request=request,
@@ -1138,6 +1112,43 @@ class EventManager(EngineScoped):
             result=result_payload,
             response_topic=result_context.get("response_topic"),
         )
+
+    async def request_engine_from_worker(self, engine_id: str, request: RequestPayload) -> ResultPayload:
+        """Send a request from this worker to the engine `engine_id`, as one of that engine's own clients, and return its result.
+
+        For a worker another engine runs, to reach that engine rather than its orchestrator. It travels
+        the connection the worker's orchestrator traffic does, which that engine carries, and is answered
+        on this worker's own engine topic, which no orchestrator listens on.
+
+        Raises:
+            TimeoutError: The engine did not answer within the worker's forwarding timeout.
+        """
+        own_engine_id = self.engine.get_engine_id()
+        if own_engine_id is None:
+            msg = f"Attempted to send a {type(request).__name__} to engine {engine_id}. Failed because this worker has no engine ID."
+            raise RuntimeError(msg)
+        response_payload = await self._send_from_worker(
+            request,
+            request_topic=f"engines/{engine_id}/request",
+            response_topic=f"engines/{own_engine_id}/response",
+        )
+        return _read_forwarded_result(request, response_payload)
+
+    async def _send_from_worker(self, request: RequestPayload, *, request_topic: str, response_topic: str) -> dict:
+        """Publish `request` from this worker on `request_topic` and await the raw reply on `response_topic`."""
+        if self._worker_request_client is None or self._websocket_event_loop is None:
+            msg = "Worker forwarding is enabled but not fully configured."
+            raise RuntimeError(msg)
+        response_future = asyncio.run_coroutine_threadsafe(
+            self._worker_request_client.request_from_worker(
+                event_request=EventRequest(request=request),
+                request_topic=request_topic,
+                worker_response_topic=response_topic,
+                timeout_ms=self._forward_timeout_ms,
+            ),
+            self._websocket_event_loop,
+        )
+        return await asyncio.wrap_future(response_future)
 
     def _refusal_for_sender(
         self, request: RequestPayload, result_context: ResultContext
@@ -1989,3 +2000,20 @@ class EventTranslationContext:
         except Exception:
             # If we can't create a new instance, return the original
             return event
+
+
+def _read_forwarded_result(request: RequestPayload, response_payload: dict) -> ResultPayload:
+    """The result payload a forwarded request's raw reply carries."""
+    result_type_name = response_payload.get("result_type")
+    result_data = response_payload.get("result", {})
+
+    if not result_type_name:
+        msg = f"Forwarded response for {type(request).__name__} missing 'result_type'."
+        raise RuntimeError(msg)
+
+    resolved_result_type = PayloadRegistry.get_type(result_type_name)
+    if resolved_result_type is None:
+        msg = f"Forwarded response 'result_type' is not registered: {result_type_name}"
+        raise RuntimeError(msg)
+
+    return cast("ResultPayload", converters.engine.structure(result_data, resolved_result_type))

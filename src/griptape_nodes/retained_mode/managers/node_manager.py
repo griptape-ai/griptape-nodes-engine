@@ -3417,7 +3417,9 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values.
+        parameter values. A worker another engine runs first asks that engine
+        whether the lease the node was sent under holds it, and refuses the
+        node if not.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
@@ -3428,6 +3430,9 @@ class NodeManager(EngineScoped):
         node = None
         if is_worker:
             library_name = (request.node_metadata or {}).get("library")
+            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
+            if lease_refusal is not None:
+                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
             obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
@@ -3747,32 +3752,34 @@ class NodeManager(EngineScoped):
     ) -> ResultPayload | None:
         """Run the node in its library's worker, here or on another engine, or None if the library has none.
 
-        A worker on another engine also waits for that engine to admit the node, and is picked only
-        after: that engine may stop the worker while the node waits, and the second wait starts it again.
+        A worker on another engine also waits for a lease on that engine, and is picked only after: that
+        engine may stop the worker while the lease waits, and the second wait starts it again.
         """
         library_manager = self.engine.library_manager
-        admission = None
+        lease = None
         try:
             try:
                 if library_name:
-                    await wm.wait_until_executable(library_name)
-                    # A worker that could not be started there leaves nothing to admit the node, and an
-                    # engine that never answered the start would never answer the admission either.
+                    # A worker that engine stopped starts again only once the lease holds it.
+                    await wm.wait_until_executable(library_name, start_stopped=False)
+                    # A worker that could not be started there leaves nothing to lease, and an engine
+                    # that never answered the start would never answer the lease either.
                     if wm.worker_unavailable_reason(library_name) is None:
-                        admission = await wm.admit_on_engine(library_name, request.node_name)
+                        lease = await wm.acquire_lease(library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
                 worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if wm is None or worker is None:
+            if worker is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
                 return preparation_failure
+            if lease is not None:
+                request.lease_id = lease.lease_id
             return await self._execute_node_via_worker(request, wm, worker)
         finally:
-            if admission is not None:
-                await wm.end_admission(admission)
+            wm.release_after_node(lease)
 
     async def _execute_node_in_isolated_execution_worker(
         self, request: ExecuteNodeRequest, wm: WorkerManager, scope: IsolatedExecutionScope

@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
+    ReleaseSettings,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.serialization.values import untag
@@ -77,10 +78,14 @@ _STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 # answers once its process exists, so this bounds an engine that is down or unreachable.
 _ENGINE_REQUEST_TIMEOUT_S = 60.0
 
-# How many times an engine tries to tell another engine that a run ended, and how long it pauses between
-# tries. That engine holds itself for the run until it hears, or until it loses its connection to this one.
+# How many times an engine tries to release a lease on another engine, and how long it pauses between
+# tries. That engine holds itself for the lease until it hears, or until it loses its connection to this one.
 _REPORT_ATTEMPTS = 5
 _REPORT_RETRY_PAUSE_S = 10.0
+
+# Set on a worker this engine runs for another engine, to this engine's ID. The worker asks this engine,
+# before each node, whether the lease the node was sent under holds it.
+HOST_ENGINE_ID_ENV = "GTN_HOST_ENGINE_ID"
 
 
 @dataclass
@@ -129,29 +134,32 @@ class _HostedWorker:
 
 @dataclass
 class _EngineRun:
-    """Another engine's run on this engine, waiting in this engine's line of runs or holding this engine."""
+    """Another engine's lease on this engine, waiting in this engine's line of runs or holding this engine."""
 
     engine_id: str
-    # The run's ID on that engine, or None for a node sent without a run, which is a run of its own.
+    lease_id: str
+    # The lease's run on that engine, or None for a node run on its own.
     run_id: str | None
-    key: tuple[str, str]
-    # Resolved with None once the run has this engine, or with why it never will.
-    admitted: asyncio.Future[str | None]
-    # Set when the run lets this engine go.
+    # Resolved with None once the lease holds this engine, or with why it never will.
+    granted: asyncio.Future[str | None]
+    # Set when the lease is released.
     released: asyncio.Event = field(default_factory=asyncio.Event)
     # This engine's own run that stands for it in the line, set once it is submitted.
     line_run: Run | None = None
-    # Admissions of its nodes still waiting, which are told the run's place in line.
-    waiting: set[str] = field(default_factory=set)
-    # Admissions of its nodes running here.
-    running: set[str] = field(default_factory=set)
-    # Admissions whose node ended before it was admitted.
-    abandoned: set[str] = field(default_factory=set)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.engine_id, self.lease_id)
+
+    @property
+    def holds_engine(self) -> bool:
+        """Whether the lease holds this engine now: granted, and not yet released."""
+        return self.granted.done() and self.granted.result() is None and not self.released.is_set()
 
 
 @dataclass
 class _EngineRunSpec(RunSpec):
-    """A run of another engine's nodes, which holds this engine from when it starts until that run lets it go."""
+    """A lease of another engine's, which holds this engine from when it starts until that engine releases it."""
 
     manager: WorkerManager
     engine_run: _EngineRun
@@ -161,7 +169,7 @@ class _EngineRunSpec(RunSpec):
         return await self.manager.hold_for_engine_run(self.engine_run)
 
     def failure(self, details: str) -> ResultPayload:
-        return worker_events.AdmitNodeResultFailure(result_details=details)
+        return worker_events.AcquireLeaseResultFailure(result_details=details)
 
     def on_place_in_line(self, run: Run) -> None:
         self.manager.report_place_in_line(self.engine_run, run.position)
@@ -171,14 +179,14 @@ class _EngineRunSpec(RunSpec):
 
 
 @dataclass
-class EngineAdmission:
-    """A node another engine was asked to admit, which that engine must be told has ended."""
+class EngineLease:
+    """A lease this engine holds, or waits for, on the engine that runs a library's worker, until it is released."""
 
-    admission_id: str
+    lease_id: str
     host_engine_id: str
-    # The run on this engine the node belongs to, or None for a node run on its own.
+    # The run on this engine the lease is for, or None for a node run on its own.
     run_id: str | None
-    # The request asking for it, done once that engine has answered.
+    # The request acquiring it, done once that engine has answered.
     request_task: asyncio.Task[ResultPayload] | None = None
 
 
@@ -284,20 +292,24 @@ class WorkerManager(EngineScoped):
         # not garbage-collected while they wait for the answer.
         self._stop_requests: set[asyncio.Task] = set()
 
-        # Other engines' runs on this engine, waiting in its line or holding it, by (engine, run).
+        # Other engines' leases on this engine, waiting in its line or holding it, by (engine, lease).
         self._engine_runs: dict[tuple[str, str], _EngineRun] = {}
 
-        # The engine whose run last held this engine, so the next run from another engine frees its workers.
+        # The engine whose lease last held this engine, so the next lease from another engine frees its workers.
         self._last_engine_run_engine_id: str | None = None
 
-        # Nodes this engine asked other engines to admit, by admission ID, until each ends.
-        self._admissions: dict[str, EngineAdmission] = {}
+        # Leases this engine holds or waits for on other engines, by lease ID, until each is released.
+        self._leases: dict[str, EngineLease] = {}
 
-        # The engines each of this engine's runs sent a node to, so the run's end reaches each of them.
-        self._run_engines: dict[str, set[str]] = {}
+        # The lease each of this engine's runs has on each engine, by (run, engine), shared by the run's nodes.
+        self._run_leases: dict[tuple[str, str], EngineLease] = {}
 
-        # Reports and run ends sent to other engines from synchronous callbacks, held until answered.
+        # Reports and lease releases sent to other engines from synchronous callbacks, held until answered.
         self._engine_notices: set[asyncio.Task] = set()
+
+        # The engine that runs this worker for another engine, which decides when it may run each node,
+        # or None for any other engine.
+        self._host_engine_id: str | None = os.environ.get(HOST_ENGINE_ID_ENV)
 
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
@@ -992,13 +1004,14 @@ class WorkerManager(EngineScoped):
             self._tx.request_client.discard_request(request_id)
             raise
 
-    async def admit_on_engine(self, library_name: str, node_name: str) -> EngineAdmission | None:
-        """Wait until the engine that runs `library_name`'s worker admits the node, or None if it runs here.
+    async def acquire_lease(self, library_name: str, node_name: str) -> EngineLease | None:
+        """Wait until the engine that runs `library_name`'s worker holds a lease for the node, or None if it runs here.
 
+        A run asks each engine once: its later nodes there wait on the same lease, and its end releases
+        it. A node outside any run has a lease of its own, which `release_after_node` releases.
         Unbounded, like the node itself: another run can hold that engine for as long as it runs. That
-        engine may stop this engine's worker there to free itself for that run, so pick the worker only
-        after this returns, through `wait_until_executable`, which starts it again. Pass the admission
-        to `end_admission` once the node ends, however it ends.
+        engine may stop this engine's worker there to free itself for the lease, so pick the worker only
+        after this returns, through `wait_until_executable`, which starts it again.
 
         Raises:
             RuntimeError: That engine will not run the node, with why.
@@ -1006,56 +1019,102 @@ class WorkerManager(EngineScoped):
         host_engine_id = self._engine_for_library(library_name)
         if host_engine_id is None:
             return None
+        lease = self._lease_for(host_engine_id)
+        request_task = cast("asyncio.Task[ResultPayload]", lease.request_task)
+        try:
+            # Shielded, since the run's other nodes may wait on the same lease.
+            result = await asyncio.shield(request_task)
+        except EngineNotFoundError as e:
+            self._end_lease(lease)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
+            raise RuntimeError(msg) from e
+        except asyncio.CancelledError:
+            self.release_after_node(lease)
+            raise
+        if not result.succeeded():
+            # Ended, so the run's next node there asks again.
+            self._end_lease(lease)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+            raise RuntimeError(msg)
+        return lease
+
+    def release_after_node(self, lease: EngineLease | None) -> None:
+        """Release a node's lease once the node ends, however it ends, if it is the node's own.
+
+        A run's lease is released when the run ends instead, since its later nodes use it too.
+        """
+        if lease is None or lease.run_id is not None:
+            return
+        self._end_lease(lease)
+
+    def _lease_for(self, host_engine_id: str) -> EngineLease:
+        """The lease the code executing now uses on `host_engine_id`, acquired there if it has none."""
         run = self.engine.flow_manager.current_run()
+        if run is not None:
+            lease = self._run_leases.get((run.run_id, host_engine_id))
+            if lease is not None:
+                return lease
         run_id = None
         if run is not None:
             run_id = run.run_id
-            self._note_run_uses_engine(run, host_engine_id)
-        admission = EngineAdmission(admission_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=run_id)
-        self._admissions[admission.admission_id] = admission
-        request = worker_events.AdmitNodeRequest(
-            admission_id=admission.admission_id, run_id=admission.run_id, node_name=node_name
-        )
-        admission.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
-        # However the admission is answered, the run no longer waits, even if that engine's last report was lost.
-        admission.request_task.add_done_callback(lambda _task: self._stop_reporting_wait(admission))
-        try:
-            result = await admission.request_task
-        except EngineNotFoundError as e:
-            await self.end_admission(admission)
-            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
-            raise RuntimeError(msg) from e
-        except BaseException:
-            await self.end_admission(admission)
-            raise
-        if not result.succeeded():
-            await self.end_admission(admission)
-            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
-            raise RuntimeError(msg)
-        return admission
+        lease = EngineLease(lease_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=run_id)
+        self._leases[lease.lease_id] = lease
+        request = worker_events.AcquireLeaseRequest(lease_id=lease.lease_id, run_id=run_id)
+        lease.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
+        # However the acquire is answered, the run no longer waits, even if that engine's last report was lost.
+        lease.request_task.add_done_callback(lambda _task: self._stop_reporting_wait(lease))
+        if run is not None:
+            self._run_leases[(run.run_id, host_engine_id)] = lease
+            run.ended.add_done_callback(lambda _ended: self._end_lease(lease))
+        return lease
 
-    def _note_run_uses_engine(self, run: Run, host_engine_id: str) -> None:
-        """Record that `run` sent a node to `host_engine_id`, so the run's end reaches that engine."""
-        engine_ids = self._run_engines.get(run.run_id)
-        if engine_ids is None:
-            engine_ids = set()
-            self._run_engines[run.run_id] = engine_ids
-            run.ended.add_done_callback(lambda _ended: self._on_run_ended(run.run_id))
-        engine_ids.add(host_engine_id)
+    def _stop_reporting_wait(self, lease: EngineLease) -> None:
+        if lease.run_id is not None:
+            self.engine.flow_manager.report_run_waiting_for_engine(lease.run_id, 0)
 
-    def _stop_reporting_wait(self, admission: EngineAdmission) -> None:
-        if admission.run_id is not None:
-            self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, 0)
+    def _end_lease(self, lease: EngineLease) -> None:
+        """Release a lease on its engine, once, however it ended, so that engine serves the next run.
 
-    async def end_admission(self, admission: EngineAdmission | None) -> None:
-        """Tell the engine asked to admit a node that the node ended, so its run can let that engine go.
-
-        Sent without waiting and retried: for a node sent without a run, nothing else lets that engine go.
+        Sent without waiting and retried: while the two engines are connected, nothing else releases it.
         """
-        if admission is None or self._admissions.pop(admission.admission_id, None) is None:
+        if self._leases.pop(lease.lease_id, None) is None:
             return
-        request = worker_events.ReportNodeExecutionEndedRequest(admission_id=admission.admission_id)
-        self._send_notice(self._report_until_answered(admission.host_engine_id, request, "a node it admitted ended"))
+        if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
+            del self._run_leases[(lease.run_id, lease.host_engine_id)]
+        if lease.request_task is not None and not lease.request_task.done():
+            lease.request_task.cancel()
+        request = worker_events.ReleaseLeaseRequest(lease_id=lease.lease_id)
+        self._send_notice(
+            self._report_until_answered(lease.host_engine_id, request, f"lease {lease.lease_id} was released")
+        )
+
+    async def lease_refusal(self, node_name: str, lease_id: str | None) -> str | None:
+        """Why this worker must not run the node now, or None if it may.
+
+        A worker another engine runs asks that engine whether the lease the node was sent under holds it
+        now. Any other worker runs each node it is sent.
+        """
+        host_engine_id = self._host_engine_id
+        if host_engine_id is None:
+            return None
+        if lease_id is None:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because it was sent "
+                "without a lease on that engine, so that engine had not agreed to run it."
+            )
+        request = worker_events.CheckLeaseRequest(
+            lease_id=lease_id, worker_engine_id=cast("str", self.engine.get_engine_id())
+        )
+        try:
+            result = await self._event_manager.request_engine_from_worker(host_engine_id, request)
+        except TimeoutError:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because that engine "
+                "did not answer whether it may run the node."
+            )
+        if not result.succeeded():
+            return f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+        return None
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
@@ -1439,6 +1498,7 @@ class WorkerManager(EngineScoped):
         host_engine_ids = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
         self._engine_registrations.clear()
         for host_engine_id in host_engine_ids:
+            self._forget_leases_on(host_engine_id)
             task = asyncio.get_running_loop().create_task(self._withdraw_session_offer(host_engine_id))
             self._stop_requests.add(task)
             task.add_done_callback(self._stop_requests.discard)
@@ -1631,10 +1691,13 @@ class WorkerManager(EngineScoped):
         resolved = self._worker_command(library_name, session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
+        # `_start_refusal` refuses a start while this engine has none.
+        own_engine_id = cast("str", self.engine.get_engine_id())
         # Read before anything awaits, since a lost connection can forget the session meanwhile.
         session = self._sessions[session_id]
-        # The worker runs on this machine's license or API key, which it inherits like a local worker.
-        environ_overrides: dict[str, str] = {}
+        # The worker runs on this machine's license or API key, which it inherits like a local worker. It
+        # runs a node only while this engine holds itself for the lease the node was sent under.
+        environ_overrides: dict[str, str] = {HOST_ENGINE_ID_ENV: own_engine_id}
         # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
         if session.static_server_base_url is not None:
             environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
@@ -1687,6 +1750,10 @@ class WorkerManager(EngineScoped):
         self, library_name: str, session_id: str, worker_key: str
     ) -> worker_events.StartWorkerForEngineResultFailure | None:
         """The failure a start of `worker_key`'s worker for that session returns, or None if this engine will start it."""
+        if self.engine.get_engine_id() is None:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details="this engine has no engine ID, which its workers need to ask it before each node."
+            )
         refusal = self._refusal_to_serve(library_name, session_id)
         if refusal is not None:
             return worker_events.StartWorkerForEngineResultFailure(
@@ -1804,110 +1871,99 @@ class WorkerManager(EngineScoped):
         )
 
     @handles(
-        worker_events.AdmitNodeRequest,
+        worker_events.AcquireLeaseRequest,
         sender=RequiredSender.SESSION,
         owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
     )
-    async def handle_admit_node_request(
-        self, request: worker_events.AdmitNodeRequest
-    ) -> worker_events.AdmitNodeResultSuccess | worker_events.AdmitNodeResultFailure:
-        """Answer once another engine's node may run here, which waits while another run has this engine.
+    async def handle_acquire_lease_request(
+        self, request: worker_events.AcquireLeaseRequest
+    ) -> worker_events.AcquireLeaseResultSuccess | worker_events.AcquireLeaseResultFailure:
+        """Answer once another engine's lease holds this engine, which waits while another run has this engine.
 
-        Another engine's run waits in this engine's own line of runs, and holds this engine from when it
-        starts until it lets it go, so its later nodes are admitted at once.
+        The lease waits in this engine's own line of runs, and holds this engine from when it reaches the
+        front until it is released.
         """
         sender = require_request_sender()
-        engine_run = self._engine_run_for(sender.engine_id, request)
-        if not engine_run.admitted.done() and any(
-            admission.host_engine_id == sender.engine_id for admission in self._admissions.values()
-        ):
-            logger.error(
-                "A run from engine %s waits for this engine while a run here waits for engine %s. Neither "
-                "continues until one is cancelled. Engines that send nodes to each other can stop each other this way.",
-                sender.engine_id,
-                sender.engine_id,
-            )
-        engine_run.waiting.add(request.admission_id)
-        self._report_place_to_admission(engine_run, request.admission_id)
-        try:
-            refusal = await asyncio.shield(engine_run.admitted)
-        finally:
-            engine_run.waiting.discard(request.admission_id)
-        if refusal is not None:
-            return worker_events.AdmitNodeResultFailure(result_details=refusal)
-        if request.admission_id in engine_run.abandoned:
-            engine_run.abandoned.discard(request.admission_id)
-            return worker_events.AdmitNodeResultFailure(result_details="the node ended before it was admitted.")
-        engine_run.running.add(request.admission_id)
-        return worker_events.AdmitNodeResultSuccess(result_details=f"Admitted node '{request.node_name}'.")
-
-    @handles(
-        worker_events.ReportNodeExecutionEndedRequest,
-        sender=RequiredSender.SESSION,
-        owner=lambda manager, request, _sender: manager._engine_admitted(request.admission_id),
-    )
-    async def handle_report_node_execution_ended_request(
-        self, request: worker_events.ReportNodeExecutionEndedRequest
-    ) -> worker_events.ReportNodeExecutionEndedResultSuccess:
-        """Record that a node another engine ran here ended, ending its run if it was the run's only node."""
-        engine_run = self._engine_run_admitting(request.admission_id)
+        engine_run = self._engine_runs.get((sender.engine_id, request.lease_id))
         if engine_run is None:
-            return worker_events.ReportNodeExecutionEndedResultSuccess(
-                result_details="This engine was not running that node, so there was nothing to record."
-            )
-        # A node sent without a run is its run's only node, admitted or still in line.
-        if engine_run.run_id is None:
-            await self._end_engine_run(engine_run, "its node ended before it was admitted.")
-            return worker_events.ReportNodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
-        if request.admission_id in engine_run.waiting:
-            engine_run.abandoned.add(request.admission_id)
-        engine_run.running.discard(request.admission_id)
-        return worker_events.ReportNodeExecutionEndedResultSuccess(result_details="Recorded the node as ended.")
+            engine_run = self._submit_engine_run(sender.engine_id, request)
+            self._log_if_waiting_on_each_other(engine_run)
+        refusal = await asyncio.shield(engine_run.granted)
+        if refusal is not None:
+            return worker_events.AcquireLeaseResultFailure(result_details=refusal)
+        return worker_events.AcquireLeaseResultSuccess(result_details=f"Lease {request.lease_id} holds this engine.")
 
     @handles(
-        worker_events.ReportRunEndedRequest,
+        worker_events.ReleaseLeaseRequest,
         sender=RequiredSender.SESSION,
         owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
     )
-    async def handle_report_run_ended_request(
-        self, request: worker_events.ReportRunEndedRequest
-    ) -> worker_events.ReportRunEndedResultSuccess:
-        """Let another engine's run go, now that it ended, so the next run in line gets this engine."""
+    async def handle_release_lease_request(
+        self, request: worker_events.ReleaseLeaseRequest
+    ) -> worker_events.ReleaseLeaseResultSuccess:
+        """Release another engine's lease, so the next run in line gets this engine, or take it out of line."""
         engine_id = require_request_sender().engine_id
-        engine_run = self._engine_runs.get((engine_id, request.run_id))
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
         if engine_run is None:
-            return worker_events.ReportRunEndedResultSuccess(
-                result_details=f"This engine was not holding run {request.run_id}."
+            return worker_events.ReleaseLeaseResultSuccess(
+                result_details=f"This engine held no lease {request.lease_id} for engine {engine_id}."
             )
-        await self._end_engine_run(engine_run, "its run ended.")
-        return worker_events.ReportRunEndedResultSuccess(
-            result_details=f"Let run {request.run_id} of engine {engine_id} go."
+        await self._end_engine_run(engine_run, "its lease was released.")
+        return worker_events.ReleaseLeaseResultSuccess(
+            result_details=f"Released lease {request.lease_id} of engine {engine_id}."
+        )
+
+    @handles(worker_events.CheckLeaseRequest)
+    def handle_check_lease_request(
+        self, request: worker_events.CheckLeaseRequest
+    ) -> worker_events.CheckLeaseResultSuccess | worker_events.CheckLeaseResultFailure:
+        """Answer a worker this engine runs whether the lease its node was sent under holds this engine now.
+
+        Takes no sender rule, so it is answered only for this engine's own clients, which is how the
+        workers it runs reach it. Answered for the engine the worker serves, whatever lease it names.
+        """
+        engine_id = self.hosted_for(request.worker_engine_id)
+        if engine_id is None:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=f"this engine runs no worker {request.worker_engine_id} for another engine."
+            )
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
+        if engine_run is None or not engine_run.holds_engine:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=(
+                    f"that engine is not holding itself for engine {engine_id}'s run now. The run may have "
+                    "ended, or another run has that engine."
+                )
+            )
+        return worker_events.CheckLeaseResultSuccess(
+            result_details=f"Lease {request.lease_id} of engine {engine_id} holds this engine."
         )
 
     @handles(
         worker_events.ReportPlaceInLineRequest,
         sender=RequiredSender.ENGINE,
-        owner=lambda manager, request, _sender: manager._engine_admitting(request.admission_id),
+        owner=lambda manager, request, _sender: manager._engine_leasing(request.lease_id),
     )
     def handle_report_place_in_line_request(
         self, request: worker_events.ReportPlaceInLineRequest
     ) -> worker_events.ReportPlaceInLineResultSuccess:
-        """Report the place in line of a run here whose node waits on another engine, as if it waited here."""
-        admission = self._admissions.get(request.admission_id)
-        # A report that arrives after the admission was answered is out of date.
-        waiting = admission is not None and admission.request_task is not None and not admission.request_task.done()
-        if admission is None or admission.run_id is None or not waiting:
+        """Report the place in line of a run here whose lease waits on another engine, as if it waited here."""
+        lease = self._leases.get(request.lease_id)
+        # A report that arrives after the acquire was answered is out of date.
+        waiting = lease is not None and lease.request_task is not None and not lease.request_task.done()
+        if lease is None or lease.run_id is None or not waiting:
             return worker_events.ReportPlaceInLineResultSuccess(
-                result_details="No run here waits on that admission, so there was nothing to report."
+                result_details="No run here waits on that lease, so there was nothing to report."
             )
-        self.engine.flow_manager.report_run_waiting_for_engine(admission.run_id, request.position)
+        self.engine.flow_manager.report_run_waiting_for_engine(lease.run_id, request.position)
         return worker_events.ReportPlaceInLineResultSuccess(result_details=f"Reported place {request.position}.")
 
     async def hold_for_engine_run(self, engine_run: _EngineRun) -> ResultPayload:
-        """Hold this engine for another engine's run, from when it reaches the front of the line until it lets go.
+        """Hold this engine for another engine's lease, from when it reaches the front of the line until it is released.
 
-        Passing from one engine's run to another's first frees workers, as `distributed_execution.release`
-        says. Freeing is best effort: a failure there still hands this engine over.
+        Passing from one engine's lease to another's first frees workers, as `distributed_execution.release`
+        says, and only then grants the lease, so a worker it stops has been reported stopped before that
+        engine sends a node. Freeing is best effort: a failure there still hands this engine over.
         """
         if self._last_engine_run_engine_id not in (None, engine_run.engine_id):
             try:
@@ -1916,27 +1972,28 @@ class WorkerManager(EngineScoped):
                 logger.exception("Could not free this engine's workers for engine %s's run.", engine_run.engine_id)
         self._last_engine_run_engine_id = engine_run.engine_id
         try:
-            if not engine_run.admitted.done():
-                engine_run.admitted.set_result(None)
+            if not engine_run.granted.done():
+                engine_run.granted.set_result(None)
             await engine_run.released.wait()
         finally:
             self._forget_engine_run(engine_run)
-        return worker_events.ReportRunEndedResultSuccess(
-            result_details=f"Engine {engine_run.engine_id}'s run let this engine go."
+        return worker_events.ReleaseLeaseResultSuccess(
+            result_details=f"Engine {engine_run.engine_id}'s lease let this engine go."
         )
 
     def report_place_in_line(self, engine_run: _EngineRun, position: int) -> None:
-        """Tell the engine whose run waits here its place in line, for each of its nodes waiting."""
-        for admission_id in list(engine_run.waiting):
-            self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, position))
+        """Tell the engine whose lease waits here its place in line."""
+        if engine_run.granted.done():
+            return
+        self._send_notice(self._send_place_in_line(engine_run.engine_id, engine_run.lease_id, position))
 
     def refuse_engine_run(self, engine_run: _EngineRun, details: str) -> None:
-        """Tell another engine's run waiting here that it will not get this engine, and why.
+        """Tell another engine's lease waiting here that it will not get this engine, and why.
 
-        Also releases it, so a run refused while `hold_for_engine_run` frees workers for it lets this engine go.
+        Also releases it, so a lease refused while `hold_for_engine_run` frees workers for it lets this engine go.
         """
-        if not engine_run.admitted.done():
-            engine_run.admitted.set_result(details)
+        if not engine_run.granted.done():
+            engine_run.granted.set_result(details)
         engine_run.released.set()
         self._forget_engine_run(engine_run)
 
@@ -1954,8 +2011,8 @@ class WorkerManager(EngineScoped):
     async def _recycle_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker for a handoff, returning once its engine has heard it stopped.
 
-        Its engine starts it again before that library's next node, so the next run's node must not be
-        admitted while that engine still counts the stopped worker as running.
+        Its engine starts it again before that library's next node, so the next lease must not be granted
+        while that engine still counts the stopped worker as running.
         """
         await self._stop_hosted_worker(hosted)
         if hosted.exit_watcher is not None:
@@ -1991,7 +2048,19 @@ class WorkerManager(EngineScoped):
         # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
         for key in [key for key in self._engine_registrations if key[0] == engine_id]:
             del self._engine_registrations[key]
+        self._forget_leases_on(engine_id)
         await self._forget_engine(engine_id, why="lost its connection")
+
+    def _forget_leases_on(self, engine_id: str) -> None:
+        """Forget this engine's leases on `engine_id`, which forgets them with the session, so a run's next node asks again.
+
+        Neither released nor cancelled: that engine has no session to release them in, and an acquire still
+        waiting fails on its own, with the reason.
+        """
+        for lease in [lease for lease in self._leases.values() if lease.host_engine_id == engine_id]:
+            del self._leases[lease.lease_id]
+            if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
+                del self._run_leases[(lease.run_id, lease.host_engine_id)]
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
         """Forget the sessions `engine_id` offered this engine, let its runs go, and stop their workers."""
@@ -2011,35 +2080,53 @@ class WorkerManager(EngineScoped):
         )
         await asyncio.gather(*(self._stop_hosted_worker(worker) for worker in hosted))
 
-    def _engine_run_for(self, engine_id: str, request: worker_events.AdmitNodeRequest) -> _EngineRun:
-        """The run here that stands for another engine's run, submitted to this engine's line if it is new."""
-        key = (engine_id, request.run_id or request.admission_id)
-        engine_run = self._engine_runs.get(key)
-        # A run that let this engine go is not joined: its next node waits in line again.
-        if engine_run is not None and not engine_run.released.is_set():
-            return engine_run
+    def _submit_engine_run(self, engine_id: str, request: worker_events.AcquireLeaseRequest) -> _EngineRun:
+        """Submit another engine's lease to this engine's line, as a run that stands for it."""
         engine_run = _EngineRun(
             engine_id=engine_id,
+            lease_id=request.lease_id,
             run_id=request.run_id,
-            key=key,
-            admitted=asyncio.get_running_loop().create_future(),
+            granted=asyncio.get_running_loop().create_future(),
         )
-        self._engine_runs[key] = engine_run
+        self._engine_runs[engine_run.key] = engine_run
         spec = _EngineRunSpec(manager=self, engine_run=engine_run, flow_name=f"a run from engine {engine_id}")
         engine_run.line_run = self.engine.flow_manager.submit_run(spec)
         return engine_run
 
+    def _log_if_waiting_on_each_other(self, engine_run: _EngineRun) -> None:
+        """Log an error if another engine's run waits here while this engine's run waits on that engine.
+
+        Each run holds its own engine while it waits on the other, so neither engine's line moves.
+        """
+        if engine_run.run_id is None or engine_run.line_run is None or not engine_run.line_run.position:
+            return
+        waiting_there = any(
+            lease.host_engine_id == engine_run.engine_id
+            and lease.run_id is not None
+            and lease.request_task is not None
+            and not lease.request_task.done()
+            for lease in self._leases.values()
+        )
+        if not waiting_there:
+            return
+        logger.error(
+            "A run from engine %s waits for this engine while a run here waits for engine %s. Neither "
+            "continues until one is cancelled. Engines that send nodes to each other can stop each other this way.",
+            engine_run.engine_id,
+            engine_run.engine_id,
+        )
+
     async def _end_engine_runs_from(self, engine_id: str, reason: str) -> None:
-        """Let go of every run from `engine_id`, holding this engine or waiting for it."""
+        """Let go of every lease from `engine_id`, holding this engine or waiting for it."""
         for engine_run in [run for run in self._engine_runs.values() if run.engine_id == engine_id]:
             await self._end_engine_run(engine_run, reason)
 
     async def _end_engine_run(self, engine_run: _EngineRun, reason: str) -> None:
-        """Let another engine's run go: one holding this engine releases it, and one still waiting leaves the line."""
-        if engine_run.admitted.done():
+        """Let another engine's lease go: one holding this engine releases it, and one still waiting leaves the line."""
+        if engine_run.granted.done():
             engine_run.released.set()
             return
-        # Refused first, so its waiting nodes hear `reason` rather than the line's own cancellation.
+        # Refused first, so its acquire hears `reason` rather than the line's own cancellation.
         self.refuse_engine_run(engine_run, reason)
         if engine_run.line_run is not None:
             await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id)
@@ -2048,35 +2135,15 @@ class WorkerManager(EngineScoped):
         if self._engine_runs.get(engine_run.key) is engine_run:
             del self._engine_runs[engine_run.key]
 
-    def _engine_run_admitting(self, admission_id: str) -> _EngineRun | None:
-        """The run here whose node holds the admission, waiting or running, or None."""
-        for engine_run in self._engine_runs.values():
-            if admission_id in engine_run.running or admission_id in engine_run.waiting:
-                return engine_run
-        return None
-
-    def _engine_admitted(self, admission_id: str) -> str | None:
-        """The engine whose node holds an admission on this engine, or None if none does."""
-        engine_run = self._engine_run_admitting(admission_id)
-        if engine_run is None:
+    def _engine_leasing(self, lease_id: str) -> str | None:
+        """The engine this engine asked for a lease, or None if it asked for no such lease."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
             return None
-        return engine_run.engine_id
+        return lease.host_engine_id
 
-    def _engine_admitting(self, admission_id: str) -> str | None:
-        """The engine this engine asked to admit a node, or None if it asked for no such admission."""
-        admission = self._admissions.get(admission_id)
-        if admission is None:
-            return None
-        return admission.host_engine_id
-
-    def _report_place_to_admission(self, engine_run: _EngineRun, admission_id: str) -> None:
-        """Tell a node that just asked to be admitted its run's place in line, if the run waits."""
-        if engine_run.line_run is None or not engine_run.line_run.position:
-            return
-        self._send_notice(self._send_place_in_line(engine_run.engine_id, admission_id, engine_run.line_run.position))
-
-    async def _send_place_in_line(self, engine_id: str, admission_id: str, position: int) -> None:
-        request = worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=position)
+    async def _send_place_in_line(self, engine_id: str, lease_id: str, position: int) -> None:
+        request = worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=position)
         try:
             result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
@@ -2084,12 +2151,6 @@ class WorkerManager(EngineScoped):
             return
         if not isinstance(result, worker_events.ReportPlaceInLineResultSuccess):
             logger.warning("Engine %s did not take its run's place in line: %s", engine_id, result.result_details)
-
-    def _on_run_ended(self, run_id: str) -> None:
-        """Tell every engine the ended run sent a node to that it ended, so they serve the next run."""
-        request = worker_events.ReportRunEndedRequest(run_id=run_id)
-        for engine_id in self._run_engines.pop(run_id, set()):
-            self._send_notice(self._report_until_answered(engine_id, request, f"run {run_id} ended"))
 
     async def _report_until_answered(self, engine_id: str, request: RequestPayload, what: str) -> None:
         """Tell `engine_id` `what`, trying again until it answers or this engine has no session with it.
@@ -2138,8 +2199,9 @@ class WorkerManager(EngineScoped):
     async def _free_for_handoff(self, incoming_engine_id: str) -> None:
         """Free workers, as `distributed_execution.release` says, before this engine passes to `incoming_engine_id`'s run."""
         config = self.engine.config_manager
-        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default="others")
-        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default="drop_cache")
+        defaults = ReleaseSettings()
+        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default=defaults.which)
+        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default=defaults.how)
         if which == "none":
             return
         frees = []
@@ -2153,7 +2215,7 @@ class WorkerManager(EngineScoped):
             else:
                 frees.append(self._drop_library_named_objects(worker_engine_id, hosted))
         # All at once, so a worker that never answers delays the handoff by one timeout, not one each. Each is
-        # waited out even if another fails, so none is still stopping once the next run is admitted.
+        # waited out even if another fails, so none is still stopping once the next lease is granted.
         outcomes = await asyncio.gather(*frees, return_exceptions=True)
         for outcome in outcomes:
             if isinstance(outcome, Exception):
@@ -2361,7 +2423,7 @@ class WorkerManager(EngineScoped):
         ready = self._execution_ready.get(library_name)
         return ready is None or ready.is_set()
 
-    async def wait_until_executable(self, library_name: str | None) -> None:
+    async def wait_until_executable(self, library_name: str | None, *, start_stopped: bool = True) -> None:
         """Block until `library_name` can be executed, or until it is settled that it cannot.
 
         A worker registers BEFORE it loads libraries -- registration is what carries the
@@ -2375,10 +2437,14 @@ class WorkerManager(EngineScoped):
         timeout is a bug report; an unbounded wait is a mystery.
 
         A library whose worker another engine stopped, to free itself for another engine's run, has that
-        worker started there again first.
+        worker started there again first, unless `start_stopped` is False: then such a library returns at
+        once, as before a lease, which must not load the library there while another run holds that engine.
         """
         if library_name is not None:
-            await self._start_remote_worker_if_stopped(library_name)
+            if start_stopped:
+                await self._start_remote_worker_if_stopped(library_name)
+            elif self._remote_worker_stopped(library_name):
+                return
         if self.has_settled(library_name):
             return
         if library_name is None:
@@ -2403,15 +2469,19 @@ class WorkerManager(EngineScoped):
 
     async def _start_remote_worker_if_stopped(self, library_name: str) -> None:
         """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
-        if self._engine_for_library(library_name) is None:
-            return
-        if self.is_worker_running_or_starting(library_name):
-            return
-        # A worker that ended on its own left a reason, which stays until the library is reset.
-        unavailable = self._worker_unavailable.get(library_name)
-        if unavailable is not None and not unavailable.retryable:
+        if not self._remote_worker_stopped(library_name):
             return
         await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
+
+    def _remote_worker_stopped(self, library_name: str) -> bool:
+        """Whether `library_name`'s worker on another engine is stopped and may be started again there."""
+        if self._engine_for_library(library_name) is None:
+            return False
+        if self.is_worker_running_or_starting(library_name):
+            return False
+        # A worker that ended on its own left a reason, which stays until the library is reset.
+        unavailable = self._worker_unavailable.get(library_name)
+        return unavailable is None or unavailable.retryable
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

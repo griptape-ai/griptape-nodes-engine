@@ -31,10 +31,16 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AlterParameterDetailsRequest,
     SetParameterValueRequest,
 )
-from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.events.worker_events import (
+    CheckLeaseRequest,
+    CheckLeaseResultFailure,
+    CheckLeaseResultSuccess,
+    WorkerGoneError,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+from griptape_nodes.retained_mode.managers.worker_manager import EngineLease
 from griptape_nodes.serialization.values import UndecodedValue, encode_value
 from tests.simulated_worker import simulated_worker
 
@@ -140,7 +146,8 @@ def _make_node_manager(
     # cannot be in. Routing awaits it, so it needs to be awaitable.
     worker_manager = worker_manager or MagicMock()
     worker_manager.wait_until_executable = AsyncMock()
-    worker_manager.admit_on_engine = AsyncMock(return_value=None)
+    worker_manager.acquire_lease = AsyncMock(return_value=None)
+    worker_manager.lease_refusal = AsyncMock(return_value=None)
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -756,6 +763,77 @@ def _create_echo_node(engine: Engine, flow_name: str) -> BaseNode:
     return engine.node_manager.get_node_by_name(result.node_name)
 
 
+class TestAWorkerAnotherEngineRuns:
+    """A worker another engine runs asks that engine, before each node, whether the node's lease holds it."""
+
+    @pytest.mark.asyncio
+    async def test_runs_the_node_once_that_engine_says_the_lease_holds_it(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        held = CheckLeaseResultSuccess(result_details="held")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=held)
+        ) as ask:
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert ask.await_args is not None
+        engine_id, check = ask.await_args.args
+        assert engine_id == "gpu-01"
+        assert isinstance(check, CheckLeaseRequest)
+        assert check.lease_id == "lease-1"
+        assert check.worker_engine_id == worker_engine.get_engine_id()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_says_the_lease_does_not_hold_it(
+        self, worker_engine: Engine
+    ) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        not_held = CheckLeaseResultFailure(result_details="that engine is not holding itself for your run now.")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=not_held)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "not holding itself for your run" in str(result.result_details)
+        assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_node_sent_without_a_lease(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "without a lease" in str(result.result_details)
+        ask.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_does_not_answer(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(side_effect=TimeoutError)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "did not answer" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_worker_on_this_machine_asks_no_engine(self, worker_engine: Engine) -> None:
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        ask.assert_not_awaited()
+
+
 class TestPreparingTheRequestForAWorker:
     """What the orchestrator puts in an ExecuteNodeRequest before it forwards it: what a save would write."""
 
@@ -905,8 +983,8 @@ class TestExecuteNodeWorkerRoute:
         node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_node_for_another_engine_picks_its_worker_once_admitted(self) -> None:
-        """That engine may stop the worker while the node waits, and the second wait starts it again."""
+    async def test_a_node_for_another_engine_picks_its_worker_once_its_lease_holds_that_engine(self) -> None:
+        """That engine may stop the worker while the lease waits, and the second wait starts it again."""
         node = _make_routed_node()
         obj_mgr = _make_mock_obj_mgr(existing_node=node)
         lib_mgr = MagicMock()
@@ -915,14 +993,21 @@ class TestExecuteNodeWorkerRoute:
         wm = MagicMock()
         node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
         calls: list[str] = []
-        admission = object()
+        lease = EngineLease(lease_id="lease-1", host_engine_id="eng-2", run_id=None)
+        sent: list[str | None] = []
         success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
+
+        def run(event_request: Any, *_args: Any) -> dict:
+            calls.append("run")
+            sent.append(event_request.request.lease_id)
+            return success
+
         wm.worker_unavailable_reason.return_value = None
-        wm.wait_until_executable = AsyncMock(side_effect=lambda *_: calls.append("wait"))
-        wm.admit_on_engine = AsyncMock(side_effect=lambda *_: calls.append("admit") or admission)
+        wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
+        wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
         lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
-        wm.route_to_worker = AsyncMock(side_effect=lambda *_: calls.append("run") or success)
-        wm.end_admission = AsyncMock(side_effect=lambda *_: calls.append("end"))
+        wm.route_to_worker = AsyncMock(side_effect=run)
+        wm.release_after_node = MagicMock(side_effect=lambda *_: calls.append("release"))
 
         request = ExecuteNodeRequest(
             node_name="worker_node",
@@ -931,12 +1016,13 @@ class TestExecuteNodeWorkerRoute:
         result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert calls == ["wait", "admit", "wait", "pick", "run", "end"]
-        wm.end_admission.assert_awaited_once_with(admission)
+        assert calls == ["wait", "acquire", "wait", "pick", "run", "release"]
+        assert sent == ["lease-1"], "the worker there checks the lease the node was sent under"
+        wm.release_after_node.assert_called_once_with(lease)
 
     @pytest.mark.asyncio
     async def test_a_node_whose_worker_there_could_not_start_asks_that_engine_for_nothing(self) -> None:
-        """An engine that never answered the start would never answer the admission either."""
+        """An engine that never answered the start would never answer the lease either."""
         node = _make_routed_node()
         obj_mgr = _make_mock_obj_mgr(existing_node=node)
         lib_mgr = MagicMock()
@@ -946,7 +1032,7 @@ class TestExecuteNodeWorkerRoute:
         node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
         wm.wait_until_executable = AsyncMock()
         wm.worker_unavailable_reason.return_value = "engine eng-2 did not answer."
-        wm.admit_on_engine = AsyncMock()
+        wm.acquire_lease = AsyncMock()
         lib_mgr.workers.get_worker_for_library.return_value = None
 
         request = ExecuteNodeRequest(
@@ -955,7 +1041,7 @@ class TestExecuteNodeWorkerRoute:
         )
         await node_manager.on_execute_node_request(request)
 
-        wm.admit_on_engine.assert_not_awaited()
+        wm.acquire_lease.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
@@ -1128,7 +1214,7 @@ class TestExecuteNodePrivateExecutionRoute:
 
         # Set after the node manager is built, which installs its own mock. The library's own wait
         # comes first and passes; only the Isolated Execution worker's wait can fail here.
-        async def wait_until_executable(key: str | None) -> None:
+        async def wait_until_executable(key: str | None, *, start_stopped: bool = True) -> None:  # noqa: ARG001
             if key is None and load_failure is not None:
                 raise RuntimeError(load_failure)
 
