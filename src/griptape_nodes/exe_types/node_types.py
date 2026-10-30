@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
+from griptape_nodes.common.sequences.models import MissingItemPolicy, Sequence
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
@@ -71,6 +72,9 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
 
+
+# The engine's `Sequence` model, by the type name a parameter declares it with.
+SEQUENCE_PARAMETER_TYPE = "Sequence"
 logger = logging.getLogger("griptape_nodes")
 
 T = TypeVar("T")
@@ -1187,23 +1191,48 @@ class BaseNode(ABC):
             if isinstance(container, ParameterContainer):
                 self._list_rows.rows_changed(container, initial_setup=initial_setup)
 
-    @staticmethod
-    def _convert_and_validate(parameter: Parameter, value: Any) -> Any:
+    def _convert_and_validate(self, parameter: Parameter, value: Any) -> Any:
         """Run the parameter's converters on `value`, then its validators on the result."""
-        candidate_value = BaseNode._convert_value(parameter, value)
+        candidate_value = self._convert_value(parameter, value)
         for validator in parameter.validators:
             validator(parameter, candidate_value)
         return candidate_value
 
-    @staticmethod
-    def _convert_value(parameter: Parameter, value: Any) -> Any:
+    def _convert_value(self, parameter: Parameter, value: Any) -> Any:
         """Run the parameter's converters on `value`, and a list's item converters on each of its items first."""
         candidate_value = value
         if isinstance(parameter, ParameterList):
             candidate_value = parameter.convert_items(candidate_value)
         for converter in parameter.converters:
             candidate_value = converter(candidate_value)
+        if parameter.type == SEQUENCE_PARAMETER_TYPE and isinstance(candidate_value, str):
+            candidate_value = self._scan_sequence(candidate_value)
         return candidate_value
+
+    def _scan_sequence(self, path: str) -> Sequence | None:
+        """Scan a path or pattern into the Sequence its parameter holds.
+
+        An editor picker, a host, or a workflow input supplies a Sequence parameter as its pattern,
+        and nothing downstream can read a pattern where it expects a Sequence. Parameters added at
+        runtime carry no converters, so the parameter's type decides this rather than a converter.
+        """
+        if not path:
+            return None
+        # Deferred import: os_events imports flow_events, which imports this module.
+        from griptape_nodes.retained_mode.events.os_events import (
+            ScanSequencesRequest,
+            ScanSequencesResultSuccess,
+        )
+
+        # SKIP keeps a range with gaps as one Sequence, as a Read node with first and last would.
+        result = self.engine.handle_request(ScanSequencesRequest(path=path, policy=MissingItemPolicy.SKIP))
+        if not isinstance(result, ScanSequencesResultSuccess):
+            msg = f"Attempted to set a Sequence from '{path}'. Failed because {result.result_details}"
+            raise ValueError(msg)  # noqa: TRY004 - a failed scan is a bad value, not a bad type
+        if not result.sequences:
+            msg = f"Attempted to set a Sequence from '{path}'. Failed because no files on disk match it."
+            raise ValueError(msg)
+        return result.sequences[0]
 
     def _also_record_as_result(self, parameter: Parameter, value: Any) -> None:
         """Additionally record `value` in `parameter_output_values` if it is something this run produced.

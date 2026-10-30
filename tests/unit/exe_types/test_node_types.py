@@ -1,7 +1,9 @@
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
+from griptape_nodes.common.sequences.models import Sequence
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import (
     AsyncResult,
@@ -499,3 +501,40 @@ class TestStatusResultDetailsKeepVariables:
             node._set_status_results(was_successful=True, result_details="Saved to: {outputs}/a.mp4")
 
         assert node.parameter_output_values["result_details"] == "Saved to: {outputs}/a.mp4"
+
+
+@pytest.mark.usefixtures("engine")
+class TestSequenceParameter:
+    def _node_with(self, param_type: str) -> MockNode:
+        node = MockNode()
+        node.add_parameter(Parameter(name="plate", type=param_type, input_types=[param_type], tooltip="test"))
+        return node
+
+    def _frames(self, directory: Path, numbers: list[int]) -> str:
+        for number in numbers:
+            (directory / f"shot.{number:04d}.png").write_bytes(b"")
+        return f"{directory}/shot.####.png"
+
+    def test_a_pattern_set_on_a_sequence_parameter_is_scanned_into_a_sequence(self, tmp_path: Path) -> None:
+        node = self._node_with("Sequence")
+        node.set_parameter_value("plate", self._frames(tmp_path, [1001, 1002, 1004]))
+        value = node.get_parameter_value("plate")
+        assert isinstance(value, Sequence)
+        assert (value.first, value.last) == (1001, 1004)
+        assert [entry.number for entry in value.entries] == [1001, 1002, 1004]
+
+    def test_a_pattern_matching_no_files_is_refused(self, tmp_path: Path) -> None:
+        node = self._node_with("Sequence")
+        with pytest.raises(ValueError, match="no files on disk match"):
+            node.set_parameter_value("plate", f"{tmp_path}/shot.####.png")
+
+    def test_an_empty_pattern_clears_a_sequence_parameter(self) -> None:
+        node = self._node_with("Sequence")
+        node.set_parameter_value("plate", "")
+        assert node.get_parameter_value("plate") is None
+
+    def test_a_text_parameter_keeps_the_pattern_it_was_given(self, tmp_path: Path) -> None:
+        node = self._node_with("str")
+        pattern = self._frames(tmp_path, [1, 2])
+        node.set_parameter_value("plate", pattern)
+        assert node.get_parameter_value("plate") == pattern
