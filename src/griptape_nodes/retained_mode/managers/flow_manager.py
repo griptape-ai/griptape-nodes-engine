@@ -141,6 +141,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
 from griptape_nodes.retained_mode.managers.event_manager import current_request_id
 from griptape_nodes.retained_mode.managers.flow.packaging import FlowPackaging
 from griptape_nodes.retained_mode.managers.flow.serialization import FlowSerialization
+from griptape_nodes.retained_mode.managers.flow.summary import FlowSummarizer
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunState
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -259,6 +260,7 @@ class FlowManager(EngineScoped):
 
         self.packaging = FlowPackaging(event_manager, engine=engine)
         self.serialization = FlowSerialization(event_manager, engine=engine)
+        self.summarizer = FlowSummarizer(event_manager, engine=engine)
 
     @property
     def global_single_node_resolution(self) -> bool:
