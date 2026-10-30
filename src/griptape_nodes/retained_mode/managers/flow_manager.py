@@ -20,6 +20,7 @@ from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
+from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
@@ -206,7 +207,6 @@ from griptape_nodes.serialization.values import Unencodable, decode_value, encod
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -989,7 +989,8 @@ class FlowManager(EngineScoped):
     def on_list_nodes_in_flow_request(self, request: ListNodesInFlowRequest) -> ResultPayload:
         """Answer `request` for the open workflow, outside dispatch.
 
-        Kept for node libraries that call it directly. Engine code sends the request instead.
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -5777,13 +5778,16 @@ class FlowManager(EngineScoped):
         return involved_node_names
 
     def get_start_node_from_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
-        """The node a run of `flow` starts from to reach `node`, None when no workflow is open.
+        """The node a run of `flow` starts from to reach `node`.
 
         Edge method for code not handed a workflow; engine code calls `get_start_node_from_node_in`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
-            return None
+            # With no workflow open there are no connections, so a node of the flow is its own start.
+            if node not in flow.nodes.values():
+                return None
+            return node
         return self.get_start_node_from_node_in(workflow, flow, node)
 
     def get_start_node_from_node_in(
@@ -5890,13 +5894,18 @@ class FlowManager(EngineScoped):
         """Bucket nodes of the open workflow into start / control-entry / data-sink roles for DAG seeding.
 
         Edge method for code not handed a workflow; engine code calls `classify_nodes_for_dag_in`.
-
-        Raises:
-            OpenWorkflowError: No workflow is open, or more than one is.
         """
-        return self.classify_nodes_for_dag_in(self.engine.current_workflow(), nodes)
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            # With no workflow open there are no connections to classify against.
+            return self._classify_nodes_for_dag(Connections(), nodes)
+        return self.classify_nodes_for_dag_in(workflow, nodes)
 
-    def classify_nodes_for_dag_in(self, workflow: WorkflowRuntime, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
+    def classify_nodes_for_dag_in(self, workflow: WorkflowRuntime, nodes: list[BaseNode]) -> DagNodeCategories:
+        """Bucket nodes of the workflow into start / control-entry / data-sink roles for DAG seeding."""
+        return self._classify_nodes_for_dag(workflow.flows.connections, nodes)
+
+    def _classify_nodes_for_dag(self, cn_mgr: Connections, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
         """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
 
         This is scope-agnostic: callers decide which nodes are in scope (a whole flow's worth of
@@ -5912,7 +5921,6 @@ class FlowManager(EngineScoped):
         data_nodes: list[BaseNode] = []
         start_nodes: list[BaseNode] = []
         control_nodes: list[BaseNode] = []
-        cn_mgr = workflow.flows.connections
         for node in nodes:
             # if it's a start node, start here!
             if isinstance(node, StartNode):

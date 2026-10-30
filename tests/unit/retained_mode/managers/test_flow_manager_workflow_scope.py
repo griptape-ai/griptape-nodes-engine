@@ -261,6 +261,20 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
+    def test_dag_edge_methods_with_no_workflow_open_see_no_connections(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        node = MagicMock(spec=BaseNode)
+        node.name = "node"
+        node.parameters = []
+        flow = MagicMock()
+        flow.nodes = {"node": node}
+
+        categories = flow_manager.classify_nodes_for_dag([node])
+
+        assert categories.data_sink_nodes == [node]
+        assert flow_manager.get_start_node_from_node(flow, node) is node
+        assert flow_manager.get_start_node_from_node(MagicMock(nodes={}), node) is None
+
 
 def _connection_request(request_type: type) -> Any:
     return request_type(
