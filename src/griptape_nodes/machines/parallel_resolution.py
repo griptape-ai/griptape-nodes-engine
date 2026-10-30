@@ -37,6 +37,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultFailure,
 )
 from griptape_nodes.serialization.values import encode_for_display
+from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
@@ -713,7 +714,13 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            exceptions = node_reference.node_reference.validate_before_node_run()
+            # The check runs in a thread so a slow one doesn't freeze the editor. While it runs, the user
+            # can press Cancel. If they did, stop here: otherwise the node runs anyway (a provider node
+            # would submit its job) even though the run was cancelled.
+            exceptions = await async_utils.to_thread(node_reference.node_reference.validate_before_node_run)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name

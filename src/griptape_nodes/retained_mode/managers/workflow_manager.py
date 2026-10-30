@@ -26,6 +26,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadataSchemaError,
     WorkflowMetadataSectionCountError,
     WorkflowMetadataTomlError,
+    WorkflowShape,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -44,6 +45,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    GetWorkflowShapeRequest,
+    GetWorkflowShapeResultFailure,
+    GetWorkflowShapeResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultFailure,
     ImportWorkflowResultSuccess,
@@ -896,6 +900,22 @@ class WorkflowManager(EngineScoped):
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""
         return extract_workflow_shape(self.engine.flow_manager, workflow_name, flow_name)
+
+    @handles(GetWorkflowShapeRequest)
+    def on_get_workflow_shape_request(self, request: GetWorkflowShapeRequest) -> ResultPayload:
+        try:
+            shape = self.extract_workflow_shape(request.workflow_name, flow_name=request.flow_name)
+        except (ValueError, KeyError) as err:
+            details = (
+                f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "
+                f"Failed because: {err.args[0]}"
+            )
+            return GetWorkflowShapeResultFailure(result_details=details)
+
+        return GetWorkflowShapeResultSuccess(
+            workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
+            result_details=f"Read the inputs and outputs of workflow '{request.workflow_name}'.",
+        )
 
     def _walk_object_tree(
         self, obj: Any, process_class_fn: Callable[[type, Any], None], visited: set[int] | None = None

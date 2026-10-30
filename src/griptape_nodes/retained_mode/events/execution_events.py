@@ -20,6 +20,16 @@ from griptape_nodes.serialization.values import DisplayValue, Value
 # Requests and Results TO/FROM USER! These begin requests - and are not fully Execution Events.
 
 
+@dataclass(kw_only=True)
+class RunIdMixin:
+    """For the result of a request that starts a run: the run it started or joined.
+
+    None when the request failed before it became a run, such as a flow name that names no flow.
+    """
+
+    run_id: str | None = None
+
+
 @dataclass
 @PayloadRegistry.register
 class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
@@ -41,13 +51,13 @@ class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class ResolveNodeResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Node resolved successfully. Node execution completed and outputs are available."""
 
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeResultFailure(ResultPayloadFailure):
+class ResolveNodeResultFailure(RunIdMixin, ResultPayloadFailure):
     """Node resolution failed. Contains validation errors that prevented execution.
 
     Args:
@@ -86,13 +96,13 @@ class StartFlowRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class StartFlowResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Flow ran to completion."""
 
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowResultFailure(ResultPayloadFailure):
+class StartFlowResultFailure(RunIdMixin, ResultPayloadFailure):
     """Flow start failed. Contains validation errors that prevented execution.
 
     Args:
@@ -162,13 +172,13 @@ class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class StartFlowFromNodeResultSuccess(RunIdMixin, WorkflowAlteredMixin, ResultPayloadSuccess):
     """Flow started from node successfully. Execution is now running from the specified node."""
 
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeResultFailure(ResultPayloadFailure):
+class StartFlowFromNodeResultFailure(RunIdMixin, ResultPayloadFailure):
     """Flow start from node failed. Contains validation errors that prevented execution.
 
     Args:
@@ -207,6 +217,106 @@ class CancelFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class CancelFlowResultFailure(ResultPayloadFailure):
     """Flow cancellation failed. Common causes: flow not running, cancellation error."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelRunRequest(RequestPayload, GraphAccessMixin):
+    """Cancel one run: a waiting run leaves the line without starting, and the run in progress stops.
+
+    Use when: withdrawing a run queued behind another, or stopping a particular run. Run ids come
+    from ListRunsRequest or RunQueuedEvent.
+
+    Args:
+        run_id: The run to cancel.
+
+    Results: CancelRunResultSuccess | CancelRunResultFailure (no run with that id)
+    """
+
+    run_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelRunResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The run was cancelled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The run was not cancelled because no run with that id is in progress or waiting."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsRequest(RequestPayload, GraphAccessMixin):
+    """Cancel every waiting run, then the run in progress, without starting another.
+
+    Use when: closing a workflow, or stopping everything a script queued.
+
+    Results: CancelAllRunsResultSuccess | CancelAllRunsResultFailure (the run in progress could not be cancelled)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Every run was cancelled."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CancelAllRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The waiting runs were cancelled, but the run in progress could not be."""
+
+
+@dataclass
+class RunInfo:
+    """A run in progress or waiting for one to end.
+
+    Args:
+        run_id: The run.
+        flow_name: The flow it executes.
+        state: Its state: queued, running, or paused.
+        position: Its place in line, 1 being next, or 0 for the run in progress.
+        request_id: The id the client gave the request that submitted the run, or None if it gave none.
+    """
+
+    run_id: str
+    flow_name: str
+    state: str
+    position: int
+    request_id: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsRequest(RequestPayload, GraphAccessMixin):
+    """List the run in progress and the runs waiting behind it.
+
+    Use when: finding a queued run to cancel, or showing what is waiting.
+
+    Results: ListRunsResultSuccess (the run in progress first, then the waiting runs in order)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The runs: the one in progress first, then the waiting runs in the order they will start.
+
+    Args:
+        runs: The runs.
+    """
+
+    runs: list[RunInfo]
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The runs could not be listed."""
 
 
 @dataclass
@@ -422,6 +532,27 @@ class ControlFlowCancelledEvent(ExecutionPayload):
     result_details: ResultDetails | str | None = None
     exception: Exception | None = None
     run_seconds: float | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class RunQueuedEvent(ExecutionPayload):
+    """A run is waiting for the machine while another run has it.
+
+    Sent when the run starts waiting, each time its place in line changes, and once more with
+    position 0 when it stops waiting, whether it got the machine or its request was cancelled.
+
+    Args:
+        run_id: The waiting run.
+        flow_name: The flow the run executes.
+        position: Its place in line, 1 being next, or 0 once it is no longer waiting.
+        request_id: The id the client gave the request that submitted the run, or None if it gave none.
+    """
+
+    run_id: str
+    flow_name: str
+    position: int
+    request_id: str | None = None
 
 
 @dataclass
