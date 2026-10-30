@@ -1135,7 +1135,7 @@ class EventManager(EngineScoped):
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
 
-        event_request: EventRequest = EventRequest(request=request)
+        event_request: EventRequest = EventRequest(request=request, open_workflow_id=self._bound_worker_workflow_id())
 
         response_future = asyncio.run_coroutine_threadsafe(
             self._worker_request_client.request_to_orchestrator(
@@ -1172,6 +1172,19 @@ class EventManager(EngineScoped):
             result=result_payload,
             response_topic=result_context.get("response_topic"),
         )
+
+    def _bound_worker_workflow_id(self) -> str | None:
+        """The orchestrator workflow id of the worker runtime the current work is bound to, else None.
+
+        A worker keeps its runtime for an orchestrator workflow under that workflow's id, so a request
+        forwarded from the node running in it names the workflow the orchestrator binds it to.
+        """
+        bound = bound_workflow.get()
+        if bound is None or bound is NO_WORKFLOW:
+            return None
+        if self.engine.worker_workflows.find(bound.workflow_id) is not bound:
+            return None
+        return bound.workflow_id
 
     def _refusal_for_sender(
         self, request: RequestPayload, result_context: ResultContext

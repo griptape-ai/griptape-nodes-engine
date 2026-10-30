@@ -92,7 +92,6 @@ class WorkflowFileOperations(EngineScoped):
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
-        self.engine.workflow_manager.variable_substitution.drop(workflow.workflow_id)
         return DeleteWorkflowResultSuccess(
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
@@ -395,7 +394,7 @@ class WorkflowFileOperations(EngineScoped):
         save_result: SaveWorkflowResultSuccess,
         source: Workflow | None,
     ) -> str | None:
-        """Post-save bookkeeping for renaming a workflow that is not open: rekey flags, persist external reg, delete old entry.
+        """Post-save bookkeeping for renaming a workflow that is not open: persist external reg, delete old entry.
 
         ``source`` is the pre-resolved registry entry for ``old_workflow_name`` (or ``None`` when
         the workflow wasn't registered). Threaded from the outer handler so we don't re-query.
@@ -404,10 +403,6 @@ class WorkflowFileOperations(EngineScoped):
         handler doesn't blow past the McCabe branch limit.
         """
         new_workflow_name = save_result.workflow_name
-
-        # Transfer the substitution flag to the new workflow before the delete call removes the old entry.
-        if source is not None and save_result.workflow_id is not None and new_workflow_name != old_workflow_name:
-            self.engine.workflow_manager.variable_substitution.rekey(source.workflow_id, save_result.workflow_id)
 
         # If the renamed file landed outside the workspace, keep it registered at its new path
         # (the old path's registration is stripped by the delete below).

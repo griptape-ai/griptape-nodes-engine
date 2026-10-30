@@ -126,6 +126,25 @@ class TestClosedWorkflowBinding:
             engine.context_manager.pop_workflow()
             assert bound_workflow.get() is NO_WORKFLOW
 
+    def test_a_request_that_closes_its_workflow_and_opens_another_acts_on_the_one_it_opened(
+        self, engine: Engine
+    ) -> None:
+        """A clean-slate load closes the open workflow, then opens and builds into the next."""
+        _open(engine, "closing")
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            engine.context_manager.pop_workflow()
+            engine.context_manager.push_workflow(workflow_name="opened")
+            return _ProbeResult(result_details="ok", workflow=engine.current_workflow())
+
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        result = engine.event_manager.handle_request(_ProbeRequest()).result
+
+        assert isinstance(result, _ProbeResult)
+        assert result.workflow is engine.open_workflows.all_open()[0]
+        assert bound_workflow.get() is None
+
     def test_a_nested_request_whose_caller_is_bound_to_a_closed_workflow_is_refused(self, engine: Engine) -> None:
         workflow = _open(engine, "closing")
         calls = _count_handler_calls(engine)
